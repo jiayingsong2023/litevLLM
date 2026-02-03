@@ -641,7 +641,11 @@ def weak_ref_tensor(tensor: Any) -> Any:
     This ignores 0-size tensors as those don't allocate any memory.
     """
     if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
-        return torch.ops._C.weak_ref_tensor(tensor)
+        try:
+            return torch.ops._C.weak_ref_tensor(tensor)
+        except (AttributeError, RuntimeError):
+            # Simplification: Fallback to regular tensor if C++ op is missing
+            return tensor
     else:
         return tensor
 

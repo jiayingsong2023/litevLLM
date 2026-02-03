@@ -80,6 +80,11 @@ def get_attn_backend(
         attn_type=attn_type or AttentionType.DECODER,
     )
 
+    # Force Triton Attention Backend for Phase 1 simplification
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    backend_enum = AttentionBackendEnum.TRITON_ATTN
+    logger.info("Simplification: Forcing AttentionBackendEnum.TRITON_ATTN")
+
     return _cached_get_attn_backend(
         backend=backend_enum,
         attn_selector_config=attn_selector_config,

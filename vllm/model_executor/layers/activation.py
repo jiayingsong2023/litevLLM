@@ -42,7 +42,7 @@ class FatreluAndMul(CustomOp):
         super().__init__()
         self.threshold = threshold
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.fatrelu_and_mul
+            self.op = getattr(torch.ops._C, "fatrelu_and_mul", None)
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
@@ -78,7 +78,7 @@ class SiluAndMul(CustomOp):
     def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.silu_and_mul
+            self.op = getattr(torch.ops._C, "silu_and_mul", None)
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 
@@ -124,7 +124,7 @@ class MulAndSilu(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.mul_and_silu
+            self.op = getattr(torch.ops._C, "mul_and_silu", None)
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 
@@ -228,9 +228,9 @@ class GeluAndMul(CustomOp):
             raise ValueError(f"Unknown approximate mode: {approximate}")
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
             if approximate == "none":
-                self.op = torch.ops._C.gelu_and_mul
+                self.op = getattr(torch.ops._C, "gelu_and_mul", None)
             elif approximate == "tanh":
-                self.op = torch.ops._C.gelu_tanh_and_mul
+                self.op = getattr(torch.ops._C, "gelu_tanh_and_mul", None)
         if current_platform.is_rocm() and approximate == "tanh":
             logger.warning_once(
                 "[ROCm] PyTorch's native GELU with tanh approximation is unstable "
@@ -312,7 +312,7 @@ class NewGELU(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            self.op = torch.ops._C.gelu_new
+            self.op = getattr(torch.ops._C, "gelu_new", None)
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 
@@ -340,7 +340,7 @@ class FastGELU(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            self.op = torch.ops._C.gelu_fast
+            self.op = getattr(torch.ops._C, "gelu_fast", None)
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 
@@ -368,7 +368,7 @@ class QuickGELU(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            self.op = torch.ops._C.gelu_quick
+            self.op = getattr(torch.ops._C, "gelu_quick", None)
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
 

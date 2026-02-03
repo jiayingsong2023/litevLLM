@@ -1,3 +1,8 @@
+# Simplification: Force VLLM_TARGET_DEVICE to "empty" and return early
+set(VLLM_TARGET_DEVICE "empty" CACHE STRING "Target device backend for vLLM" FORCE)
+message(STATUS "Simplification: Forcing VLLM_TARGET_DEVICE='empty' in CMake")
+return()
+
 cmake_minimum_required(VERSION 3.26)
 
 # When building directly using CMake, make sure you run the install step

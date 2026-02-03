@@ -178,14 +178,16 @@ class CustomOp(nn.Module):
         else:
             compilation_config.disabled_custom_ops.update([self.__class__.name])
 
+        if current_platform.is_rocm() or current_platform.is_cuda():
+            logger.info("Simplification: Forcing forward_native for CustomOp %s (enabled=%s)", self.__class__.name, enabled)
+            return self.maybe_compile(self.forward_native, enable=compile_native)
+
         if not enabled:
             # Compile forward_native to avoid eager torch ops if inside
             # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)
             return self.maybe_compile(self.forward_native, enable=compile_native)
 
-        if current_platform.is_rocm():
-            return self.forward_hip
-        elif current_platform.is_cpu():
+        if current_platform.is_cpu():
             return self.forward_cpu
         elif current_platform.is_tpu():
             return self.forward_tpu
@@ -194,7 +196,7 @@ class CustomOp(nn.Module):
         elif current_platform.is_out_of_tree():
             return self.forward_oot
         else:
-            return self.forward_cuda
+            return self.forward_native
 
     def maybe_compile(self, fn, *, enable: bool = True):
         """

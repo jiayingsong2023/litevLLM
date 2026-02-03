@@ -22,7 +22,13 @@ from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 logger = init_logger(__name__)
 
-FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+def safe_get_op(namespace, name):
+    try:
+        return getattr(namespace, name).default
+    except (AttributeError, RuntimeError):
+        return None
+
+FUSED_QK_ROPE_OP = safe_get_op(torch.ops._C, "fused_qk_norm_rope")
 
 P = ParamSpec("P")
 

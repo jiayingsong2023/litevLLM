@@ -54,19 +54,27 @@ def empty_i64(*args: Any, **kwargs: Any) -> torch.Tensor:
     return torch.empty(*args, **kwargs, dtype=torch.int64, device="cuda")
 
 
-RMS_OP = torch.ops._C.rms_norm.default
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
+def safe_get_op(namespace, name):
+    try:
+        return getattr(namespace, name).default
+    except (AttributeError, RuntimeError):
+        return None
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
+RMS_OP = safe_get_op(torch.ops._C, "rms_norm")
+RMS_ADD_OP = safe_get_op(torch.ops._C, "fused_add_rms_norm")
+
+QUANT_OPS: dict[QuantKey, Any] = {
+    kFp8StaticTensorSym: safe_get_op(torch.ops._C, "static_scaled_fp8_quant"),  # noqa: E501
+    kFp8DynamicTensorSym: safe_get_op(torch.ops._C, "dynamic_scaled_fp8_quant"),  # noqa: E501
+    kFp8DynamicTokenSym: safe_get_op(torch.ops._C, "dynamic_per_token_scaled_fp8_quant"),  # noqa: E501
 }
-if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
-    QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.default
 if current_platform.is_cuda():
-    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
-    QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+    if hasattr(torch.ops._C, "scaled_fp4_quant"):
+        QUANT_OPS[kNvfp4Dynamic] = safe_get_op(torch.ops._C, "scaled_fp4_quant")
+    
+    if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
+        QUANT_OPS[kFp8Dynamic128Sym] = safe_get_op(torch.ops._C, "per_token_group_fp8_quant")  # noqa: E501
+        QUANT_OPS[kFp8Dynamic64Sym] = safe_get_op(torch.ops._C, "per_token_group_fp8_quant")  # noqa: E501
 
 
 class FusedRMSQuantKey(NamedTuple):
@@ -86,31 +94,31 @@ class FusedRMSQuantKey(NamedTuple):
         )
 
 
-FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
+FUSED_OPS: dict[FusedRMSQuantKey, Any] = {
     FusedRMSQuantKey(
         kFp8StaticTensorSym, False
-    ): torch.ops._C.rms_norm_static_fp8_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_static_fp8_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8StaticTensorSym, True
-    ): torch.ops._C.fused_add_rms_norm_static_fp8_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "fused_add_rms_norm_static_fp8_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8DynamicTokenSym, False
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_dynamic_per_token_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8DynamicTokenSym, True
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_dynamic_per_token_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8Dynamic128Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_per_block_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8Dynamic128Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_per_block_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8Dynamic64Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_per_block_quant"),  # noqa: E501
     FusedRMSQuantKey(
         kFp8Dynamic64Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
+    ): safe_get_op(torch.ops._C, "rms_norm_per_block_quant"),  # noqa: E501
 }
 
 

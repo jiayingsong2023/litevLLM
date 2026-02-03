@@ -90,11 +90,9 @@ def select_unquantized_moe_backend(
         and current_platform.has_device_capability(90)
     )
     if current_platform.is_rocm():
-        if rocm_aiter_moe_enabled:
-            backend = UnquantizedMoeBackend.AITER
-        else:
-            backend = UnquantizedMoeBackend.TRITON
-    if current_platform.is_cuda():
+        # Simplification: Force Triton for MoE on ROCm
+        backend = UnquantizedMoeBackend.TRITON
+    elif current_platform.is_cuda():
         if flashinfer_trtllm_moe_enabled:
             backend = UnquantizedMoeBackend.FLASHINFER_TRTLLM
         elif flashinfer_cutlass_moe_enabled:

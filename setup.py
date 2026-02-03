@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 #  which is not installed yet
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
-VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
+# Simplification: Force VLLM_TARGET_DEVICE to "empty" to skip C++ extensions
+VLLM_TARGET_DEVICE = "empty"
+logger.info("Simplification: Forcing VLLM_TARGET_DEVICE='empty'")
 
 if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
     logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
@@ -959,17 +961,17 @@ def get_requirements() -> list[str]:
 
 ext_modules = []
 
-if _is_cuda() or _is_hip():
+if False: # _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
     # Optional since this doesn't get built (produce an .so file). This is just
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
-if _is_hip():
+if False: # _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda():
+if False: # _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
@@ -987,7 +989,7 @@ if _is_cuda():
             CMakeExtension(name="vllm._flashmla_extension_C", optional=True)
         )
 
-if _build_custom_ops():
+if False: # _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
 package_data = {

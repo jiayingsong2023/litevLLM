@@ -353,11 +353,20 @@ def apply_moe_activation(
 
     # Activations with gated multiplication (gate × activation(up))
     if activation == "silu":
-        torch.ops._C.silu_and_mul(output, input)
+        d = input.shape[-1] // 2
+        output.copy_(F.silu(input[..., :d]) * input[..., d:])
     elif activation == "gelu":
-        torch.ops._C.gelu_and_mul(output, input)
+        d = input.shape[-1] // 2
+        output.copy_(F.gelu(input[..., :d]) * input[..., d:])
     elif activation == "swigluoai":
-        torch.ops._C.swigluoai_and_mul(output, input)
+        d = input.shape[-1] // 2
+        # Simplified swigluoai native impl
+        alpha, limit = 1.702, 7.0
+        gate, up = input[..., :d], input[..., d:]
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        glu = gate * torch.sigmoid(gate * alpha)
+        output.copy_((up + 1) * glu)
     # Activations without gated multiplication
     elif activation == SILU_NO_MUL:
         output.copy_(F.silu(input))

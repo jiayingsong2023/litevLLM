@@ -932,8 +932,12 @@ try:
     is_vllm_fa = True
 except ImportError:
     # For rocm use upstream flash attention
+    flash_attn_varlen_func = None
     if current_platform.is_rocm():
-        from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        try:
+            from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        except ImportError:
+            logger.warning("Simplification: flash_attn not found, mla may fail if not using Triton.")
     is_vllm_fa = False
 
 

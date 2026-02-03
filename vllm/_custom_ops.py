@@ -16,7 +16,54 @@ from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
-current_platform.import_kernels()
+# Simplification: Suppress kernel import errors as we focus on Triton/Native
+try:
+    current_platform.import_kernels()
+except Exception as e:
+    logger.warning("Simplification: Failed to import C++ kernels, but continuing: %r", e)
+
+# Simplification: Mock missing namespaces and operators to avoid AttributeError
+def _setup_mocks():
+    import types
+
+    class DummyOp:
+        def __init__(self, name):
+            self.__name__ = name
+            self.default = self
+            self._is_vllm_mock = True
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(f"Simplification Error: Attempted to call missing C++ op '{self.__name__}'.")
+        def __getattr__(self, name):
+            return self
+
+    class MockNamespace:
+        def __init__(self, name):
+            self.__name__ = name
+            self._ops = {}
+        def __getattr__(self, name):
+            if name.startswith("__"): # Avoid mocking internal python attributes
+                raise AttributeError(name)
+            if name not in self._ops:
+                self._ops[name] = DummyOp(f"{self.__name__}.{name}")
+            return self._ops[name]
+
+    for ns_name in ["_C", "_rocm_C", "_moe_C", "_C_cache_ops", "_C_cuda_utils", "_C_custom_ar"]:
+        # Only replace if missing or empty
+        try:
+            ns = getattr(torch.ops, ns_name)
+            if isinstance(ns, torch._ops._OpNamespace):
+                # If it's a real namespace but we have no .so, it will fail on getattr.
+                # We'll keep it but our patched_getattr in vllm/_custom_ops.py earlier (if any) or 
+                # this replacement will help.
+                setattr(torch.ops, ns_name, MockNamespace(ns_name))
+        except (AttributeError, RuntimeError):
+            setattr(torch.ops, ns_name, MockNamespace(ns_name))
+
+_setup_mocks()
+
+# Helper to check if an op is a real torch op or our mock
+def is_real_op(op):
+    return not getattr(op, "_is_vllm_mock", False)
 
 if TYPE_CHECKING:
 
@@ -499,7 +546,7 @@ def awq_dequantize(
     return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
-if hasattr(torch.ops._C, "awq_dequantize"):
+if is_real_op(getattr(torch.ops._C, "awq_dequantize", None)):
 
     @register_fake("_C::awq_dequantize")
     def _awq_dequantize_fake(
@@ -530,7 +577,7 @@ def awq_gemm(
     return torch.ops._C.awq_gemm(input, qweight, scales, qzeros, split_k_iters)
 
 
-if hasattr(torch.ops._C, "awq_gemm"):
+if is_real_op(getattr(torch.ops._C, "awq_gemm", None)):
 
     @register_fake("_C::awq_gemm")
     def _awq_gemm_fake(
@@ -571,7 +618,7 @@ def gptq_gemm(
     )
 
 
-if hasattr(torch.ops._C, "gptq_gemm"):
+if is_real_op(getattr(torch.ops._C, "gptq_gemm", None)):
 
     @register_fake("_C::gptq_gemm")
     def _gptq_gemm_fake(
@@ -593,7 +640,7 @@ def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
 
-if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
+if is_real_op(getattr(torch.ops._C, "allspark_w8a16_gemm", None)):
 
     @register_fake("_C::allspark_w8a16_gemm")
     def _allspark_w8a16_gemm_fake(
@@ -613,7 +660,7 @@ if hasattr(torch.ops._C, "allspark_w8a16_gemm"):
         return torch.empty((m, n), device=a.device, dtype=a.dtype)
 
 
-if hasattr(torch.ops._C, "ggml_dequantize"):
+if is_real_op(getattr(torch.ops._C, "ggml_dequantize", None)):
 
     @register_fake("_C::ggml_dequantize")
     def _ggml_dequantize_fake(
@@ -660,7 +707,7 @@ if hasattr(torch.ops._C, "ggml_dequantize"):
         return torch.empty((tokens * top_k, row), dtype=torch.float16, device=W.device)
 
 
-if hasattr(torch.ops._C, "ggml_moe_a8_vec"):
+if is_real_op(getattr(torch.ops._C, "ggml_moe_a8_vec", None)):
 
     @register_fake("_C::ggml_moe_a8_vec")
     def _ggml_moe_a8_vec_fake(
@@ -1099,7 +1146,7 @@ def gptq_marlin_repack(
     )
 
 
-if hasattr(torch.ops._C, "gptq_marlin_repack"):
+if is_real_op(getattr(torch.ops._C, "gptq_marlin_repack", None)):
 
     @register_fake("_C::gptq_marlin_repack")
     def _gptq_marlin_repack_fake(
@@ -1132,7 +1179,7 @@ def awq_marlin_repack(
     )
 
 
-if hasattr(torch.ops._C, "awq_marlin_repack"):
+if is_real_op(getattr(torch.ops._C, "awq_marlin_repack", None)):
 
     @register_fake("_C::awq_marlin_repack")
     def _awq_marlin_repack_fake(
@@ -1247,7 +1294,7 @@ def marlin_gemm(
     )
 
 
-if hasattr(torch.ops._C, "marlin_gemm"):
+if is_real_op(getattr(torch.ops._C, "marlin_gemm", None)):
 
     @register_fake("_C::marlin_gemm")
     def _marlin_gemm_fake(
@@ -1325,7 +1372,7 @@ def machete_mm(
     )
 
 
-if hasattr(torch.ops._C, "machete_mm"):
+if is_real_op(getattr(torch.ops._C, "machete_mm", None)):
 
     @register_fake("_C::machete_mm")
     def machete_mm_fake(
@@ -1357,7 +1404,7 @@ def machete_prepack_B(
     )
 
 
-if hasattr(torch.ops._C, "machete_prepack_B"):
+if is_real_op(getattr(torch.ops._C, "machete_prepack_B", None)):
 
     @register_fake("_C::machete_prepack_B")
     def machete_prepack_B_fake(
@@ -1393,7 +1440,7 @@ def cutlass_w4a8_mm(
     )
 
 
-if hasattr(torch.ops._C, "cutlass_w4a8_mm"):
+if is_real_op(getattr(torch.ops._C, "cutlass_w4a8_mm", None)):
 
     @register_fake("_C::cutlass_w4a8_mm")
     def cutlass_w4a8_mm_fake(
@@ -1417,7 +1464,7 @@ def cutlass_pack_scale_fp8(scales: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.cutlass_pack_scale_fp8(scales)
 
 
-if hasattr(torch.ops._C, "cutlass_pack_scale_fp8"):
+if is_real_op(getattr(torch.ops._C, "cutlass_pack_scale_fp8", None)):
 
     @register_fake("_C::cutlass_pack_scale_fp8")
     def cutlass_pack_scale_fp8_fake(scales: torch.Tensor) -> torch.Tensor:
@@ -1428,7 +1475,7 @@ def cutlass_encode_and_reorder_int4b(b: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.cutlass_encode_and_reorder_int4b(b)
 
 
-if hasattr(torch.ops._C, "cutlass_encode_and_reorder_int4b"):
+if is_real_op(getattr(torch.ops._C, "cutlass_encode_and_reorder_int4b", None)):
 
     @register_fake("_C::cutlass_encode_and_reorder_int4b")
     def cutlass_encode_and_reorder_int4b_fake(b: torch.Tensor) -> torch.Tensor:
@@ -1507,7 +1554,7 @@ def cutlass_encode_and_reorder_int4b_grouped(
     return torch.ops._C.cutlass_encode_and_reorder_int4b_grouped(b_tensors)
 
 
-if hasattr(torch.ops._C, "cutlass_encode_and_reorder_int4b_grouped"):
+if is_real_op(getattr(torch.ops._C, "cutlass_encode_and_reorder_int4b_grouped", None)):
 
     @register_fake("_C::cutlass_encode_and_reorder_int4b_grouped")
     def cutlass_encode_and_reorder_int4b_grouped_fake(b: torch.Tensor) -> torch.Tensor:
@@ -1518,7 +1565,7 @@ def permute_cols(a: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.permute_cols(a, perm)
 
 
-if hasattr(torch.ops._C, "permute_cols"):
+if is_real_op(getattr(torch.ops._C, "permute_cols", None)):
 
     @register_fake("_C::permute_cols")
     def _permute_cols_fake(a: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
@@ -2060,6 +2107,10 @@ def wvSplitKQ(
 
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
+    # Simplification: Provide native fallback for moe_sum
+    if not is_real_op(getattr(torch.ops._moe_C, "moe_sum", None)):
+        output.copy_(input.sum(dim=1))
+        return
     torch.ops._moe_C.moe_sum(input, output)
 
 
@@ -2072,6 +2123,74 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     expert_map: torch.Tensor | None = None,
 ) -> None:
+    # Simplification: Provide a full native PyTorch implementation
+    if not is_real_op(getattr(torch.ops._moe_C, "moe_align_block_size", None)):
+        M, K = topk_ids.shape
+        num_tokens = M * K
+        
+        # 1. Flatten and get global expert IDs
+        flat_topk_ids = topk_ids.flatten()
+        
+        # 2. Filter by expert_map if provided (expert parallel)
+        if expert_map is not None:
+            # Map global to local expert IDs
+            local_expert_ids = expert_map[flat_topk_ids]
+        else:
+            local_expert_ids = flat_topk_ids
+            
+        # 3. Create a mask for tokens belonging to this rank (local_id != -1)
+        mask = local_expert_ids != -1
+        valid_local_expert_ids = local_expert_ids[mask]
+        valid_token_ids = torch.arange(num_tokens, device=topk_ids.device)[mask]
+        
+        # 4. Sort tokens by expert ID
+        # We want to group tokens by their assigned expert
+        sorted_valid_expert_ids, perm = valid_local_expert_ids.sort()
+        sorted_valid_token_ids = valid_token_ids[perm]
+        
+        # 5. Calculate padding for each expert
+        # This is the tricky part in Python. We need to insert padding tokens
+        # to make each expert's work divisible by block_size.
+        
+        # Count tokens per expert
+        expert_counts = torch.bincount(sorted_valid_expert_ids, minlength=num_experts)
+        padded_counts = (expert_counts + block_size - 1) // block_size * block_size
+        
+        # Total tokens after padding
+        total_padded_tokens = padded_counts.sum().item()
+        
+        # Prepare output tensors
+        # Note: sorted_token_ids might be smaller than total_padded_tokens 
+        # if max_num_tokens_padded was underestimated. But vLLM usually allocates enough.
+        
+        # Current implementation: loop over experts to fill (not most efficient but works)
+        # We use num_tokens as the "padding index" (out of bounds)
+        curr_out_idx = 0
+        curr_in_idx = 0
+        for e in range(num_experts):
+            count = expert_counts[e].item()
+            if count == 0:
+                continue
+            
+            # Copy original tokens
+            actual_count = count
+            sorted_token_ids[curr_out_idx : curr_out_idx + actual_count] = sorted_valid_token_ids[curr_in_idx : curr_in_idx + count]
+            
+            # Fill padding
+            pad_count = padded_counts[e].item() - count
+            if pad_count > 0:
+                sorted_token_ids[curr_out_idx + actual_count : curr_out_idx + actual_count + pad_count] = num_tokens
+            
+            # Fill expert_ids for these blocks
+            num_blocks = padded_counts[e].item() // block_size
+            experts_ids[curr_out_idx // block_size : curr_out_idx // block_size + num_blocks] = e
+            
+            curr_out_idx += count + pad_count
+            curr_in_idx += count
+            
+        num_tokens_post_pad.fill_(curr_out_idx)
+        return
+
     torch.ops._moe_C.moe_align_block_size(
         topk_ids,
         num_experts,
@@ -2179,6 +2298,22 @@ def topk_softmax(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> None:
+    # Simplification: Provide native fallback for topk_softmax
+    if not is_real_op(getattr(torch.ops._moe_C, "topk_softmax", None)):
+        logits = gating_output.float()
+        if e_score_correction_bias is not None:
+            logits += e_score_correction_bias
+        
+        routing_weights = torch.softmax(logits, dim=-1)
+        topk_weights_val, topk_ids_val = torch.topk(routing_weights, topk_ids.shape[-1], dim=-1)
+        
+        if renormalize:
+            topk_weights_val /= topk_weights_val.sum(dim=-1, keepdim=True)
+            
+        topk_weights.copy_(topk_weights_val)
+        topk_ids.copy_(topk_ids_val)
+        return
+
     torch.ops._moe_C.topk_softmax(
         topk_weights,
         topk_ids,
@@ -2197,6 +2332,22 @@ def topk_sigmoid(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> None:
+    # Simplification: Provide native fallback for topk_sigmoid
+    if not is_real_op(getattr(torch.ops._moe_C, "topk_sigmoid", None)):
+        logits = gating_output.float()
+        if e_score_correction_bias is not None:
+            logits += e_score_correction_bias
+        
+        routing_weights = torch.sigmoid(logits)
+        topk_weights_val, topk_ids_val = torch.topk(routing_weights, topk_ids.shape[-1], dim=-1)
+        
+        if renormalize:
+            topk_weights_val /= topk_weights_val.sum(dim=-1, keepdim=True)
+            
+        topk_weights.copy_(topk_weights_val)
+        topk_ids.copy_(topk_ids_val)
+        return
+
     torch.ops._moe_C.topk_sigmoid(
         topk_weights,
         topk_ids,
@@ -2310,7 +2461,7 @@ def moe_wna16_marlin_gemm(
     )
 
 
-if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):
+if is_real_op(getattr(torch.ops, "_moe_C", None)) and is_real_op(getattr(torch.ops._moe_C, "marlin_gemm_moe", None)):
 
     @register_fake("_moe_C::marlin_gemm_moe")
     def marlin_gemm_moe_fake(
@@ -2770,7 +2921,7 @@ def sm100_cutlass_mla_get_workspace_size(
     )
 
 
-if hasattr(torch.ops._C, "weight_packed_linear"):
+if is_real_op(getattr(torch.ops._C, "weight_packed_linear", None)):
 
     @register_fake("_C::weight_packed_linear")
     def weight_packed_linear_fake(
@@ -2784,7 +2935,7 @@ if hasattr(torch.ops._C, "weight_packed_linear"):
         )
 
 
-if hasattr(torch.ops._C, "fused_experts_cpu"):
+if is_real_op(getattr(torch.ops._C, "fused_experts_cpu", None)):
 
     @register_fake("_C::fused_experts_cpu")
     def fused_experts_cpu_fake(
@@ -2806,7 +2957,7 @@ if hasattr(torch.ops._C, "fused_experts_cpu"):
         return torch.empty_like(hidden_states)
 
 
-if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
+if is_real_op(getattr(torch.ops._C, "int8_scaled_mm_with_quant", None)):
 
     @register_fake("_C::int8_scaled_mm_with_quant")
     def int8_scaled_mm_with_quant_fake(
@@ -3245,7 +3396,7 @@ def hadacore_transform(x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
     return torch.ops._C.hadacore_transform(x, inplace)
 
 
-if hasattr(torch.ops._C, "hadacore_transform"):
+if is_real_op(getattr(torch.ops._C, "hadacore_transform", None)):
 
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
