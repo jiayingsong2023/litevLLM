@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
-from vllm.distributed.kv_events import KVCacheEvent
+# litevLLM - Distributed stubs
+class KVCacheEvent: pass
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector

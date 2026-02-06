@@ -31,12 +31,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     update_config,
 )
-from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.eplb.eplb_state import EplbState
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
-    get_dcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -72,8 +67,6 @@ from vllm.model_executor.models.interfaces import (
     supports_eagle3,
     supports_mrope,
     supports_multimodal_pruning,
-    supports_realtime,
-    supports_transcription,
     supports_xdrope,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -163,11 +156,11 @@ from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
 )
-from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
-from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -326,7 +319,8 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+    LoRAModelRunnerMixin,
+    KVConnectorModelRunnerMixin
 ):
     def __init__(
         self,
@@ -369,21 +363,13 @@ class GPUModelRunner(
         self.is_multimodal_pruning_enabled = False
         self.max_model_len = model_config.max_model_len
 
-        # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
-        self.dcp_world_size = self.parallel_config.decode_context_parallel_size
-        self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        self.dcp_world_size = 1
+        self.dcp_rank = 0
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
-        # Broadcast PP output for external_launcher (torchrun)
-        # to make sure we are synced across pp ranks
-        # TODO: Support overlapping mirco-batches
-        # https://github.com/vllm-project/vllm/issues/18019
-        self.broadcast_pp_output = (
-            self.parallel_config.distributed_executor_backend == "external_launcher"
-            and len(get_pp_group().ranks) > 1
-        )
+        self.broadcast_pp_output = False
 
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
@@ -416,12 +402,7 @@ class GPUModelRunner(
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
-        self.eplb_state: EplbState | None = None
-        """
-        State of the expert parallelism load balancer.
-
-        Will be lazily initialized when the model is loaded.
-        """
+        self.eplb_state = None
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
@@ -2566,15 +2547,6 @@ class GPUModelRunner(
         if is_text_generation_model(model):
             supported_tasks.append("generate")
 
-        if supports_transcription(model):
-            if model.supports_transcription_only:
-                return ["transcription"]
-
-            supported_tasks.append("transcription")
-
-        if supports_realtime(model):
-            supported_tasks.append("realtime")
-
         return supported_tasks
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
@@ -3138,40 +3110,6 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
-            # Disable DP padding when running eager to avoid excessive padding when
-            # running prefills. This lets us set cudagraph_mode="NONE" on the prefiller
-            # in a P/D setup and still use CUDA graphs (enabled by this padding) on the
-            # decoder.
-            allow_dp_padding = (
-                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            )
-
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.parallel_config,
-                    allow_microbatching=allow_microbatching,
-                    allow_dp_padding=allow_dp_padding,
-                    num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
-                    num_scheduled_tokens_per_request=num_scheduled_tokens_np,
-                    cudagraph_mode=cudagraph_mode.value,
-                )
-            )
-
-            # Extract DP-synced values
-            if num_tokens_across_dp is not None:
-                dp_rank = self.parallel_config.data_parallel_rank
-                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                # Re-dispatch with DP padding so we have the correct batch_descriptor
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                    num_tokens_padded,
-                    disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
-                )
-                # Assert to make sure the agreed upon token count is correct otherwise
-                # num_tokens_across_dp will no-longer be valid
-                assert batch_descriptor.num_tokens == num_tokens_padded
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -3319,10 +3257,8 @@ class GPUModelRunner(
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(
-                scheduler_output.preempted_req_ids
-            )
+        # No-op for litevLLM
+        pass
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -3331,14 +3267,7 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
-
-            if has_ec_transfer() and get_ec_transfer().is_producer:
-                with self.maybe_get_ec_connector_output(
-                    scheduler_output,
-                    encoder_cache=self.encoder_cache,
-                ) as ec_connector_output:
-                    self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(scheduler_output)
+            self._execute_mm_encoder(scheduler_output)
 
             if not num_scheduled_tokens:
                 if (
@@ -3567,32 +3496,8 @@ class GPUModelRunner(
             else:
                 # Rare case.
                 assert not self.is_pooling_model
-
                 sample_hidden_states = hidden_states[logits_indices]
-                if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_tokens_padded
-                        )
-                    }
-                    get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-                    logits = None
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
-
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
-
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
+                logits = self.model.compute_logits(sample_hidden_states)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3618,8 +3523,7 @@ class GPUModelRunner(
 
         if self.execute_model_state is None:
             # receive sampled token ids from the last PP rank.
-            if self.use_async_scheduling and get_pp_group().world_size > 1:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+            # No-op for litevLLM
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
 
@@ -4120,9 +4024,8 @@ class GPUModelRunner(
             else (None, None, None)
         )
 
-        if self.parallel_config.enable_eplb:
-            self.eplb_state = EplbState(self.parallel_config, self.device)
-            eplb_models = 0
+        # No-op for litevLLM
+        pass
 
         try:
             with DeviceMemoryProfiler() as m:
@@ -6050,16 +5953,8 @@ class GPUModelRunner(
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                kv_transfer_group.register_kv_caches(kv_caches)
-            kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+        # No-op for litevLLM
+        pass
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -6131,8 +6026,7 @@ class GPUModelRunner(
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-        if has_ec_transfer() and get_ec_transfer().is_producer:
-            return {}
+        # Simplified for litevLLM
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)

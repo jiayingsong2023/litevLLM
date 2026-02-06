@@ -124,9 +124,9 @@ def test_multimodal_kwargs():
     )
     mm = MultiModalKwargsItems(
         {
-            "audio": [MultiModalKwargsItem({"a0": e1})],
+            "image": [MultiModalKwargsItem({"a0": e1})],
             "video": [MultiModalKwargsItem({"v0": e2})],
-            "image": [MultiModalKwargsItem({"i0": e3, "i1": e4})],
+            "extra_image": [MultiModalKwargsItem({"i0": e3, "i1": e4})],
         }
     )
 
@@ -151,8 +151,13 @@ def test_multimodal_kwargs():
     assert len(decoded) == 3
     images = decoded["image"]
     assert len(images) == 1
-    assert len(images[0].items()) == 2
-    assert list(images[0].keys()) == ["i0", "i1"]
+    assert len(images[0].items()) == 1
+    assert list(images[0].keys()) == ["a0"]
+
+    extra_images = decoded["extra_image"]
+    assert len(extra_images) == 1
+    assert len(extra_images[0].items()) == 2
+    assert list(extra_images[0].keys()) == ["i0", "i1"]
 
     # check the tensor contents and layout in the main dict
     mm_data = mm.get_data()

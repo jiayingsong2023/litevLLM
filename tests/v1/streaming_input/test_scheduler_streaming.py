@@ -175,7 +175,7 @@ class TestStreamingScheduler(unittest.TestCase):
 
         mm_feature = MultiModalFeatureSpec(
             data=MultiModalKwargsItem.dummy(),
-            modality="audio",
+            modality="image",
             identifier="",
             mm_position=PlaceholderRange(offset=1, length=1),
         )
@@ -188,7 +188,7 @@ class TestStreamingScheduler(unittest.TestCase):
 
         mm_feature = MultiModalFeatureSpec(
             data=MultiModalKwargsItem.dummy(),
-            modality="audio",
+            modality="image",
             identifier="",
             mm_position=PlaceholderRange(offset=2, length=1),
         )

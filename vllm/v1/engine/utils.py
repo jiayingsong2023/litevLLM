@@ -19,7 +19,6 @@ from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -268,7 +267,7 @@ class CoreEngineActorManager:
         self.local_engine_actors: list[ray.ActorHandle] = []
         self.remote_engine_actors: list[ray.ActorHandle] = []
 
-        env_vars_list = get_env_vars_to_copy(destination=actor_class.__name__)
+        env_vars_list = []
         self.env_vars_dict = {
             name: os.environ[name] for name in env_vars_list if name in os.environ
         }

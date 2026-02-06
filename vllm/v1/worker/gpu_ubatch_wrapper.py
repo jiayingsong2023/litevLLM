@@ -12,7 +12,11 @@ import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_ep_group
-from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
+try:
+    from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
+except ModuleNotFoundError:
+    def set_graph_pool_id(_pool) -> None:
+        pass
 from vllm.forward_context import (
     DPMetadata,
     create_forward_context,

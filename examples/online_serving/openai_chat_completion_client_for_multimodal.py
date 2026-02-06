@@ -12,12 +12,8 @@ vllm serve llava-hf/llava-1.5-7b-hf
 vllm serve microsoft/Phi-3.5-vision-instruct --runner generate \
     --trust-remote-code --max-model-len 4096 --limit-mm-per-prompt '{"image":2}'
 
-(audio inference with Ultravox)
-vllm serve fixie-ai/ultravox-v0_5-llama-3_2-1b \
-    --max-model-len 4096 --trust-remote-code
-
 run the script with
-python openai_chat_completion_client_for_multimodal.py --chat-type audio
+python openai_chat_completion_client_for_multimodal.py --chat-type single-image
 """
 
 import base64
@@ -250,135 +246,11 @@ def run_video(model: str, max_completion_tokens: int) -> None:
     print("Chat completion output from base64 encoded video:\n", result)
 
 
-# Audio input inference
-def run_audio(model: str, max_completion_tokens: int) -> None:
-    from vllm.assets.audio import AudioAsset
-
-    audio_url = AudioAsset("winning_call").url
-    audio_base64 = encode_base64_content_from_url(audio_url)
-
-    # OpenAI-compatible schema (`input_audio`)
-    chat_completion_from_base64 = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What's in this audio?"},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            # Any format supported by librosa is supported
-                            "data": audio_base64,
-                            "format": "wav",
-                        },
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=max_completion_tokens,
-    )
-
-    result = chat_completion_from_base64.choices[0].message.content
-    print("Chat completion output from input audio:\n", result)
-
-    # HTTP URL
-    chat_completion_from_url = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What's in this audio?"},
-                    {
-                        "type": "audio_url",
-                        "audio_url": {
-                            # Any format supported by librosa is supported
-                            "url": audio_url
-                        },
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=max_completion_tokens,
-    )
-
-    result = chat_completion_from_url.choices[0].message.content
-    print("Chat completion output from audio url:\n", result)
-
-    # base64 URL
-    chat_completion_from_base64 = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What's in this audio?"},
-                    {
-                        "type": "audio_url",
-                        "audio_url": {
-                            # Any format supported by librosa is supported
-                            "url": f"data:audio/ogg;base64,{audio_base64}"
-                        },
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=max_completion_tokens,
-    )
-
-    result = chat_completion_from_base64.choices[0].message.content
-    print("Chat completion output from base64 encoded audio:\n", result)
-
-
-def run_multi_audio(model: str, max_completion_tokens: int) -> None:
-    from vllm.assets.audio import AudioAsset
-
-    # Two different audios to showcase batched inference.
-    audio_url = AudioAsset("winning_call").url
-    audio_base64 = encode_base64_content_from_url(audio_url)
-    audio_url2 = AudioAsset("azacinto_foscolo").url
-    audio_base64_2 = encode_base64_content_from_url(audio_url2)
-
-    # OpenAI-compatible schema (`input_audio`)
-    chat_completion_from_base64 = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Are these two audios the same?"},
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": audio_base64,
-                            "format": "wav",
-                        },
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": audio_base64_2,
-                            "format": "wav",
-                        },
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=max_completion_tokens,
-    )
-
-    result = chat_completion_from_base64.choices[0].message.content
-    print("Chat completion output from input audio:\n", result)
-
-
 example_function_map = {
     "text-only": run_text_only,
     "single-image": run_single_image,
     "multi-image": run_multi_image,
-    "multi-audio": run_multi_audio,
     "video": run_video,
-    "audio": run_audio,
 }
 
 

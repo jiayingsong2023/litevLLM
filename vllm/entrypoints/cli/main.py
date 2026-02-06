@@ -18,13 +18,11 @@ def main():
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.openai
     import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     CMD_MODULES = [
         vllm.entrypoints.cli.openai,
-        vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.benchmark.main,
         vllm.entrypoints.cli.collect_env,
         vllm.entrypoints.cli.run_batch,

@@ -13,12 +13,28 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.distributed.kv_transfer import (
-    ensure_kv_transfer_shutdown,
-    get_kv_transfer_group,
-    has_kv_transfer_group,
-)
-from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+try:
+    from vllm.distributed.kv_transfer import (
+        ensure_kv_transfer_shutdown,
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+except ModuleNotFoundError:
+    def ensure_kv_transfer_shutdown() -> None:
+        pass
+
+    def get_kv_transfer_group() -> None:
+        return None
+
+    def has_kv_transfer_group() -> bool:
+        return False
+
+
+try:
+    from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+except ModuleNotFoundError:
+    class KVConnectorBase:  # type: ignore[no-redef]
+        pass
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend

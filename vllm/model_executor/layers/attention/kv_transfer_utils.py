@@ -4,11 +4,21 @@ import inspect
 from collections.abc import Callable
 from functools import wraps
 
-from vllm.distributed.kv_transfer import (
-    get_kv_transfer_group,
-    has_kv_transfer_group,
-    is_v1_kv_transfer_group,
-)
+try:
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+        is_v1_kv_transfer_group,
+    )
+except ModuleNotFoundError:
+    def get_kv_transfer_group():  # type: ignore[return-type]
+        return None
+
+    def has_kv_transfer_group() -> bool:
+        return False
+
+    def is_v1_kv_transfer_group() -> bool:
+        return False
 
 
 def maybe_transfer_kv_layer(func: Callable) -> Callable:

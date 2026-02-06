@@ -54,7 +54,6 @@ from .interfaces import (
     supports_multimodal_encoder_tp_data,
     supports_multimodal_raw_input_only,
     supports_pp,
-    supports_transcription,
 )
 from .interfaces_base import (
     get_attn_type,
@@ -282,14 +281,6 @@ _CROSS_ENCODER_MODELS = {
 _MULTIMODAL_MODELS = {
     # [Decoder-only]
     "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
-    "AudioFlamingo3ForConditionalGeneration": (
-        "audioflamingo3",
-        "AudioFlamingo3ForConditionalGeneration",
-    ),
-    "MusicFlamingoForConditionalGeneration": (
-        "musicflamingo",
-        "MusicFlamingoForConditionalGeneration",
-    ),
     "AyaVisionForConditionalGeneration": (
         "aya_vision",
         "AyaVisionForConditionalGeneration",
@@ -316,25 +307,12 @@ _MULTIMODAL_MODELS = {
         "ernie45_vl",
         "Ernie4_5_VLMoeForConditionalGeneration",
     ),
-    "FunAudioChatForConditionalGeneration": (
-        "funaudiochat",
-        "FunAudioChatForConditionalGeneration",
-    ),
     "FuyuForCausalLM": ("fuyu", "FuyuForCausalLM"),
     "Gemma3ForConditionalGeneration": ("gemma3_mm", "Gemma3ForConditionalGeneration"),  # noqa: E501
-    "Gemma3nForConditionalGeneration": (
-        "gemma3n_mm",
-        "Gemma3nForConditionalGeneration",
-    ),
-    "GlmAsrForConditionalGeneration": ("glmasr", "GlmAsrForConditionalGeneration"),
     "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
     "Glm4vMoeForConditionalGeneration": ("glm4_1v", "Glm4vMoeForConditionalGeneration"),
     "GlmOcrForConditionalGeneration": ("glm_ocr", "GlmOcrForConditionalGeneration"),  # noqa: E501
-    "GraniteSpeechForConditionalGeneration": (
-        "granite_speech",
-        "GraniteSpeechForConditionalGeneration",
-    ),
     "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
     "HunYuanVLForConditionalGeneration": (
         "hunyuan_vision",
@@ -391,12 +369,10 @@ _MULTIMODAL_MODELS = {
         "LlavaOnevisionForConditionalGeneration",
     ),
     "MantisForConditionalGeneration": ("llava", "MantisForConditionalGeneration"),  # noqa: E501
-    "MiDashengLMModel": ("midashenglm", "MiDashengLMModel"),
     "MiniMaxVL01ForConditionalGeneration": (
         "minimax_vl_01",
         "MiniMaxVL01ForConditionalGeneration",
     ),
-    "MiniCPMO": ("minicpmo", "MiniCPMO"),
     "MiniCPMV": ("minicpmv", "MiniCPMV"),
     "Mistral3ForConditionalGeneration": (
         "mistral3",
@@ -420,33 +396,12 @@ _MULTIMODAL_MODELS = {
         "PaliGemmaForConditionalGeneration",
     ),
     "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
-    "Phi4MMForCausalLM": ("phi4mm", "Phi4MMForCausalLM"),
     "PixtralForConditionalGeneration": ("pixtral", "PixtralForConditionalGeneration"),  # noqa: E501
     "QwenVLForConditionalGeneration": ("qwen_vl", "QwenVLForConditionalGeneration"),  # noqa: E501
     "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
     "Qwen2_5_VLForConditionalGeneration": (
         "qwen2_5_vl",
         "Qwen2_5_VLForConditionalGeneration",
-    ),
-    "Qwen2AudioForConditionalGeneration": (
-        "qwen2_audio",
-        "Qwen2AudioForConditionalGeneration",
-    ),
-    "Qwen2_5OmniModel": (
-        "qwen2_5_omni_thinker",
-        "Qwen2_5OmniThinkerForConditionalGeneration",
-    ),
-    "Qwen2_5OmniForConditionalGeneration": (
-        "qwen2_5_omni_thinker",
-        "Qwen2_5OmniThinkerForConditionalGeneration",
-    ),
-    "Qwen3OmniMoeForConditionalGeneration": (
-        "qwen3_omni_moe_thinker",
-        "Qwen3OmniMoeThinkerForConditionalGeneration",
-    ),
-    "Qwen3ASRForConditionalGeneration": (
-        "qwen3_asr",
-        "Qwen3ASRForConditionalGeneration",
     ),
     "Qwen3VLForConditionalGeneration": ("qwen3_vl", "Qwen3VLForConditionalGeneration"),  # noqa: E501
     "Qwen3VLMoeForConditionalGeneration": (
@@ -460,15 +415,11 @@ _MULTIMODAL_MODELS = {
         "qwen2_vl",
         "Tarsier2ForConditionalGeneration",
     ),
-    "UltravoxModel": ("ultravox", "UltravoxModel"),
-    "VoxtralForConditionalGeneration": ("voxtral", "VoxtralForConditionalGeneration"),  # noqa: E501
-    "VoxtralRealtimeGeneration": ("voxtral_realtime", "VoxtralRealtimeGeneration"),  # noqa: E501
     # [Encoder-decoder]
     "NemotronParseForConditionalGeneration": (
         "nemotron_parse",
         "NemotronParseForConditionalGeneration",
     ),
-    "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),  # noqa: E501
 }
 
 _SPECULATIVE_DECODING_MODELS = {
@@ -566,7 +517,7 @@ _PREVIOUSLY_SUPPORTED_MODELS = {
     "Phi3SmallForCausalLM": "0.9.2",
     "Phi4FlashForCausalLM": "0.10.2",
     "Phi4MultimodalForCausalLM": "0.12.0",
-    # encoder-decoder models except whisper
+    # encoder-decoder models
     # have been removed for V0 deprecation.
     "BartModel": "0.10.2",
     "BartForConditionalGeneration": "0.10.2",
@@ -596,8 +547,6 @@ class _ModelInfo:
     is_hybrid: bool
     has_noops: bool
     supports_mamba_prefix_caching: bool
-    supports_transcription: bool
-    supports_transcription_only: bool
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -622,10 +571,6 @@ class _ModelInfo:
             is_attention_free=is_attention_free(model),
             is_hybrid=is_hybrid(model),
             supports_mamba_prefix_caching=supports_mamba_prefix_caching(model),
-            supports_transcription=supports_transcription(model),
-            supports_transcription_only=(
-                supports_transcription(model) and model.supports_transcription_only
-            ),
             has_noops=has_noops(model),
         )
 
@@ -703,7 +648,10 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
                 return None
 
             # file not changed, use cached _ModelInfo properties
-            return _ModelInfo(**mi_dict["modelinfo"])
+            cached = mi_dict["modelinfo"]
+            allowed_keys = set(_ModelInfo.__dataclass_fields__.keys())
+            filtered = {key: value for key, value in cached.items() if key in allowed_keys}
+            return _ModelInfo(**filtered)
         except Exception:
             logger.debug(
                 "Cached model info for class %s.%s error. ",
@@ -1169,22 +1117,6 @@ class _ModelRegistry:
     ) -> bool:
         model_cls, _ = self.inspect_model_cls(architectures, model_config)
         return model_cls.has_noops
-
-    def is_transcription_model(
-        self,
-        architectures: str | list[str],
-        model_config: ModelConfig,
-    ) -> bool:
-        model_cls, _ = self.inspect_model_cls(architectures, model_config)
-        return model_cls.supports_transcription
-
-    def is_transcription_only_model(
-        self,
-        architectures: str | list[str],
-        model_config: ModelConfig,
-    ) -> bool:
-        model_cls, _ = self.inspect_model_cls(architectures, model_config)
-        return model_cls.supports_transcription_only
 
 
 ModelRegistry = _ModelRegistry(

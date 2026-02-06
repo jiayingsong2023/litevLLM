@@ -24,9 +24,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm.envs as envs
-from vllm.distributed.kv_transfer.kv_connector.utils import (
-    get_kv_connector_cache_layout,
-)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
@@ -67,7 +64,11 @@ def get_kv_cache_layout():
     cache_layout = envs.VLLM_KV_CACHE_LAYOUT
     # When neither the user nor the override specified a layout, get default
     if cache_layout is None:
-        cache_layout = get_kv_connector_cache_layout()
+        cache_layout = "NHD"
+        logger.info_once(
+            "KV cache layout defaulted to %s (single process mode).",
+            cache_layout,
+        )
     else:
         assert is_valid_kv_cache_layout(cache_layout)
         logger.info_once(

@@ -82,7 +82,6 @@ from vllm.config.vllm import OptimizationLevel
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
-from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
 from vllm.transformers_utils.config import (
     is_interleaved,
     maybe_override_with_speculators,
@@ -837,7 +836,7 @@ class EngineArgs:
             "-dpb",
             type=str,
             default="mp",
-            help='Backend for data parallel, either "mp" or "ray".',
+            help='Backend for data parallel, only "mp" is supported.',
         )
         parallel_group.add_argument(
             "--data-parallel-hybrid-lb",
@@ -884,9 +883,6 @@ class EngineArgs:
         parallel_group.add_argument(
             "--max-parallel-loading-workers",
             **parallel_kwargs["max_parallel_loading_workers"],
-        )
-        parallel_group.add_argument(
-            "--ray-workers-use-nsight", **parallel_kwargs["ray_workers_use_nsight"]
         )
         parallel_group.add_argument(
             "--disable-custom-all-reduce",
@@ -1417,31 +1413,7 @@ class EngineArgs:
         )
 
         ray_runtime_env = None
-        if is_ray_initialized():
-            # Ray Serve LLM calls `create_engine_config` in the context
-            # of a Ray task, therefore we check is_ray_initialized()
-            # as opposed to is_in_ray_actor().
-            import ray
-
-            ray_runtime_env = ray.get_runtime_context().runtime_env
-            # Avoid logging sensitive environment variables
-            sanitized_env = ray_runtime_env.to_dict() if ray_runtime_env else {}
-            if "env_vars" in sanitized_env:
-                sanitized_env["env_vars"] = {
-                    k: "***" for k in sanitized_env["env_vars"]
-                }
-            logger.info("Using ray runtime env (env vars redacted): %s", sanitized_env)
-
-        # Get the current placement group if Ray is initialized and
-        # we are in a Ray actor. If so, then the placement group will be
-        # passed to spawned processes.
         placement_group = None
-        if is_in_ray_actor():
-            import ray
-
-            # This call initializes Ray automatically if it is not initialized,
-            # but we should not do this here.
-            placement_group = ray.util.get_current_placement_group()
 
         assert not headless or not self.data_parallel_hybrid_lb, (
             "data_parallel_hybrid_lb is not applicable in headless mode"
@@ -1535,33 +1507,19 @@ class EngineArgs:
                 "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
             )
 
-            if self.data_parallel_backend == "ray" and (
-                envs.VLLM_RAY_DP_PACK_STRATEGY == "span"
-            ):
-                # Data parallel size defaults to 1 if DP ranks are spanning
-                # multiple nodes
-                data_parallel_size_local = 1
-            else:
-                # Otherwise local DP size defaults to global DP size if not set
-                data_parallel_size_local = self.data_parallel_size
+            # Local DP size defaults to global DP size if not set.
+            data_parallel_size_local = self.data_parallel_size
 
         # DP address, used in multi-node case for torch distributed group
         # and ZMQ sockets.
         if self.data_parallel_address is None:
-            if self.data_parallel_backend == "ray":
-                host_ip = get_ip()
-                logger.info(
-                    "Using host IP %s as ray-based data parallel address", host_ip
-                )
-                data_parallel_address = host_ip
-            else:
-                assert self.data_parallel_backend == "mp", (
-                    "data_parallel_backend can only be ray or mp, got %s",
-                    self.data_parallel_backend,
-                )
-                data_parallel_address = (
-                    self.master_addr or ParallelConfig.data_parallel_master_ip
-                )
+            assert self.data_parallel_backend == "mp", (
+                "data_parallel_backend can only be mp, got %s",
+                self.data_parallel_backend,
+            )
+            data_parallel_address = (
+                self.master_addr or ParallelConfig.data_parallel_master_ip
+            )
         else:
             data_parallel_address = self.data_parallel_address
 
@@ -1623,6 +1581,13 @@ class EngineArgs:
             target_model_config=model_config,
             target_parallel_config=parallel_config,
         )
+
+        if not envs.VLLM_ENABLE_V1_MULTIPROCESSING and self.scheduling_policy == "fcfs":
+            logger.info(
+                "Simplification: Forcing scheduler policy to priority for "
+                "single-process serving."
+            )
+            self.scheduling_policy = "priority"
 
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
@@ -1783,15 +1748,9 @@ class EngineArgs:
             )
             if not supports_pp and self.distributed_executor_backend not in (
                 ParallelConfig.distributed_executor_backend,
-                "ray",
-                "mp",
-                "external_launcher",
+                "uni",
             ):
-                name = (
-                    "Pipeline Parallelism without Ray distributed "
-                    "executor or multiprocessing executor or external "
-                    "launcher"
-                )
+                name = "Pipeline Parallelism is not supported in single-process mode"
                 _raise_unsupported_error(feature_name=name)
 
     @classmethod

@@ -38,8 +38,6 @@ async def get_server_load_metrics(request: Request):
     # - /v1/messages
     # - /v1/chat/completions
     # - /v1/completions
-    # - /v1/audio/transcriptions
-    # - /v1/audio/translations
     # - /v1/embeddings
     # - /pooling
     # - /classify

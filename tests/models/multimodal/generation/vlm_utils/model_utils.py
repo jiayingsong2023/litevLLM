@@ -251,17 +251,6 @@ def minimax_vl_01_hf_output(hf_output: RunnerOutput, model: str) -> RunnerOutput
     return output_ids, output_str, out_logprobs
 
 
-def ultravox_trunc_hf_output(hf_output: RunnerOutput, model: str) -> RunnerOutput:
-    output_ids, output_str, out_logprobs = hf_output
-
-    tokenizer = AutoTokenizer.from_pretrained(model)
-    eos_token_id = tokenizer.eos_token_id
-    eos_token = tokenizer.decode(eos_token_id)
-    if output_str.endswith(eos_token):
-        output_str = output_str.split(eos_token)[0]
-    return output_ids, output_str, out_logprobs
-
-
 ####### Functions for converting image assets to embeddings
 def get_llava_embeddings(image_assets: ImageTestAssets):
     return [asset.image_embeds for asset in image_assets]
@@ -993,17 +982,6 @@ def minicpmv_25_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
-def minicpmo_26_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
-    orig_generate = hf_model.model.generate
-
-    def _generate(self, *args, image_sizes=None, **kwargs):
-        return orig_generate(*args, decode_text=False, **kwargs)
-
-    hf_model.model.generate = types.MethodType(_generate, hf_model.model)
-
-    return hf_model
-
-
 def minicpmv_26_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     orig_generate = hf_model.model.generate
 
@@ -1146,14 +1124,6 @@ def ovis2_5_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
         return BatchFeature(data=inputs, tensor_type="pt")
 
     hf_model.processor = processor
-    return hf_model
-
-
-def qwen2_5_omni_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
-    """Patches and returns an instance of the HfRunner for Qwen2.5-Omni."""
-    thinker = hf_model.model.thinker
-    thinker.get_output_embeddings = lambda: thinker.lm_head
-    hf_model.model = thinker
     return hf_model
 
 

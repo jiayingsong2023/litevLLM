@@ -78,12 +78,8 @@ class EngineCoreClient(ABC):
         executor_class: type[Executor],
         log_stats: bool,
     ) -> "EngineCoreClient":
-        # TODO: support this for debugging purposes.
         if asyncio_mode and not multiprocess_mode:
-            raise NotImplementedError(
-                "Running EngineCore in asyncio without multiprocessing "
-                "is not currently supported."
-            )
+            return InprocClient(vllm_config, executor_class, log_stats)
 
         if multiprocess_mode and asyncio_mode:
             return EngineCoreClient.make_async_mp_client(
@@ -273,6 +269,17 @@ class InprocClient(EngineCoreClient):
 
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
+        # Single-process engine manages a single rank (rank 0).
+        self.engine_ranks_managed = [0]
+
+        class DummyResources:
+            def __init__(self):
+                self.engine_dead = False
+
+        self.resources = DummyResources()
+
+    async def _run_sync(self, fn, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
         outputs, model_executed = self.engine_core.step_fn()
@@ -349,6 +356,72 @@ class InprocClient(EngineCoreClient):
 
     def dp_engines_running(self) -> bool:
         return False
+
+    async def get_output_async(self) -> EngineCoreOutputs:
+        return await self._run_sync(self.get_output)
+
+    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
+        return await self._run_sync(self.get_supported_tasks)
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        await self._run_sync(self.add_request, request)
+
+    async def profile_async(self, is_start: bool = True) -> None:
+        await self._run_sync(self.profile, is_start)
+
+    async def reset_mm_cache_async(self) -> None:
+        await self._run_sync(self.reset_mm_cache)
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        return await self._run_sync(
+            self.reset_prefix_cache, reset_running_requests, reset_connector
+        )
+
+    async def reset_encoder_cache_async(self) -> None:
+        await self._run_sync(self.reset_encoder_cache)
+
+    async def sleep_async(self, level: int = 1) -> None:
+        await self._run_sync(self.sleep, level)
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        await self._run_sync(self.wake_up, tags)
+
+    async def is_sleeping_async(self) -> bool:
+        return await self._run_sync(self.is_sleeping)
+
+    async def execute_dummy_batch_async(self) -> None:
+        await self._run_sync(self.execute_dummy_batch)
+
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        await self._run_sync(self.abort_requests, request_ids)
+
+    async def add_lora_async(self, lora_request: LoRARequest) -> bool:
+        return await self._run_sync(self.add_lora, lora_request)
+
+    async def remove_lora_async(self, lora_id: int) -> bool:
+        return await self._run_sync(self.remove_lora, lora_id)
+
+    async def list_loras_async(self) -> set[int]:
+        return await self._run_sync(self.list_loras)
+
+    async def pin_lora_async(self, lora_id: int) -> bool:
+        return await self._run_sync(self.pin_lora, lora_id)
+
+    async def save_sharded_state_async(
+        self, path: str, pattern: str | None = None, max_size: int | None = None
+    ) -> None:
+        await self._run_sync(self.save_sharded_state, path, pattern, max_size)
+
+    async def collective_rpc_async(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        return await self._run_sync(self.collective_rpc, method, timeout, args, kwargs)
 
 
 @dataclass

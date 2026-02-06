@@ -457,14 +457,10 @@ def apply_repetition_penalties(
         output_mask: A boolean tensor indicating which tokens appear in the output.
         repetition_penalties: The repetition penalties of shape (num_seqs, ).
     """
-    if logits.is_cuda and logits.is_contiguous():
-        apply_repetition_penalties_cuda(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
-    else:
-        apply_repetition_penalties_torch(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
+    # litevLLM - Always use torch fallback for now
+    apply_repetition_penalties_torch(
+        logits, prompt_mask, output_mask, repetition_penalties
+    )
 
 
 # fused quant layer norm ops

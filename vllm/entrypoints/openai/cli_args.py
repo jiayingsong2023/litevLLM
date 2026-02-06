@@ -153,7 +153,7 @@ class FrontendArgs:
     """When `--max-logprobs` is specified, represents single tokens as
     strings of the form 'token_id:{token_id}' so that tokens that are not
     JSON-encodable can be identified."""
-    disable_frontend_multiprocessing: bool = False
+    disable_frontend_multiprocessing: bool = True
     """If specified, will run the OpenAI frontend server in the same process as
     the model serving engine."""
     enable_request_id_headers: bool = False

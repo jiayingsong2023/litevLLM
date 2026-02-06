@@ -289,53 +289,9 @@ Instead of NumPy arrays, you can also pass `'torch.Tensor'` instances, as shown 
 
 Full example: [examples/offline_inference/vision_language.py](../../examples/offline_inference/vision_language.py)
 
-### Audio Inputs
-
-You can pass a tuple `(array, sampling_rate)` to the `'audio'` field of the multi-modal dictionary.
-
-Full example: [examples/offline_inference/audio_language.py](../../examples/offline_inference/audio_language.py)
-
-#### Automatic Audio Channel Normalization
-
-vLLM automatically normalizes audio channels for models that require specific audio formats. When loading audio with libraries like `torchaudio`, stereo files return shape `[channels, time]`, but many audio models (particularly Whisper-based models) expect mono audio with shape `[time]`.
-
-**Supported models with automatic mono conversion:**
-
-- **Whisper** and all Whisper-based models
-- **Qwen2-Audio**
-- **Qwen2.5-Omni** / **Qwen3-Omni** (inherits from Qwen2.5-Omni)
-- **Ultravox**
-
-For these models, vLLM automatically:
-
-1. Detects if the model requires mono audio via the feature extractor
-2. Converts multi-channel audio to mono using channel averaging
-3. Handles both `(channels, time)` format (torchaudio) and `(time, channels)` format (soundfile)
-
-**Example with stereo audio:**
-
-```python
-import torchaudio
-from vllm import LLM
-
-# Load stereo audio file - returns (channels, time) shape
-audio, sr = torchaudio.load("stereo_audio.wav")
-print(f"Original shape: {audio.shape}")  # e.g., torch.Size([2, 16000])
-
-# vLLM automatically converts to mono for Whisper-based models
-llm = LLM(model="openai/whisper-large-v3")
-
-outputs = llm.generate({
-    "prompt": "",
-    "multi_modal_data": {"audio": (audio.numpy(), sr)},
-})
-```
-
-No manual conversion is needed - vLLM handles the channel normalization automatically based on the model's requirements.
-
 ### Embedding Inputs
 
-To input pre-computed embeddings belonging to a data type (i.e. image, video, or audio) directly to the language model,
+To input pre-computed embeddings belonging to a data type (i.e. image or video) directly to the language model,
 pass a tensor of shape `(..., hidden_size of LM)` to the corresponding field of the multi-modal dictionary.
 The exact shape depends on the model being used.
 
@@ -406,36 +362,6 @@ You must enable this feature via `enable_mm_embeds=True`.
     ```
 
 For Qwen3-VL, the `image_embeds` should contain both the base image embedding and deepstack features.
-
-#### Audio Embedding Inputs
-
-You can pass pre-computed audio embeddings similar to image embeddings:
-
-??? code
-
-    ```python
-    from vllm import LLM
-    import torch
-
-    # Enable audio embeddings support
-    llm = LLM(model="fixie-ai/ultravox-v0_5-llama-3_2-1b", enable_mm_embeds=True)
-
-    # Refer to the HuggingFace repo for the correct format to use
-    prompt = "USER: <audio>\nWhat is in this audio?\nASSISTANT:"
-
-    # Load pre-computed audio embeddings, usually with shape:
-    # (num_audios, audio_feature_size, hidden_size of LM)
-    audio_embeds = torch.load(...)
-
-    outputs = llm.generate({
-        "prompt": prompt,
-        "multi_modal_data": {"audio": audio_embeds},
-    })
-
-    for o in outputs:
-        generated_text = o.outputs[0].text
-        print(generated_text)
-    ```
 
 ### Cached Inputs
 
@@ -749,119 +675,9 @@ vllm serve llava-hf/llava-1.5-7b-hf \
   --media-io-kwargs '{"image": {"rgba_background_color": [128, 128, 128]}}'
 ```
 
-### Audio Inputs
-
-Audio input is supported according to [OpenAI Audio API](https://platform.openai.com/docs/guides/audio?audio-generation-quickstart-example=audio-in).
-Here is a simple example using Ultravox-v0.5-1B.
-
-First, launch the OpenAI-compatible server:
-
-```bash
-vllm serve fixie-ai/ultravox-v0_5-llama-3_2-1b
-```
-
-Then, you can use the OpenAI client as follows:
-
-??? code
-
-    ```python
-    import base64
-    import requests
-    from openai import OpenAI
-    from vllm.assets.audio import AudioAsset
-
-    def encode_base64_content_from_url(content_url: str) -> str:
-        """Encode a content retrieved from a remote url to base64 format."""
-
-        with requests.get(content_url) as response:
-            response.raise_for_status()
-            result = base64.b64encode(response.content).decode('utf-8')
-
-        return result
-
-    openai_api_key = "EMPTY"
-    openai_api_base = "http://localhost:8000/v1"
-
-    client = OpenAI(
-        api_key=openai_api_key,
-        base_url=openai_api_base,
-    )
-
-    # Any format supported by librosa is supported
-    audio_url = AudioAsset("winning_call").url
-    audio_base64 = encode_base64_content_from_url(audio_url)
-
-    chat_completion_from_base64 = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "What's in this audio?",
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": audio_base64,
-                            "format": "wav",
-                        },
-                        "uuid": audio_url,  # Optional
-                    },
-                ],
-            },
-        ],
-        model=model,
-        max_completion_tokens=64,
-    )
-
-    result = chat_completion_from_base64.choices[0].message.content
-    print("Chat completion output from input audio:", result)
-    ```
-
-Alternatively, you can pass `audio_url`, which is the audio counterpart of `image_url` for image input:
-
-??? code
-
-    ```python
-    chat_completion_from_url = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "What's in this audio?",
-                    },
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": audio_url},
-                        "uuid": audio_url,  # Optional
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=64,
-    )
-
-    result = chat_completion_from_url.choices[0].message.content
-    print("Chat completion output from audio url:", result)
-    ```
-
-Full example: [examples/online_serving/openai_chat_completion_client_for_multimodal.py](../../examples/online_serving/openai_chat_completion_client_for_multimodal.py)
-
-!!! note
-    By default, the timeout for fetching audios through HTTP URL is `10` seconds.
-    You can override this by setting the environment variable:
-
-    ```bash
-    export VLLM_AUDIO_FETCH_TIMEOUT=<timeout>
-    ```
-
 ### Embedding Inputs
 
-To input pre-computed embeddings belonging to a data type (i.e. image, video, or audio) directly to the language model,
+To input pre-computed embeddings belonging to a data type (i.e. image or video) directly to the language model,
 pass a tensor of shape `(..., hidden_size of LM)` for each item to the corresponding field of the multi-modal dictionary.
 
 !!! important
@@ -993,7 +809,7 @@ Just like with offline inference, you can skip sending media if you expect cache
 ??? code
 
     ```python
-        # Image/video/audio URL:
+        # Image/video URL:
         {
             "type": "image_url",
             "image_url": None,
@@ -1005,13 +821,6 @@ Just like with offline inference, you can skip sending media if you expect cache
             "type": "image_embeds",
             "image_embeds": None,
             "uuid": image_uuid,
-        },
-
-        # input_audio:
-        {
-            "type": "input_audio",
-            "input_audio": None,
-            "uuid": audio_uuid,
         },
 
         # PIL Image:

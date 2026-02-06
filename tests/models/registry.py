@@ -654,12 +654,6 @@ _AUTOMATIC_CONVERTED_MODELS = {
 _MULTIMODAL_EXAMPLE_MODELS = {
     # [Decoder-only]
     "AriaForConditionalGeneration": _HfExamplesInfo("rhymes-ai/Aria"),
-    "AudioFlamingo3ForConditionalGeneration": _HfExamplesInfo(
-        "nvidia/audio-flamingo-3-hf", min_transformers_version="5.0.0"
-    ),
-    "MusicFlamingoForConditionalGeneration": _HfExamplesInfo(
-        "nvidia/music-flamingo-2601-hf", min_transformers_version="5.0.0.dev"
-    ),
     "AyaVisionForConditionalGeneration": _HfExamplesInfo("CohereLabs/aya-vision-8b"),
     "BagelForConditionalGeneration": _HfExamplesInfo("ByteDance-Seed/BAGEL-7B-MoT"),
     "BeeForConditionalGeneration": _HfExamplesInfo(
@@ -695,21 +689,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "baidu/ERNIE-4.5-VL-28B-A3B-PT",
         trust_remote_code=True,
     ),
-    "FunAudioChatForConditionalGeneration": _HfExamplesInfo(
-        "funaudiochat", is_available_online=False
-    ),
     "FuyuForCausalLM": _HfExamplesInfo("adept/fuyu-8b"),
     "Gemma3ForConditionalGeneration": _HfExamplesInfo("google/gemma-3-4b-it"),
-    "Gemma3nForConditionalGeneration": _HfExamplesInfo("google/gemma-3n-E2B-it"),
-    "GlmAsrForConditionalGeneration": _HfExamplesInfo(
-        "zai-org/GLM-ASR-Nano-2512",
-        trust_remote_code=True,
-        min_transformers_version="5.0.0",
-    ),
     "GraniteVision": _HfExamplesInfo("ibm-granite/granite-vision-3.3-2b"),
-    "GraniteSpeechForConditionalGeneration": _HfExamplesInfo(
-        "ibm-granite/granite-speech-3.3-2b"
-    ),
     "GLM4VForCausalLM": _HfExamplesInfo(
         "zai-org/glm-4v-9b",
         trust_remote_code=True,
@@ -824,10 +806,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         transformers_version_reason={"hf": "HF model is not compatible."},
         hf_overrides={"architectures": ["MantisForConditionalGeneration"]},
     ),
-    "MiDashengLMModel": _HfExamplesInfo(
-        "mispeech/midashenglm-7b", trust_remote_code=True
-    ),
-    "MiniCPMO": _HfExamplesInfo("openbmb/MiniCPM-o-2_6", trust_remote_code=True),
     "MiniCPMV": _HfExamplesInfo(
         "openbmb/MiniCPM-Llama3-V-2_5",
         extras={
@@ -907,9 +885,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         },  # noqa: E501
         extras={"phi3.5": "microsoft/Phi-3.5-vision-instruct"},
     ),
-    "Phi4MMForCausalLM": _HfExamplesInfo(
-        "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
-    ),
     "PixtralForConditionalGeneration": _HfExamplesInfo(
         "mistralai/Pixtral-12B-2409",
         extras={
@@ -928,16 +903,11 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         },  # noqa: E501
         hf_overrides={"architectures": ["QwenVLForConditionalGeneration"]},
     ),
-    "Qwen2AudioForConditionalGeneration": _HfExamplesInfo(
-        "Qwen/Qwen2-Audio-7B-Instruct"
-    ),
     "Qwen2VLForConditionalGeneration": _HfExamplesInfo("Qwen/Qwen2-VL-2B-Instruct"),
     "Qwen2_5_VLForConditionalGeneration": _HfExamplesInfo(
         "Qwen/Qwen2.5-VL-3B-Instruct",
         max_model_len=4096,
     ),
-    "Qwen2_5OmniModel": _HfExamplesInfo("Qwen/Qwen2.5-Omni-3B"),
-    "Qwen2_5OmniForConditionalGeneration": _HfExamplesInfo("Qwen/Qwen2.5-Omni-7B-AWQ"),
     "Qwen3VLForConditionalGeneration": _HfExamplesInfo(
         "Qwen/Qwen3-VL-4B-Instruct",
         max_model_len=4096,
@@ -947,17 +917,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
         max_model_len=4096,
         min_transformers_version="4.57",
-    ),
-    "Qwen3OmniMoeForConditionalGeneration": _HfExamplesInfo(
-        "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        max_model_len=4096,
-        min_transformers_version="4.57",
-    ),
-    "Qwen3ASRForConditionalGeneration": _HfExamplesInfo(
-        "Qwen/Qwen3-ASR-1.7B",
-        max_model_len=4096,
-        min_transformers_version="4.57",
-        is_available_online=False,
     ),
     "RForConditionalGeneration": _HfExamplesInfo("YannQi/R-4B", trust_remote_code=True),
     "SkyworkR1VChatModel": _HfExamplesInfo(
@@ -972,10 +931,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "StepVLForConditionalGeneration": _HfExamplesInfo(
         "stepfun-ai/Step3-VL-10B", trust_remote_code=True
     ),
-    "UltravoxModel": _HfExamplesInfo(
-        "fixie-ai/ultravox-v0_5-llama-3_2-1b",
-        trust_remote_code=True,
-    ),
     "TarsierForConditionalGeneration": _HfExamplesInfo("omni-research/Tarsier-7b"),
     "Tarsier2ForConditionalGeneration": _HfExamplesInfo(
         "omni-research/Tarsier2-Recap-7b",
@@ -984,23 +939,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
             "model_type": "tarsier2",
         },
     ),
-    "VoxtralForConditionalGeneration": _HfExamplesInfo(
-        "mistralai/Voxtral-Mini-3B-2507",
-        # disable this temporarily until we support HF format
-        is_available_online=False,
-    ),
-    "VoxtralRealtimeGeneration": _HfExamplesInfo(
-        "<place-holder>",
-        # disable this temporarily until we support HF format
-        is_available_online=False,
-    ),
     # [Encoder-decoder]
     "NemotronParseForConditionalGeneration": _HfExamplesInfo(
         "nvidia/NVIDIA-Nemotron-Parse-v1.1", trust_remote_code=True
-    ),
-    "WhisperForConditionalGeneration": _HfExamplesInfo(
-        "openai/whisper-large-v3-turbo",
-        extras={"v3": "openai/whisper-large-v3"},
     ),
     # [Cross-encoder]
     "JinaVLForRanking": _HfExamplesInfo("jinaai/jina-reranker-m0"),

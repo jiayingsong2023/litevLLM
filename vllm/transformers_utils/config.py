@@ -77,7 +77,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     deepseek_vl_v2="DeepseekVLV2Config",
     deepseek_v32="DeepseekV3Config",
     flex_olmo="FlexOlmoConfig",
-    funaudiochat="FunAudioChatConfig",
     hunyuan_vl="HunYuanVLConfig",
     isaac="IsaacConfig",
     kimi_linear="KimiLinearConfig",
@@ -88,16 +87,13 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     jais="JAISConfig",
     mlp_speculator="MLPSpeculatorConfig",
     medusa="MedusaConfig",
-    midashenglm="MiDashengLMConfig",
     eagle="EAGLEConfig",
     speculators="SpeculatorsConfig",
     nemotron="NemotronConfig",
     olmo3="Olmo3Config",
     ovis="OvisConfig",
-    ultravox="UltravoxConfig",
     step3_vl="Step3VLConfig",
     step3_text="Step3TextConfig",
-    qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
     lfm2_moe="Lfm2MoeConfig",
     tarsier2="Tarsier2Config",
@@ -952,11 +948,7 @@ def maybe_register_config_serialize_by_value() -> None:
         if transformers_modules_available:
             cloudpickle.register_pickle_by_value(transformers_modules)
 
-            # ray vendors its own version of cloudpickle
-            from vllm.v1.executor.ray_utils import ray
-
-            if ray:
-                ray.cloudpickle.register_pickle_by_value(transformers_modules)
+            # Ray support removed in single-process mode.
 
     except Exception as e:
         logger.warning(

@@ -57,11 +57,6 @@ from vllm.entrypoints.openai.responses.protocol import (
 from vllm.entrypoints.openai.responses.utils import (
     construct_input_messages,
 )
-from vllm.entrypoints.openai.translations.protocol import (
-    TranscriptionRequest,
-    TranscriptionResponse,
-    TranslationRequest,
-)
 from vllm.entrypoints.pooling.classify.protocol import (
     ClassificationChatRequest,
     ClassificationCompletionRequest,
@@ -87,7 +82,6 @@ from vllm.entrypoints.pooling.score.protocol import (
     ScoreResponse,
     ScoreTextRequest,
 )
-from vllm.entrypoints.serve.disagg.protocol import GenerateRequest, GenerateResponse
 from vllm.entrypoints.serve.tokenize.protocol import (
     DetokenizeRequest,
     TokenizeChatRequest,
@@ -168,15 +162,11 @@ ChatLikeRequest: TypeAlias = (
     | PoolingChatRequest
 )
 
-SpeechToTextRequest: TypeAlias = TranscriptionRequest | TranslationRequest
-
 AnyRequest: TypeAlias = (
     CompletionLikeRequest
     | ChatLikeRequest
-    | SpeechToTextRequest
     | ResponsesRequest
     | IOProcessorRequest
-    | GenerateRequest
 )
 
 AnyResponse: TypeAlias = (
@@ -184,12 +174,10 @@ AnyResponse: TypeAlias = (
     | ChatCompletionResponse
     | EmbeddingResponse
     | EmbeddingBytesResponse
-    | TranscriptionResponse
     | TokenizeResponse
     | PoolingResponse
     | ClassificationResponse
     | ScoreResponse
-    | GenerateResponse
 )
 
 
@@ -816,23 +804,13 @@ class OpenAIServing:
 
     def _get_active_default_mm_loras(self, request: AnyRequest) -> LoRARequest | None:
         """Determine if there are any active default multimodal loras."""
-        # TODO: Currently this is only enabled for chat completions
-        # to be better aligned with only being enabled for .generate
-        # when run offline. It would be nice to support additional
-        # tasks types in the future.
         message_types = self._get_message_types(request)
         default_mm_loras = set()
 
         for lora in self.models.lora_requests.values():
-            # Best effort match for default multimodal lora adapters;
-            # There is probably a better way to do this, but currently
-            # this matches against the set of 'types' in any content lists
-            # up until '_', e.g., to match audio_url -> audio
             if lora.lora_name in message_types:
                 default_mm_loras.add(lora)
 
-        # Currently only support default modality specific loras if
-        # we have exactly one lora matched on the request.
         if len(default_mm_loras) == 1:
             return default_mm_loras.pop()
         return None
@@ -845,8 +823,6 @@ class OpenAIServing:
         if request.model in self.models.lora_requests:
             return self.models.lora_requests[request.model]
 
-        # Currently only support default modality specific loras
-        # if we have exactly one lora matched on the request.
         if supports_default_mm_loras:
             default_mm_lora = self._get_active_default_mm_loras(request)
             if default_mm_lora is not None:

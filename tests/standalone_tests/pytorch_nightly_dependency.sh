@@ -21,10 +21,10 @@ source .venv/bin/activate
 uv pip freeze
 
 echo ">>> Installing nightly torch packages"
-uv pip install --quiet torch torchvision torchaudio --pre --extra-index-url https://download.pytorch.org/whl/nightly/cu128
+uv pip install --quiet torch torchvision --pre --extra-index-url https://download.pytorch.org/whl/nightly/cu128
 
 echo ">>> Capturing torch-related versions before requirements install"
-uv pip freeze | grep -E '^torch|^torchvision|^torchaudio' | sort > before.txt
+uv pip freeze | grep -E '^torch|^torchvision' | sort > before.txt
 echo "Before:"
 cat before.txt
 
@@ -32,7 +32,7 @@ echo ">>> Installing requirements/nightly_torch_test.txt"
 uv pip install --quiet -r requirements/nightly_torch_test.txt
 
 echo ">>> Capturing torch-related versions after requirements install"
-uv pip freeze | grep -E '^torch|^torchvision|^torchaudio' | sort > after.txt
+uv pip freeze | grep -E '^torch|^torchvision' | sort > after.txt
 echo "After:"
 cat after.txt
 

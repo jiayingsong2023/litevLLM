@@ -132,8 +132,8 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
     # Step 1: Create initial request state with one multimodal feature
     mm_feature_1 = MultiModalFeatureSpec(
         data=MultiModalKwargsItem.dummy(),
-        modality="audio",
-        identifier="audio_1",
+        modality="image",
+        identifier="image_1",
         mm_position=PlaceholderRange(offset=2, length=10),
     )
 
@@ -159,8 +159,8 @@ def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_bat
     # (original prompt + intermediate outputs + new prompt with new multimodal feature)
     mm_feature_2 = MultiModalFeatureSpec(
         data=MultiModalKwargsItem.dummy(),
-        modality="audio",
-        identifier="audio_2",
+        modality="image",
+        identifier="image_2",
         mm_position=PlaceholderRange(offset=15, length=5),
     )
 

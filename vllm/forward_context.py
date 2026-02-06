@@ -14,7 +14,6 @@ from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 logger = init_logger(__name__)
@@ -327,25 +326,7 @@ def set_forward_context(
         forward_start_time = time.perf_counter()
 
     dp_metadata: DPMetadata | None = None
-    if vllm_config.parallel_config.data_parallel_size > 1 and (
-        attn_metadata is not None or num_tokens is not None
-    ):
-        # If num_tokens_across_dp hasn't already been initialized, then
-        # initialize it here. Both DP padding and Microbatching will be
-        # disabled.
-        if num_tokens_across_dp is None:
-            assert ubatch_slices is None
-            assert num_tokens is not None
-            _, num_tokens_across_dp, _ = coordinate_batch_across_dp(
-                num_tokens_unpadded=num_tokens,
-                parallel_config=vllm_config.parallel_config,
-                allow_microbatching=False,
-                allow_dp_padding=False,
-            )
-            assert num_tokens_across_dp is not None
-        dp_metadata = DPMetadata.make(
-            vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
-        )
+    # litevLLM - DP coordination bypassed
 
     # Convenience: if cudagraph is used and num_tokens is given, we can just
     # create a batch descriptor here if not given (there's no harm since if it

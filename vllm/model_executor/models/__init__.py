@@ -7,13 +7,11 @@ from .interfaces import (
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
-    SupportsTranscription,
     has_inner_state,
     supports_lora,
     supports_mrope,
     supports_multimodal,
     supports_pp,
-    supports_transcription,
 )
 from .interfaces_base import (
     VllmModelForPooling,
@@ -39,6 +37,4 @@ __all__ = [
     "supports_mrope",
     "SupportsPP",
     "supports_pp",
-    "SupportsTranscription",
-    "supports_transcription",
 ]

@@ -715,11 +715,6 @@ def get_model_params(config):
         topk = config.moe_topk[0]
         intermediate_size = config.moe_intermediate_size[0]
         hidden_size = config.hidden_size
-    elif config.architectures[0] == "Qwen3OmniMoeForConditionalGeneration":
-        E = config.thinker_config.text_config.num_experts
-        topk = config.thinker_config.text_config.num_experts_per_tok
-        intermediate_size = config.thinker_config.text_config.moe_intermediate_size
-        hidden_size = config.thinker_config.text_config.hidden_size
     elif config.architectures[0] == "PixtralForConditionalGeneration":
         # Pixtral can contain different LLM architectures,
         # recurse to get their parameters

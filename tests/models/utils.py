@@ -523,16 +523,6 @@ def dummy_hf_overrides(
             }
         )
 
-    # e.g.: Qwen/Qwen2-Audio-7B-Instruct
-    if hasattr(hf_config, "audio_config"):
-        hf_config.audio_config.update(
-            {
-                "num_layers": 1,
-                "num_hidden_layers": 1,
-                "encoder_layers": 1,
-            }
-        )
-
     return hf_config
 
 

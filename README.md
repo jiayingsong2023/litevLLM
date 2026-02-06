@@ -37,6 +37,10 @@ python -m vllm.entrypoints.cli.main bench latency \
 - **Attention**: 纯 Triton 版 PagedAttention.
 - **MoE**: 纯 Python 调度的混合专家模型。
 - **Platform**: 深度优化 AMD ROCm 7.1 兼容性。
+- **API**: 保留 OpenAI 兼容接口与 streaming 输出。
+
+## 🚫 当前不支持
+- **Audio/Realtime**: 不支持音频转写、翻译或 realtime 相关接口。
 
 ## 📄 文档
 更多细节请参考 [ARCHITECTURE_LITE.md](./docs/ARCHITECTURE_LITE.md)。

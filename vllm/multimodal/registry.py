@@ -351,8 +351,8 @@ class MultiModalRegistry:
         max_tokens = self.get_max_tokens_per_item_by_modality(model_config)
         if not max_tokens:
             # TODO - this function assumes encoder-decoder models are
-            # multimodal. This will need to change when adding support for more
-            # than whisper.
+            # multimodal. This will need to change when adding support for
+            # more encoder-decoder multimodal models.
             return 0
         assert len(max_tokens) == 1, (
             "Encoder-decoder models are expected "

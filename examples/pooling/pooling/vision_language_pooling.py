@@ -340,7 +340,7 @@ def run_encode(model: str, modality: QueryModality, seed: int):
     req_data = model_example_map[model](query)
 
     # Disable other modalities to save memory
-    default_limits = {"image": 0, "video": 0, "audio": 0}
+    default_limits = {"image": 0, "video": 0}
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}
     )

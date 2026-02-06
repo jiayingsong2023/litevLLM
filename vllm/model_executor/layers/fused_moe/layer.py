@@ -21,7 +21,22 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
+try:
+    from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
+except ModuleNotFoundError:
+    class EplbLayerState:  # type: ignore[no-redef]
+        """Stub EPLB layer state for single-process mode."""
+
+        pass
+
+    class EplbState:  # type: ignore[no-redef]
+        """Stub EPLB state for single-process mode."""
+
+        @staticmethod
+        def build_initial_global_physical_to_logical_map(
+            num_experts: int, num_redundant_experts: int = 0
+        ) -> list[int]:
+            return list(range(num_experts + num_redundant_experts))
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,

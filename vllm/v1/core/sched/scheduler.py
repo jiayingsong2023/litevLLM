@@ -12,20 +12,24 @@ import numpy as np
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
-from vllm.distributed.ec_transfer.ec_connector.base import (
-    ECConnectorMetadata,
-    ECConnectorRole,
-)
-from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.v1 import (
-    KVConnectorBase_V1,
-    KVConnectorRole,
-    SupportsHMA,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+# litevLLM - Distributed stubs
+class ECConnectorMetadata: pass
+class ECConnectorRole: pass
+class ECConnectorFactory:
+    @staticmethod
+    def create_connector(*args, **kwargs): return None
+class EventPublisherFactory:
+    @staticmethod
+    def create(*args, **kwargs): return None
+class KVEventBatch: pass
+class KVConnectorFactory:
+    @staticmethod
+    def create_connector(*args, **kwargs): return None
+class KVConnectorBase_V1: pass
+class KVConnectorRole: pass
+class SupportsHMA: pass
+class KVConnectorMetadata: pass
+class KVConnectorStats: pass
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,

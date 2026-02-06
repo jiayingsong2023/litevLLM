@@ -25,16 +25,6 @@ def random_video(
     return rng.randint(0, 255, size=(num_frames, w, h, 3), dtype=np.uint8)
 
 
-def random_audio(
-    rng: np.random.RandomState,
-    min_len: int,
-    max_len: int,
-    sr: int,
-):
-    audio_len = rng.randint(min_len, max_len)
-    return rng.rand(audio_len), sr
-
-
 def create_video_from_image(
     image_path: str,
     video_path: str,

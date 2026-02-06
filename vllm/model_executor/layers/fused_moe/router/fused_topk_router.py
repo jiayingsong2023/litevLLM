@@ -6,7 +6,13 @@ import torch
 
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.distributed.eplb.eplb_state import EplbLayerState
+try:
+    from vllm.distributed.eplb.eplb_state import EplbLayerState
+except ModuleNotFoundError:
+    class EplbLayerState:  # type: ignore[no-redef]
+        """Stub EPLB layer state for single-process mode."""
+
+        pass
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 

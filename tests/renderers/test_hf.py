@@ -299,16 +299,12 @@ def test_resolve_chat_template_kwargs(sample_json_schema, model, expected_kwargs
     assert "unknown_param" not in resolved_mock
 
 
-# NOTE: Qwen2-Audio default chat template is specially defined inside
-# processor class instead of using `tokenizer_config.json`
 @pytest.mark.parametrize(
     ("model", "expected_format"),
     [
         ("microsoft/Phi-3.5-vision-instruct", "string"),
         ("Qwen/Qwen2-VL-2B-Instruct", "openai"),
         ("Qwen/Qwen2.5-VL-3B-Instruct", "openai"),
-        ("fixie-ai/ultravox-v0_5-llama-3_2-1b", "string"),
-        ("Qwen/Qwen2-Audio-7B-Instruct", "openai"),
         ("meta-llama/Llama-Guard-3-1B", "openai"),
     ],
 )

@@ -1143,7 +1143,6 @@ def run_mantis(questions: list[str], modality: str) -> ModelRequestData:
 # MiniCPM-V
 def run_minicpmv_base(questions: list[str], modality: str, model_name):
     assert modality in ["image", "video"]
-    # If you want to use `MiniCPM-o-2_6` with audio inputs, check `audio_language.py` # noqa
 
     # 2.0
     # The official repo doesn't work yet, so we need to use a fork for now
@@ -1161,7 +1160,7 @@ def run_minicpmv_base(questions: list[str], modality: str, model_name):
     # 2.0: image
     # 2.5: image
     # 2.6: image, video
-    # o2.6: image, video, audio
+    # o2.6: image, video
     # model_name = "openbmb/MiniCPM-o-2_6"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     engine_args = EngineArgs(
@@ -1206,10 +1205,6 @@ def run_minicpmv_base(questions: list[str], modality: str, model_name):
         prompts=prompts,
         stop_token_ids=stop_token_ids,
     )
-
-
-def run_minicpmo(questions: list[str], modality: str) -> ModelRequestData:
-    return run_minicpmv_base(questions, modality, "openbmb/MiniCPM-o-2_6")
 
 
 def run_minicpmv(questions: list[str], modality: str) -> ModelRequestData:
@@ -1579,40 +1574,6 @@ def run_phi3v(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# Phi-4-multimodal-instruct
-def run_phi4mm(questions: list[str], modality: str) -> ModelRequestData:
-    """
-    Phi-4-multimodal-instruct supports both image and audio inputs. Here, we
-    show how to process image inputs.
-    """
-    assert modality == "image"
-    model_path = snapshot_download("microsoft/Phi-4-multimodal-instruct")
-    # Since the vision-lora and speech-lora co-exist with the base model,
-    # we have to manually specify the path of the lora weights.
-    vision_lora_path = os.path.join(model_path, "vision-lora")
-    prompts = [
-        f"<|user|><|image_1|>{question}<|end|><|assistant|>" for question in questions
-    ]
-    engine_args = EngineArgs(
-        model=model_path,
-        trust_remote_code=True,
-        max_model_len=5120,
-        max_num_seqs=2,
-        max_num_batched_tokens=12800,
-        enable_lora=True,
-        max_lora_rank=320,
-        # Note - mm_processor_kwargs can also be passed to generate/chat calls
-        mm_processor_kwargs={"dynamic_hd": 16},
-        limit_mm_per_prompt={modality: 1},
-    )
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-        lora_requests=[LoRARequest("vision", 1, vision_lora_path)],
-    )
-
-
 # Pixtral HF-format
 def run_pixtral_hf(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -1724,48 +1685,6 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
         for question in questions
     ]
 
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
-
-
-# Qwen2.5-Omni
-def run_qwen2_5_omni(questions: list[str], modality: str):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
-
-    engine_args = EngineArgs(
-        model=model_name,
-        max_model_len=4096,
-        max_num_seqs=5,
-        mm_processor_kwargs={
-            "min_pixels": 28 * 28,
-            "max_pixels": 1280 * 28 * 28,
-            "fps": 1,
-        },
-        limit_mm_per_prompt={modality: 1},
-    )
-
-    if modality == "image":
-        placeholder = "<|IMAGE|>"
-    elif modality == "video":
-        placeholder = "<|VIDEO|>"
-
-    default_system = (
-        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
-        "Group, capable of perceiving auditory and visual inputs, as well as "
-        "generating text and speech."
-    )
-
-    prompts = [
-        (
-            f"<|im_start|>system\n{default_system}<|im_end|>\n"
-            f"<|im_start|>user\n<|vision_bos|>{placeholder}<|vision_eos|>"
-            f"{question}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        for question in questions
-    ]
     return ModelRequestData(
         engine_args=engine_args,
         prompts=prompts,
@@ -2074,7 +1993,6 @@ model_example_map = {
     "llava-next-video": run_llava_next_video,
     "llava-onevision": run_llava_onevision,
     "mantis": run_mantis,
-    "minicpmo": run_minicpmo,
     "minicpmv": run_minicpmv,
     "minimax_vl_01": run_minimax_vl_01,
     "mistral3": run_mistral3,
@@ -2089,12 +2007,10 @@ model_example_map = {
     "paligemma": run_paligemma,
     "paligemma2": run_paligemma2,
     "phi3_v": run_phi3v,
-    "phi4_mm": run_phi4mm,
     "pixtral_hf": run_pixtral_hf,
     "qwen_vl": run_qwen_vl,
     "qwen2_vl": run_qwen2_vl,
     "qwen2_5_vl": run_qwen2_5_vl,
-    "qwen2_5_omni": run_qwen2_5_omni,
     "qwen3_vl": run_qwen3_vl,
     "qwen3_vl_moe": run_qwen3_vl_moe,
     "rvl": run_r_vl,
@@ -2311,7 +2227,7 @@ def main(args):
     req_data = model_example_map[model](questions, modality)
 
     # Disable other modalities to save memory
-    default_limits = {"image": 0, "video": 0, "audio": 0}
+    default_limits = {"image": 0, "video": 0}
     req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
         req_data.engine_args.limit_mm_per_prompt or {}
     )

@@ -5,7 +5,13 @@ from collections.abc import Callable
 import torch
 
 import vllm.envs as envs
-from vllm.distributed.eplb.eplb_state import EplbLayerState
+try:
+    from vllm.distributed.eplb.eplb_state import EplbLayerState
+except ModuleNotFoundError:
+    class EplbLayerState:  # type: ignore[no-redef]
+        """Stub EPLB layer state for single-process mode."""
+
+        pass
 from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
     CustomRoutingRouter,
 )

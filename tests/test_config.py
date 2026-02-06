@@ -115,7 +115,6 @@ def test_update_config():
         ("jason9693/Qwen2.5-1.5B-apeach", "pooling", "classify"),
         ("cross-encoder/ms-marco-MiniLM-L-6-v2", "pooling", "none"),
         ("Qwen/Qwen2.5-Math-RM-72B", "pooling", "none"),
-        ("openai/whisper-small", "generate", "none"),
     ],
 )
 def test_auto_runner(model_id, expected_runner_type, expected_convert_type):
@@ -133,7 +132,6 @@ def test_auto_runner(model_id, expected_runner_type, expected_convert_type):
         ("jason9693/Qwen2.5-1.5B-apeach", "pooling", "classify"),
         ("cross-encoder/ms-marco-MiniLM-L-6-v2", "pooling", "none"),
         ("Qwen/Qwen2.5-Math-RM-72B", "pooling", "none"),
-        ("openai/whisper-small", "pooling", "embed"),
     ],
 )
 def test_pooling_runner(model_id, expected_runner_type, expected_convert_type):
@@ -355,7 +353,6 @@ def test_nested_hf_overrides():
     ("model_id", "is_encoder_decoder"),
     [
         ("facebook/opt-125m", False),
-        ("openai/whisper-tiny", True),
         ("meta-llama/Llama-3.2-1B-Instruct", False),
     ],
 )
@@ -673,12 +670,6 @@ def test_s3_url_different_models_create_different_directories(mock_pull_files):
             "Generative models support chunked prefill.",  # noqa: E501
         ),
         # encoder_decoder models
-        (
-            "openai/whisper-small",
-            "encoder_decoder",
-            False,
-            "Encoder decoder models do not support chunked prefill.",  # noqa: E501
-        ),
     ],
 )
 def test_is_chunked_prefill_supported(
@@ -792,12 +783,6 @@ def test_is_chunked_prefill_supported(
             "Attention free models do not support prefix caching since the feature is still experimental.",  # noqa: E501
         ),
         # encoder_decoder models
-        (
-            "openai/whisper-small",
-            "encoder_decoder",
-            False,
-            "Encoder decoder models do not support prefix caching.",  # noqa: E501
-        ),
     ],
 )
 def test_is_prefix_caching_supported(

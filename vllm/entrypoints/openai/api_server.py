@@ -35,10 +35,7 @@ from vllm.entrypoints.openai.server_utils import (
     log_response,
     validation_exception_handler,
 )
-from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
-from vllm.entrypoints.serve.elastic_ep.middleware import (
-    ScalingMiddleware,
-)
+from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.utils import (
     cli_env_setup,
@@ -139,6 +136,7 @@ async def build_async_engine_client_from_engine_args(
             client_addresses=client_config,
             client_count=client_count,
             client_index=client_index,
+            enable_multiprocessing=not disable_frontend_multiprocessing,
         )
 
         # Don't keep the dummy data in memory
@@ -166,21 +164,11 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
 
     register_basic_api_routers(app)
 
-    from vllm.entrypoints.serve import register_vllm_serve_api_routers
-
-    register_vllm_serve_api_routers(app)
-
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
     )
 
     register_models_api_router(app)
-
-    from vllm.entrypoints.sagemaker.api_router import (
-        attach_router as register_sagemaker_api_router,
-    )
-
-    register_sagemaker_api_router(app, supported_tasks)
 
     if "generate" in supported_tasks:
         from vllm.entrypoints.openai.generate.api_router import (
@@ -188,20 +176,6 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
         )
 
         register_generate_api_routers(app)
-
-    if "transcription" in supported_tasks:
-        from vllm.entrypoints.openai.translations.api_router import (
-            attach_router as register_translations_api_router,
-        )
-
-        register_translations_api_router(app)
-
-    if "realtime" in supported_tasks:
-        from vllm.entrypoints.openai.realtime.api_router import (
-            attach_router as register_realtime_api_router,
-        )
-
-        register_realtime_api_router(app)
 
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import register_pooling_api_routers
@@ -254,7 +228,6 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
-    app = sagemaker_standards_bootstrap(app)
     return app
 
 
@@ -316,20 +289,6 @@ async def init_app_state(
         await init_generate_state(
             engine_client, state, args, request_logger, supported_tasks
         )
-
-    if "transcription" in supported_tasks:
-        from vllm.entrypoints.openai.translations.api_router import (
-            init_transcription_state,
-        )
-
-        init_transcription_state(
-            engine_client, state, args, request_logger, supported_tasks
-        )
-
-    if "realtime" in supported_tasks:
-        from vllm.entrypoints.openai.realtime.api_router import init_realtime_state
-
-        init_realtime_state(engine_client, state, args, request_logger, supported_tasks)
 
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import init_pooling_state

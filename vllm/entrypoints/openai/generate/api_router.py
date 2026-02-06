@@ -35,11 +35,7 @@ def register_generate_api_routers(app: FastAPI):
 
     register_completion_api_router(app)
 
-    from vllm.entrypoints.anthropic.api_router import (
-        attach_router as register_anthropic_api_router,
-    )
-
-    register_anthropic_api_router(app)
+    # Anthropic-compatible endpoints removed in lite mode.
 
 
 async def init_generate_state(
@@ -49,7 +45,6 @@ async def init_generate_state(
     request_logger: RequestLogger | None,
     supported_tasks: tuple["SupportedTask", ...],
 ):
-    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
     from vllm.entrypoints.chat_utils import load_chat_template
     from vllm.entrypoints.mcp.tool_server import (
         DemoToolServer,
@@ -59,7 +54,6 @@ async def init_generate_state(
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
     from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-    from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
@@ -132,35 +126,5 @@ async def init_generate_state(
         if "generate" in supported_tasks
         else None
     )
-    state.anthropic_serving_messages = (
-        AnthropicServingMessages(
-            engine_client,
-            state.openai_serving_models,
-            args.response_role,
-            request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-            enable_auto_tools=args.enable_auto_tool_choice,
-            tool_parser=args.tool_call_parser,
-            reasoning_parser=args.structured_outputs_config.reasoning_parser,
-            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-            enable_force_include_usage=args.enable_force_include_usage,
-        )
-        if "generate" in supported_tasks
-        else None
-    )
-    state.serving_tokens = (
-        ServingTokens(
-            engine_client,
-            state.openai_serving_models,
-            request_logger=request_logger,
-            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-            log_error_stack=args.log_error_stack,
-            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-            enable_log_outputs=args.enable_log_outputs,
-            force_no_detokenize=args.tokens_only,
-        )
-        if "generate" in supported_tasks
-        else None
-    )
+    state.anthropic_serving_messages = None
+    state.serving_tokens = None

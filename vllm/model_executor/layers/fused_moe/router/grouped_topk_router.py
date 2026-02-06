@@ -8,7 +8,13 @@ import torch
 from vllm import _custom_ops as ops
 from vllm import envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.distributed.eplb.eplb_state import EplbLayerState
+try:
+    from vllm.distributed.eplb.eplb_state import EplbLayerState
+except ModuleNotFoundError:
+    class EplbLayerState:  # type: ignore[no-redef]
+        """Stub EPLB layer state for single-process mode."""
+
+        pass
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,

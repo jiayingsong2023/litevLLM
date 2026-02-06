@@ -80,6 +80,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool | None = None,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -138,15 +139,28 @@ class AsyncLLM(EngineClient):
             tracer = init_tracer("vllm.llm_engine", endpoint)
             self.output_processor.tracer = tracer
 
-        # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=self.log_stats,
-            client_addresses=client_addresses,
-            client_count=client_count,
-            client_index=client_index,
-        )
+        if enable_multiprocessing is None:
+            enable_multiprocessing = envs.VLLM_ENABLE_V1_MULTIPROCESSING
+
+        if enable_multiprocessing:
+            # EngineCore (starts the engine in background process).
+            self.engine_core = EngineCoreClient.make_async_mp_client(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+                client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
+            )
+        else:
+            # Single-process EngineCore (no multiprocessing).
+            self.engine_core = EngineCoreClient.make_client(
+                multiprocess_mode=False,
+                asyncio_mode=True,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=self.log_stats,
+            )
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -210,6 +224,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        enable_multiprocessing: bool | None = None,
     ) -> "AsyncLLM":
         # Create the LLMEngine.
         return cls(
@@ -224,6 +239,7 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     @classmethod
@@ -233,6 +249,7 @@ class AsyncLLM(EngineClient):
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
+        enable_multiprocessing: bool | None = None,
     ) -> "AsyncLLM":
         """Create an AsyncLLM from the EngineArgs."""
 
@@ -249,6 +266,7 @@ class AsyncLLM(EngineClient):
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            enable_multiprocessing=enable_multiprocessing,
         )
 
     def __del__(self):

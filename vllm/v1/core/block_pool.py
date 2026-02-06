@@ -3,13 +3,12 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from vllm.distributed.kv_events import (
-    MEDIUM_GPU,
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-    KVCacheEvent,
-)
+# litevLLM - Distributed stubs
+MEDIUM_GPU = "gpu"
+class AllBlocksCleared: pass
+class BlockRemoved: pass
+class BlockStored: pass
+class KVCacheEvent: pass
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
