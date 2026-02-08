@@ -5,7 +5,15 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from vllm.kernels.triton import rms_norm as triton_rms_norm, fused_add_rms_norm as triton_fused_add_rms_norm
+from vllm.kernels.triton import (
+    rms_norm as triton_rms_norm, 
+    fused_add_rms_norm as triton_fused_add_rms_norm,
+    paged_attention_v1 as triton_paged_attention_v1,
+    paged_attention_v2 as triton_paged_attention_v2,
+    rotary_embedding as triton_rotary_embedding,
+    reshape_and_cache as triton_reshape_and_cache,
+    reshape_and_cache_flash as triton_reshape_and_cache_flash
+)
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -100,7 +108,7 @@ def paged_attention_v1(
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
-    torch.ops._C.paged_attention_v1(
+    triton_paged_attention_v1(
         out,
         query,
         key_cache,
@@ -147,7 +155,7 @@ def paged_attention_v2(
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
-    torch.ops._C.paged_attention_v2(
+    triton_paged_attention_v2(
         out,
         exp_sum,
         max_logits,
@@ -372,7 +380,7 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    torch.ops._C.rotary_embedding(
+    triton_rotary_embedding(
         positions, query, key, head_size, cos_sin_cache, is_neox
     )
 
@@ -2527,18 +2535,11 @@ def reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+    triton_reshape_and_cache(
+        key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale
     )
 
 
@@ -2552,15 +2553,8 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+    triton_reshape_and_cache_flash(
+        key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale
     )
 
 
