@@ -178,9 +178,10 @@ class CustomOp(nn.Module):
         else:
             compilation_config.disabled_custom_ops.update([self.__class__.name])
 
-        if current_platform.is_rocm() or current_platform.is_cuda():
-            logger.info("Simplification: Forcing forward_native for CustomOp %s (enabled=%s)", self.__class__.name, enabled)
-            return self.maybe_compile(self.forward_native, enable=compile_native)
+        if current_platform.is_rocm():
+            return self.forward_hip
+        if current_platform.is_cuda():
+            return self.forward_cuda
 
         if not enabled:
             # Compile forward_native to avoid eager torch ops if inside
