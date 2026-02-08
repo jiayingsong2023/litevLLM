@@ -59,6 +59,13 @@ def kernel_unified_attention_2d(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    new_k_ptr,  # [num_tokens, num_kv_heads, head_size] - NEW for fusion
+    new_v_ptr,  # [num_tokens, num_kv_heads, head_size] - NEW for fusion
+    slot_mapping_ptr,  # [num_tokens] - NEW for fusion
+    new_k_stride_0: tl.int64,
+    new_k_stride_1: tl.int64,
+    new_v_stride_0: tl.int64,
+    new_v_stride_1: tl.int64,
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
@@ -124,6 +131,46 @@ def kernel_unified_attention_2d(
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
+
+    # KV-Write Fusion: Store new K/V into Paged Cache
+    if slot_mapping_ptr is not None:
+        for m in range(BLOCK_Q):
+            t_idx = cur_batch_in_all_start_index + q_block_local_idx * BLOCK_Q + m
+            if t_idx < cur_batch_in_all_stop_index:
+                slot = tl.load(slot_mapping_ptr + t_idx).to(tl.int64)
+                if slot >= 0:
+                    b_idx = slot // BLOCK_SIZE
+                    b_off = slot % BLOCK_SIZE
+                    
+                    # Load and store K
+                    # We use query_stride_0/1 as proxy for new_k/v strides 
+                    # if they are not explicitly provided, assuming same layout.
+                    # Actually, for safety, we should probably pass them.
+                    # But for now, let's use the provided head_size logic.
+                    offs_d_write = tl.arange(0, HEAD_SIZE_PADDED)
+                    mask_d_write = offs_d_write < HEAD_SIZE
+                    
+                    # Offsets for source new_k/new_v
+                    # [num_tokens, num_kv_heads, head_size]
+                    src_k_off = t_idx * new_k_stride_0 + kv_head_idx * new_k_stride_1 + offs_d_write
+                    src_v_off = t_idx * new_v_stride_0 + kv_head_idx * new_v_stride_1 + offs_d_write
+                    
+                    new_k = tl.load(new_k_ptr + src_k_off, mask=mask_d_write, other=0.0)
+                    new_v = tl.load(new_v_ptr + src_v_off, mask=mask_d_write, other=0.0)
+                    
+                    # Target offsets in cache
+                    # [num_blks, blk_size, num_kv_heads, head_size]
+                    target_k_off = (b_idx * stride_k_cache_0 + 
+                                    b_off * stride_k_cache_1 + 
+                                    kv_head_idx * stride_k_cache_2 + 
+                                    offs_d_write * stride_k_cache_3)
+                    target_v_off = (b_idx * stride_v_cache_0 + 
+                                    b_off * stride_v_cache_1 + 
+                                    kv_head_idx * stride_v_cache_2 + 
+                                    offs_d_write * stride_v_cache_3)
+                    
+                    tl.store(key_cache_ptr + target_k_off, new_k, mask=mask_d_write)
+                    tl.store(value_cache_ptr + target_v_off, new_v, mask=mask_d_write)
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
@@ -408,8 +455,15 @@ def kernel_unified_attention_3d(
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
-    key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
-    value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
+    key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    new_k_ptr,  # [num_tokens, num_kv_heads, head_size] - NEW for fusion
+    new_v_ptr,  # [num_tokens, num_kv_heads, head_size] - NEW for fusion
+    slot_mapping_ptr,  # [num_tokens] - NEW for fusion
+    new_k_stride_0: tl.int64,
+    new_k_stride_1: tl.int64,
+    new_v_stride_0: tl.int64,
+    new_v_stride_1: tl.int64,
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
@@ -471,6 +525,32 @@ def kernel_unified_attention_3d(
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
+
+    # KV-Write Fusion: Store new K/V into Paged Cache (Only done by first segment)
+    if slot_mapping_ptr is not None and segm_idx == 0:
+        for m in range(BLOCK_Q):
+            t_idx = cur_batch_in_all_start_index + q_block_local_idx * BLOCK_Q + m
+            if t_idx < cur_batch_in_all_stop_index:
+                slot = tl.load(slot_mapping_ptr + t_idx).to(tl.int64)
+                if slot >= 0:
+                    b_idx = slot // BLOCK_SIZE
+                    b_off = slot % BLOCK_SIZE
+                    offs_d_write = tl.arange(0, HEAD_SIZE_PADDED)
+                    mask_d_write = offs_d_write < HEAD_SIZE
+                    src_k_off = t_idx * new_k_stride_0 + kv_head_idx * new_k_stride_1 + offs_d_write
+                    src_v_off = t_idx * new_v_stride_0 + kv_head_idx * new_v_stride_1 + offs_d_write
+                    new_k = tl.load(new_k_ptr + src_k_off, mask=mask_d_write, other=0.0)
+                    new_v = tl.load(new_v_ptr + src_v_off, mask=mask_d_write, other=0.0)
+                    target_k_off = (b_idx * stride_k_cache_0 + 
+                                    b_off * stride_k_cache_1 + 
+                                    kv_head_idx * stride_k_cache_2 + 
+                                    offs_d_write * stride_k_cache_3)
+                    target_v_off = (b_idx * stride_v_cache_0 + 
+                                    b_off * stride_v_cache_1 + 
+                                    kv_head_idx * stride_v_cache_2 + 
+                                    offs_d_write * stride_v_cache_3)
+                    tl.store(key_cache_ptr + target_k_off, new_k, mask=mask_d_write)
+                    tl.store(value_cache_ptr + target_v_off, new_v, mask=mask_d_write)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -896,6 +976,9 @@ def unified_attention(
     q_descale,
     k_descale,
     v_descale,
+    new_k=None,  # NEW
+    new_v=None,  # NEW
+    slot_mapping=None,  # NEW
     seq_threshold_3D=None,
     num_par_softmax_segments=None,
     softmax_segm_output=None,
@@ -992,6 +1075,13 @@ def unified_attention(
             query_ptr=q,
             key_cache_ptr=k,
             value_cache_ptr=v,
+            new_k_ptr=new_k,
+            new_v_ptr=new_v,
+            slot_mapping_ptr=slot_mapping,
+            new_k_stride_0=new_k.stride(0) if new_k is not None else 0,
+            new_k_stride_1=new_k.stride(1) if new_k is not None else 0,
+            new_v_stride_0=new_v.stride(0) if new_v is not None else 0,
+            new_v_stride_1=new_v.stride(1) if new_v is not None else 0,
             sink_ptr=sinks,
             block_tables_ptr=block_table,
             seq_lens_ptr=seqused_k,
@@ -1047,6 +1137,13 @@ def unified_attention(
             query_ptr=q,
             key_cache_ptr=k,
             value_cache_ptr=v,
+            new_k_ptr=new_k,
+            new_v_ptr=new_v,
+            slot_mapping_ptr=slot_mapping,
+            new_k_stride_0=new_k.stride(0) if new_k is not None else 0,
+            new_k_stride_1=new_k.stride(1) if new_k is not None else 0,
+            new_v_stride_0=new_v.stride(0) if new_v is not None else 0,
+            new_v_stride_1=new_v.stride(1) if new_v is not None else 0,
             sink_ptr=sinks,
             block_tables_ptr=block_table,
             seq_lens_ptr=seqused_k,

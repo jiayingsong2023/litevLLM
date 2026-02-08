@@ -272,7 +272,7 @@ class TritonAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
 
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -506,6 +506,9 @@ class TritonAttentionImpl(AttentionImpl):
             q_descale=None,  # Not supported
             k_descale=layer._k_scale.expand(descale_shape),
             v_descale=layer._v_scale.expand(descale_shape),
+            new_k=key[:num_actual_tokens],
+            new_v=value[:num_actual_tokens],
+            slot_mapping=attn_metadata.slot_mapping[:num_actual_tokens],
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
