@@ -1137,20 +1137,12 @@ class ModelConfig:
 
     def get_num_kv_heads(self, parallel_config: ParallelConfig) -> int:
         """Returns the number of KV heads per GPU."""
-        if self.use_mla:
-            # When using MLA during decode it becomes MQA
-            return 1
-
-        total_num_kv_heads = self.get_total_num_kv_heads()
-        # If tensor parallelism is used, we divide the number of KV heads by
-        # the tensor parallel size. We will replicate the KV heads in the
-        # case where the number of KV heads is smaller than the tensor
-        # parallel size so each GPU has at least one KV head.
-        return max(1, total_num_kv_heads // parallel_config.tensor_parallel_size)
+        # For single node, always return total number of KV heads
+        return self.get_total_num_kv_heads()
 
     def get_num_attention_heads(self, parallel_config: ParallelConfig) -> int:
-        num_heads = self.model_arch_config.total_num_attention_heads
-        return num_heads // parallel_config.tensor_parallel_size
+        # For single node, always return total number of attention heads
+        return self.model_arch_config.total_num_attention_heads
 
     def get_num_experts(self) -> int:
         return self.model_arch_config.num_experts

@@ -1,0 +1,55 @@
+✦ 为了评估本项目中 Continuous Batching (连续批处理)
+  的实现完整性及优化空间，我深入调研了调度器（Scheduler）与执行引擎（LLMEngine）的交互逻辑。
+
+  在 vLLM 架构中，Continuous Batching 的核心在于“在迭代级别（Iteration-level）重新调度”，而非传统的请求级别。
+
+  1. 实现现状检查 (Implementation Audit)
+
+  经过代码审计，本项目目前具备 Continuous Batching 的基础框架，但由于“全 Triton
+  化”的开发目标，仍有部分关键环节需要改进：
+
+   * 调度策略 (Scheduler):
+       * 已实现: 基础的 FCFS (先来先服务) 调度，支持将 Prefill 和 Decode 请求动态加入当前迭代。
+       * 缺陷: 现有的 BlockManager 在处理 Triton 布局的 KV Cache 时，内存回收和分配的 Python 开销在 AMD AI Max+395
+         等高吞吐设备上可能成为瓶颈（GIL 限制）。
+   * 批处理类型 (Batch Type):
+       * 已实现: BatchType 枚举（PREFILL, DECODE, MIXED）。
+       * 优化点: MIXED 模式（即 Piggybacking）虽然在枚举中定义，但 Triton 内核层对“混合预填与解码”的算子融合（Operator
+         Fusion）尚未完全优化。
+   * 元数据准备 (Metadata Preparation):
+       * 关键问题: Continuous Batching 需要频繁计算 slot_mapping、block_tables 和 seq_lens。目前的实现主要在 CPU
+         上生成这些 Tensor 并拷贝到 GPU。在高并发下，这会导致显著的 Host-to-Device 延迟。
+
+  2. Triton 化优化建议 (Optimization Opportunities)
+
+  针对 AMD AI Max+395 硬件特性，建议从以下几个维度对 Continuous Batching 进行“深层 Triton 化”：
+
+  A. 异步元数据生成 (Triton-based Metadata Setup)
+   * 方案: 将原本在 scheduler.py 中通过 Python 循环生成的 slot_mapping 和指针偏移量计算，迁移到专门的 Triton 内核中。
+   * 目标: 只需要向 GPU 发送一个紧凑的请求描述符（如 block_ids），在 GPU 内部利用 Triton 展开成算子所需的详细索引
+     Tensor，减少 PCIe 通信带宽消耗。
+
+  B. 块级预填优化 (Chunked Prefill)
+   * 方案: 引入 Chunked Prefill。对于极长的 Prompt，不要一次性抢占所有 KV 槽位，而是分块（Chunk）处理。
+   * 优化: 结合 Triton 的流水线能力，使 Prefill 的中间块计算能与 Decode 请求的访存操作重叠（Overlapping）。
+
+  C. 算子融合：Flash-Decoding
+   * 方案: 在 Continuous Batching 中，随着 Sequence Length 增加，Decode 阶段会变慢。
+   * 建议: 实现 Flash-Decoding 的 Triton 版本。它通过在各个 KV 块上并行计算 Partial Attention，最后进行 Reduce
+     汇总，能显著提升长文本场景下的 Batch 吞吐量。
+
+  D. AMD 硬件适配 (Shared Memory Tiling)
+   * 适配: AMD AI Max+395 拥有极高的 L2 缓存和内存带宽。
+   * 手段: 调整 PagedAttention 内核中的 BLOCK_N 大小（建议调整为 32 或 64），并利用 Triton 的 tl.dot 充分调用 AMD 的
+     Matrix Core。
+
+  3. 后续工作计划
+
+  为了进一步完善 Continuous Batching，建议下一步优先执行以下任务：
+
+   1. 实现 `ChunkedPrefill` Triton 内核: 解决长文本请求阻塞 Decode 请求（Head-of-line blocking）的问题。
+   2. 优化 `SlotMapping` 逻辑: 将逻辑地址到物理地址的映射计算部分移入 Triton，减少 CPU 端的算力占用。
+   3. 开发混合 Batch 压力测试工具: 模拟 100+ 并发下 Prefill 和 Decode 混合进入引擎的场景，寻找是否存在内存抖动。
+
+  总结: 本项目的 Continuous Batching 框架“形已备”，但“神（Triton
+  性能瓶颈）”仍有优化空间，特别是元数据处理和长序列调度方面。

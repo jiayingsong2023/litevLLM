@@ -15,11 +15,6 @@ import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.distributed import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
-)
-from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
@@ -100,14 +95,9 @@ class Worker(WorkerBase):
         current_platform.set_device(self.device)
         current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-        # Initialize the mock distributed environment
-        init_worker_distributed_environment(
-            self.vllm_config,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-            current_platform.dist_backend,
-        )
+        # Simplification: No distributed environment to initialize
+        from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+        init_batch_invariance(self.vllm_config.attention_config.backend)
 
         set_random_seed(self.model_config.seed)
         gc.collect()
@@ -227,21 +217,3 @@ class Worker(WorkerBase):
     def get_model(self) -> nn.Module: return self.model_runner.get_model()
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]: return self.model_runner.get_supported_tasks()
     def check_health(self) -> None: pass
-
-
-def init_worker_distributed_environment(
-    vllm_config: VllmConfig,
-    rank: int,
-    distributed_init_method: str | None = None,
-    local_rank: int = -1,
-    backend: str = "nccl",
-) -> None:
-    """Initialize the mock distributed environment."""
-    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
-    init_batch_invariance(vllm_config.attention_config.backend)
-    
-    init_distributed_environment(
-        vllm_config.parallel_config.world_size, rank, distributed_init_method or "env://", local_rank, backend
-    )
-
-    ensure_model_parallel_initialized(1, 1, 1, 1)

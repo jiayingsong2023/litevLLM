@@ -93,6 +93,8 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -138,6 +140,8 @@ class MulAndSilu(CustomOp):
         return x[..., :d] * F.silu(x[..., d:])
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -255,6 +259,8 @@ class GeluAndMul(CustomOp):
         return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -294,11 +300,14 @@ class SwigluOAIAndMul(CustomOp):
         return gated_output
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        torch.ops._C.swigluoai_and_mul(out, x, self.alpha, self.limit)
-        return out
+        try:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            torch.ops._C.swigluoai_and_mul(out, x, self.alpha, self.limit)
+            return out
+        except (AttributeError, RuntimeError):
+            return self.forward_native(x)
 
     def extra_repr(self) -> str:
         return f"alpha={repr(self.alpha)}, limit={repr(self.limit)}"
@@ -318,12 +327,9 @@ class NewGELU(CustomOp):
 
             self.op = ipex_ops.gelu_new
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        c = math.sqrt(2.0 / math.pi)
-        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
-
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out
@@ -346,11 +352,9 @@ class FastGELU(CustomOp):
 
             self.op = ipex_ops.gelu_fast
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
-
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out
@@ -379,6 +383,8 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if self.op is None:
+            return self.forward_native(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out

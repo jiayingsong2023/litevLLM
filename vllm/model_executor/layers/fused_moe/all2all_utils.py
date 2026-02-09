@@ -13,9 +13,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.flashinfer_a2a_prepare_finalize import (
-    FlashInferA2APrepareAndFinalize,
-)
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
@@ -27,21 +24,6 @@ from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep, has_mori, has_pplx
 
 logger = init_logger(__name__)
-
-if current_platform.is_cuda_alike():
-    if has_pplx():
-        from .pplx_prepare_finalize import (
-            PplxPrepareAndFinalize,
-            pplx_hidden_dim_scale_bytes,
-        )
-    if has_deep_ep():
-        from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
-        from .deepep_ll_prepare_finalize import (
-            DEEPEP_QUANT_BLOCK_SHAPE,
-            DeepEPLLPrepareAndFinalize,
-        )
-    if has_mori():
-        from .mori_prepare_finalize import MoriPrepareAndFinalize
 
 
 def maybe_roundup_layer_hidden_size(
@@ -64,16 +46,78 @@ def maybe_roundup_layer_hidden_size(
         Original hidden size otherwise.
     """
     if moe_parallel_config.use_deepep_ht_kernels:
+        from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
         hidden_size = DeepEPHTPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype
         )
 
     if moe_parallel_config.use_deepep_ll_kernels:
+        from .deepep_ll_prepare_finalize import DeepEPLLPrepareAndFinalize
         hidden_size = DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
 
     return hidden_size
+
+
+def maybe_make_prepare_finalize(
+    moe: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig | None,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    allow_new_interface: bool = False,
+) -> FusedMoEPrepareAndFinalize | None:
+    # ... (rest of the function)
+    if not moe.moe_parallel_config.use_all2all_kernels:
+        if not allow_new_interface:
+            return None
+
+        # For DP/TP case, fall back to naive P/F.
+        if moe.moe_parallel_config.dp_size > 1:
+            logger.info_once(
+                "Detected DP deployment with no --enable-expert-parallel. "
+                "Falling back to AllGather+ReduceScatter dispatch/combine."
+            )
+            return MoEPrepareAndFinalizeNaiveEP(
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=(
+                    get_ep_group().device_communicator.all2all_manager.world_size
+                ),
+            )
+        else:
+            return MoEPrepareAndFinalizeNoEP()
+
+    all2all_manager = get_ep_group().device_communicator.all2all_manager
+    assert all2all_manager is not None
+
+    prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+
+    if moe.use_pplx_kernels:
+        from .pplx_prepare_finalize import (
+            PplxPrepareAndFinalize,
+            pplx_hidden_dim_scale_bytes,
+        )
+        assert quant_config is not None
+        # ... (rest of the block)
+    elif moe.use_deepep_ht_kernels:
+        from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
+        # ... (rest of the block)
+    elif moe.use_deepep_ll_kernels:
+        from .deepep_ll_prepare_finalize import (
+            DEEPEP_QUANT_BLOCK_SHAPE,
+            DeepEPLLPrepareAndFinalize,
+        )
+        # ... (rest of the block)
+    elif moe.use_mori_kernels:
+        from .mori_prepare_finalize import MoriPrepareAndFinalize
+        # ... (rest of the block)
+    elif moe.use_fi_all2allv_kernels:
+        from .flashinfer_a2a_prepare_finalize import FlashInferA2APrepareAndFinalize
+        assert quant_config is not None
+        prepare_finalize = FlashInferA2APrepareAndFinalize(
+            num_dispatchers=all2all_manager.world_size,
+        )
+    # ...
+
 
 
 def maybe_make_prepare_finalize(

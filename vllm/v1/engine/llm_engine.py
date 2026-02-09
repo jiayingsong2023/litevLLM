@@ -67,22 +67,7 @@ class LLMEngine:
         self.log_stats = log_stats
 
         parallel_config = vllm_config.parallel_config
-        executor_backend = parallel_config.distributed_executor_backend
-
-        self.external_launcher_dp = (
-            parallel_config.data_parallel_size > 1
-            and executor_backend == "external_launcher"
-        )
-        # important: init dp group before init the engine_core
-        # In the decoupled engine case this is handled in EngineCoreProc.
-        if (
-            not multiprocess_mode
-            and parallel_config.data_parallel_size > 1
-            and not self.external_launcher_dp
-        ):
-            self.dp_group = parallel_config.stateless_init_dp_group()
-        else:
-            self.dp_group = None
+        self.dp_group = None
         self.should_execute_dummy_batch = False
 
         self.input_processor = InputProcessor(self.vllm_config)
@@ -124,11 +109,6 @@ class LLMEngine:
         if not multiprocess_mode:
             # for v0 compatibility
             self.model_executor = self.engine_core.engine_core.model_executor  # type: ignore
-
-        if self.external_launcher_dp:
-            # If we use DP in external launcher mode, we reuse the
-            # existing DP group used for data communication.
-            self.dp_group = get_dp_group().cpu_group
 
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
@@ -182,18 +162,7 @@ class LLMEngine:
         return self.output_processor.get_num_unfinished_requests()
 
     def has_unfinished_requests(self) -> bool:
-        has_unfinished = self.output_processor.has_unfinished_requests()
-        if self.dp_group is None:
-            return has_unfinished or self.engine_core.dp_engines_running()
-        return self.has_unfinished_requests_dp(has_unfinished)
-
-    def has_unfinished_requests_dp(self, has_unfinished: bool) -> bool:
-        aggregated_has_unfinished = ParallelConfig.has_unfinished_dp(
-            self.dp_group, has_unfinished
-        )
-        if not has_unfinished and aggregated_has_unfinished:
-            self.should_execute_dummy_batch = True
-        return aggregated_has_unfinished
+        return self.output_processor.has_unfinished_requests() or self.engine_core.dp_engines_running()
 
     @classmethod
     def validate_outputs(cls, outputs, output_type):
@@ -411,8 +380,3 @@ class LLMEngine:
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         return self.collective_rpc("apply_model", args=(func,))
-
-    def __del__(self):
-        dp_group = getattr(self, "dp_group", None)
-        if dp_group is not None and not self.external_launcher_dp:
-            stateless_destroy_torch_distributed_process_group(dp_group)

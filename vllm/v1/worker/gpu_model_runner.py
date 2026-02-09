@@ -35,6 +35,8 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
     graph_capture,
+    has_ec_transfer_group,
+    has_kv_transfer_group,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )

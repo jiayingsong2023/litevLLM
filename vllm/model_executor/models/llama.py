@@ -369,25 +369,20 @@ class LlamaModel(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
-        ):
-            self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        # In single node, we always have embed_tokens and full layers
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+        )
+        
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer()
+        
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
@@ -405,31 +400,19 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **extra_layer_kwargs,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-            residual = None
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
         else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
 
         aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
+        for idx, layer in enumerate(self.layers):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(
                 positions, hidden_states, residual, **extra_layer_kwargs
-            )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -535,22 +518,19 @@ class LlamaForCausalLM(
             layer_type=layer_type,
         )
 
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
-            logit_scale = getattr(config, "logit_scale", 1.0)
-            self.logits_processor = LogitsProcessor(
-                config.vocab_size, scale=logit_scale
-            )
-        else:
-            self.lm_head = PPMissingLayer()
+        logit_scale = getattr(config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size, scale=logit_scale
+        )
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
