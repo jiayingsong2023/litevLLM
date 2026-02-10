@@ -3,6 +3,10 @@
 import torch
 import numpy as np
 from gguf import dequantize, GGMLQuantizationType
+from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
+
+# Global cache to store dequantized weights on GPU
+_DEQUANT_CACHE = {}
 
 def ggml_dequantize_fallback(
     W: torch.Tensor, 
@@ -12,20 +16,34 @@ def ggml_dequantize_fallback(
     dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
     """
-    Lite fallback for GGML/GGUF dequantization using the gguf-py library.
+    Lite fallback for GGML/GGUF dequantization.
+    Caches the result on GPU based on the underlying storage to handle views correctly.
     """
-    # Convert torch tensor to numpy for gguf.dequantize
+    # Use storage data pointer and offset to uniquely identify the tensor view
+    try:
+        storage_ptr = W.untyped_storage().data_ptr()
+    except AttributeError:
+        storage_ptr = W.storage().data_ptr()
+        
+    cache_key = (storage_ptr, W.storage_offset(), W.shape, quant_type, m, n, dtype)
+    
+    if cache_key in _DEQUANT_CACHE:
+        return _DEQUANT_CACHE[cache_key]
+
+    # Q4_K (Type 12) 使用原生 Triton 内核
+    if quant_type == 12:
+        res = dequant_q4_k_triton(W, m, n, dtype)
+        _DEQUANT_CACHE[cache_key] = res
+        return res
+
+    # 其它类型暂时保留 CPU 降级，但同样通过 storage 缓存来加速
+    # 只有在第一次遇到该存储切片时才会执行
     w_np = W.cpu().numpy()
-    
-    # dequantize returns a numpy array
     dequant_np = dequantize(w_np, GGMLQuantizationType(quant_type))
-    
-    # Convert back to torch and reshape
-    # Note: gguf.dequantize output might need reshaping to (m, n)
-    # The output of dequantize is typically a 1D or 2D array depending on input
     output = torch.from_numpy(dequant_np).to(device=W.device, dtype=dtype)
-    
-    return output.view(m, n)
+    res = output.view(m, n)
+    _DEQUANT_CACHE[cache_key] = res
+    return res
 
 def ggml_mul_mat_vec_a8_fallback(
     W: torch.Tensor,

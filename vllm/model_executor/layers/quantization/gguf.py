@@ -188,6 +188,7 @@ def _fused_mul_mat_gguf(
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
         mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
+    
     # HACK: when doing chunked prefill we don't generate output tokens
     # so input to logits generator is empty which causes invalid parameter
     if x.shape[0] == 0:
@@ -541,6 +542,8 @@ class GGUFLinearMethod(LinearMethodBase):
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
+            if qweight_type == 0 and layer.qweight_type.data.numel() > 0:
+                qweight_type = int(layer.qweight_type.data[0].item())
             out = fused_mul_mat_gguf(x, qweight, qweight_type)
         if bias is not None:
             out.add_(bias)

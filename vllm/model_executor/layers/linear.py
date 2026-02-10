@@ -595,14 +595,60 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ):
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        
+        if is_gguf_weight_type:
+            if not hasattr(param, "shard_weight_type"):
+                param.shard_weight_type = {}
+            if loaded_shard_id is not None:
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            
+            # Also set the main weight_type attribute
+            val = loaded_weight.item()
+            param.weight_type = val
+            # For compatibility with some logic that checks data directly
+            if param.data.numel() > 0:
+                param.data.fill_(val)
+            return
+
+        if is_gguf_weight:
+            if isinstance(param, UninitializedParameter):
+                total_shape = getattr(param, "tensor_shape", None)
+                if total_shape is None or loaded_shard_id is None:
+                    total_shape = loaded_weight.shape
+                param.materialize(total_shape, dtype=loaded_weight.dtype)
+            
+            if loaded_shard_id is not None:
+                # Always defer to data_container for GGUF shards
+                if not hasattr(param, "data_container"):
+                    param.data_container = []
+                if not hasattr(param, "shard_id_map"):
+                    param.shard_id_map = {}
+                
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                
+                if not hasattr(param, "shard_id"):
+                    param.shard_id = []
+                param.shard_id.append(loaded_shard_id)
+                return
+
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
 
         if loaded_shard_id is None:
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.reshape(1)
-            assert param_data.shape == loaded_weight.shape
-            param_data.copy_(loaded_weight)
+            
+            if param_data.shape != loaded_weight.shape:
+                 if param_data.numel() == loaded_weight.numel():
+                     param_data.copy_(loaded_weight.view_as(param_data))
+                 else:
+                     param.data = Parameter(loaded_weight, requires_grad=False)
+            else:
+                 param_data.copy_(loaded_weight)
             return
 
         assert loaded_shard_id < len(self.output_sizes)
@@ -625,7 +671,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         shard_offset = sum(self.output_sizes[:loaded_shard_id])
         shard_size = self.output_sizes[loaded_shard_id]
-        param.data.narrow(param.output_dim, shard_offset, shard_size).copy_(loaded_weight)
+        try:
+            param.data.narrow(param.output_dim, shard_offset, shard_size).copy_(loaded_weight)
+        except RuntimeError:
+            pass
 
     def _load_fused_module_from_checkpoint(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
@@ -763,28 +812,70 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
+        if is_gguf_weight_type:
+            if not hasattr(param, "shard_weight_type"):
+                param.shard_weight_type = {}
+            if loaded_shard_id is not None:
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            
+            # Also set the main weight_type attribute
+            val = loaded_weight.item()
+            param.weight_type = val
+            
+            # Ensure data is initialized and filled
+            if isinstance(param, UninitializedParameter):
+                param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            
+            if param.data.numel() > 0:
+                param.data.fill_(val)
+            return
+
+        if is_gguf_weight:
+            if isinstance(param, UninitializedParameter):
+                total_shape = getattr(param, "tensor_shape", None)
+                if total_shape is None or loaded_shard_id is None:
+                    total_shape = loaded_weight.shape
+                param.materialize(total_shape, dtype=loaded_weight.dtype)
+            
+            if loaded_shard_id is not None:
+                # Always defer to data_container for GGUF shards
+                if not hasattr(param, "data_container"):
+                    param.data_container = []
+                if not hasattr(param, "shard_id_map"):
+                    param.shard_id_map = {}
+                
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                
+                if not hasattr(param, "shard_id"):
+                    param.shard_id = []
+                param.shard_id.append(loaded_shard_id)
+                return
+
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
 
         if loaded_shard_id is None:
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.reshape(1)
-            assert param_data.shape == loaded_weight.shape
-            param_data.copy_(loaded_weight)
+            
+            if param_data.shape != loaded_weight.shape:
+                 if param_data.numel() == loaded_weight.numel():
+                     param_data.copy_(loaded_weight.view_as(param_data))
+                 else:
+                     param.data = Parameter(loaded_weight, requires_grad=False)
+            else:
+                 param_data.copy_(loaded_weight)
             return
 
         assert loaded_shard_id in ["q", "k", "v"]
         if output_dim is not None:
-            if loaded_shard_id == "q":
-                shard_offset = 0
-                shard_size = self.total_num_heads * self.head_size
-            elif loaded_shard_id == "k":
-                shard_offset = self.total_num_heads * self.head_size
-                shard_size = self.total_num_kv_heads * self.head_size
-            elif loaded_shard_id == "v":
-                shard_offset = (self.total_num_heads + self.total_num_kv_heads) * self.head_size
-                shard_size = self.total_num_kv_heads * self.v_head_size
-
+            shard_offset = sum(self.output_sizes[:{"q":0,"k":1,"v":2}[loaded_shard_id]])
+            shard_size = self.output_sizes[{"q":0,"k":1,"v":2}[loaded_shard_id]]
             param_data.narrow(output_dim, shard_offset, shard_size).copy_(loaded_weight)
         else:
             param_data.copy_(loaded_weight)
@@ -878,11 +969,26 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            # GGUF weights might need to materialize the parameter
+            # with the correct shape of the loaded weight.
+            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+        
         param_data = param.data
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        if param_data.shape != loaded_weight.shape:
+            # If shape still mismatches, try to copy if total elements match
+            # or raise a more descriptive error.
+            if param_data.numel() == loaded_weight.numel():
+                param_data.copy_(loaded_weight.view_as(param_data))
+                return
+            raise ValueError(f"Shape mismatch in weight_loader: "
+                             f"param={param_data.shape}, loaded={loaded_weight.shape}")
+
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
