@@ -27,15 +27,38 @@ uv pip install -e .
 
 ### 运行基准测试 (以 MoE 模型为例)
 ```bash
-# 强制使用 Eager 模式运行 (目前推荐)
-python -m vllm.entrypoints.cli.main bench latency \
+# 推荐使用 uv run 自动处理环境依赖
+uv run python -m vllm.entrypoints.cli.main bench latency \
     --model Qwen/Qwen1.5-MoE-A2.7B-Chat \
+    --enforce-eager
+```
+
+### 运行量化模型基准测试
+`litevLLM` 现已支持 GGUF 和 AWQ 格式的纯 Python/Triton 降级路径。
+
+#### 1. GGUF 模型 (Q4_K_M, Q5_K_M 等)
+```bash
+uv run python -m vllm.entrypoints.cli.main bench latency \
+    --model TheBloke/Llama-2-7B-Chat-GGUF \
+    --quantization gguf \
+    --enforce-eager
+```
+
+#### 2. AWQ 模型
+```bash
+uv run python -m vllm.entrypoints.cli.main bench latency \
+    --model TheBloke/Llama-2-7B-Chat-AWQ \
+    --quantization awq \
     --enforce-eager
 ```
 
 ## 🛠 当前支持
 - **Attention**: 纯 Triton 版 PagedAttention.
 - **MoE**: 纯 Python 调度的混合专家模型。
+- **Quantization**: 
+  - **GGUF**: 完整的 GGML 算子 Python 降级（Q3_K, Q5_K, Q6_K, IQ4_NL 等）。
+  - **AWQ**: 强制使用 Triton 实现的 AWQ 算子。
+  - **FP8**: 纯 Python 实现的动态/静态量化 fallback。
 - **Platform**: 深度优化 AMD ROCm 7.1 兼容性。
 - **API**: 保留 OpenAI 兼容接口与 streaming 输出。
 
