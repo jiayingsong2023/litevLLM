@@ -52,6 +52,9 @@ uv run python -m vllm.entrypoints.cli.main bench latency \
     --enforce-eager
 ```
 
+## 🚀 Real-World Performance
+- **[Case Study: AMD Strix Point (Ryzen AI 300) Support](docs/design/STRIX_POINT_CASE_STUDY.md)** - See how litevLLM delivers 2x performance over llama.cpp on the latest AMD APUs with zero friction.
+
 ## 🛠 当前支持
 - **Attention**: 纯 Triton 版 PagedAttention.
 - **MoE**: 纯 Python 调度的混合专家模型。
