@@ -37,7 +37,7 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.engine.v1.async_llm import AsyncLLM
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)

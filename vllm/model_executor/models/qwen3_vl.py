@@ -92,7 +92,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.math_utils import round_up
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import (
     MultiModalEmbeddings,

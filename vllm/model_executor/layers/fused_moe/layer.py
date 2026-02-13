@@ -75,7 +75,7 @@ from vllm.utils.torch_utils import (
     current_stream,
     direct_register_custom_op,
 )
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 

@@ -43,8 +43,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
+from vllm.attention.backend import AttentionMetadata
+from vllm.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
 # Added by the IBM Team, 2024
 

@@ -58,7 +58,7 @@ from vllm.multimodal.inputs import MultiModalDataDict
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.dotsocr import DotsOCRConfig, DotsVisionConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.backends.registry import AttentionBackendEnum
 
 from .vision import is_vit_use_data_parallel, run_dp_sharded_mrope_vision_model
 

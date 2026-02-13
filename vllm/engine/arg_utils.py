@@ -93,14 +93,14 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.sample.logits_processor import LogitsProcessor
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.model_loader import LoadFormats
     from vllm.usage.usage_lib import UsageContext
-    from vllm.v1.executor import Executor
+    from vllm.executor import Executor
 else:
     Executor = Any
     QuantizationMethods = Any

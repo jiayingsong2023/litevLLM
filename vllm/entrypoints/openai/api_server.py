@@ -72,7 +72,7 @@ async def build_async_engine_client(
         # Pre-import heavy modules in the forkserver process
         logger.debug("Setup forkserver with pre-imports")
         multiprocessing.set_start_method("forkserver")
-        multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
+        multiprocessing.set_forkserver_preload(["vllm.engine.v1.async_llm"])
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 
@@ -117,7 +117,7 @@ async def build_async_engine_client_from_engine_args(
     if disable_frontend_multiprocessing:
         logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing.")
 
-    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.engine.v1.async_llm import AsyncLLM
 
     async_llm: AsyncLLM | None = None
 

@@ -1,5 +1,5 @@
 import torch
-from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
+from vllm.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 
 def reshape_and_cache(
     key: torch.Tensor,

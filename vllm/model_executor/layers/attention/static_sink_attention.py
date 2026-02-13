@@ -11,18 +11,18 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backend import (
+from vllm.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
     subclass_attention_backend,
 )
-from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+from vllm.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_diffkv,
 )
-from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import (
+from vllm.attention.selector import get_attn_backend
+from vllm.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     SinkFullAttentionSpec,

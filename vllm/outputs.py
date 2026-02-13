@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalPlaceholderDict
-from vllm.v1.metrics.stats import RequestStateStats
+from vllm.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
 

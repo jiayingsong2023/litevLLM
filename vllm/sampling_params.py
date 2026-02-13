@@ -15,7 +15,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor
 from vllm.tokenizers import TokenizerLike
-from vllm.v1.serial_utils import PydanticMsgspecMixin
+from vllm.serial_utils import PydanticMsgspecMixin
 
 logger = init_logger(__name__)
 

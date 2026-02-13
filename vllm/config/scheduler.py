@@ -15,7 +15,7 @@ from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.interface import SchedulerInterface
+    from vllm.core.sched.interface import SchedulerInterface
 
 logger = init_logger(__name__)
 
@@ -115,10 +115,10 @@ class SchedulerConfig:
     some image tokens can be scheduled (like TTTTIIIII, leaving IIIII),
     it will be scheduled as TTTT in one step and IIIIIIIIII in the next."""
 
-    # scheduler class or path. "vllm.v1.core.sched.scheduler.Scheduler"
+    # scheduler class or path. "vllm.core.sched.scheduler.Scheduler"
     # (default) or "mod.custom_class".
     scheduler_cls: str | type[object] = Field(default=None)
-    """The scheduler class to use. "vllm.v1.core.sched.scheduler.Scheduler" is
+    """The scheduler class to use. "vllm.core.sched.scheduler.Scheduler" is
     the default scheduler. Can be a class directly or the path to a class of
     form "mod.custom_class"."""
 
@@ -155,10 +155,10 @@ class SchedulerConfig:
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
             if self.async_scheduling:
-                from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+                from vllm.core.sched.async_scheduler import AsyncScheduler
 
                 return AsyncScheduler
-            from vllm.v1.core.sched.scheduler import Scheduler
+            from vllm.core.sched.scheduler import Scheduler
 
             return Scheduler
 

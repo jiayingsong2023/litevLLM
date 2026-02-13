@@ -13,7 +13,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.math_utils import round_up
-from vllm.v1.worker.ubatching import (
+from vllm.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
     dbo_get_previous_event,

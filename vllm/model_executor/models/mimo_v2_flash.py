@@ -42,7 +42,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
+from vllm.attention.backend import AttentionType
 
 from .interfaces import MixtureOfExperts, SupportsPP
 from .utils import (

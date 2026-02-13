@@ -11,11 +11,11 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_mqa_logits, fp8_paged_mqa_logits
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.mla.indexer import (
+from vllm.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
-from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops

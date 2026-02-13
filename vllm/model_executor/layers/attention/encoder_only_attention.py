@@ -8,15 +8,15 @@ import torch
 from vllm.config import CacheConfig
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.attention import Attention
-from vllm.v1.attention.backend import (
+from vllm.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
     subclass_attention_backend,
 )
-from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.attention.selector import get_attn_backend
+from vllm.kv_cache_interface import KVCacheSpec
 
 
 @functools.lru_cache

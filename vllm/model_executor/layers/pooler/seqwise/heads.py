@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from vllm.model_executor.layers.pooler import ActivationFn, ClassifierFn, ProjectorFn
 from vllm.tasks import PoolingTask
-from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.pool.metadata import PoolingMetadata
 
 from .methods import SequencePoolingMethodOutput
 

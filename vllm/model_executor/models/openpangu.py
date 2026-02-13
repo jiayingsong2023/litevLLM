@@ -84,8 +84,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
+from vllm.attention.backend import AttentionType
+from vllm.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
 
 
 def check_ffn_act_fn(act_fn: str):

@@ -16,8 +16,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.attention.backend import AttentionMetadata
+from vllm.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from .fla.ops.kda import (
     FusedRMSNormGated,

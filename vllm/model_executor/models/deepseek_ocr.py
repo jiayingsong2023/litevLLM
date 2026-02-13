@@ -57,7 +57,7 @@ from vllm.transformers_utils.processors.deepseek_ocr import (
     count_tiles,
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.v1.sample.logits_processor import (
+from vllm.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
 )

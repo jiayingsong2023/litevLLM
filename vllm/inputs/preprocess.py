@@ -20,7 +20,7 @@ from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.renderers import renderer_from_config
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.jsontree import json_iter_leaves
-from vllm.v1.metrics.stats import MultiModalCacheStats
+from vllm.metrics.stats import MultiModalCacheStats
 
 from .data import (
     DecoderOnlyInputs,

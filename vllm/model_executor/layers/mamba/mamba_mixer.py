@@ -36,7 +36,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadata
+from vllm.attention.backends.mamba1_attn import Mamba1AttentionMetadata
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer

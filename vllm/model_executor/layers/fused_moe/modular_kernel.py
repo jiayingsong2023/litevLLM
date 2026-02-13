@@ -27,13 +27,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.ubatching import (
+from vllm.worker.ubatching import (
     dbo_enabled,
     dbo_maybe_run_recv_hook,
     dbo_register_recv_hook,
     dbo_yield,
 )
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 

@@ -17,8 +17,8 @@ from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    from vllm.v1.worker.gpu_worker import Worker
+    from vllm.worker.gpu_model_runner import GPUModelRunner
+    from vllm.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
 

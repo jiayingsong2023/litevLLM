@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
+    from vllm.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 else:
     KVConnectorOutput = Any
 

@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.kv_cache_interface import KVCacheConfig
 else:
     PretrainedConfig = Any
 

@@ -726,7 +726,7 @@ def tensorize_vllm_model(
         ) as stream:
             stream.write(encryption_params.key)
 
-    from vllm.v1.engine.llm_engine import LLMEngine
+    from vllm.engine.v1.llm_engine import LLMEngine
 
     engine = LLMEngine.from_vllm_config(engine_config)
     engine.collective_rpc(

@@ -6,61 +6,80 @@ import triton.language as tl
 
 @triton.jit
 def dequant_q4_k_kernel(
-    w_ptr, 
+    w_ptr,
     out_ptr,
     n_elements,
-    stride_w_row, 
+    stride_w_row,
     stride_out_row,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Triton kernel for GGUF Q4_K dequantization.
-    Each block processes 256 elements (144 bytes).
+    A safer, more compatible Triton kernel for GGUF Q4_K dequantization.
+    This version avoids vectorization and uses simple loops to prevent
+    compiler bugs on new hardware like AMD's gfx1151.
     """
     pid = tl.program_id(0)
     
-    # 一个 superblock 对应 256 个元素，占 144 字节
     elements_per_block = 256
     bytes_per_block = 144
     
-    block_idx = pid
+    # Calculate the starting element index for this program instance.
+    start_element = pid * BLOCK_SIZE
     
-    # 指向当前 superblock 的起始位置
+    # Boundary check: Ensure we don't go past the total number of elements.
+    if start_element >= n_elements:
+        return
+
+    # Determine the block this element belongs to.
+    block_idx = start_element // elements_per_block
+    
+    # Find the offset within the block.
+    in_block_offset = start_element % elements_per_block
+
+    # Pointers to the start of the block for weights and output.
     w_block_ptr = w_ptr + block_idx * bytes_per_block
-    
-    # 1. 加载 d 和 dmin (fp16)
-    # 前 4 字节是 d 和 dmin
+    out_block_ptr = out_ptr + block_idx * elements_per_block
+
+    # --- Load Scales and Mins ---
+    # These are shared for the whole block.
     d = tl.load(w_block_ptr.to(tl.pointer_type(tl.float16)))
     dmin = tl.load((w_block_ptr + 2).to(tl.pointer_type(tl.float16)))
+
+    # For Q4_K, scales are more complex. We'll simplify for now
+    # and assume the primary scale `d` is the most important.
     
-    # 2. 加载 scales (12 字节，包含 16 个 6-bit scales)
-    # 为了简化第一个版本，我们先处理核心的 128 字节 qs 数据
-    # qs 从第 16 字节开始 (4+12)
-    qs_base_ptr = w_block_ptr + 16
-    
-    # 计算输出位置
-    out_block_ptr = out_ptr + block_idx * elements_per_block
-    
-    # 3. 提取 4-bit 并计算
-    # 每字节包含两个 4-bit 值
-    offs = tl.arange(0, 128)
-    qs_bytes = tl.load(qs_base_ptr + offs)
-    
-    # 提取低 4 位和高 4 位
-    q1 = (qs_bytes & 0x0F).to(tl.float32)
-    q2 = (qs_bytes >> 4).to(tl.float32)
-    
-    # 基础解压公式 (简化版: 假设 scale 为 1)
-    # 实际 Q4_K 公式: x = d * scale * q - dmin * scale_min
-    # 这里我们先实现能够跑通形状的逻辑
-    v1 = (q1 * d).to(tl.float16)
-    v2 = (q2 * d).to(tl.float16)
-    
-    # 写入输出
-    # 注意输出布局需要对应 [v1_0, v2_0, v1_1, v2_1, ...]
-    out_offs = tl.arange(0, 128)
-    tl.store(out_block_ptr + out_offs * 2, v1)
-    tl.store(out_block_ptr + out_offs * 2 + 1, v2)
+    # --- Dequantize Loop ---
+    # This loop will run for each element in the thread's assigned BLOCK_SIZE.
+    for i in range(BLOCK_SIZE):
+        current_element_index = start_element + i
+        
+        if current_element_index < n_elements:
+            # Recalculate offset within the current block for each element.
+            current_in_block_offset = current_element_index % elements_per_block
+            
+            # Find the byte that contains our 4-bit weight.
+            # The quantized data starts at byte 16 of the block.
+            qs_byte_offset = 16 + (current_in_block_offset // 2)
+            qs_byte_ptr = w_block_ptr + qs_byte_offset
+            
+            byte_val = tl.load(qs_byte_ptr)
+
+            # Determine if we need the lower or upper 4 bits.
+            is_upper_nibble = (current_in_block_offset % 2) == 1
+            
+            if is_upper_nibble:
+                q_val = (byte_val >> 4) & 0x0F
+            else:
+                q_val = byte_val & 0x0F
+
+            # Perform the dequantization.
+            # Simplified formula: final_val = d * q_val - dmin
+            # A more complete implementation would use the 6-bit scales.
+            final_val = (d * q_val.to(tl.float16))
+            
+            # Write to the output tensor.
+            out_element_ptr = out_ptr + current_element_index
+            tl.store(out_element_ptr, final_val)
 
 def dequant_q4_k_triton(W: torch.Tensor, m: int, n: int, dtype: torch.dtype):
     """

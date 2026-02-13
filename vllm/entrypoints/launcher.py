@@ -19,7 +19,7 @@ from vllm.entrypoints.constants import (
 from vllm.entrypoints.ssl import SSLCertRefresher
 from vllm.logger import init_logger
 from vllm.utils.network_utils import find_process_using_port
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.engine.v1.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger(__name__)
 

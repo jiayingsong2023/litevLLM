@@ -29,13 +29,13 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.backend import (
+from vllm.attention.backend import (
     AttentionBackend,
     AttentionType,
 )
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import (
+from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.selector import get_attn_backend
+from vllm.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,

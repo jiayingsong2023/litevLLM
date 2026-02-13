@@ -8,7 +8,7 @@ import json
 from collections.abc import Mapping
 
 from vllm.logger import init_logger
-from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
+from vllm.metrics.reader import Gauge, get_metrics_snapshot
 
 logger = init_logger(__name__)
 

@@ -60,7 +60,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
-from vllm.v1.attention.backend import AttentionType
+from vllm.attention.backend import AttentionType
 
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (

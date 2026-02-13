@@ -235,7 +235,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.backend import (
+from vllm.attention.backend import (
     AttentionBackend,
     AttentionLayer,
     AttentionMetadata,
@@ -245,17 +245,17 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     SparseMLAAttentionImpl,
 )
-from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
-from vllm.v1.attention.backends.utils import (
+from vllm.attention.backends.fa_utils import get_flash_attn_version
+from vllm.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import (
+from vllm.attention.ops.common import cp_lse_ag_out_rs
+from vllm.attention.ops.merge_attn_states import merge_attn_states
+from vllm.attention.selector import get_attn_backend
+from vllm.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,

@@ -24,7 +24,7 @@ from vllm.model_executor.models.llama import (
     LlamaModel,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
+from vllm.attention.backend import AttentionType
 
 from .utils import AutoWeightsLoader
 

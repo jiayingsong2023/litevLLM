@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 from vllm.tasks import PoolingTask
-from vllm.v1.outputs import PoolerOutput
-from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.v1_outputs import PoolerOutput
+from vllm.pool.metadata import PoolingMetadata
 
 from .common import PoolingParamsUpdate
 

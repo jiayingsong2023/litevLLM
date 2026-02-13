@@ -61,7 +61,7 @@ from vllm.multimodal.processing import (
 from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.v1.attention.backend import AttentionType
+from vllm.attention.backend import AttentionType
 
 logger = init_logger(__name__)
 DEFAULT_FINAL_IMAGE_SIZE = (2048, 1648)

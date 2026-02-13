@@ -28,8 +28,8 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
+from vllm.attention.backend import AttentionMetadata
+from vllm.attention.backends.linear_attn import LinearAttentionMetadata
 
 
 class MiniMaxText01RMSNormTP(CustomOp):

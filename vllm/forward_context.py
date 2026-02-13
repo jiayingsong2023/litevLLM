@@ -13,8 +13,8 @@ import vllm.envs as envs
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.worker.ubatch_utils import UBatchSlices
+from vllm.attention.backend import AttentionMetadata
+from vllm.worker.ubatch_utils import UBatchSlices
 
 logger = init_logger(__name__)
 

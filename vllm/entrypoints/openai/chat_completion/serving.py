@@ -84,7 +84,7 @@ from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.tool_parsers.utils import partial_json_loads
 from vllm.utils.collection_utils import as_list
-from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
+from vllm.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
 

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
     from ray.util.placement_group import PlacementGroup
 
-    from vllm.v1.executor import Executor
+    from vllm.executor import Executor
 else:
     RuntimeEnv = Any
     PlacementGroup = Any

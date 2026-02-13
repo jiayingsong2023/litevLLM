@@ -11,7 +11,7 @@ from vllm.config import get_current_vllm_config
 from vllm.config.pooler import TokenPoolingType
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.tasks import PoolingTask
-from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.pool.metadata import PoolingMetadata
 
 TokenPoolingMethodOutputItem: TypeAlias = torch.Tensor | None
 

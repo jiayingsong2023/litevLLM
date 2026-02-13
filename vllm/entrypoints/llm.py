@@ -78,11 +78,11 @@ from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.collection_utils import as_iter, is_list_of
 from vllm.utils.counter import Counter
-from vllm.v1.engine.llm_engine import LLMEngine
-from vllm.v1.sample.logits_processor import LogitsProcessor
+from vllm.engine.v1.llm_engine import LLMEngine
+from vllm.sample.logits_processor import LogitsProcessor
 
 if TYPE_CHECKING:
-    from vllm.v1.metrics.reader import Metric
+    from vllm.metrics.reader import Metric
 
 logger = init_logger(__name__)
 

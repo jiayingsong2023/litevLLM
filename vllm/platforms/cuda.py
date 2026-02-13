@@ -17,14 +17,14 @@ import vllm._C  # noqa
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
 from vllm.utils.torch_utils import cuda_device_count_stateless
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.config.cache import CacheDType
-    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
     CacheDType = None
@@ -148,13 +148,13 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.attention.backends.registry import AttentionBackendEnum
 
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            parallel_config.worker_cls = "vllm.worker.gpu_worker.Worker"
 
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
@@ -180,7 +180,7 @@ class CudaPlatformBase(Platform):
             use_cutlass_mla = False
             use_flashinfer_mla = False
 
-            from vllm.v1.attention.ops.flashmla import is_flashmla_dense_supported
+            from vllm.attention.ops.flashmla import is_flashmla_dense_supported
 
             if vllm_config.attention_config.backend is None:
                 # Default case

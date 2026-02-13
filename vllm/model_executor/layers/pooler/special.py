@@ -8,7 +8,7 @@ import torch
 from vllm.config import PoolerConfig
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.tasks import PoolingTask
-from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.pool.metadata import PoolingMetadata
 
 from .abstract import Pooler, PoolerOutput
 from .common import ClassifierFn

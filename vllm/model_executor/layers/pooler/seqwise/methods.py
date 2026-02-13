@@ -10,7 +10,7 @@ import torch.nn as nn
 from vllm.config.pooler import SequencePoolingType
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.tasks import PoolingTask
-from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.pool.metadata import PoolingMetadata
 
 SequencePoolingMethodOutput: TypeAlias = torch.Tensor | list[torch.Tensor]
 

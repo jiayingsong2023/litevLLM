@@ -49,7 +49,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionMetadata
+from vllm.attention.backend import AttentionMetadata
 
 from .interfaces import HasInnerState, IsHybrid
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers

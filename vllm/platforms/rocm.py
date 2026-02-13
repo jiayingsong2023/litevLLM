@@ -10,13 +10,13 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import cuda_device_count_stateless
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.attention.selector import AttentionSelectorConfig
 
 logger = init_logger(__name__)
 
@@ -393,7 +393,7 @@ class RocmPlatform(Platform):
                 cache_config.block_size = 16
 
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            parallel_config.worker_cls = "vllm.worker.gpu_worker.Worker"
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.
         if (
             use_aiter_rms_norm

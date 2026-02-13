@@ -37,7 +37,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.cache import LRUCache
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.worker.utils import MultiModalBudget
+from vllm.worker.utils import MultiModalBudget
 
 logger = init_logger(__name__)
 

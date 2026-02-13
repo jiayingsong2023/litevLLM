@@ -10,15 +10,15 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backend import (
+from vllm.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
     subclass_attention_backend_with_overrides,
 )
-from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec
+from vllm.attention.selector import get_attn_backend
+from vllm.kv_cache_interface import CrossAttentionSpec, KVCacheSpec
 
 logger = init_logger(__name__)
 

@@ -41,7 +41,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
+from vllm.attention.backend import AttentionType
 
 STEP_PACKED_MODULES_MAPPING = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],

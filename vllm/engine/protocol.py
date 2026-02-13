@@ -14,8 +14,8 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
-from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.input_processor import InputProcessor
+from vllm.engine.v1 import EngineCoreRequest
+from vllm.engine.v1.input_processor import InputProcessor
 
 
 class EngineClient(ABC):
