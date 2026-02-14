@@ -80,6 +80,9 @@ from vllm.utils.collection_utils import as_iter, is_list_of
 from vllm.utils.counter import Counter
 from vllm.engine.v1.llm_engine import LLMEngine
 from vllm.sample.logits_processor import LogitsProcessor
+from vllm.entrypoints.output_processors.abstract import OutputProcessorStrategy
+from vllm.entrypoints.output_processors.default import DefaultOutputProcessor
+from vllm.entrypoints.output_processors.verl import VerlOutputProcessor
 
 if TYPE_CHECKING:
     from vllm.metrics.reader import Metric
@@ -183,6 +186,9 @@ class LLM:
             dictionary or an AttentionConfig instance. If a dictionary, it will
             be converted to an AttentionConfig. Allows specifying the attention
             backend and other attention-related settings.
+        output_processor_type: The type of output processor to use. Currently
+            supported: "default" (standard vLLM output), "verl" (vectorized
+            output for Verl RLHF). Defaults to "default".
         **kwargs: Arguments for [`EngineArgs`][vllm.EngineArgs].
 
     Note:
@@ -226,6 +232,7 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
+        output_processor_type: str = "default",
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -356,6 +363,12 @@ class LLM:
         # Cache for __repr__ to avoid repeated collective_rpc calls
         self._cached_repr: str | None = None
 
+        # Initialize Output Processor
+        if output_processor_type == "verl":
+            self.output_processor = VerlOutputProcessor()
+        else:
+            self.output_processor = DefaultOutputProcessor()
+
     def get_tokenizer(self) -> TokenizerLike:
         return self.llm_engine.get_tokenizer()
 
@@ -379,7 +392,7 @@ class LLM:
         lora_request: list[LoRARequest] | LoRARequest | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> list[RequestOutput]:
+    ) -> list[RequestOutput] | Any:
         """Generates the completions for the input prompts.
 
         This class automatically batches the given prompts, considering
@@ -433,7 +446,8 @@ class LLM:
         )
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
-        return self.engine_class.validate_outputs(outputs, RequestOutput)
+        validated_outputs = self.engine_class.validate_outputs(outputs, RequestOutput)
+        return self.output_processor.process_outputs(validated_outputs)
 
     def _get_modality_specific_lora_reqs(
         self,
