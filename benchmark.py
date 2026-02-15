@@ -8,10 +8,8 @@ def benchmark():
     
     print(f"Loading model: {model_path}...")
     start_load = time.time()
-    # n_gpu_layers=-1 means offload all layers to GPU if possible
-    # For now, using default (CPU) to ensure stability, 
-    # but since the user has AMD GPU, we can try n_gpu_layers=35
-    llm = Llama(model_path=model_path, n_ctx=2048, n_gpu_layers=0) 
+    # n_gpu_layers=-1 means offload all layers to GPU
+    llm = Llama(model_path=model_path, n_ctx=2048, n_gpu_layers=-1) 
     load_time = time.time() - start_load
     print(f"Model loaded in {load_time:.2f}s")
 

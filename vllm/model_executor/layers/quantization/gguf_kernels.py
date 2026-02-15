@@ -9,10 +9,10 @@ from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
 from vllm.kernels.triton.gguf_gemm import matmul_q4_k_vec
 
 # LRU Cache to store dequantized weights on GPU
-# Default size is increased to 128 to reduce cache thrashing on 7B models.
-# Llama-2-7B has ~224 weights. 128 covers >50% of the model.
+# Default size is increased to 300 to reduce cache thrashing on 7B models.
+# Llama-2-7B has ~291 tensors. 300 covers the entire model.
 # Users can override this via VLLM_GGUF_CACHE_SIZE env var.
-_CACHE_CAPACITY = int(os.environ.get("VLLM_GGUF_CACHE_SIZE", "128"))
+_CACHE_CAPACITY = int(os.environ.get("VLLM_GGUF_CACHE_SIZE", "300"))
 _DEQUANT_CACHE = OrderedDict()
 
 def ggml_dequantize_fallback(
@@ -47,6 +47,7 @@ def ggml_dequantize_fallback(
         res = dequant_q4_k_triton(W, m, n, dtype)
     else:
         # 其它类型暂时保留 CPU 降级
+        # print(f"Fallback dequant for type {quant_type} (m={m}, n={n})")
         w_np = W.cpu().numpy()
         dequant_np = dequantize(w_np, GGMLQuantizationType(quant_type))
         output = torch.from_numpy(dequant_np).to(device=W.device, dtype=dtype)

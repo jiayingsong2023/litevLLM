@@ -5088,7 +5088,7 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
-        with freeze_gc(), graph_capture(device=self.device):
+        with freeze_gc(), graph_capture():
             start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
             for (
