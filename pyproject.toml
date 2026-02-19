@@ -54,7 +54,7 @@ dependencies = [
     "peft",
     "datasets",
     "timm>=1.0.17",
-    "numba == 0.61.2",
+    "numba == 0.64.0",
     "torchvision == 0.24.0",
     "gguf>=0.17.1",
     "cloudpickle",
