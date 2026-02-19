@@ -104,58 +104,120 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
     # lazy import to avoid triggering `torch.compile` too early
-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+    method_to_config: dict[str, type[QuantizationConfig]] = {}
+    
+    try:
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+        method_to_config["quark"] = QuarkConfig
+    except ImportError: pass
 
-    from .awq import AWQConfig
-    from .awq_marlin import AWQMarlinConfig
-    from .bitsandbytes import BitsAndBytesConfig
-    from .compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
-    from .cpu_wna16 import CPUAWQConfig
-    from .experts_int8 import ExpertsInt8Config
-    from .fbgemm_fp8 import FBGEMMFp8Config
-    from .fp8 import Fp8Config
-    from .fp_quant import FPQuantConfig
-    from .gguf import GGUFConfig
-    from .gptq import GPTQConfig
-    from .gptq_marlin import GPTQMarlinConfig
-    from .inc import INCConfig
-    from .ipex_quant import IPEXConfig
-    from .modelopt import ModelOptFp8Config, ModelOptNvFp4Config
-    from .moe_wna16 import MoeWNA16Config
-    from .mxfp4 import Mxfp4Config
-    from .petit import PetitNvFp4Config
-    from .ptpc_fp8 import PTPCFp8Config
-    from .torchao import TorchAOConfig
+    try:
+        from .awq import AWQConfig
+        method_to_config["awq"] = AWQConfig
+    except ImportError: pass
 
-    method_to_config: dict[str, type[QuantizationConfig]] = {
-        "awq": AWQConfig,
-        "fp8": Fp8Config,
-        "fbgemm_fp8": FBGEMMFp8Config,
-        "fp_quant": FPQuantConfig,
-        "modelopt": ModelOptFp8Config,
-        "modelopt_fp4": ModelOptNvFp4Config,
-        "gguf": GGUFConfig,
-        "gptq_marlin": GPTQMarlinConfig,
-        "awq_marlin": AWQMarlinConfig,
-        "gptq": GPTQConfig,
-        "compressed-tensors": CompressedTensorsConfig,
-        "bitsandbytes": BitsAndBytesConfig,
-        "ptpc_fp8": PTPCFp8Config,
-        "experts_int8": ExpertsInt8Config,
-        "ipex": IPEXConfig,
-        "quark": QuarkConfig,
-        "moe_wna16": MoeWNA16Config,
-        "torchao": TorchAOConfig,
-        "auto-round": INCConfig,
-        "inc": INCConfig,
-        "mxfp4": Mxfp4Config,
-        "petit_nvfp4": PetitNvFp4Config,
-        "cpu_awq": CPUAWQConfig,
-    }
+    try:
+        from .awq_marlin import AWQMarlinConfig
+        method_to_config["awq_marlin"] = AWQMarlinConfig
+    except ImportError: pass
+
+    try:
+        from .bitsandbytes import BitsAndBytesConfig
+        method_to_config["bitsandbytes"] = BitsAndBytesConfig
+    except ImportError: pass
+
+    try:
+        from .compressed_tensors.compressed_tensors import CompressedTensorsConfig
+        method_to_config["compressed-tensors"] = CompressedTensorsConfig
+    except ImportError: pass
+
+    try:
+        from .cpu_wna16 import CPUAWQConfig
+        method_to_config["cpu_awq"] = CPUAWQConfig
+    except ImportError: pass
+
+    try:
+        from .experts_int8 import ExpertsInt8Config
+        method_to_config["experts_int8"] = ExpertsInt8Config
+    except ImportError: pass
+
+    try:
+        from .fbgemm_fp8 import FBGEMMFp8Config
+        method_to_config["fbgemm_fp8"] = FBGEMMFp8Config
+    except ImportError: pass
+
+    try:
+        from .fp8 import Fp8Config
+        method_to_config["fp8"] = Fp8Config
+    except ImportError: pass
+
+    try:
+        from .fp_quant import FPQuantConfig
+        method_to_config["fp_quant"] = FPQuantConfig
+    except ImportError: pass
+
+    try:
+        from .gguf import GGUFConfig
+        method_to_config["gguf"] = GGUFConfig
+    except ImportError: pass
+
+    try:
+        from .gptq import GPTQConfig
+        method_to_config["gptq"] = GPTQConfig
+    except ImportError: pass
+
+    try:
+        from .gptq_marlin import GPTQMarlinConfig
+        method_to_config["gptq_marlin"] = GPTQMarlinConfig
+    except ImportError: pass
+
+    try:
+        from .inc import INCConfig
+        method_to_config["inc"] = INCConfig
+        method_to_config["auto-round"] = INCConfig
+    except ImportError: pass
+
+    try:
+        from .ipex_quant import IPEXConfig
+        method_to_config["ipex"] = IPEXConfig
+    except ImportError: pass
+
+    try:
+        from .modelopt import ModelOptFp8Config, ModelOptNvFp4Config
+        method_to_config["modelopt"] = ModelOptFp8Config
+        method_to_config["modelopt_fp4"] = ModelOptNvFp4Config
+    except ImportError: pass
+
+    try:
+        from .moe_wna16 import MoeWNA16Config
+        method_to_config["moe_wna16"] = MoeWNA16Config
+    except ImportError: pass
+
+    try:
+        from .mxfp4 import Mxfp4Config
+        method_to_config["mxfp4"] = Mxfp4Config
+    except ImportError: pass
+
+    try:
+        from .petit import PetitNvFp4Config
+        method_to_config["petit_nvfp4"] = PetitNvFp4Config
+    except ImportError: pass
+
+    try:
+        from .ptpc_fp8 import PTPCFp8Config
+        method_to_config["ptpc_fp8"] = PTPCFp8Config
+    except ImportError: pass
+
+    try:
+        from .torchao import TorchAOConfig
+        method_to_config["torchao"] = TorchAOConfig
+    except ImportError: pass
+
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+
+    if quantization not in method_to_config:
+        raise ImportError(f"Quantization method {quantization} is not available in this simplified build.")
 
     return method_to_config[quantization]
 

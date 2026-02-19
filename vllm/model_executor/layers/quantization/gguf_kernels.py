@@ -42,16 +42,25 @@ def ggml_dequantize_fallback(
         _DEQUANT_CACHE.move_to_end(cache_key)
         return _DEQUANT_CACHE[cache_key]
 
+    # Handle MoE 3D tensors [E, rows, cols_bytes]
+    orig_shape = W.shape
+    if len(W.shape) == 3:
+        W_flat = W.view(-1, W.shape[-1])
+        m_total = W.shape[0] * m
+    else:
+        W_flat = W
+        m_total = m
+
     # Q4_K (Type 12) 使用原生 Triton 内核
     if quant_type == 12:
-        res = dequant_q4_k_triton(W, m, n, dtype)
+        res_flat = dequant_q4_k_triton(W_flat, m_total, n, dtype)
     else:
-        # 其它类型暂时保留 CPU 降级
-        # print(f"Fallback dequant for type {quant_type} (m={m}, n={n})")
-        w_np = W.cpu().numpy()
+        # print(f"Fallback dequant for type {quant_type} (m_total={m_total}, n={n})")
+        w_np = W_flat.cpu().numpy()
         dequant_np = dequantize(w_np, GGMLQuantizationType(quant_type))
-        output = torch.from_numpy(dequant_np).to(device=W.device, dtype=dtype)
-        res = output.view(m, n)
+        res_flat = torch.from_numpy(dequant_np).to(device=W.device, dtype=dtype)
+
+    res = res_flat.view(orig_shape[0], m, n) if len(orig_shape) == 3 else res_flat.view(m, n)
 
     # Add to cache and evict if necessary
     _DEQUANT_CACHE[cache_key] = res
