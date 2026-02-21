@@ -11,8 +11,8 @@ from typing_extensions import TypeVar
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import stateless_destroy_torch_distributed_process_group
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed import (stateless_destroy_torch_distributed_process_group,
+                              get_dp_group)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger

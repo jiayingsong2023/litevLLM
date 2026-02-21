@@ -1081,9 +1081,11 @@ def get_moe_configs(
                 )
                 # If a configuration has been found, return it
                 tuned_config = json.load(f)
-                # Delete triton_version from tuned_config
-                tuned_config.pop("triton_version", None)
-                return {int(key): val for key, val in tuned_config.items()}
+                return {
+                    int(key): val
+                    for key, val in tuned_config.items()
+                    if key.isdigit()
+                }
 
     # If no optimized configuration is available, we will use the default
     # configuration
