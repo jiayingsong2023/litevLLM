@@ -67,26 +67,45 @@ logger = init_logger(__name__)
 
 _TEXT_GENERATION_MODELS = {
     # [Decoder-only]
+    "AquilaModel": ("llama", "LlamaForCausalLM"),
+    "AquilaForCausalLM": ("llama", "LlamaForCausalLM"),  # AquilaChat2
     # baichuan-7b, upper case 'C' in the class name
     # baichuan-13b, lower case 'c' in the class name
-    "GemmaForCausalLM": ("gemma", "GemmaForCausalLM"),
-    "Gemma2ForCausalLM": ("gemma2", "Gemma2ForCausalLM"),
+    "ChatGLMModel": ("chatglm", "ChatGLMForCausalLM"),
+    "ChatGLMForConditionalGeneration": ("chatglm", "ChatGLMForCausalLM"),
+    "CwmForCausalLM": ("llama", "LlamaForCausalLM"),
+    "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
+    "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
+    "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+    "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+    "GlmForCausalLM": ("glm", "GlmForCausalLM"),
+    "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
+    "InternLMForCausalLM": ("llama", "LlamaForCausalLM"),
+    "InternLM3ForCausalLM": ("llama", "LlamaForCausalLM"),
+    "IQuestCoderForCausalLM": ("llama", "LlamaForCausalLM"),
+    "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),  # noqa: E501
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
+    "MiniMaxForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
+    "MiniMaxText01ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
+    "MiniMaxM1ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
+    "MiniMaxM2ForCausalLM": ("minimax_m2", "MiniMaxM2ForCausalLM"),
     "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
     "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
     # transformers's mpt class has lower case
-    "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
     "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
+    "XverseForCausalLM": ("llama", "LlamaForCausalLM"),
 }
 
 _EMBEDDING_MODELS = {
     # [Text-only]
     "BertModel": ("bert", "BertEmbeddingModel"),
-    "Gemma2Model": ("gemma2", "Gemma2ForCausalLM"),
+    "BertSpladeSparseEmbeddingModel": ("bert", "BertSpladeSparseEmbeddingModel"),
+    "GlmForCausalLM": ("glm", "GlmForCausalLM"),
+    "LlamaBidirectionalModel": ("llama", "LlamaBidirectionalModel"),
     "LlamaModel": ("llama", "LlamaForCausalLM"),
     **{
         # Multiple models share the same architecture, so we include them all
@@ -95,10 +114,12 @@ _EMBEDDING_MODELS = {
         if arch == "LlamaForCausalLM"
     },
     "MistralModel": ("llama", "LlamaForCausalLM"),
-    "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
     "Qwen2Model": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+    "RobertaForMaskedLM": ("roberta", "RobertaEmbeddingModel"),
     "RobertaModel": ("roberta", "RobertaEmbeddingModel"),
+    "XLMRobertaModel": ("roberta", "RobertaEmbeddingModel"),
+    "BgeM3EmbeddingModel": ("roberta", "BgeM3EmbeddingModel"),
     # [Multimodal]
     "LlavaNextForConditionalGeneration": (
         "llava_next",
@@ -112,6 +133,8 @@ _EMBEDDING_MODELS = {
 }
 
 _CROSS_ENCODER_MODELS = {
+    "BertForSequenceClassification": ("bert", "BertForSequenceClassification"),
+    "BertForTokenClassification": ("bert", "BertForTokenClassification"),
     "GteNewForSequenceClassification": (
         "bert_with_rope",
         "GteNewForSequenceClassification",
@@ -128,6 +151,7 @@ _CROSS_ENCODER_MODELS = {
         "modernbert",
         "ModernBertForTokenClassification",
     ),
+    "RobertaForSequenceClassification": ("roberta", "RobertaForSequenceClassification"),
     "XLMRobertaForSequenceClassification": (
         "roberta",
         "RobertaForSequenceClassification",
@@ -148,6 +172,7 @@ _MULTIMODAL_MODELS = {
         "cohere2_vision",
         "Cohere2VisionForConditionalGeneration",
     ),
+    "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
     "Eagle2_5_VLForConditionalGeneration": (
         "eagle2_5_vl",
         "Eagle2_5_VLForConditionalGeneration",
@@ -156,10 +181,12 @@ _MULTIMODAL_MODELS = {
         "ernie45_vl",
         "Ernie4_5_VLMoeForConditionalGeneration",
     ),
+    "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
     "HunYuanVLForConditionalGeneration": (
         "hunyuan_vision",
         "HunYuanVLForConditionalGeneration",
     ),
+    "InternVLChatModel": ("internvl", "InternVLChatModel"),
     "OpenCUAForConditionalGeneration": (
         "opencua",
         "OpenCUAForConditionalGeneration",
@@ -180,11 +207,11 @@ _MULTIMODAL_MODELS = {
         "keye_vl1_5",
         "KeyeVL1_5ForConditionalGeneration",
     ),
+    "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),  # noqa: E501
     "LightOnOCRForConditionalGeneration": (
         "lightonocr",
         "LightOnOCRForConditionalGeneration",
     ),
-    "LlavaForConditionalGeneration": ("llava", "LlavaForConditionalGeneration"),
     "LlavaNextForConditionalGeneration": (
         "llava_next",
         "LlavaNextForConditionalGeneration",
@@ -252,6 +279,7 @@ _SPECULATIVE_DECODING_MODELS = {
 
 _TRANSFORMERS_SUPPORTED_MODELS = {
     # Text generation models
+    "SmolLM3ForCausalLM": ("transformers", "TransformersForCausalLM"),
     # Multimodal models
     "Emu3ForConditionalGeneration": (
         "transformers",
@@ -261,6 +289,8 @@ _TRANSFORMERS_SUPPORTED_MODELS = {
 
 _TRANSFORMERS_BACKEND_MODELS = {
     # Text generation models
+    "TransformersForCausalLM": ("transformers", "TransformersForCausalLM"),
+    "TransformersMoEForCausalLM": ("transformers", "TransformersMoEForCausalLM"),
     # Multimodal models
     "TransformersMultiModalForCausalLM": (
         "transformers",
@@ -271,6 +301,8 @@ _TRANSFORMERS_BACKEND_MODELS = {
         "TransformersMultiModalMoEForCausalLM",
     ),
     # Embedding models
+    "TransformersEmbeddingModel": ("transformers", "TransformersEmbeddingModel"),
+    "TransformersMoEEmbeddingModel": ("transformers", "TransformersMoEEmbeddingModel"),
     "TransformersMultiModalEmbeddingModel": (
         "transformers",
         "TransformersMultiModalEmbeddingModel",
