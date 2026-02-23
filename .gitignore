@@ -241,3 +241,5 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 .gemini/
 gha-creds-*.json
+models/
+*.gguf
