@@ -30,6 +30,12 @@ The new Triton kernels were benchmarked against the PyTorch Native implementatio
 ## Usage
 The migration is transparent. `vllm.model_executor.layers.layernorm.RMSNorm` will automatically use the Triton kernel when running on CUDA/ROCm.
 
+## Architecture Standardization (LiteBase)
+To further optimize the "Lite" architecture, we have modularized the model implementations:
+1.  **Generic Base Classes**: Created `vllm/model_executor/models/lite_base.py` which provides unified logic for Llama-like models.
+2.  **Redundancy Removal**: Eliminated duplicate forward/loading logic across 20+ redundant model files.
+3.  **Unified Linear Layer**: All models now use `LiteLinear` which dispatches directly to Triton-optimized paths and handles sharded weight loading without distributed overhead.
+
 ## Verification
 *   **Correctness**: Validated via `tests/kernels/triton/test_rms_norm.py`. Max difference vs Native < 1e-3 (FP16).
 *   **Benchmark**: Reproduce results using `python3 benchmarks/benchmark_triton_rms_norm.py`.

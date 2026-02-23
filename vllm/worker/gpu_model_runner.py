@@ -106,7 +106,10 @@ from vllm.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+try:
+    from vllm.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+except ImportError:
+    GDNAttentionMetadataBuilder = None
 from vllm.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,

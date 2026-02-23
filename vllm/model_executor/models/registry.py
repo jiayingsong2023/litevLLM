@@ -91,7 +91,7 @@ _TEXT_GENERATION_MODELS = {
     "MiniMaxText01ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM1ForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),
     "MiniMaxM2ForCausalLM": ("minimax_m2", "MiniMaxM2ForCausalLM"),
-    "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
+    "MistralForCausalLM": ("llama", "LiteForCausalLM"),
     "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
     # transformers's mpt class has lower case
     "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),

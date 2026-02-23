@@ -19,18 +19,21 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
 )
-from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
-    MarlinExperts,
-)
+try:
+    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
+except ImportError:
+    MarlinExperts = None
+
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     TritonExperts,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
-    FusedMoEModularMethod,
-)
-from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-    UnfusedOAITritonExperts,
-)
+try:
+    from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
+        UnfusedOAITritonExperts,
+    )
+except ImportError:
+    UnfusedOAITritonExperts = None
+
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
 )
