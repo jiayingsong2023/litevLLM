@@ -38,6 +38,7 @@ def split_tensor_along_last_dim(tensor, num_partitions, contiguous_split_chunks=
 def divide(x, y): return x // y
 
 def ensure_model_parallel_initialized(*args, **kwargs): pass
+def initialize_model_parallel(*args, **kwargs): pass
 def init_distributed_environment(*args, **kwargs): pass
 def set_custom_all_reduce(*args, **kwargs): pass
 def stateless_destroy_torch_distributed_process_group(*args, **kwargs): pass
@@ -62,6 +63,9 @@ def graph_capture():
     yield
 
 def prepare_communication_buffer_for_model(*args, **kwargs):
+    pass
+
+def cleanup_dist_env_and_memory():
     pass
 
 def get_pp_indices(num_layers, world_size, rank):
