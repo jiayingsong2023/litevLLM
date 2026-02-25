@@ -137,6 +137,7 @@ class PriorityRequestQueue(RequestQueue):
     If multiple requests have the same priority, the one with the earlier
     `arrival_time` is processed first.
     """
+    __slots__ = ("_heap",)
 
     def __init__(self) -> None:
         self._heap: list[Request] = []

@@ -104,7 +104,7 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
         NONE_HASH = BlockHash(hash_fn(hash_seed))
 
 
-@dataclass
+@dataclass(slots=True)
 class KVCacheBlock:
     """KV-cache block metadata."""
 
@@ -174,6 +174,7 @@ class FreeKVCacheBlockQueue:
     Args:
         blocks: A list of KVCacheBlock objects.
     """
+    __slots__ = ("num_free_blocks", "fake_free_list_head", "fake_free_list_tail")
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)

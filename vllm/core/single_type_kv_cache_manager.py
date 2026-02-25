@@ -26,6 +26,18 @@ class SingleTypeKVCacheManager(ABC):
     An abstract base class for a manager that handle the kv cache management
     logic of one specific type of attention layer.
     """
+    __slots__ = (
+        "block_size",
+        "dcp_world_size",
+        "pcp_world_size",
+        "kv_cache_spec",
+        "block_pool",
+        "enable_caching",
+        "req_to_blocks",
+        "num_cached_block",
+        "kv_cache_group_id",
+        "_null_block",
+    )
 
     def __init__(
         self,
@@ -398,6 +410,7 @@ class SingleTypeKVCacheManager(ABC):
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
+    __slots__ = ()
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -459,6 +472,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    __slots__ = ("sliding_window",)
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
@@ -592,6 +606,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
+    __slots__ = ("attention_chunk_size",)
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.attention_chunk_size = kv_cache_spec.attention_chunk_size
@@ -742,6 +757,13 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 
 class MambaManager(SingleTypeKVCacheManager):
+    __slots__ = (
+        "mamba_cache_mode",
+        "num_speculative_blocks",
+        "last_state_block_idx",
+        "_allocated_block_reqs",
+    )
+
     def __init__(self, kv_cache_spec: MambaSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode

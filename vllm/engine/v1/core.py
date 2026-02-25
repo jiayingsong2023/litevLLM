@@ -409,7 +409,7 @@ class EngineCore:
 
     def step_with_batch_queue(
         self,
-    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+    ) -> tuple[EngineCoreOutputs | None, bool]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 

@@ -19,7 +19,7 @@ from vllm.request import Request
 logger = init_logger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class KVCacheBlocks:
     """
     The allocation result of KVCacheManager, work as the interface between
@@ -93,6 +93,20 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    __slots__ = (
+        "max_model_len",
+        "enable_caching",
+        "use_eagle",
+        "log_stats",
+        "metrics_collector",
+        "prefix_cache_stats",
+        "coordinator",
+        "num_kv_cache_groups",
+        "block_pool",
+        "kv_cache_config",
+        "empty_kv_cache_blocks",
+    )
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,

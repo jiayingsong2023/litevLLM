@@ -50,6 +50,7 @@ class BlockHashToBlockMap:
     NOTE #2: The union type is introduced in order to reduce GC costs
     from the inner dict.
     """
+    __slots__ = ("_cache",)
 
     def __init__(self):
         self._cache: dict[
@@ -142,6 +143,18 @@ class BlockPool:
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
     """
+    __slots__ = (
+        "num_gpu_blocks",
+        "enable_caching",
+        "hash_block_size",
+        "blocks",
+        "free_block_queue",
+        "cached_block_hash_to_block",
+        "null_block",
+        "enable_kv_cache_events",
+        "kv_event_queue",
+        "metrics_collector",
+    )
 
     def __init__(
         self,

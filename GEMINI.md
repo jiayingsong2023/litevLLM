@@ -15,6 +15,7 @@
 *   **`vllm/engine/lite_engine.py`**: Core orchestration logic for the single-GPU inference loop.
 *   **`vllm/distributed/`**: Compatibility shims (`parallel_state.py`, `utils.py`) for single-device execution.
 *   **`vllm/attention/backends/triton_attn.py`**: The sole production attention backend (FlashAttention implementation in Triton).
+*   **`vllm/config/`**: Refactored to remove distributed (`parallel_config.py` simplified), speculative, and profiler configurations. `VllmConfig` is streamlined.
 
 ## Usage & Development
 
@@ -39,3 +40,4 @@ uv pip install -e .
 *   **Adding Models:** Check `llama.py` for examples. Usually, you just need to alias `LiteModel` and `LiteForCausalLM` or subclass `LiteDecoderLayer` for custom logic (like `GemmaLiteModel`).
 *   **Circular Imports:** Avoid importing from `vllm.model_executor.model_loader.weight_utils` at the top level of layer files; import inside methods if needed.
 *   **No C++:** Never add code that requires a C++ compiler. Use Triton for kernels.
+*   **No Distributed:** Do not re-introduce distributed logic or dependencies (e.g. `torch.distributed`). The engine is strict single-GPU.

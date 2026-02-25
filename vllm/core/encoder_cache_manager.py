@@ -17,53 +17,16 @@ logger = init_logger(__name__)
 
 class EncoderCacheManager:
     """Manages caching of encoder outputs for multimodal models in vLLM V1.
-
-    The EncoderCacheManager handles the lifecycle of multimodal encoder outputs
-    (such as vision embeddings from images) during request processing. It
-    provides memory-aware caching to avoid recomputing encoder outputs when the
-    same multimodal inputs appear in different stages of request processing.
-
-    This manager is particularly important for:
-    - Vision-language models (e.g., LLaVA) where image encoder outputs are
-      cached
-    - Any multimodal model where encoder computation is expensive and
-      cacheable
-
-    The cache operates at the granularity of individual multimodal input items
-    within requests, allowing for fine-grained memory management and enabling
-    chunked processing of multimodal inputs.
-
-    Cache is enabled to share embeddings of same multimodal data
-    item (identified by their hash value) between different requests,
-    and eviction takes place at allocation time when there's no free
-    space for new embeddings.
-    Oldest cached embeddings with no request referenced will be first evicted.
-
-    NOTE: The EncoderCacheManager operates on the level of multimodal embeddings
-    instead of encoder tokens (i.e. all tokens that represent the multimodal data
-    in the input sequence). This means all break/text tokens in-between multimodal
-    embeddings are not considered with respect to the cache size and the number
-    of free slots.
-
-    Args:
-        cache_size: Limit the size of the cache, measured by the number of
-                    encoder embeddings from the input sequence.
-
-    Attributes:
-        cache_size: Total cache capacity in encoder embeddings.
-        num_free_slots: Current available cache capacity in encoder embeddings.
-        num_freeable_slots: Capacity that can be immediately reclaimed by
-            evicting entries with zero references (in encoder embeddings).
-        cached: Mapping from mm_hash to a set of request IDs that currently
-            reference the cached entry. If the set is empty, the entry exists
-            but is not referenced by any request and is eligible for
-            reclamation.
-        freeable: List of tuples (mm_hash, num_encoder_embeds) representing entries
-            whose no current running request is needed and that can be freed to
-            make space when needed.
-        freed: List of mm_hash strings that were actually evicted since the
-            last call to get_freed_mm_hashes(). This list is cleared on return.
+    ...
     """
+    __slots__ = (
+        "cache_size",
+        "num_free_slots",
+        "num_freeable_slots",
+        "cached",
+        "freeable",
+        "freed",
+    )
 
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
@@ -366,6 +329,7 @@ def compute_mm_encoder_budget(
 # utilize the cache and this class will fold into EncoderCacheManager, as
 # differences with MM models shrink.
 class EncoderDecoderCacheManager(EncoderCacheManager):
+    __slots__ = ("allocated", "to_free")
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
         self.num_free_slots = cache_size

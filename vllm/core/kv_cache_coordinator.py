@@ -29,6 +29,14 @@ class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
     """
+    __slots__ = (
+        "kv_cache_config",
+        "max_model_len",
+        "enable_caching",
+        "block_pool",
+        "use_eagle",
+        "single_type_managers",
+    )
 
     def __init__(
         self,
@@ -255,6 +263,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     supports arbitrary numbers of KV cache groups (including 0 groups).
     Does not implement any features related to prefix caching.
     """
+    __slots__ = ("num_single_type_manager",)
 
     def __init__(
         self,
@@ -300,6 +309,12 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
     case for models with only one KV cache type, e.g., all attention layers use
     full attention or all attention layers use sliding window attention.
     """
+    __slots__ = (
+        "kv_cache_spec",
+        "block_size",
+        "dcp_world_size",
+        "pcp_world_size",
+    )
 
     def __init__(
         self,
@@ -365,6 +380,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
     KV cache coordinator for hybrid models with multiple KV cache types, and
     thus multiple kv cache groups.
     """
+    __slots__ = (
+        "hash_block_size",
+        "attention_groups",
+        "lcm_block_size",
+    )
 
     def __init__(
         self,
