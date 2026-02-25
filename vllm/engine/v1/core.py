@@ -88,52 +88,30 @@ class EngineCore:
     ):
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
-
         load_general_plugins()
 
         self.vllm_config = vllm_config
-        if not vllm_config.parallel_config.data_parallel_rank_local:
-            logger.info(
-                "Initializing a V1 LLM engine (v%s) with config: %s",
-                VLLM_VERSION,
-                vllm_config,
-            )
+        logger.info("Initializing LitevLLM Engine (v%s)", VLLM_VERSION)
 
         self.log_stats = log_stats
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
-        if executor_fail_callback is not None:
-            self.model_executor.register_failure_callback(executor_fail_callback)
-
         self.available_gpu_memory_for_kv_cache = -1
 
-        # Setup KV Caches and update CacheConfig after profiling.
+        # Setup KV Caches
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
         )
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-
-        scheduler_block_size = (
-            vllm_config.cache_config.block_size
-            * vllm_config.parallel_config.decode_context_parallel_size
-            * vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        scheduler_block_size = vllm_config.cache_config.block_size
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -144,137 +122,47 @@ class EngineCore:
             block_size=scheduler_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
-        if self.scheduler.connector is not None:  # type: ignore
-            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+        self.mm_registry = MULTIMODAL_REGISTRY
+        self.mm_receiver_cache = self.mm_registry.engine_receiver_cache_from_config(vllm_config)
 
-        self.mm_registry = mm_registry = MULTIMODAL_REGISTRY
-        self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
-            vllm_config
-        )
-
-        # If a KV connector is initialized for scheduler, we want to collect
-        # handshake metadata from all workers so the connector in the scheduler
-        # will have the full context
-        kv_connector = self.scheduler.get_kv_connector()
-        if kv_connector is not None:
-            # Collect and store KV connector xfer metadata from workers
-            # (after KV cache registration)
-            xfer_handshake_metadata = (
-                self.model_executor.get_kv_connector_handshake_metadata()
-            )
-
-            if xfer_handshake_metadata:
-                # xfer_handshake_metadata is list of dicts from workers
-                # Each dict already has structure {tp_rank: metadata}
-                # Merge all worker dicts into a single dict
-                content: dict[int, Any] = {}
-                for worker_dict in xfer_handshake_metadata:
-                    if worker_dict is not None:
-                        content.update(worker_dict)
-                kv_connector.set_xfer_handshake_metadata(content)
-
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
-        ) = None
-        if self.batch_queue_size > 1:
-            logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
-            self.batch_queue = deque(maxlen=self.batch_queue_size)
-
-        self.is_ec_producer = (
-            vllm_config.ec_transfer_config is not None
-            and vllm_config.ec_transfer_config.is_ec_producer
-        )
+        # LitevLLM: No batch queue for single cards (minimizes latency)
+        self.batch_queue = None
+        self.is_ec_producer = False
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
-        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
-            caching_hash_fn = get_hash_fn_by_name(
-                vllm_config.cache_config.prefix_caching_hash_algo
-            )
+        self.request_block_hasher = None
+        if vllm_config.cache_config.enable_prefix_caching:
+            caching_hash_fn = get_hash_fn_by_name(vllm_config.cache_config.prefix_caching_hash_algo)
             init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(scheduler_block_size, caching_hash_fn)
 
-            self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
-            )
-
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
+        self.step_fn = self.step
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
-
         self.aborts_queue = queue.Queue[list[str]]()
-        # Mark the startup heap as static so that it's ignored by GC.
-        # Reduces pause times of oldest generation collections.
+        
         freeze_gc_heap()
-        # If enable, attach GC debugger after static variable freeze.
-        maybe_attach_gc_debug_callback()
-        # Enable environment variable cache (e.g. assume no more
-        # environment variable overrides after this point)
         enable_envs_cache()
 
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
-
-        # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
-
-        has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
-        if has_kv_cache:
-            if os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
-                dp_group = getattr(self, "dp_group", None)
-                assert dp_group is not None
-                self.available_gpu_memory_for_kv_cache = (
-                    ParallelConfig.sync_kv_cache_memory_size(dp_group, -1)
-                )
-                available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
-                    kv_cache_specs
-                )
-            else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
-                available_gpu_memory = self.model_executor.determine_available_memory()
-                self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+        
+        if any(kv_cache_spec for kv_cache_spec in kv_cache_specs):
+            available_gpu_memory = self.model_executor.determine_available_memory()
+            self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
-            # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
 
-        assert len(kv_cache_specs) == len(available_gpu_memory)
-
-        # Track max_model_len before KV cache config to detect auto-fit changes
-        max_model_len_before = vllm_config.model_config.max_model_len
-
-        kv_cache_configs = get_kv_cache_configs(
-            vllm_config, kv_cache_specs, available_gpu_memory
-        )
-
-        # If auto-fit reduced max_model_len, sync the new value to workers.
-        # This is needed because workers were spawned before memory profiling
-        # and have the original (larger) max_model_len cached.
-        max_model_len_after = vllm_config.model_config.max_model_len
-        if max_model_len_after != max_model_len_before:
-            self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
-
+        kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory)
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
-        num_gpu_blocks = scheduler_kv_cache_config.num_blocks
-        num_cpu_blocks = 0
-
-        # Initialize kv cache and warmup the execution
+        
+        # Initialize and warmup
         self.model_executor.initialize_from_config(kv_cache_configs)
 
-        elapsed = time.time() - start
-        logger.info_once(
-            "init engine (profile, create kv cache, warmup model) took %.2f seconds",
-            elapsed,
-            scope="local",
-        )
-        return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+        logger.info_once("init engine took %.2f seconds", time.time() - start, scope="local")
+        return scheduler_kv_cache_config.num_blocks, 0, scheduler_kv_cache_config
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
@@ -366,20 +254,16 @@ class EngineCore:
         )
         self._iteration_index += 1
 
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-        """Schedule, execute, and make output.
-
-        Returns tuple of outputs and a flag indicating whether the model
-        was executed.
-        """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
+    def step(self) -> tuple[EngineCoreOutputs, bool]:
+        """Schedule, execute, and make output."""
         if not self.scheduler.has_requests():
-            return {}, False
+            return EngineCoreOutputs(), False
+        
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        
+        from vllm.v1_outputs import AsyncModelRunnerOutput
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -387,9 +271,11 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            
+            # LitevLLM: Unpack async result if necessary
+            if isinstance(model_output, AsyncModelRunnerOutput):
+                model_output = model_output.get_output()
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -398,165 +284,13 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
-        # When using async scheduling we can't get draft token ids in advance,
-        # so we update draft token ids in the worker process and don't
-        # need to update draft token ids here.
         if not self.async_scheduling and self.use_spec_decode and model_executed:
-            # Take the draft token ids.
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
-    def step_with_batch_queue(
-        self,
-    ) -> tuple[EngineCoreOutputs | None, bool]:
-        """Schedule and execute batches with the batch queue.
-        Note that if nothing to output in this step, None is returned.
-
-        The execution flow is as follows:
-        1. Try to schedule a new batch if the batch queue is not full.
-        If a new batch is scheduled, directly return an empty engine core
-        output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs.
-        2. If there is no new scheduled batch, meaning that the batch queue
-        is full or no other requests can be scheduled, we block until the first
-        batch in the job queue is finished.
-        3. Update the scheduler from the output.
-        """
-        batch_queue = self.batch_queue
-        assert batch_queue is not None
-
-        # Try to schedule a new batch if the batch queue is not full, but
-        # the scheduler may return an empty batch if all requests are scheduled.
-        # Note that this is not blocking.
-        assert len(batch_queue) < self.batch_queue_size
-
-        model_executed = False
-        deferred_scheduler_output = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
-            exec_future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
-            if not self.is_ec_producer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
-
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, True
-
-        elif not batch_queue:
-            # Queue is empty. We should not reach here since this method should
-            # only be called when the scheduler contains requests or the queue
-            # is non-empty.
-            return None, False
-
-        # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
-
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-
-        # NOTE(nick): We can either handle the deferred tasks here or save
-        # in a field and do it immediately once step_with_batch_queue is
-        # re-called. The latter slightly favors TTFT over TPOT/throughput.
-        if deferred_scheduler_output:
-            # If we are doing speculative decoding with structured output,
-            # we need to get the draft token ids from the prior step before
-            # we can compute the grammar bitmask for the deferred request.
-            if self.use_spec_decode:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                assert draft_token_ids is not None
-                # Update the draft token ids in the scheduler output to
-                # filter out the invalid spec tokens, which will be padded
-                # with -1 and skipped by the grammar bitmask computation.
-                self.scheduler.update_draft_token_ids_in_output(
-                    draft_token_ids, deferred_scheduler_output
-                )
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
-            )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
-
-        return engine_core_outputs, model_executed
-
-    def _process_aborts_queue(self):
-        if not self.aborts_queue.empty():
-            request_ids = []
-            while not self.aborts_queue.empty():
-                ids = self.aborts_queue.get_nowait()
-                # Should be a list here, but also handle string just in case.
-                request_ids.extend((ids,) if isinstance(ids, str) else ids)
-            # More efficient to abort all as a single batch.
-            self.abort_requests(request_ids)
-
-    def shutdown(self):
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
-
-    def profile(self, is_start: bool = True):
-        self.model_executor.profile(is_start)
-
     def reset_mm_cache(self):
-        # NOTE: Since this is mainly for debugging, we don't attempt to
-        # re-sync the internal caches (P0 sender, P1 receiver)
-        if self.scheduler.has_unfinished_requests():
-            logger.warning(
-                "Resetting the multi-modal cache when requests are "
-                "in progress may lead to desynced internal caches."
-            )
-
-        # The cache either exists in EngineCore or WorkerWrapperBase
-        if self.mm_receiver_cache is not None:
-            self.mm_receiver_cache.clear_cache()
-
-        self.model_executor.reset_mm_cache()
+        pass
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -566,23 +300,7 @@ class EngineCore:
         )
 
     def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache to invalidate all cached encoder outputs.
-
-        This should be called when model weights are updated to ensure
-        stale vision embeddings computed with old weights are not reused.
-        Clears both the scheduler's cache manager and the GPU model runner's cache.
-        """
-        # NOTE: Since this is mainly for debugging, we don't attempt to
-        # re-sync the internal caches (P0 sender, P1 receiver)
-        if self.scheduler.has_unfinished_requests():
-            logger.warning(
-                "Resetting the encoder cache when requests are "
-                "in progress may lead to desynced internal caches."
-            )
-
-        # Reset the scheduler's encoder cache manager (logical state)
         self.scheduler.reset_encoder_cache()
-        # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
     def sleep(self, level: int = 1):
@@ -619,14 +337,42 @@ class EngineCore:
             path=path, pattern=pattern, max_size=max_size
         )
 
-    def collective_rpc(
-        self,
-        method: str | Callable[..., _R],
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+    def profile(self, is_start: bool = True):
+        self.model_executor.profile(is_start)
+
+    @contextmanager
+    def log_error_detail(self, scheduler_output: SchedulerOutput):
+        try:
+            yield
+        except Exception as err:
+            dump_engine_exception(self.vllm_config, scheduler_output, self.scheduler.make_stats())
+            raise err
+
+    def shutdown(self):
+        self.structured_output_manager.clear_backend()
+        if self.model_executor:
+            self.model_executor.shutdown()
+        if self.scheduler:
+            self.scheduler.shutdown()
+
+    def collective_rpc(self, method: str, *args, **kwargs) -> Any:
+        return getattr(self.model_executor, method)(*args, **kwargs)
+
+    def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
+        if self.mm_receiver_cache is not None and request.mm_features:
+            request.mm_features = self.mm_receiver_cache.get_and_update_features(request.mm_features)
+        req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if req.use_structured_output:
+            self.structured_output_manager.grammar_init(req)
+        return req, request.current_wave
+
+    def _process_aborts_queue(self):
+        if not self.aborts_queue.empty():
+            request_ids = []
+            while not self.aborts_queue.empty():
+                ids = self.aborts_queue.get_nowait()
+                request_ids.extend((ids,) if isinstance(ids, str) else ids)
+            self.abort_requests(request_ids)
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
