@@ -32,16 +32,7 @@ try:
 except ImportError as e:
     logger.warning("Failed to import from amdsmi with %r", e)
 
-try:
-    import vllm._C  # noqa: F401
-except ImportError as e:
-    logger.warning("Failed to import from vllm._C with %r", e)
-
-# import custom ops, trigger op registration
-try:
-    import vllm._rocm_C  # noqa: F401
-except ImportError as e:
-    logger.warning("Failed to import from vllm._rocm_C with %r", e)
+# AMDSMI utils logic continues...
 
 # Models not supported by ROCm.
 _ROCM_UNSUPPORTED_MODELS: list[str] = []
@@ -213,17 +204,6 @@ class RocmPlatform(Platform):
     # bitsandbytes not supported on gfx9 (warp size 64 limitation)
     if not on_gfx9():
         supported_quantization += ["bitsandbytes"]
-
-    @classmethod
-    def import_kernels(cls) -> None:
-        """Import ROCm-specific kernels."""
-        super().import_kernels()
-
-        import contextlib
-
-        # Import ROCm-specific extension
-        with contextlib.suppress(ImportError):
-            import vllm._rocm_C  # noqa: F401
 
     @classmethod
     def get_attn_backend_cls(

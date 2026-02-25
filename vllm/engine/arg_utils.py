@@ -27,7 +27,7 @@ from typing import (
 import huggingface_hub
 import regex as re
 import torch
-from pydantic import TypeAdapter, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 from pydantic.fields import FieldInfo
 from typing_extensions import TypeIs
 
@@ -38,10 +38,6 @@ from vllm.config import (
     CompilationConfig,
     ConfigType,
     DeviceConfig,
-    ECTransferConfig,
-    EPLBConfig,
-    KVEventsConfig,
-    KVTransferConfig,
     LoadConfig,
     LoRAConfig,
     ModelConfig,
@@ -49,9 +45,7 @@ from vllm.config import (
     ObservabilityConfig,
     ParallelConfig,
     PoolerConfig,
-    ProfilerConfig,
     SchedulerConfig,
-    SpeculativeConfig,
     StructuredOutputsConfig,
     VllmConfig,
     get_attr_docs,
@@ -75,7 +69,6 @@ from vllm.config.model import (
 )
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.observability import DetailedTraceModules
-from vllm.config.parallel import DistributedExecutorBackend, ExpertPlacementStrategy
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel
@@ -244,6 +237,7 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
         dataclass_cls = next(generator, None)
 
         # Get the default value of the field
+        default = None
         if field.default is not MISSING:
             default = field.default
             # Handle pydantic.Field defaults
@@ -377,51 +371,38 @@ class EngineArgs:
     max_cudagraph_capture_size: int | None = get_field(
         CompilationConfig, "max_cudagraph_capture_size"
     )
-    # Note: Specifying a custom executor backend by passing a class
-    # is intended for expert use only. The API may change without
-    # notice.
-    distributed_executor_backend: (
-        str | DistributedExecutorBackend | type[Executor] | None
-    ) = ParallelConfig.distributed_executor_backend
-    # number of P/D disaggregation (or other disaggregation) workers
-    pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
-    master_addr: str = ParallelConfig.master_addr
-    master_port: int = ParallelConfig.master_port
-    nnodes: int = ParallelConfig.nnodes
-    node_rank: int = ParallelConfig.node_rank
-    tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
-    prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
-    decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
-    dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
-    cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
-    data_parallel_size: int = ParallelConfig.data_parallel_size
-    data_parallel_rank: int | None = None
-    data_parallel_start_rank: int | None = None
-    data_parallel_size_local: int | None = None
-    data_parallel_address: str | None = None
-    data_parallel_rpc_port: int | None = None
-    data_parallel_hybrid_lb: bool = False
-    data_parallel_external_lb: bool = False
-    data_parallel_backend: str = ParallelConfig.data_parallel_backend
-    enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
-    all2all_backend: str = ParallelConfig.all2all_backend
-    enable_dbo: bool = ParallelConfig.enable_dbo
-    ubatch_size: int = ParallelConfig.ubatch_size
-    dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
-    dbo_prefill_token_threshold: int = ParallelConfig.dbo_prefill_token_threshold
-    disable_nccl_for_dp_synchronization: bool | None = (
-        ParallelConfig.disable_nccl_for_dp_synchronization
-    )
-    eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
-    enable_eplb: bool = ParallelConfig.enable_eplb
-    expert_placement_strategy: ExpertPlacementStrategy = (
-        ParallelConfig.expert_placement_strategy
-    )
-    _api_process_count: int = ParallelConfig._api_process_count
-    _api_process_rank: int = ParallelConfig._api_process_rank
-    max_parallel_loading_workers: int | None = (
-        ParallelConfig.max_parallel_loading_workers
-    )
+    # Parallelism (Fixed to 1 for LiteEngine)
+    pipeline_parallel_size: int = 1
+    tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
+    
+    # Compatibility stubs
+    master_addr: str = "127.0.0.1"
+    master_port: int = 29500
+    nnodes: int = 1
+    node_rank: int = 0
+    
+    distributed_executor_backend: str = "uni"
+    worker_cls: str = "auto"
+    
+    # MoE compatibility
+    enable_expert_parallel: bool = False
+    all2all_backend: str = "naive"
+    enable_eplb: bool = False
+    eplb_config: Any = Field(default_factory=dict)
+    expert_placement_strategy: str = "linear"
+
+    # Context Parallel stubs
+    prefill_context_parallel_size: int = 1
+    decode_context_parallel_size: int = 1
+    dcp_kv_cache_interleave_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
+    
+    # API stubs
+    _api_process_count: int = 1
+    _api_process_rank: int = 0
+    
+    max_parallel_loading_workers: int | None = None
     block_size: BlockSize | None = CacheConfig.block_size
     enable_prefix_caching: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
@@ -450,7 +431,6 @@ class EngineArgs:
     quantization: QuantizationMethods | None = ModelConfig.quantization
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
-    disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
         MultiModalConfig, "limit_per_prompt"
     )
@@ -485,7 +465,6 @@ class EngineArgs:
     lora_dtype: str | torch.dtype | None = LoRAConfig.lora_dtype
     enable_tower_connector_lora: bool = LoRAConfig.enable_tower_connector_lora
 
-    ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
@@ -504,8 +483,6 @@ class EngineArgs:
     reasoning_parser_plugin: str | None = None
 
     logits_processor_pattern: str | None = ModelConfig.logits_processor_pattern
-
-    speculative_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
@@ -533,15 +510,8 @@ class EngineArgs:
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
-    worker_cls: str = ParallelConfig.worker_cls
-    worker_extension_cls: str = ParallelConfig.worker_extension_cls
-
-    profiler_config: ProfilerConfig = get_field(VllmConfig, "profiler_config")
-
-    kv_transfer_config: KVTransferConfig | None = None
-    kv_events_config: KVEventsConfig | None = None
-
-    ec_transfer_config: ECTransferConfig | None = None
+    worker_cls: str = "auto"
+    worker_extension_cls: str = ""
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
@@ -557,6 +527,9 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
+
+    kv_offloading_size: float | None = CacheConfig.kv_offloading_size
+    kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -757,140 +730,25 @@ class EngineArgs:
             **structured_outputs_kwargs["reasoning_parser_plugin"],
         )
 
-        # Parallel arguments
-        parallel_kwargs = get_kwargs(ParallelConfig)
+        # Parallel arguments (Simplified for Single GPU)
         parallel_group = parser.add_argument_group(
             title="ParallelConfig",
-            description=ParallelConfig.__doc__,
+            description="Configuration for single-GPU execution.",
         )
         parallel_group.add_argument(
-            "--distributed-executor-backend",
-            **parallel_kwargs["distributed_executor_backend"],
+            "--pipeline-parallel-size", "-pp", type=int, default=1, help="(Fixed to 1)"
         )
         parallel_group.add_argument(
-            "--pipeline-parallel-size",
-            "-pp",
-            **parallel_kwargs["pipeline_parallel_size"],
-        )
-        parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
-        parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
-        parallel_group.add_argument("--nnodes", "-n", **parallel_kwargs["nnodes"])
-        parallel_group.add_argument("--node-rank", "-r", **parallel_kwargs["node_rank"])
-        parallel_group.add_argument(
-            "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+            "--tensor-parallel-size", "-tp", type=int, default=1, help="(Fixed to 1)"
         )
         parallel_group.add_argument(
-            "--decode-context-parallel-size",
-            "-dcp",
-            **parallel_kwargs["decode_context_parallel_size"],
+            "--data-parallel-size", "-dp", type=int, default=1, help="(Fixed to 1)"
         )
         parallel_group.add_argument(
-            "--dcp-kv-cache-interleave-size",
-            **parallel_kwargs["dcp_kv_cache_interleave_size"],
+            "--worker-cls", type=str, default="auto", help="Worker class."
         )
         parallel_group.add_argument(
-            "--cp-kv-cache-interleave-size",
-            **parallel_kwargs["cp_kv_cache_interleave_size"],
-        )
-        parallel_group.add_argument(
-            "--prefill-context-parallel-size",
-            "-pcp",
-            **parallel_kwargs["prefill_context_parallel_size"],
-        )
-        parallel_group.add_argument(
-            "--data-parallel-size", "-dp", **parallel_kwargs["data_parallel_size"]
-        )
-        parallel_group.add_argument(
-            "--data-parallel-rank",
-            "-dpn",
-            type=int,
-            help="Data parallel rank of this instance. "
-            "When set, enables external load balancer mode.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-start-rank",
-            "-dpr",
-            type=int,
-            help="Starting data parallel rank for secondary nodes.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-size-local",
-            "-dpl",
-            type=int,
-            help="Number of data parallel replicas to run on this node.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-address",
-            "-dpa",
-            type=str,
-            help="Address of data parallel cluster head-node.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-rpc-port",
-            "-dpp",
-            type=int,
-            help="Port for data parallel RPC communication.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-backend",
-            "-dpb",
-            type=str,
-            default="mp",
-            help='Backend for data parallel, only "mp" is supported.',
-        )
-        parallel_group.add_argument(
-            "--data-parallel-hybrid-lb",
-            "-dph",
-            **parallel_kwargs["data_parallel_hybrid_lb"],
-        )
-        parallel_group.add_argument(
-            "--data-parallel-external-lb",
-            "-dpe",
-            **parallel_kwargs["data_parallel_external_lb"],
-        )
-        parallel_group.add_argument(
-            "--enable-expert-parallel",
-            "-ep",
-            **parallel_kwargs["enable_expert_parallel"],
-        )
-        parallel_group.add_argument(
-            "--all2all-backend", **parallel_kwargs["all2all_backend"]
-        )
-        parallel_group.add_argument("--enable-dbo", **parallel_kwargs["enable_dbo"])
-        parallel_group.add_argument(
-            "--ubatch-size",
-            **parallel_kwargs["ubatch_size"],
-        )
-        parallel_group.add_argument(
-            "--dbo-decode-token-threshold",
-            **parallel_kwargs["dbo_decode_token_threshold"],
-        )
-        parallel_group.add_argument(
-            "--dbo-prefill-token-threshold",
-            **parallel_kwargs["dbo_prefill_token_threshold"],
-        )
-        parallel_group.add_argument(
-            "--disable-nccl-for-dp-synchronization",
-            **parallel_kwargs["disable_nccl_for_dp_synchronization"],
-        )
-        parallel_group.add_argument("--enable-eplb", **parallel_kwargs["enable_eplb"])
-        parallel_group.add_argument("--eplb-config", **parallel_kwargs["eplb_config"])
-        parallel_group.add_argument(
-            "--expert-placement-strategy",
-            **parallel_kwargs["expert_placement_strategy"],
-        )
-
-        parallel_group.add_argument(
-            "--max-parallel-loading-workers",
-            **parallel_kwargs["max_parallel_loading_workers"],
-        )
-        parallel_group.add_argument(
-            "--disable-custom-all-reduce",
-            **parallel_kwargs["disable_custom_all_reduce"],
-        )
-        parallel_group.add_argument("--worker-cls", **parallel_kwargs["worker_cls"])
-        parallel_group.add_argument(
-            "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
+            "--expert-placement-strategy", type=str, default="linear", help="Expert placement strategy."
         )
 
         # KV cache arguments
@@ -1151,20 +1009,6 @@ class EngineArgs:
             title="VllmConfig",
             description=VllmConfig.__doc__,
         )
-        # We construct SpeculativeConfig using fields from other configs in
-        # create_engine_config. So we set the type to a JSON string here to
-        # delay the Pydantic validation that comes with SpeculativeConfig.
-        vllm_kwargs["speculative_config"]["type"] = optional_type(json.loads)
-        vllm_group.add_argument(
-            "--speculative-config", **vllm_kwargs["speculative_config"]
-        )
-        vllm_group.add_argument(
-            "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
-        )
-        vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
-        vllm_group.add_argument(
-            "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
-        )
         vllm_group.add_argument(
             "--compilation-config", "-cc", **vllm_kwargs["compilation_config"]
         )
@@ -1177,7 +1021,6 @@ class EngineArgs:
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
         )
-        vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
         vllm_group.add_argument(
             "--optimization-level", **vllm_kwargs["optimization_level"]
         )
@@ -1310,85 +1153,27 @@ class EngineArgs:
             pt_load_map_location=self.pt_load_map_location,
         )
 
-    def create_speculative_config(
-        self,
-        target_model_config: ModelConfig,
-        target_parallel_config: ParallelConfig,
-    ) -> SpeculativeConfig | None:
-        """Initializes and returns a SpeculativeConfig object based on
-        `speculative_config`.
-
-        This function utilizes `speculative_config` to create a
-        SpeculativeConfig object. The `speculative_config` can either be
-        provided as a JSON string input via CLI arguments or directly as a
-        dictionary from the engine.
-        """
-        if self.speculative_config is None:
-            return None
-
-        # Note(Shangming): These parameters are not obtained from the cli arg
-        # '--speculative-config' and must be passed in when creating the engine
-        # config.
-        self.speculative_config.update(
-            {
-                "target_model_config": target_model_config,
-                "target_parallel_config": target_parallel_config,
-            }
-        )
-        return SpeculativeConfig(**self.speculative_config)
-
     def create_engine_config(
         self,
         usage_context: UsageContext | None = None,
         headless: bool = False,
     ) -> VllmConfig:
         """
-        Create the VllmConfig.
-
-        NOTE: If VllmConfig is incompatible, we raise an error.
+        Create the VllmConfig for single-GPU LiteEngine.
         """
         current_platform.pre_register_and_update()
-
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
-
-        # Check if the model is a speculator and override model/tokenizer/config
-        # BEFORE creating ModelConfig, so the config is created with the target model
-        # Skip speculator detection for cloud storage models (eg: S3, GCS) since
-        # HuggingFace cannot load configs directly from S3 URLs. S3 models can still
-        # use speculators with explicit --speculative-config.
-        if not is_cloud_storage(self.model):
-            (self.model, self.tokenizer, self.speculative_config) = (
-                maybe_override_with_speculators(
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    revision=self.revision,
-                    trust_remote_code=self.trust_remote_code,
-                    vllm_speculative_config=self.speculative_config,
-                )
-            )
 
         model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
         self.tokenizer = model_config.tokenizer
 
-        self._check_feature_supported(model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
-        self._set_default_max_num_seqs_and_batched_tokens_args(
-            usage_context, model_config
-        )
+        self._set_default_max_num_seqs_and_batched_tokens_args(usage_context, model_config)
 
-        sliding_window: int | None = None
-        if not is_interleaved(model_config.hf_text_config):
-            # Only set CacheConfig.sliding_window if the model is all sliding
-            # window. Otherwise CacheConfig.sliding_window will override the
-            # global layers in interleaved sliding window models.
-            sliding_window = model_config.get_sliding_window()
-
-        # Resolve "auto" kv_cache_dtype to actual value from model config
-        resolved_cache_dtype = resolve_kv_cache_dtype_string(
-            self.kv_cache_dtype, model_config
-        )
+        sliding_window = model_config.get_sliding_window() if not is_interleaved(model_config.hf_text_config) else None
+        resolved_cache_dtype = resolve_kv_cache_dtype_string(self.kv_cache_dtype, model_config)
 
         cache_config = CacheConfig(
             block_size=self.block_size,
@@ -1412,175 +1197,89 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        ray_runtime_env = None
-        placement_group = None
+        parallel_config = ParallelConfig(is_moe_model=model_config.is_moe)
 
-        assert not headless or not self.data_parallel_hybrid_lb, (
-            "data_parallel_hybrid_lb is not applicable in headless mode"
-        )
-        assert not (self.data_parallel_hybrid_lb and self.data_parallel_external_lb), (
-            "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
-        )
-        assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
-            "nnodes > 1 is only supported with data_parallel_backend=mp"
-        )
-        inferred_data_parallel_rank = 0
-        if self.nnodes > 1:
-            world_size = (
-                self.data_parallel_size
-                * self.pipeline_parallel_size
-                * self.tensor_parallel_size
-            )
-            world_size_within_dp = (
-                self.pipeline_parallel_size * self.tensor_parallel_size
-            )
-            local_world_size = world_size // self.nnodes
-            assert world_size % self.nnodes == 0, (
-                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            )
-            assert self.node_rank < self.nnodes, (
-                f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
-            )
-            inferred_data_parallel_rank = (
-                self.node_rank * local_world_size
-            ) // world_size_within_dp
-            if self.data_parallel_size > 1 and self.data_parallel_external_lb:
-                self.data_parallel_rank = inferred_data_parallel_rank
-                logger.info(
-                    "Inferred data_parallel_rank %d from node_rank %d for external lb",
-                    self.data_parallel_rank,
-                    self.node_rank,
-                )
-            elif self.data_parallel_size_local is None:
-                # Infer data parallel size local for internal dplb:
-                self.data_parallel_size_local = max(
-                    local_world_size // world_size_within_dp, 1
-                )
-        data_parallel_external_lb = (
-            self.data_parallel_external_lb or self.data_parallel_rank is not None
-        )
-        # Local DP rank = 1, use pure-external LB.
-        if data_parallel_external_lb:
-            assert self.data_parallel_rank is not None, (
-                "data_parallel_rank or node_rank must be specified if "
-                "data_parallel_external_lb is enable."
-            )
-            assert self.data_parallel_size_local in (1, None), (
-                "data_parallel_size_local must be 1 or None when data_parallel_rank "
-                "is set"
-            )
-            data_parallel_size_local = 1
-            # Use full external lb if we have local_size of 1.
-            self.data_parallel_hybrid_lb = False
-        elif self.data_parallel_size_local is not None:
-            data_parallel_size_local = self.data_parallel_size_local
+        if not envs.VLLM_ENABLE_V1_MULTIPROCESSING and self.scheduling_policy == "fcfs":
+            self.scheduling_policy = "priority"
 
-            if self.data_parallel_start_rank and not headless:
-                # Infer hybrid LB mode.
-                self.data_parallel_hybrid_lb = True
-
-            if self.data_parallel_hybrid_lb and data_parallel_size_local == 1:
-                # Use full external lb if we have local_size of 1.
-                logger.warning(
-                    "data_parallel_hybrid_lb is not eligible when "
-                    "data_parallel_size_local = 1, autoswitch to "
-                    "data_parallel_external_lb."
-                )
-                data_parallel_external_lb = True
-                self.data_parallel_hybrid_lb = False
-
-            if data_parallel_size_local == self.data_parallel_size:
-                # Disable hybrid LB mode if set for a single node
-                self.data_parallel_hybrid_lb = False
-
-            self.data_parallel_rank = (
-                self.data_parallel_start_rank or inferred_data_parallel_rank
-            )
-            if self.nnodes > 1:
-                logger.info(
-                    "Inferred data_parallel_rank %d from node_rank %d",
-                    self.data_parallel_rank,
-                    self.node_rank,
-                )
-        else:
-            assert not self.data_parallel_hybrid_lb, (
-                "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
-            )
-
-            # Local DP size defaults to global DP size if not set.
-            data_parallel_size_local = self.data_parallel_size
-
-        # DP address, used in multi-node case for torch distributed group
-        # and ZMQ sockets.
-        if self.data_parallel_address is None:
-            assert self.data_parallel_backend == "mp", (
-                "data_parallel_backend can only be mp, got %s",
-                self.data_parallel_backend,
-            )
-            data_parallel_address = (
-                self.master_addr or ParallelConfig.data_parallel_master_ip
-            )
-        else:
-            data_parallel_address = self.data_parallel_address
-
-        # This port is only used when there are remote data parallel engines,
-        # otherwise the local IPC transport is used.
-        data_parallel_rpc_port = (
-            self.data_parallel_rpc_port
-            if (self.data_parallel_rpc_port is not None)
-            else ParallelConfig.data_parallel_rpc_port
+        scheduler_config = SchedulerConfig(
+            runner_type=model_config.runner_type,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_seqs=self.max_num_seqs,
+            max_model_len=model_config.max_model_len,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            disable_chunked_mm_input=self.disable_chunked_mm_input,
+            is_multimodal_model=model_config.is_multimodal_model,
+            is_encoder_decoder=model_config.is_encoder_decoder,
+            policy=self.scheduling_policy,
+            scheduler_cls=self.scheduler_cls,
+            max_num_partial_prefills=self.max_num_partial_prefills,
+            max_long_partial_prefills=self.max_long_partial_prefills,
+            long_prefill_token_threshold=self.long_prefill_token_threshold,
+            disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+            async_scheduling=self.async_scheduling,
+            stream_interval=self.stream_interval,
         )
 
-        if self.tokens_only and not model_config.skip_tokenizer_init:
-            model_config.skip_tokenizer_init = True
-            logger.info("Skipping tokenizer initialization for tokens-only mode.")
-
-        parallel_config = ParallelConfig(
-            pipeline_parallel_size=self.pipeline_parallel_size,
-            tensor_parallel_size=self.tensor_parallel_size,
-            prefill_context_parallel_size=self.prefill_context_parallel_size,
-            data_parallel_size=self.data_parallel_size,
-            data_parallel_rank=self.data_parallel_rank or 0,
-            data_parallel_external_lb=data_parallel_external_lb,
-            data_parallel_size_local=data_parallel_size_local,
-            master_addr=self.master_addr,
-            master_port=self.master_port,
-            nnodes=self.nnodes,
-            node_rank=self.node_rank,
-            data_parallel_master_ip=data_parallel_address,
-            data_parallel_rpc_port=data_parallel_rpc_port,
-            data_parallel_backend=self.data_parallel_backend,
-            data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
-            is_moe_model=model_config.is_moe,
-            enable_expert_parallel=self.enable_expert_parallel,
-            all2all_backend=self.all2all_backend,
-            enable_dbo=self.enable_dbo,
-            ubatch_size=self.ubatch_size,
-            dbo_decode_token_threshold=self.dbo_decode_token_threshold,
-            dbo_prefill_token_threshold=self.dbo_prefill_token_threshold,
-            disable_nccl_for_dp_synchronization=self.disable_nccl_for_dp_synchronization,
-            enable_eplb=self.enable_eplb,
-            eplb_config=self.eplb_config,
-            expert_placement_strategy=self.expert_placement_strategy,
-            max_parallel_loading_workers=self.max_parallel_loading_workers,
-            disable_custom_all_reduce=self.disable_custom_all_reduce,
-            ray_workers_use_nsight=self.ray_workers_use_nsight,
-            ray_runtime_env=ray_runtime_env,
-            placement_group=placement_group,
-            distributed_executor_backend=self.distributed_executor_backend,
-            worker_cls=self.worker_cls,
-            worker_extension_cls=self.worker_extension_cls,
-            decode_context_parallel_size=self.decode_context_parallel_size,
-            dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
-            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
-            _api_process_count=self._api_process_count,
-            _api_process_rank=self._api_process_rank,
+        lora_config = (
+            LoRAConfig(
+                max_lora_rank=self.max_lora_rank,
+                max_loras=self.max_loras,
+                default_mm_loras=self.default_mm_loras,
+                fully_sharded_loras=self.fully_sharded_loras,
+                lora_dtype=self.lora_dtype,
+                enable_tower_connector_lora=self.enable_tower_connector_lora,
+                max_cpu_loras=self.max_cpu_loras
+                if self.max_cpu_loras and self.max_cpu_loras > 0
+                else None,
+            )
+            if self.enable_lora
+            else None
         )
 
-        speculative_config = self.create_speculative_config(
-            target_model_config=model_config,
-            target_parallel_config=parallel_config,
+        load_config = self.create_load_config()
+
+        structured_outputs_config = copy.deepcopy(self.structured_outputs_config)
+        if self.reasoning_parser: structured_outputs_config.reasoning_parser = self.reasoning_parser
+        if self.reasoning_parser_plugin: structured_outputs_config.reasoning_parser_plugin = self.reasoning_parser_plugin
+
+        observability_config = ObservabilityConfig(
+            show_hidden_metrics_for_version=self.show_hidden_metrics_for_version,
+            otlp_traces_endpoint=self.otlp_traces_endpoint,
+            collect_detailed_traces=self.collect_detailed_traces,
+            kv_cache_metrics=self.kv_cache_metrics,
+            kv_cache_metrics_sample=self.kv_cache_metrics_sample,
+            cudagraph_metrics=self.cudagraph_metrics,
+            enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
+            enable_mfu_metrics=self.enable_mfu_metrics,
+            enable_mm_processor_stats=self.enable_mm_processor_stats,
+            enable_logging_iteration_details=self.enable_logging_iteration_details,
         )
+
+        compilation_config = copy.deepcopy(self.compilation_config)
+        if self.cudagraph_capture_sizes is not None:
+            compilation_config.cudagraph_capture_sizes = self.cudagraph_capture_sizes
+        if self.max_cudagraph_capture_size is not None:
+            compilation_config.max_cudagraph_capture_size = (
+                self.max_cudagraph_capture_size
+            )
+        config = VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            parallel_config=parallel_config,
+            scheduler_config=scheduler_config,
+            device_config=device_config,
+            load_config=load_config,
+            attention_config=self.attention_config,
+            lora_config=lora_config,
+            structured_outputs_config=structured_outputs_config,
+            observability_config=observability_config,
+            compilation_config=compilation_config,
+            additional_config=self.additional_config,
+            optimization_level=self.optimization_level,
+        )
+
+        return config
 
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING and self.scheduling_policy == "fcfs":
             logger.info(
@@ -1629,20 +1328,6 @@ class EngineArgs:
             if self.enable_lora
             else None
         )
-
-        if (
-            lora_config is not None
-            and speculative_config is not None
-            and scheduler_config.max_num_batched_tokens
-            < (
-                scheduler_config.max_num_seqs
-                * (speculative_config.num_speculative_tokens + 1)
-            )
-        ):
-            raise ValueError(
-                "Consider increasing max_num_batched_tokens or "
-                "decreasing num_speculative_tokens"
-            )
 
         # bitsandbytes pre-quantized model need a specific model loader
         if model_config.quantization == "bitsandbytes":
@@ -1715,14 +1400,9 @@ class EngineArgs:
             load_config=load_config,
             attention_config=attention_config,
             lora_config=lora_config,
-            speculative_config=speculative_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
             compilation_config=compilation_config,
-            kv_transfer_config=self.kv_transfer_config,
-            kv_events_config=self.kv_events_config,
-            ec_transfer_config=self.ec_transfer_config,
-            profiler_config=self.profiler_config,
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
         )

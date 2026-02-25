@@ -12,7 +12,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
-from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.torch_utils import set_random_seed
 from vllm.worker.cpu_model_runner import CPUModelRunner
 from vllm.worker.gpu_worker import Worker, init_worker_distributed_environment
@@ -39,17 +38,8 @@ class CPUWorker(Worker):
 
         self.parallel_config.disable_custom_all_reduce = True
 
-        # Torch profiler. Enabled and configured through profiler_config.
+        # Torch profiler. Disabled for LiteEngine.
         self.profiler: Any | None = None
-        profiler_config = vllm_config.profiler_config
-        if profiler_config.profiler == "torch":
-            worker_name = f"{vllm_config.instance_id}-rank-{self.rank}"
-            self.profiler = TorchProfilerWrapper(
-                profiler_config,
-                worker_name=worker_name,
-                local_rank=self.local_rank,
-                activities=["CPU"],
-            )
 
     def init_device(self):
         # Setup OpenMP threads affinity.

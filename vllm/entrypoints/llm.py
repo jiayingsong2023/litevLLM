@@ -22,7 +22,6 @@ from vllm.config import (
     AttentionConfig,
     CompilationConfig,
     PoolerConfig,
-    ProfilerConfig,
     StructuredOutputsConfig,
     is_init_field,
 )
@@ -227,7 +226,6 @@ class LLM:
         structured_outputs_config: dict[str, Any]
         | StructuredOutputsConfig
         | None = None,
-        profiler_config: dict[str, Any] | ProfilerConfig | None = None,
         attention_config: dict[str, Any] | AttentionConfig | None = None,
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
@@ -246,25 +244,6 @@ class LLM:
             # we serialize it using cloudpickle to avoid pickling issues
             if isinstance(worker_cls, type):
                 kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
-
-        if "kv_transfer_config" in kwargs and isinstance(
-            kwargs["kv_transfer_config"], dict
-        ):
-            from vllm.config.kv_transfer import KVTransferConfig
-
-            raw_config_dict = kwargs["kv_transfer_config"]
-            try:
-                kwargs["kv_transfer_config"] = KVTransferConfig(**raw_config_dict)
-            except ValidationError as e:
-                logger.error(
-                    "Failed to convert 'kv_transfer_config' dict to "
-                    "KVTransferConfig object. Dict: %s. Error: %s",
-                    raw_config_dict,
-                    e,
-                )
-                # Consider re-raising a more specific vLLM error or ValueError
-                # to provide better context to the user.
-                raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
 
         if hf_overrides is None:
             hf_overrides = {}
@@ -289,7 +268,6 @@ class LLM:
         structured_outputs_instance = _make_config(
             structured_outputs_config, StructuredOutputsConfig
         )
-        profiler_config_instance = _make_config(profiler_config, ProfilerConfig)
         attention_config_instance = _make_config(attention_config, AttentionConfig)
 
         # warn about single-process data parallel usage.
@@ -317,7 +295,6 @@ class LLM:
             trust_remote_code=trust_remote_code,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
-            tensor_parallel_size=tensor_parallel_size,
             dtype=dtype,
             quantization=quantization,
             revision=revision,
@@ -329,13 +306,11 @@ class LLM:
             cpu_offload_gb=cpu_offload_gb,
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
-            disable_custom_all_reduce=disable_custom_all_reduce,
             hf_token=hf_token,
             hf_overrides=hf_overrides,
             mm_processor_kwargs=mm_processor_kwargs,
             pooler_config=pooler_config,
             structured_outputs_config=structured_outputs_instance,
-            profiler_config=profiler_config_instance,
             attention_config=attention_config_instance,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,

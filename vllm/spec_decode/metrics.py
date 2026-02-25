@@ -3,11 +3,11 @@
 
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import prometheus_client
 
-from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -118,100 +118,30 @@ class SpecDecodingLogging:
 
 
 class SpecDecodingProm:
-    """Record spec decoding metrics in Prometheus.
-
-    The acceptance rate can be calculated using a PromQL query:
-
-      rate(vllm:spec_decode_num_accepted_tokens_total[$interval]) /
-      rate(vllm:spec_decode_num_draft_tokens_total[$interval])
-
-    The mean acceptance length (conventionally including bonus tokens)
-    can be calculated using:
-
-      1 + (
-      rate(vllm:spec_decode_num_accepted_tokens_total[$interval]) /
-      rate(vllm:spec_decode_num_drafts[$interval]))
-
-    A per-position acceptance rate vector can be computed using
-
-      vllm:spec_decode_num_accepted_tokens_per_pos[$interval] /
-      vllm:spec_decode_num_drafts[$interval]
-    """
-
-    _counter_cls = prometheus_client.Counter
+    """Stubbed SpecDecodingProm for LiteEngine."""
 
     def __init__(
         self,
-        speculative_config: SpeculativeConfig | None,
+        speculative_config: Any,
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
     ):
-        self.spec_decoding_enabled = speculative_config is not None
-        if not self.spec_decoding_enabled:
-            return
-
-        counter_drafts = self._counter_cls(
-            name="vllm:spec_decode_num_drafts",
-            documentation="Number of spec decoding drafts.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_drafts = make_per_engine(
-            counter_drafts, per_engine_labelvalues
-        )
-
-        counter_draft_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_draft_tokens",
-            documentation="Number of draft tokens.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_draft_tokens = make_per_engine(
-            counter_draft_tokens, per_engine_labelvalues
-        )
-
-        counter_accepted_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens",
-            documentation="Number of accepted tokens.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_accepted_tokens = make_per_engine(
-            counter_accepted_tokens, per_engine_labelvalues
-        )
-
-        assert speculative_config is not None
-        num_spec_tokens = (
-            speculative_config.num_speculative_tokens
-            if self.spec_decoding_enabled
-            else 0
-        )
-        pos_labelnames = labelnames + ["position"]
-        base_counter = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens_per_pos",
-            documentation="Accepted tokens per draft position.",
-            labelnames=pos_labelnames,
-        )
-        self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
-            int, list[prometheus_client.Counter]
-        ] = {
-            idx: [base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)]
-            for idx, lv in per_engine_labelvalues.items()
-        }
+        self.spec_decoding_enabled = False
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
-        if not self.spec_decoding_enabled:
-            return
-        self.counter_spec_decode_num_drafts[engine_idx].inc(
-            spec_decoding_stats.num_drafts
-        )
-        self.counter_spec_decode_num_draft_tokens[engine_idx].inc(
-            spec_decoding_stats.num_draft_tokens
-        )
-        self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
-            spec_decoding_stats.num_accepted_tokens
-        )
-        for pos, counter in enumerate(
-            self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
-        ):
-            counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        pass
+
+
+def make_per_engine(
+    counter: prometheus_client.Counter,
+    per_engine_labelvalues: dict[int, list[object]],
+):
+    """Create a counter for each label value."""
+    return {
+        idx: counter.labels(*labelvalues)
+        for idx, labelvalues in per_engine_labelvalues.items()
+    }
+
 
 
 def make_per_engine(

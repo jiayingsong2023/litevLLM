@@ -22,7 +22,6 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
@@ -70,18 +69,6 @@ class Worker(WorkerBase):
 
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.profiler: Any | None = None
-        
-        profiler_config = vllm_config.profiler_config
-        if profiler_config.profiler == "torch":
-            worker_name = f"{vllm_config.instance_id}-rank-{self.rank}"
-            self.profiler = TorchProfilerWrapper(
-                profiler_config,
-                worker_name=worker_name,
-                local_rank=self.local_rank,
-                activities=["CPU", "CUDA"],
-            )
-        elif profiler_config.profiler == "cuda":
-            self.profiler = CudaProfilerWrapper(profiler_config)
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
