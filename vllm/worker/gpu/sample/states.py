@@ -10,7 +10,6 @@ NO_LOGPROBS = -1
 _NP_INT64_MIN = np.iinfo(np.int64).min
 _NP_INT64_MAX = np.iinfo(np.int64).max
 
-
 class SamplingStates:
     def __init__(self, max_num_reqs: int, vocab_size: int):
         self.max_num_reqs = max_num_reqs

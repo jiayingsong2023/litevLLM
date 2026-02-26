@@ -7,7 +7,6 @@ from vllm.v1_outputs import DraftTokenIds
 from vllm.worker.gpu.async_utils import async_copy_to_np
 from vllm.worker.gpu.input_batch import InputBatch
 
-
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device

@@ -4,7 +4,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-
 @triton.jit
 def _temperature_kernel(
     logits_ptr,
@@ -30,7 +29,6 @@ def _temperature_kernel(
     logits = logits / temperature
     tl.store(logits_ptr + batch_idx * logits_stride + block, logits, mask=mask)
 
-
 def apply_temperature(
     logits: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -47,7 +45,6 @@ def apply_temperature(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-
 
 @triton.jit
 def _gumbel_sample_kernel(
@@ -104,7 +101,6 @@ def _gumbel_sample_kernel(
     value = tl.max(logits, axis=0)
     tl.store(local_argmax_ptr + batch_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + batch_idx * local_max_stride + block_idx, value)
-
 
 def gumbel_sample(
     logits: torch.Tensor,  # [num_reqs, vocab_size]

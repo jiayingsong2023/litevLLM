@@ -6,7 +6,6 @@ from vllm.model_executor.models.interfaces import SupportsMRoPE
 from vllm.triton_utils import tl, triton
 from vllm.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
-
 class MRopeState:
     def __init__(
         self,
@@ -83,7 +82,6 @@ class MRopeState:
             num_computed_tokens,
             BLOCK_SIZE=1024,
         )
-
 
 @triton.jit
 def _prepare_mrope_positions_kernel(

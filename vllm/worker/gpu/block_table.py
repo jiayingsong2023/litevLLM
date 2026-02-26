@@ -9,7 +9,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
-
 class BlockTables:
     def __init__(
         self,
@@ -140,7 +139,6 @@ class BlockTables:
         self.slot_mappings.fill_(PAD_SLOT_ID)
         return self.slot_mappings[:, :num_tokens]
 
-
 @triton.jit
 def _gather_block_tables_kernel(
     batch_idx_to_req_idx,  # [batch_size]
@@ -169,7 +167,6 @@ def _gather_block_tables_kernel(
         offset = i + tl.arange(0, BLOCK_SIZE)
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
-
 
 @triton.jit
 def _compute_slot_mappings_kernel(
@@ -214,7 +211,6 @@ def _compute_slot_mappings_kernel(
         )
         slot_ids = block_numbers * block_size + positions % block_size
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
-
 
 @triton.jit
 def _load_ptr(ptr_to_ptr, elem_dtype):

@@ -11,7 +11,6 @@ from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_cuda_view_from_cpu_tensor
 
-
 def async_copy_to_gpu(
     x: torch.Tensor | np.ndarray,
     out: torch.Tensor | None = None,
@@ -31,7 +30,6 @@ def async_copy_to_gpu(
     # CPU-to-GPU copy
     return out.copy_(tmp, non_blocking=True)
 
-
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
@@ -39,7 +37,6 @@ class UvaBuffer:
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
         self.np = self.cpu.numpy()
         self.uva = get_cuda_view_from_cpu_tensor(self.cpu)
-
 
 class UvaBufferPool:
     def __init__(
@@ -79,7 +76,6 @@ class UvaBufferPool:
         # CPU-to-GPU copy
         return out.copy_(uva, non_blocking=True)
 
-
 class UvaBackedTensor:
     def __init__(
         self, size: int | Sequence[int], dtype: torch.dtype, max_concurrency: int = 2
@@ -99,7 +95,6 @@ class UvaBackedTensor:
         # CPU-to-CPU copy
         self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
         return self.gpu
-
 
 class StagedWriteTensor:
     def __init__(
@@ -204,7 +199,6 @@ class StagedWriteTensor:
         self._staged_write_starts.clear()
         self._staged_write_contents.clear()
         self._staged_write_cu_lens.clear()
-
 
 @triton.jit
 def _apply_write_kernel(

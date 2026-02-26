@@ -15,7 +15,6 @@ from vllm.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.worker.gpu_input_batch import CachedRequestState
 from vllm.worker.lora_model_runner_mixin import GPUInputBatch
 
-
 @triton.jit
 def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
@@ -34,7 +33,6 @@ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
         data = tl.load(curr_src_ptr, mask=mask)
         tl.store(curr_dst_ptr, data, mask=mask)
 
-
 def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
@@ -43,7 +41,6 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     grid = (batch,)
     BLOCK_SIZE = 1024
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
-
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
@@ -56,7 +53,6 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
     assert len(mamba_group_ids) > 0, "no mamba layers in the model"
     assert all(mamba_specs[0] == spec for spec in mamba_specs)
     return mamba_group_ids, mamba_specs[0]
-
 
 def collect_mamba_copy_meta(
     src_state_list: list[int],
@@ -90,7 +86,6 @@ def collect_mamba_copy_meta(
                 dest_state_list.append(state[dest_block_id].data_ptr())
                 num_elements_list.append(copy_spec.num_elements * state.element_size())
 
-
 def do_mamba_copy_block(
     src_state_list: list[int],
     dest_state_list: list[int],
@@ -106,7 +101,6 @@ def do_mamba_copy_block(
 
     batch_memcpy(src_state_ptrs, dst_state_ptrs, num_elements)
 
-
 def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
@@ -117,10 +111,6 @@ def preprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
 ):
-    """
-    Copy the mamba state of previous step to the last
-    (1 + num_speculative_blocks) block.
-    """
     mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
     num_speculative_blocks = mamba_spec.num_speculative_blocks
     # TODO(Chen): we need to optimize this function a lot
@@ -173,7 +163,6 @@ def preprocess_mamba(
             input_batch.num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(src_state_list, dest_state_list, num_elements_list)
 
-
 def postprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
@@ -183,10 +172,6 @@ def postprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
 ):
-    """
-    If a blocks is converted from partial block to full block in this step, copy the
-    state from the block for running state to the new full block.
-    """
     num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
     scheduled_spec_decode_tokens_dict = scheduler_output.scheduled_spec_decode_tokens
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu

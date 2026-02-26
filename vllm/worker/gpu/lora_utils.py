@@ -6,7 +6,6 @@ from vllm.lora.request import LoRARequest
 
 NO_LORA_ID = 0
 
-
 class LoraState:
     def __init__(self, max_num_reqs: int):
         self.lora_ids = np.zeros(max_num_reqs, dtype=np.int32)

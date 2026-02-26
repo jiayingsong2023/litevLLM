@@ -8,7 +8,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.worker.gpu.input_batch import InputBatch
 
-
 class StructuredOutputsWorker:
     def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
         self.logits_indices = torch.zeros(
@@ -78,7 +77,6 @@ class StructuredOutputsWorker:
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
         self.copy_stream.wait_stream(current_stream)
-
 
 # Adapted from
 # https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py

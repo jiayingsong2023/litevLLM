@@ -31,7 +31,6 @@ from vllm.worker.ubatching import UBatchContext, make_ubatch_contexts
 
 logger = init_logger(__name__)
 
-
 @dataclass
 class UbatchMetadata:
     context: UBatchContext
@@ -41,13 +40,11 @@ class UbatchMetadata:
     intermediate_tensors: IntermediateTensors | None
     num_tokens: int
 
-
 @dataclass
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
     ubatch_metadata: UbatchMetadata
     outputs: Any | None = None
-
 
 class SMControlContextManager:
     def __init__(
@@ -56,21 +53,6 @@ class SMControlContextManager:
         set_comm_sms: Callable[[int], None],
         set_compute_sms: Callable[[int], None],
     ):
-        """
-        Context manager for controlling SM (Streaming Multiprocessor)
-        allocation. Upon entering the context, it sets the number of SMs
-        allocated for communication and computation to comm_sms and
-        total_sms - comm_sms respectively. Upon exiting, it restores the
-        allocation to use all available SMs (i.e. total_sms).
-
-        Args:
-            comm_sms (int): The number of SMs to allocate for communication.
-                (The remainder will be used for computation.)
-            set_comm_sms (Callable[[int], None]):
-                A function that sets the number of SMs for communication.
-            set_compute_sms (Callable[[int], None]):
-                A function that sets the number of SMs for computation.
-        """
 
         assert current_platform.is_cuda(), (
             "SM control is currently only supported on CUDA"
@@ -93,7 +75,6 @@ class SMControlContextManager:
     def __exit__(self, exc_type, exc_value, traceback):
         self.set_comm_sms(self.total_sms)
         self.set_compute_sms(self.total_sms)
-
 
 class UBatchWrapper:
     def __init__(
@@ -174,27 +155,6 @@ class UBatchWrapper:
         return self.runnable
 
     def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
-        """
-        Capture a cudagraph for a microbatched run.
-
-        The logic here is somewhat complicated because we need to make sure that
-        each of the ubatch threads initialize the cuda context before we start
-        the graph capture.
-
-        The flow is as follows:
-        1. The main thread starts up each ubatch thread. Each thread will
-        initialize its cuda context (torch.cuda.current_blas_handle())
-        before going to sleep upon entering the ubatch_context.
-
-        2. The main thread starts the graph capture and wakes up the first
-        ubatch thread.
-
-        3. Each ubatch thread runs the model to completion and returns the
-        completed output tensors back to the main thread.
-
-        4. The main thread stores the captured cudagraph along with its metadata
-        and returns
-        """
 
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):

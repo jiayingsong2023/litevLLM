@@ -25,7 +25,6 @@ from vllm.sample.metadata import SamplingMetadata
 from vllm.v1_utils import copy_slice
 from vllm.worker.block_table import MultiGroupBlockTable
 
-
 @dataclass
 class CachedRequestState:
     req_id: str
@@ -76,7 +75,6 @@ class CachedRequestState:
         if idx - self.num_prompt_tokens < len(self.output_token_ids):
             return self.output_token_ids[idx - self.num_prompt_tokens]
         return -1
-
 
 class InputBatch:
     def __init__(
@@ -276,9 +274,6 @@ class InputBatch:
         return cast(list[str], self._req_ids)
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
-        """Track add-request operations for logits processors.
-        Not applicable to pooling models.
-        """
 
         # Fill the next empty index if there is one.
         if (new_req_index := self.batch_update_builder.pop_removed()) is None:
@@ -467,14 +462,6 @@ class InputBatch:
         cur_spec_token_ids.extend(spec_token_ids)
 
     def remove_request(self, req_id: str) -> int | None:
-        """This method must always be followed by a call to condense().
-
-        Args:
-          req_id: request to remove
-
-        Returns:
-          Removed request index, or `None` if `req_id` not recognized
-        """
 
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
@@ -624,15 +611,6 @@ class InputBatch:
             )
 
     def condense(self) -> None:
-        """Slide non-empty requests down into lower, empty indices.
-
-        Any consecutive empty indices at the very end of the list are not
-        filled.
-
-        Returns:
-          swaps: list of (from,to) swap tuples for moved requests
-          empty_req_indices: indices not filled by condensation
-        """
         num_reqs = self.num_reqs
 
         if not (empty_req_indices := self.batch_update_builder.removed):
@@ -754,147 +732,6 @@ class InputBatch:
         del self.spec_token_ids[num_reqs:]
 
     def refresh_metadata(self):
-        """Apply any batch updates to sampling metadata."""
-
-        if self.is_pooling_model:
-            batch_changed = self.batch_update_builder.reset()
-            if batch_changed:
-                self.sampling_metadata = self._make_sampling_metadata()
-            return
-
-        # For non-pooling models - generate and apply logitsprocs update;
-        # reset batch update tracking.
-        # Update sampling metadata if batch state is changed.
-        batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
-        for logit_proc in self.logitsprocs.all:
-            logit_proc.update_state(batch_update)
-        if batch_update:
-            self.sampling_metadata = self._make_sampling_metadata()
-
-    def _make_sampling_metadata(self) -> SamplingMetadata:
-        num_reqs = self.num_reqs
-        if not self.all_greedy:
-            temperature = copy_slice(
-                self.temperature_cpu_tensor, self.temperature, num_reqs
-            )
-        else:
-            temperature = None
-        if not self.no_top_p:
-            copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
-        if not self.no_top_k:
-            copy_slice(self.top_k_cpu_tensor, self.top_k, num_reqs)
-
-        if not self.no_penalties:
-            # Since syncing these tensors is expensive only copy them
-            # if necessary i.e. if there are requests which require
-            # penalties to be applied during sampling.
-            copy_slice(
-                self.frequency_penalties_cpu_tensor, self.frequency_penalties, num_reqs
-            )
-            copy_slice(
-                self.presence_penalties_cpu_tensor, self.presence_penalties, num_reqs
-            )
-            copy_slice(
-                self.repetition_penalties_cpu_tensor,
-                self.repetition_penalties,
-                num_reqs,
-            )
-
-        needs_prompt_token_ids = (
-            not self.no_penalties
-            or self.logits_processing_needs_token_ids[:num_reqs].any()
-        )
-        # The prompt tokens are used only for applying penalties or
-        # step pooling during the sampling/pooling process.
-        # Hence copy these tensors only when there are requests which
-        # need penalties/step_pooler to be applied.
-        prompt_token_ids = (
-            self._make_prompt_token_ids_tensor() if needs_prompt_token_ids else None
-        )
-
-        # Only set output_token_ids if required by the current requests'
-        # sampling parameters.
-        needs_output_token_ids = (
-            not self.no_penalties
-            or bool(self.bad_words_token_ids)
-            or self.logitsprocs_need_output_token_ids
-        )
-        output_token_ids = (
-            cast(list[list[int]], self.req_output_token_ids)
-            if needs_output_token_ids
-            else []
-        )
-
-        allowed_token_ids_mask: torch.Tensor | None = None
-        if not self.no_allowed_token_ids:
-            assert self.allowed_token_ids_mask is not None
-            copy_slice(
-                self.allowed_token_ids_mask_cpu_tensor,
-                self.allowed_token_ids_mask,
-                num_reqs,
-            )
-            allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
-
-        return SamplingMetadata(
-            temperature=temperature,
-            all_greedy=self.all_greedy,
-            all_random=self.all_random,
-            top_p=None if self.no_top_p else self.top_p[:num_reqs],
-            top_k=None if self.no_top_k else self.top_k[:num_reqs],
-            generators=self.generators,
-            max_num_logprobs=self.max_num_logprobs,
-            prompt_token_ids=prompt_token_ids,
-            frequency_penalties=self.frequency_penalties[:num_reqs],
-            presence_penalties=self.presence_penalties[:num_reqs],
-            repetition_penalties=self.repetition_penalties[:num_reqs],
-            output_token_ids=output_token_ids,
-            spec_token_ids=self.spec_token_ids,
-            no_penalties=self.no_penalties,
-            allowed_token_ids_mask=allowed_token_ids_mask,
-            bad_words_token_ids=self.bad_words_token_ids,
-            logitsprocs=self.logitsprocs,
-        )
-
-    def get_pooling_params(self) -> list[PoolingParams]:
-        assert len(self.req_ids) == len(self.pooling_params)
-        return [self.pooling_params[req_id] for req_id in self.req_ids]
-
-    def get_pooling_states(self) -> list[PoolingStates]:
-        assert len(self.req_ids) == len(self.pooling_states)
-        return [self.pooling_states[req_id] for req_id in self.req_ids]
-
-    def get_pooling_metadata(self) -> PoolingMetadata:
-        pooling_params = self.get_pooling_params()
-        pooling_states = self.get_pooling_states()
-
-        return PoolingMetadata(
-            prompt_lens=torch.from_numpy(self.num_prompt_tokens[: self.num_reqs]),
-            prompt_token_ids=self.sampling_metadata.prompt_token_ids,
-            pooling_params=pooling_params,
-            pooling_states=pooling_states,
-        )
-
-    def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
-        num_reqs = self.num_reqs
-        max_prompt_len = self.num_prompt_tokens[:num_reqs].max()
-        prompt_token_ids_cpu_tensor = torch.empty(
-            (self.num_reqs, max_prompt_len),
-            device="cpu",
-            dtype=torch.int64,
-            pin_memory=self.pin_memory,
-        )
-        prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
-        prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
-        # Use the value of vocab_size as a pad since we don't have a
-        # token_id of this value.
-        for i in range(num_reqs):
-            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
-        return prompt_token_ids_cpu_tensor.to(device=self.device, non_blocking=True)
-
-    def make_lora_inputs(
-        self, num_scheduled_tokens: np.ndarray, num_sampled_tokens: np.ndarray
-    ) -> tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:
-        """
         Given the num_scheduled_tokens for each request in the batch, return
         datastructures used to activate the current LoRAs.
         Returns:
@@ -904,127 +741,12 @@ class InputBatch:
             2. token_lora_mapping: A tuple of size np.sum(num_scheduled_tokens)
                where, token_lora_mapping[i] is the LoRA id to use for ith token.
             3. lora_requests: Set of relevant LoRA requests.
-        """
-
-        req_lora_mapping = self.request_lora_mapping[: self.num_reqs]
-        prompt_lora_mapping = tuple(req_lora_mapping.repeat(num_sampled_tokens))
-        token_lora_mapping = tuple(req_lora_mapping.repeat(num_scheduled_tokens))
-
-        active_lora_requests: set[LoRARequest] = set(
-            self.lora_id_to_lora_request.values()
-        )
-
-        return prompt_lora_mapping, token_lora_mapping, active_lora_requests
-
-    def set_async_sampled_token_ids(
-        self,
-        sampled_token_ids_cpu: torch.Tensor,
-        async_copy_ready_event: torch.Event,
-    ) -> None:
-        """
         In async scheduling case, store ref to sampled_token_ids_cpu
         tensor and corresponding copy-ready event. Used to repair
         output_token_ids prior to sampling, if needed by logits processors.
-        """
-        if self.sampling_metadata.output_token_ids:
-            self.sampled_token_ids_cpu = sampled_token_ids_cpu
-            self.async_copy_ready_event = async_copy_ready_event
-        else:
-            self.sampled_token_ids_cpu = None
-            self.async_copy_ready_event = None
-
-    def update_async_output_token_ids(self) -> None:
-        """
         In async scheduling case, update output_token_ids in sampling metadata
         from prior steps sampled token ids once they've finished copying to CPU.
         This is called right before they are needed by the logits processors.
-        """
-        output_token_ids = self.sampling_metadata.output_token_ids
-        if self.sampled_token_ids_cpu is None or not output_token_ids:
-            # Output token ids not needed or not async scheduling.
-            return
-
-        assert self.prev_req_id_to_index is not None
-        sampled_token_ids = None
-        for index, req_id in enumerate(self.req_ids):
-            prev_index = self.prev_req_id_to_index.get(req_id)
-            if prev_index is None:
-                continue
-            req_output_token_ids = output_token_ids[index]
-            if not req_output_token_ids or req_output_token_ids[-1] != -1:
-                # Final output id is not a placeholder, some tokens must have
-                # been discarded after a kv-load failure.
-                continue
-            if sampled_token_ids is None:
-                assert self.async_copy_ready_event is not None
-                self.async_copy_ready_event.synchronize()
-                sampled_token_ids = self.sampled_token_ids_cpu.tolist()
-            # Replace placeholder token id(s) with actual sampled id(s).
-            new_ids: list[int] = sampled_token_ids[prev_index]
-            if not new_ids:
-                continue
-            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
-            # Also account for case where there may be a smaller number of
-            # output placeholders (tokens can be discarded after a kv-load failure).
-            first_placeholder = req_output_token_ids.index(-1)
-            num_placeholders = len(req_output_token_ids) - first_placeholder
-            num_to_replace = min(num_sampled_ids, num_placeholders)
-            del new_ids[num_to_replace:]
-            end_index = first_placeholder + num_to_replace
-            req_output_token_ids[first_placeholder:end_index] = new_ids
-
-    def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
-        """
         In async scheduling case, update spec_token_ids in sampling metadata with
         real draft token ids from prior step. This is called right before they are
         needed by the rejection sampler for penalty/bad_words computation.
-        """
-        if not draft_token_ids or not self.prev_req_id_to_index:
-            return
-
-        if (spec_token_ids := self.sampling_metadata.spec_token_ids) is not None:
-            for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
-                if spec_ids:
-                    prev_index = self.prev_req_id_to_index.get(req_id)
-                    if prev_index is not None:
-                        draft_ids = draft_token_ids[prev_index]
-                        if draft_ids:
-                            del draft_ids[len(spec_ids) :]
-                            spec_ids.clear()
-                            spec_ids.extend(draft_ids)
-
-    @property
-    def num_reqs(self) -> int:
-        return len(self.req_id_to_index)
-
-    @property
-    def all_greedy(self) -> bool:
-        return len(self.random_reqs) == 0
-
-    @property
-    def all_random(self) -> bool:
-        return len(self.greedy_reqs) == 0
-
-    @property
-    def no_top_p(self) -> bool:
-        return len(self.top_p_reqs) == 0
-
-    @property
-    def no_top_k(self) -> bool:
-        return len(self.top_k_reqs) == 0
-
-    @property
-    def no_penalties(self) -> bool:
-        return (
-            len(self.presence_penalties_reqs) == 0
-            and len(self.frequency_penalties_reqs) == 0
-            and len(self.repetition_penalties_reqs) == 0
-        )
-
-    @property
-    def max_num_logprobs(self) -> int | None:
-        return max(self.num_logprobs.values()) if self.num_logprobs else None
-
-    @property
-    def no_allowed_token_ids(self) -> bool:
-        return len(self.has_allowed_token_ids) == 0

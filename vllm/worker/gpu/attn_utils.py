@@ -19,7 +19,6 @@ from vllm.kv_cache_interface import (
 )
 from vllm.worker.utils import bind_kv_cache
 
-
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
@@ -29,7 +28,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             kv_cache_spec[layer_name] = spec
     return kv_cache_spec
-
 
 def init_attn_backend(
     kv_cache_config: KVCacheConfig, vllm_config: VllmConfig, device: torch.device
@@ -59,7 +57,6 @@ def init_attn_backend(
                 attn_metadata_builder.set_workspace_buffer(flashinfer_workspace)
     return attn_backends, attn_metadata_builders
 
-
 def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -75,7 +72,6 @@ def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
         "Some layers are not correctly initialized"
     )
     return kv_cache_raw_tensors
-
 
 def _reshape_kv_cache(
     kv_cache_config: KVCacheConfig,
@@ -118,7 +114,6 @@ def _reshape_kv_cache(
             kv_caches[layer_name] = raw_tensor.permute(*inv_order)
     return kv_caches
 
-
 def init_kv_cache(
     runner_kv_caches: list[torch.Tensor],
     forward_context: dict[str, Any],
@@ -131,7 +126,6 @@ def init_kv_cache(
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
 
-
 def build_slot_mappings_by_layer(
     slot_mappings: torch.Tensor, kv_cache_config: KVCacheConfig
 ) -> dict[str, torch.Tensor]:
@@ -141,7 +135,6 @@ def build_slot_mappings_by_layer(
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
-
 
 def build_attn_metadata(
     attn_metadata_builders: list[AttentionMetadataBuilder],

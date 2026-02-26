@@ -17,7 +17,6 @@ from vllm.worker.gpu.cudagraph_utils import (
 from vllm.worker.gpu.dp_utils import make_num_tokens_across_dp
 from vllm.worker.gpu.input_batch import InputBuffers
 
-
 class EagleCudaGraphManager:
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config

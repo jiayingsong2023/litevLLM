@@ -17,7 +17,6 @@ from vllm.worker.gpu.sample.output import SamplerOutput
 from vllm.worker.gpu.sample.penalties import PenaltiesState
 from vllm.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 
-
 class Sampler:
     def __init__(
         self,

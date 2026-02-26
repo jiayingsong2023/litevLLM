@@ -30,12 +30,7 @@ logger = init_logger(__name__)
 
 _R = TypeVar("_R")
 
-
 class WorkerBase:
-    """Worker interface that allows vLLM to cleanly separate implementations for
-    different hardware. Also abstracts control plane communication, e.g., to
-    communicate request metadata to other workers.
-    """
 
     def __init__(
         self,
@@ -45,17 +40,6 @@ class WorkerBase:
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        """
-        Initialize common worker components.
-
-        Args:
-            vllm_config: Complete vLLM configuration
-            local_rank: Local device index
-            rank: Global rank in distributed setup
-            distributed_init_method: Distributed initialization method
-            is_driver_worker: Whether this worker handles driver
-                responsibilities
-        """
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -84,25 +68,10 @@ class WorkerBase:
         self.model_runner: nn.Module | None = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """Get specifications for KV cache implementation."""
-        raise NotImplementedError
-
-    def compile_or_warm_up_model(self) -> None:
-        """Prepare model for execution through compilation/warmup."""
         raise NotImplementedError
 
     def check_health(self) -> None:
-        """Basic health check (override for device-specific checks)."""
-        return
-
-    def init_device(self) -> None:
-        """Initialize device state, such as loading the model or other on-device
         memory allocations.
-        """
-        raise NotImplementedError
-
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Initialize the KV cache with the given size in blocks."""
         raise NotImplementedError
 
     def reset_mm_cache(self) -> None:
@@ -114,40 +83,18 @@ class WorkerBase:
         raise NotImplementedError
 
     def apply_model(self, fn: Callable[[nn.Module], _R]) -> _R:
-        """Apply a function on the model inside this worker."""
-        return fn(self.get_model())
-
-    def get_model_inspection(self) -> str:
-        """Return a transformers-style hierarchical view of the model."""
         from vllm.model_inspection import format_model_inspection
 
         return format_model_inspection(self.get_model())
 
     def load_model(self) -> None:
-        """Load model onto target device."""
-        raise NotImplementedError
-
-    def execute_model(
-        self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        """If this method returns None, sample_tokens should be called immediately after
         to obtain the ModelRunnerOutput.
 
         Note that this design may be changed in future if/when structured outputs
         parallelism is re-architected.
-        """
-        raise NotImplementedError
-
-    def sample_tokens(
-        self, grammar_output: GrammarOutput
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        """Should be called immediately after execute_model iff it returned None."""
         raise NotImplementedError
 
     def get_cache_block_size_bytes(self) -> int:
-        """Return the size of a single cache block, in bytes. Used in
-        speculative decoding.
-        """
         raise NotImplementedError
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -164,38 +111,15 @@ class WorkerBase:
 
     @property
     def vocab_size(self) -> int:
-        """Get vocabulary size from model configuration."""
-        return self.model_config.get_vocab_size()
-
-    def shutdown(self) -> None:
-        """Clean up resources held by the worker."""
         return
 
-
 class WorkerWrapperBase:
-    """
-    This class represents one process in an executor/engine. It is responsible
-    for lazily initializing the worker and handling the worker's lifecycle.
-    We first instantiate the WorkerWrapper, which remembers the worker module
-    and class name. Then, when we call `update_environment_variables`, and the
-    real initialization happens in `init_worker`.
-    """
 
     def __init__(
         self,
         rpc_rank: int = 0,
         global_rank: int | None = None,
     ) -> None:
-        """
-        Initialize the worker wrapper with the given vllm_config and rpc_rank.
-        Note: rpc_rank is the rank of the worker in the executor. In most cases,
-        it is also the rank of the worker in the distributed group. However,
-        when multiple executors work together, they can be different.
-        e.g. in the case of SPMD-style offline inference with TP=2,
-        users can launch 2 engines/executors, each with only 1 worker.
-        All workers have rpc_rank=0, but they have different ranks in the TP
-        group.
-        """
         self.rpc_rank = rpc_rank
         self.global_rank = self.rpc_rank if global_rank is None else global_rank
 
@@ -208,11 +132,6 @@ class WorkerWrapperBase:
             self.worker.shutdown()
 
     def adjust_rank(self, rank_mapping: dict[int, int]) -> None:
-        """
-        Adjust the rpc_rank based on the given mapping.
-        It is only used during the initialization of the executor,
-        to adjust the rpc_rank of workers after we create all workers.
-        """
         if self.rpc_rank in rank_mapping:
             self.rpc_rank = rank_mapping[self.rpc_rank]
 
@@ -229,10 +148,6 @@ class WorkerWrapperBase:
         update_environment_variables(envs)
 
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
-        """
-        Here we inject some common logic before initializing the worker.
-        Arguments are passed to the worker class constructor.
-        """
         kwargs = all_kwargs[self.rpc_rank]
 
         vllm_config: VllmConfig | None = kwargs.get("vllm_config")

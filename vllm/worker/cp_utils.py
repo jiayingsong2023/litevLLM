@@ -10,7 +10,6 @@ if TYPE_CHECKING:
 else:
     AttentionLayerBase = object
 
-
 def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -41,7 +40,6 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                     f"but the impl {layer_impl.__class__.__name__} "
                     "does not support PCP."
                 )
-
 
 def get_total_cp_world_size():
     try:

@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Define KV connector functionality mixin for model runners.
-"""
 
 import copy
 from collections.abc import Generator
@@ -29,7 +26,6 @@ except ModuleNotFoundError:
     def has_kv_transfer_group() -> bool:
         return False
 
-
 try:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 except ModuleNotFoundError:
@@ -50,7 +46,6 @@ if TYPE_CHECKING:
     from vllm.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
-
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
 class KVConnectorModelRunnerMixin:
@@ -131,34 +126,6 @@ class KVConnectorModelRunnerMixin:
         attn_groups: list[list[AttentionGroup]],
         cache_dtype: CacheDType,
     ) -> bool:
-        """
-        Determines whether a uniform KV layout should be used.
-        A uniform layout means all layers KV caches will share the same
-        underlying tensor, where for a given block number, the respective
-        KV data for all layers will be contiguous.
-        This will allow efficient KV transfer of per-block KV data for all
-        layers at once.
-        Note this layout will only be applied given 3 conditions:
-        1. The KV Cache config contains just a single group where all layers
-            have the same page size.
-        2. A KV connector is configured, and the KV connector instance prefers
-            to use this layout (prefer_cross_layer_blocks() returns True)
-        2. The flash attention backend supports this layout
-            (get_kv_cache_stride_order(True) includes a placement for a
-            num_layers dimension)
-
-        Note that the actual placement of the num_layers dimensions
-        in the unified layers tensors will be determined by the attention
-        backend.
-        Thus, the layers KV data may still not be contiguous per block
-        if the attention backend does not support it.
-
-        Args:
-            attn_groups: The list of attention groups for this model
-            cache_dtype: The KV cache dtype
-        Returns:
-            True if we should use a uniform KV cache layout.
-        """
 
         if not has_kv_transfer_group():
             return False
@@ -200,25 +167,6 @@ class KVConnectorModelRunnerMixin:
         device: torch.device,
         kernel_block_sizes: list[int],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, type[AttentionBackend]]:
-        """
-        Initializes and reshapes KV caches for the simple case where all
-        layers have the same layout.
-
-        This function assumes use_uniform_kv_cache() returned True.
-
-        Args:
-            kv_cache_config: The KV cache config
-            attn_groups: The list of attention groups for this model
-            cache_dtype: The KV cache dtype
-            device: The torch device to allocate on.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-        Returns:
-            A tuple (kv_caches, cross_layers_kv_cache, attn_backend) where:
-                kv_caches is a dict mapping between layer names to their
-                    corresponding memory buffer for KV cache.
-                cross_layers_kv_cache is the cross layers kv cache tensor
-                attn_backend is the attention backend matching this tensor
-        """
         attn_group = attn_groups[0][0]
         kv_cache_spec = attn_group.kv_cache_spec
         assert isinstance(kv_cache_spec, AttentionSpec)

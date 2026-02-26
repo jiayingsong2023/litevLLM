@@ -4,7 +4,6 @@ import torch
 
 from vllm.config import VllmConfig
 
-
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None

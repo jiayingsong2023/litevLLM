@@ -8,7 +8,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.worker.gpu.buffer_utils import UvaBackedTensor
 
-
 class PenaltiesState:
     def __init__(self, max_num_reqs: int, vocab_size: int, device: torch.device):
         self.max_num_reqs = max_num_reqs
@@ -90,7 +89,6 @@ class PenaltiesState:
             self.output_bin_counts,
         )
 
-
 @triton.jit
 def _penalties_kernel(
     logits_ptr,
@@ -155,7 +153,6 @@ def _penalties_kernel(
     # Store back to logits.
     tl.store(logits_ptr + batch_idx * logits_stride + block, logits, mask=mask)
 
-
 def apply_penalties(
     logits: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -182,7 +179,6 @@ def apply_penalties(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-
 
 @triton.jit(do_not_specialize=["prefill_len", "prompt_len"])
 def _bincount_kernel(
@@ -211,7 +207,6 @@ def _bincount_kernel(
         prefill_tokens = tl.load(prefill_token_ids_ptr + block, mask=mask)
         tl.atomic_add(output_bin_counts_ptr + prefill_tokens, 1, mask=mask)
 
-
 def bincount(
     prefill_token_ids: torch.Tensor,
     prefill_len: int,
@@ -231,7 +226,6 @@ def bincount(
         output_bin_counts,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-
 
 def use_penalty(sampling_params: SamplingParams) -> bool:
     return (

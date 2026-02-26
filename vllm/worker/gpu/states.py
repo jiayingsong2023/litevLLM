@@ -5,7 +5,6 @@ import torch
 
 from vllm.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
-
 class RequestState:
     def __init__(
         self,

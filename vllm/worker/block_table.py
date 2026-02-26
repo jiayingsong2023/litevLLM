@@ -12,7 +12,6 @@ from vllm.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
-
 class BlockTable:
     def __init__(
         self,
@@ -25,18 +24,6 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
     ):
-        """
-        Args:
-            block_size: Block size used for KV cache memory allocation
-            max_num_reqs: Maximum number of concurrent requests supported.
-            max_num_blocks_per_req: Maximum number of blocks per request.
-            max_num_batched_tokens: Maximum number of tokens in a batch.
-            pin_memory: Whether to pin memory for faster GPU transfers.
-            device: Target device for the block table.
-            kernel_block_size: The block_size of underlying attention kernel.
-                Will be the same as `block_size` if `block_size` is supported
-                by the attention kernel.
-        """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
@@ -206,20 +193,6 @@ class BlockTable:
         blocks_per_kv_block: int,
         kernel_block_arange: np.ndarray,
     ) -> np.ndarray:
-        """Convert kv_manager_block_id IDs to kernel block IDs.
-
-        Example:
-            # kv_manager_block_ids: 32 tokens,
-            # Kernel block size: 16 tokens
-            # blocks_per_kv_block = 2
-            >>> kv_manager_block_ids = np.array([0, 1, 2])
-            >>> Result: [0, 1, 2, 3, 4, 5]
-
-            # Each kv_manager_block_id maps to 2 kernel block id:
-            # kv_manager_block_id 0 → kernel block id [0, 1]
-            # kv_manager_block_id 1 → kernel block id [2, 3]
-            # kv_manager_block_id 2 → kernel block id [4, 5]
-        """
         if blocks_per_kv_block == 1:
             return kv_manager_block_ids
 
@@ -231,27 +204,9 @@ class BlockTable:
         return kernel_block_ids.reshape(-1)
 
     def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
-        """Returns the device tensor of the block table."""
-        return self.block_table.gpu[:num_reqs]
-
-    def get_cpu_tensor(self) -> torch.Tensor:
-        """Returns the CPU tensor of the block table."""
         return self.block_table.cpu
 
     def get_numpy_array(self) -> np.ndarray:
-        """Returns the numpy array of the block table."""
-        return self.block_table.np
-
-    def _make_buffer(
-        self, *size: int | torch.SymInt, dtype: torch.dtype
-    ) -> CpuGpuBuffer:
-        return CpuGpuBuffer(
-            *size, dtype=dtype, device=self.device, pin_memory=self.pin_memory
-        )
-
-
-class MultiGroupBlockTable:
-    """The BlockTables for each KV cache group."""
 
     def __init__(
         self,
@@ -338,5 +293,3 @@ class MultiGroupBlockTable:
             block_table.clear()
 
     def __getitem__(self, idx: int) -> "BlockTable":
-        """Returns the BlockTable for the i-th KV cache group."""
-        return self.block_tables[idx]

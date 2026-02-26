@@ -4,7 +4,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-
 @triton.jit
 def _min_p_kernel(
     logits_ptr,
@@ -39,7 +38,6 @@ def _min_p_kernel(
         )
         logits = tl.where(logits < threshold, float("-inf"), logits)
         tl.store(logits_ptr + req_idx * logits_stride + block, logits, mask=mask)
-
 
 def apply_min_p(
     logits: torch.Tensor, idx_mapping: torch.Tensor, min_p: torch.Tensor

@@ -11,7 +11,6 @@ MAX_NUM_ALLOWED_TOKEN_IDS = 1024
 MAX_NUM_LOGIT_BIAS_TOKENS = 1024
 MAX_NUM_STOP_TOKEN_IDS = 128
 
-
 class LogitBiasState:
     def __init__(self, max_num_reqs: int, device: torch.device):
         self.max_num_reqs = max_num_reqs
@@ -143,7 +142,6 @@ class LogitBiasState:
             self.stop_token_ids.gpu,
         )
 
-
 @triton.jit
 def _bias_kernel(
     logits_ptr,
@@ -233,7 +231,6 @@ def _bias_kernel(
             -float("inf"),
             mask=mask,
         )
-
 
 def apply_logit_bias(
     logits: torch.Tensor,

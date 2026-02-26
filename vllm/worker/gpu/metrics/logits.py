@@ -5,7 +5,6 @@ from torch._inductor.runtime.triton_helpers import libdevice
 
 from vllm.triton_utils import tl, triton
 
-
 @triton.jit
 def _num_nans_kernel(
     logits_ptr,
@@ -26,7 +25,6 @@ def _num_nans_kernel(
         is_nan = libdevice.isnan(logits).to(tl.int1)
         num_nans += tl.sum(is_nan).to(tl.int32)
     tl.store(num_nans_ptr + req_idx, num_nans)
-
 
 def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
     num_reqs, vocab_size = logits.shape

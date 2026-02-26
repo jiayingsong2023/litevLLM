@@ -12,5 +12,3 @@ def coordinate_batch_across_dp(
     num_scheduled_tokens_per_request=None,
     cudagraph_mode: int | None = None,
 ):
-    """Single-process stub for DP coordination."""
-    return False, None, CUDAGraphMode.NONE.value if cudagraph_mode is None else cudagraph_mode

@@ -6,7 +6,6 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1_outputs import LogprobsTensors
 
-
 @triton.jit
 def _topk_log_softmax_kernel(
     output_ptr,
@@ -48,7 +47,6 @@ def _topk_log_softmax_kernel(
     o = logits - max_val - lse
     tl.store(output_ptr + req_idx * topk + k_offset, o, mask=k_mask)
 
-
 @triton.jit
 def _ranks_kernel(
     output_ptr,
@@ -71,7 +69,6 @@ def _ranks_kernel(
         n += tl.sum((logits > x).to(tl.int32))
     tl.store(output_ptr + req_idx, n)
 
-
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -90,7 +87,6 @@ def compute_token_logprobs(
         PADDED_TOPK=triton.next_power_of_2(num_logprobs),
     )
     return logprobs
-
 
 def compute_topk_logprobs(
     logits: torch.Tensor,

@@ -8,7 +8,6 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.worker.utils import sanity_check_mm_encoder_outputs
 
-
 class EncoderRunner:
     def __init__(
         self,
@@ -29,19 +28,10 @@ class EncoderRunner:
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
     def reset_mm_cache(self) -> None:
-        """
-        Clear the multi-modal cache that was used during profiling,
-        but no longer needed during inference.
-        """
         # TODO: Implement MM budget for encoder dummy run
         pass
 
     def reset_encoder_cache(self) -> None:
-        """Clear the GPU-side encoder cache storing vision embeddings.
-
-        This should be called when model weights are updated to ensure
-        stale embeddings computed with old weights are not reused.
-        """
         self.encoder_cache.clear()
 
     def add_request(self, req_id: str, mm_features: list[MultiModalFeatureSpec]):

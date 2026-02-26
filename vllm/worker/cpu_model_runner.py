@@ -14,7 +14,6 @@ from vllm.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
-
 class CPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         with _torch_cuda_wrapper():
@@ -84,7 +83,6 @@ class CPUModelRunner(GPUModelRunner):
         # Note: For CPU backend, dp padding is not required for now.
         return 0, None
 
-
 @contextmanager
 def _torch_cuda_wrapper():
     class _EventPlaceholder:
@@ -105,7 +103,6 @@ def _torch_cuda_wrapper():
     finally:
         torch.Event = cuda_event
         torch.cuda.Stream = cuda_stream
-
 
 @contextmanager
 def _set_global_compilation_settings(config: VllmConfig):

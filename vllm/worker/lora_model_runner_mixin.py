@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Define LoRA functionality mixin for model runners.
-"""
 
 from contextlib import contextmanager
 from typing import TypeAlias
@@ -23,7 +20,6 @@ from vllm.worker.gpu_input_batch import InputBatch as GPUInputBatch
 InputBatch: TypeAlias = GPUInputBatch
 
 logger = init_logger(__name__)
-
 
 # Defined as a mixin for GPUModelRunner
 class LoRAModelRunnerMixin:

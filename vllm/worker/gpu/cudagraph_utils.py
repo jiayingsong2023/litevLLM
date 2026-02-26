@@ -22,7 +22,6 @@ from vllm.worker.gpu.block_table import BlockTables
 from vllm.worker.gpu.dp_utils import make_num_tokens_across_dp
 from vllm.worker.gpu.input_batch import InputBuffers
 
-
 class CudaGraphManager:
     def __init__(self, vllm_config: VllmConfig, uses_mrope: bool, device: torch.device):
         self.vllm_config = vllm_config
@@ -162,7 +161,6 @@ class CudaGraphManager:
         assert self.hidden_states is not None
         return self.hidden_states[:num_tokens]
 
-
 def get_cudagraph_sizes(
     capture_sizes: list[int] | None,
     max_num_reqs: int,
@@ -193,7 +191,6 @@ def get_cudagraph_sizes(
                 break
     return cudagraph_sizes
 
-
 def get_cudagraph_size(
     num_tokens_after_dp_padding: int,
     num_tokens_per_request: Iterable[int],
@@ -215,7 +212,6 @@ def get_cudagraph_size(
         return None
     return size
 
-
 def capture_graphs(
     cudagraph_sizes: dict[int, int],
     device: torch.device,
@@ -230,7 +226,6 @@ def capture_graphs(
     with graph_capture(device=device):
         for size in sizes_to_capture:
             capture_fn(size, **capture_kwargs)
-
 
 def prepare_inputs_to_capture(
     num_reqs: int,

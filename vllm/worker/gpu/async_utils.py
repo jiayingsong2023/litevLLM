@@ -7,7 +7,6 @@ import torch
 from vllm.v1_outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.worker.gpu.sample.output import SamplerOutput
 
-
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -67,7 +66,6 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
         return self.model_runner_output
-
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
     return x.to("cpu", non_blocking=True).numpy()

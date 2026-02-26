@@ -66,7 +66,6 @@ from vllm.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
 
-
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(
         self,

@@ -4,7 +4,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-
 @triton.jit
 def _rejection_sample_kernel(
     sampled_ptr,  # [num_reqs, num_speculative_steps + 1]
@@ -36,7 +35,6 @@ def _rejection_sample_kernel(
         )
         num_sampled += 1
     tl.store(num_sampled_ptr + req_idx, num_sampled)
-
 
 def rejection_sample(
     # [num_draft_tokens + num_reqs]

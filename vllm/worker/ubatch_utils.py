@@ -9,7 +9,6 @@ import torch
 from vllm.config import ParallelConfig
 from vllm.attention.backend import CommonAttentionMetadata
 
-
 @dataclass
 class UBatchSlice:
     request_slice: slice
@@ -25,15 +24,12 @@ class UBatchSlice:
     def num_tokens(self) -> int:
         return self.token_slice.stop - self.token_slice.start
 
-
 UBatchSlices: TypeAlias = list[UBatchSlice]
-
 
 def is_last_ubatch_empty(
     orig_num_tokens: int, padded_num_tokens: int, num_ubatches: int
 ) -> bool:
     return (padded_num_tokens // num_ubatches) * (num_ubatches - 1) >= orig_num_tokens
-
 
 def check_ubatch_thresholds(
     config: ParallelConfig, num_tokens: int, uniform_decode: bool
@@ -44,7 +40,6 @@ def check_ubatch_thresholds(
         return num_tokens >= config.dbo_decode_token_threshold
     else:
         return num_tokens >= config.dbo_prefill_token_threshold
-
 
 # This pads the last ubatch slice out to the total number of tokens
 # (num_tokens + padding) since we do `create_ubatch_slices` before applying DP padding.
@@ -58,7 +53,6 @@ def _pad_out_ubatch_slices(
     return ubatch_slices[:-1] + [
         UBatchSlice(padded_last_request_slice, padded_last_token_slice)
     ]
-
 
 def maybe_create_ubatch_slices(
     should_ubatch: bool,
@@ -113,31 +107,18 @@ def maybe_create_ubatch_slices(
 
     return ubatch_slices, ubatch_slices_padded
 
-
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,
     request_slice: slice,
 ) -> torch.Tensor:
-    """
-    Creates a new query_start_loc that corresponds to the requests in
-    request_slice.
-
-    Note: This function creates a new tensor to hold the new query_start_locs.
-    This will break cudagraph compatibility.
-    """
     return (
         query_start_loc[request_slice.start : request_slice.stop + 1]
         - query_start_loc[request_slice.start]
     )
 
-
 def _make_metadata_with_slice(
     ubatch_slice: UBatchSlice, attn_metadata: CommonAttentionMetadata
 ) -> CommonAttentionMetadata:
-    """
-    This function creates a new CommonAttentionMetadata that corresponds to
-    the requests included in ubatch_slice
-    """
 
     assert not ubatch_slice.is_empty(), f"Ubatch slice {ubatch_slice} is empty"
 
@@ -225,17 +206,10 @@ def _make_metadata_with_slice(
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
     )
 
-
 def split_attn_metadata(
     ubatch_slices: list[UBatchSlice],
     common_attn_metadata: CommonAttentionMetadata,
 ) -> list[CommonAttentionMetadata]:
-    """
-    Creates a new CommonAttentionMetadata instance that corresponds to the
-    requests for each UBatchSlice in ubatch_slices.
-
-    Note: This function does not modify common_attn_metadata
-    """
     results = []
     for ubatch_slice in ubatch_slices:
         results.append(_make_metadata_with_slice(ubatch_slice, common_attn_metadata))

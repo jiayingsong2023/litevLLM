@@ -11,7 +11,6 @@ from vllm.v1_outputs import LogprobsTensors
 from vllm.worker.gpu.input_batch import InputBatch
 from vllm.worker.gpu.sample.logprob import compute_topk_logprobs
 
-
 class PromptLogprobsWorker:
     def __init__(self, max_num_reqs: int):
         self.max_num_reqs = max_num_reqs
@@ -125,7 +124,6 @@ class PromptLogprobsWorker:
             prompt_logprobs_dict[req_id] = logprobs
         return prompt_logprobs_dict
 
-
 @triton.jit
 def _prompt_logprobs_token_ids_kernel(
     prompt_logprobs_token_ids_ptr,
@@ -160,7 +158,6 @@ def _prompt_logprobs_token_ids_kernel(
             prompt_logprobs_token_ids_ptr + query_start + block, token_ids, mask=mask
         )
 
-
 def get_prompt_logprobs_token_ids(
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -180,7 +177,6 @@ def get_prompt_logprobs_token_ids(
         BLOCK_SIZE=1024,
     )
     return token_ids
-
 
 def compute_prompt_logprobs_with_chunking(
     prompt_token_ids: torch.Tensor,

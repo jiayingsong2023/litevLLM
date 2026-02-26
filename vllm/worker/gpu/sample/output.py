@@ -6,7 +6,6 @@ import torch
 
 from vllm.v1_outputs import LogprobsTensors
 
-
 @dataclass
 class SamplerOutput:
     sampled_token_ids: torch.Tensor

@@ -9,7 +9,6 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 
-
 class InputBuffers:
     def __init__(
         self,
@@ -27,7 +26,6 @@ class InputBuffers:
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
-
 
 @dataclass
 class InputBatch:
@@ -145,7 +143,6 @@ class InputBatch:
             has_structured_output_reqs=False,
         )
 
-
 @triton.jit
 def _prepare_prefill_inputs_kernel(
     input_ids_ptr,
@@ -182,7 +179,6 @@ def _prepare_prefill_inputs_kernel(
         next_token = tl.load(prefill_ptr + next_pos)
         tl.store(next_prefill_tokens_ptr + req_state_idx, next_token)
 
-
 def prepare_prefill_inputs(
     input_ids: torch.Tensor,
     next_prefill_tokens: torch.Tensor,
@@ -204,7 +200,6 @@ def prepare_prefill_inputs(
         num_computed_tokens,
         BLOCK_SIZE=1024,
     )
-
 
 @triton.jit
 def _prepare_pos_seq_lens_kernel(
@@ -242,7 +237,6 @@ def _prepare_pos_seq_lens_kernel(
         pos = num_computed_tokens + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
 
-
 def prepare_pos_seq_lens(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -262,7 +256,6 @@ def prepare_pos_seq_lens(
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )
-
 
 @triton.jit
 def _combine_sampled_and_draft_tokens_kernel(
@@ -320,7 +313,6 @@ def _combine_sampled_and_draft_tokens_kernel(
             mask=mask,
         )
 
-
 def combine_sampled_and_draft_tokens(
     input_ids: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -357,7 +349,6 @@ def combine_sampled_and_draft_tokens(
     )
     return logits_indices
 
-
 @triton.jit
 def _get_num_sampled_and_rejected_kernel(
     num_sampled_ptr,
@@ -386,7 +377,6 @@ def _get_num_sampled_and_rejected_kernel(
     num_rejected = tl.where(is_chunked_prefilling, 0, num_rejected)
     tl.store(num_rejected_ptr + batch_idx, num_rejected)
 
-
 def get_num_sampled_and_rejected(
     num_sampled: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -405,7 +395,6 @@ def get_num_sampled_and_rejected(
         prefill_len,
     )
     return num_sampled, num_rejected
-
 
 @triton.jit
 def _post_update_kernel(
@@ -448,7 +437,6 @@ def _post_update_kernel(
     num_computed += query_len - num_rejected
     tl.store(num_computed_tokens_ptr + req_state_idx, num_computed)
 
-
 def post_update(
     # [num_reqs]
     idx_mapping: torch.Tensor,
@@ -482,7 +470,6 @@ def post_update(
         num_warps=1,
     )
 
-
 @triton.jit
 def _expand_idx_mapping_kernel(
     idx_mapping_ptr,
@@ -499,7 +486,6 @@ def _expand_idx_mapping_kernel(
     mask = block < num_tokens
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
     tl.store(expanded_idx_mapping_ptr + start_idx + block, req_state_idx, mask=mask)
-
 
 def expand_idx_mapping(
     idx_mapping: torch.Tensor,

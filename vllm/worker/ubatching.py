@@ -16,11 +16,7 @@ _THREAD_ID_TO_CONTEXT: dict = {}
 _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
 
-
 class UBatchContext:
-    """
-    Context manager for micro-batching synchronization using threading events.
-    """
 
     def __init__(
         self,
@@ -146,16 +142,13 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
 
-
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
-
 
 def dbo_current_ubatch_id() -> int:
     if len(_THREAD_ID_TO_CONTEXT) == 0:
         return 0
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-
 
 def _register_ubatch_function(func):
     def wrapper(*args, **kwargs):
@@ -165,7 +158,6 @@ def _register_ubatch_function(func):
             func(ctx, *args, **kwargs)
 
     return wrapper
-
 
 dbo_maybe_run_recv_hook = _register_ubatch_function(UBatchContext.maybe_run_recv_hook)
 dbo_yield = _register_ubatch_function(UBatchContext.yield_)
@@ -182,13 +174,11 @@ dbo_switch_to_compute_sync = _register_ubatch_function(
     UBatchContext.switch_to_compute_sync
 )
 
-
 def dbo_register_recv_hook(recv_hook):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % _NUM_UBATCHES]
         next_ctx.recv_hook = recv_hook
-
 
 def dbo_get_previous_event(func, *args, **kwargs):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
@@ -197,7 +187,6 @@ def dbo_get_previous_event(func, *args, **kwargs):
         # execute callable on the ubatch compute stream to record/wait events there
         with torch.cuda.stream(ctx.compute_stream):
             return func(*args, **kwargs)
-
 
 def make_ubatch_contexts(
     num_micro_batches: int,
@@ -215,9 +204,6 @@ def make_ubatch_contexts(
     if len(_CURRENT_CONTEXTS) < num_micro_batches:
         _CURRENT_CONTEXTS.extend([None] * (num_micro_batches - len(_CURRENT_CONTEXTS)))
 
-    """
-    Create a context manager for micro-batching synchronization.
-    """
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]
     gpu_compute_done_events = [torch.Event() for _ in range(num_micro_batches)]

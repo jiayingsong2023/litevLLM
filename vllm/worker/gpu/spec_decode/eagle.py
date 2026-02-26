@@ -24,7 +24,6 @@ from vllm.worker.gpu.spec_decode.eagle_cudagraph import EagleCudaGraphManager
 
 logger = init_logger(__name__)
 
-
 class EagleSpeculator:
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -315,7 +314,6 @@ class EagleSpeculator:
         )  # FIXME
         return self.draft_tokens[:num_reqs]
 
-
 @triton.jit
 def _prepare_eagle_inputs_kernel(
     last_token_indices_ptr,
@@ -368,7 +366,6 @@ def _prepare_eagle_inputs_kernel(
         target_pos = tl.load(target_positions_ptr + query_start + block, mask=mask)
         tl.store(eagle_positions_ptr + query_start + block, target_pos, mask=mask)
 
-
 def prepare_eagle_inputs(
     input_buffers: InputBuffers,
     input_batch: InputBatch,
@@ -402,7 +399,6 @@ def prepare_eagle_inputs(
         BLOCK_SIZE=1024,
     )
     return last_token_indices
-
 
 @triton.jit
 def _prepare_eagle_docode_kernel(
@@ -472,7 +468,6 @@ def _prepare_eagle_docode_kernel(
     seq_len = tl.minimum(seq_len + 1, max_model_len)
     tl.store(seq_lens_ptr + req_idx, seq_len)
 
-
 def prepare_eagle_decode(
     draft_tokens: torch.Tensor,
     output_hidden_states: torch.Tensor,
@@ -504,7 +499,6 @@ def prepare_eagle_decode(
         max_num_reqs,
         BLOCK_SIZE=1024,
     )
-
 
 @triton.jit
 def _update_eagle_inputs_kernel(
@@ -550,7 +544,6 @@ def _update_eagle_inputs_kernel(
     seq_len = tl.load(seq_lens_ptr + req_idx)
     seq_len = tl.minimum(seq_len + 1, max_model_len)
     tl.store(seq_lens_ptr + req_idx, seq_len)
-
 
 def update_eagle_inputs(
     draft_tokens: torch.Tensor,
