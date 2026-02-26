@@ -14,19 +14,15 @@ router = APIRouter()
 
 logger = init_logger(__name__)
 
-
 def base(request: Request) -> OpenAIServing:
     # Reuse the existing instance
     return tokenization(request)
 
-
 def tokenization(request: Request) -> OpenAIServingTokenization:
     return request.app.state.openai_serving_tokenization
 
-
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
-
 
 @router.get("/load")
 async def get_server_load_metrics(request: Request):
@@ -48,12 +44,10 @@ async def get_server_load_metrics(request: Request):
     # - /v2/rerank
     return JSONResponse(content={"server_load": request.app.state.server_load_metrics})
 
-
 @router.get("/version")
 async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
-
 
 def register_basic_api_routers(app: FastAPI):
     app.include_router(router)

@@ -26,7 +26,6 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
-
 class OpenAIServingTokenization(OpenAIServing):
     def __init__(
         self,
@@ -151,40 +150,9 @@ class OpenAIServingTokenization(OpenAIServing):
     async def get_tokenizer_info(
         self,
     ) -> TokenizerInfoResponse | ErrorResponse:
-        """Get comprehensive tokenizer information."""
-        try:
-            tokenizer = self.renderer.get_tokenizer()
-            info = TokenizerInfo(tokenizer, self.chat_template).to_dict()
-            return TokenizerInfoResponse(**info)
-        except Exception as e:
-            return self.create_error_response(f"Failed to get tokenizer info: {str(e)}")
-
-
-@dataclass
-class TokenizerInfo:
-    tokenizer: TokenizerLike
-    chat_template: str | None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return the tokenizer configuration."""
         return self._get_tokenizer_config()
 
     def _get_tokenizer_config(self) -> dict[str, Any]:
-        """Get tokenizer configuration directly from the tokenizer object."""
-        config = dict(getattr(self.tokenizer, "init_kwargs", None) or {})
-
-        # Remove file path fields
-        config.pop("vocab_file", None)
-        config.pop("merges_file", None)
-
-        config = self._make_json_serializable(config)
-        config["tokenizer_class"] = type(self.tokenizer).__name__
-        if self.chat_template:
-            config["chat_template"] = self.chat_template
-        return config
-
-    def _make_json_serializable(self, obj):
-        """Convert any non-JSON-serializable objects to serializable format."""
         if hasattr(obj, "content"):
             return obj.content
         elif isinstance(obj, dict):

@@ -16,7 +16,6 @@ from vllm.entrypoints.pooling.base.protocol import (
 from vllm.renderers import TokenizeParams
 from vllm.utils import random_uuid
 
-
 def _get_max_total_output_tokens(
     model_config: ModelConfig,
 ) -> tuple[int | None, int]:
@@ -32,7 +31,6 @@ def _get_max_total_output_tokens(
     max_embed_len = pooler_config.max_embed_len or max_total_tokens
     max_output_tokens = max_total_tokens - max_embed_len
     return max_total_tokens, max_output_tokens
-
 
 class EmbeddingCompletionRequest(
     PoolingBasicRequestMixin, CompletionRequestMixin, EmbedRequestMixin
@@ -54,7 +52,6 @@ class EmbeddingCompletionRequest(
             max_total_tokens_param="max_model_len",
             max_output_tokens_param="max_model_len - max_embed_len",
         )
-
 
 class EmbeddingChatRequest(
     PoolingBasicRequestMixin, ChatRequestMixin, EmbedRequestMixin
@@ -82,15 +79,12 @@ class EmbeddingChatRequest(
             max_output_tokens_param="max_model_len - max_embed_len",
         )
 
-
 EmbeddingRequest: TypeAlias = EmbeddingCompletionRequest | EmbeddingChatRequest
-
 
 class EmbeddingResponseData(OpenAIBaseModel):
     index: int
     object: str = "embedding"
     embedding: list[float] | str
-
 
 class EmbeddingResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"embd-{random_uuid()}")
@@ -99,7 +93,6 @@ class EmbeddingResponse(OpenAIBaseModel):
     model: str
     data: list[EmbeddingResponseData]
     usage: UsageInfo
-
 
 class EmbeddingBytesResponse(OpenAIBaseModel):
     content: list[bytes]

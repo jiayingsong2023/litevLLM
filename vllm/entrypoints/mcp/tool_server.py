@@ -14,7 +14,6 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from mcp.types import ListToolsResult
 
-
 async def list_server_and_tools(server_url: str):
     from mcp import ClientSession
     from mcp.client.sse import sse_client
@@ -26,7 +25,6 @@ async def list_server_and_tools(server_url: str):
         initialize_response = await session.initialize()
         list_tools_response = await session.list_tools()
         return initialize_response, list_tools_response
-
 
 def trim_schema(schema: dict) -> dict:
     # Turn JSON Schema from MCP generated into Harmony's variant.
@@ -52,7 +50,6 @@ def trim_schema(schema: dict) -> dict:
         }
     return schema
 
-
 def post_process_tools_description(
     list_tools_result: "ListToolsResult",
 ) -> "ListToolsResult":
@@ -70,34 +67,22 @@ def post_process_tools_description(
 
     return list_tools_result
 
-
 class ToolServer(ABC):
     @abstractmethod
     def has_tool(self, tool_name: str) -> bool:
-        """
-        Return True if the tool is supported, False otherwise.
-        """
         pass
 
     @abstractmethod
     def get_tool_description(
         self, tool_name: str, allowed_tools: list[str] | None = None
     ) -> ToolNamespaceConfig | None:
-        """
-        Return the tool description for the given tool name.
-        If the tool is not supported, return None.
-        """
         pass
 
     @abstractmethod
     def new_session(
         self, tool_name: str, session_id: str, headers: dict[str, str] | None = None
     ) -> AbstractAsyncContextManager[Any]:
-        """
-        Create a session for the tool.
-        """
         ...
-
 
 class MCPToolServer(ToolServer):
     def __init__(self):
@@ -192,7 +177,6 @@ class MCPToolServer(ToolServer):
         ):
             await session.initialize()
             yield session
-
 
 class DemoToolServer(ToolServer):
     def __init__(self):

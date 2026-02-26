@@ -21,12 +21,7 @@ logger = init_logger(__name__)
 
 MIN_GPT_OSS_VERSION = "0.0.7"
 
-
 def validate_gpt_oss_install():
-    """
-    Check if the gpt-oss is installed and its version is at least 0.0.7.
-    If not, raise an ImportError.
-    """
     from importlib.metadata import PackageNotFoundError, version
 
     from packaging.version import InvalidVersion, Version
@@ -45,7 +40,6 @@ def validate_gpt_oss_install():
             f"but {pkg_version} is installed."
         ) from None
 
-
 class Tool(ABC):
     @abstractmethod
     async def get_result(self, context: "ConversationContext") -> Any:
@@ -54,7 +48,6 @@ class Tool(ABC):
     @abstractmethod
     async def get_result_parsable_context(self, context: "ConversationContext") -> Any:
         pass
-
 
 class HarmonyBrowserTool(Tool):
     def __init__(self):
@@ -96,7 +89,6 @@ class HarmonyBrowserTool(Tool):
     @property
     def tool_config(self) -> Any:
         return self.browser_tool.tool_config
-
 
 class HarmonyPythonTool(Tool):
     def __init__(self):
@@ -151,10 +143,6 @@ class HarmonyPythonTool(Tool):
         return tool_output_msgs
 
     async def get_result_parsable_context(self, context: "ConversationContext") -> Any:
-        """
-        This function converts parsable context types to harmony and
-        back so we can use GPTOSS demo python tool
-        """
         from vllm.entrypoints.openai.responses.context import ParsableContext
 
         assert isinstance(context, ParsableContext)

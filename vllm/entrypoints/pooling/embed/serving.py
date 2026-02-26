@@ -35,9 +35,7 @@ from vllm.utils.serial_utils import (
 
 logger = init_logger(__name__)
 
-
 EmbeddingServeContext: TypeAlias = ServeContext[EmbeddingRequest]
-
 
 class OpenAIServingEmbedding(OpenAIServing):
     request_id_prefix = "embd"
@@ -188,11 +186,6 @@ class OpenAIServingEmbedding(OpenAIServing):
             assert_never(encoding_format)
 
     def _get_max_position_embeddings(self) -> int:
-        """Get the model's effective maximum sequence length for chunking."""
-        return self.model_config.max_model_len
-
-    def _should_use_chunked_processing(self, request) -> bool:
-        """Check if chunked processing should be used for this request."""
         return (
             isinstance(request, (EmbeddingCompletionRequest, EmbeddingChatRequest))
             and self.supports_chunked_processing
@@ -206,54 +199,6 @@ class OpenAIServingEmbedding(OpenAIServing):
         trace_headers: Mapping[str, str] | None,
         prompt_idx: int,
     ) -> list[AsyncGenerator[PoolingRequestOutput, None]]:
-        """Process a single prompt using chunked processing."""
-        generators: list[AsyncGenerator[PoolingRequestOutput, None]] = []
-
-        # Split into chunks using max_position_embeddings
-        max_pos_embeddings = self._get_max_position_embeddings()
-        # Process all chunks for MEAN aggregation
-        for chunk_idx, chunk_tokens in enumerate(
-            chunk_list(token_ids, max_pos_embeddings)
-        ):
-            # Create a request ID for this chunk
-            chunk_request_id = f"{ctx.request_id}-prompt-{prompt_idx}-chunk-{chunk_idx}"
-
-            # Create engine prompt for this chunk
-            chunk_engine_prompt = TokensPrompt(prompt_token_ids=chunk_tokens)
-
-            # Log the chunk
-            self._log_inputs(
-                chunk_request_id,
-                chunk_engine_prompt,
-                params=pooling_params,
-                lora_request=ctx.lora_request,
-            )
-
-            tok_params = ctx.request.build_tok_params(self.model_config)
-            tokenization_kwargs = tok_params.get_encode_kwargs()
-
-            # Create generator for this chunk and wrap it to return indices
-            original_generator = self.engine_client.encode(
-                chunk_engine_prompt,
-                pooling_params,
-                chunk_request_id,
-                lora_request=ctx.lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=ctx.request.priority,
-            )
-
-            generators.append(original_generator)
-
-        return generators
-
-    def _validate_input(
-        self,
-        request: object,
-        input_ids: list[int],
-        input_text: str,
-    ) -> TokensPrompt:
-        """Override to support chunked processing for embedding requests."""
         token_num = len(input_ids)
 
         # Note: EmbeddingRequest doesn't have max_tokens
@@ -330,35 +275,6 @@ class OpenAIServingEmbedding(OpenAIServing):
         trace_headers: Mapping[str, str] | None,
         prompt_index: int,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
-        """Create a generator for a single prompt using standard processing."""
-        request_id_item = f"{ctx.request_id}-{prompt_index}"
-
-        self._log_inputs(
-            request_id_item,
-            engine_prompt,
-            params=pooling_params,
-            lora_request=ctx.lora_request,
-        )
-
-        tok_params = ctx.request.build_tok_params(self.model_config)
-        tokenization_kwargs = tok_params.get_encode_kwargs()
-
-        # Return the original generator without wrapping
-        return self.engine_client.encode(
-            engine_prompt,
-            pooling_params,
-            request_id_item,
-            lora_request=ctx.lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=ctx.request.priority,
-        )
-
-    async def _prepare_generators(
-        self,
-        ctx: EmbeddingServeContext,
-    ) -> ErrorResponse | None:
-        """Override to support chunked processing."""
         # Check if we should use chunked processing
         use_chunked = self._should_use_chunked_processing(ctx.request)
 
@@ -426,13 +342,6 @@ class OpenAIServingEmbedding(OpenAIServing):
         self,
         ctx: EmbeddingServeContext,
     ) -> ErrorResponse | None:
-        """Collect and aggregate batch results
-        with support for chunked processing.
-
-        For chunked requests, performs online aggregation to
-        minimize memory usage.
-        For regular requests, collects results normally.
-        """
         try:
             if ctx.engine_prompts is None:
                 return self.create_error_response("Engine prompts not available")
@@ -597,12 +506,6 @@ class OpenAIServingEmbedding(OpenAIServing):
         request: EmbeddingRequest,
         raw_request: Request | None = None,
     ) -> EmbeddingResponse | ErrorResponse:
-        """
-        Embedding API similar to OpenAI's API.
-
-        See https://platform.openai.com/docs/api-reference/embeddings/create
-        for the API specification. This API mimics the OpenAI Embedding API.
-        """
         model_name = self.models.model_name()
         request_id = (
             f"{self.request_id_prefix}-"

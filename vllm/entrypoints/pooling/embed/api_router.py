@@ -18,10 +18,8 @@ from vllm.entrypoints.utils import load_aware_call, with_cancellation
 
 router = APIRouter()
 
-
 def embedding(request: Request) -> OpenAIServingEmbedding | None:
     return request.app.state.openai_serving_embedding
-
 
 @router.post(
     "/v1/embeddings",

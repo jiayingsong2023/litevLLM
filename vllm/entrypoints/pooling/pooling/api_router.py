@@ -19,10 +19,8 @@ from vllm.entrypoints.utils import load_aware_call, with_cancellation
 
 router = APIRouter()
 
-
 def pooling(request: Request) -> OpenAIServingPooling | None:
     return request.app.state.openai_serving_pooling
-
 
 @router.post(
     "/pooling",

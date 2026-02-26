@@ -17,14 +17,12 @@ if TYPE_CHECKING:
 else:
     FlexibleArgumentParser = argparse.ArgumentParser
 
-
 def _register_signal_handlers():
     def signal_handler(sig, frame):
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTSTP, signal_handler)
-
 
 def _interactive_cli(args: argparse.Namespace) -> tuple[str, OpenAI]:
     _register_signal_handlers()
@@ -43,7 +41,6 @@ def _interactive_cli(args: argparse.Namespace) -> tuple[str, OpenAI]:
 
     return model_name, openai_client
 
-
 def _print_chat_stream(stream) -> str:
     output = ""
     for chunk in stream:
@@ -54,7 +51,6 @@ def _print_chat_stream(stream) -> str:
     print()
     return output
 
-
 def _print_completion_stream(stream) -> str:
     output = ""
     for chunk in stream:
@@ -64,7 +60,6 @@ def _print_completion_stream(stream) -> str:
             print(text, end="", flush=True)
     print()
     return output
-
 
 def chat(system_prompt: str | None, model_name: str, client: OpenAI) -> None:
     conversation: list[ChatCompletionMessageParam] = []
@@ -84,7 +79,6 @@ def chat(system_prompt: str | None, model_name: str, client: OpenAI) -> None:
         )
         output = _print_chat_stream(stream)
         conversation.append({"role": "assistant", "content": output})
-
 
 def _add_query_options(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     parser.add_argument(
@@ -117,48 +111,7 @@ def _add_query_options(parser: FlexibleArgumentParser) -> FlexibleArgumentParser
     )
     return parser
 
-
 class ChatCommand(CLISubcommand):
-    """The `chat` subcommand for the vLLM CLI."""
-
-    name = "chat"
-
-    @staticmethod
-    def cmd(args: argparse.Namespace) -> None:
-        model_name, client = _interactive_cli(args)
-        system_prompt = args.system_prompt
-        conversation: list[ChatCompletionMessageParam] = []
-
-        if system_prompt is not None:
-            conversation.append({"role": "system", "content": system_prompt})
-
-        if args.quick:
-            conversation.append({"role": "user", "content": args.quick})
-
-            stream = client.chat.completions.create(
-                model=model_name, messages=conversation, stream=True
-            )
-            output = _print_chat_stream(stream)
-            conversation.append({"role": "assistant", "content": output})
-            return
-
-        print("Please enter a message for the chat model:")
-        while True:
-            try:
-                input_message = input("> ")
-            except EOFError:
-                break
-            conversation.append({"role": "user", "content": input_message})
-
-            stream = client.chat.completions.create(
-                model=model_name, messages=conversation, stream=True
-            )
-            output = _print_chat_stream(stream)
-            conversation.append({"role": "assistant", "content": output})
-
-    @staticmethod
-    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-        """Add CLI arguments for the chat command."""
         _add_query_options(parser)
         parser.add_argument(
             "--system-prompt",
@@ -189,40 +142,7 @@ class ChatCommand(CLISubcommand):
         )
         return ChatCommand.add_cli_args(parser)
 
-
 class CompleteCommand(CLISubcommand):
-    """The `complete` subcommand for the vLLM CLI."""
-
-    name = "complete"
-
-    @staticmethod
-    def cmd(args: argparse.Namespace) -> None:
-        model_name, client = _interactive_cli(args)
-
-        kwargs = {
-            "model": model_name,
-            "stream": True,
-        }
-        if args.max_tokens:
-            kwargs["max_tokens"] = args.max_tokens
-
-        if args.quick:
-            stream = client.completions.create(prompt=args.quick, **kwargs)
-            _print_completion_stream(stream)
-            return
-
-        print("Please enter prompt to complete:")
-        while True:
-            try:
-                input_prompt = input("> ")
-            except EOFError:
-                break
-            stream = client.completions.create(prompt=input_prompt, **kwargs)
-            _print_completion_stream(stream)
-
-    @staticmethod
-    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-        """Add CLI arguments for the complete command."""
         _add_query_options(parser)
         parser.add_argument(
             "--max-tokens",
@@ -254,7 +174,6 @@ class CompleteCommand(CLISubcommand):
             usage="vllm complete [options]",
         )
         return CompleteCommand.add_cli_args(parser)
-
 
 def cmd_init() -> list[CLISubcommand]:
     return [ChatCommand(), CompleteCommand()]

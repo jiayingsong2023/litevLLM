@@ -12,15 +12,7 @@ if typing.TYPE_CHECKING:
 else:
     FlexibleArgumentParser = argparse.ArgumentParser
 
-
 class CollectEnvSubcommand(CLISubcommand):
-    """The `collect-env` subcommand for the vLLM CLI."""
-
-    name = "collect-env"
-
-    @staticmethod
-    def cmd(args: argparse.Namespace) -> None:
-        """Collect information about the environment."""
         collect_env_main()
 
     def subparser_init(
@@ -32,7 +24,6 @@ class CollectEnvSubcommand(CLISubcommand):
             description="Start collecting environment information.",
             usage="vllm collect-env",
         )
-
 
 def cmd_init() -> list[CLISubcommand]:
     return [CollectEnvSubcommand()]

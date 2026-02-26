@@ -23,7 +23,6 @@ from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
-
 class PoolingCompletionRequest(
     PoolingBasicRequestMixin,
     CompletionRequestMixin,
@@ -57,7 +56,6 @@ class PoolingCompletionRequest(
             use_activation=self.use_activation,
             dimensions=self.dimensions,
         )
-
 
 class PoolingChatRequest(
     PoolingBasicRequestMixin, ChatRequestMixin, EmbedRequestMixin, ClassifyRequestMixin
@@ -95,9 +93,7 @@ class PoolingChatRequest(
             dimensions=self.dimensions,
         )
 
-
 T = TypeVar("T")
-
 
 class IOProcessorRequest(PoolingBasicRequestMixin, EncodingRequestMixin, Generic[T]):
     data: T
@@ -106,31 +102,20 @@ class IOProcessorRequest(PoolingBasicRequestMixin, EncodingRequestMixin, Generic
     def to_pooling_params(self):
         return PoolingParams()
 
-
 class IOProcessorResponse(OpenAIBaseModel, Generic[T]):
     request_id: str | None = None
-    """
-    The request_id associated with this response
-    """
     created_at: int = Field(default_factory=lambda: int(time.time()))
 
     data: T
-    """
-    When using plugins IOProcessor plugins, the actual output is generated
-    by the plugin itself. Hence, we use a generic type for the response data
-    """
-
 
 PoolingRequest: TypeAlias = (
     PoolingCompletionRequest | PoolingChatRequest | IOProcessorRequest
 )
 
-
 class PoolingResponseData(OpenAIBaseModel):
     index: int
     object: str = "pooling"
     data: list[list[float]] | list[float] | str
-
 
 class PoolingResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"pool-{random_uuid()}")
@@ -139,7 +124,6 @@ class PoolingResponse(OpenAIBaseModel):
     model: str
     data: list[PoolingResponseData]
     usage: UsageInfo
-
 
 class PoolingBytesResponse(OpenAIBaseModel):
     content: list[bytes]

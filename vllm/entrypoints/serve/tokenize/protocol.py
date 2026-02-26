@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 from typing import Any, TypeAlias
 
 from pydantic import ConfigDict, Field, model_validator
@@ -18,7 +17,6 @@ from vllm.entrypoints.openai.engine.protocol import (
     OpenAIBaseModel,
 )
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
-
 
 class TokenizeCompletionRequest(OpenAIBaseModel):
     model: str | None = None
@@ -44,7 +42,6 @@ class TokenizeCompletionRequest(OpenAIBaseModel):
             max_output_tokens=0,
             add_special_tokens=self.add_special_tokens,
         )
-
 
 class TokenizeChatRequest(OpenAIBaseModel):
     model: str | None = None
@@ -143,16 +140,13 @@ class TokenizeChatRequest(OpenAIBaseModel):
             add_special_tokens=self.add_special_tokens,
         )
 
-
 TokenizeRequest: TypeAlias = TokenizeCompletionRequest | TokenizeChatRequest
-
 
 class TokenizeResponse(OpenAIBaseModel):
     count: int
     max_model_len: int
     tokens: list[int]
     token_strs: list[str] | None = None
-
 
 class DetokenizeRequest(OpenAIBaseModel):
     model: str | None = None
@@ -165,16 +159,10 @@ class DetokenizeRequest(OpenAIBaseModel):
             needs_detokenization=True,
         )
 
-
 class DetokenizeResponse(OpenAIBaseModel):
     prompt: str
 
-
 class TokenizerInfoResponse(OpenAIBaseModel):
-    """
-    Response containing tokenizer configuration
-    equivalent to tokenizer_config.json
-    """
 
     model_config = ConfigDict(extra="allow")
     tokenizer_class: str

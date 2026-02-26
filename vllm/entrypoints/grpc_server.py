@@ -2,20 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # mypy: ignore-errors
-"""
-vLLM gRPC Server
-
-Starts a gRPC server for vLLM using the VllmEngine protocol.
-
-Usage:
-    python -m vllm.entrypoints.grpc_server --model <model_path>
-
-Example:
-    python -m vllm.entrypoints.grpc_server \
-        --model meta-llama/Llama-2-7b-hf \
-        --host 0.0.0.0 \
-        --port 50051
-"""
 
 import argparse
 import asyncio
@@ -42,28 +28,9 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
-
 class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
-    """
-    gRPC servicer implementing the VllmEngine service.
-
-    Handles 6 RPCs:
-    - Generate: Streaming text generation
-    - Embed: Embeddings (TODO)
-    - HealthCheck: Health probe
-    - Abort: Cancel requests out-of-band
-    - GetModelInfo: Model metadata
-    - GetServerInfo: Server state
-    """
 
     def __init__(self, async_llm: AsyncLLM, start_time: float):
-        """
-        Initialize the servicer.
-
-        Args:
-            async_llm: The AsyncLLM instance
-            start_time: The server start time, in seconds since epoch
-        """
         self.async_llm = async_llm
         self.start_time = start_time
         logger.info("VllmEngineServicer initialized")
@@ -73,16 +40,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncGenerator[vllm_engine_pb2.GenerateResponse, None]:
-        """
-        Handle streaming generation requests.
-
-        Args:
-            request: The GenerateRequest protobuf
-            context: gRPC context
-
-        Yields:
-            GenerateResponse protobuf messages (streaming)
-        """
         request_id = request.request_id
         logger.debug("Generate request %s received.", request_id)
 
@@ -128,18 +85,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.EmbedRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.EmbedResponse:
-        """
-        Handle embedding requests.
-
-        TODO: Implement in Phase 4
-
-        Args:
-            request: The EmbedRequest protobuf
-            context: gRPC context
-
-        Returns:
-            EmbedResponse protobuf
-        """
         logger.warning("Embed RPC not yet implemented")
         await context.abort(
             grpc.StatusCode.UNIMPLEMENTED, "Embed RPC not yet implemented"
@@ -150,16 +95,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.HealthCheckResponse:
-        """
-        Handle health check requests.
-
-        Args:
-            request: The HealthCheckRequest protobuf
-            context: gRPC context
-
-        Returns:
-            HealthCheckResponse protobuf
-        """
         is_healthy = not self.async_llm.errored
         message = "Health" if is_healthy else "Engine is not alive"
 
@@ -172,16 +107,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.AbortRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.AbortResponse:
-        """
-        Out-of-band abort requests.
-
-        Args:
-            request: The AbortRequest protobuf
-            context: gRPC context
-
-        Returns:
-            AbortResponse protobuf
-        """
         request_ids = request.request_ids
         logger.debug("Abort requests: %s", request_ids)
 
@@ -193,16 +118,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.GetModelInfoRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.GetModelInfoResponse:
-        """
-        Handle model info requests.
-
-        Args:
-            request: The GetModelInfoRequest protobuf
-            context: gRPC context
-
-        Returns:
-            GetModelInfoResponse protobuf
-        """
         model_config = self.async_llm.model_config
 
         return vllm_engine_pb2.GetModelInfoResponse(
@@ -218,16 +133,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: vllm_engine_pb2.GetServerInfoRequest,
         context: grpc.aio.ServicerContext,
     ) -> vllm_engine_pb2.GetServerInfoResponse:
-        """
-        Handle server info requests.
-
-        Args:
-            request: The GetServerInfoRequest protobuf
-            context: gRPC context
-
-        Returns:
-            GetServerInfoResponse protobuf
-        """
         num_requests = self.async_llm.output_processor.get_num_unfinished_requests()
 
         return vllm_engine_pb2.GetServerInfoResponse(
@@ -244,16 +149,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     def _sampling_params_from_proto(
         params: vllm_engine_pb2.SamplingParams, stream: bool = True
     ) -> SamplingParams:
-        """
-        Convert protobuf SamplingParams to vLLM SamplingParams.
-
-        Args:
-            params: Protobuf SamplingParams message
-            stream: Whether streaming is enabled
-
-        Returns:
-            vLLM SamplingParams with detokenize=False and structured_outputs
-        """
         # Build stop sequences
         stop = list(params.stop) if params.stop else None
         stop_token_ids = list(params.stop_token_ids) if params.stop_token_ids else None
@@ -321,16 +216,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     @staticmethod
     def _chunk_response(output: RequestOutput) -> vllm_engine_pb2.GenerateResponse:
-        """
-        Build a streaming chunk response from vLLM output.
-        When output_kind=DELTA, vLLM returns only new tokens automatically.
-
-        Args:
-            output: vLLM RequestOutput (with delta tokens when output_kind=DELTA)
-
-        Returns:
-            GenerateResponse with chunk field set
-        """
         # Get the completion output (first one if n > 1)
         completion = output.outputs[0] if output.outputs else None
 
@@ -361,15 +246,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     @staticmethod
     def _complete_response(output: RequestOutput) -> vllm_engine_pb2.GenerateResponse:
-        """
-        Build a final completion response from vLLM output.
-
-        Args:
-            output: vLLM RequestOutput (finished=True)
-
-        Returns:
-            GenerateResponse with complete field set
-        """
         # Get the completion output (first one if n > 1)
         completion = output.outputs[0] if output.outputs else None
 
@@ -401,14 +277,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             ),
         )
 
-
 async def serve_grpc(args: argparse.Namespace):
-    """
-    Main serving function.
-
-    Args:
-        args: Parsed command line arguments
-    """
     log_version_and_model(logger, VLLM_VERSION, args.model)
     logger.info("vLLM gRPC server args: %s", args)
 
@@ -489,44 +358,4 @@ async def serve_grpc(args: argparse.Namespace):
 
         logger.info("Shutdown complete")
 
-
 def main():
-    """Main entry point."""
-    parser = FlexibleArgumentParser(
-        description="vLLM gRPC Server",
-    )
-
-    # Server args
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="Host to bind gRPC server to",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=50051,
-        help="Port to bind gRPC server to",
-    )
-    parser.add_argument(
-        "--disable-log-stats-server",
-        action="store_true",
-        help="Disable stats logging on server side",
-    )
-
-    # Add vLLM engine args
-    parser = AsyncEngineArgs.add_cli_args(parser)
-
-    args = parser.parse_args()
-
-    # Run server
-    try:
-        uvloop.run(serve_grpc(args))
-    except Exception as e:
-        logger.exception("Server failed: %s", e)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

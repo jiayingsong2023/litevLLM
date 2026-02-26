@@ -28,18 +28,7 @@ from vllm.utils.gc_utils import freeze_gc_heap
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
 
-
 class AuthenticationMiddleware:
-    """
-    Pure ASGI middleware that authenticates each request by checking
-    if the Authorization Bearer token exists and equals anyof "{api_key}".
-
-    Notes
-    -----
-    There are two cases in which authentication is skipped:
-        1. The HTTP method is OPTIONS.
-        2. The request path doesn't start with /v1 (e.g. /health).
-    """
 
     def __init__(self, app: ASGIApp, tokens: list[str]) -> None:
         self.app = app
@@ -76,13 +65,7 @@ class AuthenticationMiddleware:
             return response(scope, receive, send)
         return self.app(scope, receive, send)
 
-
 class XRequestIdMiddleware:
-    """
-    Middleware the set's the X-Request-Id header for each response
-    to a random uuid4 (hex) value if the header isn't already
-    present in the request, otherwise use the provided request id.
-    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -95,10 +78,6 @@ class XRequestIdMiddleware:
         request_headers = Headers(scope=scope)
 
         async def send_with_request_id(message: Message) -> None:
-            """
-            Custom send function to mutate the response headers
-            and append X-Request-Id to it.
-            """
             if message["type"] == "http.response.start":
                 response_headers = MutableHeaders(raw=message["headers"])
                 request_id = request_headers.get("X-Request-Id", uuid.uuid4().hex)
@@ -106,7 +85,6 @@ class XRequestIdMiddleware:
             await send(message)
 
         return self.app(scope, receive, send_with_request_id)
-
 
 def load_log_config(log_config_file: str | None) -> dict | None:
     if not log_config_file:
@@ -120,17 +98,7 @@ def load_log_config(log_config_file: str | None) -> dict | None:
         )
         return None
 
-
 def get_uvicorn_log_config(args: Namespace) -> dict | None:
-    """
-    Get the uvicorn log config based on the provided arguments.
-
-    Priority:
-    1. If log_config_file is specified, use it
-    2. If disable_access_log_for_endpoints is specified, create a config with
-       the access log filter
-    3. Otherwise, return None (use uvicorn defaults)
-    """
     # First, try to load from file if specified
     log_config = load_log_config(args.log_config_file)
     if log_config is not None:
@@ -153,143 +121,24 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
 
     return None
 
-
 def _extract_content_from_chunk(chunk_data: dict) -> str:
-    """Extract content from a streaming response chunk."""
-    try:
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionStreamResponse,
-        )
-        from vllm.entrypoints.openai.completion.protocol import (
-            CompletionStreamResponse,
-        )
-
-        # Try using Completion types for type-safe parsing
-        if chunk_data.get("object") == "chat.completion.chunk":
-            chat_response = ChatCompletionStreamResponse.model_validate(chunk_data)
-            if chat_response.choices and chat_response.choices[0].delta.content:
-                return chat_response.choices[0].delta.content
-        elif chunk_data.get("object") == "text_completion":
-            completion_response = CompletionStreamResponse.model_validate(chunk_data)
-            if completion_response.choices and completion_response.choices[0].text:
-                return completion_response.choices[0].text
-    except pydantic.ValidationError:
-        # Fallback to manual parsing
-        if "choices" in chunk_data and chunk_data["choices"]:
-            choice = chunk_data["choices"][0]
-            if "delta" in choice and choice["delta"].get("content"):
-                return choice["delta"]["content"]
-            elif choice.get("text"):
-                return choice["text"]
-    return ""
-
-
-class SSEDecoder:
-    """Robust Server-Sent Events decoder for streaming responses."""
 
     def __init__(self):
         self.buffer = ""
         self.content_buffer = []
 
     def decode_chunk(self, chunk: bytes) -> list[dict]:
-        """Decode a chunk of SSE data and return parsed events."""
-        import json
-
-        try:
-            chunk_str = chunk.decode("utf-8")
-        except UnicodeDecodeError:
-            # Skip malformed chunks
-            return []
-
-        self.buffer += chunk_str
-        events = []
-
-        # Process complete lines
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            line = line.rstrip("\r")  # Handle CRLF
-
-            if line.startswith("data: "):
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    events.append({"type": "done"})
-                elif data_str:
-                    try:
-                        event_data = json.loads(data_str)
-                        events.append({"type": "data", "data": event_data})
-                    except json.JSONDecodeError:
-                        # Skip malformed JSON
-                        continue
-
-        return events
-
-    def extract_content(self, event_data: dict) -> str:
-        """Extract content from event data."""
         return _extract_content_from_chunk(event_data)
 
     def add_content(self, content: str) -> None:
-        """Add content to the buffer."""
-        if content:
-            self.content_buffer.append(content)
-
-    def get_complete_content(self) -> str:
-        """Get the complete buffered content."""
         return "".join(self.content_buffer)
 
-
 def _log_streaming_response(response, response_body: list) -> None:
-    """Log streaming response with robust SSE parsing."""
-    from starlette.concurrency import iterate_in_threadpool
-
-    sse_decoder = SSEDecoder()
-    chunk_count = 0
-
-    def buffered_iterator():
-        nonlocal chunk_count
-
-        for chunk in response_body:
-            chunk_count += 1
-            yield chunk
-
-            # Parse SSE events from chunk
-            events = sse_decoder.decode_chunk(chunk)
-
-            for event in events:
-                if event["type"] == "data":
-                    content = sse_decoder.extract_content(event["data"])
-                    sse_decoder.add_content(content)
-                elif event["type"] == "done":
-                    # Log complete content when done
-                    full_content = sse_decoder.get_complete_content()
-                    if full_content:
-                        # Truncate if too long
-                        if len(full_content) > 2048:
-                            full_content = full_content[:2048] + ""
-                            "...[truncated]"
-                        logger.info(
-                            "response_body={streaming_complete: content=%r, chunks=%d}",
-                            full_content,
-                            chunk_count,
-                        )
-                    else:
-                        logger.info(
-                            "response_body={streaming_complete: no_content, chunks=%d}",
-                            chunk_count,
-                        )
-                    return
-
-    response.body_iterator = iterate_in_threadpool(buffered_iterator())
-    logger.info("response_body={streaming_started: chunks=%d}", len(response_body))
-
-
-def _log_non_streaming_response(response_body: list) -> None:
-    """Log non-streaming response."""
     try:
         decoded_body = response_body[0].decode()
         logger.info("response_body={%s}", decoded_body)
     except UnicodeDecodeError:
         logger.info("response_body={<binary_data>}")
-
 
 async def log_response(request: Request, call_next):
     response = await call_next(request)
@@ -308,7 +157,6 @@ async def log_response(request: Request, call_next):
         _log_non_streaming_response(response_body)
     return response
 
-
 async def http_exception_handler(_: Request, exc: HTTPException):
     err = ErrorResponse(
         error=ErrorInfo(
@@ -318,7 +166,6 @@ async def http_exception_handler(_: Request, exc: HTTPException):
         )
     )
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
-
 
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
     param = None
@@ -348,9 +195,7 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
     )
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
-
 _running_tasks: set[asyncio.Task] = set()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

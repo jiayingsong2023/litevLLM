@@ -13,7 +13,6 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 logger = init_logger(__name__)
 
-
 class RequestLogger:
     def __init__(self, *, max_log_len: int | None) -> None:
         self.max_log_len = max_log_len

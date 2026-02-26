@@ -26,9 +26,7 @@ from vllm.pooling_params import PoolingParams
 
 logger = init_logger(__name__)
 
-
 ClassificationServeContext: TypeAlias = ServeContext[ClassificationRequest]
-
 
 class ServingClassification(OpenAIServing):
     request_id_prefix = "classify"
@@ -59,10 +57,6 @@ class ServingClassification(OpenAIServing):
         self,
         ctx: ClassificationServeContext,
     ) -> ErrorResponse | None:
-        """
-        Process classification inputs: tokenize text, resolve adapters,
-        and prepare model-specific inputs.
-        """
         try:
             ctx.lora_request = self._maybe_get_adapters(ctx.request)
 
@@ -101,10 +95,6 @@ class ServingClassification(OpenAIServing):
         self,
         ctx: ClassificationServeContext,
     ) -> ClassificationResponse | ErrorResponse:
-        """
-        Convert model outputs to a formatted classification response
-        with probabilities and labels.
-        """
         id2label = getattr(self.model_config.hf_config, "id2label", {})
 
         items: list[ClassificationData] = []

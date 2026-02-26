@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The CLI entrypoints of vLLM
-
-Note that all future modules must be lazily loaded within main
-to avoid certain eager import breakage."""
 
 import importlib.metadata
 import sys
@@ -11,7 +7,6 @@ import sys
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
 
 def main():
     import vllm.entrypoints.cli.benchmark.main
@@ -71,7 +66,6 @@ def main():
         args.dispatch_function(args)
     else:
         parser.print_help()
-
 
 if __name__ == "__main__":
     main()

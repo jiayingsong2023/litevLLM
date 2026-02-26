@@ -22,14 +22,11 @@ router = APIRouter()
 
 logger = init_logger(__name__)
 
-
 def score(request: Request) -> ServingScores | None:
     return request.app.state.openai_serving_scores
 
-
 def rerank(request: Request) -> ServingScores | None:
     return request.app.state.openai_serving_scores
-
 
 @router.post(
     "/score",
@@ -63,7 +60,6 @@ async def create_score(request: ScoreRequest, raw_request: Request):
 
     assert_never(generator)
 
-
 @router.post(
     "/v1/score",
     dependencies=[Depends(validate_json_request)],
@@ -81,7 +77,6 @@ async def create_score_v1(request: ScoreRequest, raw_request: Request):
     )
 
     return await create_score(request, raw_request)
-
 
 @router.post(
     "/rerank",
@@ -114,7 +109,6 @@ async def do_rerank(request: RerankRequest, raw_request: Request):
 
     assert_never(generator)
 
-
 @router.post(
     "/v1/rerank",
     dependencies=[Depends(validate_json_request)],
@@ -132,7 +126,6 @@ async def do_rerank_v1(request: RerankRequest, raw_request: Request):
     )
 
     return await do_rerank(request, raw_request)
-
 
 @router.post(
     "/v2/rerank",

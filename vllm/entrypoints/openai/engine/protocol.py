@@ -22,7 +22,6 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
-
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does allow extra fields
     model_config = ConfigDict(extra="allow")
@@ -54,17 +53,14 @@ class OpenAIBaseModel(BaseModel):
             )
         return result
 
-
 class ErrorInfo(OpenAIBaseModel):
     message: str
     type: str
     param: str | None = None
     code: int
 
-
 class ErrorResponse(OpenAIBaseModel):
     error: ErrorInfo
-
 
 class ModelPermission(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"modelperm-{random_uuid()}")
@@ -80,7 +76,6 @@ class ModelPermission(OpenAIBaseModel):
     group: str | None = None
     is_blocking: bool = False
 
-
 class ModelCard(OpenAIBaseModel):
     id: str
     object: str = "model"
@@ -91,15 +86,12 @@ class ModelCard(OpenAIBaseModel):
     max_model_len: int | None = None
     permission: list[ModelPermission] = Field(default_factory=list)
 
-
 class ModelList(OpenAIBaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
 
-
 class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
-
 
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
@@ -107,11 +99,9 @@ class UsageInfo(OpenAIBaseModel):
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
 
-
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: UsageInfo | None = None
-
 
 class JsonSchemaResponseFormat(OpenAIBaseModel):
     name: str
@@ -121,7 +111,6 @@ class JsonSchemaResponseFormat(OpenAIBaseModel):
     json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
     strict: bool | None = None
 
-
 class LegacyStructuralTag(OpenAIBaseModel):
     begin: str
     # schema is the field, but that causes conflicts with pydantic so
@@ -129,44 +118,36 @@ class LegacyStructuralTag(OpenAIBaseModel):
     structural_tag_schema: dict[str, Any] | None = Field(default=None, alias="schema")
     end: str
 
-
 class LegacyStructuralTagResponseFormat(OpenAIBaseModel):
     type: Literal["structural_tag"]
     structures: list[LegacyStructuralTag]
     triggers: list[str]
 
-
 class StructuralTagResponseFormat(OpenAIBaseModel):
     type: Literal["structural_tag"]
     format: Any
 
-
 AnyStructuralTagResponseFormat: TypeAlias = (
     LegacyStructuralTagResponseFormat | StructuralTagResponseFormat
 )
-
 
 class ResponseFormat(OpenAIBaseModel):
     # type must be "json_schema", "json_object", or "text"
     type: Literal["text", "json_object", "json_schema"]
     json_schema: JsonSchemaResponseFormat | None = None
 
-
 AnyResponseFormat: TypeAlias = (
     ResponseFormat | StructuralTagResponseFormat | LegacyStructuralTagResponseFormat
 )
-
 
 class StreamOptions(OpenAIBaseModel):
     include_usage: bool | None = True
     continuous_usage_stats: bool | None = False
 
-
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: str | None = None
     parameters: dict[str, Any] | None = None
-
 
 # extra="forbid" is a workaround to have kwargs as a field,
 # see https://github.com/pydantic/pydantic/issues/3125
@@ -177,9 +158,7 @@ class LogitsProcessorConstructor(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-
 LogitsProcessors = list[str | LogitsProcessorConstructor]
-
 
 def get_logits_processors(
     processors: LogitsProcessors | None, pattern: str | None
@@ -214,7 +193,6 @@ def get_logits_processors(
         )
     return None
 
-
 class FunctionCall(OpenAIBaseModel):
     # Internal field to preserve native tool call ID from tool parser.
     # Excluded from serialization to maintain OpenAI API compatibility
@@ -223,17 +201,14 @@ class FunctionCall(OpenAIBaseModel):
     name: str
     arguments: str
 
-
 class ToolCall(OpenAIBaseModel):
     id: str = Field(default_factory=make_tool_call_id)
     type: Literal["function"] = "function"
     function: FunctionCall
 
-
 class DeltaFunctionCall(BaseModel):
     name: str | None = None
     arguments: str | None = None
-
 
 # a tool call delta where everything is optional
 class DeltaToolCall(OpenAIBaseModel):
@@ -241,7 +216,6 @@ class DeltaToolCall(OpenAIBaseModel):
     type: Literal["function"] | None = None
     index: int
     function: DeltaFunctionCall | None = None
-
 
 class ExtractedToolCallInformation(BaseModel):
     # indicate if tools were called
@@ -254,13 +228,11 @@ class ExtractedToolCallInformation(BaseModel):
     # But some models will do this intentionally
     content: str | None = None
 
-
 class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
-
 
 ####### Tokens IN <> Tokens OUT #######
 class GenerateRequest(BaseModel):
@@ -273,40 +245,5 @@ class GenerateRequest(BaseModel):
         ),
     )
     token_ids: list[int]
-    """The token ids to generate text from."""
-
-    # features: MultiModalFeatureSpec
-    # TODO (NickLucche): implement once Renderer work is completed
-    features: str | None = None
-    """The processed MM inputs for the model."""
 
     sampling_params: SamplingParams
-    """The sampling parameters for the model."""
-
-    model: str | None = None
-
-    stream: bool | None = False
-    stream_options: StreamOptions | None = None
-    cache_salt: str | None = Field(
-        default=None,
-        description=(
-            "If specified, the prefix cache will be salted with the provided "
-            "string to prevent an attacker to guess prompts in multi-user "
-            "environments. The salt should be random, protected from "
-            "access by 3rd parties, and long enough to be "
-            "unpredictable (e.g., 43 characters base64-encoded, corresponding "
-            "to 256 bit)."
-        ),
-    )
-    priority: int = Field(
-        default=0,
-        description=(
-            "The priority of the request (lower means earlier handling; "
-            "default: 0). Any priority other than 0 will raise an error "
-            "if the served model does not use priority scheduling."
-        ),
-    )
-    kv_transfer_params: dict[str, Any] | None = Field(
-        default=None,
-        description="KVTransfer parameters used for disaggregated serving.",
-    )

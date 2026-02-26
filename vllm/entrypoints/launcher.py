@@ -23,18 +23,12 @@ from vllm.engine.v1.exceptions import EngineDeadError, EngineGenerateError
 
 logger = init_logger(__name__)
 
-
 async def serve_http(
     app: FastAPI,
     sock: socket.socket | None,
     enable_ssl_refresh: bool = False,
     **uvicorn_kwargs: Any,
 ):
-    """
-    Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
-    options.  Supports http header limits via h11_max_incomplete_event_size and
-    h11_max_header_count.
-    """
     logger.info("Available routes are:")
     # post endpoints
     for route in app.routes:
@@ -124,56 +118,18 @@ async def serve_http(
     finally:
         watchdog_task.cancel()
 
-
 async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
-    """
-    # Watchdog task that runs in the background, checking
-    # for error state in the engine. Needed to trigger shutdown
-    # if an exception arises is StreamingResponse() generator.
-    """
     VLLM_WATCHDOG_TIME_S = 5.0
     while True:
         await asyncio.sleep(VLLM_WATCHDOG_TIME_S)
         terminate_if_errored(server, engine)
 
-
 def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
-    """
-    See discussions here on shutting down a uvicorn server
-    https://github.com/encode/uvicorn/discussions/1103
-    In this case we cannot await the server shutdown here
-    because handler must first return to close the connection
-    for this request.
-    """
     engine_errored = engine.errored and not engine.is_running
     if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
         server.should_exit = True
 
-
 def _add_shutdown_handlers(app: FastAPI, server: uvicorn.Server) -> None:
-    """
-    VLLM V1 AsyncLLM catches exceptions and returns
-    only two types: EngineGenerateError and EngineDeadError.
-
-    EngineGenerateError is raised by the per request generate()
-    method. This error could be request specific (and therefore
-    recoverable - e.g. if there is an error in input processing).
-
-    EngineDeadError is raised by the background output_handler
-    method. This error is global and therefore not recoverable.
-
-    We register these @app.exception_handlers to return nice
-    responses to the end user if they occur and shut down if needed.
-    See https://fastapi.tiangolo.com/tutorial/handling-errors/
-    for more details on how exception handlers work.
-
-    If an exception is encountered in a StreamingResponse
-    generator, the exception is not raised, since we already sent
-    a 200 status. Rather, we send an error message as the next chunk.
-    Since the exception is not raised, this means that the server
-    will not automatically shut down. Instead, we use the watchdog
-    background task for check for errored state.
-    """
 
     @app.exception_handler(RuntimeError)
     @app.exception_handler(EngineDeadError)

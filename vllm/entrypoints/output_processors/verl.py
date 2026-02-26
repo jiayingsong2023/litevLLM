@@ -4,10 +4,6 @@ from vllm.outputs import RequestOutput
 from vllm.entrypoints.output_processors.abstract import OutputProcessorStrategy
 
 class VerlOutputProcessor(OutputProcessorStrategy):
-    """
-    Verl-specific output processor that vectorizes the output processing
-    to reduce CPU overhead, specifically designed for RLHF workflows.
-    """
     def process_outputs(self, request_outputs: List[RequestOutput], **kwargs) -> Dict[str, torch.Tensor]:
         if not request_outputs:
             return {}

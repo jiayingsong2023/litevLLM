@@ -9,24 +9,14 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 # Global variable to track scaling state
 _scaling_elastic_ep = False
 
-
 def get_scaling_elastic_ep():
     return _scaling_elastic_ep
-
 
 def set_scaling_elastic_ep(value):
     global _scaling_elastic_ep
     _scaling_elastic_ep = value
 
-
 class ScalingMiddleware:
-    """
-    Middleware that checks if the model is currently scaling and
-    returns a 503 Service Unavailable response if it is.
-
-    This middleware applies to all HTTP requests and prevents
-    processing when the model is in a scaling state.
-    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app

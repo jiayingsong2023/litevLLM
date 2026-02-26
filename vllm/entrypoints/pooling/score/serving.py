@@ -44,7 +44,6 @@ from vllm.utils.async_utils import make_async, merge_async_iterators
 
 logger = init_logger(__name__)
 
-
 class ServingScores(OpenAIServing):
     def __init__(
         self,
@@ -338,11 +337,6 @@ class ServingScores(OpenAIServing):
         request: ScoreRequest,
         raw_request: Request | None = None,
     ) -> ScoreResponse | ErrorResponse:
-        """
-        Score API similar to Sentence Transformers cross encoder
-
-        See https://sbert.net/docs/package_reference/cross_encoder
-        """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
@@ -376,15 +370,6 @@ class ServingScores(OpenAIServing):
     async def do_rerank(
         self, request: RerankRequest, raw_request: Request | None = None
     ) -> RerankResponse | ErrorResponse:
-        """
-        Rerank API based on JinaAI's rerank API; implements the same
-        API interface. Designed for compatibility with off-the-shelf
-        tooling, since this is a common standard for reranking APIs
-
-        See example client implementations at
-        https://github.com/infiniflow/ragflow/blob/main/rag/llm/rerank_model.py
-        numerous clients use this standard.
-        """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
@@ -468,9 +453,6 @@ class ServingScores(OpenAIServing):
         documents: list[str] | ScoreMultiModalParam,
         top_n: int,
     ) -> RerankResponse:
-        """
-        Convert the output of do_rank to a RerankResponse
-        """
         results: list[RerankResult] = []
         num_prompt_tokens = 0
         for idx, final_res in enumerate(final_res_batch):

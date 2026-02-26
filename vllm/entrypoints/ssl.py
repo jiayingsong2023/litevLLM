@@ -11,11 +11,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 class SSLCertRefresher:
-    """A class that monitors SSL certificate files and
-    reloads them when they change.
-    """
 
     def __init__(
         self,
@@ -56,20 +52,6 @@ class SSLCertRefresher:
             )
 
     async def _watch_files(self, paths, fun: Callable[[Change, str], None]) -> None:
-        """Watch multiple file paths asynchronously."""
-        logger.info("SSLCertRefresher monitors files: %s", paths)
-        async for changes in awatch(*paths):
-            try:
-                for change, file_path in changes:
-                    logger.info("File change detected: %s - %s", change.name, file_path)
-                    fun(change, file_path)
-            except Exception as e:
-                logger.error(
-                    "SSLCertRefresher failed taking action on file change. Error: %s", e
-                )
-
-    def stop(self) -> None:
-        """Stop watching files."""
         if self.watch_ssl_cert_task:
             self.watch_ssl_cert_task.cancel()
             self.watch_ssl_cert_task = None

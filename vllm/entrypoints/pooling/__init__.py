@@ -17,7 +17,6 @@ else:
     RequestLogger = object
     SupportedTask = object
 
-
 def register_pooling_api_routers(
     app: FastAPI, supported_tasks: tuple["SupportedTask", ...]
 ):
@@ -41,7 +40,6 @@ def register_pooling_api_routers(
         from vllm.entrypoints.pooling.score.api_router import router as score_router
 
         app.include_router(score_router)
-
 
 def init_pooling_state(
     engine_client: "EngineClient",

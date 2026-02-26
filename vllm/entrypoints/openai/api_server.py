@@ -58,7 +58,6 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
-
 @asynccontextmanager
 async def build_async_engine_client(
     args: Namespace,
@@ -94,7 +93,6 @@ async def build_async_engine_client(
     ) as engine:
         yield engine
 
-
 @asynccontextmanager
 async def build_async_engine_client_from_engine_args(
     engine_args: AsyncEngineArgs,
@@ -103,13 +101,6 @@ async def build_async_engine_client_from_engine_args(
     disable_frontend_multiprocessing: bool = False,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    """
-    Create EngineClient, either:
-        - in-process using the AsyncLLMEngine Directly
-        - multiprocess using AsyncLLMEngine RPC
-
-    Returns the Client or None if the creation failed.
-    """
 
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -147,7 +138,6 @@ async def build_async_engine_client_from_engine_args(
     finally:
         if async_llm:
             async_llm.shutdown()
-
 
 def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> FastAPI:
     if args.disable_fastapi_docs:
@@ -230,7 +220,6 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
 
     return app
 
-
 async def init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -298,7 +287,6 @@ async def init_app_state(
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
-
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
     family = socket.AF_INET
     if is_valid_ipv6_address(addr[0]):
@@ -311,12 +299,10 @@ def create_server_socket(addr: tuple[str, int]) -> socket.socket:
 
     return sock
 
-
 def create_server_unix_socket(path: str) -> socket.socket:
     sock = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
     sock.bind(path)
     return sock
-
 
 def validate_api_server_args(args):
     valid_tool_parses = ToolParserManager.list_registered()
@@ -335,10 +321,7 @@ def validate_api_server_args(args):
             f"(chose from {{ {','.join(valid_reasoning_parsers)} }})"
         )
 
-
 def setup_server(args):
-    """Validate API server args, set up signal handler, create socket
-    ready to serve."""
 
     log_version_and_model(logger, VLLM_VERSION, args.model)
     log_non_default_args(args)
@@ -379,21 +362,7 @@ def setup_server(args):
         listen_address = f"http{'s' if is_ssl else ''}://{host_part}:{port}"
     return listen_address, sock
 
-
 async def run_server(args, **uvicorn_kwargs) -> None:
-    """Run a single-worker API server."""
-
-    # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
-
-    listen_address, sock = setup_server(args)
-    await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
-
-
-async def run_server_worker(
-    listen_address, sock, args, client_config=None, **uvicorn_kwargs
-) -> None:
-    """Run a single API server worker."""
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -447,7 +416,6 @@ async def run_server_worker(
         await shutdown_task
     finally:
         sock.close()
-
 
 if __name__ == "__main__":
     # NOTE(simon):

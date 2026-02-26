@@ -16,10 +16,8 @@ from vllm.entrypoints.utils import load_aware_call, with_cancellation
 
 router = APIRouter()
 
-
 def classify(request: Request) -> ServingClassification | None:
     return request.app.state.openai_serving_classification
-
 
 @router.post("/classify", dependencies=[Depends(validate_json_request)])
 @with_cancellation

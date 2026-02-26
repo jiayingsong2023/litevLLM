@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 from typing import Annotated, Any
 
 from pydantic import Field, model_validator
@@ -18,7 +17,6 @@ from vllm.utils import random_uuid
 from vllm.utils.serial_utils import EmbedDType, EncodingFormat, Endianness
 
 logger = init_logger(__name__)
-
 
 class PoolingBasicRequestMixin(OpenAIBaseModel):
     # --8<-- [start:pooling-common-params]
@@ -46,7 +44,6 @@ class PoolingBasicRequestMixin(OpenAIBaseModel):
     )
     # --8<-- [end:pooling-common-extra-params]
 
-
 class CompletionRequestMixin(OpenAIBaseModel):
     # --8<-- [start:completion-params]
     input: list[int] | list[list[int]] | str | list[str]
@@ -61,7 +58,6 @@ class CompletionRequestMixin(OpenAIBaseModel):
         ),
     )
     # --8<-- [end:completion-extra-params]
-
 
 class ChatRequestMixin(OpenAIBaseModel):
     # --8<-- [start:chat-params]
@@ -142,7 +138,6 @@ class ChatRequestMixin(OpenAIBaseModel):
             ),
         )
 
-
 class EncodingRequestMixin(OpenAIBaseModel):
     # --8<-- [start:encoding-params]
     encoding_format: EncodingFormat = "float"
@@ -166,7 +161,6 @@ class EncodingRequestMixin(OpenAIBaseModel):
         ),
     )
     # --8<-- [end:encoding-extra-params]
-
 
 class EmbedRequestMixin(EncodingRequestMixin):
     # --8<-- [start:embed-params]
@@ -198,7 +192,6 @@ class EmbedRequestMixin(EncodingRequestMixin):
             use_activation=self.use_activation,
             truncate_prompt_tokens=getattr(self, "truncate_prompt_tokens", None),
         )
-
 
 class ClassifyRequestMixin(OpenAIBaseModel):
     # --8<-- [start:classify-extra-params]

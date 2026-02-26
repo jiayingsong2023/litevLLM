@@ -17,7 +17,6 @@ from vllm.entrypoints.pooling.base.protocol import (
 from vllm.renderers import TokenizeParams
 from vllm.utils import random_uuid
 
-
 class ClassificationCompletionRequest(
     PoolingBasicRequestMixin, CompletionRequestMixin, ClassifyRequestMixin
 ):
@@ -32,7 +31,6 @@ class ClassificationCompletionRequest(
             add_special_tokens=self.add_special_tokens,
             max_total_tokens_param="max_model_len",
         )
-
 
 class ClassificationChatRequest(
     PoolingBasicRequestMixin, ChatRequestMixin, ClassifyRequestMixin
@@ -55,18 +53,15 @@ class ClassificationChatRequest(
             max_total_tokens_param="max_model_len",
         )
 
-
 ClassificationRequest: TypeAlias = (
     ClassificationCompletionRequest | ClassificationChatRequest
 )
-
 
 class ClassificationData(OpenAIBaseModel):
     index: int
     label: str | None
     probs: list[float]
     num_classes: int
-
 
 class ClassificationResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"classify-{random_uuid()}")

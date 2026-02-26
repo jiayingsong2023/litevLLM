@@ -19,7 +19,6 @@ from vllm.entrypoints.pooling.score.utils import (
 from vllm.renderers import TokenizeParams
 from vllm.utils import random_uuid
 
-
 class ScoreRequestMixin(PoolingBasicRequestMixin, ClassifyRequestMixin):
     # --8<-- [start:score-extra-params]
     mm_processor_kwargs: dict[str, Any] | None = Field(
@@ -45,11 +44,9 @@ class ScoreRequestMixin(PoolingBasicRequestMixin, ClassifyRequestMixin):
             use_activation=self.use_activation,
         )
 
-
 class ScoreDataRequest(ScoreRequestMixin):
     data_1: list[str] | str | ScoreMultiModalParam
     data_2: list[str] | str | ScoreMultiModalParam
-
 
 class ScoreQueriesDocumentsRequest(ScoreRequestMixin):
     queries: list[str] | str | ScoreMultiModalParam
@@ -63,7 +60,6 @@ class ScoreQueriesDocumentsRequest(ScoreRequestMixin):
     def data_2(self):
         return self.documents
 
-
 class ScoreTextRequest(ScoreRequestMixin):
     text_1: list[str] | str | ScoreMultiModalParam
     text_2: list[str] | str | ScoreMultiModalParam
@@ -76,11 +72,9 @@ class ScoreTextRequest(ScoreRequestMixin):
     def data_2(self):
         return self.text_2
 
-
 ScoreRequest: TypeAlias = (
     ScoreQueriesDocumentsRequest | ScoreDataRequest | ScoreTextRequest
 )
-
 
 class RerankRequest(PoolingBasicRequestMixin, ClassifyRequestMixin):
     query: str | ScoreMultiModalParam
@@ -105,22 +99,18 @@ class RerankRequest(PoolingBasicRequestMixin, ClassifyRequestMixin):
             max_total_tokens_param="max_model_len",
         )
 
-
 class RerankDocument(BaseModel):
     text: str | None = None
     multi_modal: ScoreContentPartParam | None = None
-
 
 class RerankResult(BaseModel):
     index: int
     document: RerankDocument
     relevance_score: float
 
-
 class RerankUsage(BaseModel):
     prompt_tokens: int
     total_tokens: int
-
 
 class RerankResponse(OpenAIBaseModel):
     id: str
@@ -128,12 +118,10 @@ class RerankResponse(OpenAIBaseModel):
     usage: RerankUsage
     results: list[RerankResult]
 
-
 class ScoreResponseData(OpenAIBaseModel):
     index: int
     object: str = "score"
     score: float
-
 
 class ScoreResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"embd-{random_uuid()}")

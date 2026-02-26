@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -27,13 +26,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 def tokenization(request: Request) -> OpenAIServingTokenization:
     return request.app.state.openai_serving_tokenization
 
-
 router = APIRouter()
-
 
 @router.post(
     "/tokenize",
@@ -62,7 +58,6 @@ async def tokenize(request: TokenizeRequest, raw_request: Request):
         return JSONResponse(content=generator.model_dump())
 
     assert_never(generator)
-
 
 @router.post(
     "/detokenize",
@@ -95,14 +90,8 @@ async def detokenize(request: DetokenizeRequest, raw_request: Request):
 
     assert_never(generator)
 
-
 def attach_router(app: FastAPI):
     if getattr(app.state.args, "enable_tokenizer_info_endpoint", False):
-        """Conditionally register the tokenizer info endpoint if enabled."""
-
-        @router.get("/tokenizer_info")
-        async def get_tokenizer_info(raw_request: Request):
-            """Get comprehensive tokenizer information."""
             result = await tokenization(raw_request).get_tokenizer_info()
             return JSONResponse(
                 content=result.model_dump(),
