@@ -29,7 +29,6 @@ AITER_MODEL_LIST = [
     "Qwen/Qwen3-8B",
 ]
 
-
 # @maybe_test_rocm_aiter
 @pytest.mark.parametrize(
     "model",

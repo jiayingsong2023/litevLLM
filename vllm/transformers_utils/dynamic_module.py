@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 def try_get_class_from_dynamic_module(
     class_reference: str,
     pretrained_model_name_or_path: str,
@@ -29,10 +28,6 @@ def try_get_class_from_dynamic_module(
     warn_on_fail: bool = True,
     **kwargs,
 ) -> type | None:
-    """
-    As `transformers.dynamic_module_utils.get_class_from_dynamic_module`,
-    but ignoring any errors.
-    """
     try:
         resolve_trust_remote_code(
             trust_remote_code,

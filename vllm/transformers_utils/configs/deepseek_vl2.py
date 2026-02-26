@@ -5,7 +5,6 @@
 
 from transformers import DeepseekV2Config, PretrainedConfig
 
-
 class VisionEncoderConfig(PretrainedConfig):
     model_type: str = "vision"
 
@@ -56,7 +55,6 @@ class VisionEncoderConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
-
 class MlpProjectorConfig(PretrainedConfig):
     model_type = "mlp_projector"
     projector_type: str = "downsample_mlp_gelu"
@@ -85,7 +83,6 @@ class MlpProjectorConfig(PretrainedConfig):
         self.downsample_ratio = downsample_ratio
 
         super().__init__(**kwargs)
-
 
 class DeepseekVLV2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"

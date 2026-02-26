@@ -27,7 +27,6 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 from transformers.tokenization_utils_base import TextInput
 
-
 class Qwen3ASRProcessorKwargs(ProcessingKwargs, total=False):
     _defaults = {
         "text_kwargs": {
@@ -41,11 +40,7 @@ class Qwen3ASRProcessorKwargs(ProcessingKwargs, total=False):
         },
     }
 
-
 def _get_feat_extract_output_lengths(input_lengths):
-    """
-    Computes the output length of the convolutional layers and the output length of the audio encoder
-    """
 
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -54,21 +49,7 @@ def _get_feat_extract_output_lengths(input_lengths):
     )
     return output_lengths
 
-
 class Qwen3ASRProcessor(ProcessorMixin):
-    r"""
-    Constructs a Qwen3ASR processor.
-    [`Qwen3ASRProcessor`] offers all the functionalities of [`WhisperFeatureExtractor`], and [`Qwen2TokenizerFast`]. See the
-    [`~Qwen3ASRProcessor.__call__`] and [`~Qwen3ASRProcessor.decode`] for more information.
-
-    Args:
-        feature_extractor ([`WhisperFeatureExtractor`], *optional*):
-            The audio feature extractor.
-        tokenizer ([`Qwen2TokenizerFast`], *optional*):
-            The text tokenizer.
-        chat_template (`Optional[str]`, *optional*):
-            The Jinja template to use for formatting the conversation. If not provided, the default chat template is used.
-    """
 
     attributes = ["feature_extractor", "tokenizer"]
     feature_extractor_class = "WhisperFeatureExtractor"
@@ -86,21 +67,6 @@ class Qwen3ASRProcessor(ProcessorMixin):
         audio: AudioInput = None,
         **kwargs,
     ) -> BatchFeature:
-        """
-        Main method to prepare for the model one or several sequences(s) and audio(s). This method forwards the `text`
-        and `kwargs` arguments to Qwen2TokenizerFast's [`~Qwen2TokenizerFast.__call__`] if `text` is not `None` to encode
-        the text. To prepare the audio(s), this method forwards the `audio` and `kwargs` arguments to
-        WhisperFeatureExtractor's [`~WhisperFeatureExtractor.__call__`] if `audio` is not `None`. Please refer to the doctsring
-        of the above two methods for more information.
-
-        Args:
-            text (`str`, `List[str]`, `List[List[str]]`):
-                The sequence or batch of sequences to be encoded. Each sequence can be a string or a list of strings
-                (pretokenized string). If the sequences are provided as list of strings (pretokenized), you must set
-                `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
-            audio (`np.ndarray`, `List[np.ndarray]`):
-                The audio or batch of audio to be prepared. Each audio can be a NumPy array.
-        """
 
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
@@ -180,24 +146,6 @@ class Qwen3ASRProcessor(ProcessorMixin):
     def get_chunked_index(
         self, token_indices: np.ndarray, tokens_per_chunk: int
     ) -> list[tuple[int, int]]:
-        """
-        Splits token index list into chunks based on token value ranges.
-
-        Given a list of token indices, returns a list of (start, end) index tuples representing
-        slices of the list where the token values fall within successive ranges of `tokens_per_chunk`.
-
-        For example, if `tokens_per_chunk` is 1000, the function will create chunks such that:
-        - the first chunk contains token values < 1000,
-        - the second chunk contains values >= 1000 and < 2000, and so on.
-
-        Parameters:
-            token_indices (`np.ndarray`): A monotonically increasing list of token index values.
-            tokens_per_chunk (`int`): Number of tokens per chunk (used as the chunk size threshold).
-
-        Returns:
-            `list[tuple[int, int]]`: A list of tuples, each representing the start (inclusive)
-                                and end (exclusive) indices of a chunk in `token_indices`.
-        """
 
         def _iter():
             i, start_idx = 0, 0  # skip bos token
@@ -227,6 +175,5 @@ class Qwen3ASRProcessor(ProcessorMixin):
                 + ["feature_attention_mask"]
             )
         )
-
 
 AutoProcessor.register("Qwen3ASRProcessor", Qwen3ASRProcessor)

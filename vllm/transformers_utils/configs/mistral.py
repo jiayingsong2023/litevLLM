@@ -8,7 +8,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 def adapt_config_dict(
     config_dict: dict[str, Any],
     defaults: dict[str, Any],
@@ -77,7 +76,6 @@ def adapt_config_dict(
 
     return config
 
-
 def _remap_mistral_vision_args(config: dict) -> dict:
     if config.get("multimodal"):
         vision_config = config.pop("multimodal")
@@ -94,7 +92,6 @@ def _remap_mistral_vision_args(config: dict) -> dict:
     if quant_config:
         config["quantization_config"] = quant_config
     return config
-
 
 def _remap_mistral_yarn_args(config: dict) -> dict:
     yarn_config_map = {
@@ -120,7 +117,6 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 
     return config
-
 
 def _remap_general_mistral_args(config: dict) -> dict:
     # Mistral key -> HF key
@@ -150,7 +146,6 @@ def _remap_general_mistral_args(config: dict) -> dict:
 
     return config
 
-
 def _remap_mistral_quantization_args(config: dict) -> dict:
     if config.get("quantization"):
         quantization = config.pop("quantization", {})
@@ -168,7 +163,6 @@ def _remap_mistral_quantization_args(config: dict) -> dict:
             raise ValueError(f"Found unknown quantization='{quantization}' in config")
 
     return config
-
 
 def _remap_moe_args(config: dict) -> dict:
     moe_config_map = {

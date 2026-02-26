@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Kimi-K2.5 Model Configuration.
-
-This configuration supports video-chunk as an internal modality type.
-A video-chunk is the smallest independently processable unit of video.
-"""
 
 from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig
-
 
 class KimiK25VisionConfig(PretrainedConfig):
     model_type = "kimi_k25_vision"
@@ -59,21 +52,7 @@ class KimiK25VisionConfig(PretrainedConfig):
         self.projector_hidden_act = projector_hidden_act
         self.projector_ln_eps = projector_ln_eps
 
-
 class KimiK25Config(PretrainedConfig):
-    """Kimi-K2.5 model configuration.
-
-    Kimi-K2.5 extends Kimi-K2 with vision support using video-chunks.
-    A video-chunk consists of multiple consecutive frames
-    that are processed together with temporal pooling.
-
-    Args:
-        vision_config: Configuration for the vision tower and projector.
-        text_config: Configuration for the text model (DeepseekV3).
-        ignore_index: The ignore index for the loss function.
-        media_placeholder_token_id: The token ID for media placeholders.
-        pad_token_id: The token ID for padding.
-    """
 
     model_type = "kimi_k25"
 
@@ -120,10 +99,4 @@ class KimiK25Config(PretrainedConfig):
 
     @property
     def hidden_size(self) -> int:
-        """Get hidden size from text config for compatibility."""
-        return self.text_config.hidden_size
-
-    @property
-    def vocab_size(self) -> int:
-        """Get vocab size from text config for compatibility."""
         return self.text_config.vocab_size

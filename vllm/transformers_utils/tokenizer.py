@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import warnings
 
-
 def __getattr__(name: str):
     # Keep until lm-eval is updated
     if name == "get_tokenizer":

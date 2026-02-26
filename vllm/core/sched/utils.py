@@ -4,26 +4,7 @@ import contextlib
 
 from vllm.request import Request, RequestStatus
 
-
 def remove_all(lst: list, items_to_remove: set) -> list:
-    """Remove all items from a list that are in the items_to_remove set.
-
-    This method optimizes for the common case of removing a single item,
-    falling back to list comprehension for multiple items.
-
-    Args:
-        lst: The list to remove items from
-        items_to_remove: Set of items to remove
-
-    Returns:
-        Either the modified original list (for single item removal) or
-        a new list (for multiple item removal). Callers should use the
-        returned value.
-
-    Note:
-        For single item removal, this modifies the original list in-place
-        and returns it. For multiple items, it creates and returns a new list.
-    """
     if not items_to_remove:
         return lst
 
@@ -35,7 +16,6 @@ def remove_all(lst: list, items_to_remove: set) -> list:
         return lst
     # For multiple items, use list comprehension
     return [item for item in lst if item not in items_to_remove]
-
 
 def check_stop(request: Request, max_model_len: int) -> bool:
     assert not request.pooling_params

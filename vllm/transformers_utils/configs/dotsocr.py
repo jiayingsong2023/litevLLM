@@ -5,7 +5,6 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.qwen2 import Qwen2Config
 
-
 class DotsVisionConfig(PretrainedConfig):
     model_type: str = "dots_vit"
 
@@ -48,7 +47,6 @@ class DotsVisionConfig(PretrainedConfig):
         self.is_causal = is_causal
         self.post_norm = post_norm
         self.gradient_checkpointing = gradient_checkpointing
-
 
 class DotsOCRConfig(Qwen2Config):
     model_type = "dots_ocr"

@@ -4,7 +4,6 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-
 class Step3VisionEncoderConfig(PretrainedConfig):
     model_type = "step3_vision_encoder"
 
@@ -33,7 +32,6 @@ class Step3VisionEncoderConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.hidden_act = hidden_act
         super().__init__(**kwargs)
-
 
 class Step3TextConfig(PretrainedConfig):
     model_type = "step3_text"
@@ -144,7 +142,6 @@ class Step3TextConfig(PretrainedConfig):
         self.moe_layers_enum = moe_layers_enum
 
         super().__init__(**kwargs)
-
 
 class Step3VLConfig(PretrainedConfig):
     model_type = "step3_vl"

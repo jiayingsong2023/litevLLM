@@ -7,7 +7,6 @@ from transformers.configuration_utils import PretrainedConfig
 
 from vllm.transformers_utils.configs.moonvit import MoonViTConfig
 
-
 class KimiVLConfig(PretrainedConfig):
     model_type = "kimi_vl"
 

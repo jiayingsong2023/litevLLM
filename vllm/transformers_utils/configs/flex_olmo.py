@@ -4,7 +4,6 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-
 class FlexOlmoConfig(PretrainedConfig):
     model_type = "flex_olmo"
     keys_to_ignore_at_inference = ["past_key_values"]

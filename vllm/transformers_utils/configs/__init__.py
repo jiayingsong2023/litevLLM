@@ -1,14 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Model configs may be defined in this directory for the following reasons:
-
-- There is no configuration file defined by HF Hub or Transformers library.
-- There is a need to override the existing config to support vLLM.
-- The HF model_type isn't recognized by the Transformers library but can
-  be mapped to an existing Transformers config, such as
-  deepseek-ai/DeepSeek-V3.2-Exp.
-"""
 
 from __future__ import annotations
 
@@ -90,7 +81,6 @@ __all__ = [
     "Tarsier2Config",
 ]
 
-
 def __getattr__(name: str):
     if name in _CLASS_TO_MODULE:
         module_name = _CLASS_TO_MODULE[name]
@@ -98,7 +88,6 @@ def __getattr__(name: str):
         return getattr(module, name)
 
     raise AttributeError(f"module 'configs' has no attribute '{name}'")
-
 
 def __dir__():
     return sorted(list(__all__))

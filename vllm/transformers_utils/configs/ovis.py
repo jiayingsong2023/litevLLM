@@ -9,27 +9,7 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
-
 class AIMv2Config(PretrainedConfig):
-    """This is the configuration class to store the configuration of an [`AIMv2Model`].
-    Instantiating a configuration with the defaults will yield a similar configuration
-    to that of the [apple/aimv2-large-patch14-224](https://huggingface.co/apple/aimv2-large-patch14-224).
-    Args:
-        hidden_size: Dimension of the hidden representations.
-        intermediate_size: Dimension of the SwiGLU representations.
-        num_hidden_layers: Number of hidden layers in the Transformer.
-        num_attention_heads: Number of attention heads for each attention layer
-            in the Transformer.
-        num_channels: Number of input channels.
-        image_size: Image size.
-        patch_size: Patch size.
-        rms_norm_eps: Epsilon value used for the RMS normalization layer.
-        attention_dropout: Dropout ratio for attention probabilities.
-        projection_dropout: Dropout ratio for the projection layer after the attention.
-        qkv_bias: Whether to add a bias to the queries, keys and values.
-        use_bias: Whether to add a bias in the feed-forward and projection layers.
-        kwargs: Keyword arguments for the [`PretrainedConfig`].
-    """
 
     model_type: str = "aimv2"
 
@@ -63,7 +43,6 @@ class AIMv2Config(PretrainedConfig):
         self.projection_dropout = projection_dropout
         self.qkv_bias = qkv_bias
         self.use_bias = use_bias
-
 
 # ----------------------------------------------------------------------
 #                     Visual Tokenizer Configuration
@@ -105,7 +84,6 @@ class BaseVisualTokenizerConfig(PretrainedConfig):
         self.backbone_config = backbone_config
         self.hidden_stride = hidden_stride
 
-
 class Aimv2VisualTokenizerConfig(BaseVisualTokenizerConfig):
     model_type = "aimv2_visual_tokenizer"
 
@@ -116,7 +94,6 @@ class Aimv2VisualTokenizerConfig(BaseVisualTokenizerConfig):
         if self.depths:
             assert len(self.depths) == 1
             self.backbone_kwargs["num_hidden_layers"] = self.depths[0]
-
 
 class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
     model_type = "siglip_visual_tokenizer"
@@ -129,10 +106,8 @@ class SiglipVisualTokenizerConfig(BaseVisualTokenizerConfig):
             assert len(self.depths) == 1
             self.backbone_kwargs["num_hidden_layers"] = self.depths[0]
 
-
 AutoConfig.register("siglip_visual_tokenizer", SiglipVisualTokenizerConfig)
 AutoConfig.register("aimv2_visual_tokenizer", Aimv2VisualTokenizerConfig)
-
 
 # ----------------------------------------------------------------------
 #                           Ovis Configuration

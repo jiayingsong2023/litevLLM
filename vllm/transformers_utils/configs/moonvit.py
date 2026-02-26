@@ -3,7 +3,6 @@
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/configuration_kimi_vl.py
 from transformers.configuration_utils import PretrainedConfig
 
-
 class MoonViTConfig(PretrainedConfig):
     model_type = "moonvit"
 

@@ -28,7 +28,6 @@ else:
     SamplingParams = object
     Request = object
 
-
 @bc_linter_include
 @dataclass
 class NewRequestData:
@@ -108,7 +107,6 @@ class NewRequestData:
             ")"
         )
 
-
 @bc_linter_include
 @dataclass
 class CachedRequestData:
@@ -154,12 +152,6 @@ class CachedRequestData:
 
     @cached_property
     def _req_id_to_num_output_tokens(self) -> dict[str, int]:
-        """Cache mapping of req_id to num_output_tokens for O(1) lookup.
-
-        This cached property is safe because CachedRequestData instances
-        are created fresh each scheduling iteration and not mutated during
-        computation of iteration details.
-        """
         return dict(zip(self.req_ids, self.num_output_tokens))
 
     def is_context_phase(self, req_id: str) -> bool:
@@ -177,7 +169,6 @@ class CachedRequestData:
             num_computed_tokens=[],
             num_output_tokens=[],
         )
-
 
 @bc_linter_include
 @dataclass
@@ -251,7 +242,6 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
-
 
 @dataclass
 class GrammarOutput:

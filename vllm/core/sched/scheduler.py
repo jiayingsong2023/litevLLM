@@ -50,7 +50,6 @@ from vllm.v1_utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -757,11 +756,6 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
-        """Preempt a request and put it back to the waiting queue.
-
-        NOTE: The request should be popped from the running queue outside of this
-        method.
-        """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
@@ -808,11 +802,6 @@ class Scheduler(SchedulerInterface):
     def _update_request_as_session(
         self, session: Request, update: StreamingUpdate
     ) -> None:
-        """
-        Updates the waiting session with the next streaming update.
-
-        Discards the last sampled output token from the prior input chunk.
-        """
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
@@ -918,26 +907,6 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
-        """
-        Determine which encoder inputs need to be scheduled in the current step,
-        and update `num_new_tokens` and encoder token budget accordingly.
-
-        An encoder input will be scheduled if:
-        - Its output tokens overlap with the range of tokens being computed
-        in this step, i.e.,
-        [num_computed_tokens, num_computed_tokens + num_new_tokens).
-        - It is not already computed and stored in the encoder cache.
-        - It is not exist on remote encoder cache (via ECConnector)
-        - There is sufficient encoder token budget to process it.
-        - The encoder cache has space to store it.
-
-        If an encoder input cannot be scheduled due to cache or budget
-        limitations, the method adjusts `num_new_tokens` to schedule only the
-        decoder tokens up to just before the unschedulable encoder input.
-
-        Note that num_computed_tokens includes both locally cached
-        blocks and externally cached blocks (via KVConnector).
-        """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
             return [], num_new_tokens, encoder_compute_budget, []
         encoder_inputs_to_schedule: list[int] = []
@@ -1262,145 +1231,6 @@ class Scheduler(SchedulerInterface):
         return engine_core_outputs
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """Return True if finished (can be False for resumable requests)."""
-        if not request.resumable:
-            return True
-
-        if request.streaming_queue:
-            update = request.streaming_queue.popleft()
-            if update is None:
-                # Streaming request finished.
-                return True
-            self._update_request_as_session(request, update)
-        else:
-            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-            self.num_waiting_for_streaming_input += 1
-
-        self.waiting.add_request(request)
-        return False
-
-    def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.model_config.enable_return_routed_experts:
-            return None
-
-        kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-        block_ids = kv_blocks.get_block_ids()[0]
-        num_tokens = request.num_tokens - 1
-
-        # compute slot mapping
-        block_ids_array = np.array(block_ids, dtype=np.int32)
-        num_blocks = len(block_ids)
-        block_size = self.block_size
-
-        # generate block offsets
-        block_offsets = np.arange(0, block_size)
-
-        # compute slot mapping: slot = block_id * block_size + offset
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids_array.reshape((num_blocks, 1)) * block_size
-        ).flatten()[:num_tokens]
-
-        return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
-
-    def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
-    ) -> tuple[list[int], bool]:
-        # Append generated tokens and check for stop. Note that if
-        # a request is still being prefilled, we expect the model runner
-        # to return empty token ids for the request.
-        stopped = False
-        for num_new, output_token_id in enumerate(new_token_ids, 1):
-            request.append_output_token_ids(output_token_id)
-
-            # Check for stop and update request state.
-            # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
-            if stopped:
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
-                break
-        return new_token_ids, stopped
-
-    def _free_encoder_inputs(self, request: Request) -> None:
-        cached_encoder_input_ids = self.encoder_cache_manager.get_cached_input_ids(
-            request
-        )
-        # OPTIMIZATION: Avoid list(set) if the set is empty.
-        if not cached_encoder_input_ids:
-            return
-
-        # Here, we use list(set) to avoid modifying the set while iterating
-        # over it.
-        for input_id in list(cached_encoder_input_ids):
-            mm_feature = request.mm_features[input_id]
-            start_pos = mm_feature.mm_position.offset
-            num_tokens = mm_feature.mm_position.length
-            if self.is_encoder_decoder and request.num_computed_tokens > 0:
-                # With Whisper, as soon as we've generated a single token,
-                # we know we're done with the encoder input. Cross Attention
-                # KVs have been calculated and cached already.
-                self.encoder_cache_manager.free_encoder_input(request, input_id)
-            elif start_pos + num_tokens <= request.num_computed_tokens:
-                # The encoder output is already processed and stored
-                # in the decoder's KV cache.
-                self.encoder_cache_manager.free_encoder_input(request, input_id)
-
-    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
-        ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
-            # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
-            request.spec_token_ids = spec_token_ids
-
-    def update_draft_token_ids_in_output(
-        self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
-    ) -> None:
-        num_invalid_spec_tokens: dict[str, int] = {}
-
-        sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
-        ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
-            placeholder_spec_tokens = sched_spec_tokens.get(req_id)
-            if not placeholder_spec_tokens:
-                continue
-
-            orig_num_spec_tokens = len(placeholder_spec_tokens)
-            # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                assert metadata is not None and metadata.grammar is not None
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
-            # Pad to original number of spec tokens.
-            num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
-            if num_invalid_tokens:
-                spec_token_ids.extend([-1] * num_invalid_tokens)
-                num_invalid_spec_tokens[req_id] = num_invalid_tokens
-
-            sched_spec_tokens[req_id] = spec_token_ids
-
-        scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
-
-    def get_request_counts(self) -> tuple[int, int]:
-        """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
@@ -1428,11 +1258,6 @@ class Scheduler(SchedulerInterface):
     def finish_requests(
         self, request_ids: str | Iterable[str], finished_status: RequestStatus
     ) -> None:
-        """Handles the finish signal from outside the scheduler.
-
-        For example, the API server can abort a request when the client
-        disconnects.
-        """
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
@@ -1491,13 +1316,6 @@ class Scheduler(SchedulerInterface):
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        """Reset the KV prefix cache.
-
-        If reset_running_requests is True, all the running requests will be
-        preempted and moved to the waiting queue.
-        Otherwise, this method will only reset the KV prefix cache when there
-        is no running requests taking KV cache.
-        """
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -1549,11 +1367,6 @@ class Scheduler(SchedulerInterface):
         return True
 
     def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache to invalidate all cached encoder outputs.
-
-        This should be called when model weights are updated to ensure
-        stale vision embeddings are not reused.
-        """
         self.encoder_cache_manager.reset()
 
     def make_stats(
@@ -1587,50 +1400,3 @@ class Scheduler(SchedulerInterface):
         )
 
     def _get_encoder_cache_usage(self) -> float:
-        """Get encoder cache usage as a fraction (0.0 to 1.0)."""
-        ecm = self.encoder_cache_manager
-        if ecm.cache_size == 0:
-            return 0.0
-        used_slots = ecm.cache_size - ecm.num_free_slots
-        return used_slots / ecm.cache_size
-
-    def make_spec_decoding_stats(
-        self,
-        spec_decoding_stats: SpecDecodingStats | None,
-        num_draft_tokens: int,
-        num_accepted_tokens: int,
-        num_invalid_spec_tokens: dict[str, int] | None,
-        request_id: str,
-    ) -> SpecDecodingStats | None:
-        if not self.log_stats or not num_draft_tokens:
-            return None
-        if spec_decoding_stats is None:
-            spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
-        spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
-        )
-        return spec_decoding_stats
-
-    def shutdown(self) -> None:
-        if self.kv_event_publisher:
-            self.kv_event_publisher.shutdown()
-
-    ########################################################################
-    # LitevLLM: Simplified Methods (Distributed logic removed)
-    ########################################################################
-
-    def get_kv_connector(self) -> Any:
-        return None
-
-    def _connector_finished(
-        self, request: Request
-    ) -> tuple[bool, dict[str, Any] | None]:
-        return False, None
-
-    def _update_waiting_for_remote_kv(self, request: Request) -> bool:
-        return True
-
-    def _update_from_kv_xfer_finished(self, kv_connector_output: Any):
-        pass

@@ -1,27 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GGUF utility functions."""
-
-from functools import cache
-from os import PathLike
-from pathlib import Path
-
-import gguf
-import regex as re
-from gguf.constants import Keys, VisionProjectorType
-from gguf.quants import GGMLQuantizationType
-from transformers import Gemma3Config, PretrainedConfig, SiglipVisionConfig
-
-from vllm.logger import init_logger
-
-from .repo_utils import list_filtered_repo_files
-
-logger = init_logger(__name__)
-
-
-@cache
-def check_gguf_file(model: str | PathLike) -> bool:
-    """Check if the file is a GGUF model."""
     model = Path(model)
     if not model.is_file():
         return False
@@ -37,45 +15,11 @@ def check_gguf_file(model: str | PathLike) -> bool:
         logger.debug("Error reading file %s: %s", model, e)
         return False
 
-
 @cache
 def is_remote_gguf(model: str | Path) -> bool:
-    """Check if the model is a remote GGUF model."""
-    pattern = r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*:[A-Za-z0-9_+-]+$"
-    model = str(model)
-    if re.fullmatch(pattern, model):
-        _, quant_type = model.rsplit(":", 1)
-        return is_valid_gguf_quant_type(quant_type)
-    return False
-
-
-# Common suffixes used in GGUF file naming conventions
-# e.g., Q4_K_M, Q3_K_S, Q5_K_L, Q2_K_XL
-_GGUF_QUANT_SUFFIXES = ("_M", "_S", "_L", "_XL", "_XS", "_XXS")
-
-
-def is_valid_gguf_quant_type(gguf_quant_type: str) -> bool:
-    """Check if the quant type is a valid GGUF quant type.
 
     Supports both exact GGML quant types (e.g., Q4_K, IQ1_S) and
     extended naming conventions (e.g., Q4_K_M, Q3_K_S, Q5_K_L).
-    """
-    # Check for exact match first
-    if getattr(GGMLQuantizationType, gguf_quant_type, None) is not None:
-        return True
-
-    # Check for extended naming conventions (e.g., Q4_K_M -> Q4_K)
-    for suffix in _GGUF_QUANT_SUFFIXES:
-        if gguf_quant_type.endswith(suffix):
-            base_type = gguf_quant_type[: -len(suffix)]
-            if getattr(GGMLQuantizationType, base_type, None) is not None:
-                return True
-
-    return False
-
-
-def split_remote_gguf(model: str | Path) -> tuple[str, str]:
-    """Split the model into repo_id and quant type."""
     model = str(model)
     if is_remote_gguf(model):
         parts = model.rsplit(":", 1)
@@ -87,16 +31,7 @@ def split_remote_gguf(model: str | Path) -> tuple[str, str]:
         f"- Extended suffixes also supported: {_GGUF_QUANT_SUFFIXES}",
     )
 
-
 def is_gguf(model: str | Path) -> bool:
-    """Check if the model is a GGUF model.
-
-    Args:
-        model: Model name, path, or Path object to check.
-
-    Returns:
-        True if the model is a GGUF model, False otherwise.
-    """
     model = str(model)
 
     # Check if it's a local GGUF file
@@ -106,16 +41,7 @@ def is_gguf(model: str | Path) -> bool:
     # Check if it's a remote GGUF model (repo_id:quant_type format)
     return is_remote_gguf(model)
 
-
 def detect_gguf_multimodal(model: str) -> Path | None:
-    """Check if GGUF model has multimodal projector file.
-
-    Args:
-        model: Model path string
-
-    Returns:
-        Path to mmproj file if found, None otherwise
-    """
     if not model.endswith(".gguf"):
         return None
 
@@ -134,29 +60,7 @@ def detect_gguf_multimodal(model: str) -> Path | None:
     except Exception:
         return None
 
-
 def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | None":
-    """Extract vision config parameters from mmproj.gguf metadata.
-
-    Reads vision encoder configuration from GGUF metadata fields using
-    standardized GGUF constants. Automatically detects the projector type
-    (e.g., gemma3, llama4) and applies model-specific parameters accordingly.
-
-    The function extracts standard CLIP vision parameters from GGUF metadata
-    and applies projector-type-specific customizations. For unknown projector
-    types, it uses safe defaults from SiglipVisionConfig.
-
-    Args:
-        mmproj_path: Path to mmproj.gguf file (str or Path)
-
-    Returns:
-        SiglipVisionConfig if extraction succeeds, None if any required
-        field is missing from the GGUF metadata
-
-    Raises:
-        Exception: Exceptions from GGUF reading (file not found, corrupted
-            file, etc.) propagate directly from gguf.GGUFReader
-    """
     reader = gguf.GGUFReader(str(mmproj_path))
 
     # Detect projector type to apply model-specific parameters
@@ -219,28 +123,10 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
 
     return config
 
-
 def maybe_patch_hf_config_from_gguf(
     model: str,
     hf_config: PretrainedConfig,
 ) -> PretrainedConfig:
-    """Patch HF config for GGUF models.
-
-    Applies GGUF-specific patches to HuggingFace config:
-    1. For multimodal models: patches architecture and vision config
-    2. For all GGUF models: overrides vocab_size from embedding tensor
-
-    This ensures compatibility with GGUF models that have extended
-    vocabularies (e.g., Unsloth) where the GGUF file contains more
-    tokens than the HuggingFace tokenizer config specifies.
-
-    Args:
-        model: Model path string
-        hf_config: HuggingFace config to patch in-place
-
-    Returns:
-        Updated HuggingFace config
-    """
     # Patch multimodal config if mmproj.gguf exists
     mmproj_path = detect_gguf_multimodal(model)
     if mmproj_path is not None:
@@ -259,22 +145,11 @@ def maybe_patch_hf_config_from_gguf(
 
     return hf_config
 
-
 def get_gguf_file_path_from_hf(
     repo_id: str | Path,
     quant_type: str,
     revision: str | None = None,
 ) -> str:
-    """Get the GGUF file path from HuggingFace Hub based on repo_id and quant_type.
-
-    Args:
-        repo_id: The HuggingFace repository ID (e.g., "Qwen/Qwen3-0.6B")
-        quant_type: The quantization type (e.g., "Q4_K_M", "F16")
-        revision: Optional revision/branch name
-
-    Returns:
-        The path to the GGUF file on HuggingFace Hub (e.g., "filename.gguf"),
-    """
     repo_id = str(repo_id)
     gguf_patterns = [
         f"*-{quant_type}.gguf",

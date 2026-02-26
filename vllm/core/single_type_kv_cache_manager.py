@@ -20,12 +20,7 @@ from vllm.kv_cache_interface import (
 )
 from vllm.request import Request
 
-
 class SingleTypeKVCacheManager(ABC):
-    """
-    An abstract base class for a manager that handle the kv cache management
-    logic of one specific type of attention layer.
-    """
     __slots__ = (
         "block_size",
         "dcp_world_size",
@@ -48,13 +43,6 @@ class SingleTypeKVCacheManager(ABC):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> None:
-        """
-        Initializes the SingleTypeKVCacheManager.
-        Args:
-            kv_cache_spec: The kv_cache_spec for this manager.
-            block_pool: The block pool.
-            kv_cache_group_id: The id of the kv cache group of this manager.
-        """
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
@@ -90,24 +78,6 @@ class SingleTypeKVCacheManager(ABC):
         total_computed_tokens: int,
         num_tokens_main_model: int,
     ) -> int:
-        """
-        Get the number of blocks needed to be allocated for the request.
-
-        Args:
-            request_id: The request ID.
-            num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated).
-            new_computed_blocks: The new computed blocks just hitting the
-                prefix caching.
-            total_computed_tokens: Include both local and external computed
-                tokens.
-            num_tokens_main_model: The number of tokens for the main model (aka target
-                model in spec decode). w/o spec decode, it is num_tokens;
-                with spec decode, it is num_tokens - num_lookahead_tokens.
-
-        Returns:
-            The number of blocks to allocate.
-        """
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
@@ -153,21 +123,6 @@ class SingleTypeKVCacheManager(ABC):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        """
-        Add the new computed blocks to the request. This involves three steps:
-        1. Touch the computed blocks to make sure they won't be evicted.
-        1.5. (Optional) For sliding window, skip blocks are padded with null blocks.
-        2. Add the remaining computed blocks.
-        3. (Optional) For KV connectors, allocate new blocks for external computed
-            tokens (if any).
-
-        Args:
-            request_id: The request ID.
-            new_computed_blocks: The new computed blocks just hitting the
-                prefix cache.
-            num_local_computed_tokens: The number of local computed tokens.
-            num_external_computed_tokens: The number of external computed tokens.
-        """
 
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
@@ -220,20 +175,6 @@ class SingleTypeKVCacheManager(ABC):
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
-        """
-        Allocate new blocks for the request to give it at least `num_tokens`
-        token slots.
-
-        Args:
-            request_id: The request ID.
-            num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated).
-            num_tokens_main_model: The number of tokens for the main model (aka target
-                model in spec decode). w/o spec decode, it is num_tokens;
-                with spec decode, it is num_tokens - num_lookahead_tokens.
-        Returns:
-            The new allocated blocks.
-        """
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
@@ -245,14 +186,6 @@ class SingleTypeKVCacheManager(ABC):
             return new_blocks
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
-        """
-        Cache the blocks for the request.
-
-        Args:
-            request: The request.
-            num_tokens: The total number of tokens that need to be cached
-                (including tokens that are already cached).
-        """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -271,12 +204,6 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block[request.request_id] = num_full_blocks
 
     def free(self, request_id: str) -> None:
-        """
-        Free the blocks for the request.
-
-        Args:
-            request_id: The request ID.
-        """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
 
@@ -289,17 +216,6 @@ class SingleTypeKVCacheManager(ABC):
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        """
-        Get the number of common prefix blocks for all requests with allocated
-        KV cache.
-
-        Args:
-            running_request_id: The request ID.
-
-        Returns:
-            The number of common prefix blocks for all requests with allocated
-            KV cache.
-        """
 
         raise NotImplementedError
 
@@ -317,56 +233,12 @@ class SingleTypeKVCacheManager(ABC):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
-        """
-        Get the longest cache hit prefix of the blocks that is not longer than
-        `max_length`. The prefix should be a common prefix hit for all the
-        kv cache groups in `kv_cache_group_ids`. If no cache hit is found,
-        return an empty list.
-        If eagle is enabled, drop the last matched block to force recompute the
-        last block to get the required hidden states for eagle drafting head.
-        Need to be customized for each attention type.
-
-        Args:
-            block_hashes: The block hashes of the request.
-            max_length: The maximum length of the cache hit prefix.
-            kv_cache_group_ids: The ids of the kv cache groups.
-            block_pool: The block pool.
-            kv_cache_spec: The kv cache spec.
-            use_eagle: Whether to use eagle.
-            alignment_tokens: The returned cache hit length (in tokens) should
-                be a multiple of this value (in tokens). By default, it should
-                be set to the block_size.
-            dcp_world_size: The world size of decode context parallelism.
-            pcp_world_size: The world size of prefill context parallelism.
-
-        Returns:
-            A list of cached blocks with skipped blocks replaced by null block
-            for each kv cache group in `kv_cache_group_ids`.
-            Return a list of length `len(kv_cache_group_ids)`, where the i-th
-            element is a list of cached blocks for the i-th kv cache group
-            in `kv_cache_group_ids`.
-            For example, sliding window manager should return a list like
-            ([NULL, NULL, KVCacheBlock(7), KVCacheBlock(8)]) for block size 4
-            and sliding window 8 and len(kv_cache_group_ids) = 1.
-        """
 
         raise NotImplementedError
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
-        """
-        Remove and free the blocks that are no longer needed for attention computation.
-        The removed blocks should be replaced by null_block.
-
-        This function depends on `get_num_skipped_tokens`, which need to be implemented
-        differently for each attention type.
-
-        Args:
-            request_id: The request ID.
-            total_computed_tokens: The total number of computed tokens, including
-                local computed tokens and external computed tokens.
-        """
         # Remove the blocks that will be skipped during attention computation.
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         if num_skipped_tokens <= 0:
@@ -396,18 +268,8 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(removed_blocks)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """
-        Get the number of tokens that will be skipped for attention computation.
-
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-        """
         # The default behavior is to not skip any tokens.
         return 0
-
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     __slots__ = ()
@@ -469,7 +331,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
-
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
     __slots__ = ("sliding_window",)
@@ -568,42 +429,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return computed_blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """
-        Get the number of tokens that will be skipped for attention computation.
-
-        For sliding window, this corresponds to the tokens that are prior to
-        the current sliding window.
-
-        Example:
-        sliding_window=4, num_computed_tokens=7
-
-        Tokens:   [ 0  1  2  3  4  5  6  7 ]
-                  | ---- computed -----|
-                                         ^ next token to be computed
-                               |-----------| sliding window for next token
-                  |--skipped---|
-
-        The current window contains tokens 4~7. Tokens 0~3 will be skipped for
-        attention computation since they are outside the sliding window.
-        Thus, get_num_skipped_tokens(7) == 4.
-
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-        """
         return max(0, num_computed_tokens - self.sliding_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        """
-        NOTE(Chen): The prefix blocks are null blocks for sliding window layers.
-        So it's not correct to count ref_cnt like FullAttentionManager. Return
-        0 here for correctness. Need to support cascade attention + sliding
-        window in the future.
-        """
         return 0
-
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
     __slots__ = ("attention_chunk_size",)
@@ -624,41 +453,6 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
-        """
-        For chunked local attention, we need to find the longest cache hit
-        prefix of the blocks that is not longer than `max_length`. The prefix
-        should be a common prefix hit for all the kv cache groups in
-        `kv_cache_group_ids`. If no cache hit is found, return an empty list.
-        note we mark as computed if the whole block is outside of the local
-        window, and set the block as null. Examples:
-
-        1. Attention chunk size of 8, block size of 4, max length of 15
-        for next token at 15th (zero-indexed), 8th - 14th tokens are in
-        the window(needs lookup), 0th - 7th are not in the window,
-        so they are already marked as computed. We check the complete
-        block3 (8th - 11th tokens), Assume block 3 is hit, we will return
-        [null, null, block 3], otherwise, we return [null, null]
-
-        2. Attention chunk size of 8, block size of 4, max length of 16
-        for next token at 16th (zero-indexed), 0th - 15th tokens are not
-        in the window, so they are already marked as computed.
-        we return 4 blocks[null, null, null, null]
-
-        Args:
-            block_hashes: The block hashes of the request.
-            max_length: The maximum length of the cache hit prefix.
-            kv_cache_group_ids: The ids of the kv cache groups.
-            block_pool: The block pool.
-            kv_cache_spec: The kv cache spec.
-            use_eagle: Whether to use eagle.
-            dcp_world_size: The world size of decode context parallelism.
-            pcp_world_size: The world size of prefill context parallelism.
-            alignment_tokens: The returned cache hit length (in tokens) should
-                be a multiple of this value (in tokens).
-
-        Returns:
-            A list of cached blocks
-        """
         assert isinstance(kv_cache_spec, ChunkedLocalAttentionSpec), (
             "ChunkedLocalAttentionManager can only be used for "
             "chunked local attention groups"
@@ -704,57 +498,13 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         return computed_blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """
-        Get the number of tokens that will be skipped for attention computation.
-
-        For chunked local attention, this corresponds to the tokens that are on
-        the left side of the current chunk.
-
-        Example 1:
-        chunk size = 8, num_computed_tokens = 13
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 | ----- computed ---------------|
-                                                  ^^ next token to be computed
-                                   |----------------| <-- attention window for
-                                                          next token
-                 |--- skipped -----|
-        Output: get_num_skipped_tokens(13) == 8
-
-        Example 2:
-        chunk size = 8, num_computed_tokens = 8
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 | --- computed ---|
-                                     ^ next token to be computed
-                                   |--| <-- attention window for next token
-                 | --- skipped ----|
-        Output: get_num_skipped_tokens(8) == 8
-
-        Example 3:
-        chunk size = 8, num_computed_tokens = 7
-        Tokens:  [ 0 1 2 3 4 5 6 7 | 8 9 10 11 12 13 14 15 ] ...
-                 |---computed---|
-                                 ^ next token to be computed
-                 |-----------------| <-- attention window for next token
-                 no token should be skipped.
-        Output: get_num_skipped_tokens(7) == 0
-
-        Args:
-            num_computed_tokens: The number of tokens that have been computed.
-
-        Returns:
-            The number of tokens that will be skipped for attention computation.
-        """
         num_skipped_tokens = (
             num_computed_tokens // self.attention_chunk_size
         ) * self.attention_chunk_size
         return num_skipped_tokens
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        """
-        cascade attention is not supported by chunked local attention.
-        """
         return 0
-
 
 class MambaManager(SingleTypeKVCacheManager):
     __slots__ = (
@@ -846,9 +596,6 @@ class MambaManager(SingleTypeKVCacheManager):
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        """
-        cascade attention is not supported by mamba
-        """
         return 0
 
     def get_num_blocks_to_allocate(
@@ -987,101 +734,6 @@ class MambaManager(SingleTypeKVCacheManager):
         super().free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
-        """
-        Get the number of tokens whose mamba state are not needed anymore. Mamba only
-        need to keep the state of the last computed token, so we return
-        num_computed_tokens - 1.
-        """
         return num_computed_tokens - 1
 
-
 class CrossAttentionManager(SingleTypeKVCacheManager):
-    """Manager for cross-attention KV cache in encoder-decoder models."""
-
-    def allocate_new_computed_blocks(
-        self,
-        request_id: str,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
-    ) -> None:
-        # We do not cache blocks for cross-attention to be shared between
-        # requests, so  `new_computed_blocks` should always be empty.
-        assert len(new_computed_blocks) == 0
-
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
-        # We do not cache blocks for cross-attention to be shared between
-        # requests, so this method is not relevant.
-        raise ValueError("Should not be called as prefix caching is disabled.")
-
-    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        # Cross-attention blocks contain request-specific encoder states
-        # and are not shared between different requests
-        return 0
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
-        assert isinstance(kv_cache_spec, CrossAttentionSpec), (
-            "CrossAttentionManager can only be used for cross-attention groups"
-        )
-        # Cross-attention does not benefit from prefix caching since:
-        # 1. Encoder states are unique per request (different audio/image
-        #    inputs)
-        # 2. Encoder states are computed once per request, not incrementally
-        # 3. No reusable prefix exists between different multimodal inputs
-        # Return empty blocks to indicate no cache hits
-        raise NotImplementedError("CrossAttentionManager does not support caching")
-
-
-class SinkFullAttentionManager(FullAttentionManager):
-    def __init__(
-        self,
-        kv_cache_spec: SinkFullAttentionSpec,
-        block_pool: BlockPool,
-        enable_caching: bool,
-        kv_cache_group_id: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ):
-        super().__init__(
-            kv_cache_spec,
-            block_pool,
-            enable_caching,
-            kv_cache_group_id,
-            dcp_world_size,
-            pcp_world_size,
-        )
-        sink_len = kv_cache_spec.sink_len
-        assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
-        num_sink_block = sink_len // self.block_size
-        self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
-
-
-spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
-    FullAttentionSpec: FullAttentionManager,
-    MLAAttentionSpec: FullAttentionManager,
-    SlidingWindowSpec: SlidingWindowManager,
-    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-    MambaSpec: MambaManager,
-    CrossAttentionSpec: CrossAttentionManager,
-    SinkFullAttentionSpec: SinkFullAttentionManager,
-}
-
-
-def get_manager_for_kv_cache_spec(
-    kv_cache_spec: KVCacheSpec, **kwargs
-) -> SingleTypeKVCacheManager:
-    manager_class = spec_manager_map[type(kv_cache_spec)]
-    manager = manager_class(kv_cache_spec, **kwargs)
-    return manager
