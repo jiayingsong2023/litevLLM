@@ -1,8 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Compatibility layer for vLLM models.
-Maps all distributed linear layers to LiteLinear for single-GPU inference.
-"""
 
 from .lite_linear import LiteLinear
 

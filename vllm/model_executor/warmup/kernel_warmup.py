@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Warmup kernels used during model execution.
-This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
-happen during model execution.
-"""
 
 from typing import TYPE_CHECKING
 
@@ -21,7 +16,6 @@ if TYPE_CHECKING:
     from vllm.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
-
 
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
@@ -78,17 +72,7 @@ def kernel_warmup(worker: "Worker"):
             create_mixed_batch=True,
         )
 
-
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
-    """
-    Autotune FlashInfer operations.
-    FlashInfer have many implementations for the same operation,
-    autotuning runs benchmarks for each implementation and stores
-    the results. The results are cached transparently and
-    future calls to FlashInfer will use the best implementation.
-    Without autotuning, FlashInfer will rely on heuristics, which may
-    be significantly slower.
-    """
     from vllm.utils.flashinfer import autotune
 
     with torch.inference_mode(), autotune():

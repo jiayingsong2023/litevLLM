@@ -40,10 +40,8 @@ _KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
 
 PAD_SLOT_ID = -1
 
-
 def is_valid_kv_cache_layout(value: str) -> bool:
     return value in get_args(KVCacheLayoutType)
-
 
 @functools.lru_cache
 def get_kv_cache_layout():
@@ -78,20 +76,12 @@ def get_kv_cache_layout():
         )
     return cache_layout
 
-
 def set_kv_cache_layout(cache_layout: KVCacheLayoutType):
     global _KV_CACHE_LAYOUT_OVERRIDE
     _KV_CACHE_LAYOUT_OVERRIDE = cache_layout
 
-
 @dataclass
 class PerLayerParameters:
-    """
-    Currently, FlashInfer backend only support models in which all layers share
-    the same values for the following hyperparameters. Should not be used for
-    trtllm-gen backend since it supports different values for the following
-    hyperparameters.
-    """
 
     window_left: int
     logits_soft_cap: float | None
@@ -101,14 +91,9 @@ class PerLayerParameters:
     has_same_window_lefts: bool | None = field(default=None, compare=False)
     has_same_all_params: bool | None = field(default=None, compare=False)
 
-
 def get_per_layer_parameters(
     vllm_config: VllmConfig, layer_names: list[str], cls_: type["AttentionImpl"]
 ) -> dict[str, PerLayerParameters]:
-    """
-    Scan layers in `layer_names` and determine some hyperparameters
-    to use during `plan`.
-    """
 
     layers = get_layers_from_vllm_config(
         vllm_config,
@@ -134,21 +119,9 @@ def get_per_layer_parameters(
 
     return per_layer_params
 
-
 def infer_global_hyperparameters(
     per_layer_params: dict[str, PerLayerParameters],
 ) -> PerLayerParameters:
-    """
-    Currently, FlashInfer backend other than trtllm-gen
-    only support models in which all layers share
-    the same values for the following hyperparameters:
-    - `window_left`
-    - `logits_soft_cap`
-    - `sm_scale`
-
-    So this function asserts that all layers share the same values for these
-    hyperparameters and returns the global values.
-    """
 
     assert len(per_layer_params) > 0, "No attention layers found in the model."
 
@@ -163,7 +136,6 @@ def infer_global_hyperparameters(
     )
 
     return global_params
-
 
 #
 # Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
@@ -359,7 +331,6 @@ def make_local_attention_virtual_batches(
         _num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_local),
     ), make_block_table
 
-
 def make_kv_sharing_fast_prefill_common_attn_metadata(
     common_attn_metadata: CommonAttentionMetadata,
 ) -> CommonAttentionMetadata:
@@ -418,28 +389,10 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
     )
     return common_attn_metadata
 
-
 def split_decodes_prefills_and_extends(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,
 ) -> tuple[int, int, int, int, int, int]:
-    """
-    Assuming a reordered batch, finds the boundary between prefill and decode
-    requests.
-
-    Args:
-        common_attn_metadata: CommonAttentionMetadata object containing the
-            batch metadata.
-        decode_threshold: The maximum query length to be considered a decode.
-
-    Returns:
-        num_decodes: The number of decode requests.
-        num_extends: The number of extend requests.
-        num_prefills: The number of prefill requests.
-        num_decode_tokens: The number of tokens in the decode requests.
-        num_extend_tokens: The number of tokens in the extend requests.
-        num_prefill_tokens: The number of tokens in the prefill requests.
-    """
     max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -485,30 +438,11 @@ def split_decodes_prefills_and_extends(
         num_prefill_tokens,
     )
 
-
 def split_decodes_and_prefills(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,
     require_uniform: bool = False,
 ) -> tuple[int, int, int, int]:
-    """
-    Assuming a reordered batch, finds the boundary between prefill and decode
-    requests.
-
-    Args:
-        common_attn_metadata: CommonAttentionMetadata object containing the
-            batch metadata.
-        decode_threshold: The maximum query length to be considered a decode.
-        require_uniform: If True, requires that all decode requests have the
-            same query length. When set, some queries may be considered prefills
-            even if they are <= decode_threshold, in order to ensure uniformity.
-
-    Returns:
-        num_decodes: The number of decode requests.
-        num_prefills: The number of prefill requests.
-        num_decode_tokens: The number of tokens in the decode requests.
-        num_prefill_tokens: The number of tokens in the prefill requests.
-    """
     max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -546,21 +480,9 @@ def split_decodes_and_prefills(
     num_prefill_tokens = num_tokens - num_decode_tokens
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
-
 def split_prefill_chunks(
     seq_lens_cpu: torch.Tensor, workspace_size: int, request_offset: int = 0
 ) -> list[tuple[int, int]]:
-    """
-    Split the prefill requests into chunks such that the total sequence length
-    of each chunk is less than or equal to the workspace size.
-
-    Args:
-        seq_lens_cpu: The sequence lengths of the prefill requests on CPU.
-        workspace_size: The maximum workspace size (in tokens) per chunk.
-        request_offset: The offset to add to the request indices.
-    Returns:
-        A list of tuples of (reqs_start, reqs_end) representing chunk boundaries.
-    """
     chunk_bounds = []
     i, n = 0, len(seq_lens_cpu)
     assert torch.all(seq_lens_cpu <= workspace_size).item()
@@ -573,19 +495,11 @@ def split_prefill_chunks(
         chunk_bounds.append((start + request_offset, i + request_offset))
     return chunk_bounds
 
-
 def reorder_batch_to_split_decodes_and_prefills(
     input_batch: "InputBatch",
     scheduler_output: "SchedulerOutput",
     decode_threshold: int = 1,
 ) -> bool:
-    """
-    Reorders the batch to split into prefill and decode requests; places all
-    requests with <= decode_threshold tokens at the front of the batch.
-
-    Returns:
-        True if the batch was modified, False otherwise.
-    """
     # We now want to reorder the batch into decode → extend → prefill order
     # where:
     #   decode: request with num_scheduled_tokens <= decode_threshold
@@ -640,12 +554,7 @@ def reorder_batch_to_split_decodes_and_prefills(
 
     return True
 
-
 def reshape_query_for_spec_decode(query: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """
-    Reshapes the query tensor for the specified batch size, so that
-    it has shape (batch_size, seq_len, num_heads, head_dim).
-    """
     assert query.dim() == 3, f"query must be 3D, got {query.dim()}D"
     total_tokens = query.shape[0]
     num_heads = query.shape[1]
@@ -656,12 +565,7 @@ def reshape_query_for_spec_decode(query: torch.Tensor, batch_size: int) -> torch
     seq_len = total_tokens // batch_size
     return query.view(batch_size, seq_len, num_heads, head_dim)
 
-
 def reshape_attn_output_for_spec_decode(attn_output: torch.Tensor) -> torch.Tensor:
-    """
-    Reshapes the attention output tensor, so that
-    the batch_size and seq_len dimensions are combined.
-    """
     if attn_output.dim() == 3:
         # Already in the correct shape
         return attn_output
@@ -669,25 +573,19 @@ def reshape_attn_output_for_spec_decode(attn_output: torch.Tensor) -> torch.Tens
     total_tokens = attn_output.shape[0] * attn_output.shape[1]
     return attn_output.view(total_tokens, attn_output.shape[2], attn_output.shape[3])
 
-
 def subclass_attention_metadata(
     name_prefix: str,
     metadata_cls: Any,
     fields: list[tuple[str, Any, Any]],
 ) -> Any:
-    """
-    Return a new subclass of `metadata_cls` with additional fields
-    """
     name: str = name_prefix + metadata_cls.__name__  # type: ignore
     Wrapped = make_dataclass(name, fields, bases=(metadata_cls,))
     return Wrapped
-
 
 @runtime_checkable
 class KVSharingFastPrefillMetadata(Protocol):
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
-
 
 def create_fast_prefill_custom_backend(
     prefix: str,
@@ -732,7 +630,6 @@ def create_fast_prefill_custom_backend(
     )
 
     return attn_backend
-
 
 def compute_causal_conv1d_metadata(
     query_start_loc_p_cpu: torch.Tensor,
@@ -785,17 +682,12 @@ def compute_causal_conv1d_metadata(
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
 
-
 def get_dcp_local_seq_lens(
     seq_lens: torch.Tensor,
     dcp_size: int = 1,
     dcp_rank: int | None = None,
     cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
-    """While using dcp, kv_cache size stored on each rank may be different,
-    use this function to calculate split decode seq_lens of each dcp rank.
-    Only consider dcp now, we can extend the case of cp based on this.
-    """
     num_requests = seq_lens.size(0)
     if dcp_rank is None:
         rank_offsets = (
@@ -825,19 +717,11 @@ def get_dcp_local_seq_lens(
     dcp_local_seq_lens = base + remainder
     return dcp_local_seq_lens.squeeze(1)
 
-
 def extend_all_queries_by_1(
     common_attn_metadata: CommonAttentionMetadata,
     arange: torch.Tensor,
     new_slot_mapping: torch.Tensor,
 ) -> CommonAttentionMetadata:
-    """
-    Creates a new CommonAttentionMetadata with all query lengths increased by 1.
-    Also all seq lens are increased by 1.
-    This is useful e.g. in speculative decoding with draft models, where we
-    extend each sequence by 1 token.
-    The slot mapping is computed externally, as it requires more information.
-    """
     cad = common_attn_metadata
     # query start loc must be increased by [+0, +1, +2, ..., +batch_size]
     new_query_start_loc = cad.query_start_loc + arange[: len(cad.query_start_loc)]
@@ -857,27 +741,12 @@ def extend_all_queries_by_1(
     )
     return new_cad
 
-
 def mamba_get_block_table_tensor(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     kv_cache_spec: KVCacheSpec,
     mamba_cache_mode: str,
 ) -> torch.Tensor:
-    """
-    Get the block table tensor for mamba kernels from the input
-    common_attn_metadata.block_table_tensor given different mamba cache modes.
-
-    - "all":   input  (#requests, cdiv(max_model_len, block_size));
-               output (#requests, cdiv(max_model_len, block_size)).
-
-    - "none":  input  (#requests, 1 + num_speculative_blocks);
-               output (#requests, 1 + num_speculative_blocks).
-
-    - "align": input  (#requests, cdiv(max_model_len, block_size));
-               output (#requests, 1 + num_speculative_blocks), which are the last
-               1 + num_speculative_blocks of each request.
-    """
     if mamba_cache_mode in ("all", "none"):
         return block_table
     else:

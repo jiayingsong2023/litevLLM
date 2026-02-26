@@ -15,7 +15,6 @@ from .methods import SequencePoolingMethodOutput
 
 SequencePoolerHeadOutput: TypeAlias = torch.Tensor | list[torch.Tensor]
 
-
 class SequencePoolerHead(nn.Module, ABC):
     @abstractmethod
     def get_supported_tasks(self) -> Set[PoolingTask]:
@@ -28,7 +27,6 @@ class SequencePoolerHead(nn.Module, ABC):
         pooling_metadata: PoolingMetadata,
     ) -> SequencePoolerHeadOutput:
         raise NotImplementedError
-
 
 class EmbeddingPoolerHead(SequencePoolerHead):
     def __init__(
@@ -95,7 +93,6 @@ class EmbeddingPoolerHead(SequencePoolerHead):
 
         # pooled_data shape: [batchsize, embedding_dimension]
         return pooled_data
-
 
 class ClassifierPoolerHead(SequencePoolerHead):
     def __init__(

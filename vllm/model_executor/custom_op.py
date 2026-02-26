@@ -18,21 +18,7 @@ logger = init_logger(__name__)
 op_registry: dict[str, type["CustomOp"] | type["PluggableLayer"]] = {}
 op_registry_oot: dict[str, type["CustomOp"] | type["PluggableLayer"]] = {}
 
-
 class PluggableLayer(nn.Module):
-    """
-    Base class for pluggable layers.
-
-    A PluggableLayer is a *module-composing* abstraction: it may instantiate other
-    ``torch.nn.Module`` objects as sub-layers, and its functionality depends on
-    these sub-layers following a generalized invocation sequence. Also, it is stateful
-    and may hold parameters or buffers.
-
-    Unlike :class:`CustomOp`, PluggableLayer does NOT provide per-platform
-    ``forward_*`` dispatch. Instead, it supports out-of-tree (OOT) replacement
-    of the entire layer class at instantiation time, allowing customized
-    initialization and submodule composition.
-    """
 
     def __new__(cls, *args, **kwargs):
         try:
@@ -89,12 +75,7 @@ class PluggableLayer(nn.Module):
         else:
             raise TypeError("Decorator can only be applied to classes.")
 
-
 class CustomOp(nn.Module):
-    """
-    Base class for custom ops.
-    Dispatches the forward method to the appropriate backend.
-    """
 
     def __new__(cls, *args, **kwargs):
         try:
@@ -126,11 +107,6 @@ class CustomOp(nn.Module):
         return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):
-        """PyTorch-native implementation of the forward method.
-        This method is optional. If implemented, it can be used with compilers
-        such as torch.compile or PyTorch XLA. Also, it can be used for testing
-        purposes.
-        """
         raise NotImplementedError
 
     def forward_cuda(self, *args, **kwargs):
@@ -200,14 +176,6 @@ class CustomOp(nn.Module):
             return self.forward_native
 
     def maybe_compile(self, fn, *, enable: bool = True):
-        """
-        Compile fn if compilation enabled.
-        Useful for CustomOp instances called from within a torch custom op,
-        meaning the forward call is hidden from the model-level torch.compile.
-
-        NOTE: this does not enable fusion across ops, so opaque custom ops
-        should still be unwrapped wherever possible.
-        """
         # Do not compile if compilation disabled
         from vllm.config.compilation import CompilationMode
 
@@ -255,12 +223,6 @@ class CustomOp(nn.Module):
 
     @staticmethod
     def default_on() -> bool:
-        """
-        Behavior controlled by `CompilationConfig.custom_ops`: On by default if
-        'all', off by default if 'none'.
-        When PyTorch Inductor is used, 'none' is the default value,
-        otherwise 'all'.
-        """
         compilation_config = get_cached_compilation_config()
         count_none = compilation_config.custom_ops.count("none")
         count_all = compilation_config.custom_ops.count("all")

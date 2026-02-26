@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 import vllm.envs as envs
@@ -14,7 +13,6 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
-
 
 def rocm_per_tensor_float_w8a8_scaled_mm_impl(
     A: torch.Tensor,
@@ -51,7 +49,6 @@ def rocm_per_tensor_float_w8a8_scaled_mm_impl(
         )
     return output
 
-
 def rocm_per_tensor_float_w8a8_scaled_mm_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -62,14 +59,12 @@ def rocm_per_tensor_float_w8a8_scaled_mm_fake(
 ) -> torch.Tensor:
     return A.new_empty((*A.shape[:-1], B.shape[1]), dtype=out_dtype)
 
-
 if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_per_tensor_float_w8a8_scaled_mm_impl",
         op_func=rocm_per_tensor_float_w8a8_scaled_mm_impl,
         fake_impl=rocm_per_tensor_float_w8a8_scaled_mm_fake,
     )
-
 
 class ROCmFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     @classmethod

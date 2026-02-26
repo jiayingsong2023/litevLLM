@@ -12,19 +12,10 @@ from vllm.pool.metadata import PoolingMetadata
 
 from .common import PoolingParamsUpdate
 
-
 class Pooler(nn.Module, ABC):
-    """The interface required for all poolers used in pooling models in vLLM."""
-
-    @abstractmethod
-    def get_supported_tasks(self) -> Set[PoolingTask]:
-        """Determine which pooling tasks are supported."""
         raise NotImplementedError
 
     def get_pooling_updates(self, task: PoolingTask) -> PoolingParamsUpdate:
-        """
-        Construct the updated pooling parameters to use for a supported task.
-        """
         return PoolingParamsUpdate()
 
     @abstractmethod
@@ -34,6 +25,5 @@ class Pooler(nn.Module, ABC):
         pooling_metadata: PoolingMetadata,
     ) -> PoolerOutput:
         raise NotImplementedError
-
 
 __all__ = ["Pooler"]

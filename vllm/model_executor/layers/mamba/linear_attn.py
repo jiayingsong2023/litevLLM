@@ -31,7 +31,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.attention.backend import AttentionMetadata
 from vllm.attention.backends.linear_attn import LinearAttentionMetadata
 
-
 class MiniMaxText01RMSNormTP(CustomOp):
     name = "MiniMaxText01RMSNormTP"
 
@@ -101,7 +100,6 @@ class MiniMaxText01RMSNormTP(CustomOp):
         k = k.to(orig_dtype)
         return q, k
 
-
 class MiniMaxText01LinearKernel:
     @staticmethod
     def jit_linear_forward_prefix(
@@ -129,7 +127,6 @@ class MiniMaxText01LinearKernel:
         kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
         assert output.shape[0] == 1, "batch size must be 1"
         return rearrange(output.squeeze(0), "h n d -> n (h d)")
-
 
 class MiniMaxText01LinearAttention(nn.Module, MambaBase):
     @property
@@ -381,7 +378,6 @@ class MiniMaxText01LinearAttention(nn.Module, MambaBase):
 
         output[:num_actual_tokens], _ = self.out_proj(hidden)
 
-
 def linear_attention(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -392,7 +388,6 @@ def linear_attention(
     self = forward_context.no_compile_layers[layer_name]
     self._forward(hidden_states=hidden_states, output=output, positions=positions)
 
-
 def linear_attention_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -400,7 +395,6 @@ def linear_attention_fake(
     layer_name: str,
 ) -> None:
     return
-
 
 direct_register_custom_op(
     op_name="linear_attention",

@@ -33,7 +33,6 @@ elif current_platform.is_rocm():
                 "to be installed. Please install flash-attn first."
             )
 
-
 def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
     # import here to avoid circular dependencies
     from vllm.platforms import current_platform
@@ -94,20 +93,17 @@ def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
     except (ImportError, AssertionError):
         return None
 
-
 def flash_attn_supports_fp8() -> bool:
     return (
         get_flash_attn_version() == 3
         and current_platform.is_device_capability_family(90)
     )
 
-
 def flash_attn_supports_sinks() -> bool:
     if current_platform.is_xpu():
         return True
     else:
         return get_flash_attn_version() == 3
-
 
 def flash_attn_supports_mla():
     from vllm.platforms import current_platform
@@ -124,7 +120,6 @@ def flash_attn_supports_mla():
         except (ImportError, AssertionError):
             pass
     return False
-
 
 def is_flash_attn_varlen_func_available() -> bool:
     return current_platform.is_cuda() or current_platform.is_xpu()

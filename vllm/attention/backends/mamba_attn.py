@@ -25,7 +25,6 @@ from vllm.kv_cache_interface import AttentionSpec, MambaSpec
 
 M = TypeVar("M", bound="BaseMambaAttentionMetadata")
 
-
 @dataclass
 class BaseMambaAttentionMetadata:
     num_prefills: int
@@ -55,7 +54,6 @@ class BaseMambaAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
-
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     metadata_cls: type[M]
@@ -115,10 +113,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> M:
-        """
-        This method builds the metadata for full cudagraph capture.
-        Currently, only decode is supported for full cudagraphs with Mamba.
-        """
         m = common_attn_metadata
 
         assert m.num_reqs == m.num_actual_tokens, (
@@ -136,10 +130,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> M:
-        """
-        Default build implementation for Mamba-like attention backends.
-        Subclasses (e.g., Mamba2) can override to add additional metadata.
-        """
         return self._compute_common_metadata(common_attn_metadata)
 
     def _compute_prefix_caching_block_indices(
@@ -177,9 +167,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> M:
-        """
-        Compute metadata common to both Mamba1 and Mamba2.
-        """
         num_reqs = common_attn_metadata.num_reqs
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (

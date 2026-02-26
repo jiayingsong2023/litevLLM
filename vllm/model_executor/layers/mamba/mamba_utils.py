@@ -15,7 +15,6 @@ from vllm.utils.torch_utils import (
     get_kv_cache_torch_dtype,
 )
 
-
 class MambaStateDtypeCalculator:
     @classmethod
     def linear_attention_state_dtype(
@@ -93,7 +92,6 @@ class MambaStateDtypeCalculator:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         return (state_dtype, state_dtype, state_dtype, torch.float32)
 
-
 class MambaStateShapeCalculator:
     @classmethod
     def linear_attention_state_shape(
@@ -160,8 +158,6 @@ class MambaStateShapeCalculator:
 
     @classmethod
     def extra_groups_for_head_shards(cls, ngroups: int, tp_size: int):
-        """Compute the increase in group numbers to account for
-        replication in order to accompany the head shards."""
 
         # in the case ngoups % tp_size == 0, this will be zero
         if ngroups % tp_size == 0:
@@ -228,35 +224,15 @@ class MambaStateShapeCalculator:
             recurrent_state_shape,
         )
 
-
 @dataclass
 class MambaCopySpec:
-    """
-    Data class specifying the memory-copy parameters for Mamba states used for
-    prefix caching in align mode.
-
-    Attributes:
-        start_addr (int): Starting address for the memory copy operation.
-        num_elements (int): Number of elements to copy from the starting address.
-    """
 
     start_addr: int
     num_elements: int
 
-
 MambaStateCopyFunc: TypeAlias = Callable[
     [torch.Tensor, list[int], int, int], MambaCopySpec
 ]
-"""
-Type alias for a function that computes a MambaCopySpec for copying state slices.
-Parameters:
-  state: torch.Tensor - the Mamba state tensor (e.g., conv or temporal states).
-  block_ids: list[int] - the list of block indices for the state to copy.
-  cur_block_idx: int - current block index within `block_ids` to copy from.
-  num_accepted_tokens: int - number of accepted tokens used to compute the copy offset.
-      Range: 1 .. 1 + num_speculative_tokens (inclusive).
-"""
-
 
 def get_conv_copy_spec(
     state: torch.Tensor,
@@ -264,30 +240,13 @@ def get_conv_copy_spec(
     cur_block_idx: int,
     num_accepted_tokens: int,
 ) -> MambaCopySpec:
-    """Return a MambaCopySpec for copying a convolutional state slice."""
-    src_block_id = block_ids[cur_block_idx]
-    src_state = state[src_block_id, num_accepted_tokens - 1 :]
-    return MambaCopySpec(
-        start_addr=src_state.data_ptr(), num_elements=src_state.numel()
-    )
-
-
-def get_temporal_copy_spec(
-    state: torch.Tensor,
-    block_ids: list[int],
-    cur_block_idx: int,
-    num_accepted_tokens: int,
-) -> MambaCopySpec:
-    """Return a MambaCopySpec for copying a temporal state slice."""
     src_block_id = block_ids[cur_block_idx + num_accepted_tokens - 1]
     src_state = state[src_block_id]
     return MambaCopySpec(
         start_addr=src_state.data_ptr(), num_elements=src_state.numel()
     )
 
-
 get_full_copy_spec = get_temporal_copy_spec
-
 
 class MambaStateCopyFuncCalculator:
     @classmethod

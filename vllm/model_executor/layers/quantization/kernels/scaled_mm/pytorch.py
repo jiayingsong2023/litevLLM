@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm.config import CompilationMode, get_current_vllm_config
@@ -12,13 +11,7 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
 )
 
-
 class TorchFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
-    """
-    Base class for FP8 linear kernels using Torch.
-    Each subclass represents a kernel variant for
-    specific device capabilities and torch versions.
-    """
 
     @classmethod
     def is_supported(
@@ -45,7 +38,6 @@ class TorchFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         vllm_config = get_current_vllm_config().compilation_config
         pad_output = vllm_config.mode < CompilationMode.VLLM_COMPILE
         return 17 if pad_output else None
-
 
 class PerTensorTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
     @classmethod
@@ -79,7 +71,6 @@ class PerTensorTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
             output = output[0]
 
         return torch.narrow(output, 0, 0, output_shape[0]).view(*output_shape)
-
 
 class RowWiseTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
     @classmethod
@@ -146,7 +137,6 @@ class RowWiseTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
         )
 
         return torch.narrow(output, 0, 0, output_shape[0]).view(*output_shape)
-
 
 class ChannelWiseTorchFP8ScaledMMLinearKernel(TorchFP8ScaledMMLinearKernel):
     @classmethod

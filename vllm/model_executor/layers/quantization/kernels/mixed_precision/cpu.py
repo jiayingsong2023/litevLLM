@@ -15,7 +15,6 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 _CPUWNA16_SUPPORTED_QUANT_TYPES = (scalar_types.uint4, scalar_types.uint4b8)
 
-
 class CPUWNA16LinearKernel(MPLinearKernel):
     @classmethod
     def get_min_capability(cls) -> int:
@@ -116,7 +115,6 @@ class CPUWNA16LinearKernel(MPLinearKernel):
             isa_hint=layer.isa_hint,
         )
         return x
-
 
 def _get_isa_hint(dtype: torch.dtype) -> str:
     supports_amx = torch._C._cpu._is_amx_tile_supported()

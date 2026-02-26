@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Taken from https://github.com/ModelTC/LightLLM/blob/8ed97c74c18f11505b048b1ba00ba5c0cef8bff6/lightllm/common/fused_moe/deepep_scatter_gather.py
-and updated to fit vllm needs and terminology.
-"""
 
 import torch
 
@@ -13,7 +9,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
 
-
 def expert_num_tokens_round_up_and_sum(
     expert_num_tokens: torch.Tensor, alignment: int
 ) -> int:
@@ -21,7 +16,6 @@ def expert_num_tokens_round_up_and_sum(
     # alignment.
     ent = (expert_num_tokens.to(torch.int64) + (alignment - 1)) // alignment * alignment
     return torch.sum(ent).item()
-
 
 def compute_aligned_M(
     M: int,
@@ -43,19 +37,16 @@ def compute_aligned_M(
     M_sum = round_up(M_sum, alignment)
     return M_sum
 
-
 @triton.jit
 def apply_expert_map(expert_id, expert_map):
     if expert_id != -1:
         expert_id = tl.load(expert_map + expert_id).to(expert_id.dtype)
     return expert_id
 
-
 @triton.jit
 def round_up_128(x: int) -> int:
     y = 128
     return ((x + y - 1) // y) * y
-
 
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
@@ -95,7 +86,6 @@ def _fwd_kernel_ep_scatter_1(
             cur_expert,
             mask=mask,
         )
-
 
 @triton.jit
 def _fwd_kernel_ep_scatter_2(
@@ -162,7 +152,6 @@ def _fwd_kernel_ep_scatter_2(
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
                 tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
-
 
 @torch.no_grad()
 def ep_scatter(
@@ -231,7 +220,6 @@ def ep_scatter(
     )
     return
 
-
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
@@ -293,7 +281,6 @@ def _fwd_kernel_ep_gather(
             accumulator.to(output_tensor.dtype.element_ty),
         )
 
-
 @torch.no_grad()
 def ep_gather(
     input_tensor: torch.Tensor,
@@ -334,7 +321,6 @@ def ep_gather(
         BLOCK_D=BLOCK_D,
     )
     return
-
 
 def deepgemm_moe_permute(
     aq: torch.Tensor,
@@ -407,7 +393,6 @@ def deepgemm_moe_permute(
     )
 
     return aq_out, aq_scale_out, expert_ids, inv_perm
-
 
 def deepgemm_unpermute_and_reduce(
     a: torch.Tensor,  # Grouped gemm output

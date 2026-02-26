@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm.platforms import current_platform
@@ -11,7 +10,6 @@ from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
-
 
 class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     @classmethod

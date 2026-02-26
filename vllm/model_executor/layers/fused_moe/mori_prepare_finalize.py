@@ -11,11 +11,7 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
-    """
-    Prepare/Finalize using MoRI kernels.
-    """
 
     def __init__(
         self,
@@ -60,16 +56,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        """
-        Returns a tuple of:
-        - quantized + dispatched a.
-        - Optional quantized + dispatched a1_scales.
-        - Optional ExpertTokensMetadata containing gpu/cpu tensors
-          as big as the number of local experts with the information about the
-          number of tokens assigned to each local expert.
-        - Optional dispatched expert topk IDs
-        - Optional dispatched expert topk weight
-        """
         if defer_input_quant:
             raise NotImplementedError(
                 f"{self.__class__.__name__} does not support defer_input_quant=True. "

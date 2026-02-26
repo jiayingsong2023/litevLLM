@@ -20,14 +20,7 @@ except ModuleNotFoundError:
     def is_v1_kv_transfer_group() -> bool:
         return False
 
-
 def maybe_transfer_kv_layer(func: Callable) -> Callable:
-    """Decorator that handles KV layer transfer prior and after execution of
-    an attention layer, if enabled. Otherwise, the wrapper is a no-op.
-
-    On entry: waits for the KV layer from the connector.
-    On exit: saves the KV layer to the connector.
-    """
     # Import at runtime to avoid circular dependency
     from vllm.model_executor.layers.attention.attention import get_attention_context
 

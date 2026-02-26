@@ -10,7 +10,6 @@ import torch
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.scalar_type import ScalarType
 
-
 @dataclass
 class MPLinearLayerConfig:
     full_weight_shape: tuple[int, int]  # [in, out]
@@ -21,7 +20,6 @@ class MPLinearLayerConfig:
     zero_points: bool
     has_g_idx: bool
     out_type: torch.dtype | None = None
-
 
 class MPLinearKernel(ABC):
     @classmethod

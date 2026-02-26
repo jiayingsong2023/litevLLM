@@ -22,11 +22,6 @@ def ggml_dequantize_fallback(
     n: int, 
     dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
-    """
-    Lite fallback for GGML/GGUF dequantization.
-    Caches the result on GPU based on the underlying storage to handle views correctly.
-    Uses LRU eviction to manage GPU memory usage.
-    """
     global _DEQUANT_CACHE
     
     # Use storage data pointer and offset to uniquely identify the tensor view
@@ -75,10 +70,6 @@ def ggml_mul_mat_vec_a8_fallback(
     quant_type: int,
     row: int,
 ) -> torch.Tensor:
-    """
-    Lite fallback for GGML matrix-vector multiplication.
-    Dequantizes the weight matrix then performs standard matmul.
-    """
     # row is the output dimension (m)
     # W shape is [row, encoded_n]
     # We need to calculate n from W.shape and quant_type
@@ -111,7 +102,4 @@ def ggml_mul_mat_a8_fallback(
     quant_type: int,
     row: int,
 ) -> torch.Tensor:
-    """
-    Lite fallback for GGML matrix-matrix multiplication.
-    """
     return ggml_mul_mat_vec_a8_fallback(W, X, quant_type, row)

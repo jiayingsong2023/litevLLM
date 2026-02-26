@@ -20,7 +20,6 @@ from vllm.platforms import current_platform
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
-
 class MacheteLinearKernel(MPLinearKernel):
     @classmethod
     def get_min_capability(cls) -> int:

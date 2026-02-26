@@ -58,28 +58,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     ],
 }
 
-
 def choose_mp_linear_kernel(
     config: MPLinearLayerConfig, compute_capability: int | None = None
 ) -> type[MPLinearKernel]:
-    """
-    Choose an MPLinearKernel that can implement the given config for the given
-     compute capability. Attempts to choose the best kernel in terms of
-     performance.
-
-    Args:
-        config (MPLinearLayerConfig): Description of the linear layer to be
-            implemented.
-        compute_capability (Optional[int], optional): The compute capability of
-            the target device, if None uses `current_platform` to get
-            the compute capability. Defaults to None.
-
-    Raises:
-        ValueError: If no kernel can implement the given config.
-
-    Returns:
-        type[MPLinearKernel]: Chosen kernel.
-    """
     if compute_capability is None:
         if current_platform is None:
             raise ValueError("Cannot determine compute capability")

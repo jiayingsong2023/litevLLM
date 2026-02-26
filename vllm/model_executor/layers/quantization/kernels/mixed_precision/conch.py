@@ -19,7 +19,6 @@ _CONCH_SUPPORTED_WEIGHT_TYPES: Final = [
 ]
 _CONCH_SUPPORTED_GROUP_SIZES: Final = [-1, 128]
 
-
 class ConchLinearKernel(MPLinearKernel):
     @classmethod
     def get_min_capability(cls) -> int:

@@ -25,12 +25,6 @@ try:
     from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
 except ModuleNotFoundError:
     class EplbLayerState:  # type: ignore[no-redef]
-        """Stub EPLB layer state for single-process mode."""
-
-        pass
-
-    class EplbState:  # type: ignore[no-redef]
-        """Stub EPLB state for single-process mode."""
 
         @staticmethod
         def build_initial_global_physical_to_logical_map(
@@ -79,13 +73,11 @@ from vllm.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
-
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
-
 
 def determine_expert_map(
     ep_size: int,
@@ -95,34 +87,6 @@ def determine_expert_map(
     num_fused_shared_experts: int = 0,
     return_expert_mask: bool = False,
 ) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
-    """
-    Calculates how many experts should be assigned to each rank for EP and
-    creates a mapping from global to local expert index. Experts are
-    distributed evenly across ranks. Any remaining are assigned to the
-    last rank.
-
-    Args:
-        ep_size: The size of the expert parallel group
-        ep_rank: The rank of the current process in the expert parallel
-            group
-        global_num_experts: The total number of experts in the model.
-        expert_placement_strategy: The expert placement strategy.
-
-    Returns:
-        tuple[int, Optional[torch.Tensor]]: A tuple containing:
-            - local_num_experts (int): The number of experts assigned
-                to the current rank.
-            - expert_map (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts,) mapping from global to local index.
-                Contains -1 for experts not assigned to the current rank.
-                Returns None if ep_size is 1.
-            - expert_mask (Optional[torch.Tensor]): A tensor of shape
-                (global_num_experts + num_fused_shared_experts + 1,)
-                containing 1 for experts assigned to the current rank
-                and 0 for sentinel.
-                Returns None if ep_size is 1.
-                Used only when AITER MOE is enabled.
-    """
     assert ep_size > 0
     if ep_size == 1:
         return (global_num_experts, None, None)
@@ -175,7 +139,6 @@ def determine_expert_map(
 
     return (local_num_experts, expert_map, expert_mask)
 
-
 def determine_expert_placement_strategy(
     expert_placement_strategy: ExpertPlacementStrategy,
     moe_parallel_config: FusedMoEParallelConfig,
@@ -211,27 +174,13 @@ def determine_expert_placement_strategy(
 
     return expert_placement_strategy
 
-
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
-    """
-    Compresses the expert map by removing any -1 entries.
-
-    Args:
-        expert_map (torch.Tensor): A tensor of shape (global_num_experts,)
-            mapping from global to local index. Contains -1 for experts not
-            assigned to the current rank.
-
-    Returns:
-        str: A string mapping from local to global index.
-            Using str to support hashing for logging once only.
-    """
     global_indices = torch.where(expert_map != -1)[0]
     local_indices = expert_map[global_indices]
     return ", ".join(
         f"{local_index.item()}->{global_index.item()}"
         for local_index, global_index in zip(local_indices, global_indices)
     )
-
 
 def maybe_roundup_hidden_size(
     hidden_size: int,
@@ -240,23 +189,6 @@ def maybe_roundup_hidden_size(
     moe_parallel_config: FusedMoEParallelConfig,
     is_lora_enabled: bool,
 ) -> int:
-    """
-    Given layer hidden size and MoE configurations, round up hidden_size
-    if necessary.
-
-    Args:
-        hidden_size: Layer hidden-size
-        act_dtype: Data type of the layer activations.
-        quant_config: Fused MoE quantization configuration.
-        moe_parallel_config: Fused MoE parallelization strategy configuration.
-        is_lora_enabled: True if the engine is enabled with LoRA. This
-            is used in the case of mxfp4 quantization in selecting the
-            MxFP4Backend.
-
-    Return:
-        Rounded up hidden_size if rounding up is required based on the configs.
-        Original hidden size otherwise.
-    """
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_roundup_layer_hidden_size,
     )
@@ -287,31 +219,9 @@ def maybe_roundup_hidden_size(
 
     return hidden_size
 
-
 # --8<-- [start:fused_moe]
 @CustomOp.register("fused_moe")
 class FusedMoE(CustomOp):
-    """FusedMoE layer for MoE models.
-
-    This layer contains both MergedColumnParallel weights (gate_up_proj /
-    w13) and RowParallelLinear weights (down_proj/ w2).
-
-    Note: Mixtral uses w1, w2, and w3 for gate, up, and down_proj. We
-    copy that naming convention here and handle any remapping in the
-    load_weights function in each model implementation.
-
-    Args:
-        num_experts: Number of experts in the model
-        top_k: Number of experts selected for each token
-        hidden_size: Input hidden state size of the transformer
-        intermediate_size: Intermediate size of the experts
-        params_dtype: Data type for the parameters.
-        reduce_results: Whether to all_reduce on the output of the layer
-        renormalize: Whether to renormalize the logits in the fused_moe kernel
-        quant_config: Quantization configure.
-        enable_eplb: Whether to enable expert parallelism load balancer.
-        router_logits_dtype: Data type for router logits buffers.
-    """
 
     # --8<-- [end:fused_moe]
 
@@ -584,10 +494,6 @@ class FusedMoE(CustomOp):
         self.quant_config = quant_config
 
         def _get_quant_method() -> FusedMoEMethodBase:
-            """
-            Helper method to ensure self.quant_method is never None and
-            of the proper type.
-            """
             quant_method = None
             if self.quant_config is not None:
                 quant_method = self.quant_config.get_quant_method(self, prefix)
@@ -914,10 +820,6 @@ class FusedMoE(CustomOp):
         param: torch.Tensor,
         tp_rank: int,
     ):
-        """
-        Load w13 weight scales assuming that w1 weight scales and w3 weight
-        scales are stored in the same loaded_weight tensor.
-        """
         shard_size = param.shape[shard_dim]
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
@@ -933,15 +835,6 @@ class FusedMoE(CustomOp):
         tp_rank: int,
         load_full_w2: bool = False,
     ):
-        """
-        Load grouped weight scales for group quantization or model weights
-            :param shard_dim: dimension to shard
-            :param expert_data: parameter for a particular expert
-            :param shard_id: either w1, w2, or w3
-            :param loaded_weight: checkpoint weight to load into the param
-            :param tp_rank: tensor parallel rank
-            :param load_full_w2: whether or not the w2 loaded should be sharded.
-        """
         if shard_id == "w2":
             # In the case where we have actorder/g_idx, we do not partition the
             # w2 scales, as indicated by `load_full` argument, for all tp cases
@@ -1401,21 +1294,6 @@ class FusedMoE(CustomOp):
         def _maybe_make_contiguous(
             name: str, p: torch.nn.Parameter
         ) -> torch.nn.Parameter:
-            """
-            In some cases, the last 2 dimensions (the non-expert dimensions)
-            of the weight scale tensor are transposed. This function
-            transforms the tensor (view update) so the tensor is contiguous().
-            Example: A non-contiguous scale tensor,
-              `x` of shape (E, 32, 16) and stride (512, 1, 32) is transformed to
-              `x_` of shape (E, 16, 32) and stride (512, 32, 1).
-              Note that we specifically use torch.transpose() so `x_` refers
-              to the same underlying memory. The tensors `x` and `x_`, pointing
-              to the same underlying memory make this transformation safe in the
-              context of EPLB. i.e. It is the same memory and just the view
-              is different.
-            Note: This function handles the "weight_scale" tensors specifically.
-            This could however be generalized to handle similar tensors.
-            """
             if p.ndim != 3:
                 return p
             if p.is_contiguous():
@@ -1470,12 +1348,6 @@ class FusedMoE(CustomOp):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
-        """
-        Register the EPLB state in this layer.
-
-        This is used later in forward pass, where we get the expert mapping
-        and record the load metrics in `expert_load_view`.
-        """
         self.eplb_state.expert_load_view = expert_load_view[moe_layer_idx]
         self.eplb_state.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
@@ -1520,18 +1392,6 @@ class FusedMoE(CustomOp):
         )
 
     def must_reduce_shared_expert_outputs(self) -> bool:
-        """
-        The shared_experts are typically computed using the RowParallelLinear
-        layer. The result of this function is typically used as
-        the reduce_results argument to the module.
-        When just tensor-parallel is used, it is not required to reduce
-        the shared_experts results immediately. Instead we reduce at the
-        once at the end of the MoE op. (Refer to DeepSeekV2MoE module)
-        With EP and all2all kernels - this is no longer viable as all
-        GPU ranks in DP, produce the complete set of hidden_states.
-        Therefore it is required that we reduce the shared_experts output
-        early.
-        """
         assert self.quant_method is not None
         return (
             isinstance(self.quant_method, FusedMoEModularMethod)
@@ -1539,9 +1399,6 @@ class FusedMoE(CustomOp):
         )
 
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
-        """
-        Some combine kernels reduce across GPU ranks by default.
-        """
         if self.must_reduce_shared_expert_outputs():
             return final_hidden_states
         else:
@@ -1986,7 +1843,6 @@ class FusedMoE(CustomOp):
 
         return s
 
-
 def get_layer_from_name(layer_name: str) -> FusedMoE:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -2004,7 +1860,6 @@ def get_layer_from_name(layer_name: str) -> FusedMoE:
     self = cast(FusedMoE, forward_context.no_compile_layers[layer_name])
     return self
 
-
 def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -2014,14 +1869,12 @@ def moe_forward(
     assert self.shared_experts is None
     return self.forward_impl(hidden_states, router_logits)
 
-
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
-
 
 direct_register_custom_op(
     op_name="moe_forward",
@@ -2030,7 +1883,6 @@ direct_register_custom_op(
     fake_impl=moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
-
 
 def moe_forward_shared(
     hidden_states: torch.Tensor,
@@ -2041,7 +1893,6 @@ def moe_forward_shared(
     assert self.shared_experts is not None
     return self.forward_impl(hidden_states, router_logits)
 
-
 def moe_forward_shared_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -2050,7 +1901,6 @@ def moe_forward_shared_fake(
     shared_out = torch.empty_like(hidden_states)
     fused_out = torch.empty_like(hidden_states)
     return shared_out, fused_out
-
 
 direct_register_custom_op(
     op_name="moe_forward_shared",

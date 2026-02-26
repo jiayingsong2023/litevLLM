@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Flattened, Single-GPU Qwen2 model optimized for LiteEngine and Triton."""
+"""
+Qwen2: LitevLLM Optimized Implementation.
+Qwen2 shares the same architecture as Llama, so we alias the core logic.
+"""
+import torch.nn as nn
+from vllm.model_executor.models.llama import LlamaModel, LlamaForCausalLM
 
-import torch
-from torch import nn
-from typing import Iterable, Optional, Set, Tuple, Any
-from transformers import Qwen2Config
+class Qwen2Model(LlamaModel):
+    """Qwen2 backbone, identical to Llama."""
+    pass
 
-from vllm.config import VllmConfig
-from vllm.model_executor.models.lite_base import LiteForCausalLM, LiteModel
-
-# Use generic implementations directly
-Qwen2Model = LiteModel
-Qwen2ForCausalLM = LiteForCausalLM
+class Qwen2ForCausalLM(LlamaForCausalLM):
+    """Qwen2 causal model, identical to Llama."""
+    pass

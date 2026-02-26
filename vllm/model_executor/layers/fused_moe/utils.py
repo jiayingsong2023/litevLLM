@@ -27,7 +27,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
-
 @triton.jit
 def _count_expert_num_tokens(
     topk_ids_ptr,
@@ -59,25 +58,9 @@ def _count_expert_num_tokens(
     if curr_expert < num_experts:
         tl.store(expert_num_tokens_ptr + curr_expert, tl.sum(acc))
 
-
 def count_expert_num_tokens(
     topk_ids: torch.Tensor, num_local_experts: int, expert_map: torch.Tensor | None
 ) -> torch.Tensor:
-    """
-    Count the number to tokens assigned to each expert.
-
-    Parameters:
-    - topk_ids (torch.Tensor): Tensor mapping each token to its
-    list of experts.
-    - num_local_experts (int): Number of experts in this rank.
-    - expert_map (Optional[torch.Tensor]):  A tensor mapping expert indices
-    from the global expert space to the local expert space of the expert
-    parallel shard.
-
-    Returns:
-    A tensor of size num_local_experts, where tensor[i] holds the number
-    of tokens assigned to the ith expert.
-    """
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
     expert_num_tokens = torch.empty(
         (num_local_experts), device=topk_ids.device, dtype=torch.int32
@@ -99,17 +82,11 @@ def count_expert_num_tokens(
 
     return expert_num_tokens
 
-
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
-    """
-    Shrink the given tensor and apply the given view to it.  This is
-    used to resize the intermediate fused_moe caches.
-    """
     assert prod(v) <= x.numel(), (
         f"{v} ({prod(v)}) <= {x.shape} ({x.numel()})"
     )  # CUDAGRAPH unfriendly?
     return x.flatten()[: prod(v)].view(*v)
-
 
 def _nvfp4_quantize(
     A: torch.Tensor,
@@ -118,17 +95,12 @@ def _nvfp4_quantize(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return ops.scaled_fp4_quant(A, A_scale, is_sf_swizzled_layout=is_sf_swizzled_layout)
 
-
 def _fp8_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Perform fp8 quantization on the inputs.  If a block_shape
-    is provided, the output will be blocked.
-    """
     if block_shape is None:
         # TODO(luka): use QuantFP8 custom op
         #  https://github.com/vllm-project/vllm/issues/20711
@@ -144,17 +116,12 @@ def _fp8_quantize(
 
     return A, A_scale
 
-
 def _int8_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Perform int8 quantization on the inputs.  If a block_shape
-    is provided, the output will be blocked.
-    """
 
     # If weights are per-channel (per_channel_quant=True), then
     # activations apply per-token quantization. Otherwise, assume
@@ -171,7 +138,6 @@ def _int8_quantize(
 
     return A, A_scale
 
-
 def _mxfp4_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -187,7 +153,6 @@ def _mxfp4_quantize(
 
     return A, None
 
-
 def _mxfp8_e4m3_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -198,7 +163,6 @@ def _mxfp8_e4m3_quantize(
     assert not per_act_token_quant
     assert block_shape is None
     return mxfp8_e4m3_quantize(A)
-
 
 def _mxfp6_e3m2_quantize(
     A: torch.Tensor,
@@ -216,7 +180,6 @@ def _mxfp6_e3m2_quantize(
 
     return A, None
 
-
 def _mxfp6_e2m3_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -232,7 +195,6 @@ def _mxfp6_e2m3_quantize(
     A = quant_dequant_mxfp6(A, quant_dtype="fp6_e2m3")
 
     return A, None
-
 
 def moe_kernel_quantize_input(
     A: torch.Tensor,
@@ -261,16 +223,11 @@ def moe_kernel_quantize_input(
     else:
         return A, A_scale
 
-
 def _fp8_perm(m: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """
-    A permutation routine that works on fp8 types.
-    """
     if torch.is_floating_point(m) and m.dtype.itemsize == 1:
         return m.view(dtype=torch.uint8)[idx, ...].view(dtype=m.dtype)
     else:
         return m[idx, ...]
-
 
 def normalize_scales_shape(scales: torch.Tensor | None) -> torch.Tensor | None:
     if scales is not None:
@@ -279,7 +236,6 @@ def normalize_scales_shape(scales: torch.Tensor | None) -> torch.Tensor | None:
         else:
             scales = scales.view(-1, scales.size(-1))
     return scales
-
 
 def normalize_batched_scales_shape(
     scales: torch.Tensor | None,
@@ -295,7 +251,6 @@ def normalize_batched_scales_shape(
             scales = scales.view(num_experts, -1, scales.size(-1))
 
     return scales
-
 
 def _validate_scale_shape(
     a: torch.Tensor,
@@ -317,30 +272,18 @@ def _validate_scale_shape(
         expected = (a.shape[0], cdiv(a.shape[1], block_shape[1]))
         assert a_scale.shape == expected, f"{a_scale.shape} == {expected}"
 
-
 def activation_without_mul(activation: str) -> str:
     return activation + "_no_mul"
-
 
 RELU2_NO_MUL: str = activation_without_mul("relu2")
 SILU_NO_MUL: str = activation_without_mul("silu")
 GELU_NO_MUL: str = activation_without_mul("gelu")
-
 
 def apply_moe_activation(
     activation: str,
     output: torch.Tensor,
     input: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Apply MoE activation function.
-
-    For *_and_mul activations (silu, gelu, swigluoai):
-        - Expects output.size(-1) * 2 == input.size(-1)
-
-    For *_no_mul activations (silu_no_mul, gelu_no_mul, relu2_no_mul):
-        - Expects output.size(-1) == input.size(-1)
-    """
     is_no_mul = activation.endswith("_no_mul")
     if is_no_mul:
         assert output.size(-1) == input.size(-1), (
@@ -379,7 +322,6 @@ def apply_moe_activation(
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
     return output
-
 
 # Torch custom ops can't deal with outputs aliasing inputs so we need to
 # disable inplace for torch >= 2.9.

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm import _custom_ops as ops
@@ -10,7 +9,6 @@ from vllm.platforms import current_platform
 
 from .cutlass import CutlassInt8ScaledMMLinearKernel
 from .ScaledMMLinearKernel import Int8ScaledMMLinearLayerConfig
-
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     @classmethod
@@ -49,16 +47,6 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        `AiterInt8ScaledMMLinearKernel` implements a fused version of
-            `output = torch.mm((scale_a * a), (scale_b * b)).to(out_dtype)`
-        where scale_a * a and scale_b * b are implemented using numpy-style
-        broadcasting.
-        Currently only support per-tensor-per-tensor GEMM
-        and per-token-per-channel GEMM through AITER
-        w8a8 scaled gemm. `AiterInt8ScaledMMLinearKernel` also does not support
-        ATIER block scaled GEMM and mix-precision GEMM.
-        """
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
         # ops.scaled_int8_quant supports both dynamic and static quant:

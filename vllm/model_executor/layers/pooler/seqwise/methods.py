@@ -14,7 +14,6 @@ from vllm.pool.metadata import PoolingMetadata
 
 SequencePoolingMethodOutput: TypeAlias = torch.Tensor | list[torch.Tensor]
 
-
 class SequencePoolingMethod(nn.Module, ABC):
     def get_supported_tasks(self) -> Set[PoolingTask]:
         return {"token_embed", "token_classify", "embed", "classify", "score"}
@@ -30,7 +29,6 @@ class SequencePoolingMethod(nn.Module, ABC):
     ) -> SequencePoolingMethodOutput:
         raise NotImplementedError
 
-
 class CLSPool(SequencePoolingMethod):
     def forward(
         self,
@@ -44,7 +42,6 @@ class CLSPool(SequencePoolingMethod):
 
         return hidden_states[pooling_cursor.first_token_indices_gpu]
 
-
 class LastPool(SequencePoolingMethod):
     def forward(
         self,
@@ -53,7 +50,6 @@ class LastPool(SequencePoolingMethod):
     ) -> SequencePoolingMethodOutput:
         pooling_cursor = pooling_metadata.get_pooling_cursor()
         return hidden_states[pooling_cursor.last_token_indices_gpu]
-
 
 class MeanPool(SequencePoolingMethod):
     def forward(
@@ -80,7 +76,6 @@ class MeanPool(SequencePoolingMethod):
         return (
             cumsum[end_indices] - cumsum[start_indices] + hidden_states[start_indices]
         ) / prompt_lens.unsqueeze(1)
-
 
 def get_seq_pooling_method(pooling_type: SequencePoolingType | str):
     if pooling_type == "CLS":

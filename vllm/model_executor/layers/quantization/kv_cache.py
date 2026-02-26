@@ -13,26 +13,12 @@ from vllm.attention.backend import is_quantized_kv_cache
 
 logger = init_logger(__name__)
 
-
 class BaseKVCacheMethod(QuantizeMethodBase):
-    """
-    Quant method that adds `_k_scale` and `_v_scale` attributes to the
-    Attention layer to support loading those scaling factors from checkpoints.
-    The k/v_scale will be used to:
-        - quantize k/v_cache entries before saving them to the cache
-        - dequantize k/v_cache entries before fetching them from the cache
-
-    :param quant_config: the appropriate QuantizationConfig
-    """
 
     def __init__(self, quant_config: QuantizationConfig):
         self.quant_config = quant_config
 
     def create_weights(self, layer: torch.nn.Module):
-        """
-        Create "weight" (aka q_scale, k_scale and v_scale)
-        for an attention layer.
-        """
         # Initialize the Q and KV cache scales to -1.0, an invalid value.
         # If the q and k/v_scales appear in the checkpoint, it will be
         # overwritten when loading weights.

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 from torch import nn
 
@@ -47,7 +46,6 @@ from vllm.attention.backend import AttentionMetadata
 from vllm.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
 # Added by the IBM Team, 2024
-
 
 # Adapted from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
 # --8<-- [start:mixer2_gated_rms_norm]
@@ -156,17 +154,11 @@ class Mixer2RMSNormGated(CustomOp):
             norm_before_gate=False,
         )
 
-
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
     tp_size: int,
     tp_rank: int,
 ) -> LoaderFunction:
-    """Create a weight loader for mamba v2. This ensures that the projections
-    are correctly sharded so that they can be split into x, B, C. It also
-    ensures that all the groups corresponding to a head shard is placed
-    together with it.
-    """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         # - track boundary of (sharded) param, and loaded_weight, respectively
@@ -216,20 +208,10 @@ def mamba_v2_sharded_weight_loader(
 
     return loader
 
-
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 # --8<-- [start:mamba_mixer2]
 @CustomOp.register("mamba_mixer2")
 class MambaMixer2(MambaBase, CustomOp):
-    """
-    Compute ∆, A, B, C, and D the state space parameters and compute
-    the `contextualized_states`. A, D are input independent
-    (see Mamba paper [1] Section 3.5.2 "Interpretation of A"
-    for why A isn't selective) ∆, B, C are input-dependent
-    (this is a key difference between Mamba and the linear time
-    invariant S4, and is why Mamba is called
-    **selective** state spaces)
-    """
 
     # --8<-- [end:mamba_mixer2]
 
@@ -914,7 +896,6 @@ class MambaMixer2(MambaBase, CustomOp):
     def mamba_type(self) -> str:
         return "mamba2"
 
-
 def mamba_mixer2(
     projected_states: torch.Tensor,
     output: torch.Tensor,
@@ -924,14 +905,12 @@ def mamba_mixer2(
     self = forward_context.no_compile_layers[layer_name]
     self.conv_ssm_forward(projected_states=projected_states, output=output)
 
-
 def mamba_mixer2_fake(
     projected_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
     return
-
 
 direct_register_custom_op(
     op_name="mamba_mixer2",

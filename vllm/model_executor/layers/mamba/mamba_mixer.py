@@ -38,20 +38,10 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.attention.backends.mamba1_attn import Mamba1AttentionMetadata
 
-
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
 # --8<-- [start:mamba_mixer]
 @CustomOp.register("mamba_mixer")
 class MambaMixer(MambaBase, CustomOp):
-    """
-    Compute ∆, A, B, C, and D the state space parameters and compute
-    the `contextualized_states`. A, D are input independent
-    (see Mamba paper [1] Section 3.5.2 "Interpretation of A"
-    for why A isn't selective) ∆, B, C are input-dependent
-    (this is a key difference between Mamba and the linear time
-    invariant S4, and is why Mamba is called
-    **selective** state spaces)
-    """
 
     # --8<-- [end:mamba_mixer]
 
@@ -228,27 +218,6 @@ class MambaMixer(MambaBase, CustomOp):
         pass
 
     def forward_cuda(self, hidden_states: torch.Tensor, output: torch.Tensor):
-        """
-        Run the Mamba-1 SSM pipeline.
-
-        Steps
-        -----
-        1. Apply the gated-MLP linear projection to the raw input.
-        2. Pass the projected sequence through the convolutional mixing layer.
-        3. Feed the result into the State-Space Model (SSM) blocks.
-        4. Perform the recurrence y ← SSM(A, B, C, Δ)(x)
-           to produce contextual representations.
-        5. Project the contextualised sequence back
-           to the output embedding dimension.
-
-        Batch handling
-        --------------
-        Prefill and decode tokens are processed by dedicated CUDA
-        kernels for both the convolutional (conv1d) and SSM stages.
-        In the case of a mixed batch (containing both prefill and
-        decode tokens), both sets of kernels are executed independently
-        and their outputs are concatenated before the final output projection.
-        """
 
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -468,7 +437,6 @@ class MambaMixer(MambaBase, CustomOp):
             return self.dt_proj.bias.float()
         return None
 
-
 class PrefillDecodeSplit(NamedTuple):
     hidden_states_BC_p: torch.Tensor
     hidden_states_BC_d: torch.Tensor
@@ -476,7 +444,6 @@ class PrefillDecodeSplit(NamedTuple):
     gate_d: torch.Tensor
     state_indices_tensor_p: torch.Tensor
     state_indices_tensor_d: torch.Tensor
-
 
 def split_batch_to_prefill_and_decode(
     hidden_states_BC: torch.Tensor,
@@ -514,7 +481,6 @@ def split_batch_to_prefill_and_decode(
         state_indices_tensor_d=state_indices_tensor_d,
     )
 
-
 def mamba_mixer(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -524,14 +490,12 @@ def mamba_mixer(
     self = forward_context.no_compile_layers[layer_name]
     self.forward_cuda(hidden_states=hidden_states, output=output)
 
-
 def mamba_mixer_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
     return
-
 
 direct_register_custom_op(
     op_name="mamba_mixer",

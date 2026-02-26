@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Rotary Positional Embeddings Base Class."""
-
-import torch
-
-from vllm._aiter_ops import rocm_aiter_ops
-from vllm.model_executor.custom_op import CustomOp
-
-from .common import ApplyRotaryEmb
-
-
-# --8<-- [start:rotary_embedding]
-@CustomOp.register("rotary_embedding")
-class RotaryEmbeddingBase(CustomOp):
-    """Original rotary positional embedding."""
 
     # --8<-- [end:rotary_embedding]
 
@@ -60,21 +46,6 @@ class RotaryEmbeddingBase(CustomOp):
         )
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
-        """Compute the inverse frequency."""
-        # NOTE(woosuk): To exactly match the HF implementation, we need to
-        # use CPU to compute the cache and then move it to GPU. However, we
-        # create the cache on GPU for faster initialization. This may cause
-        # a slight numerical difference between the HF implementation and ours.
-        inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
-            )
-        )
-        return inv_freq
-
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
@@ -97,7 +68,6 @@ class RotaryEmbeddingBase(CustomOp):
         cos_sin = self.cos_sin_cache[:seqlen]
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
-
 
 class RotaryEmbedding(RotaryEmbeddingBase):
     def __init__(
@@ -123,46 +93,6 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         cos_sin_cache: torch.Tensor,
         is_neox_style: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """A PyTorch-native implementation of forward()."""
-        positions = positions.flatten()
-        num_tokens = positions.shape[0]
-        cos_sin = cos_sin_cache.index_select(0, positions)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, head_size)
-        query_rot = query[..., :rotary_dim]
-        query_pass = query[..., rotary_dim:]
-        query_rot = ApplyRotaryEmb.forward_static(
-            query_rot,
-            cos,
-            sin,
-            is_neox_style,
-        )
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        # key may be None in some cases, e.g. cross-layer KV sharing
-        if key is not None:
-            key_shape = key.shape
-            key = key.view(num_tokens, -1, head_size)
-            key_rot = key[..., :rotary_dim]
-            key_pass = key[..., rotary_dim:]
-            key_rot = ApplyRotaryEmb.forward_static(
-                key_rot,
-                cos,
-                sin,
-                is_neox_style,
-            )
-            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
-
-    def forward_native(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """A PyTorch-native implementation of forward()."""
         return self.forward_static(
             positions,
             query,

@@ -19,7 +19,6 @@ from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
 
-
 def pplx_hidden_dim_scale_bytes(
     max_num_tokens: int,
     hidden_dim: int,
@@ -60,7 +59,6 @@ def pplx_hidden_dim_scale_bytes(
         round_up(hidden_dim_bytes, align),
         round_up(hidden_scale_bytes, align),
     )
-
 
 class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def __init__(

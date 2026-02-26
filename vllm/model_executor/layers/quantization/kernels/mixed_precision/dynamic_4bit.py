@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm.model_executor.layers.quantization.utils import replace_parameter
@@ -9,7 +8,6 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-
 
 # This implementation is for the KleidiAI-accelerated w4a8int quantization
 # scheme on Arm CPUs:

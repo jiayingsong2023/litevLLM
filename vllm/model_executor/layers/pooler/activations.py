@@ -15,7 +15,6 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
-
 def get_classification_act_fn(
     config: PretrainedConfig,
 ) -> "PoolerActivation":
@@ -30,7 +29,6 @@ def get_classification_act_fn(
         return PoolerMultiLabelClassify()
 
     return PoolerClassify()
-
 
 def get_cross_encoder_act_fn(
     config: PretrainedConfig,
@@ -57,7 +55,6 @@ def get_cross_encoder_act_fn(
 
     return PoolerClassify()
 
-
 def resolve_classifier_act_fn(
     model_config: ModelConfig,
     static_num_labels: bool = True,
@@ -77,9 +74,7 @@ def resolve_classifier_act_fn(
     assert callable(act_fn)
     return act_fn
 
-
 _T = TypeVar("_T", torch.Tensor, list[torch.Tensor])
-
 
 class PoolerActivation(nn.Module, ABC):
     @staticmethod
@@ -105,21 +100,17 @@ class PoolerActivation(nn.Module, ABC):
 
         return self.forward_chunk(pooled_data)
 
-
 class PoolerIdentity(PoolerActivation):
     def forward_chunk(self, pooled_data: torch.Tensor) -> torch.Tensor:
         return pooled_data
-
 
 class PoolerNormalize(PoolerActivation):
     def forward_chunk(self, pooled_data: torch.Tensor) -> torch.Tensor:
         return F.normalize(pooled_data, p=2, dim=-1)
 
-
 class PoolerMultiLabelClassify(PoolerActivation):
     def forward_chunk(self, pooled_data: torch.Tensor) -> torch.Tensor:
         return F.sigmoid(pooled_data)
-
 
 class PoolerClassify(PoolerActivation):
     def __init__(self, *, static_num_labels: bool = True) -> None:
@@ -150,7 +141,6 @@ class PoolerClassify(PoolerActivation):
             return F.sigmoid(pooled_data)
 
         return F.softmax(pooled_data, dim=-1)
-
 
 class LambdaPoolerActivation(PoolerActivation):
     def __init__(self, fn: Callable[[torch.Tensor], torch.Tensor]):

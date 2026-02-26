@@ -27,21 +27,7 @@ from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
@@ -71,32 +57,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
-
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
-    """Pad the vocab size to the given value."""
-    return ((vocab_size + pad_to - 1) // pad_to) * pad_to
-
-
-def vocab_range_from_per_partition_vocab_size(
-    per_partition_vocab_size: int, rank: int, offset: int = 0
-) -> Sequence[int]:
-    index_f = rank * per_partition_vocab_size
-    index_l = index_f + per_partition_vocab_size
-    return index_f + offset, index_l + offset
-
-
-def vocab_range_from_global_vocab_size(
-    global_vocab_size: int, rank: int, world_size: int, offset: int = 0
-) -> Sequence[int]:
-    per_partition_vocab_size = divide(global_vocab_size, world_size)
-    return vocab_range_from_per_partition_vocab_size(
-        per_partition_vocab_size, rank, offset=offset
-    )
-
-
-@dataclass
-class VocabParallelEmbeddingShardIndices:
-    """Indices for a shard of a vocab parallel embedding."""
 
     padded_org_vocab_start_index: int
     padded_org_vocab_end_index: int
@@ -152,7 +113,6 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_org_elements <= self.num_org_elements_padded
         assert self.num_added_elements <= self.num_added_elements_padded
 
-
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
@@ -180,47 +140,9 @@ def get_masked_input_and_mask(
     input_ = vocab_mask * (input_ - valid_offset)
     return input_, ~vocab_mask
 
-
 # --8<-- [start:vocab_parallel_embedding]
 @CustomOp.register("vocab_parallel_embedding")
 class VocabParallelEmbedding(CustomOp):
-    """Embedding parallelized in the vocabulary dimension.
-
-    Adapted from torch.nn.Embedding, note that we pad the vocabulary size to
-    make sure it is divisible by the number of model parallel GPUs.
-
-    In order to support various loading methods, we ensure that LoRA-added
-    embeddings are always at the end of TP-sharded tensors. In other words,
-    we shard base embeddings and LoRA embeddings separately (both padded),
-    and place them in the same tensor.
-    In this example, we will have the original vocab size = 1010,
-    added vocab size = 16 and padding to 64. Therefore, the total
-    vocab size with padding will be 1088 (because we first pad 1010 to
-    1024, add 16, and then pad to 1088).
-    Therefore, the tensor format looks like the following:
-    TP1, rank 0 (no sharding):
-                            |< --------BASE-------- >|< -BASE PADDING-- >|< -----LORA------ >|< -LORA PADDING-- >|
-    corresponding token_id: |  0  |  1  | ... | 1009 |  -1  | ... |  -1  | 1010 | ... | 1025 |  -1  | ... |  -1  |
-                     index: |  0  |  1  | ... | 1009 | 1010 | ... | 1023 | 1024 | ... | 1039 | 1040 | ... | 1087 |
-
-    TP2, rank 0:
-                            |< --------------------BASE--------------------- >|< -----LORA------ >|< -LORA PADDING- >|
-    corresponding token_id: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 1010 | ... | 1025 |  -1  | ... |  -1 |
-                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 527  |  528 | ... | 543 |
-    TP2, rank 1:
-                            |< -----------BASE----------- >|< -BASE PADDING- >|< -----------LORA PADDING----------- >|
-    corresponding token_id: | 512 | 513 | 514 | ... | 1009 | -1  | ...  | -1  |  -1  | ... |  -1  | -1  | ... |   -1 |
-                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 527  | 528 | ... |  543 |
-
-    Args:
-        num_embeddings: vocabulary size.
-        embedding_dim: size of hidden state.
-        params_dtype: type of the parameters.
-        org_num_embeddings: original vocabulary size (without LoRA).
-        padding_size: padding size for the vocabulary.
-        quant_config: quant config for the layer
-        prefix: full name of the layer in the state dict
-    """  # noqa: E501
 
     # --8<-- [end:vocab_parallel_embedding]
 
@@ -321,9 +243,6 @@ class VocabParallelEmbedding(CustomOp):
         tp_rank: int,
         tp_size: int,
     ) -> VocabParallelEmbeddingShardIndices:
-        """Get start and end indices for vocab parallel embedding, following the
-        layout outlined in the class docstring, based on the given tp_rank and
-        tp_size."""
         num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
         padded_org_vocab_start_index, padded_org_vocab_end_index = (
             vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
@@ -350,16 +269,6 @@ class VocabParallelEmbedding(CustomOp):
         )
 
     def get_sharded_to_full_mapping(self) -> list[int] | None:
-        """Get a mapping that can be used to reindex the gathered
-        logits for sampling.
-
-        During sampling, we gather logits from all ranks. The relationship
-        of index->token_id will follow the same format as outlined in the class
-        docstring. However, after the gather, we want to reindex the final
-        logits tensor to map index->token_id one-to-one (the index is always
-        equal the token_id it corresponds to). The indices returned by this
-        method allow us to do that.
-        """
         if self.tp_size < 2:
             return None
 
@@ -494,24 +403,9 @@ class VocabParallelEmbedding(CustomOp):
         s += f", tp_size={self.tp_size}"
         return s
 
-
 # --8<-- [start:parallel_lm_head]
 @CustomOp.register("parallel_lm_head")
 class ParallelLMHead(VocabParallelEmbedding):
-    """Parallelized LM head.
-
-    Output logits weight matrices used in the Sampler. The weight and bias
-    tensors are padded to make sure they are divisible by the number of
-    model parallel GPUs.
-
-    Args:
-        num_embeddings: vocabulary size.
-        embedding_dim: size of hidden state.
-        bias: whether to use bias.
-        params_dtype: type of the parameters.
-        org_num_embeddings: original vocabulary size (without LoRA).
-        padding_size: padding size for the vocabulary.
-    """
 
     # --8<-- [end:parallel_lm_head]
 
@@ -551,14 +445,3 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):
-        """Tie the weights with word embeddings."""
-        # GGUF quantized embed_tokens.
-        if self.quant_config and self.quant_config.get_name() == "gguf":
-            return embed_tokens
-        else:
-            self.weight = embed_tokens.weight
-            return self
-
-    def forward(self, input_):
-        del input_
-        raise RuntimeError("LMHead's weights should be used in the sampler.")

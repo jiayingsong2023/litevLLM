@@ -13,7 +13,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
-
 class MoEPrepareAndFinalizeNaiveEP(mk.FusedMoEPrepareAndFinalize):
     def __init__(
         self,
@@ -128,7 +127,6 @@ class MoEPrepareAndFinalizeNaiveEP(mk.FusedMoEPrepareAndFinalize):
         output.copy_(
             get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
         )
-
 
 class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
     @property

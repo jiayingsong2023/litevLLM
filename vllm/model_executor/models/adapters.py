@@ -35,43 +35,7 @@ _GENERATE_SUFFIXES = [
     "LMHeadModel",
 ]
 
-
 def _load_st_projector(model_config: "ModelConfig") -> nn.Module | None:
-    """Load Sentence-Transformers Dense projection layers."""
-
-    dense_modules = try_get_dense_modules(
-        model_config.model, revision=model_config.revision
-    )
-
-    if dense_modules is None:
-        return
-
-    try:
-        layers = []
-        for layer_config in dense_modules:
-            folder = layer_config["folder"]
-            linear = nn.Linear(
-                layer_config["in_features"],
-                layer_config["out_features"],
-                bias=layer_config.get("bias", True),
-                dtype=model_config.head_dtype,
-            )
-            if not _load_dense_weights(linear, folder, model_config):
-                continue
-            layers.append(linear)
-            if act_name := layer_config.get("activation_function"):
-                layers.append(get_act_fn(act_name))
-        return nn.Sequential(*layers).to(dtype=model_config.head_dtype)
-    except Exception:
-        logger.exception("ST projector loading failed")
-
-    return None
-
-
-def _load_dense_weights(
-    linear: nn.Linear, folder: str, model_config: "ModelConfig"
-) -> bool:
-    """Load weights using vLLM's weight_loader pattern."""
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     for filename in ["model.safetensors", "pytorch_model.bin"]:
@@ -115,7 +79,6 @@ def _load_dense_weights(
 
     return False
 
-
 def _get_pooling_model_name(orig_model_name: str, pooling_suffix: str) -> str:
     model_name = orig_model_name
 
@@ -123,7 +86,6 @@ def _get_pooling_model_name(orig_model_name: str, pooling_suffix: str) -> str:
         model_name = model_name.removesuffix(generate_suffix)
 
     return model_name + pooling_suffix
-
 
 def _create_pooling_model_cls(orig_cls: _T) -> _T:
     # Lazy import
@@ -222,18 +184,7 @@ def _create_pooling_model_cls(orig_cls: _T) -> _T:
 
     return ModelForPooling  # type: ignore
 
-
 def as_embedding_model(cls: _T) -> _T:
-    """
-    Subclass an existing vLLM model to support embeddings.
-
-    By default, the embeddings of the whole prompt are extracted from the
-    normalized hidden state corresponding to the last token.
-
-    Note:
-        We assume that no extra layers are added to the original model;
-        please implement your own model if this is not the case.
-    """
     # Avoid modifying existing embedding models
     if is_pooling_model(cls):
         return cls
@@ -256,19 +207,7 @@ def as_embedding_model(cls: _T) -> _T:
 
     return ModelForEmbedding  # type: ignore
 
-
 def as_seq_cls_model(cls: _T) -> _T:
-    """
-    Subclass an existing vLLM model to support classify and score tasks.
-
-    By default, the class probabilities are extracted from the softmaxed
-    hidden state corresponding to the last token.
-
-    Note:
-        We assume that the classification head is a single linear layer
-        stored as the attribute `score` of the top-level model;
-        please implement your own model if this is not the case.
-    """
     # Avoid modifying existing classification models
     if is_pooling_model(cls):
         return cls
@@ -342,7 +281,6 @@ def as_seq_cls_model(cls: _T) -> _T:
 
     return ModelForSequenceClassification  # type: ignore
 
-
 class SequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -373,12 +311,7 @@ class SequenceClassificationConfig(VerifyAndUpdateConfig):
         use_sep_token = getattr(text_config, "use_sep_token", False)
         text_config.use_sep_token = use_sep_token
 
-
 def _get_language_model_for_seq_cls(model) -> nn.Module:
-    """
-    Get the language model component for sequence classification conversion.
-    For VLMs, returns the inner language model. For standard LLMs, returns model itself.
-    """
     if supports_multimodal(model):
         try:
             lm = model.get_language_model()
@@ -406,13 +339,8 @@ def _get_language_model_for_seq_cls(model) -> nn.Module:
 
     return model
 
-
 @contextmanager
 def _disable_seq_cls_loading_on_inner_model(language_model, is_vlm: bool):
-    """
-    Context manager to temporarily disable sequence classification loading
-    on inner VLM models to prevent recursive seq_cls_model_loader calls.
-    """
     if not is_vlm:
         yield
         return
@@ -442,7 +370,6 @@ def _disable_seq_cls_loading_on_inner_model(language_model, is_vlm: bool):
             inner_text_config.classifier_from_token = original_tokens
         if original_hf_tokens is not None:
             inner_hf_config.classifier_from_token = original_hf_tokens
-
 
 def load_weights_using_from_2_way_softmax(
     model, weights: Iterable[tuple[str, torch.Tensor]]
@@ -525,7 +452,6 @@ def load_weights_using_from_2_way_softmax(
     loaded_weights.discard(lm_head_name)
     return loaded_weights
 
-
 def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Tensor]]):
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -594,12 +520,10 @@ def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Te
     loaded_weights.discard(lm_head_name)
     return loaded_weights
 
-
 SEQ_CLS_LOAD_METHODS = {
     "from_2_way_softmax": load_weights_using_from_2_way_softmax,
     "no_post_processing": load_weights_no_post_processing,
 }
-
 
 def seq_cls_model_loader(model, weights: Iterable[tuple[str, torch.Tensor]]):
     # Online convert ForCausalLM into ForSequenceClassification model.

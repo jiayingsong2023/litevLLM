@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
@@ -25,7 +24,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.attention.backend import AttentionMetadata
 from vllm.attention.backends.short_conv_attn import ShortConvAttentionMetadata
-
 
 # --8<-- [start:short_conv]
 @CustomOp.register("short_conv")
@@ -227,7 +225,6 @@ class ShortConv(MambaBase, CustomOp):
     def mamba_type(self) -> str:
         return "short_conv"
 
-
 def short_conv(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -237,14 +234,12 @@ def short_conv(
     self = forward_context.no_compile_layers[layer_name]
     self.forward_cuda(hidden_states=hidden_states, output=output)
 
-
 def short_conv_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
     return
-
 
 direct_register_custom_op(
     op_name="short_conv",

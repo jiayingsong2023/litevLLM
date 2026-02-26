@@ -1,27 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 
-
 class TopKWeightAndReduceDelegate(mk.TopKWeightAndReduce):
-    """
-    Useful in the case when some FusedMoEPermuteExpertsUnpermute
-    implementation does not perform weight application and reduction
-    but cannot address the needs of all the compatible PrepareAndFinalize
-    implementations.
-    For example, BatchedTritonExperts is compatible with both
-    PplxPrepareAndFinalize and BatchedPrepareAndFinalize. PplxPrepareAndFinalize
-    does the weight-application + reduction as part of the pplx combine kernel.
-    But the BatchedPrepareAndFinalize needs an implementation. To facilitate
-    this case, the BatchedTritonExperts could use TopKWeightAndReduceDelegate
-    so the PrepareAndFinalize implementations could choose how to
-    weight + reduce.
-    """
 
     def __eq__(self, other):
         return isinstance(other, TopKWeightAndReduceDelegate)
@@ -39,12 +24,7 @@ class TopKWeightAndReduceDelegate(mk.TopKWeightAndReduce):
             "TopKWeightAndReduce implementation."
         )
 
-
 class TopKWeightAndReduceNoOP(mk.TopKWeightAndReduce):
-    """
-    The fused_experts outputs have already been weight applied and reduced.
-    This implementation is a no-op.
-    """
 
     def __eq__(self, other):
         return isinstance(other, TopKWeightAndReduceNoOP)
@@ -71,12 +51,7 @@ class TopKWeightAndReduceNoOP(mk.TopKWeightAndReduce):
         output.copy_(fused_expert_output, non_blocking=True)
         return output
 
-
 class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
-    """
-    TopKWeightAndReduce implementation for a fused_experts output
-    of shape (m, topk, K)
-    """
 
     def __eq__(self, other):
         return isinstance(other, TopKWeightAndReduceContiguous)
@@ -115,12 +90,7 @@ class TopKWeightAndReduceContiguous(mk.TopKWeightAndReduce):
         ops.moe_sum(fused_expert_output, output)
         return output
 
-
 class TopKWeightAndReduceNaiveBatched(mk.TopKWeightAndReduce):
-    """
-    TopKWeightAndReduce implementation for a fused_experts output
-    of shape (num_experts, batch_size, K)
-    """
 
     def __init__(self, rank: int):
         self.rank = rank

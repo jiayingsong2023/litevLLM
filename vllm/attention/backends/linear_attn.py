@@ -17,7 +17,6 @@ from vllm.attention.backends.utils import (
 )
 from vllm.kv_cache_interface import AttentionSpec, MambaSpec
 
-
 class LinearAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -26,7 +25,6 @@ class LinearAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["LinearAttentionMetadataBuilder"]:
         return LinearAttentionMetadataBuilder
-
 
 @dataclass
 class LinearAttentionMetadata:
@@ -38,7 +36,6 @@ class LinearAttentionMetadata:
     seq_lens: torch.Tensor
 
     state_indices_tensor: torch.Tensor  # shape: [batch,]
-
 
 class LinearAttentionMetadataBuilder(AttentionMetadataBuilder[LinearAttentionMetadata]):
     reorder_batch_threshold: int = 1

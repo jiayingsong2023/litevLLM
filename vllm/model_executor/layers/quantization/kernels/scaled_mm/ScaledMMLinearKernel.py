@@ -14,11 +14,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
-
 @dataclass
 class ScaledMMLinearLayerConfig:
     pass
-
 
 @dataclass
 class Int8ScaledMMLinearLayerConfig(ScaledMMLinearLayerConfig):
@@ -27,13 +25,11 @@ class Int8ScaledMMLinearLayerConfig(ScaledMMLinearLayerConfig):
     is_channelwise: bool
     input_symmetric: bool
 
-
 @dataclass
 class FP8ScaledMMLinearLayerConfig(ScaledMMLinearLayerConfig):
     weight_quant_key: QuantKey
     activation_quant_key: QuantKey
     out_dtype: torch.dtype | None
-
 
 _FP8ParamsT = tuple[
     torch.Tensor,  # weight
@@ -51,7 +47,6 @@ _Int8ParamsT = tuple[
 
 _ParamsT = TypeVar("_ParamsT", _Int8ParamsT, _FP8ParamsT)
 _ConfigT = TypeVar("_ConfigT", bound=ScaledMMLinearLayerConfig)
-
 
 class ScaledMMLinearKernel(Generic[_ConfigT, _ParamsT], ABC):
     @classmethod
@@ -89,7 +84,6 @@ class ScaledMMLinearKernel(Generic[_ConfigT, _ParamsT], ABC):
     @abstractmethod
     def _get_layer_params(self, layer) -> _ParamsT:
         raise NotImplementedError
-
 
 class FP8ScaledMMLinearKernel(
     ScaledMMLinearKernel[FP8ScaledMMLinearLayerConfig, _FP8ParamsT], ABC
@@ -171,7 +165,6 @@ class FP8ScaledMMLinearKernel(
 
     def get_output_padding(self) -> int | None:
         return None
-
 
 class Int8ScaledMMLinearKernel(
     ScaledMMLinearKernel[Int8ScaledMMLinearLayerConfig, _Int8ParamsT], ABC

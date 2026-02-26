@@ -29,13 +29,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
 
-
 class GGUFModelLoader(BaseModelLoader):
-    """
-    Model loader that can load GGUF files. This is useful for loading models
-    that are quantized with GGUF and saved in the GGUF format. This loader
-    supports loading both full models and sharded models.
-    """
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -76,14 +70,6 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
     def _get_gguf_weights_map(self, model_config: ModelConfig):
-        """
-        GGUF uses this naming convention for their tensors from HF checkpoint:
-        `blk.N.BB.weight` and `blk.N.BB.bias`
-        where N signifies the block number of a layer, and BB signifies the
-        attention/mlp layer components.
-        See "Standardized tensor names" in
-        https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
-        """
         config = model_config.hf_config
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
@@ -192,24 +178,6 @@ class GGUFModelLoader(BaseModelLoader):
             }
 
         def find_hf_name_in_tensor_map(hf_name: str) -> str | None:
-            """
-            Map HuggingFace parameter name to GGUF tensor name.
-
-            This function handles the mismatch between HF parameter naming
-            conventions and gguf-py's expected format:
-            1. Strips 'model.' prefix (common in multimodal models)
-            2. Converts '_weight' suffix to '.weight' (Gemma3 compatibility)
-            3. Searches vision_name_map for multimodal parameters
-            4. Falls back to text_name_map for language model parameters
-
-            Args:
-                hf_name: Full HuggingFace parameter name (e.g.,
-                        'model.multi_modal_projector.mm_soft_emb_norm.weight')
-
-            Returns:
-                GGUF tensor name with suffix (e.g., 'mm.soft_emb_norm.weight')
-                or None if no mapping found
-            """
             # Strip 'language_model.' prefix for multimodal models - gguf-py
             # tensor mappings expect parameter names without this prefix.
             # Note: 'model.' prefix should be KEPT for text-only models as
@@ -300,17 +268,6 @@ class GGUFModelLoader(BaseModelLoader):
         model_name_or_path: str,
         gguf_to_hf_name_map: dict[str, str],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """
-        Iterate over GGUF model weights, loading from both main model file and
-        mmproj.gguf for multimodal Gemma3 models.
-
-        For Gemma3 multimodal GGUF models:
-        - Main file (gemma-3-*.gguf): Language model weights (model.*)
-        - mmproj file (mmproj*.gguf): Vision tower + projector weights (v.*, mm.*)
-
-        Yields:
-            Tuples of (parameter_name, tensor) for all model weights
-        """
         hf_config = model_config.hf_config
         is_multimodal = hasattr(hf_config, "vision_config")
 

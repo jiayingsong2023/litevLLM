@@ -1,20 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Conv Layer Class."""
-
-import math
-from typing import Literal
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from vllm.model_executor.custom_op import CustomOp
-from vllm.utils.torch_utils import is_torch_equal
-
-
-class ConvLayerBase(CustomOp):
-    """Conv layer base class."""
 
     num_dim: int
 
@@ -104,46 +89,9 @@ class ConvLayerBase(CustomOp):
         s += f"bias={self.bias is not None}"
         return s
 
-
 # --8<-- [start:conv2d]
 @CustomOp.register("conv2d")
 class Conv2dLayer(ConvLayerBase):
-    """Conv layer with Conv2d."""
-
-    # --8<-- [end:conv2d]
-
-    num_dim = 2
-
-    def _forward_mulmat(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 4
-        B, C, H, W = x.shape
-        K1, K2 = self.kernel_size
-        H, W = H // K1, W // K2
-        x = x.unfold(2, K1, K1).unfold(3, K2, K2)
-        x = x.permute(0, 2, 3, 1, 4, 5).reshape(-1, self.input_size)
-        x = F.linear(
-            x,
-            self.weight.view(self.out_channels, self.input_size),
-            self.bias,
-        )
-        x = x.view(B, H, W, self.out_channels).permute(0, 3, 1, 2)
-        return x
-
-    def _forward_conv(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 4
-        x = F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
-        return x
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Expected input shape: (batch_size, in_channels, height, width)"""
         assert x.dim() == 4
         if self.enable_linear:
             return self._forward_mulmat(x)
@@ -154,14 +102,7 @@ class Conv2dLayer(ConvLayerBase):
         # By default, we use CUDNN's convolution ops with optimization.
         return self._forward_conv(x)
 
-
 class CausalConv2dLayer(Conv2dLayer):
-    """
-    A causal version of nn.Conv2d where each location in the 2D matrix would
-    have no access to locations on its right or down
-    All arguments are the same as nn.Conv2d except padding which should be
-    set as None
-    """
 
     def __init__(
         self,
@@ -206,46 +147,9 @@ class CausalConv2dLayer(Conv2dLayer):
         x = super().forward(x)
         return x
 
-
 # --8<-- [start:conv3d]
 @CustomOp.register("conv3d")
 class Conv3dLayer(ConvLayerBase):
-    """Conv layer with Conv3d."""
-
-    # --8<-- [end:conv3d]
-
-    num_dim = 3
-
-    def _forward_mulmat(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 5
-        B, C, T, H, W = x.shape
-        K1, K2, K3 = self.kernel_size
-        T, H, W = T // K1, H // K2, W // K3
-        x = x.unfold(2, K1, K1).unfold(3, K2, K2).unfold(4, K3, K3)
-        x = x.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(-1, self.input_size)
-        x = F.linear(
-            x,
-            self.weight.view(self.out_channels, self.input_size),
-            self.bias,
-        )
-        x = x.view(B, T, H, W, self.out_channels).permute(0, 4, 1, 2, 3)
-        return x
-
-    def _forward_conv(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 5
-        x = F.conv3d(
-            x,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
-        return x
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Expected input shape: (batch_size, in_channels, time, height, width)"""
         if self.enable_linear:
             return self._forward_mulmat(x)
         else:

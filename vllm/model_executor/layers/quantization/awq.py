@@ -28,12 +28,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 class AWQConfig(QuantizationConfig):
-    """Config class for AWQ.
-
-    Reference: https://arxiv.org/abs/2306.00978
-    """
 
     def __init__(
         self,
@@ -161,13 +156,7 @@ class AWQConfig(QuantizationConfig):
         }
         self.modules_to_not_convert = list(layers - quant_layers)
 
-
 class AWQLinearMethod(LinearMethodBase):
-    """Linear method for AWQ.
-
-    Args:
-        quant_config: The AWQ quantization config.
-    """
 
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config

@@ -12,20 +12,17 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-
 # common functions
 def rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
 def rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     x = torch.stack((-x2, x1), dim=-1)
     return x.flatten(-2)
-
 
 # yarn functions
 # Inverse dim formula to find dim based on number of rotations
@@ -38,7 +35,6 @@ def yarn_find_correction_dim(
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
         2 * math.log(base)
     )
-
 
 # Find dim range bounds based on rotations
 def yarn_find_correction_range(
@@ -56,7 +52,6 @@ def yarn_find_correction_range(
         high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
-
 def yarn_linear_ramp_mask(
     low: float, high: float, dim: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -67,12 +62,10 @@ def yarn_linear_ramp_mask(
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
-
 def yarn_get_mscale(scale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * math.log(scale) + 1.0
-
 
 def _flashinfer_rotary_embedding(
     positions: torch.Tensor,
@@ -82,10 +75,6 @@ def _flashinfer_rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    """Custom op wrapper for flashinfer's rotary embedding.
-
-    This is an in-place operation that modifies query and key tensors directly.
-    """
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     apply_rope_with_cos_sin_cache_inplace(
@@ -97,7 +86,6 @@ def _flashinfer_rotary_embedding(
         is_neox=is_neox,
     )
 
-
 def _flashinfer_rotary_embedding_fake(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -108,7 +96,6 @@ def _flashinfer_rotary_embedding_fake(
 ) -> None:
     return
 
-
 # Register flashinfer rotary embedding custom op
 direct_register_custom_op(
     op_name="flashinfer_rotary_embedding",
@@ -116,7 +103,6 @@ direct_register_custom_op(
     mutates_args=["query", "key"],  # These tensors are modified in-place
     fake_impl=_flashinfer_rotary_embedding_fake,
 )
-
 
 # --8<-- [start:apply_rotary_emb]
 @CustomOp.register("apply_rotary_emb")
@@ -147,15 +133,6 @@ class ApplyRotaryEmb(CustomOp):
         is_neox_style: bool = True,
         enable_fp32_compute: bool = False,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: [batch_size (optional), seq_len, num_heads, head_size]
-            cos: [seq_len, head_size // 2]
-            sin: [seq_len, head_size // 2]
-            is_neox_style: Whether to use the Neox-style or GPT-J-style.
-            enable_fp32_compute: Temporarily convert x, cos, sin to FP32 dtype
-                                 for higher accuracy.
-        """
         origin_dtype = x.dtype
         if enable_fp32_compute:
             x = x.float()
@@ -233,13 +210,6 @@ class ApplyRotaryEmb(CustomOp):
 
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
-        """
-        Arguments of apply_rotary_emb() in vllm_flash_attn:
-            x: [batch_size, seq_len, nheads, headdim]
-            cos, sin: [seqlen_rotary, rotary_dim / 2]
-            interleaved: defalut as False (Neox-style).
-            ...
-        """
         interleaved = not self.is_neox_style
         output = apply_rotary_emb(x, cos, sin, interleaved)
 
@@ -255,13 +225,6 @@ class ApplyRotaryEmb(CustomOp):
         if self.apply_rotary_emb_flash_attn is not None:
             x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
-            """
-            Arguments of apply_rotary() in flash_attn:
-                x: [batch_size, seq_len, nheads, headdim]
-                cos, sin: [seqlen_rotary, rotary_dim / 2]
-                interleaved: defalut as False (Neox-style).
-                ...
-            """
             interleaved = not self.is_neox_style
             output = self.apply_rotary_emb_flash_attn(
                 x, cos, sin, interleaved=interleaved

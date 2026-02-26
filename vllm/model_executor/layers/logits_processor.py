@@ -1,78 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A layer that compute logits from hidden_stats."""
-
-import torch
-
-from vllm.distributed import (
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_gather,
-)
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.platforms import current_platform
-
-
-# --8<-- [start:logits_processor]
-@CustomOp.register("logits_processor")
-class LogitsProcessor(CustomOp):
-    """Process logits and apply logits processors from sampling metadata.
 
     This layer does the following:
     1. Gather logits from model hidden_states.
     2. Scale logits if needed.
     3. Apply logits processors (if any).
-    """
-
-    # --8<-- [end:logits_processor]
-
-    def __init__(
-        self,
-        vocab_size: int,
-        org_vocab_size: int | None = None,
-        scale: float = 1.0,
-        logits_as_input: bool = False,
-        soft_cap: float | None = None,
-    ) -> None:
-        """
         Args:
             scale: A scaling factor to apply to the logits.
-        """
-        super().__init__()
-        self.scale = scale
-        self.vocab_size = vocab_size
-        # Whether the input is logits (default is hidden states).
-        self.logits_as_input = logits_as_input
-        # original vocabulary size (without LoRA).
-        self.org_vocab_size = org_vocab_size or vocab_size
-        # Soft cap the logits. Used in Gemma 2.
-        self.soft_cap = soft_cap
-        # Whether to use gather or all-gather to gather the logits.
-        self.use_all_gather = current_platform.use_all_gather()
-
-    def forward(
-        self,
-        lm_head: VocabParallelEmbedding,
-        hidden_states: torch.Tensor,
-        embedding_bias: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if self.logits_as_input:
-            logits = hidden_states
-        else:
-            # Get the logits for the next tokens.
-            logits = self._get_logits(hidden_states, lm_head, embedding_bias)
-        if logits is not None:
-            if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
-
-            if self.scale != 1.0:
-                logits *= self.scale
-        return logits
-
-    def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """gather/all-gather the logits tensor across model parallel group."""
         if self.use_all_gather:
             # Gather is not supported for some devices such as TPUs.
             # Use all-gather instead.

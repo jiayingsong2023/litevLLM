@@ -37,7 +37,6 @@ from .quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
-
 def kda_attention(
     q_proj_states: torch.Tensor,
     k_proj_states: torch.Tensor,
@@ -58,7 +57,6 @@ def kda_attention(
         core_attn_out=core_attn_out,
     )
 
-
 def kda_attention_fake(
     q_proj_states: torch.Tensor,
     k_proj_states: torch.Tensor,
@@ -70,14 +68,12 @@ def kda_attention_fake(
 ) -> None:
     return
 
-
 direct_register_custom_op(
     op_name="kda_attention",
     op_func=kda_attention,
     mutates_args=["core_attn_out"],
     fake_impl=kda_attention_fake,
 )
-
 
 class KimiDeltaAttention(nn.Module, MambaBase):
     @property

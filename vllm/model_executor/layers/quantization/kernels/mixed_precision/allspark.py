@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm import _custom_ops as ops
@@ -13,7 +12,6 @@ from vllm.model_executor.layers.quantization.utils.allspark_utils import (
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-
 
 class AllSparkLinearKernel(MPLinearKernel):
     @classmethod

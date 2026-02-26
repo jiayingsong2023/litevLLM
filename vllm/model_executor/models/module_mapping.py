@@ -6,7 +6,6 @@
 
 from dataclasses import dataclass, field
 
-
 @dataclass
 class MultiModelKeys:
     language_model: list[str] = field(default_factory=list)

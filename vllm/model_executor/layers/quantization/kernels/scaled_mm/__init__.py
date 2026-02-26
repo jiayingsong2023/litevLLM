@@ -77,7 +77,6 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
 _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel)
 _KernelConfigT = TypeVar("_KernelConfigT", bound=ScaledMMLinearLayerConfig)
 
-
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
@@ -103,36 +102,12 @@ def is_supported_and_can_implement_kernel(
 
     return True, ""
 
-
 def choose_scaled_mm_linear_kernel(
     config: _KernelConfigT,
     possible_kernels: dict[PlatformEnum, list[type[_KernelT]]],
     compute_capability: int | None = None,
     force_kernel: type[_KernelT] | None = None,
 ) -> type[_KernelT]:
-    """
-    Choose a _KernelT that can implement the given config for the
-    given compute capability. Attempts to choose the best kernel in terms of
-    performance.
-
-    Args:
-        config (_KernelConfigT): Description of the linear layer
-            to be implemented.
-        possible_kernels (dict[PlatformEnum, list[_KernelT]]): A
-            dictionary of platforms and their list of possible kernels.
-        compute_capability (Optional[int], optional): The compute capability of
-            the target device, if None uses `current_platform` to get the
-            compute capability. Defaults to None.
-        force_kernel (Optional[type[_KernelT]]): An Optional forced kernel to override
-            the possible_kernels if it can be implemented. If None, it will only try the
-            possible kernels.
-
-    Raises:
-        ValueError: If no kernel can implement the given config.
-
-    Returns:
-        _KernelT: Chosen kernel.
-    """
 
     failure_reason_list = []
 
@@ -161,7 +136,6 @@ def choose_scaled_mm_linear_kernel(
         "Failed to find a kernel that can implement the "
         "ScaledMM linear layer. Reasons: \n" + "\n".join(failure_reason_list)
     )
-
 
 def init_fp8_linear_kernel(
     activation_quant_key: QuantKey,
@@ -192,7 +166,6 @@ def init_fp8_linear_kernel(
         scaled_mm_linear_kernel_config,
         layer_param_names=["weight", "weight_scale", "input_scale", "input_scale_ub"],
     )
-
 
 def init_int8_linear_kernel(
     is_channelwise: bool,

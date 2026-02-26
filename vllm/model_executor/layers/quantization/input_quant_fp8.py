@@ -24,14 +24,9 @@ _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
 
-
 # --8<-- [start:quant_fp8]
 @CustomOp.register("quant_fp8")
 class QuantFP8(CustomOp):
-    """
-    Quantize input tensor to FP8 (per-tensor, per-token, per-channel, or per-group).
-    This CustomOp supports both static and dynamic quantization.
-    """
 
     # --8<-- [end:quant_fp8]
 
@@ -45,18 +40,6 @@ class QuantFP8(CustomOp):
         use_ue8m0: bool | None = None,  # for Torch compile
         compile_native: bool = True,
     ):
-        """
-        :param static: static or dynamic quantization
-        :param group_shape: quantization group shape (PER_TOKEN, PER_TENSOR,
-            PER_CHANNEL, or arbitrary block size)
-        :param num_token_padding: Pad the token dimension of output to this
-            size
-        :param tma_aligned_scales: For group quantization, output scales in
-            TMA-aligned layout
-        :param column_major_scales: For group quantization, output scales in
-            column major format
-        :param compile_native: Manually compile forward_native if compile mode > None
-        """
         super().__init__(compile_native=compile_native)
         self.static = static
         self.group_shape = group_shape

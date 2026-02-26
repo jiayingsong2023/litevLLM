@@ -9,17 +9,7 @@ from torch import nn
 from vllm.model_executor.layers.fused_moe.fused_moe import zero_experts_compute_triton
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
-
 class ZeroExpertFusedMoE(FusedMoE):
-    """
-    A FusedMoE operation that also computes the results of zero experts.
-    Zero experts perform identity operations (scaled pass-through) instead
-    of full MLP computations.
-
-    This class uses memoization to avoid redundant routing computation:
-    routing is computed once and reused for both zero expert computation
-    and the main FusedMoE forward pass.
-    """
 
     def __init__(
         self,
@@ -70,19 +60,6 @@ class ZeroExpertFusedMoE(FusedMoE):
 
         # Create custom_routing_function to reuse memoized routing results
         def custom_routing_function(hidden_states, gating_output, topk, renormalize):
-            """Return memoized `topk_weights` and `topk_ids`."""
-            if self._memoized_topk_weights is None or self._memoized_topk_ids is None:
-                raise RuntimeError(
-                    "ZeroExpertFusedMoE: routing results not memoized. "
-                    "Call select_experts first to compute routing."
-                )
-            return self._memoized_topk_weights, self._memoized_topk_ids
-
-        self.custom_routing_function = custom_routing_function
-
-    @contextmanager
-    def _temporarily_set_attrs(self, **attrs):
-        """
         Temporarily set attributes using object.__setattr__ and restore them.
 
         This bypasses nn.Module.__setattr__ to avoid Dynamo tracing issues.
@@ -91,23 +68,6 @@ class ZeroExpertFusedMoE(FusedMoE):
         resulting in "Unsupported" errors. Using object.__setattr__ directly
         sets the attribute without triggering nn.Module's custom __setattr__,
         allowing Dynamo to trace the code successfully.
-        """
-        originals = {key: getattr(self, key) for key in attrs}
-        try:
-            for key, value in attrs.items():
-                object.__setattr__(self, key, value)
-            yield
-        finally:
-            for key, value in originals.items():
-                object.__setattr__(self, key, value)
-
-    def _compute_zero_expert_result(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Compute zero expert results using pre-computed routing."""
         if (
             self._actual_zero_expert_num is None
             or self._actual_zero_expert_num <= 0
@@ -128,16 +88,6 @@ class ZeroExpertFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,  # Full logits including zero experts
     ) -> torch.Tensor:
-        """
-        Forward pass with zero expert support and routing memoization.
-
-        Args:
-            hidden_states: Input hidden states
-            router_logits: Full router logits (including zero experts)
-
-        Returns:
-            Combined output from real experts and zero experts
-        """
         # Prepare temporary attribute overrides for routing computation
         temp_attrs = {
             "custom_routing_function": None,  # Disable for first routing

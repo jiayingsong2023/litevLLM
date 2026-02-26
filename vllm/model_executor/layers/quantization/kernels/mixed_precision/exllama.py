@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm import _custom_ops as ops
@@ -13,7 +12,6 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
-
 
 class ExllamaLinearKernel(MPLinearKernel):
     SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]

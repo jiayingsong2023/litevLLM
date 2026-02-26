@@ -16,7 +16,6 @@ from .methods import TokenPoolingMethodOutputItem
 
 TokenPoolerHeadOutputItem: TypeAlias = torch.Tensor | None
 
-
 class TokenPoolerHead(nn.Module, ABC):
     @abstractmethod
     def get_supported_tasks(self) -> Set[PoolingTask]:
@@ -39,7 +38,6 @@ class TokenPoolerHead(nn.Module, ABC):
         assert len(pooled_data) == len(pooling_params)
 
         return [self.forward_chunk(d, p) for d, p in zip(pooled_data, pooling_params)]
-
 
 class TokenEmbeddingPoolerHead(TokenPoolerHead):
     def __init__(
@@ -84,7 +82,6 @@ class TokenEmbeddingPoolerHead(TokenPoolerHead):
 
         # pooled_data shape: [n_tokens, embedding_dimension]
         return pooled_data
-
 
 class TokenClassifierPoolerHead(TokenPoolerHead):
     def __init__(

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm import _custom_ops as ops
@@ -17,7 +16,6 @@ from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
-
 
 class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
@@ -140,7 +138,6 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         return ops.cutlass_scaled_mm(
             x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
         )
-
 
 class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     @classmethod

@@ -39,12 +39,7 @@ else:
 
 logger = init_logger(__name__)
 
-
 class GPTQConfig(QuantizationConfig):
-    """Config class for GPTQ.
-
-    Reference: https://arxiv.org/abs/2210.17323
-    """
 
     def __init__(
         self,
@@ -215,19 +210,12 @@ class GPTQConfig(QuantizationConfig):
         }
         self.modules_in_block_to_quantize = list(quant_layers)
 
-
 class ExllamaState(Enum):
     UNUSED = enum.auto()
     UNINITIALIZED = enum.auto()
     READY = enum.auto()
 
-
 class GPTQLinearMethod(LinearMethodBase):
-    """Linear method for GPTQ.
-
-    Args:
-        quant_config: The GPTQ quantization config.
-    """
 
     def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config

@@ -27,7 +27,6 @@ logger = init_logger(__name__)
 
 _CPU_ARCH_PREFER_MIXED_BATCH = (CpuArchEnum.X86, CpuArchEnum.ARM)
 
-
 class CPUAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [
@@ -50,8 +49,6 @@ class CPUAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """CPU attention supports decoder,
-        encoder-only and encoder-decoder attention."""
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
@@ -81,7 +78,6 @@ class CPUAttentionBackend(AttentionBackend):
     def use_cascade_attention(*args, **kwargs) -> bool:
         return False
 
-
 @dataclass
 class CPUAttentionMetadata:
     isa: str
@@ -100,7 +96,6 @@ class CPUAttentionMetadata:
     num_decode_tokens: int = 0
     sdpa_attn_masks: list[torch.Tensor | None] | None = None
     sdpa_start_loc: torch.Tensor | None = None
-
 
 class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
     def __init__(
@@ -206,7 +201,6 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
 
         return attn_metadata
 
-
 class CPUAttentionBackendImpl(AttentionImpl):
     def __init__(
         self,
@@ -274,18 +268,6 @@ class CPUAttentionBackendImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass for CPU attention backend.
-
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [2, num_blocks, num_kv_heads, block_size, head_size]
-            attn_metadata: Metadata for attention.
-        Returns:
-            shape = [num_tokens, num_heads * head_size]
-        """
         assert output is not None, "Output tensor must be provided."
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
@@ -425,7 +407,6 @@ class CPUAttentionBackendImpl(AttentionImpl):
             output[start_q:end_q, :, :] = sub_out
         return output
 
-
 def _make_alibi_bias(
     alibi_slopes: torch.Tensor,
     dtype: torch.dtype,
@@ -456,7 +437,6 @@ def _make_alibi_bias(
 
     return attn_biases
 
-
 def _make_sliding_window_bias(
     sdpa_start_loc: torch.Tensor,
     left_window_size: int,
@@ -482,7 +462,6 @@ def _make_sliding_window_bias(
         attn_biases.append(mask)
 
     return attn_biases
-
 
 def _get_attn_isa(
     dtype: torch.dtype, block_size: int, head_size: int | None = None

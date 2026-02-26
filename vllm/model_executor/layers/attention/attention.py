@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 def validate_kv_sharing_target(
     current_layer_name, target_layer_name, static_forward_context
 ):
@@ -79,16 +78,7 @@ def validate_kv_sharing_target(
             error_msg + f"must be the same type as the current layer ({expected})."
         )
 
-
 def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
-    """Returns whether the quantization method should load quantized weights."""
-    return quant_method is not None and not isinstance(
-        quant_method, UnquantizedLinearMethod
-    )
-
-
-def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) -> None:
-    """Sets default quantization scales for the layer."""
     if register_buffer:
         layer.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
         layer.register_buffer("_v_scale", torch.tensor(1.0, dtype=torch.float32))
@@ -113,24 +103,11 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
     layer.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
     layer.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
-
 def _init_kv_cache_quant(
     layer: nn.Module,
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> None:
-    """Initializes KV cache scaling factors and quantization method.
-
-    This helper function sets up the KV cache quantization attributes that are
-    shared between Attention and MLAAttention layers. It initializes scale
-    tensors for query, key, value, and probability, and configures the
-    quantization method if applicable.
-
-    Args:
-        layer: The attention layer instance to initialize.
-        quant_config: Optional quantization configuration.
-        prefix: Layer name prefix for quantization method lookup.
-    """
     quant_method = (
         quant_config.get_quant_method(layer, prefix=prefix) if quant_config else None
     )
@@ -172,18 +149,7 @@ def _init_kv_cache_quant(
         layer.quant_method = quant_method
         layer.quant_method.create_weights(layer)
 
-
 class Attention(nn.Module, AttentionLayerBase):
-    """Attention layer.
-
-    This class takes query, key, and value tensors as input. The input tensors
-    can either contain prompt tokens or generation tokens.
-    The class does the following:
-
-    1. Store the input key and value tensors in the KV cache.
-    2. Perform (multi-head/multi-query/grouped-query) attention.
-    3. Return the output tensor.
-    """
 
     def __init__(
         self,
@@ -204,10 +170,6 @@ class Attention(nn.Module, AttentionLayerBase):
         head_size_v: int | None = None,
         **extra_impl_args,
     ) -> None:
-        """
-        The KV cache is stored inside this class and is accessed via
-        `self.kv_cache`.
-        """
         super().__init__()
         if per_layer_sliding_window is not None:
             # per-layer sliding window
@@ -379,15 +341,6 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
-        """
-        The KV cache is stored inside this class and is accessed via
-        `self.kv_cache`.
-
-        Attention metadata (`attn_metadata`) is set using a context manager in
-        the model runner's `execute_model` method. It is accessed via forward
-        context using
-        `vllm.forward_context.get_forward_context().attn_metadata`.
-        """
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
         output_dtype = query.dtype
@@ -525,7 +478,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
             )
 
-
 def maybe_calc_kv_scales(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -542,7 +494,6 @@ def maybe_calc_kv_scales(
 
     self.calc_kv_scales(query, key, value)
 
-
 def maybe_calc_kv_scales_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -551,7 +502,6 @@ def maybe_calc_kv_scales_fake(
 ) -> None:
     return
 
-
 direct_register_custom_op(
     op_name="maybe_calc_kv_scales",
     op_func=maybe_calc_kv_scales,
@@ -559,28 +509,9 @@ direct_register_custom_op(
     fake_impl=maybe_calc_kv_scales_fake,
 )
 
-
 def get_attention_context(
     layer_name: str,
 ) -> tuple[Any, "Attention | MLAAttention", torch.Tensor]:
-    """Extract attention context for a given layer.
-
-    This helper function extracts the attention metadata, attention layer
-    instance, and KV cache tensor for a specific layer.
-
-    Args:
-        layer_name: The name/identifier of the attention layer.
-
-    Returns:
-        A tuple containing:
-        - attn_metadata: Attention metadata for this specific layer, or None if
-            no metadata available
-        - attn_layer: The attention layer instance (Attention or MLAAttention)
-        - kv_cache: The KV cache tensor for current virtual engine
-
-        Note: attn_metadata may be None, but attn_layer and kv_cache are always
-        extracted from the forward context.
-    """
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if isinstance(attn_metadata, dict):
@@ -588,7 +519,6 @@ def get_attention_context(
     attn_layer = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
     return attn_metadata, attn_layer, kv_cache
-
 
 @maybe_transfer_kv_layer
 def unified_attention(
@@ -602,7 +532,6 @@ def unified_attention(
 
     return output
 
-
 def unified_attention_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -611,23 +540,17 @@ def unified_attention_fake(
 ) -> torch.Tensor:
     return torch.empty_like(query).contiguous()
 
-
 direct_register_custom_op(
     op_name="unified_attention",
     op_func=unified_attention,
     fake_impl=unified_attention_fake,
 )
 
-
 def unified_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    """
-    Returns a dummy that is passed to unified_attention to signal a side effect and
-    the data dependency between them to ensure torch.compile preserves ordering.
-    """
     forward_context = get_forward_context()
     attn_layer = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
@@ -651,7 +574,6 @@ def unified_kv_cache_update(
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
-
 def unified_kv_cache_update_fake(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -659,14 +581,12 @@ def unified_kv_cache_update_fake(
 ) -> torch.Tensor:
     return torch.empty(0, device=key.device, dtype=key.dtype)
 
-
 direct_register_custom_op(
     op_name="unified_kv_cache_update",
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
     mutates_args=[],
 )
-
 
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
@@ -697,7 +617,6 @@ def unified_attention_with_output(
         output_block_scale=output_block_scale,
     )
 
-
 def unified_attention_with_output_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -709,7 +628,6 @@ def unified_attention_with_output_fake(
     kv_cache_dummy_dep: torch.Tensor | None = None,
 ) -> None:
     return
-
 
 direct_register_custom_op(
     op_name="unified_attention_with_output",

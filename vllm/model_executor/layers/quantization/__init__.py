@@ -48,32 +48,7 @@ DEPRECATED_QUANTIZATION_METHODS = [
 # The customized quantization methods which will be added to this dict.
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
 
-
 def register_quantization_config(quantization: str):
-    """Register a customized vllm quantization config.
-
-    When a quantization method is not supported by vllm, you can register a customized
-    quantization config to support it.
-
-    Args:
-        quantization (str): The quantization method name.
-
-    Examples:
-        >>> from vllm.model_executor.layers.quantization import (
-        ...     register_quantization_config,
-        ... )
-        >>> from vllm.model_executor.layers.quantization import get_quantization_config
-        >>> from vllm.model_executor.layers.quantization.base_config import (
-        ...     QuantizationConfig,
-        ... )
-        >>>
-        >>> @register_quantization_config("my_quant")
-        ... class MyQuantConfig(QuantizationConfig):
-        ...     pass
-        >>>
-        >>> get_quantization_config("my_quant")
-        <class 'MyQuantConfig'>
-    """  # noqa: E501
 
     def _wrapper(quant_config_cls):
         if quantization in QUANTIZATION_METHODS:
@@ -97,7 +72,6 @@ def register_quantization_config(quantization: str):
         return quant_config_cls
 
     return _wrapper
-
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
@@ -220,7 +194,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         raise ImportError(f"Quantization method {quantization} is not available in this simplified build.")
 
     return method_to_config[quantization]
-
 
 __all__ = [
     "QuantizationConfig",

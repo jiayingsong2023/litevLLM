@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 class VerifyAndUpdateConfig:
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -27,13 +26,11 @@ class VerifyAndUpdateConfig:
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         return
 
-
 class Gemma3TextModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         hf_config = model_config.hf_config
         hf_config.is_causal = not hf_config.use_bidirectional_attention
-
 
 class GteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -54,14 +51,12 @@ class GteNewModelConfig(VerifyAndUpdateConfig):
             "rope_parameters": config.rope_parameters,
         }
 
-
 class JambaForSequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         pooler_config = model_config.pooler_config
         if pooler_config.use_activation is None:
             pooler_config.use_activation = False
-
 
 class JinaRobertaModelConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -90,7 +85,6 @@ class JinaRobertaModelConfig(VerifyAndUpdateConfig):
                 "rope_parameters": config.rope_parameters,
             }
 
-
 class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -110,7 +104,6 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
         model_config.pooler_config.seq_pooling_type = pooling_type
-
 
 class NomicBertModelConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -218,7 +211,6 @@ class NomicBertModelConfig(VerifyAndUpdateConfig):
                 max_model_len
             )
 
-
 class Qwen2ForProcessRewardModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -227,7 +219,6 @@ class Qwen2ForProcessRewardModelConfig(VerifyAndUpdateConfig):
         if pooler_config.step_tag_id is None:
             pooler_config.step_tag_id = 151651
 
-
 class Qwen2ForRewardModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -235,7 +226,6 @@ class Qwen2ForRewardModelConfig(VerifyAndUpdateConfig):
 
         if pooler_config.use_activation is None:
             pooler_config.use_activation = False
-
 
 class Qwen3ForSequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -258,10 +248,8 @@ class Qwen3ForSequenceClassificationConfig(VerifyAndUpdateConfig):
         text_config.method = "from_2_way_softmax"
         text_config.classifier_from_token = tokens
 
-
 class Qwen3VLForSequenceClassificationConfig(Qwen3ForSequenceClassificationConfig):
     pass
-
 
 class JinaVLForSequenceClassificationConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -271,7 +259,6 @@ class JinaVLForSequenceClassificationConfig(VerifyAndUpdateConfig):
         pooler_config = model_config.pooler_config
         if pooler_config.logit_bias is None:
             pooler_config.logit_bias = 2.65
-
 
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -291,7 +278,6 @@ class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
             "max_position": config.max_position_embeddings,
             "rope_parameters": config.rope_parameters,
         }
-
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -315,17 +301,9 @@ class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
                 "Overriding max cuda graph capture size to %d for performance.", 1024
             )
 
-
 class MambaModelConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """
-        Enable FULL_AND_PIECEWISE cuda graph mode by default (required
-        to get good performance for mamba layers in V1).
-
-        Args:
-            vllm_config: vLLM Config
-        """
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
@@ -379,20 +357,9 @@ class MambaModelConfig(VerifyAndUpdateConfig):
             if cache_config.mamba_block_size is None:
                 cache_config.mamba_block_size = model_config.max_model_len
 
-
 class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """
-        Ensure that page size of attention layers is greater than or
-        equal to the mamba layers. If not, automatically set the attention
-        block size to ensure that it is. If the attention page size is
-        strictly greater than the mamba page size, we pad the mamba page size
-        to make them equal.
-
-        Args:
-            vllm_config: vLLM Config
-        """
         # Save the user input before it gets modified by MambaModelConfig
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         # Enable FULL_AND_PIECEWISE by default
@@ -539,13 +506,9 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                 mamba_padding_pct,
             )
 
-
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """
-        Updated fp8 cache to custom "fp8_ds_mla" format for DeepSeekV32
-        """
         hf_config = vllm_config.model_config.hf_config
 
         # Mirror the check in vllm/model_executor/models/deepseek_v2.py
@@ -561,14 +524,9 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
             cache_config.cache_dtype = "auto"
             logger.info("Using bfloat16 kv-cache for DeepSeekV3.2")
 
-
 class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        """Update mamba_ssm_cache_dtype for NemotronH models when set to 'auto'
-        (or not explicitly set), to the value specified in the HF config, or to
-        float16 if not specified.
-        """
         cache_config = vllm_config.cache_config
         if cache_config.mamba_ssm_cache_dtype == "auto":
             hf_config = vllm_config.model_config.hf_config
@@ -580,7 +538,6 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
                 mamba_ssm_cache_dtype,
             )
             cache_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
-
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GteModel": SnowflakeGteNewModelConfig,

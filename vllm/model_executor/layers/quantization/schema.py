@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-This file contains the Pydantic schemas for various quantization-related
-parameters. When a relevant quantization technique is specified, these
-parameters are loaded in the form of a JSON alongside the model weights
-and augment the model with additional information needed for use of that
-technique. The format of this JSON should be specified by one or more
-schemas contained here.
-
-For example, when the KV cache is quantized to FP8-E4M3 (currently only
-possible on ROCm), the model can be optionally augmented with KV cache
-scaling factors.
-"""
 
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-
 
 class KVCacheQuantSchema(BaseModel):
     dtype: str
@@ -67,7 +54,6 @@ class KVCacheQuantSchema(BaseModel):
                     f"TP rank {tp_rank}."
                 )
         return self
-
 
 class QuantParamSchema(BaseModel):
     # TODO: Generalize and extend with more fields

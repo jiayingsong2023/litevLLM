@@ -26,12 +26,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Shared resampler perceiver network used in multimodal models and
-related helpers for sincos positional embeddings.
-
-Example models: Qwen (Qwen-VL), MiniCPM-V 2.0
-"""
 
 import math
 from collections.abc import Callable
@@ -46,7 +40,6 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 DEFAULT_LN = partial(nn.LayerNorm, eps=1e-6)
-
 
 def get_abs_pos(abs_pos: torch.Tensor, tgt_size: torch.Tensor | int) -> torch.Tensor:
     # abs_pos: L, C
@@ -70,17 +63,11 @@ def get_abs_pos(abs_pos: torch.Tensor, tgt_size: torch.Tensor | int) -> torch.Te
         .to(dtype=dtype)
     )
 
-
 # sin/cos positional embedding helpers are adapted from:
 # https://github.com/facebookresearch/mae/blob/efb2a8062c206524e35e47d04501ed4f544c0ae8/util/pos_embed.py#L20
 def get_1d_sincos_pos_embed_from_grid(
     embed_dim: int, pos: np.ndarray, version: tuple[int, int] = (2, 0)
 ) -> torch.Tensor:
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,) / (H, W)
-    out: (M, D) / (H, W, D)
-    """
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.0
@@ -98,7 +85,6 @@ def get_1d_sincos_pos_embed_from_grid(
         emb_cos = np.cos(out)  # (H, W, D/2)
         emb = np.concatenate([emb_sin, emb_cos], axis=-1)  # (H, W, D)
     return emb
-
 
 def get_2d_sincos_pos_embed_from_grid(
     embed_dim: int, grid: np.ndarray, version: tuple[int, int] = (2, 0)
@@ -119,19 +105,12 @@ def get_2d_sincos_pos_embed_from_grid(
         emb = np.concatenate([emb_h, emb_w], axis=-1)  # (H, W, D)
     return emb
 
-
 def get_2d_sincos_pos_embed(
     embed_dim: int,
     grid_size: int | tuple[int, int],
     cls_token: bool = False,
     version: tuple[int, int] = (2, 0),
 ) -> torch.Tensor:
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or
-                [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
     if isinstance(grid_size, int):
         grid_h_size, grid_w_size = grid_size, grid_size
     else:
@@ -152,14 +131,7 @@ def get_2d_sincos_pos_embed(
         pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, version)
     return pos_embed
 
-
 class BaseResampler(nn.Module):
-    """
-    A 2D perceiver-resampler network with one cross attention layers by
-        (grid_size**2) learnable queries and 2d sincos pos_emb.
-    Outputs:
-        A tensor with the shape of (grid_size**2, embed_dim)
-    """
 
     def __init__(
         self,
@@ -206,14 +178,7 @@ class BaseResampler(nn.Module):
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
 
-
 class Resampler2(BaseResampler):
-    """Resampler-perceiver network to be used for a variety of model types,
-    e.g., Qwen-vl / Minicpmv 2.0. The main difference is the addition of the
-    do_post_projection arg, which indicates whether or not there should be
-    a post layer normalization and projector after the attention. This is
-    present in minicpmv2.0, but not qwen-vl.
-    """
 
     def __init__(
         self,

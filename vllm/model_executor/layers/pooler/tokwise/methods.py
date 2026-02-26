@@ -15,7 +15,6 @@ from vllm.pool.metadata import PoolingMetadata
 
 TokenPoolingMethodOutputItem: TypeAlias = torch.Tensor | None
 
-
 class TokenPoolingMethod(nn.Module, ABC):
     def get_supported_tasks(self) -> Set[PoolingTask]:
         return {"token_embed", "token_classify"}
@@ -30,7 +29,6 @@ class TokenPoolingMethod(nn.Module, ABC):
         pooling_metadata: PoolingMetadata,
     ) -> list[TokenPoolingMethodOutputItem]:
         raise NotImplementedError
-
 
 class AllPool(TokenPoolingMethod):
     def __init__(self):
@@ -77,7 +75,6 @@ class AllPool(TokenPoolingMethod):
 
         return output_list
 
-
 class StepPool(AllPool):
     def get_pooling_updates(self, task: PoolingTask) -> PoolingParamsUpdate:
         return PoolingParamsUpdate(requires_token_ids=True)
@@ -111,7 +108,6 @@ class StepPool(AllPool):
             pooled_data.append(data)
 
         return pooled_data
-
 
 def get_tok_pooling_method(pooling_type: TokenPoolingType | str):
     if pooling_type == "ALL":

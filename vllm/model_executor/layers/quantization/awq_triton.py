@@ -7,7 +7,6 @@ from vllm.triton_utils import tl, triton
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
-
 @triton.jit
 def awq_dequantize_kernel(
     qweight_ptr,  # quantized matrix
@@ -103,7 +102,6 @@ def awq_dequantize_kernel(
 
     # Finally, store.
     tl.store(result_ptr + result_offsets, iweights, result_masks)
-
 
 @triton.jit
 def awq_gemm_kernel(
@@ -226,7 +224,6 @@ def awq_gemm_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
-
 # qweights - [K     , M // 8], int32
 # scales   - [K // G, M     ], float16
 # zeros    - [K // G, M // 8], int32
@@ -277,7 +274,6 @@ def awq_dequantize_triton(
     )
 
     return result
-
 
 # input   - [M, K]
 # qweight - [K, N // 8]

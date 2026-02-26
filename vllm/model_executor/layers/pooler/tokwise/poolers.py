@@ -44,16 +44,7 @@ TokenPoolingHeadFn: TypeAlias = Callable[
 
 TokenPoolerOutput: TypeAlias = list[torch.Tensor | None]
 
-
 class TokenPooler(Pooler):
-    """
-    A layer that pools specific information from hidden states.
-
-    This layer does the following:
-    1. Extracts specific tokens or aggregates data based on pooling method.
-    2. Postprocesses the output based on pooling head.
-    3. Returns structured results as `PoolerOutput`.
-    """
 
     def __init__(
         self,
@@ -92,7 +83,6 @@ class TokenPooler(Pooler):
         pooled_data = self.head(pooled_data, pooling_metadata)
         return pooled_data
 
-
 def pooler_for_token_embed(
     pooler_config: PoolerConfig, projector: ProjectorFn | None = None
 ) -> TokenPooler:
@@ -109,7 +99,6 @@ def pooler_for_token_embed(
     )
 
     return TokenPooler(pooling=pooling, head=head)
-
 
 def pooler_for_token_classify(
     pooler_config: PoolerConfig,
