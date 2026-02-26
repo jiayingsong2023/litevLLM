@@ -111,7 +111,6 @@ def _paged_attention_kernel(
     off_out = seq_idx * stride_out_seq + head_idx * stride_out_head + tl.arange(0, BLOCK_D) * stride_out_dim
     tl.store(Out_ptr + off_out, out)
 
-
 def paged_attention_v1(
     out: torch.Tensor,
     query: torch.Tensor,

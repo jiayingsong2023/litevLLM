@@ -15,7 +15,6 @@ from .base import MediaIO, MediaWithBytes
 
 logger = init_logger(__file__)
 
-
 class ImageMediaIO(MediaIO[Image.Image]):
     def __init__(self, image_mode: str = "RGB", **kwargs) -> None:
         super().__init__()
@@ -50,75 +49,3 @@ class ImageMediaIO(MediaIO[Image.Image]):
     def _convert_image_mode(
         self, image: Image.Image | MediaWithBytes[Image.Image]
     ) -> Image.Image:
-        """Convert image mode with custom background color."""
-        if isinstance(image, MediaWithBytes):
-            image = image.media
-        if image.mode == self.image_mode:
-            return image
-        elif image.mode == "RGBA" and self.image_mode == "RGB":
-            return rgba_to_rgb(image, self.rgba_background_color)
-        else:
-            return convert_image_mode(image, self.image_mode)
-
-    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
-        image = Image.open(BytesIO(data))
-        return MediaWithBytes(self._convert_image_mode(image), data)
-
-    def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
-        return self.load_bytes(pybase64.b64decode(data, validate=True))
-
-    def load_file(self, filepath: Path) -> MediaWithBytes[Image.Image]:
-        with open(filepath, "rb") as f:
-            data = f.read()
-        image = Image.open(BytesIO(data))
-        return MediaWithBytes(self._convert_image_mode(image), data)
-
-    def encode_base64(
-        self,
-        media: Image.Image,
-        *,
-        image_format: str | None = None,
-    ) -> str:
-        if image_format is None:
-            logger.warning_once(
-                "The default format of `ImageMediaIO.encode_base64` will be changed "
-                'from "JPEG" to "PNG" in v0.15 to avoid lossy compression. '
-                "To continue using the old default, "
-                'pass `format="JPEG"` explicitly to silence this warning.'
-            )
-            image_format = "JPEG"
-
-        image = media
-
-        with BytesIO() as buffer:
-            image = self._convert_image_mode(image)
-            image.save(buffer, image_format)
-            data = buffer.getvalue()
-
-        return pybase64.b64encode(data).decode("utf-8")
-
-
-class ImageEmbeddingMediaIO(MediaIO[torch.Tensor]):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def load_bytes(self, data: bytes) -> torch.Tensor:
-        buffer = BytesIO(data)
-        # Enable sparse tensor integrity checks to prevent out-of-bounds
-        # writes from maliciously crafted tensors
-        with torch.sparse.check_sparse_tensor_invariants():
-            tensor = torch.load(buffer, weights_only=True)
-            return tensor.to_dense()
-
-    def load_base64(self, media_type: str, data: str) -> torch.Tensor:
-        return self.load_bytes(pybase64.b64decode(data, validate=True))
-
-    def load_file(self, filepath: Path) -> torch.Tensor:
-        # Enable sparse tensor integrity checks to prevent out-of-bounds
-        # writes from maliciously crafted tensors
-        with torch.sparse.check_sparse_tensor_invariants():
-            tensor = torch.load(filepath, weights_only=True)
-            return tensor.to_dense()
-
-    def encode_base64(self, media: torch.Tensor) -> str:
-        return pybase64.b64encode(media.numpy()).decode("utf-8")

@@ -11,12 +11,9 @@ _K = TypeVar("_K", bound=Hashable)
 _V = TypeVar("_V")
 _T = TypeVar("_T")
 
-
 class _Sentinel: ...
 
-
 ALL_PINNED_SENTINEL = _Sentinel()
-
 
 class _MappingOrderCacheView(UserDict[_K, _V]):
     def __init__(self, data: Mapping[_K, _V], ordered_keys: Mapping[_K, None]):
@@ -28,7 +25,6 @@ class _MappingOrderCacheView(UserDict[_K, _V]):
 
     def keys(self) -> KeysView[_K]:
         return KeysView(self.ordered_keys)
-
 
 class CacheInfo(NamedTuple):
     hits: int
@@ -46,7 +42,6 @@ class CacheInfo(NamedTuple):
             hits=self.hits - other.hits,
             total=self.total - other.total,
         )
-
 
 class LRUCache(cachetools.LRUCache[_K, _V]):
     def __init__(self, capacity: float, getsizeof: Callable[[_V], float] | None = None):
@@ -79,15 +74,6 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
 
     @property
     def cache(self) -> Mapping[_K, _V]:
-        """Return the internal cache dictionary in order (read-only)."""
-        return _MappingOrderCacheView(
-            self._Cache__data,  # type: ignore
-            self.order,
-        )
-
-    @property
-    def order(self) -> Mapping[_K, None]:
-        """Return the internal order dictionary (read-only)."""
         return MappingProxyType(self._LRUCache__order)  # type: ignore
 
     @property
@@ -102,12 +88,6 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         return self.currsize / self.maxsize
 
     def stat(self, *, delta: bool = False) -> CacheInfo:
-        """
-        Gets the cumulative number of hits and queries against this cache.
-
-        If `delta=True`, instead gets these statistics
-        since the last call that also passed `delta=True`.
-        """
         info = CacheInfo(hits=self._hits, total=self._total)
 
         if delta:
@@ -160,19 +140,11 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         self.__setitem__(key, value)
 
     def pin(self, key: _K) -> None:
-        """
-        Pins a key in the cache preventing it from being
-        evicted in the LRU order.
-        """
         if key not in self:
             raise ValueError(f"Cannot pin key: {key} not in cache.")
         self.pinned_items.add(key)
 
     def _unpin(self, key: _K) -> None:
-        """
-        Unpins a key in the cache allowing it to be
-        evicted in the LRU order.
-        """
         self.pinned_items.remove(key)
 
     def _on_remove(self, key: _K, value: _V | None) -> None:
@@ -189,26 +161,3 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
             self.remove_oldest()
 
     def popitem(self, remove_pinned: bool = False):
-        """Remove and return the `(key, value)` pair least recently used."""
-        if not remove_pinned:
-            # pop the oldest item in the cache that is not pinned
-            lru_key = next(
-                (key for key in self.order if key not in self.pinned_items),
-                ALL_PINNED_SENTINEL,
-            )
-            if lru_key is ALL_PINNED_SENTINEL:
-                raise RuntimeError(
-                    "All items are pinned, cannot remove oldest from the cache."
-                )
-        else:
-            lru_key = next(iter(self.order))
-        value = self.pop(cast(_K, lru_key))
-        return (lru_key, value)
-
-    def clear(self) -> None:
-        while len(self) > 0:
-            self.remove_oldest(remove_pinned=True)
-
-        self._hits = 0
-        self._total = 0
-        self._last_info = CacheInfo(hits=0, total=0)

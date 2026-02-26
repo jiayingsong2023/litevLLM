@@ -32,7 +32,6 @@ atexit.register(global_thread_pool.shutdown)
 
 MEDIA_CONNECTOR_REGISTRY = ExtensionManager()
 
-
 @MEDIA_CONNECTOR_REGISTRY.register("http")
 class MediaConnector:
     def __init__(
@@ -43,17 +42,6 @@ class MediaConnector:
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
     ) -> None:
-        """
-        Args:
-            media_io_kwargs: Additional args passed to process media
-                             inputs, keyed by modalities. For example,
-                             to set num_frames for video, set
-                             `--media-io-kwargs '{"video":{"num_frames":40}}'`
-            connection: HTTP connection client to download media contents.
-            allowed_local_media_path: A local directory to load media files from.
-            allowed_media_domains: If set, only media URLs that belong to this
-                                   domain can be used for multi-modal inputs.
-        """
         super().__init__()
 
         self.media_io_kwargs: dict[str, dict[str, Any]] = (
@@ -202,9 +190,6 @@ class MediaConnector:
         self,
         audio_url: str,
     ) -> tuple[np.ndarray, int | float]:
-        """
-        Load audio from a URL.
-        """
         audio_io = AudioMediaIO(**self.media_io_kwargs.get("audio", {}))
 
         return self.load_from_url(
@@ -217,9 +202,6 @@ class MediaConnector:
         self,
         audio_url: str,
     ) -> tuple[np.ndarray, int | float]:
-        """
-        Asynchronously fetch audio from a URL.
-        """
         audio_io = AudioMediaIO(**self.media_io_kwargs.get("audio", {}))
 
         return await self.load_from_url_async(
@@ -234,11 +216,6 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
     ) -> Image.Image:
-        """
-        Load a PIL image from an HTTP or base64 data URL.
-
-        By default, the image is converted into RGB format.
-        """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
@@ -259,11 +236,6 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
     ) -> Image.Image:
-        """
-        Asynchronously load a PIL image from an HTTP or base64 data URL.
-
-        By default, the image is converted into RGB format.
-        """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
@@ -284,9 +256,6 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
     ) -> tuple[npt.NDArray, dict[str, Any]]:
-        """
-        Load video from an HTTP or base64 data URL.
-        """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
@@ -304,11 +273,6 @@ class MediaConnector:
         *,
         image_mode: str = "RGB",
     ) -> tuple[npt.NDArray, dict[str, Any]]:
-        """
-        Asynchronously load video from an HTTP or base64 data URL.
-
-        By default, the image is converted into RGB format.
-        """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
@@ -324,9 +288,6 @@ class MediaConnector:
         self,
         data: str,
     ) -> torch.Tensor:
-        """
-        Load image embedding from a URL.
-        """
         image_embedding_io = ImageEmbeddingMediaIO()
 
         return image_embedding_io.load_base64("", data)
@@ -335,9 +296,6 @@ class MediaConnector:
         self,
         data: str,
     ) -> torch.Tensor:
-        """
-        Load audio embedding from a URL.
-        """
         audio_embedding_io = AudioEmbeddingMediaIO()
 
         return audio_embedding_io.load_base64("", data)

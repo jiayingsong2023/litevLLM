@@ -1,39 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Argument parsing utilities for vLLM."""
-
-import json
-import sys
-import textwrap
-from argparse import (
-    Action,
-    ArgumentDefaultsHelpFormatter,
-    ArgumentParser,
-    ArgumentTypeError,
-    Namespace,
-    RawDescriptionHelpFormatter,
-    _ArgumentGroup,
-)
-from collections import defaultdict
-from typing import Any
-
-import regex as re
-import yaml
-
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
-
-class SortedHelpFormatter(ArgumentDefaultsHelpFormatter, RawDescriptionHelpFormatter):
-    """SortedHelpFormatter that sorts arguments by their option strings."""
 
     def _split_lines(self, text, width):
-        """
-        1. Sentences split across lines have their single newlines removed.
-        2. Paragraphs and explicit newlines are split into separate lines.
-        3. Each line is wrapped to the specified width (width of terminal).
-        """
         # The patterns also include whitespace after the newline
         single_newline = re.compile(r"(?<!\n)\n(?!\n)\s*")
         multiple_newlines = re.compile(r"\n{2,}\s*")
@@ -45,186 +13,7 @@ class SortedHelpFormatter(ArgumentDefaultsHelpFormatter, RawDescriptionHelpForma
         actions = sorted(actions, key=lambda x: x.option_strings)
         super().add_arguments(actions)
 
-
 class FlexibleArgumentParser(ArgumentParser):
-    """ArgumentParser that allows both underscore and dash in names."""
-
-    _deprecated: set[Action] = set()
-    _json_tip: str = (
-        "When passing JSON CLI arguments, the following sets of arguments "
-        "are equivalent:\n"
-        '   --json-arg \'{"key1": "value1", "key2": {"key3": "value2"}}\'\n'
-        "   --json-arg.key1 value1 --json-arg.key2.key3 value2\n\n"
-        "Additionally, list elements can be passed individually using +:\n"
-        '   --json-arg \'{"key4": ["value3", "value4", "value5"]}\'\n'
-        "   --json-arg.key4+ value3 --json-arg.key4+='value4,value5'\n\n"
-    )
-    _search_keyword: str | None = None
-
-    def __init__(self, *args, **kwargs):
-        # Set the default "formatter_class" to SortedHelpFormatter
-        if "formatter_class" not in kwargs:
-            kwargs["formatter_class"] = SortedHelpFormatter
-        # Pop kwarg "add_json_tip" to control whether to add the JSON tip
-        self.add_json_tip = kwargs.pop("add_json_tip", True)
-        super().__init__(*args, **kwargs)
-
-    if sys.version_info < (3, 13):
-        # Enable the deprecated kwarg for Python 3.12 and below
-
-        def parse_known_args(self, args=None, namespace=None):
-            namespace, args = super().parse_known_args(args, namespace)
-            for action in FlexibleArgumentParser._deprecated:
-                if (
-                    hasattr(namespace, dest := action.dest)
-                    and getattr(namespace, dest) != action.default
-                ):
-                    logger.warning_once("argument '%s' is deprecated", dest)
-            return namespace, args
-
-        def add_argument(self, *args, **kwargs):
-            deprecated = kwargs.pop("deprecated", False)
-            action = super().add_argument(*args, **kwargs)
-            if deprecated:
-                FlexibleArgumentParser._deprecated.add(action)
-            return action
-
-        class _FlexibleArgumentGroup(_ArgumentGroup):
-            def add_argument(self, *args, **kwargs):
-                deprecated = kwargs.pop("deprecated", False)
-                action = super().add_argument(*args, **kwargs)
-                if deprecated:
-                    FlexibleArgumentParser._deprecated.add(action)
-                return action
-
-        def add_argument_group(self, *args, **kwargs):
-            group = self._FlexibleArgumentGroup(self, *args, **kwargs)
-            self._action_groups.append(group)
-            return group
-
-    def format_help(self):
-        # Only use custom help formatting for bottom level parsers
-        if self._subparsers is not None:
-            return super().format_help()
-
-        formatter = self._get_formatter()
-
-        # Handle keyword search of the args
-        if (search_keyword := self._search_keyword) is not None:
-            # Normalise the search keyword
-            search_keyword = search_keyword.lower().replace("_", "-")
-            # Return full help if searching for 'all'
-            if search_keyword == "all":
-                self.epilog = self._json_tip
-                return super().format_help()
-
-            # Return group help if searching for a group title
-            for group in self._action_groups:
-                if group.title and group.title.lower() == search_keyword:
-                    formatter.start_section(group.title)
-                    formatter.add_text(group.description)
-                    formatter.add_arguments(group._group_actions)
-                    formatter.end_section()
-                    formatter.add_text(self._json_tip)
-                    return formatter.format_help()
-
-            # Return matched args if searching for an arg name
-            matched_actions = []
-            for group in self._action_groups:
-                for action in group._group_actions:
-                    # search option name
-                    if any(
-                        search_keyword in opt.lower() for opt in action.option_strings
-                    ):
-                        matched_actions.append(action)
-            if matched_actions:
-                formatter.start_section(f"Arguments matching '{search_keyword}'")
-                formatter.add_arguments(matched_actions)
-                formatter.end_section()
-                formatter.add_text(self._json_tip)
-                return formatter.format_help()
-
-            # No match found
-            formatter.add_text(
-                f"No group or arguments matching '{search_keyword}'.\n"
-                "Use '--help' to see available groups or "
-                "'--help=all' to see all available parameters."
-            )
-            return formatter.format_help()
-
-        # usage
-        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
-
-        # description
-        formatter.add_text(self.description)
-
-        # positionals, optionals and user-defined groups
-        formatter.start_section("Config Groups")
-        config_groups = ""
-        for group in self._action_groups:
-            if not group._group_actions:
-                continue
-            title = group.title
-            description = group.description or ""
-            config_groups += f"{title: <24}{description}\n"
-        formatter.add_text(config_groups)
-        formatter.end_section()
-
-        # epilog
-        formatter.add_text(self.epilog)
-
-        # determine help from format above
-        return formatter.format_help()
-
-    def parse_args(  # type: ignore[override]
-        self,
-        args: list[str] | None = None,
-        namespace: Namespace | None = None,
-    ):
-        if args is None:
-            args = sys.argv[1:]
-
-        # Check for --model in command line arguments first
-        if args and args[0] == "serve":
-            try:
-                model_idx = next(
-                    i
-                    for i, arg in enumerate(args)
-                    if arg == "--model" or arg.startswith("--model=")
-                )
-                logger.warning(
-                    "With `vllm serve`, you should provide the model as a "
-                    "positional argument or in a config file instead of via "
-                    "the `--model` option. "
-                    "The `--model` option will be removed in v0.13."
-                )
-
-                if args[model_idx] == "--model":
-                    model_tag = args[model_idx + 1]
-                    rest_start_idx = model_idx + 2
-                else:
-                    model_tag = args[model_idx].removeprefix("--model=")
-                    rest_start_idx = model_idx + 1
-
-                # Move <model> to the front, e,g:
-                # [Before]
-                # vllm serve -tp 2 --model <model> --enforce-eager --port 8001
-                # [After]
-                # vllm serve <model> -tp 2 --enforce-eager --port 8001
-                args = [
-                    "serve",
-                    model_tag,
-                    *args[1:model_idx],
-                    *args[rest_start_idx:],
-                ]
-            except StopIteration:
-                pass
-
-        if "--config" in args:
-            args = self._pull_args_from_config(args)
-
-        def repl(match: re.Match) -> str:
-            """Replaces underscores with dashes in the matched string."""
             return match.group(0).replace("_", "-")
 
         # Everything between the first -- and the first .
@@ -260,11 +49,6 @@ class FlexibleArgumentParser(ArgumentParser):
                 processed_args.append(arg)
 
         def create_nested_dict(keys: list[str], value: str) -> dict[str, Any]:
-            """Creates a nested dictionary from a list of keys and a value.
-
-            For example, `keys = ["a", "b", "c"]` and `value = 1` will create:
-            `{"a": {"b": {"c": 1}}}`
-            """
             nested_dict: Any = value
             for key in reversed(keys):
                 nested_dict = {key: nested_dict}
@@ -274,9 +58,6 @@ class FlexibleArgumentParser(ArgumentParser):
             original: dict[str, Any],
             update: dict[str, Any],
         ) -> set[str]:
-            """Recursively updates a dictionary with another dictionary.
-            Returns a set of duplicate keys that were overwritten.
-            """
             duplicates = set[str]()
             for k, v in update.items():
                 if isinstance(v, dict) and isinstance(original.get(k), dict):
@@ -361,39 +142,6 @@ class FlexibleArgumentParser(ArgumentParser):
         return value
 
     def _pull_args_from_config(self, args: list[str]) -> list[str]:
-        """Method to pull arguments specified in the config file
-        into the command-line args variable.
-
-        The arguments in config file will be inserted between
-        the argument list.
-
-        example:
-        ```yaml
-            port: 12323
-            tensor-parallel-size: 4
-        ```
-        ```python
-        $: vllm {serve,chat,complete} "facebook/opt-12B" \
-            --config config.yaml -tp 2
-        $: args = [
-            "serve,chat,complete",
-            "facebook/opt-12B",
-            '--config', 'config.yaml',
-            '-tp', '2'
-        ]
-        $: args = [
-            "serve,chat,complete",
-            "facebook/opt-12B",
-            '--port', '12323',
-            '--tensor-parallel-size', '4',
-            '-tp', '2'
-            ]
-        ```
-
-        Please note how the config args are inserted after the sub command.
-        this way the order of priorities is maintained when these are args
-        parsed by super().
-        """
         assert args.count("--config") <= 1, "More than one config file specified!"
 
         index = args.index("--config")
@@ -443,32 +191,6 @@ class FlexibleArgumentParser(ArgumentParser):
         return args
 
     def load_config_file(self, file_path: str) -> list[str]:
-        """Loads a yaml file and returns the key value pairs as a
-        flattened list with argparse like pattern.
-
-        Supports both flat configs and nested YAML structures.
-
-        Flat config example:
-        ```yaml
-            port: 12323
-            tensor-parallel-size: 4
-        ```
-        returns:
-            ['--port', '12323', '--tensor-parallel-size', '4']
-
-        Nested config example:
-        ```yaml
-            compilation-config:
-              pass_config:
-                fuse_allreduce_rms: true
-            speculative-config:
-              model: "nvidia/gpt-oss-120b-Eagle3-v2"
-              num_speculative_tokens: 3
-        ```
-        returns:
-            ['--compilation-config', '{"pass_config": {"fuse_allreduce_rms": true}}',
-             '--speculative-config', '{"model": "nvidia/gpt-oss-120b-Eagle3-v2", ...}']
-        """
         extension: str = file_path.split(".")[-1]
         if extension not in ("yaml", "yml"):
             raise ValueError(

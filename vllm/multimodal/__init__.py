@@ -14,14 +14,6 @@ from .inputs import (
 from .registry import MultiModalRegistry
 
 MULTIMODAL_REGISTRY = MultiModalRegistry()
-"""
-The global [`MultiModalRegistry`][vllm.multimodal.registry.MultiModalRegistry]
-is used by model runners to dispatch data processing according to the target
-model.
-
-Info:
-    [mm_processing](../../../design/mm_processing.md)
-"""
 
 __all__ = [
     "BatchedTensorInputs",

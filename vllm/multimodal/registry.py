@@ -37,36 +37,18 @@ N = TypeVar("N", bound=type["SupportsMultiModal"])
 _I = TypeVar("_I", bound=BaseProcessingInfo)
 _I_co = TypeVar("_I_co", bound=BaseProcessingInfo, covariant=True)
 
-
 class ProcessingInfoFactory(Protocol[_I_co]):
-    """
-    Constructs a
-    [`BaseMultiModalProcessor`][vllm.multimodal.processing.BaseMultiModalProcessor]
-    instance from the context.
-    """
 
     def __call__(
         self,
         ctx: InputProcessingContext,
     ) -> _I_co: ...
 
-
 class DummyInputsBuilderFactory(Protocol[_I]):  # type: ignore[misc]
-    """
-    Constructs a
-    [`BaseDummyInputsBuilder`][vllm.multimodal.processing.BaseDummyInputsBuilder]
-    instance from the context.
-    """
 
     def __call__(self, info: _I) -> BaseDummyInputsBuilder[_I]: ...
 
-
 class MultiModalProcessorFactory(Protocol[_I]):  # type: ignore[misc]
-    """
-    Constructs a
-    [`BaseMultiModalProcessor`][vllm.multimodal.processing.BaseMultiModalProcessor]
-    instance from the context.
-    """
 
     def __call__(
         self,
@@ -75,7 +57,6 @@ class MultiModalProcessorFactory(Protocol[_I]):  # type: ignore[misc]
         *,
         cache: BaseMultiModalProcessorCache | None = None,
     ) -> BaseMultiModalProcessor[_I]: ...
-
 
 @dataclass(frozen=True)
 class _ProcessorFactories(Generic[_I]):
@@ -93,22 +74,12 @@ class _ProcessorFactories(Generic[_I]):
         dummy_inputs_builder = self.dummy_inputs(info)
         return self.processor(info, dummy_inputs_builder, cache=cache)
 
-
 class MultiModalRegistry:
-    """
-    A registry that dispatches data processing according to the model.
-    """
 
     def _extract_mm_options(
         self,
         model_config: "ModelConfig",
     ) -> Mapping[str, BaseDummyOptions] | None:
-        """
-        Extract multimodal dummy options from model config.
-
-        Returns None if no configurable options are found, otherwise returns
-        a mapping of modality names to their dummy options.
-        """
         if not model_config.multimodal_config:
             return None
 
@@ -121,12 +92,6 @@ class MultiModalRegistry:
         return mm_options if len(mm_options) > 0 else None
 
     def supports_multimodal_inputs(self, model_config: "ModelConfig") -> bool:
-        """
-        Checks if the model supports multimodal inputs.
-        Returns True if the model is multimodal with any non-zero supported
-        modalities, otherwise returns False, effectively running in
-        text-only mode.
-        """
         if not model_config.is_multimodal_model:
             return False
 
@@ -156,10 +121,6 @@ class MultiModalRegistry:
         profiler_limits: Mapping[str, int] | None = None,
         observability_config: ObservabilityConfig | None = None,
     ) -> Mapping[str, int]:
-        """
-        Get the maximum number of tokens per data item from each modality based
-        on underlying model configuration.
-        """
         if not model_config.is_multimodal_model:
             return {}
 
@@ -202,10 +163,6 @@ class MultiModalRegistry:
         *,
         observability_config: ObservabilityConfig | None = None,
     ) -> Mapping[str, int]:
-        """
-        Get the maximum number of multi-modal input instances for each modality
-        that are allowed per prompt for a model class.
-        """
         if not model_config.is_multimodal_model:
             return {}
 
@@ -219,13 +176,6 @@ class MultiModalRegistry:
         info: ProcessingInfoFactory[_I],
         dummy_inputs: DummyInputsBuilderFactory[_I],
     ):
-        """
-        Register a multi-modal processor to a model class. The processor
-        is constructed lazily, hence a factory method should be passed.
-
-        When the model receives multi-modal data, the provided function is
-        invoked to transform the data into a dictionary of model inputs.
-        """
 
         def wrapper(model_cls: N) -> N:
             if "_processor_factory" in model_cls.__dict__:
@@ -287,9 +237,6 @@ class MultiModalRegistry:
         tokenizer: TokenizerLike | None = None,
         cache: BaseMultiModalProcessorCache | None = None,
     ) -> BaseMultiModalProcessor[BaseProcessingInfo]:
-        """
-        Create a multi-modal processor for a specific model and tokenizer.
-        """
         if not model_config.is_multimodal_model:
             raise ValueError(f"{model_config.model} is not a multimodal model")
 
@@ -309,11 +256,6 @@ class MultiModalRegistry:
         observability_config: ObservabilityConfig | None = None,
         processor: BaseMultiModalProcessor | None = None,
     ) -> MultiModalInputs:
-        """
-        Create dummy data for profiling the memory usage of a model.
-
-        The model is identified by `model_config`.
-        """
         seq_len = model_config.max_model_len
 
         if processor is None:
@@ -343,9 +285,6 @@ class MultiModalRegistry:
         return mm_inputs
 
     def get_encdec_max_encoder_len(self, model_config: "ModelConfig") -> int:
-        """
-        Get the maximum length of the encoder input for encoder-decoder models.
-        """
         if not model_config.is_encoder_decoder:
             return 0
         max_tokens = self.get_max_tokens_per_item_by_modality(model_config)
@@ -392,24 +331,6 @@ class MultiModalRegistry:
         self,
         vllm_config: "VllmConfig",
     ) -> BaseMultiModalProcessorCache | None:
-        """Return a `BaseMultiModalProcessorCache`, if enabled."""
-        cache_type = self._get_cache_type(vllm_config)
-        if cache_type is None:
-            return None
-        elif cache_type == "processor_only":
-            return MultiModalProcessorOnlyCache(vllm_config.model_config)
-        elif cache_type == "lru":
-            return MultiModalProcessorSenderCache(vllm_config.model_config)
-        elif cache_type == "shm":
-            return ShmObjectStoreSenderCache(vllm_config)
-        else:
-            raise ValueError(f"Unknown cache type: {cache_type!r}")
-
-    def processor_only_cache_from_config(
-        self,
-        vllm_config: "VllmConfig",
-    ) -> MultiModalProcessorOnlyCache | None:
-        """Return a `MultiModalProcessorOnlyCache`, if enabled."""
         cache_type = self._get_cache_type(vllm_config)
         if cache_type is None:
             return None
@@ -420,21 +341,6 @@ class MultiModalRegistry:
         self,
         vllm_config: "VllmConfig",
     ) -> BaseMultiModalReceiverCache | None:
-        """Return a `BaseMultiModalReceiverCache` for the engine process."""
-        cache_type = self._get_cache_type(vllm_config)
-        if cache_type in (None, "processor_only", "shm"):
-            return None
-        elif cache_type == "lru":
-            return MultiModalReceiverCache(vllm_config.model_config)
-        else:
-            raise ValueError(f"Unknown cache type: {cache_type!r}")
-
-    def worker_receiver_cache_from_config(
-        self,
-        vllm_config: "VllmConfig",
-        shared_worker_lock: LockType,
-    ) -> BaseMultiModalReceiverCache | None:
-        """Return a `BaseMultiModalReceiverCache` for the worker process."""
         cache_type = self._get_cache_type(vllm_config)
         if cache_type in (None, "processor_only", "lru"):
             return None

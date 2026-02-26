@@ -23,7 +23,6 @@ try:
 except ImportError:
     soundfile = PlaceholderModule("soundfile")  # type: ignore[assignment]
 
-
 class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
     def __init__(self, **kwargs) -> None:
         super().__init__()
@@ -61,7 +60,6 @@ class AudioMediaIO(MediaIO[tuple[npt.NDArray, float]]):
             data = buffer.getvalue()
 
         return base64.b64encode(data).decode("utf-8")
-
 
 class AudioEmbeddingMediaIO(MediaIO[torch.Tensor]):
     def __init__(self) -> None:

@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Contains helpers related to importing modules.
-
-This is similar in concept to the `importlib` module.
-"""
 
 import importlib.metadata
 import importlib.util
@@ -22,45 +17,13 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 def import_pynvml():
-    """
-    Historical comments:
-
-    libnvml.so is the library behind nvidia-smi, and
-    pynvml is a Python wrapper around it. We use it to get GPU
-    status without initializing CUDA context in the current process.
-    Historically, there are two packages that provide pynvml:
-    - `nvidia-ml-py` (https://pypi.org/project/nvidia-ml-py/): The official
-        wrapper. It is a dependency of vLLM, and is installed when users
-        install vLLM. It provides a Python module named `pynvml`.
-    - `pynvml` (https://pypi.org/project/pynvml/): An unofficial wrapper.
-        Prior to version 12.0, it also provides a Python module `pynvml`,
-        and therefore conflicts with the official one. What's worse,
-        the module is a Python package, and has higher priority than
-        the official one which is a standalone Python file.
-        This causes errors when both of them are installed.
-        Starting from version 12.0, it migrates to a new module
-        named `pynvml_utils` to avoid the conflict.
-    It is so confusing that many packages in the community use the
-    unofficial one by mistake, and we have to handle this case.
-    For example, `nvcr.io/nvidia/pytorch:24.12-py3` uses the unofficial
-    one, and it will cause errors, see the issue
-    https://github.com/vllm-project/vllm/issues/12847 for example.
-    After all the troubles, we decide to copy the official `pynvml`
-    module to our codebase, and use it directly.
-    """
     import vllm.third_party.pynvml as pynvml
 
     return pynvml
 
-
 @cache
 def import_triton_kernels():
-    """
-    For convenience, prioritize triton_kernels that is available in
-    `site-packages`. Use `vllm.third_party.triton_kernels` as a fall-back.
-    """
     if _has_module("triton_kernels"):
         import triton_kernels
 
@@ -83,14 +46,7 @@ def import_triton_kernels():
             "https://github.com/triton-lang/triton/tree/main/python/triton_kernels"
         )
 
-
 def import_from_path(module_name: str, file_path: str | os.PathLike):
-    """
-    Import a Python file according to its file path.
-
-    Based on the official recipe:
-    https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly
-    """
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None:
         raise ModuleNotFoundError(f"No module named {module_name!r}")
@@ -102,15 +58,10 @@ def import_from_path(module_name: str, file_path: str | os.PathLike):
     spec.loader.exec_module(module)
     return module
 
-
 def resolve_obj_by_qualname(qualname: str) -> Any:
-    """
-    Resolve an object by its fully-qualified class name.
-    """
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
-
 
 @cache
 def get_vllm_optional_dependencies():
@@ -127,24 +78,9 @@ def get_vllm_optional_dependencies():
         for extra in extras
     }
 
-
 class _PlaceholderBase:
-    """
-    Disallows downstream usage of placeholder modules.
-
-    We need to explicitly override each dunder method because
-    [`__getattr__`][vllm.utils.import_utils._PlaceholderBase.__getattr__]
-    is not called when they are accessed.
-
-    Info:
-        [Special method lookup](https://docs.python.org/3/reference/datamodel.html#special-lookup)
-    """
 
     def __getattr__(self, key: str) -> Never:
-        """
-        The main class should implement this to throw an error
-        for attribute accesses representing downstream usage.
-        """
         raise NotImplementedError
 
     # [Basic customization]
@@ -283,14 +219,7 @@ class _PlaceholderBase:
     def __exit__(self, *args: object, **kwargs: object):
         return self.__getattr__("__exit__")
 
-
 class PlaceholderModule(_PlaceholderBase):
-    """
-    A placeholder object to use when a module does not exist.
-
-    This enables more informative errors when trying to access attributes
-    of a module that does not exist.
-    """
 
     def __init__(self, name: str) -> None:
         super().__init__()
@@ -319,7 +248,6 @@ class PlaceholderModule(_PlaceholderBase):
             "when the original module can be imported"
         )
 
-
 class _PlaceholderModuleAttr(_PlaceholderBase):
     def __init__(self, module: PlaceholderModule, attr_path: str) -> None:
         super().__init__()
@@ -339,17 +267,7 @@ class _PlaceholderModuleAttr(_PlaceholderBase):
             "when the original module can be imported"
         )
 
-
 class LazyLoader(ModuleType):
-    """
-    `LazyLoader` module borrowed from [Tensorflow]
-    (https://github.com/tensorflow/tensorflow/blob/main/tensorflow/python/util/lazy_loader.py)
-    with an addition of "module caching".
-
-    Lazily import a module, mainly to avoid pulling in large dependencies.
-    Modules such as `xgrammar` might do additional side effects, so we
-    only want to use this when it is needed, delaying all eager effects.
-    """
 
     def __init__(
         self,
@@ -390,35 +308,15 @@ class LazyLoader(ModuleType):
             self._module = self._load()
         return dir(self._module)
 
-
 # Optional dependency detection utilities
 @cache
 def _has_module(module_name: str) -> bool:
-    """Return True if *module_name* can be found in the current environment.
-
-    The result is cached so that subsequent queries for the same module incur
-    no additional overhead.
-    """
     return importlib.util.find_spec(module_name) is not None
 
-
 def has_pplx() -> bool:
-    """Whether the optional `pplx_kernels` package is available."""
-    return _has_module("pplx_kernels")
-
-
-def has_deep_ep() -> bool:
-    """Whether the optional `deep_ep` package is available."""
     return _has_module("deep_ep")
 
-
 def has_deep_gemm() -> bool:
-    """Whether the optional `deep_gemm` package is available."""
-    return _has_module("deep_gemm")
-
-
-def has_triton_kernels() -> bool:
-    """Whether the optional `triton_kernels` package is available."""
     is_available = _has_module("triton_kernels") or _has_module(
         "vllm.third_party.triton_kernels"
     )
@@ -426,38 +324,12 @@ def has_triton_kernels() -> bool:
         import_triton_kernels()
     return is_available
 
-
 def has_tilelang() -> bool:
-    """Whether the optional `tilelang` package is available."""
-    return _has_module("tilelang")
-
-
-def has_arctic_inference() -> bool:
-    """Whether the optional `arctic_inference` package is available."""
 
     return _has_module("arctic_inference")
 
-
 def has_helion() -> bool:
-    """Whether the optional `helion` package is available.
-
-    Helion is a Python-embedded DSL for writing ML kernels.
-    See: https://github.com/pytorch/helion
-
-    Usage:
-        if has_helion():
-            import helion
-            import helion.language as hl
-            # use helion...
-    """
     return _has_module("helion")
 
-
 def has_aiter() -> bool:
-    """Whether the optional `aiter` package is available."""
-    return _has_module("aiter")
-
-
-def has_mori() -> bool:
-    """Whether the optional `mori` package is available."""
     return _has_module("mori")

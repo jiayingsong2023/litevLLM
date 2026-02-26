@@ -16,7 +16,6 @@ try:
 except ImportError:
     librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
-
 try:
     import scipy.signal as scipy_signal
 except ImportError:
@@ -24,19 +23,7 @@ except ImportError:
 
 # ============================================================
 
-
 class ChannelReduction(str, Enum):
-    """Method to reduce multi-channel audio to target channels."""
-
-    MEAN = "mean"  # Average across channels (default, preserves energy balance)
-    FIRST = "first"  # Take first channel only
-    MAX = "max"  # Take max value across channels
-    SUM = "sum"  # Sum across channels
-
-
-@dataclass
-class AudioSpec:
-    """Specification for target audio format.
 
     This dataclass defines the expected audio format for a model's feature
     extractor. It is used to normalize audio data before processing.
@@ -46,14 +33,6 @@ class AudioSpec:
             (no normalization). 1 = mono, 2 = stereo, etc.
         channel_reduction: Method to reduce channels when input has more
             channels than target. Only used when reducing channels.
-    """
-
-    target_channels: int | None = 1
-    channel_reduction: ChannelReduction = ChannelReduction.MEAN
-
-    @property
-    def needs_normalization(self) -> bool:
-        """Whether audio normalization is needed."""
         return self.target_channels is not None
 
     def __repr__(self) -> str:
@@ -64,37 +43,14 @@ class AudioSpec:
             f"reduction={self.channel_reduction.value})"
         )
 
-
 # Pre-defined specs for common use cases
 MONO_AUDIO_SPEC = AudioSpec(target_channels=1, channel_reduction=ChannelReduction.MEAN)
 PASSTHROUGH_AUDIO_SPEC = AudioSpec(target_channels=None)
-
 
 def normalize_audio(
     audio: npt.NDArray[np.floating] | torch.Tensor,
     spec: AudioSpec,
 ) -> npt.NDArray[np.floating] | torch.Tensor:
-    """Normalize audio to the specified format.
-
-    This function handles channel reduction for multi-channel audio,
-    supporting both numpy arrays and torch tensors.
-
-    Args:
-        audio: Input audio data. Can be:
-            - 1D array/tensor: (time,) - already mono
-            - 2D array/tensor: (channels, time) - standard format from torchaudio
-            - 2D array/tensor: (time, channels) - format from soundfile
-              (will be auto-detected and transposed if time > channels)
-        spec: AudioSpec defining the target format.
-
-    Returns:
-        Normalized audio in the same type as input (numpy or torch).
-        For mono output (target_channels=1), returns 1D array/tensor.
-
-    Raises:
-        ValueError: If audio has unsupported dimensions or channel expansion
-            is requested (e.g., mono to stereo).
-    """
     if not spec.needs_normalization:
         return audio
 
@@ -147,11 +103,9 @@ def normalize_audio(
         # For now, just take first N channels
         return audio[: spec.target_channels]
 
-
 # ============================================================
 # Audio Resampling
 # ============================================================
-
 
 def resample_audio_librosa(
     audio: npt.NDArray[np.floating],
@@ -160,7 +114,6 @@ def resample_audio_librosa(
     target_sr: float,
 ) -> npt.NDArray[np.floating]:
     return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
-
 
 def resample_audio_scipy(
     audio: npt.NDArray[np.floating],
@@ -174,45 +127,4 @@ def resample_audio_scipy(
         return scipy_signal.resample_poly(audio, target_sr // orig_sr, 1)
     return audio
 
-
 class AudioResampler:
-    """Resample audio data to a target sample rate."""
-
-    def __init__(
-        self,
-        target_sr: float | None = None,
-        method: Literal["librosa", "scipy"] = "librosa",
-    ):
-        self.target_sr = target_sr
-        self.method = method
-
-    def resample(
-        self,
-        audio: npt.NDArray[np.floating],
-        *,
-        orig_sr: float,
-    ) -> npt.NDArray[np.floating]:
-        if self.target_sr is None:
-            raise RuntimeError(
-                "Audio resampling is not supported when `target_sr` is not provided"
-            )
-        if math.isclose(
-            float(orig_sr),
-            float(self.target_sr),
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ):
-            return audio
-        if self.method == "librosa":
-            return resample_audio_librosa(
-                audio, orig_sr=orig_sr, target_sr=self.target_sr
-            )
-        elif self.method == "scipy":
-            return resample_audio_scipy(
-                audio, orig_sr=orig_sr, target_sr=self.target_sr
-            )
-        else:
-            raise ValueError(
-                f"Invalid resampling method: {self.method}. "
-                "Supported methods are 'librosa' and 'scipy'."
-            )

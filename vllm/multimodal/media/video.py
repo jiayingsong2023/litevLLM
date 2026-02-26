@@ -15,7 +15,6 @@ from ..video import VIDEO_LOADER_REGISTRY
 from .base import MediaIO
 from .image import ImageMediaIO
 
-
 class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
     def __init__(
         self,

@@ -13,12 +13,6 @@ def matmul_q4_k_vec_kernel(
     stride_out,         # Stride for Output
     BLOCK_SIZE: tl.constexpr, # Must be 256 for Q4_K superblock
 ):
-    """
-    Fused Matrix-Vector Multiplication for GGUF Q4_K.
-    Computes Y = W * X where W is quantized Q4_K and X is FP16.
-    
-    Grid: (M,) - One program instance per output row.
-    """
     # Current row index (M dimension)
     row_idx = tl.program_id(0)
     

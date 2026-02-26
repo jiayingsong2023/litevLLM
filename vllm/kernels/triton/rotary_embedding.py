@@ -8,11 +8,6 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    """
-    Triton-compatible interface for Rotary Embedding.
-    Currently uses PyTorch native operations for simplicity and correctness in Lite mode.
-    Performs in-place updates on query and key.
-    """
     # query: [num_tokens, num_heads, head_size]
     # key:   [num_tokens, num_kv_heads, head_size]
     # positions: [num_tokens]
