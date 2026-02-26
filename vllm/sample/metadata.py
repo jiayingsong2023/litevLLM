@@ -7,7 +7,6 @@ import torch
 
 from vllm.sample.logits_processor import LogitsProcessors
 
-
 @dataclass
 class SamplingMetadata:
     temperature: torch.Tensor | None

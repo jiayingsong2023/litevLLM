@@ -13,13 +13,7 @@ from .protocol import TokenizerLike
 
 HfTokenizer: TypeAlias = PreTrainedTokenizer | PreTrainedTokenizerFast
 
-
 def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
-    """
-    By default, transformers will recompute multiple tokenizer properties
-    each time they are called, leading to a significant slowdown.
-    This proxy caches these properties for faster access.
-    """
     cached_tokenizer = copy.copy(tokenizer)
 
     tokenizer_all_special_ids = tokenizer.all_special_ids
@@ -62,7 +56,6 @@ def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
     cached_tokenizer.__class__ = CachedTokenizer
     return cached_tokenizer
-
 
 class CachedHfTokenizer(TokenizerLike):
     @classmethod

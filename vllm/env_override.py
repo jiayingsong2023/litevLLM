@@ -30,7 +30,6 @@ torch._inductor.config.compile_threads = 1
 # a test failure for test_multi_graph_piecewise_compile_outputs_equal.
 # For more context, see https://github.com/pytorch/pytorch/pull/165514.
 
-
 def memory_plan_reuse_patched(self):
     import torch._inductor.ir as ir
     from torch._inductor.codegen.wrapper import (
@@ -89,7 +88,6 @@ def memory_plan_reuse_patched(self):
     past_planning_states.append(planning_states.pop())
     assert len(planning_states) == 0
 
-
 # ===================================================
 # torch 2.9 Inductor get_graph_partition_signature monkeypatch
 # ===================================================
@@ -98,14 +96,9 @@ def memory_plan_reuse_patched(self):
 # `tests/compile/test_fusion_attn.py::test_attn_quant`.
 # For more context, see https://github.com/pytorch/pytorch/pull/165815.
 
-
 def get_graph_partition_signature_patched(
     self, partitions, skip_cudagraphs: list[bool]
 ):
-    """
-    Gets signature for each graph partition, including input nodes, output nodes, and
-    whether deallocating an input within graph partition.
-    """
     from torch._inductor import dependencies
     from torch._inductor.ir import GraphPartitionSignature, MutationOutput, NoneLayout
     from torch._inductor.virtualized import V
@@ -117,10 +110,6 @@ def get_graph_partition_signature_patched(
     name_to_node = self.get_name_to_nodes()
 
     def is_none_layout(buf_name: str) -> bool:
-        """
-        Checks if buf_name is NoneLayout. Buffers with NoneLayout is not allocated
-        so graph partition should not take it as inputs or outputs.
-        """
         buf = self.name_to_buf.get(buf_name, None)
 
         if buf is None:
@@ -239,7 +228,6 @@ def get_graph_partition_signature_patched(
 
     return signatures[::-1]
 
-
 # ========================================
 # torch 2.9 Inductor Scheduler monkeypatch
 # ========================================
@@ -260,117 +248,14 @@ def get_graph_partition_signature_patched(
 # functions just return True.
 # ========================================
 
-
 def should_partition_patched(self, node, should_log: bool = False) -> bool:
     # This is a patched version of
     # torch._inductor.scheduler.Scheduler.should_partition that modifies
     # the following piece of code so that we always return True:
     # https://github.com/pytorch/pytorch/blob/ecb53078faf86ca1b33277df33b82985675bb011/torch/_inductor/scheduler.py#L4712-L4724
-    """Return True if we should partition the inductor graph on this node"""
-
-    import torch._inductor.ir as ir
-    from torch._inductor.scheduler import (
-        BaseSchedulerNode,
-        FusedSchedulerNode,
-    )
-    from torch._inductor.utils import (
-        _unstable_customized_partition_wrapper,
-        is_cudagraph_unsafe_op,
-        maybe_log_cudagraph_partition,
-    )
-
-    # Allow users to manually specify if a node should be partitioned
-    # Can only do this for FallbackKernels
-    ir_node = node.node
-    if isinstance(ir_node, torch._inductor.ir.FallbackKernel) and (
-        op := ir_node.op_overload
-    ):
-        op_overload_packet_name = op.name()
-        op_overload_name = (
-            f"{op_overload_packet_name}.{op._overloadname}"
-            if isinstance(op, torch._ops.OpOverload)
-            else op_overload_packet_name
-        )
-        if (
-            op_overload_packet_name
-            in torch._inductor.config.custom_should_partition_ops
-            or op_overload_name in torch._inductor.config.custom_should_partition_ops
-        ):
-            assert isinstance(op, torch._ops.OpOverload)
-            return True
-
-    # When not using cudagraphs, keep all kernels in the `call` function
-    # instead of graph partition functions, since graph partition only brings
-    # benefit to cudagraph
-    if (
-        not torch._inductor.config.triton.cudagraphs
-        and _unstable_customized_partition_wrapper.wrapper is None
-    ):
-        return True
-
-    # avoid duplicating logs when should_partition is called multiple times
-    # on the same node
-    def noop_log(msg: str, node: BaseSchedulerNode | None) -> None:
-        return
-
-    log_partition_reason = maybe_log_cudagraph_partition if should_log else noop_log
-
-    if isinstance(node, FusedSchedulerNode):
-        return any(self.should_partition(snode) for snode in node.snodes)
-
-    assert node.node is not None
-
-    if not node.is_gpu():
-        log_partition_reason("non gpu ops", node=node)
-
-        return True
-
-    if isinstance(node.node, ir.DeviceCopy):
-        log_partition_reason("DeviceCopy ops", node=node)
-        return True
-
-    if isinstance(node.node, ir.Conditional):
-        log_partition_reason("Conditional ops", node=node)
-        return True
-
-    if getattr(node.node, "unbacked_bindings", None):
-        log_partition_reason("unbacked binding ops", node=node)
-        return True
-
-    if is_cudagraph_unsafe_op(node.node):
-        log_partition_reason("CUDAGraph-unsafe custom ops", node=node)
-        return True
-
-    return False
-
-
-def _update_scheduler_patched(self) -> None:
-    # Copied from torch._inductor.graph.GrahLowering._update_scheduler. Patches
-    # this method so that we can patch Scheduler.should_partition with the
-    # function above
-    """
     (Re)initializes the scheduler member.  When initializing the scheduler, no CUBIN
     files should be generated (to avoid biasing any benchmarks and pessimizing
     fusion decisions).
-    """
-    import torch._inductor.config as config
-    from torch._inductor.scheduler import Scheduler
-
-    Scheduler.should_partition = should_partition_patched
-    Scheduler.get_graph_partition_signature = get_graph_partition_signature_patched
-
-    with config.patch("triton.store_cubin", False):
-        self.scheduler = Scheduler(self.operations)
-
-
-# ===================================================
-# torch 2.9 Inductor get_raw_stream workaround
-# ===================================================
-# Workaround for TorchInductor autotune using get_raw_stream() without defining it.
-# This occurs when compile_sizes > 1 in compilation_config.
-# For more context, see https://github.com/vllm-project/vllm/issues/30905.
-def _patch_get_raw_stream_if_needed():
-    """Workaround for TorchInductor autotune get_raw_stream() bug."""
     from vllm.utils.torch_utils import is_torch_equal
 
     # Only apply the patch for torch 2.9.0 or 2.9.1
@@ -383,7 +268,6 @@ def _patch_get_raw_stream_if_needed():
             from torch._C import _cuda_getCurrentRawStream as _get_raw_stream
 
             builtins.get_raw_stream = _get_raw_stream  # type: ignore[attr-defined]
-
 
 _patch_get_raw_stream_if_needed()
 

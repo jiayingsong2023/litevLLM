@@ -20,31 +20,25 @@ from .data import (
 if TYPE_CHECKING:
     import torch
 
-
 class ParsedStrPrompt(TypedDict):
     type: Literal["str"]
     content: str
-
 
 class ParsedTextPrompt(TypedDict):
     type: Literal["text"]
     content: TextPrompt
 
-
 class ParsedTokensPrompt(TypedDict):
     type: Literal["tokens"]
     content: TokensPrompt
-
 
 class ParsedEmbedsPrompt(TypedDict):
     type: Literal["embeds"]
     content: EmbedsPrompt
 
-
 ParsedSingletonPrompt: TypeAlias = (
     ParsedStrPrompt | ParsedTextPrompt | ParsedTokensPrompt | ParsedEmbedsPrompt
 )
-
 
 def parse_singleton_prompt(prompt: SingletonPrompt) -> ParsedSingletonPrompt:
     if isinstance(prompt, str):
@@ -62,12 +56,10 @@ def parse_singleton_prompt(prompt: SingletonPrompt) -> ParsedSingletonPrompt:
         "inputs must be a string, TextPrompt, TokensPrompt, or EmbedsPrompt"
     )
 
-
 def is_explicit_encoder_decoder_prompt(
     prompt: PromptType,
 ) -> TypeIs[ExplicitEncoderDecoderPrompt]:
     return isinstance(prompt, dict) and "encoder_prompt" in prompt
-
 
 def split_enc_dec_inputs(
     inputs: ProcessorInputs,
@@ -81,12 +73,10 @@ def split_enc_dec_inputs(
 
     return None, inputs
 
-
 class PromptComponents(NamedTuple):
     text: str | None = None
     token_ids: list[int] | None = None
     embeds: "torch.Tensor | None" = None
-
 
 def get_prompt_components(prompt: PromptType) -> PromptComponents:
     if isinstance(prompt, str):
@@ -100,7 +90,6 @@ def get_prompt_components(prompt: PromptType) -> PromptComponents:
         token_ids=prompt.get("prompt_token_ids"),  # type: ignore[arg-type]
         embeds=prompt.get("prompt_embeds"),
     )
-
 
 def get_prompt_len(prompt: TokensPrompt | EmbedsPrompt):
     return length_from_prompt_token_ids_or_embeds(

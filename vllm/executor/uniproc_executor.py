@@ -22,33 +22,8 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
-
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
-        """Initialize the worker and load the model."""
-        self.driver_worker = WorkerWrapperBase(rpc_rank=0)
-        distributed_init_method, rank, local_rank = self._distributed_args()
-        kwargs = dict(
-            vllm_config=self.vllm_config,
-            local_rank=local_rank,
-            rank=rank,
-            distributed_init_method=distributed_init_method,
-            is_driver_worker=True,
-            shared_worker_lock=Lock(),
-        )
-
-        self.async_output_thread: ThreadPoolExecutor | None = None
-        if self.max_concurrent_batches > 1:
-            self.async_output_thread = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="WorkerAsyncOutput"
-            )
-
-        self.driver_worker.init_worker(all_kwargs=[kwargs])
-        self.driver_worker.init_device()
-        self.driver_worker.load_model()
-
-    def _distributed_args(self) -> tuple[str, int, int]:
-        """Return (distributed_init_method, rank, local_rank)."""
         distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
         # set local rank as the device index if specified
         device_info = self.vllm_config.device_config.device.__str__().split(":")
@@ -136,51 +111,6 @@ class UniProcExecutor(Executor):
         if worker := self.driver_worker:
             worker.shutdown()
 
-
 class ExecutorWithExternalLauncher(UniProcExecutor):
-    """An executor that uses external launchers to launch engines,
-    specially designed for torchrun-compatible launchers, for
-    offline inference with tensor parallelism.
-
-    see https://github.com/vllm-project/vllm/issues/11400 for
-    the motivation, and examples/offline_inference/torchrun_example.py
-    for the usage example.
-
-    The key idea: although it is tensor-parallel inference, we only
-    create one worker per executor, users will launch multiple
-    engines with torchrun-compatible launchers, and all these engines
-    work together to process the same prompts. When scheduling is
-    deterministic, all the engines will generate the same outputs,
-    and they don't need to synchronize the states with each other.
-    """
 
     def _init_executor(self) -> None:
-        """Initialize the worker and load the model."""
-        assert not envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
-            "To get deterministic execution, "
-            "please set VLLM_ENABLE_V1_MULTIPROCESSING=0"
-        )
-        super()._init_executor()
-
-    def _distributed_args(self) -> tuple[str, int, int]:
-        # engines are launched in torchrun-compatible launchers
-        # so we can use the env:// method.
-        # required env vars:
-        # - RANK
-        # - LOCAL_RANK
-        # - MASTER_ADDR
-        # - MASTER_PORT
-        distributed_init_method = "env://"
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        return distributed_init_method, rank, local_rank
-
-    def determine_available_memory(self) -> list[int]:  # in bytes
-        # we need to get the min across all ranks.
-        memory = super().determine_available_memory()
-        from vllm.distributed.parallel_state import get_world_group
-
-        cpu_group = get_world_group().cpu_group
-        memory_tensor = torch.tensor([memory], device="cpu", dtype=torch.int64)
-        dist.all_reduce(memory_tensor, group=cpu_group, op=dist.ReduceOp.MIN)
-        return [memory_tensor.item()]

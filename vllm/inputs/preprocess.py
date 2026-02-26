@@ -42,7 +42,6 @@ from .parse import is_explicit_encoder_decoder_prompt, parse_singleton_prompt
 
 logger = init_logger(__name__)
 
-
 class InputPreprocessor:
     def __init__(
         self,
@@ -87,11 +86,6 @@ class InputPreprocessor:
         return self.tokenizer.eos_token_id
 
     def get_decoder_start_token_id(self) -> int | None:
-        """
-        Obtain the decoder start token id employed by an encoder/decoder
-        model. Returns None for non-encoder/decoder models or if the
-        model config is unavailable.
-        """
 
         if not self.model_config.is_encoder_decoder:
             logger.warning_once(
@@ -121,36 +115,6 @@ class InputPreprocessor:
         return dec_start_token_id
 
     def _get_default_enc_dec_decoder_prompt(self) -> list[int]:
-        """
-        Specifically for encoder/decoder models:
-        generate a default decoder prompt for when
-        the user specifies only the encoder prompt.
-
-        Encoder/decoder models utilize the decoder
-        prompt in different ways; as new models are
-        added, it is intended that this function
-        will be extended to produce differing
-        default decoder prompts, depending on the
-        model variety.
-
-        Absent a special case, the default behavior
-        of this method is to mirror the behavior of
-        the HuggingFace (HF) GenerationMixin for a None
-        decoder prompt, which is to employ a logit processor
-        setting to force the first decoded token to be <BOS>.
-        Here, this behavior is approximated by having the
-        "default" decoder prompt be <BOS>.
-
-        However, it is possible that in the future
-        other models may have different or more
-        complex logic for the default decoder prompt.
-        This motivates having a special helper method
-        for default decoder prompts.
-
-        Returns:
-
-        * prompt_token_ids
-        """
 
         bos_token_id = self.get_bos_token_id()
         assert bos_token_id is not None
@@ -160,22 +124,6 @@ class InputPreprocessor:
         self,
         decoder_input_ids: list[int] | None,
     ) -> list[int]:
-        """
-        Prepares `decoder_input_ids` for generation with encoder-decoder models.
-
-        Based on:
-        https://github.com/huggingface/transformers/blob/4037a2b5b1278736e566aec12e169100275545ea/src/transformers/generation/utils.py
-        specifically,
-        `GenerationMixin._prepare_decoder_input_ids_for_generation()`.
-
-        Arguments:
-
-        * decoder_input_ids: input token ids to preprocess
-
-        Returns:
-
-        * Processed token list
-        """
 
         decoder_start_token_id = self.get_decoder_start_token_id()
         assert decoder_start_token_id is not None
@@ -215,10 +163,6 @@ class InputPreprocessor:
         prompt: str,
         tokenization_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
-        """
-        Apply the model's tokenizer to a text prompt, returning the
-        corresponding token IDs.
-        """
         tokenizer = self.get_tokenizer()
         tokenization_kwargs = self._get_tokenization_kw(tokenization_kwargs)
 
@@ -249,10 +193,6 @@ class InputPreprocessor:
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> MultiModalInputs:
-        """
-        Apply the model's multi-modal processor to a multi-modal prompt,
-        returning the corresponding token IDs and metadata.
-        """
         mm_processor = self._get_mm_processor()
 
         if mm_processor_kwargs is None:
@@ -393,17 +333,6 @@ class InputPreprocessor:
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> SingletonInputs:
-        """
-        Extract the singleton inputs from a prompt.
-
-        Arguments:
-
-        * prompt: single encoder or decoder input prompt
-
-        Returns:
-
-        * [`SingletonInputs`][vllm.inputs.data.SingletonInputs] instance
-        """
         parsed = parse_singleton_prompt(prompt)
 
         if parsed["type"] == "embeds":
@@ -471,10 +400,6 @@ class InputPreprocessor:
         inputs: SingletonInputs | MultiModalEncDecInputs,
         decoder_inputs_to_override: SingletonInputs | None = None,
     ) -> tuple[SingletonInputs, SingletonInputs]:
-        """
-        For encoder/decoder models only:
-        Separate Encoder/Decoder inputs from a MultiModalEncDecInputs
-        """
         if (
             inputs["type"] == "embeds"
             or decoder_inputs_to_override
@@ -534,39 +459,6 @@ class InputPreprocessor:
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> EncoderDecoderInputs:
-        """
-        For encoder/decoder models only:
-        Process an input prompt into an
-        [`EncoderDecoderInputs`][vllm.inputs.data.EncoderDecoderInputs]
-        instance.
-
-        There are two types of input prompts:
-        singleton prompts which carry only the
-        encoder prompt, and explicit encoder/decoder
-        prompts which carry both the encoder and the
-        decoder prompts as member variables.
-
-        This function handles the following scenarios:
-        * Singleton encoder prompt: extract encoder prompt
-          token ids & infer default decoder prompt token ids
-        * Explicit encoder/decoder prompt: extract encoder
-          and decoder prompt token ids
-
-        Note that for Explicit encoder/decoder prompts,
-        each sub-prompt (encoder or decoder prompt) can
-        have any possible singleton type; thus this
-        method relies on helper functions to obtain
-        token ids for the sub-prompts.
-
-        Arguments:
-
-        * prompt: an input prompt
-
-        Returns:
-
-        * [`EncoderDecoderInputs`][vllm.inputs.data.EncoderDecoderInputs]
-          instance
-        """
         encoder_inputs: SingletonInputs
         decoder_inputs: SingletonInputs | None
         if is_explicit_encoder_decoder_prompt(prompt):
@@ -623,19 +515,6 @@ class InputPreprocessor:
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> DecoderOnlyInputs:
-        """
-        For decoder-only models:
-        Process an input prompt into a
-        [`DecoderOnlyInputs`][vllm.inputs.data.DecoderOnlyInputs] instance.
-
-        Arguments:
-
-        * prompt: input prompt
-
-        Returns:
-
-        * [`DecoderOnlyInputs`][vllm.inputs.data.DecoderOnlyInputs] instance
-        """
 
         prompt_comps = self._prompt_to_llm_inputs(
             prompt,
@@ -681,29 +560,3 @@ class InputPreprocessor:
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> ProcessorInputs:
-        """Preprocess the input prompt."""
-        res = self._preprocess(prompt, tokenization_kwargs, mm_uuids=mm_uuids)
-
-        if self.mm_processor_cache and self.mm_cache_stats is not None:
-            delta = self.mm_processor_cache.make_stats(delta=True)
-            self.mm_cache_stats.requests += 1
-            self.mm_cache_stats.queries += delta.total
-            self.mm_cache_stats.hits += delta.hits
-
-        return res
-
-    def stat_mm_cache(self) -> MultiModalCacheStats | None:
-        mm_cache_stats = self.mm_cache_stats
-        if mm_cache_stats is None:
-            return None
-
-        self.mm_cache_stats = MultiModalCacheStats()
-
-        return mm_cache_stats
-
-    def clear_mm_cache(self) -> None:
-        if self.mm_processor_cache is not None:
-            self.mm_processor_cache.clear_cache()
-
-        if self.mm_cache_stats is not None:
-            self.mm_cache_stats.reset = True

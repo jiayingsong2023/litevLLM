@@ -5,7 +5,6 @@ import torch
 
 _SMALLEST_LOGIT = float("-inf")
 
-
 def _apply_bad_words_single_batch(
     logits: torch.Tensor,
     bad_words_token_ids: list[list[int]],
@@ -25,7 +24,6 @@ def _apply_bad_words_single_batch(
         if actual_prefix == expected_prefix:
             logits[last_token_id] = _SMALLEST_LOGIT
 
-
 def apply_bad_words(
     logits: torch.Tensor,
     bad_words_token_ids: dict[int, list[list[int]]],
@@ -33,7 +31,6 @@ def apply_bad_words(
 ) -> None:
     for i, bad_words_ids in bad_words_token_ids.items():
         _apply_bad_words_single_batch(logits[i], bad_words_ids, past_tokens_ids[i])
-
 
 def apply_bad_words_with_drafts(
     logits: torch.Tensor,

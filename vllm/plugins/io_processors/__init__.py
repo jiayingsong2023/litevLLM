@@ -10,7 +10,6 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = logging.getLogger(__name__)
 
-
 def get_io_processor(
     vllm_config: VllmConfig, plugin_from_init: str | None = None
 ) -> IOProcessor | None:

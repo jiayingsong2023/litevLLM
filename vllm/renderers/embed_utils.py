@@ -11,7 +11,6 @@ from vllm.exceptions import VLLMValidationError
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
-
 def safe_load_prompt_embeds(
     model_config: "ModelConfig",
     embed: bytes,

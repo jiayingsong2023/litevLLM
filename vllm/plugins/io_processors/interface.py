@@ -15,7 +15,6 @@ from vllm.sampling_params import SamplingParams
 IOProcessorInput = TypeVar("IOProcessorInput")
 IOProcessorOutput = TypeVar("IOProcessorOutput")
 
-
 class IOProcessor(ABC, Generic[IOProcessorInput, IOProcessorOutput]):
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config

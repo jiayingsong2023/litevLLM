@@ -28,7 +28,6 @@ else:
         "lmformatenforcer.integrations.vllm",
     )
 
-
 @lru_cache
 def _cached_build_vllm_token_enforcer_tokenizer_data(
     tokenizer: PreTrainedTokenizerBase, vocab_size: int
@@ -36,7 +35,6 @@ def _cached_build_vllm_token_enforcer_tokenizer_data(
     return lmfe_vllm.build_vllm_token_enforcer_tokenizer_data(
         tokenizer, use_bitmask=True, vocab_size=vocab_size
     )
-
 
 @dataclass
 class LMFormatEnforcerGrammar(StructuredOutputGrammar):
@@ -87,7 +85,6 @@ class LMFormatEnforcerGrammar(StructuredOutputGrammar):
 
     def reset(self):
         self.current_tokens_prefix = []
-
 
 @dataclass
 class LMFormatEnforcerBackend(StructuredOutputBackend):
@@ -143,7 +140,6 @@ class LMFormatEnforcerBackend(StructuredOutputBackend):
 
     def destroy(self):
         pass
-
 
 def validate_structured_output_request_lm_format_enforcer(params: SamplingParams):
     if params.structured_outputs is None:

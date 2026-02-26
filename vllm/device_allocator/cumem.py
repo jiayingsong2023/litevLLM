@@ -23,7 +23,6 @@ from vllm.utils.system_utils import find_loaded_library
 
 logger = init_logger(__name__)
 
-
 cumem_available = False
 try:
     from vllm.cumem_allocator import (
@@ -48,21 +47,17 @@ except ModuleNotFoundError:
 # py_device, py_alignedSize, py_d_mem, py_p_memHandle
 HandleType = tuple[int, int, int, int]
 
-
 @dataclasses.dataclass
 class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
 
-
 def create_and_map(allocation_handle: HandleType) -> None:
     python_create_and_map(*allocation_handle)
 
-
 def unmap_and_release(allocation_handle: HandleType) -> None:
     python_unmap_and_release(*allocation_handle)
-
 
 def get_pluggable_allocator(
     python_malloc_fn: Callable[[int], int], python_free_func: Callable[[int, int], None]
@@ -73,7 +68,6 @@ def get_pluggable_allocator(
     )
     return new_alloc
 
-
 @contextmanager
 def use_memory_pool_with_allocator(
     python_malloc_fn: Callable[[int], int], python_free_func: Callable[[int, int], None]
@@ -83,42 +77,13 @@ def use_memory_pool_with_allocator(
     with torch.cuda.memory.use_mem_pool(mem_pool):
         yield mem_pool, new_alloc
 
-
 class CuMemAllocator:
-    """
-    A singleton class that manages a memory pool for CUDA tensors.
-    The memory in this pool can be offloaded or discarded when the
-    allocator sleeps.
-
-    Inside the `use_memory_pool(tag)` context, all tensors created will
-    be allocated in the memory pool, and has the same tag as the
-    tag passed to the context.
-
-    When we call `sleep`, all tensors with the specified tag will be
-    offloaded to CPU memory, and the rest of the tensors will be discarded.
-    When we call `wake_up`, all tensors that are previously offloaded
-    will be loaded back to GPU memory, and the rest of the tensors will
-    have empty memory.
-
-    Why it needs to be a singleton?
-    When allocated tensors are garbage collected, PyTorch will call
-    the free callback, which will call the `python_free_callback` method.
-    The C-extension uses a global variable to store the function of an
-    instance of this class. If we create multiple instances of this class,
-    the global variable will be overwritten and the free callback will
-    not work as expected.
-    """
 
     instance: "CuMemAllocator" = None
     default_tag: str = "default"
 
     @staticmethod
     def get_instance() -> "CuMemAllocator":
-        """
-        CuMemAllocator is a singleton class.
-        We cannot call the constructor directly.
-        Call this method to get the instance.
-        """
         assert cumem_available, "cumem allocator is not available"
         if CuMemAllocator.instance is None:
             CuMemAllocator.instance = CuMemAllocator()
@@ -142,9 +107,6 @@ class CuMemAllocator:
         self.python_free_callback = self._python_free_callback
 
     def _python_malloc_callback(self, allocation_handle: HandleType) -> None:
-        """
-        Internal method to store the allocation data
-        when memory is allocated in the memory pool."""
         py_d_mem = allocation_handle[2]
         self.pointer_to_data[py_d_mem] = AllocationData(
             allocation_handle, self.current_tag
@@ -158,9 +120,6 @@ class CuMemAllocator:
         return
 
     def _python_free_callback(self, ptr: int) -> HandleType:
-        """
-        Internal method to look up the allocation data
-        when memory is freed in the memory pool."""
         data = self.pointer_to_data.pop(ptr)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
@@ -173,14 +132,6 @@ class CuMemAllocator:
         return data.handle
 
     def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
-        """
-        Put the allocator in sleep mode.
-        All data in the memory allocation with the specified tag will be
-        offloaded to CPU memory, and others will be discarded.
-
-        :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
-        """
         if offload_tags is None:
             # by default, allocated tensors are offloaded
             # when the allocator sleeps
@@ -223,15 +174,6 @@ class CuMemAllocator:
         torch.cuda.empty_cache()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        """
-        Wake up the allocator from sleep mode.
-        All data that is previously offloaded will be loaded back to GPU
-        memory, and the rest of the data will have empty memory.
-
-        :param tags: The tags of the memory allocation that will be loaded
-            back to GPU memory. If None, all memory allocation will be loaded
-            back to GPU memory.
-        """
         for ptr, data in self.pointer_to_data.items():
             if tags is None or data.tag in tags:
                 handle = data.handle
@@ -248,14 +190,6 @@ class CuMemAllocator:
 
     @contextmanager
     def use_memory_pool(self, tag: str | None = None):
-        """
-        A context manager to use the memory pool.
-        All memory allocation created inside the context will be allocated
-        in the memory pool, and has the specified tag.
-
-        :param tag: The tag of the memory allocation. If None, the default tag
-            will be used.
-        """
         if tag is None:
             tag = CuMemAllocator.default_tag
 
@@ -291,9 +225,6 @@ class CuMemAllocator:
             self.current_tag = old_tag
 
     def get_current_usage(self) -> int:
-        """
-        Get the total number of bytes allocated in the memory pool.
-        """
         sum_bytes: int = 0
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle

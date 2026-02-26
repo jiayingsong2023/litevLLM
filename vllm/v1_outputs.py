@@ -18,7 +18,6 @@ else:
     KVConnectorStats = object
     KVConnectorKVEvents = object
 
-
 class LogprobsLists(NamedTuple):
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]
     logprob_token_ids: np.ndarray
@@ -42,7 +41,6 @@ class LogprobsLists(NamedTuple):
             self.sampled_token_ranks[req_idx:end_idx],
             None,
         )
-
 
 class LogprobsTensors(NamedTuple):
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]
@@ -75,21 +73,6 @@ class LogprobsTensors(NamedTuple):
         )
 
     def filter(self, mask: torch.Tensor) -> "LogprobsTensors":
-        """Filter the logprobs tensors with the given bool mask."""
-        assert self.cu_num_generated_tokens is None, (
-            "filter can't be used with cu_num_generated_tokens"
-        )
-        return LogprobsTensors(
-            self.logprob_token_ids[mask],
-            self.logprobs[mask],
-            self.selected_token_ranks[mask],
-        )
-
-    @staticmethod
-    def empty_cpu(
-        num_positions: int, num_tokens_per_position: int
-    ) -> "LogprobsTensors":
-        """Create empty LogprobsTensors on CPU."""
 
         logprob_token_ids = torch.empty(
             (num_positions, num_tokens_per_position), dtype=torch.int32, device="cpu"
@@ -104,11 +87,9 @@ class LogprobsTensors(NamedTuple):
             selected_token_ranks=selected_token_ranks,
         )
 
-
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
 PoolerOutput: TypeAlias = torch.Tensor | list[torch.Tensor] | list[torch.Tensor | None]
-
 
 @dataclass
 class SamplerOutput:
@@ -118,7 +99,6 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
-
 
 @dataclass
 class KVConnectorOutput:
@@ -146,13 +126,11 @@ class KVConnectorOutput:
             and not self.invalid_block_ids
         )
 
-
 @dataclass
 class ECConnectorOutput:
     # [mm_hash]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
-
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
@@ -195,19 +173,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
     @abstractmethod
     def get_output(self) -> ModelRunnerOutput:
-        """Get the ModelRunnerOutput for this async output.
-
-        This is a blocking call that waits until the results are ready, which
-        might involve copying device tensors to the host.
-        This method should only be called once per AsyncModelRunnerOutput.
-        """
         pass
-
 
 @dataclass
 class DraftTokenIds:
@@ -216,14 +186,9 @@ class DraftTokenIds:
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
 
-
 def make_empty_encoder_model_runner_output(
     scheduler_output: "SchedulerOutput",
 ) -> ModelRunnerOutput:
-    """
-    Create a ModelRunnerOutput stub that contains the correct
-    per-request bookkeeping but no generated data yet.
-    """
     if not scheduler_output.num_scheduled_tokens:
         return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -245,6 +210,5 @@ def make_empty_encoder_model_runner_output(
         sampled_token_ids=sampled_token_ids,
         pooler_output=pooler_output,
     )
-
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[], req_id_to_index={})

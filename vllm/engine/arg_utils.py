@@ -100,14 +100,12 @@ else:
     LoadFormats = Any
     UsageContext = Any
 
-
 logger = init_logger(__name__)
 
 # object is used to allow for special typing forms
 T = TypeVar("T")
 TypeHint: TypeAlias = type[Any] | object
 TypeHintT: TypeAlias = type[T] | object
-
 
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
     def _parse_type(val: str) -> T:
@@ -120,7 +118,6 @@ def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
 
     return _parse_type
 
-
 def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
     def _optional_type(val: str) -> T | None:
         if val == "" or val == "None":
@@ -129,205 +126,20 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
 
     return _optional_type
 
-
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
     return optional_type(json.loads)(val)
 
-
 def is_type(type_hint: TypeHint, type: TypeHintT) -> TypeIs[TypeHintT]:
-    """Check if the type hint is a specific type."""
-    return type_hint is type or get_origin(type_hint) is type
-
-
-def contains_type(type_hints: set[TypeHint], type: TypeHintT) -> bool:
-    """Check if the type hints contain a specific type."""
     return any(is_type(type_hint, type) for type_hint in type_hints)
 
-
 def get_type(type_hints: set[TypeHint], type: TypeHintT) -> TypeHintT:
-    """Get the specific type from the type hints."""
-    return next((th for th in type_hints if is_type(th, type)), None)
-
-
-def literal_to_kwargs(type_hints: set[TypeHint]) -> dict[str, Any]:
-    """Get the `type` and `choices` from a `Literal` type hint in `type_hints`.
 
     If `type_hints` also contains `str`, we use `metavar` instead of `choices`.
-    """
-    type_hint = get_type(type_hints, Literal)
-    options = get_args(type_hint)
-    option_type = type(options[0])
-    if not all(isinstance(option, option_type) for option in options):
-        raise ValueError(
-            "All options must be of the same type. "
-            f"Got {options} with types {[type(c) for c in options]}"
-        )
-    kwarg = "metavar" if contains_type(type_hints, str) else "choices"
-    return {"type": option_type, kwarg: sorted(options)}
-
-
-def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str, Any]:
-    type_hint = get_type(type_hints, type)
-    types = get_args(type_hint)
-    elem_type = types[0]
-
-    # Handle Ellipsis
-    assert all(t is elem_type for t in types if t is not Ellipsis), (
-        f"All non-Ellipsis elements must be of the same type. Got {types}."
-    )
-
-    # Handle Union types
-    if get_origin(elem_type) in {Union, UnionType}:
-        # Union for Union[X, Y] and UnionType for X | Y
-        assert str in get_args(elem_type), (
-            "If element can have multiple types, one must be 'str' "
-            f"(i.e. 'list[int | str]'). Got {elem_type}."
-        )
-        elem_type = str
-
-    return {
-        "type": elem_type,
-        "nargs": "+" if type is not tuple or Ellipsis in types else len(types),
-    }
-
-
-def is_not_builtin(type_hint: TypeHint) -> bool:
-    """Check if the class is not a built-in type."""
     return type_hint.__module__ != "builtins"
 
-
 def get_type_hints(type_hint: TypeHint) -> set[TypeHint]:
-    """Extract type hints from Annotated or Union type hints."""
-    type_hints: set[TypeHint] = set()
-    origin = get_origin(type_hint)
-    args = get_args(type_hint)
-
-    if origin is Annotated:
-        type_hints.update(get_type_hints(args[0]))
-    elif origin in {Union, UnionType}:
-        # Union for Union[X, Y] and UnionType for X | Y
-        for arg in args:
-            type_hints.update(get_type_hints(arg))
-    else:
-        type_hints.add(type_hint)
-
-    return type_hints
-
-
-NEEDS_HELP = (
-    any("--help" in arg for arg in sys.argv)  # vllm SUBCOMMAND --help
-    or (argv0 := sys.argv[0]).endswith("mkdocs")  # mkdocs SUBCOMMAND
-    or argv0.endswith("mkdocs/__main__.py")  # python -m mkdocs SUBCOMMAND
-)
-
-
-@functools.lru_cache(maxsize=30)
-def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
-    # Save time only getting attr docs if we're generating help text
-    cls_docs = get_attr_docs(cls) if NEEDS_HELP else {}
-    kwargs = {}
-    for field in fields(cls):
-        # Get the set of possible types for the field
-        type_hints: set[TypeHint] = get_type_hints(field.type)
-
-        # If the field is a dataclass, we can use the model_validate_json
-        generator = (th for th in type_hints if is_dataclass(th))
-        dataclass_cls = next(generator, None)
-
-        # Get the default value of the field
-        default = None
-        if field.default is not MISSING:
-            default = field.default
-            # Handle pydantic.Field defaults
-            if isinstance(default, FieldInfo):
-                if default.default_factory is None:
-                    default = default.default
-                else:
-                    # VllmConfig's Fields have default_factory set to config classes.
-                    # These could emit logs on init, which would be confusing.
-                    with suppress_logging():
-                        default = default.default_factory()
-        elif field.default_factory is not MISSING:
-            default = field.default_factory()
-
-        # Get the help text for the field
-        name = field.name
-        help = cls_docs.get(name, "").strip()
-        # Escape % for argparse
-        help = help.replace("%", "%%")
-
-        # Initialise the kwargs dictionary for the field
-        kwargs[name] = {"default": default, "help": help}
-
-        # Set other kwargs based on the type hints
-        json_tip = (
-            "Should either be a valid JSON string or JSON keys passed individually."
-        )
-        if dataclass_cls is not None:
-
-            def parse_dataclass(val: str, cls=dataclass_cls) -> Any:
-                try:
-                    return TypeAdapter(cls).validate_json(val)
-                except ValidationError as e:
-                    raise argparse.ArgumentTypeError(repr(e)) from e
-
-            kwargs[name]["type"] = parse_dataclass
-            kwargs[name]["help"] += f"\n\n{json_tip}"
-        elif contains_type(type_hints, bool):
-            # Creates --no-<name> and --<name> flags
-            kwargs[name]["action"] = argparse.BooleanOptionalAction
-        elif contains_type(type_hints, Literal):
-            kwargs[name].update(literal_to_kwargs(type_hints))
-        elif contains_type(type_hints, tuple):
-            kwargs[name].update(collection_to_kwargs(type_hints, tuple))
-        elif contains_type(type_hints, list):
-            kwargs[name].update(collection_to_kwargs(type_hints, list))
-        elif contains_type(type_hints, set):
-            kwargs[name].update(collection_to_kwargs(type_hints, set))
-        elif contains_type(type_hints, int):
-            if name == "max_model_len":
-                kwargs[name]["type"] = human_readable_int_or_auto
-                kwargs[name]["help"] += f"\n\n{human_readable_int_or_auto.__doc__}"
-            elif name in ("max_num_batched_tokens", "kv_cache_memory_bytes"):
-                kwargs[name]["type"] = human_readable_int
-                kwargs[name]["help"] += f"\n\n{human_readable_int.__doc__}"
-            else:
-                kwargs[name]["type"] = int
-        elif contains_type(type_hints, float):
-            kwargs[name]["type"] = float
-        elif contains_type(type_hints, dict) and (
-            contains_type(type_hints, str)
-            or any(is_not_builtin(th) for th in type_hints)
-        ):
-            kwargs[name]["type"] = union_dict_and_str
-        elif contains_type(type_hints, dict):
-            kwargs[name]["type"] = parse_type(json.loads)
-            kwargs[name]["help"] += f"\n\n{json_tip}"
-        elif contains_type(type_hints, str) or any(
-            is_not_builtin(th) for th in type_hints
-        ):
-            kwargs[name]["type"] = str
-        else:
-            raise ValueError(f"Unsupported type {type_hints} for argument {name}.")
-
-        # If the type hint was a sequence of literals, use the helper function
-        # to update the type and choices
-        if get_origin(kwargs[name].get("type")) is Literal:
-            kwargs[name].update(literal_to_kwargs({kwargs[name]["type"]}))
-
-        # If None is in type_hints, make the argument optional.
-        # But not if it's a bool, argparse will handle this better.
-        if type(None) in type_hints and not contains_type(type_hints, bool):
-            kwargs[name]["type"] = optional_type(kwargs[name]["type"])
-            if kwargs[name].get("choices"):
-                kwargs[name]["choices"].append("None")
-    return kwargs
-
-
-def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
-    """Return argparse kwargs for the given Config dataclass.
 
     If `--help` or `mkdocs` are not present in the command line command, the
     attribute documentation will not be included in the help output.
@@ -335,13 +147,6 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     The heavy computation is cached via functools.lru_cache, and a deep copy
     is returned so callers can mutate the dictionary without affecting the
     cached version.
-    """
-    return copy.deepcopy(_compute_kwargs(cls))
-
-
-@dataclass
-class EngineArgs:
-    """Arguments for vLLM engine."""
 
     model: str = ModelConfig.model
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
@@ -539,57 +344,6 @@ class EngineArgs:
     logits_processors: list[str | type[LogitsProcessor]] | None = (
         ModelConfig.logits_processors
     )
-    """Custom logitproc types"""
-
-    async_scheduling: bool | None = SchedulerConfig.async_scheduling
-
-    stream_interval: int = SchedulerConfig.stream_interval
-
-    kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
-    optimization_level: OptimizationLevel = VllmConfig.optimization_level
-
-    kv_offloading_size: float | None = CacheConfig.kv_offloading_size
-    kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
-    tokens_only: bool = False
-
-    def __post_init__(self):
-        # support `EngineArgs(compilation_config={...})`
-        # without having to manually construct a
-        # CompilationConfig object
-        if isinstance(self.compilation_config, dict):
-            self.compilation_config = CompilationConfig(**self.compilation_config)
-        if isinstance(self.attention_config, dict):
-            self.attention_config = AttentionConfig(**self.attention_config)
-        if isinstance(self.eplb_config, dict):
-            self.eplb_config = EPLBConfig(**self.eplb_config)
-        # Setup plugins
-        from vllm.plugins import load_general_plugins
-
-        load_general_plugins()
-        # when use hf offline,replace model and tokenizer id to local model path
-        if huggingface_hub.constants.HF_HUB_OFFLINE:
-            model_id = self.model
-            self.model = get_model_path(self.model, self.revision)
-            if model_id is not self.model:
-                logger.info(
-                    "HF_HUB_OFFLINE is True, replace model_id [%s] to model_path [%s]",
-                    model_id,
-                    self.model,
-                )
-            if self.tokenizer is not None:
-                tokenizer_id = self.tokenizer
-                self.tokenizer = get_model_path(self.tokenizer, self.tokenizer_revision)
-                if tokenizer_id is not self.tokenizer:
-                    logger.info(
-                        "HF_HUB_OFFLINE is True, replace tokenizer_id [%s] "
-                        "to tokenizer_path [%s]",
-                        tokenizer_id,
-                        self.tokenizer,
-                    )
-
-    @staticmethod
-    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-        """Shared CLI arguments for vLLM engine."""
 
         # Model arguments
         model_kwargs = get_kwargs(ModelConfig)
@@ -1158,9 +912,6 @@ class EngineArgs:
         usage_context: UsageContext | None = None,
         headless: bool = False,
     ) -> VllmConfig:
-        """
-        Create the VllmConfig for single-GPU LiteEngine.
-        """
         current_platform.pre_register_and_update()
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
@@ -1410,250 +1161,6 @@ class EngineArgs:
         return config
 
     def _check_feature_supported(self, model_config: ModelConfig):
-        """Raise an error if the feature is not supported."""
-        if self.logits_processor_pattern != EngineArgs.logits_processor_pattern:
-            _raise_unsupported_error(feature_name="--logits-processor-pattern")
-
-        # No Concurrent Partial Prefills so far.
-        if (
-            self.max_num_partial_prefills != SchedulerConfig.max_num_partial_prefills
-            or self.max_long_partial_prefills
-            != SchedulerConfig.max_long_partial_prefills
-        ):
-            _raise_unsupported_error(feature_name="Concurrent Partial Prefill")
-
-        if self.pipeline_parallel_size > 1:
-            supports_pp = getattr(
-                self.distributed_executor_backend, "supports_pp", False
-            )
-            if not supports_pp and self.distributed_executor_backend not in (
-                ParallelConfig.distributed_executor_backend,
-                "uni",
-            ):
-                name = "Pipeline Parallelism is not supported in single-process mode"
-                _raise_unsupported_error(feature_name=name)
-
-    @classmethod
-    def get_batch_defaults(
-        cls,
-        world_size: int,
-    ) -> tuple[dict[UsageContext | None, int], dict[UsageContext | None, int]]:
-        from vllm.usage.usage_lib import UsageContext
-
-        default_max_num_batched_tokens: dict[UsageContext | None, int]
-        default_max_num_seqs: dict[UsageContext | None, int]
-
-        # When no user override, set the default values based on the usage
-        # context.
-        # Use different default values for different hardware.
-
-        # Try to query the device name on the current platform. If it fails,
-        # it may be because the platform that imports vLLM is not the same
-        # as the platform that vLLM is running on (e.g. the case of scaling
-        # vLLM with Ray) and has no GPUs. In this case we use the default
-        # values for non-H100/H200 GPUs.
-        try:
-            device_memory = current_platform.get_device_total_memory()
-            device_name = current_platform.get_device_name().lower()
-        except Exception:
-            # This is only used to set default_max_num_batched_tokens
-            device_memory = 0
-            device_name = ""
-
-        # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces
-        # throughput, see PR #17885 for more details.
-        # So here we do an extra device name check to prevent such regression.
-        if device_memory >= 70 * GiB_bytes and "a100" not in device_name:
-            # For GPUs like H100 and MI300x, use larger default values.
-            default_max_num_batched_tokens = {
-                UsageContext.LLM_CLASS: 16384,
-                UsageContext.OPENAI_API_SERVER: 8192,
-            }
-            default_max_num_seqs = {
-                UsageContext.LLM_CLASS: 1024,
-                UsageContext.OPENAI_API_SERVER: 1024,
-            }
-        else:
-            # TODO(woosuk): Tune the default values for other hardware.
-            default_max_num_batched_tokens = {
-                UsageContext.LLM_CLASS: 8192,
-                UsageContext.OPENAI_API_SERVER: 2048,
-            }
-            default_max_num_seqs = {
-                UsageContext.LLM_CLASS: 256,
-                UsageContext.OPENAI_API_SERVER: 256,
-            }
-
-        # tpu specific default values.
-        if current_platform.is_tpu():
-            chip_name = current_platform.get_device_name()
-
-            if chip_name == "V6E":
-                default_max_num_batched_tokens = {
-                    UsageContext.LLM_CLASS: 2048,
-                    UsageContext.OPENAI_API_SERVER: 1024,
-                }
-            elif chip_name == "V5E":
-                default_max_num_batched_tokens = {
-                    UsageContext.LLM_CLASS: 1024,
-                    UsageContext.OPENAI_API_SERVER: 512,
-                }
-            elif chip_name == "V5P":
-                default_max_num_batched_tokens = {
-                    UsageContext.LLM_CLASS: 512,
-                    UsageContext.OPENAI_API_SERVER: 256,
-                }
-
-        # cpu specific default values.
-        if current_platform.is_cpu():
-            default_max_num_batched_tokens = {
-                UsageContext.LLM_CLASS: 4096 * world_size,
-                UsageContext.OPENAI_API_SERVER: 2048 * world_size,
-            }
-            default_max_num_seqs = {
-                UsageContext.LLM_CLASS: 256 * world_size,
-                UsageContext.OPENAI_API_SERVER: 128 * world_size,
-            }
-
-        return default_max_num_batched_tokens, default_max_num_seqs
-
-    def _set_default_chunked_prefill_and_prefix_caching_args(
-        self, model_config: ModelConfig
-    ) -> None:
-        default_chunked_prefill = model_config.is_chunked_prefill_supported
-        default_prefix_caching = model_config.is_prefix_caching_supported
-
-        if self.enable_chunked_prefill is None:
-            self.enable_chunked_prefill = default_chunked_prefill
-
-            logger.debug(
-                "%s chunked prefill by default",
-                "Enabling" if default_chunked_prefill else "Disabling",
-            )
-        elif (
-            model_config.runner_type == "generate"
-            and not self.enable_chunked_prefill
-            and default_chunked_prefill
-        ):
-            logger.warning_once(
-                "This model does not officially support disabling chunked prefill. "
-                "Disabling this manually may cause the engine to crash "
-                "or produce incorrect outputs.",
-                scope="local",
-            )
-        elif (
-            model_config.runner_type == "pooling"
-            and self.enable_chunked_prefill
-            and not default_chunked_prefill
-        ):
-            logger.warning_once(
-                "This model does not officially support chunked prefill. "
-                "Enabling this manually may cause the engine to crash "
-                "or produce incorrect outputs.",
-                scope="local",
-            )
-
-        if self.enable_prefix_caching is None:
-            self.enable_prefix_caching = default_prefix_caching
-
-            logger.debug(
-                "%s prefix caching by default",
-                "Enabling" if default_prefix_caching else "Disabling",
-            )
-        elif (
-            model_config.runner_type == "pooling"
-            and self.enable_prefix_caching
-            and not default_prefix_caching
-        ):
-            logger.warning_once(
-                "This model does not officially support prefix caching. "
-                "Enabling this manually may cause the engine to crash "
-                "or produce incorrect outputs.",
-                scope="local",
-            )
-
-        # Disable chunked prefill and prefix caching for:
-        # POWER (ppc64le)/s390x/RISCV CPUs in V1
-        if current_platform.is_cpu() and current_platform.get_cpu_architecture() in (
-            CpuArchEnum.POWERPC,
-            CpuArchEnum.S390X,
-            CpuArchEnum.RISCV,
-        ):
-            logger.info(
-                "Chunked prefill is not supported for POWER, "
-                "S390X and RISC-V CPUs; "
-                "disabling it for V1 backend."
-            )
-            self.enable_chunked_prefill = False
-            logger.info(
-                "Prefix caching is not supported for POWER, "
-                "S390X and RISC-V CPUs; "
-                "disabling it for V1 backend."
-            )
-            self.enable_prefix_caching = False
-
-    def _set_default_max_num_seqs_and_batched_tokens_args(
-        self,
-        usage_context: UsageContext | None,
-        model_config: ModelConfig,
-    ):
-        world_size = self.pipeline_parallel_size * self.tensor_parallel_size
-        (
-            default_max_num_batched_tokens,
-            default_max_num_seqs,
-        ) = self.get_batch_defaults(world_size)
-
-        orig_max_num_batched_tokens = self.max_num_batched_tokens
-        orig_max_num_seqs = self.max_num_seqs
-
-        if self.max_num_batched_tokens is None:
-            self.max_num_batched_tokens = default_max_num_batched_tokens.get(
-                usage_context,
-                SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS,
-            )
-
-        if self.max_num_seqs is None:
-            self.max_num_seqs = default_max_num_seqs.get(
-                usage_context,
-                SchedulerConfig.DEFAULT_MAX_NUM_SEQS,
-            )
-
-        if orig_max_num_batched_tokens is None:
-            if not self.enable_chunked_prefill:
-                # If max_model_len is too short, use the default for higher throughput.
-                self.max_num_batched_tokens = max(
-                    model_config.max_model_len,
-                    self.max_num_batched_tokens,
-                )
-
-            # When using default settings,
-            # Ensure max_num_batched_tokens does not exceed model limit.
-            # Some models (e.g., Whisper) have embeddings tied to max length.
-            self.max_num_batched_tokens = min(
-                self.max_num_seqs * model_config.max_model_len,
-                self.max_num_batched_tokens,
-            )
-
-            logger.debug(
-                "Defaulting max_num_batched_tokens to %d for %s usage context.",
-                self.max_num_batched_tokens,
-                usage_context.value if usage_context else None,
-            )
-
-        if orig_max_num_seqs is None:
-            assert self.max_num_batched_tokens is not None  # For type checking
-            self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
-
-            logger.debug(
-                "Defaulting max_num_seqs to %d for %s usage context.",
-                self.max_num_seqs,
-                usage_context.value if usage_context else None,
-            )
-
-
-@dataclass
-class AsyncEngineArgs(EngineArgs):
-    """Arguments for asynchronous vLLM engine."""
 
     enable_log_requests: bool = False
 
@@ -1683,7 +1190,6 @@ class AsyncEngineArgs(EngineArgs):
         current_platform.pre_register_and_update(parser)
         return parser
 
-
 def _raise_unsupported_error(feature_name: str):
     msg = (
         f"{feature_name} is not supported. We recommend to "
@@ -1691,16 +1197,7 @@ def _raise_unsupported_error(feature_name: str):
     )
     raise NotImplementedError(msg)
 
-
 def human_readable_int(value: str) -> int:
-    """Parse human-readable integers like '1k', '2M', etc.
-    Including decimal values with decimal multipliers.
-
-    Examples:
-    - '1k' -> 1,000
-    - '1K' -> 1,024
-    - '25.6k' -> 25,600
-    """
     value = value.strip()
 
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT])", value)
@@ -1737,18 +1234,7 @@ def human_readable_int(value: str) -> int:
     # Regular plain number.
     return int(value)
 
-
 def human_readable_int_or_auto(value: str) -> int:
-    """Parse human-readable integers like '1k', '2M', etc.
-    Including decimal values with decimal multipliers.
-    Also accepts -1 or 'auto' as a special value for auto-detection.
-
-    Examples:
-    - '1k' -> 1,000
-    - '1K' -> 1,024
-    - '25.6k' -> 25,600
-    - '-1' or 'auto' -> -1 (special value for auto-detection)
-    """
     value = value.strip()
 
     if value == "-1" or value.lower() == "auto":

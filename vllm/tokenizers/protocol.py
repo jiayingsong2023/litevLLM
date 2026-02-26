@@ -8,7 +8,6 @@ if TYPE_CHECKING:
 
     from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
-
 class TokenizerLike(Protocol):
     @classmethod
     def from_pretrained(

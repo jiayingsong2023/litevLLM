@@ -19,7 +19,6 @@ if TYPE_CHECKING:
         ConversationMessage,
     )
 
-
 class BaseRenderer(ABC):
     @classmethod
     @abstractmethod

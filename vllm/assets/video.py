@@ -19,13 +19,8 @@ try:
 except ImportError:
     librosa = PlaceholderModule("librosa")  # type: ignore[assignment]
 
-
 @lru_cache
 def download_video_asset(filename: str) -> str:
-    """
-    Download and open an image from huggingface
-    repo: raushan-testing-hf/videos-test
-    """
     video_directory = get_cache_dir() / "video-example-data"
     video_directory.mkdir(parents=True, exist_ok=True)
 
@@ -39,7 +34,6 @@ def download_video_asset(filename: str) -> str:
             cache_dir=video_directory,
         )
     return video_path_str
-
 
 def video_to_ndarrays(path: str, num_frames: int = -1) -> npt.NDArray:
     import cv2
@@ -72,11 +66,9 @@ def video_to_ndarrays(path: str, num_frames: int = -1) -> npt.NDArray:
         )
     return frames
 
-
 def video_to_pil_images_list(path: str, num_frames: int = -1) -> list[Image.Image]:
     frames = video_to_ndarrays(path, num_frames)
     return [Image.fromarray(frame) for frame in frames]
-
 
 def video_get_metadata(path: str, num_frames: int = -1) -> dict[str, Any]:
     import cv2
@@ -104,9 +96,7 @@ def video_get_metadata(path: str, num_frames: int = -1) -> dict[str, Any]:
     }
     return metadata
 
-
 VideoAssetName = Literal["baby_reading"]
-
 
 @dataclass(frozen=True)
 class VideoAsset:
@@ -141,9 +131,4 @@ class VideoAsset:
         return ret
 
     def get_audio(self, sampling_rate: float | None = None) -> npt.NDArray:
-        """
-        Read audio data from the video asset, used in Qwen2.5-Omni examples.
-
-        See also: examples/offline_inference/qwen2_5_omni/only_thinker.py
-        """
         return librosa.load(self.video_path, sr=sampling_rate)[0]

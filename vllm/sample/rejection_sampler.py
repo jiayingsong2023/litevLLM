@@ -25,29 +25,7 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
 
-
 class RejectionSampler(nn.Module):
-    """
-    The implementation strictly follows the algorithm described in
-        https://arxiv.org/abs/2211.17192.
-    However, we want to clarify the terminology used in the implementation:
-    accepted tokens: tokens that are accepted based on the relationship
-            between the "raw" draft and target probabilities.
-    recovered tokens: tokens that are sampled based on the adjusted probability
-        distribution, which is derived from both the draft and target
-        probabilities.
-    bonus tokens:
-        If all proposed tokens are accepted, the bonus token is added to the
-        end of the sequence. The bonus token is only sampled from the target
-        probabilities. We pass in the bonus tokens instead of sampling them
-        in the rejection sampler to allow for more flexibility in the
-        sampling process. For example, we can use top_p, top_k sampling for
-        bonus tokens, while spec decode does not support these sampling
-        strategies.
-    output tokens:
-        Tokens are finally generated with the rejection sampler.
-        output tokens = accepted tokens + recovered tokens + bonus tokens
-    """
 
     def __init__(self, sampler: Sampler):
         super().__init__()
@@ -65,28 +43,6 @@ class RejectionSampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput:
-        """
-        Args:
-            metadata:
-                Metadata for spec decoding.
-            draft_probs (Optional[torch.Tensor]):
-                Probability distribution for the draft tokens. Shape is
-                [num_tokens, vocab_size]. Can be None if probabilities are
-                not provided, which is the case for ngram spec decode.
-            logits (torch.Tensor):
-                Target model's logits probability distribution.
-                Shape is [num_tokens + batch_size, vocab_size]. Here,
-                probabilities from different requests are flattened into a
-                single tensor because this is the shape of the output logits.
-                NOTE: `logits` can be updated in place to save memory.
-            sampling_metadata (vllm.sample.metadata.SamplingMetadata):
-                Additional metadata needed for sampling, such as temperature,
-                top-k/top-p parameters, or other relevant information.
-        Returns:
-            SamplerOutput:
-                Contains the final output token IDs and their logprobs if
-                requested.
-        """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
         bonus_logits_indices = metadata.bonus_logits_indices
@@ -220,18 +176,6 @@ class RejectionSampler(nn.Module):
         discard_req_indices: Sequence[int] = (),
         logprobs_tensors: LogprobsTensors | None = None,
     ) -> tuple[list[list[int]], LogprobsLists | None]:
-        """Parse the output of the rejection sampler.
-        Args:
-            output_token_ids: The sampled token IDs in shape
-                [batch_size, max_spec_len + 1]. The rejected tokens are
-                replaced with `PLACEHOLDER_TOKEN_ID` by the rejection sampler
-                and will be filtered out in this function.
-            vocab_size: The size of the vocabulary.
-            discard_req_indices: Optional row indices to discard tokens in.
-            logprobs_tensors: Optional logprobs tensors to filter.
-        Returns:
-            A list of lists of token IDs.
-        """
         output_token_ids_np = output_token_ids.cpu().numpy()
         # Create mask for valid tokens.
         valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
@@ -339,7 +283,6 @@ class RejectionSampler(nn.Module):
                 result.append([*result[-1], spec[i]])
         return result
 
-
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -440,28 +383,11 @@ def rejection_sample(
     )
     return output_token_ids
 
-
 def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
-    """Process logits based on sampling metadata.
-
-    This function applies temperature scaling to the logits,
-    as well as top-k and top-p. For greedy decoding, it returns
-    the original logits.
-
-    Args:
-        logits: Input logits tensor to be processed.
-        cu_num_draft_tokens: Cumulative number of draft tokens.
-        sampling_metadata: Metadata containing sampling parameters such as
-            temperature and whether greedy sampling is used.
-
-    Returns:
-        torch.Tensor: Processed logits if non-greedy sampling is used,
-        otherwise returns the original logits.
-    """
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     if sampling_metadata.all_greedy:
@@ -498,7 +424,6 @@ def apply_sampling_constraints(
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
 
-
 def expand_batch_to_tokens(
     x: torch.Tensor,  # [batch_size]
     cu_num_tokens: torch.Tensor,  # [batch_size]
@@ -506,25 +431,6 @@ def expand_batch_to_tokens(
     replace_from: int = 0,
     replace_to: int = 0,
 ) -> torch.Tensor:
-    """Expand [batch_size] tensor to [num_tokens] tensor based on the number of
-    tokens per batch in cu_num_tokens.
-
-    For example, if x = [a, b, c] and cu_num_tokens = [2, 5, 6], then
-    num_tokens = 6, and expanded_x = [a, a, b, b, b, c].
-
-    Args:
-        x: [batch_size] tensor to expand.
-        cu_num_tokens: [batch_size] tensor containing the cumulative number of
-            tokens per batch. Each element represents the total number of
-            tokens up to and including that batch.
-        num_tokens: Total number of tokens.
-        replace_from: int = 0
-            Value to be replaced if it is found in x.
-        replace_to: int = 0
-            Value to replace with when replace_from is found.
-    Returns:
-        expanded_x: [num_tokens] tensor.
-    """
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
@@ -538,38 +444,12 @@ def expand_batch_to_tokens(
     )
     return expanded_x
 
-
 def generate_uniform_probs(
     num_tokens: int,
     num_draft_tokens: list[int],
     generators: dict[int, torch.Generator],
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Generates a batch of uniform random samples, with optional seeding
-    if available.
-
-    This method creates a tensor of shape `(num_tokens, )` filled
-    with uniform random values in the range [0, 1). If `generators` is provided,
-    the requests with their own seeds will use the provided `torch.Generator`
-    for reproducibility. The samples for the other requests will be generated
-    without a seed.
-
-    Args:
-        num_tokens: int
-            Total number of tokens.
-        num_draft_tokens: List[List[int]]
-            Number of draft tokens per request.
-        generators: Optional[Dict[int, torch.Generator]]
-            A dictionary mapping indices in the batch to
-            `torch.Generator` objects.
-        device: torch.device
-            The device on which to allocate the tensor.
-    Returns:
-        uniform_rand: torch.Tensor
-            A tensor of shape `(num_tokens, )` containing uniform
-            random values in the range [0, 1).
-    """
     # NOTE(woosuk): We deliberately use float64 instead of float32 here
     # because when using float32, there's a non-negligible chance that
     # uniform_prob is sampled to be exact 0.0 as reported in
@@ -592,7 +472,6 @@ def generate_uniform_probs(
             uniform_probs[start_idx:end_idx].uniform_(generator=generator)
         start_idx = end_idx
     return uniform_probs
-
 
 def sample_recovered_tokens(
     max_spec_len: int,
@@ -637,7 +516,6 @@ def sample_recovered_tokens(
     )
     return recovered_token_ids
 
-
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_greedy_sample_kernel(
@@ -681,7 +559,6 @@ def rejection_greedy_sample_kernel(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,
         )
-
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
 @triton.jit(do_not_specialize=["max_spec_len"])
@@ -744,7 +621,6 @@ def rejection_random_sample_kernel(
             bonus_token_id,
         )
 
-
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
 @triton.jit(do_not_specialize=["replace_from", "replace_to"])
 def expand_kernel(
@@ -767,7 +643,6 @@ def expand_kernel(
     src_val = tl.where(src_val == replace_from, replace_to, src_val)
     offset = tl.arange(0, MAX_NUM_TOKENS)
     tl.store(output_ptr + start_idx + offset, src_val, mask=offset < num_tokens)
-
 
 @triton.jit
 def sample_recovered_tokens_kernel(

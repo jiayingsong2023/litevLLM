@@ -7,7 +7,6 @@ import vllm.envs as envs
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
 
-
 class FilesystemResolver(LoRAResolver):
     def __init__(self, lora_cache_dir: str):
         self.lora_cache_dir = lora_cache_dir
@@ -24,9 +23,6 @@ class FilesystemResolver(LoRAResolver):
     async def _get_lora_req_from_path(
         self, lora_name: str, lora_path: str, base_model_name: str
     ) -> LoRARequest | None:
-        """Builds a LoraRequest pointing to the lora path if it's a valid
-        LoRA adapter and has a matching base_model_name.
-        """
         if os.path.exists(lora_path):
             adapter_config_path = os.path.join(lora_path, "adapter_config.json")
 
@@ -45,18 +41,4 @@ class FilesystemResolver(LoRAResolver):
                     return lora_request
         return None
 
-
 def register_filesystem_resolver():
-    """Register the filesystem LoRA Resolver with vLLM"""
-
-    lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR
-    if lora_cache_dir:
-        if not os.path.exists(lora_cache_dir) or not os.path.isdir(lora_cache_dir):
-            raise ValueError(
-                "VLLM_LORA_RESOLVER_CACHE_DIR must be set to a valid directory \
-                for Filesystem Resolver plugin to function"
-            )
-        fs_resolver = FilesystemResolver(lora_cache_dir)
-        LoRAResolverRegistry.register_resolver("Filesystem Resolver", fs_resolver)
-
-    return

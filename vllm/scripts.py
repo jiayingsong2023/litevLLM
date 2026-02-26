@@ -6,7 +6,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-
 # Backwards compatibility for the move from vllm.scripts to
 # vllm.entrypoints.cli.main
 def main():

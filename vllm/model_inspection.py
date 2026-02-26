@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Model inspection utilities for vLLM."""
-
-import torch.nn as nn
-
-
-def _get_module_info(module: nn.Module) -> str:
-    """Get info string for a module."""
     class_name = type(module).__name__
     parts = []
 
@@ -32,17 +25,7 @@ def _get_module_info(module: nn.Module) -> str:
     # For unknown modules, use the default PyTorch repr
     return str(module)
 
-
 def _get_child_signature(child: nn.Module) -> str:
-    """Get a signature for a child module to detect duplicates."""
-    lines = []
-    for name, submodule in child.named_modules():
-        lines.append(f"{name}:{_get_module_info(submodule)}")
-    return "\n".join(lines)
-
-
-def _format_index_ranges(indices: list[int]) -> str:
-    """Format indices into range notation (e.g., [0,1,2,4,5,6] -> '0-2, 4-6')."""
     indices = sorted(indices)
     ranges = []
     start = end = indices[0]
@@ -57,24 +40,11 @@ def _format_index_ranges(indices: list[int]) -> str:
     ranges.append(str(start) if start == end else f"{start}-{end}")
     return ", ".join(ranges)
 
-
 def _format_module_tree(
     module: nn.Module,
     name: str = "",
     indent: int = 0,
 ) -> list[str]:
-    """Format a module tree with indentation, grouping identical layers.
-
-    Produces output like:
-        (layers): ModuleList(
-          (0-27, 29-47): 47 x LlamaDecoderLayer(
-            ...
-          )
-          (28, 48): 2 x DifferentDecoderLayer(
-            ...
-          )
-        )
-    """
     lines = []
     prefix = "  " * indent
     children = list(module.named_children())
@@ -130,7 +100,4 @@ def _format_module_tree(
     lines.append(f"{prefix})")
     return lines
 
-
 def format_model_inspection(model: nn.Module) -> str:
-    """Format a model into a transformers-style hierarchical string."""
-    return "\n".join(_format_module_tree(model))

@@ -1,8 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-LiteEngine: Optimized, Flattened, Single-GPU Inference Engine.
-Standardizes on Triton kernels and removes all distributed overhead.
-"""
 
 import asyncio
 import gc
@@ -72,45 +68,6 @@ class LiteEngine:
         logger.info("LiteEngine: Optimized single-GPU engine ready.")
 
     def _initialize_engine(self):
-        """Profile memory and allocate KV cache blocks."""
-        logger.info("LiteEngine: Profiling memory usage...")
-        
-        # 1. Profile: Run a dummy forward pass to get peak memory usage
-        # This is a simplified version of ModelRunner.profile_run
-        with torch.no_grad():
-            # Create dummy inputs for profiling
-            dummy_input_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-            dummy_positions = torch.zeros((1,), dtype=torch.long, device=self.device)
-            
-            # Temporary dummy cache for profiling
-            # (In a real engine, we'd calculate exact max_num_blocks here)
-            start_mem = torch.cuda.memory_allocated(self.device)
-            self.model(input_ids=dummy_input_ids, positions=dummy_positions, kv_caches=None, attn_metadata=None)
-            end_mem = torch.cuda.memory_allocated(self.device)
-            model_mem = end_mem - start_mem
-            logger.info(f"LiteEngine: Model weight/act memory: {model_mem / 1024**3:.2f} GB")
-
-        # 2. Allocate KV Cache based on remaining memory
-        # For now, we use a stable default or config value
-        if self.cache_config.num_gpu_blocks is None:
-            self.cache_config.num_gpu_blocks = 2048 
-            
-        from vllm.attention.selector import get_attn_backend
-        backend_cls = get_attn_backend(
-            self.model_config.get_head_size(),
-            self.model_config.dtype,
-            self.cache_config.cache_dtype,
-            self.cache_config.block_size,
-        )
-        self.attn_backend = backend_cls(self.vllm_config)
-        self.kv_cache = self.attn_backend.get_impl_cls().allocate_kv_cache(
-            num_blocks=self.cache_config.num_gpu_blocks,
-            device=self.device,
-        )
-        logger.info(f"LiteEngine: Allocated {self.cache_config.num_gpu_blocks} blocks of KV Cache.")
-
-    def _prepare_inputs(self, scheduler_output: Any):
-        """Prepare flattened tensors and Triton-specific metadata."""
         input_ids_list = []
         positions_list = []
         slot_mapping_list = []
@@ -152,34 +109,3 @@ class LiteEngine:
         return input_ids, positions, attn_metadata
 
     async def step(self) -> List[RequestOutput]:
-        """Core inference step integrating Continuous Batching."""
-        # 1. Scheduler: Get next batch of tokens to process
-        scheduler_output = self.scheduler.schedule()
-        if not scheduler_output.scheduled_requests:
-            return []
-
-        # 2. Input Prep: Direct-to-Triton Tensor mapping
-        input_ids, positions, attn_metadata = self._prepare_inputs(scheduler_output)
-
-        # 3. Model Forward: Pure Triton compute path
-        logits = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            kv_caches=self.kv_cache,
-            attn_metadata=attn_metadata
-        )
-
-        # 4. Sampling: Fast single-GPU sampler
-        # We reuse vllm sampler but with optimized metadata
-        from vllm.sample.metadata import SamplingMetadata
-        sampling_metadata = SamplingMetadata.from_scheduler_output(scheduler_output, self.device)
-        sampler_output = self.sampler(logits, sampling_metadata)
-
-        # 5. Update: Notify streams and update scheduler state
-        outputs = self.scheduler.update_from_output(sampler_output, scheduler_output)
-        
-        for output in outputs:
-            if output.request_id in self._request_streams:
-                self._request_streams[output.request_id].put_nowait(output)
-                
-        return outputs

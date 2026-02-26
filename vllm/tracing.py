@@ -47,10 +47,8 @@ except ImportError:
     class Tracer:  # type: ignore
         pass
 
-
 def is_otel_available() -> bool:
     return _is_otel_imported
-
 
 def init_tracer(
     instrumenting_module_name: str, otlp_traces_endpoint: str
@@ -70,7 +68,6 @@ def init_tracer(
     tracer = trace_provider.get_tracer(instrumenting_module_name)
     return tracer
 
-
 def get_span_exporter(endpoint):
     protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
     if protocol == "grpc":
@@ -86,7 +83,6 @@ def get_span_exporter(endpoint):
 
     return OTLPSpanExporter(endpoint=endpoint)
 
-
 def extract_trace_context(headers: Mapping[str, str] | None) -> Context | None:
     if is_otel_available():
         headers = headers or {}
@@ -94,10 +90,8 @@ def extract_trace_context(headers: Mapping[str, str] | None) -> Context | None:
     else:
         return None
 
-
 def extract_trace_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
     return {h: headers[h] for h in TRACE_HEADERS if h in headers}
-
 
 class SpanAttributes:
     # Attribute names copied from here to avoid version conflicts:
@@ -125,10 +119,8 @@ class SpanAttributes:
     GEN_AI_LATENCY_TIME_IN_MODEL_DECODE = "gen_ai.latency.time_in_model_decode"
     GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE = "gen_ai.latency.time_in_model_inference"
 
-
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:
     return any(h in headers for h in TRACE_HEADERS)
-
 
 @run_once
 def log_tracing_disabled_warning() -> None:

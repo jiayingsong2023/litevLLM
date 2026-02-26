@@ -21,7 +21,6 @@ from .protocol import BaseRenderer
 
 logger = init_logger(__name__)
 
-
 def safe_apply_chat_template(
     tokenizer: MistralTokenizer,
     messages: list[ChatCompletionMessageParam],
@@ -47,7 +46,6 @@ def safe_apply_chat_template(
             "An error occurred in `mistral_common` while applying chat template"
         )
         raise ValueError(str(e)) from e
-
 
 class MistralRenderer(BaseRenderer):
     @classmethod

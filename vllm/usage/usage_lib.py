@@ -43,14 +43,7 @@ _USAGE_ENV_VARS_TO_COLLECT = [
     "VLLM_ENABLE_V1_MULTIPROCESSING",
 ]
 
-
 def set_runtime_usage_data(key: str, value: str | int | bool) -> None:
-    """Set global usage data that will be sent with every usage heartbeat."""
-    _GLOBAL_RUNTIME_DATA[key] = value
-
-
-def is_usage_stats_enabled():
-    """Determine whether or not we can send usage stats to the server.
     The logic is as follows:
     - By default, it should be enabled.
     - Three environment variables can disable it:
@@ -59,68 +52,6 @@ def is_usage_stats_enabled():
         - VLLM_NO_USAGE_STATS=1
     - A file in the home directory can disable it if it exists:
         - $HOME/.config/vllm/do_not_track
-    """
-    global _USAGE_STATS_ENABLED
-    if _USAGE_STATS_ENABLED is None:
-        do_not_track = envs.VLLM_DO_NOT_TRACK
-        no_usage_stats = envs.VLLM_NO_USAGE_STATS
-        do_not_track_file = os.path.exists(_USAGE_STATS_DO_NOT_TRACK_PATH)
-
-        _USAGE_STATS_ENABLED = not (do_not_track or no_usage_stats or do_not_track_file)
-    return _USAGE_STATS_ENABLED
-
-
-def _get_current_timestamp_ns() -> int:
-    return int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1e9)
-
-
-def _detect_cloud_provider() -> str:
-    # Try detecting through vendor file
-    vendor_files = [
-        "/sys/class/dmi/id/product_version",
-        "/sys/class/dmi/id/bios_vendor",
-        "/sys/class/dmi/id/product_name",
-        "/sys/class/dmi/id/chassis_asset_tag",
-        "/sys/class/dmi/id/sys_vendor",
-    ]
-    # Mapping of identifiable strings to cloud providers
-    cloud_identifiers = {
-        "amazon": "AWS",
-        "microsoft corporation": "AZURE",
-        "google": "GCP",
-        "oraclecloud": "OCI",
-    }
-
-    for vendor_file in vendor_files:
-        path = Path(vendor_file)
-        if path.is_file():
-            file_content = path.read_text().lower()
-            for identifier, provider in cloud_identifiers.items():
-                if identifier in file_content:
-                    return provider
-
-    # Try detecting through environment variables
-    env_to_cloud_provider = {
-        "RUNPOD_DC_ID": "RUNPOD",
-    }
-    for env_var, provider in env_to_cloud_provider.items():
-        if os.environ.get(env_var):
-            return provider
-
-    return "UNKNOWN"
-
-
-class UsageContext(str, Enum):
-    UNKNOWN_CONTEXT = "UNKNOWN_CONTEXT"
-    LLM_CLASS = "LLM_CLASS"
-    API_SERVER = "API_SERVER"
-    OPENAI_API_SERVER = "OPENAI_API_SERVER"
-    OPENAI_BATCH_RUNNER = "OPENAI_BATCH_RUNNER"
-    ENGINE_CONTEXT = "ENGINE_CONTEXT"
-
-
-class UsageMessage:
-    """Collect platform information and send it to the usage stats server."""
 
     def __init__(self) -> None:
         # NOTE: vLLM's server _only_ support flat KV pair.
@@ -242,11 +173,6 @@ class UsageMessage:
         self._send_to_server(data)
 
     def _report_continuous_usage(self):
-        """Report usage every 10 minutes.
-
-        This helps us to collect more data points for uptime of vLLM usages.
-        This function can also help send over performance metrics over time.
-        """
         while True:
             time.sleep(600)
             data = {
@@ -272,6 +198,5 @@ class UsageMessage:
         with open(_USAGE_STATS_JSON_PATH, "a") as f:
             json.dump(data, f)
             f.write("\n")
-
 
 usage_message = UsageMessage()

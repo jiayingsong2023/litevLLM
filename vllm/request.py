@@ -28,14 +28,8 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.core.kv_cache_utils import BlockHash
 
-
 @dataclass
 class StreamingUpdate:
-    """Lightweight data for streaming session continuation.
-
-    Contains only the fields needed to update an existing streaming session
-    with new input data.
-    """
 
     mm_features: list[MultiModalFeatureSpec] | None
     prompt_token_ids: list[int] | None
@@ -54,7 +48,6 @@ class StreamingUpdate:
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
         )
-
 
 class Request:
     def __init__(
@@ -269,10 +262,6 @@ class Request:
         return events
 
     def __lt__(self, other: "Request") -> bool:
-        """
-        Compare two requests based on priority, arrival time, and request ID.
-        Used in priority scheduling.
-        """
         if self.priority != other.priority:
             return self.priority < other.priority
         if self.arrival_time != other.arrival_time:
@@ -281,45 +270,4 @@ class Request:
             return self.request_id < other.request_id
         return id(self) < id(other)
 
-
 class RequestStatus(enum.IntEnum):
-    """Status of a request."""
-
-    WAITING = enum.auto()
-    WAITING_FOR_FSM = enum.auto()
-    WAITING_FOR_REMOTE_KVS = enum.auto()
-    WAITING_FOR_STREAMING_REQ = enum.auto()
-    RUNNING = enum.auto()
-    PREEMPTED = enum.auto()
-    # Note: anything after PREEMPTED will be considered
-    # as a finished status.
-    FINISHED_STOPPED = enum.auto()
-    FINISHED_LENGTH_CAPPED = enum.auto()
-    FINISHED_ABORTED = enum.auto()
-    FINISHED_IGNORED = enum.auto()
-    FINISHED_ERROR = enum.auto()
-
-    def __str__(self) -> str:
-        return self.name
-
-    @staticmethod
-    def is_finished(status: "RequestStatus") -> bool:
-        return status > RequestStatus.PREEMPTED
-
-    @staticmethod
-    def get_finished_reason(status: "RequestStatus") -> FinishReason | None:
-        return _FINISHED_REASON_MAP.get(status)
-
-
-# Mapping of finished statuses to their finish reasons.
-# NOTE: The ignored requests are the requests whose prompt lengths
-# are longer than the model's length cap. Therefore, the stop
-# reason should also be "length" as in OpenAI API.
-_FINISHED_REASON_MAP = {
-    RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
-    RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
-    RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
-    RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
-    RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
-    RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
-}

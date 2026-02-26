@@ -30,14 +30,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 _VLLM_TOKENIZERS = {
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Tokenizer"),
     "grok2": ("grok2", "Grok2Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
     "mistral": ("mistral", "MistralTokenizer"),
 }
-
 
 @dataclass
 class _TokenizerRegistry:
@@ -71,14 +69,12 @@ class _TokenizerRegistry:
         tokenizer_cls = self.load_tokenizer_cls(tokenizer_mode)
         return tokenizer_cls.from_pretrained(*args, **kwargs)
 
-
 TokenizerRegistry = _TokenizerRegistry(
     {
         mode: (f"vllm.tokenizers.{mod_relname}", cls_name)
         for mode, (mod_relname, cls_name) in _VLLM_TOKENIZERS.items()
     }
 )
-
 
 def resolve_tokenizer_args(
     tokenizer_name: str | Path,
@@ -171,9 +167,7 @@ def resolve_tokenizer_args(
 
     return tokenizer_mode, tokenizer_name, args, kwargs
 
-
 cached_resolve_tokenizer_args = lru_cache(resolve_tokenizer_args)
-
 
 def tokenizer_args_from_config(config: "ModelConfig", **kwargs):
     return cached_resolve_tokenizer_args(
@@ -185,9 +179,7 @@ def tokenizer_args_from_config(config: "ModelConfig", **kwargs):
         **kwargs,
     )
 
-
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
-
 
 def get_tokenizer(
     tokenizer_name: str | Path,
@@ -198,43 +190,3 @@ def get_tokenizer(
     download_dir: str | None = None,
     **kwargs,
 ) -> _T:
-    """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
-    tokenizer_mode, tokenizer_name, args, kwargs = cached_resolve_tokenizer_args(
-        tokenizer_name,
-        *args,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        download_dir=download_dir,
-        **kwargs,
-    )
-
-    if tokenizer_cls == TokenizerLike:
-        tokenizer_cls_ = TokenizerRegistry.load_tokenizer_cls(tokenizer_mode)
-    else:
-        tokenizer_cls_ = tokenizer_cls
-
-    tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
-    if not tokenizer.is_fast:
-        logger.warning(
-            "Using a slow tokenizer. This might cause a significant "
-            "slowdown. Consider using a fast tokenizer instead."
-        )
-
-    return tokenizer  # type: ignore
-
-
-cached_get_tokenizer = lru_cache(get_tokenizer)
-
-
-def cached_tokenizer_from_config(model_config: "ModelConfig", **kwargs):
-    if model_config.skip_tokenizer_init:
-        return None
-
-    return cached_get_tokenizer(
-        model_config.tokenizer,
-        runner_type=model_config.runner_type,
-        tokenizer_mode=model_config.tokenizer_mode,
-        revision=model_config.tokenizer_revision,
-        trust_remote_code=model_config.trust_remote_code,
-        **kwargs,
-    )

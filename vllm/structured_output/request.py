@@ -14,7 +14,6 @@ from vllm.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 
-
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
@@ -65,7 +64,6 @@ class StructuredOutputRequest:
     @functools.cached_property
     def structured_output_key(self) -> StructuredOutputKey:
         return get_structured_output_key(self.params)
-
 
 def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:
     if params.json is not None:

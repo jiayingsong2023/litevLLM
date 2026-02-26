@@ -46,7 +46,6 @@ else:
     import sre_constants
     import sre_parse
 
-
 @dataclass
 class OutlinesBackend(StructuredOutputBackend):
     def __post_init__(self):
@@ -102,7 +101,6 @@ class OutlinesBackend(StructuredOutputBackend):
     def destroy(self):
         pass
 
-
 @dataclass
 class OutlinesGrammar(StructuredOutputGrammar):
     vocab_size: int
@@ -116,11 +114,6 @@ class OutlinesGrammar(StructuredOutputGrammar):
     _prev_finished: bool = field(default=False, init=False, repr=False, hash=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
-        """Accepts a list of tokens and advances the FSM.
-
-        Returns True if the FSM was advanced successfully.
-        Returns False if the FSM failed to advance.
-        """
         if self.guide.accepts_tokens(tokens):
             # Advance can fail when the next state reached after advancing with
             # the current tokens is a dead state. This is because Guide.accepts_tokens()
@@ -162,7 +155,6 @@ class OutlinesGrammar(StructuredOutputGrammar):
         self._prev_finished = False
         self.guide.reset()
 
-
 def validate_structured_output_request_outlines(params: SamplingParams):
     if params.structured_outputs is None:
         return
@@ -198,12 +190,7 @@ def validate_structured_output_request_outlines(params: SamplingParams):
             "does not support grammar specifications"
         )
 
-
 def _prefix_needs_context(parsed) -> bool:
-    """Return True if there's a look-around/anchor before any consumer."""
-
-    def subpattern_consumes(parsed) -> bool:
-        """Return True if subpattern can consume at least one character."""
         tokens = parsed.data if hasattr(parsed, "data") else parsed
         for ttype, tval in tokens:
             # literal, character class, or dot always consumes
@@ -267,63 +254,9 @@ def _prefix_needs_context(parsed) -> bool:
 
     return False
 
-
 def _check_unsupported(parsed) -> None:
-    """Check for regex features unsupported by regex-automata"""
-    tokens = parsed.data if hasattr(parsed, "data") else parsed
-    for ttype, tval in tokens:
-        # backreference
-        if ttype in (sre_parse.GROUPREF, sre_parse.GROUPREF_EXISTS):
-            raise ValueError("Backreferences are unsupported.")
-
-        # look-around assertion
-        elif ttype in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
-            raise ValueError("Look-Around assertion are unsupported.")
-
-        # unicode word boundaries
-        elif ttype == sre_parse.AT:
-            if tval in (sre_constants.AT_BOUNDARY, sre_constants.AT_NON_BOUNDARY):
-                raise ValueError("Unicode word boundaries are unsupported.")
-
-        elif ttype == sre_parse.BRANCH:
-            # tval is (None, branches)
-            for branch in tval[1]:
-                _check_unsupported(branch)
-
-        # tval is (min, max, subpattern)
-        elif ttype == sre_parse.MAX_REPEAT:
-            _check_unsupported(tval[2])
-
-
-def validate_regex_is_buildable(pattern: str) -> None:
-    """
     Validates that the input regex is not using unsupported features
     of the `regex-automata` crate (outlines_core regex engine) and has a
     universal start state.
     definition of universal start state used can be found at:
     https://docs.rs/regex-automata/latest/regex_automata/dfa/trait.Automaton.html#method.universal_start_state
-    """
-    try:
-        parsed = sre_parse.parse(pattern)
-
-    except sre_constants.error as e:
-        raise ValueError(f"Error parsing regex: {e}") from e
-
-    try:
-        _check_unsupported(parsed)
-    except ValueError as e:
-        raise ValueError(
-            f"Regex uses unsupported feature for structured outputs: {e}. "
-            "Only basic matching constructs are supported—lookarounds, "
-            "backreferences, and unicode boundaries are not."
-        ) from e
-
-    if _prefix_needs_context(parsed):
-        raise ValueError(
-            "Regex does not have a anchored universal start state"
-            "This means that the Regex uses anchors (^) or look-arounds "
-            "in a way which requires context before any token is matched."
-            "structured outputs needs regexes that can match without needing "
-            "that context. Try rewriting the pattern without using these "
-            f"constructs. Pattern:\n{pattern}"
-        )

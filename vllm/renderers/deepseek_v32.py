@@ -19,7 +19,6 @@ from .protocol import BaseRenderer
 
 logger = init_logger(__name__)
 
-
 class DeepseekV32Renderer(BaseRenderer):
     @classmethod
     def from_config(

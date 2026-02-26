@@ -18,7 +18,6 @@ from .protocol import BaseRenderer
 
 logger = init_logger(__name__)
 
-
 class TerratorchRenderer(BaseRenderer):
     @classmethod
     def from_config(

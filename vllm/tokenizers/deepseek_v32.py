@@ -12,7 +12,6 @@ from .deepseek_v32_encoding import encode_messages
 from .hf import CachedHfTokenizer
 from .protocol import TokenizerLike
 
-
 class DeepseekV32Tokenizer(CachedHfTokenizer):
     @classmethod
     def from_pretrained(

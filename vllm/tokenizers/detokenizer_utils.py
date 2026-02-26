@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 from vllm.tokenizers import TokenizerLike
-
 
 def _replace_none_with_empty(tokens: list[str | None]):
     for i, token in enumerate(tokens):
         if token is None:
             tokens[i] = ""
-
 
 def _convert_tokens_to_string_with_added_encoders(
     tokenizer: TokenizerLike,
@@ -50,23 +47,15 @@ def _convert_tokens_to_string_with_added_encoders(
         return " ".join(sub_texts)
     return "".join(sub_texts)
 
-
 # 5 is an arbitrary value that should work for all
 # tokenizers (bigger = more conservative).
 INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-
 
 def convert_prompt_ids_to_tokens(
     tokenizer: TokenizerLike,
     prompt_ids: list[int],
     skip_special_tokens: bool = False,
 ) -> tuple[list[str], int, int]:
-    """Converts the prompt ids to tokens and returns the tokens and offsets
-    for incremental detokenization.
-
-    Note that not all tokens are converted to strings. Only the tokens that
-    are necessary for incremental detokenization are converted to strings.
-    """
     # We do not need to convert the whole prompt to tokens.
     # Offset a little more in case we have special tokens.
     new_tokens = tokenizer.convert_ids_to_tokens(
@@ -79,21 +68,10 @@ def convert_prompt_ids_to_tokens(
     _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]
     return new_tokens, prefix_offset, read_offset
 
-
 def convert_ids_list_to_tokens(
     tokenizer: TokenizerLike,
     token_ids: list[int],
 ) -> list[str]:
-    """Detokenize the input ids individually.
-
-    Args:
-      tokenizer: tokenizer used by model under test
-      token_ids: convert these tokens (Python list form)
-
-    Returns:
-      Python list of token string representations
-
-    """
     token_str_lst = []
     for token_id in token_ids:
         # use default skip_special_tokens.
@@ -102,7 +80,6 @@ def convert_ids_list_to_tokens(
             token_str = ""
         token_str_lst.append(token_str)
     return token_str_lst
-
 
 # Based on
 # https://github.com/huggingface/text-generation-inference/blob/v0.9.4/server/text_generation_server/models/model.py#L62C9-L62C15
@@ -116,30 +93,6 @@ def detokenize_incrementally(
     skip_special_tokens: bool = False,
     spaces_between_special_tokens: bool = True,
 ) -> tuple[list[str], str, int, int]:
-    """Detokenizes the input ids incrementally and returns the new tokens
-    and the new text.
-
-    If `prev_tokens` is None, this function will convert the input ids to
-    tokens and return the tokens and the new text. Otherwise, it will return the
-    new tokens and the new text.
-
-    This function will also return the new prefix offset and the new read
-    offset to be used in the next iteration.
-
-    The offsets are necessary to defeat cleanup algorithms in the decode which
-    decide to add a space or not depending on the surrounding ids.
-
-    Args:
-        tokenizer: The tokenizer to use.
-        all_input_ids: The input ids. The last id is the new token id.
-        prev_tokens: The previous tokens. If None, this function will convert
-            the input ids to tokens and return the tokens and the new text.
-        prefix_offset: The prefix offset.
-        read_offset: The read offset.
-        skip_special_tokens: Whether to skip special tokens.
-        spaces_between_special_tokens: Whether to add spaces between special
-            tokens.
-    """
     new_token_id = all_input_ids[-1]
     # This is the first iteration for this sequence
     is_first_iter = prev_tokens is None

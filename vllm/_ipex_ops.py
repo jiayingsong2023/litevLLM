@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
 import torch
 
 from vllm.logger import init_logger
@@ -13,7 +12,6 @@ try:
     import intel_extension_for_pytorch as ipex
 except ImportError as e:
     logger.debug("Import error msg: %s", e.msg)
-
 
 class ipex_ops:
     @staticmethod
@@ -398,30 +396,6 @@ class ipex_ops:
         use_per_token_if_dynamic: bool = False,
         output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Quantize input tensor to FP8 and return quantized tensor and scale.
-
-        This function is designed for both static and dynamic quantization:
-        If you provide the scale, it will use static scaling and if you omit
-        it, the scale will be determined dynamically. Currently, XPU platform
-        only supports dynamic quantization. The function also allows optional
-        padding of the output tensors for downstream kernels that will benefit
-        from padding.
-
-        Args:
-            input: The input tensor to be quantized to FP8
-            scale: Optional scaling factor for the FP8 quantization
-            scale_ub: Optional upper bound for scaling factor in dynamic
-                per token case
-            num_token_padding: If specified, pad the first dimension
-                of the output to at least this value.
-            use_per_token_if_dynamic: Whether to do per_tensor or per_token
-                in the dynamic quantization case.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: The output tensor in FP8 and
-                scaling factor.
-        """
         # This code assumes batch_dim and num_tokens are flattened
         assert input.ndim == 2
         shape: tuple[int, int] | torch.Size = input.shape

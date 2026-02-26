@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-
 _VLLM_RENDERERS = {
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Renderer"),
     "hf": ("hf", "HfRenderer"),
@@ -22,7 +21,6 @@ _VLLM_RENDERERS = {
     "mistral": ("mistral", "MistralRenderer"),
     "terratorch": ("terratorch", "TerratorchRenderer"),
 }
-
 
 @dataclass
 class RendererRegistry:
@@ -61,28 +59,9 @@ class RendererRegistry:
         renderer_cls = self.load_renderer_cls(renderer_mode)
         return renderer_cls.from_config(config, tokenizer_kwargs)
 
-
 RENDERER_REGISTRY = RendererRegistry(
     {
         mode: (f"vllm.renderers.{mod_relname}", cls_name)
         for mode, (mod_relname, cls_name) in _VLLM_RENDERERS.items()
     }
 )
-"""The global `RendererRegistry` instance."""
-
-
-def renderer_from_config(config: "ModelConfig", **kwargs):
-    tokenizer_mode, tokenizer_name, args, kwargs = tokenizer_args_from_config(
-        config, **kwargs
-    )
-
-    if config.tokenizer_mode == "auto" and config.model_impl == "terratorch":
-        renderer_mode = "terratorch"
-    else:
-        renderer_mode = tokenizer_mode
-
-    return RENDERER_REGISTRY.load_renderer(
-        renderer_mode,
-        config,
-        tokenizer_kwargs={**kwargs, "tokenizer_name": tokenizer_name},
-    )

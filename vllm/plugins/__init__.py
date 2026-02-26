@@ -24,7 +24,6 @@ STAT_LOGGER_PLUGINS_GROUP = "vllm.stat_logger_plugins"
 # make sure one process only loads plugins once
 plugins_loaded = False
 
-
 def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
     from importlib.metadata import entry_points
 
@@ -64,12 +63,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
     return plugins
 
-
 def load_general_plugins():
-    """WARNING: plugins can be loaded for multiple times in different
-    processes. They should be designed in a way that they can be loaded
-    multiple times without causing issues.
-    """
     global plugins_loaded
     if plugins_loaded:
         return

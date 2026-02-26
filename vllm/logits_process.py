@@ -11,12 +11,6 @@ LogitsProcessor: TypeAlias = (
     Callable[[list[int], torch.Tensor], torch.Tensor]
     | Callable[[list[int], list[int], torch.Tensor], torch.Tensor]
 )
-"""LogitsProcessor is a function that takes a list
-of previously generated tokens, the logits tensor
-for the next token and, optionally, prompt tokens as a
-first argument, and returns a modified tensor of logits
-to sample from."""
-
 
 def get_bad_words_logits_processors(
     bad_words: list[str], tokenizer: TokenizerLike
@@ -43,7 +37,6 @@ def get_bad_words_logits_processors(
                 bad_words_ids.append(prompt_token_ids)
 
     return [NoBadWordsLogitsProcessor(bad_words_ids=bad_words_ids)]
-
 
 class NoBadWordsLogitsProcessor:
     _SMALLEST_LOGIT = float("-inf")

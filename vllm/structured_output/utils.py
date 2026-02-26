@@ -35,11 +35,9 @@ else:
         "convert_slow_tokenizer", globals(), "transformers.convert_slow_tokenizer"
     )
 
-
 logger = init_logger(__name__)
 
 CACHE = None
-
 
 def apply_grammar_bitmask(
     scheduler_output: SchedulerOutput,
@@ -47,14 +45,6 @@ def apply_grammar_bitmask(
     input_batch: InputBatch,
     logits: torch.Tensor,
 ) -> None:
-    """
-    Apply grammar bitmask to output logits of the model with xgrammar function.
-
-    Args:
-        scheduler_output (SchedulerOutput): The result of engine scheduling.
-        input_batch (InputBatch): The input of model runner.
-        logits (torch.Tensor): The output logits of model forward.
-    """
     # Serialization of np.ndarray is much more efficient than a tensor,
     # so we receive it in that format.
     grammar_bitmask = grammar_output.grammar_bitmask
@@ -118,12 +108,7 @@ def apply_grammar_bitmask(
 
     xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)
 
-
 class OutlinesVocabulary:
-    """
-    Wrapper class for `outlines_core.Vocabulary`,
-    which allows us to store a hash with the vocabulary
-    """
 
     def __init__(self, vocabulary: oc.Vocabulary) -> None:
         # Actual vocabulary object
@@ -134,33 +119,7 @@ class OutlinesVocabulary:
         hash_int = int(hex_str, 16)
         self._hash = hash_int
 
-
 def get_outlines_cache_path() -> str:
-    """Get the context object that contains previously-computed return values"""
-    outlines_cache_dir = os.getenv("OUTLINES_CACHE_DIR")
-    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
-    home_dir = os.path.expanduser("~")
-
-    if outlines_cache_dir:
-        # OUTLINES_CACHE_DIR takes precedence
-        return outlines_cache_dir
-    if xdg_cache_home:
-        return os.path.join(xdg_cache_home, ".cache", "outlines")
-    # If homedir is "/", we may be inside a container, and thus writing to
-    # root would be problematic, so we fall back to using a tempfile.
-    # Also validate the path exists, since os.path.expanduser does
-    # not guarantee existence.
-    if os.path.isdir(home_dir) and home_dir != "/":
-        # Default Unix fallback: ~/.cache/outlines
-        return os.path.join(home_dir, ".cache", "outlines")
-
-    # home_dir may be / inside a docker container without existing user
-    tempdir = tempfile.gettempdir()
-    return os.path.join(tempdir, ".cache", "outlines")
-
-
-def get_outlines_cache():
-    """Get the Cache instance to be used for index caching"""
 
     cache_dir = get_outlines_cache_path()
     if envs.VLLM_V1_USE_OUTLINES_CACHE:
@@ -180,19 +139,12 @@ def get_outlines_cache():
 
     return LRUCache(maxsize=128)
 
-
 re_llama_byte_token = re.compile(r"^<0x[0-9A-F]{2}>$")
 re_replacement_seq = re.compile(r"^.{0,6}�+.{0,6}$")
-
 
 def _reduced_vocabulary(
     tokenizer: TokenizerLike, eos_token_id: int
 ) -> dict[bytes, list[int]]:
-    """Create a map from vocabulary tokens to lists of equivalent token ids.
-
-    Returns:
-        A Dict of token string -> equivalent token ids
-    """
 
     unicode_to_bytes = {
         v: k for k, v in convert_slow_tokenizer.bytes_to_unicode().items()
@@ -254,40 +206,7 @@ def _reduced_vocabulary(
 
     return vocabulary
 
-
 def get_outlines_vocabulary(tokenizer: TokenizerLike) -> oc.Vocabulary:
-    """Get the `Vocabulary` object for a given tokenizer."""
-    if hasattr(tokenizer, "_outlines_vocabulary"):
-        return tokenizer._outlines_vocabulary  # type: ignore
-
-    try:
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            eos_token_id = tokenizer.eos_token_id
-        else:
-            raise ValueError(
-                "Error during structured outputs setup for outlines: Tokenizer "
-                f"({type(tokenizer)}) has no `eos_token_id` property, but "
-                "`eos_token_id` is required for structured outputs to work properly."
-            )
-
-        reduced_vocab = _reduced_vocabulary(
-            tokenizer,
-            eos_token_id,  # type: ignore
-        )
-        vocabulary = OutlinesVocabulary(oc.Vocabulary(eos_token_id, reduced_vocab))
-        tokenizer._outlines_vocabulary = vocabulary  # type: ignore
-
-        return vocabulary
-    except AttributeError as e:
-        raise ValueError(
-            "Cannot get the vocabulary of the tokenizer "
-            f"({type(tokenizer)}). The tokenizer should have a "
-            "get_vocab method."
-        ) from e
-
-
-def grammar_is_likely_lark(grammar_str: str) -> bool:
-    """
     Check if grammar appears to use Lark syntax.
 
     Args:
@@ -301,25 +220,6 @@ def grammar_is_likely_lark(grammar_str: str) -> bool:
         True
         >>> grammar_is_likely_lark("rule ::= 'abc'")
         False
-    """
-    if not grammar_str or not isinstance(grammar_str, str):
-        return False
-
-    for line in grammar_str.split("\n"):
-        # Remove both comment styles
-        line = re.sub(r"(#|//).*$", "", line).strip()
-        if not line:
-            continue
-
-        # Look for EBNF rule definition
-        if "::=" in line:
-            return False
-
-    return True
-
-
-def convert_lark_to_ebnf(grammar_str: str) -> str:
-    """
     Convert a Lark grammar string to EBNF format.
 
     EBNF reference:
@@ -337,27 +237,9 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
         >>> print(convert_lark_to_ebnf("rule: 'hello'"))
         root ::= rule
         rule ::= "hello"
-    """
-    if not isinstance(grammar_str, str):
-        raise ValueError(f"Grammar must be a string, got {type(grammar_str)}")
-    if not grammar_str.strip():
-        raise ValueError("Grammar string cannot be empty")
-
-    defined_rules = set()
-    referenced_rules = set()
-    output_lines = []
-
-    def clean_line(line: str) -> str:
-        """Remove comments and whitespace from line."""
         return re.sub(r"(#|//).*$", "", line).strip()
 
     def check_quotes(text: str, rule_name: str, line_num: int) -> None:
-        """Validate quote matching in text."""
-        if text.count("'") % 2 != 0 or text.count('"') % 2 != 0:
-            raise ValueError(f"Mismatched quotes in {rule_name} on line {line_num}")
-
-    def extract_references(text: str) -> set[str]:
-        """Extract rule references from text."""
         # Remove quoted strings and special characters
         text = re.sub(r'"[^"]*"', "", text)
         text = re.sub(r"[+*?()|\[\]{}]", " ", text)
@@ -447,13 +329,5 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
 
     return "\n".join(output_lines)
 
-
 def choice_as_grammar(choice: list[str]) -> str:
     def escape_ebnf_string(s: str) -> str:
-        """Escape special characters in a EBNF string."""
-        # Escape double quotes and backslashes
-        return re.sub(r'(["\\])', r"\\\1", s)
-
-    escaped_choices = (escape_ebnf_string(c) for c in choice)
-    grammar = "root ::= " + " | ".join(f'"{c}"' for c in escaped_choices)
-    return grammar

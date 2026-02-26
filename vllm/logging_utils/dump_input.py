@@ -15,7 +15,6 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
-
 def prepare_object_to_dump(obj) -> str:
     if isinstance(obj, str):
         return f"'{obj}'"  # Double quotes
@@ -52,7 +51,6 @@ def prepare_object_to_dump(obj) -> str:
         except (TypeError, OverflowError):
             return repr(obj)
 
-
 def dump_engine_exception(
     config: VllmConfig,
     scheduler_output: SchedulerOutput,
@@ -62,7 +60,6 @@ def dump_engine_exception(
     # unexpected errors during logging
     with contextlib.suppress(Exception):
         _dump_engine_exception(config, scheduler_output, scheduler_stats)
-
 
 def _dump_engine_exception(
     config: VllmConfig,

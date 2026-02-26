@@ -39,7 +39,6 @@ logger = init_logger(__name__)
 
 T = TypeVar("T")
 
-
 class ConstantList(Generic[T], Sequence):
     def __init__(self, x: list[T]) -> None:
         self._x = x
@@ -101,80 +100,15 @@ class ConstantList(Generic[T], Sequence):
     def copy(self) -> list[T]:
         return self._x.copy()
 
-
 class CpuGpuBuffer:
-    """Buffer to easily copy tensors between CPU and GPU."""
-
-    def __init__(
-        self,
-        *size: int | torch.SymInt,
-        dtype: torch.dtype,
-        device: torch.device,
-        pin_memory: bool,
-        with_numpy: bool = True,
-    ) -> None:
-        self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
-        self.gpu = torch.zeros_like(self.cpu, device=device)
-        self.np: np.ndarray
-        # To keep type hints simple (avoiding generics and subclasses), we
-        # only conditionally create the numpy array attribute. This can cause
-        # AttributeError if `self.np` is accessed when `with_numpy=False`.
-        if with_numpy:
-            if dtype == torch.bfloat16:
-                raise ValueError(
-                    "Bfloat16 torch tensors cannot be directly cast to a "
-                    "numpy array, so call CpuGpuBuffer with with_numpy=False"
-                )
-            self.np = self.cpu.numpy()
-
-    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
-        if n is None:
-            return self.gpu.copy_(self.cpu, non_blocking=True)
-        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
-
-    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
-        """NOTE: Because this method is non-blocking, explicit synchronization
-        is needed to ensure the data is copied to CPU."""
-        if n is None:
-            return self.cpu.copy_(self.gpu, non_blocking=True)
-        return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
-
-
-def get_engine_client_zmq_addr(local_only: bool, host: str, port: int = 0) -> str:
-    """Assign a new ZMQ socket address.
 
     If local_only is True, participants are colocated and so a unique IPC
     address will be returned.
 
     Otherwise, the provided host and port will be used to construct a TCP
-    address (port == 0 means assign an available port)."""
-
-    return (
-        get_open_zmq_ipc_path()
-        if local_only
-        else (get_tcp_uri(host, port or get_open_port()))
-    )
-
-
-class APIServerProcessManager:
-    """Manages a group of API server processes.
 
     Handles creation, monitoring, and termination of API server worker
     processes. Also monitors extra processes to check if they are healthy.
-    """
-
-    def __init__(
-        self,
-        target_server_fn: Callable,
-        listen_address: str,
-        sock: Any,
-        args: argparse.Namespace,
-        num_servers: int,
-        input_addresses: list[str],
-        output_addresses: list[str],
-        stats_update_address: str | None = None,
-    ):
-        """Initialize and start API server worker processes.
 
         Args:
             target_server_fn: Function to call for each API server process
@@ -185,52 +119,6 @@ class APIServerProcessManager:
             input_addresses: Input addresses for each API server
             output_addresses: Output addresses for each API server
             stats_update_address: Optional stats update address
-        """
-        self.listen_address = listen_address
-        self.sock = sock
-        self.args = args
-
-        # Start API servers
-        spawn_context = multiprocessing.get_context("spawn")
-        self.processes: list[BaseProcess] = []
-
-        for i, in_addr, out_addr in zip(
-            range(num_servers), input_addresses, output_addresses
-        ):
-            client_config = {
-                "input_address": in_addr,
-                "output_address": out_addr,
-                "client_count": num_servers,
-                "client_index": i,
-            }
-            if stats_update_address is not None:
-                client_config["stats_update_address"] = stats_update_address
-
-            proc = spawn_context.Process(
-                target=target_server_fn,
-                name=f"ApiServer_{i}",
-                args=(listen_address, sock, args, client_config),
-            )
-            self.processes.append(proc)
-            proc.start()
-
-        logger.info("Started %d API server processes", len(self.processes))
-
-        # Shutdown only the API server processes on garbage collection
-        # The extra processes are managed by their owners
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
-
-    def close(self) -> None:
-        self._finalizer()
-
-
-def wait_for_completion_or_failure(
-    api_server_manager: APIServerProcessManager,
-    engine_manager: Union["CoreEngineProcManager", "CoreEngineActorManager"]
-    | None = None,
-    coordinator: "DPCoordinator | None" = None,
-) -> None:
-    """Wait for all processes to complete or detect if any fail.
 
     Raises an exception if any process exits with a non-zero status.
 
@@ -240,103 +128,12 @@ def wait_for_completion_or_failure(
             If CoreEngineProcManager, it manages local engines;
             if CoreEngineActorManager, it manages all engines.
         coordinator: The coordinator for data parallel.
-    """
-
-    from vllm.engine.v1.utils import CoreEngineActorManager, CoreEngineProcManager
-
-    try:
-        logger.info("Waiting for API servers to complete ...")
-        # Create a mapping of sentinels to their corresponding processes
-        # for efficient lookup
-        sentinel_to_proc: dict[Any, BaseProcess] = {
-            proc.sentinel: proc for proc in api_server_manager.processes
-        }
-
-        if coordinator:
-            sentinel_to_proc[coordinator.proc.sentinel] = coordinator.proc
-
-        actor_run_refs = []
-        if isinstance(engine_manager, CoreEngineProcManager):
-            for proc in engine_manager.processes:
-                sentinel_to_proc[proc.sentinel] = proc
-        elif isinstance(engine_manager, CoreEngineActorManager):
-            actor_run_refs = engine_manager.get_run_refs()
-
-        # Check if any process terminates
-        while sentinel_to_proc or actor_run_refs:
-            # Wait for any process to terminate
-            ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
-
-            # Process any terminated processes
-            for sentinel in ready_sentinels:
-                proc = sentinel_to_proc.pop(sentinel)
-
-                # Check if process exited with error
-                if proc.exitcode != 0:
-                    raise RuntimeError(
-                        f"Process {proc.name} (PID: {proc.pid}) "
-                        f"died with exit code {proc.exitcode}"
-                    )
-
-            if actor_run_refs:
-                import ray
-
-                _, actor_run_refs = ray.wait(actor_run_refs, timeout=5)
-
-    except KeyboardInterrupt:
-        logger.info("Received KeyboardInterrupt, shutting down API servers...")
-    except Exception as e:
-        logger.exception("Exception occurred while running API servers: %s", str(e))
-        raise
-    finally:
-        logger.info("Terminating remaining processes ...")
-        api_server_manager.close()
-        if coordinator:
-            coordinator.close()
-        if engine_manager:
-            engine_manager.close()
-
-
-# Note(rob): shutdown function cannot be a bound method,
-# else the gc cannot collect the object.
-def shutdown(procs: list[BaseProcess]):
-    # Shutdown the process.
-    for proc in procs:
-        if proc.is_alive():
-            proc.terminate()
-
-    # Allow 5 seconds for remaining procs to terminate.
-    deadline = time.monotonic() + 5
-    for proc in procs:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if proc.is_alive():
-            proc.join(remaining)
-
-    for proc in procs:
-        if proc.is_alive() and (pid := proc.pid) is not None:
-            kill_process_tree(pid)
-
-
-def copy_slice(
-    from_tensor: torch.Tensor, to_tensor: torch.Tensor, length: int
-) -> torch.Tensor:
-    """
     Copy the first length elements of a tensor into another tensor in a
     non-blocking manner.
 
     Used to copy pinned CPU tensor data to pre-allocated GPU tensors.
 
     Returns the sliced target tensor.
-    """
-    return to_tensor[:length].copy_(from_tensor[:length], non_blocking=True)
-
-
-def report_usage_stats(
-    vllm_config, usage_context: UsageContext = UsageContext.ENGINE_CONTEXT
-) -> None:
-    """Report usage statistics if enabled."""
 
     if not is_usage_stats_enabled():
         return
@@ -379,9 +176,7 @@ def report_usage_stats(
         },
     )
 
-
 _PROFILER_FUNC = None
-
 
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     global _PROFILER_FUNC
@@ -401,19 +196,8 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     _PROFILER_FUNC = func
     return func(name)
 
-
 def tensor_data(tensor: torch.Tensor) -> memoryview:
-    """Get the raw data of a tensor as a uint8 memoryview, useful for
-    serializing and hashing.
-
-    Args:
-        tensor: The input tensor.
-
-    Returns:
-        A memoryview of the tensor data as uint8.
-    """
     return tensor.flatten().contiguous().view(torch.uint8).numpy().data
-
 
 @dataclass
 class IterationDetails:
@@ -428,21 +212,7 @@ class IterationDetails:
                  num_generation_requests={self.num_generation_requests}, \
                  num_generation_tokens={self.num_generation_tokens})"
 
-
 def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
-    """
-    Compute the number of context/generation requests and tokens
-    for the current iteration's scheduler output. A requests is regarded
-    as a context request if its output tokens are still 0, an extended chunk
-    of chunked prefill falls into this category.
-
-    Args:
-        scheduler_output: The scheduler output for the current iteration.
-
-    Returns:
-        An IterationDetails object containing the number of
-        context/generation requests and tokens.
-    """
     num_context_requests = 0
     num_context_tokens = 0
     num_generation_requests = 0

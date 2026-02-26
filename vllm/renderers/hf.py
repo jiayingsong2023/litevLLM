@@ -42,18 +42,9 @@ else:
     MultiModalDataDict = dict[str, Any]
     MultiModalUUIDDict = dict[str, Any]
 
-
 logger = init_logger(__name__)
 
-
 _PROCESSOR_CHAT_TEMPLATES = dict[tuple[str, bool], str | None]()
-"""
-Used in `_try_get_processor_chat_template` to avoid calling
-`cached_get_processor` again if the processor fails to be loaded.
-
-This is needed because `lru_cache` does not cache when an exception happens.
-"""
-
 
 def _try_get_processor_chat_template(
     tokenizer: HfTokenizer,
@@ -96,7 +87,6 @@ def _try_get_processor_chat_template(
 
     _PROCESSOR_CHAT_TEMPLATES[cache_key] = None
     return None
-
 
 def resolve_chat_template(
     tokenizer: HfTokenizer,
@@ -147,13 +137,11 @@ def resolve_chat_template(
 
     return chat_template
 
-
 def _is_var_access(node: jinja2.nodes.Node, varname: str) -> bool:
     if isinstance(node, jinja2.nodes.Name):
         return node.ctx == "load" and node.name == varname
 
     return False
-
 
 def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
     if isinstance(node, jinja2.nodes.Getitem):
@@ -167,7 +155,6 @@ def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
         return _is_var_access(node.node, varname) and node.attr == key
 
     return False
-
 
 def _is_var_or_elems_access(
     node: jinja2.nodes.Node,
@@ -187,7 +174,6 @@ def _is_var_or_elems_access(
         return _is_var_or_elems_access(node.node, varname, key)
 
     return _is_attr_access(node, varname, key) if key else _is_var_access(node, varname)
-
 
 def _iter_nodes_assign_var_or_elems(root: jinja2.nodes.Node, varname: str):
     # Global variable that is implicitly defined at the root
@@ -210,7 +196,6 @@ def _iter_nodes_assign_var_or_elems(root: jinja2.nodes.Node, varname: str):
                 if lhs.name != related_varname:
                     related_varnames.append(lhs.name)
 
-
 # NOTE: The proper way to handle this is to build a CFG so that we can handle
 # the scope in which each variable is defined, but that is too complicated
 def _iter_nodes_assign_messages_item(root: jinja2.nodes.Node):
@@ -229,7 +214,6 @@ def _iter_nodes_assign_messages_item(root: jinja2.nodes.Node):
                 yield loop_ast, loop_target.name
                 break
 
-
 def _iter_nodes_assign_content_item(root: jinja2.nodes.Node):
     message_varnames = [
         varname for _, varname in _iter_nodes_assign_messages_item(root)
@@ -246,7 +230,6 @@ def _iter_nodes_assign_content_item(root: jinja2.nodes.Node):
                 yield loop_ast, loop_target.name
                 break
 
-
 def _try_extract_ast(chat_template: str) -> jinja2.nodes.Template | None:
     import transformers.utils.chat_template_utils as hf_chat_utils
 
@@ -256,7 +239,6 @@ def _try_extract_ast(chat_template: str) -> jinja2.nodes.Template | None:
     except Exception:
         logger.exception("Error when compiling Jinja template")
         return None
-
 
 @lru_cache(maxsize=32)
 def _detect_content_format(
@@ -277,7 +259,6 @@ def _detect_content_format(
         return default
     else:
         return "openai"
-
 
 def _resolve_chat_template_content_format(
     chat_template: str | None,
@@ -307,7 +288,6 @@ def _resolve_chat_template_content_format(
 
     return detected_format
 
-
 @lru_cache
 def _log_chat_template_content_format(
     chat_template: str | None,  # For caching purposes
@@ -330,7 +310,6 @@ def _log_chat_template_content_format(
             given_format,
             detected_format,
         )
-
 
 def resolve_chat_template_content_format(
     chat_template: str | None,
@@ -358,7 +337,6 @@ def resolve_chat_template_content_format(
 
     return detected_format
 
-
 # adapted from https://github.com/huggingface/transformers/blob/v4.56.2/src/transformers/utils/chat_template_utils.py#L398-L412
 # only preserve the parse function used to resolve chat template kwargs
 class AssistantTracker(jinja2.ext.Extension):
@@ -371,7 +349,6 @@ class AssistantTracker(jinja2.ext.Extension):
         call_block = jinja2.nodes.CallBlock(call, [], [], body)
         return call_block.set_lineno(lineno)
 
-
 def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
     env = jinja2.sandbox.ImmutableSandboxedEnvironment(
         trim_blocks=True,
@@ -382,9 +359,7 @@ def _resolve_chat_template_kwargs(chat_template: str) -> Set[str]:
     template_vars = jinja2.meta.find_undeclared_variables(parsed_content)
     return template_vars
 
-
 _cached_resolve_chat_template_kwargs = lru_cache(_resolve_chat_template_kwargs)
-
 
 @lru_cache
 def _get_hf_base_chat_template_params() -> frozenset[str]:
@@ -405,7 +380,6 @@ def _get_hf_base_chat_template_params() -> frozenset[str]:
         if p.kind
         not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
     )
-
 
 def resolve_chat_template_kwargs(
     tokenizer: HfTokenizer,
@@ -436,7 +410,6 @@ def resolve_chat_template_kwargs(
 
     accept_vars = (fn_kw | template_vars | hf_base_params) - unexpected_vars
     return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
-
 
 def safe_apply_chat_template(
     model_config: "ModelConfig",
@@ -485,23 +458,10 @@ def safe_apply_chat_template(
         )
         raise ValueError(str(e)) from e
 
-
 def rebuild_mm_uuids_from_mm_data(
     mm_uuids: "MultiModalUUIDDict",
     mm_data: "MultiModalDataDict",
 ) -> "MultiModalUUIDDict":
-    """Rebuild mm_uuids after vision_chunk processing.
-
-    When videos are split into chunks, the original UUIDs need to be updated
-    to reflect the new UUIDs generated for each chunk.
-
-    Args:
-        mm_uuids: Original UUIDs dictionary
-        mm_data: Processed multimodal data with vision_chunk items
-
-    Returns:
-        Updated UUIDs dictionary with chunk UUIDs
-    """
     vision_chunks = mm_data.get("vision_chunk")
     if vision_chunks is None:
         return mm_uuids
@@ -520,20 +480,9 @@ def rebuild_mm_uuids_from_mm_data(
 
     return mm_uuids
 
-
 def build_video_prompts_from_mm_data(
     mm_data: "MultiModalDataDict",
 ) -> list[str]:
-    """Build video prompts from vision_chunk data.
-
-    Collects prompts from video chunks and groups them by video_idx.
-
-    Args:
-        mm_data: Processed multimodal data with vision_chunk items
-
-    Returns:
-        List of video prompts, one per video.
-    """
     vision_chunks = mm_data.get("vision_chunk")
     if vision_chunks is None:
         return []
@@ -556,7 +505,6 @@ def build_video_prompts_from_mm_data(
     ]
 
     return video_prompts
-
 
 def replace_vision_chunk_video_placeholder(
     prompt_raw: str | list[int],
@@ -582,7 +530,6 @@ def replace_vision_chunk_video_placeholder(
                 len(video_prompts),
             )
     return prompt_raw
-
 
 class HfRenderer(BaseRenderer):
     @classmethod

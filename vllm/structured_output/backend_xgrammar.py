@@ -31,7 +31,6 @@ else:
 
 logger = init_logger(__name__)
 
-
 @dataclass
 class XgrammarBackend(StructuredOutputBackend):
     def __post_init__(self):
@@ -149,7 +148,6 @@ class XgrammarBackend(StructuredOutputBackend):
     def destroy(self):
         del self.compiler
 
-
 @dataclass
 class XgrammarGrammar(StructuredOutputGrammar):
     # NOTE: This would be a generic-enough class for
@@ -168,11 +166,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
     _is_terminated: bool = field(default=False, repr=False, hash=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
-        """Accepts a list of tokens and advances the FSM.
-
-        Returns True if the FSM was advanced successfully.
-        Returns False if the FSM failed to advance.
-        """
         if self._is_terminated:
             return False
         for token in tokens:
@@ -189,11 +182,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
-        """Checks if the list of tokens are accepted by the FSM in sequence.
-        Will not advance the FSM.
-
-        Returns the prefix list of tokens that are accepted by the FSM.
-        """
         accepted_tokens = []
         for token in tokens:
             if self.matcher.accept_token(token):
@@ -220,7 +208,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.num_processed_tokens = 0
         self.matcher.reset()
 
-
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
 STRING_SUPPORTED_FORMATS = {
     "email",
@@ -239,140 +226,6 @@ STRING_SUPPORTED_FORMATS = {
     "relative-json-pointer",
 }
 
-
 def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
-    """Check if JSON schema contains features unsupported by xgrammar."""
-
-    def check_object(obj: dict[str, Any]) -> bool:
-        if not isinstance(obj, dict):
-            return False
-
-        # Check for numeric ranges
-        if obj.get("type") in ("integer", "number") and ("multipleOf" in obj):
-            return True
-
-        # Check for array unsupported keywords
-        if obj.get("type") == "array" and any(
-            key in obj
-            for key in ("uniqueItems", "contains", "minContains", "maxContains")
-        ):
-            return True
-
-        # Unsupported keywords for strings
-        if (
-            obj.get("type") == "string"
-            and "format" in obj
-            and obj["format"] not in STRING_SUPPORTED_FORMATS
-        ):
-            return True
-
-        # Unsupported keywords for objects
-        if obj.get("type") == "object" and any(
-            key in obj for key in ("patternProperties", "propertyNames")
-        ):
-            return True
-
-        # Recursively check all nested objects and arrays
-        for value in obj.values():
-            if isinstance(value, dict):
-                if check_object(value):
-                    return True
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and check_object(item):
-                        return True
-
-        return False
-
-    return check_object(schema)
-
-
-def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
-    """Validate that the request is supported by structured output.
 
     Raises ValueError if the request is not supported.
-    """
-    if sampling_params.structured_outputs is None:
-        return
-
-    so_params = sampling_params.structured_outputs
-
-    if so_params.regex:
-        try:
-            xgr.Grammar.from_regex(so_params.regex)
-        except Exception as err:
-            raise ValueError(
-                f"Failed to transform regex into a grammar: {err}"
-            ) from err
-
-    if so_params.choice:
-        choice_grammar = choice_as_grammar(so_params.choice)
-        try:
-            xgr.Grammar.from_ebnf(choice_grammar)
-        except Exception as err:
-            raise ValueError(
-                "Failed to transform choices into a grammar: {err}"
-            ) from err
-        so_params.choice = None
-        so_params.grammar = choice_grammar
-        return
-
-    if so_params.json:
-        if isinstance(so_params.json, str):
-            try:
-                schema = json.loads(so_params.json)
-            except json.JSONDecodeError as e:
-                raise ValueError("Invalid JSON grammar specification.") from e
-        else:
-            schema = so_params.json
-
-        try:
-            xgr.Grammar.from_json_schema(schema)
-        except Exception as err:
-            raise ValueError(
-                f"Failed to transform json schema into a grammar: {err}"
-            ) from err
-
-        if has_xgrammar_unsupported_json_features(schema):
-            raise ValueError(
-                "The provided JSON schema contains features not supported by xgrammar."
-            )
-        return
-
-    if so_params.grammar:
-        if grammar_is_likely_lark(so_params.grammar):
-            # xgrammar supports EBNF grammars only
-            try:
-                so_params.grammar = convert_lark_to_ebnf(so_params.grammar)
-            except ValueError as e:
-                raise ValueError(
-                    "Failed to convert the grammar from Lark to EBNF. "
-                ) from e
-
-        # Test parsing EBNF grammar, possibly already converted from Lark
-        try:
-            # parse the grammar, but we aren't compiling it.
-            xgr.Grammar.from_ebnf(so_params.grammar)
-        except Exception as e:
-            raise ValueError("Invalid grammar specification.") from e
-        return
-
-    if so_params.structural_tag:
-        try:
-            s_tag = json.loads(so_params.structural_tag)
-
-            # Using the deprecated method of compiling structural tag
-            if "structures" in s_tag:
-                tags = [
-                    xgr.StructuralTagItem(
-                        begin=s["begin"],
-                        schema=json.dumps(s["schema"]),
-                        end=s["end"],
-                    )
-                    for s in s_tag["structures"]
-                ]
-                xgr.Grammar.from_structural_tag(tags, s_tag["triggers"])
-            else:
-                xgr.Grammar.from_structural_tag(so_params.structural_tag)
-        except Exception as e:
-            raise ValueError("Invalid structural tag specification.") from e

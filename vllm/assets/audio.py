@@ -21,7 +21,6 @@ ASSET_DIR = "multimodal_asset"
 
 AudioAssetName = Literal["winning_call", "mary_had_lamb"]
 
-
 @dataclass(frozen=True)
 class AudioAsset:
     name: AudioAssetName
