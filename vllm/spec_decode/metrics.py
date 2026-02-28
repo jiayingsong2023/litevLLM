@@ -1,3 +1,2 @@
 # SPDX-License-Identifier: Apache-2.0
-class SchedulerInterface:
-    pass
+class SpecDecodingStats: pass

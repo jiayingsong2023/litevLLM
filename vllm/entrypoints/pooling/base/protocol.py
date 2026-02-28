@@ -14,7 +14,7 @@ from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
 from vllm.logger import init_logger
 from vllm.renderers import ChatParams, merge_kwargs
 from vllm.utils import random_uuid
-from vllm.utils.serial_utils import EmbedDType, EncodingFormat, Endianness
+from vllm.serial_utils import EmbedDType, EncodingFormat, Endianness
 
 logger = init_logger(__name__)
 

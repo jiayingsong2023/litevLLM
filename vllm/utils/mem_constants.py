@@ -3,3 +3,5 @@
 MB_bytes = 1_000_000
 
 GB_bytes = 1_000_000_000
+MiB_bytes = 1024 * 1024
+GiB_bytes = 1024 * 1024 * 1024

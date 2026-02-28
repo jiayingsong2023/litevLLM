@@ -38,10 +38,16 @@ class TritonAttention(nn.Module):
         # Simplified for now: assuming kernel exists in vllm.attention.ops.triton_paged_attn
         try:
             from vllm.attention.ops.triton_paged_attn import triton_paged_attention
+            # Check if block_tables is available in attn_metadata
+            block_tables = attn_metadata.get("block_tables", None)
+            if block_tables is None and hasattr(attn_metadata, "block_tables"):
+                 block_tables = attn_metadata.block_tables
+
             output = triton_paged_attention(
                 q, k, v, kv_cache,
                 attn_metadata["slot_mapping"],
                 attn_metadata["seq_lens"],
+                block_tables,
                 self.scale
             )
         except ImportError:

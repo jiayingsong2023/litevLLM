@@ -9,7 +9,7 @@ import pybase64
 import torch
 
 from vllm.utils.import_utils import PlaceholderModule
-from vllm.utils.serial_utils import tensor2base64
+from vllm.serial_utils import tensor2base64
 
 from .base import MediaIO
 

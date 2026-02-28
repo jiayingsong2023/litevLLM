@@ -31,7 +31,7 @@ from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.tasks import PoolingTask, SupportedTask
 from vllm.utils.async_utils import merge_async_iterators
-from vllm.utils.serial_utils import (
+from vllm.serial_utils import (
     EmbedDType,
     EncodingFormat,
     Endianness,

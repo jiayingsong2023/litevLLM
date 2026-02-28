@@ -10,7 +10,8 @@ from typing import Any
 import numpy as np
 
 from vllm import envs
-from vllm.compilation.cuda_graph import CUDAGraphStat
+# from vllm.compilation.cuda_graph import CUDAGraphStat
+class CUDAGraphStat: pass
 from vllm.config import VllmConfig
 # litevLLM - Distributed stubs removed
 class EventPublisherFactory:
@@ -1400,3 +1401,4 @@ class Scheduler(SchedulerInterface):
         )
 
     def _get_encoder_cache_usage(self) -> float:
+        return self.encoder_cache_manager.usage

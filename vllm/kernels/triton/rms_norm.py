@@ -1,4 +1,4 @@
-
+# SPDX-License-Identifier: Apache-2.0
 import torch
 import triton
 import triton.language as tl
@@ -36,20 +36,19 @@ def rms_norm(
     weight: torch.Tensor,
     epsilon: float,
 ) -> None:
-    M, N = input.shape
-    BLOCK_SIZE = triton.next_power_of_2(N)
+    # Handle multidimensional input by flattening all but the last dimension
+    orig_shape = input.shape
+    input_2d = input.view(-1, orig_shape[-1])
+    out_2d = out.view(-1, orig_shape[-1])
     
-    # Heuristic for Block Size
-    # If N is too large, we might need a different kernel strategy (tiling), 
-    # but for typical hidden sizes (up to 8k-16k), a single block is usually fine on modern GPUs.
-    # However, triton has a limit on block size. 
-    # For simplicity in this POC, we assume N fits in shared memory/block limit.
+    M, N = input_2d.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
     
     grid = (M,)
     
     _rms_norm_kernel[grid](
-        input, out, weight,
-        input.stride(0), out.stride(0),
+        input_2d, out_2d, weight,
+        input_2d.stride(0), out_2d.stride(0),
         N, epsilon,
         BLOCK_SIZE=BLOCK_SIZE,
     )
@@ -71,32 +70,7 @@ def _fused_add_rms_norm_kernel(
     x = tl.load(X_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     res = tl.load(Res_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-    # Fuse add: x = x + residual
-    # Note: vLLM implementation updates residual in-place too? 
-    # The signature is fused_add_rms_norm(input, residual, weight, epsilon)
-    # Usually this means input += residual, then norm. 
-    # Or residual = input + residual?
-    # Let's check the pytorch reference in layernorm.py:
-    #   x = x + residual
-    #   residual = x
-    # So both input and residual are updated to the sum.
-    
     new_x = x + res
-    
-    # Store updated residual (which matches the new input before norm)
-    # The CUDA kernel usually updates 'input' to be the normalized value, 
-    # and 'residual' to be the sum.
-    # Wait, vllm/model_executor/layers/layernorm.py says:
-    #   ops.fused_add_rms_norm(x, residual, weight, eps)
-    #   return x, residual
-    # And the native implementation:
-    #   x = x + residual
-    #   residual = x
-    #   variance = ...
-    #   x = x * rsqrt * weight
-    # So: 'residual' becomes (old_x + old_residual)
-    #     'x' becomes Norm(old_x + old_residual)
-    
     tl.store(Res_ptr + cols, new_x, mask=mask)
 
     # Compute variance on the sum
@@ -119,13 +93,18 @@ def fused_add_rms_norm(
     weight: torch.Tensor,
     epsilon: float,
 ) -> None:
-    M, N = input.shape
+    # Handle multidimensional input
+    orig_shape = input.shape
+    input_2d = input.view(-1, orig_shape[-1])
+    residual_2d = residual.view(-1, orig_shape[-1])
+    
+    M, N = input_2d.shape
     BLOCK_SIZE = triton.next_power_of_2(N)
     grid = (M,)
     
     _fused_add_rms_norm_kernel[grid](
-        input, residual, weight,
-        input.stride(0), residual.stride(0),
+        input_2d, residual_2d, weight,
+        input_2d.stride(0), residual_2d.stride(0),
         N, epsilon,
         BLOCK_SIZE=BLOCK_SIZE,
     )

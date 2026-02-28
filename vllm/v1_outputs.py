@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 import numpy as np
 import torch
 
-from vllm.compilation.cuda_graph import CUDAGraphStat
+# from vllm.compilation.cuda_graph import CUDAGraphStat
+class CUDAGraphStat: pass
 from vllm.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:

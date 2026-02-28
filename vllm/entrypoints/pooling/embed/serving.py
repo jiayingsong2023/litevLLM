@@ -28,7 +28,7 @@ from vllm.outputs import PoolingOutput, PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import chunk_list
-from vllm.utils.serial_utils import (
+from vllm.serial_utils import (
     encode_pooling_bytes,
     encode_pooling_output,
 )
