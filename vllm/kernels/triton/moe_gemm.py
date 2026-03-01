@@ -11,7 +11,7 @@ def _index_aware_gemm_kernel(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     M, N, K,
-    weight, # 当前专家的路由权重
+    weight,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
@@ -26,32 +26,42 @@ def _index_aware_gemm_kernel(
     off_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     off_k = tl.arange(0, BLOCK_SIZE_K)
     
-    # 索引感知加载
-    real_m_indices = tl.load(Index_Map + off_m, mask=off_m < M, other=0)
+    # 修复 1: 在加载 Index_Map 时加入严格掩码
+    # 如果超出 M，则加载 0（指向原始矩阵第 0 行，保证指针计算安全）
+    m_mask = off_m < M
+    real_m_indices = tl.load(Index_Map + off_m, mask=m_mask, other=0)
     
+    # 修复 2: 确保 a_ptrs 计算在 mask 保护下
     a_ptrs = A + (real_m_indices[:, None] * stride_am + off_k[None, :] * stride_ak)
     b_ptrs = B + (off_k[:, None] * stride_bk + off_n[None, :] * stride_bn)
     
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=(off_m[:, None] < M) & (off_k[None, :] < K - k * BLOCK_SIZE_K), other=0.0)
-        b = tl.load(b_ptrs, mask=(off_k[:, None] < K - k * BLOCK_SIZE_K) & (off_n[None, :] < N), other=0.0)
+        k_mask = off_k[None, :] < K - k * BLOCK_SIZE_K
+        # 同时对 M 和 K 进行遮蔽
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask.T & (off_n[None, :] < N), other=0.0)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         
-    # 应用权重并进行原子累加 (Atomic Add) 到全局输出 C
-    # 这样多个专家可以并发地向同一个 C 写入结果
     res = (accumulator * weight).to(C.dtype.element_ty)
-    c_ptrs = C + (real_m_indices[:, None] * stride_cm + off_n[None, :] * stride_cn)
     
-    # 注意：原子累加确保了并发安全性
-    tl.atomic_add(c_ptrs, res, mask=(off_m[:, None] < M) & (off_n[None, :] < N))
+    # 修复 3: 写回输出时确保 real_m_indices 是有效的
+    c_ptrs = C + (real_m_indices[:, None] * stride_cm + off_n[None, :] * stride_cn)
+    tl.atomic_add(c_ptrs, res, mask=m_mask[:, None] & (off_n[None, :] < N))
 
 def index_aware_linear(a, b, index_map, out, weight=1.0):
+    # 如果该专家没有分配到 token，直接返回
     M = index_map.shape[0]
+    if M == 0:
+        return
+        
     K = a.shape[1]
-    N = b.shape[0] # 权重 [N, K]
+    N = b.shape[0]
+    
+    # 动态调整 BLOCK_SIZE_M 以适应极小的 M (例如 M=1 时不需要 BLOCK=32)
+    # 但为了 Tensor Core 效率，通常保持 16 或 32 的倍数
     
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
     
