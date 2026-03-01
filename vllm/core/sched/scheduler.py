@@ -39,7 +39,7 @@ from vllm.core.sched.output import (
 )
 from vllm.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.core.sched.utils import check_stop, remove_all
-from vllm.engine.v1 import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.engine.v1_protocol import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.metrics.perf import ModelMetrics, PerfStats
 from vllm.metrics.stats import PrefixCacheStats, SchedulerStats
