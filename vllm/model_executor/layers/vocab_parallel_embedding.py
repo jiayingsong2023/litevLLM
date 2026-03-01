@@ -55,7 +55,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
+        from vllm.kernels.triton.embedding import embedding as triton_embedding
+        return triton_embedding(input_, layer.weight)
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
 
