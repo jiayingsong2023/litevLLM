@@ -359,3 +359,17 @@ async def serve_grpc(args: argparse.Namespace):
         logger.info("Shutdown complete")
 
 def main():
+    parser = FlexibleArgumentParser(description="vLLM gRPC Server")
+    parser = AsyncEngineArgs.add_cli_args(parser)
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="host name")
+    parser.add_argument("--port", type=int, default=50051, help="port number")
+    parser.add_argument("--enable-log-requests", action="store_true", help="enable logging requests")
+    parser.add_argument("--disable-log-stats-server", action="store_true", help="disable logging stats")
+    
+    args = parser.parse_args()
+    
+    uvloop.install()
+    asyncio.run(serve_grpc(args))
+
+if __name__ == "__main__":
+    main()
