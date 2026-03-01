@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 import torch.nn as nn
-from vllm.kernels.triton.rms_norm import rms_norm, fused_add_rms_norm
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -11,11 +10,14 @@ class RMSNorm(nn.Module):
 
     def forward(self, x, residual=None):
         if residual is not None:
-            # 使用 Triton 融合的 Add + RMSNorm
-            fused_add_rms_norm(x, residual, self.weight, self.variance_epsilon)
-            return x, residual
+            x = x + residual
+            
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        out = self.weight * x.to(input_dtype)
         
-        # 使用 Triton 融合的 RMSNorm
-        out = torch.empty_like(x)
-        rms_norm(out, x, self.weight, self.variance_epsilon)
+        if residual is not None:
+            return out, x.to(input_dtype) # 简化 residual 返回
         return out
