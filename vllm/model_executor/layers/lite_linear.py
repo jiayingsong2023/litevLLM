@@ -1,20 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-LiteLinear: A unified Linear layer for single-GPU inference.
-This layer replaces ColumnParallelLinear and RowParallelLinear, removing
-all distributed/TP overhead and supporting multiple quantization formats.
-"""
 import torch
 import torch.nn as nn
 from typing import Optional, Any
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 class LiteLinear(nn.Module):
-    # Global LRU Cache for Dequantized Weights (Shared across layers to manage memory)
-    # Key: (id(layer), qtype), Value: dequantized_weight_tensor
     _DEQUANT_CACHE = {}
     _CACHE_ORDER = []
-    _MAX_CACHE_SIZE = 128 # Covers most 7B-13B model layers
+    _MAX_CACHE_SIZE = 128
 
     def __init__(
         self,
@@ -31,6 +24,9 @@ class LiteLinear(nn.Module):
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
         self.prefix = prefix
+        self.qweight = None
+        self.qscales = None
+        self.qtype = "q4_0"
 
         if self.quant_config is None:
             self.weight = nn.Parameter(
@@ -50,29 +46,7 @@ class LiteLinear(nn.Module):
         if self.quant_config is None:
             return torch.nn.functional.linear(x, self.weight, self.bias)
         
-        # GGUF Weight Caching Logic with LRU
-        if self.quant_config.get_name() == "gguf":
-            layer_id = id(self)
-            if layer_id in LiteLinear._DEQUANT_CACHE:
-                # Cache Hit: Move to end (most recent)
-                weight = LiteLinear._DEQUANT_CACHE[layer_id]
-                LiteLinear._CACHE_ORDER.remove(layer_id)
-                LiteLinear._CACHE_ORDER.append(layer_id)
-            else:
-                # Cache Miss: Dequantize and Cache
-                from vllm.kernels.triton.gguf_dequant import gguf_dequantize
-                weight = gguf_dequantize(self.qweight, self.qscales, self.qtype)
-                
-                # Manage Cache Size
-                if len(LiteLinear._DEQUANT_CACHE) >= LiteLinear._MAX_CACHE_SIZE:
-                    oldest_id = LiteLinear._CACHE_ORDER.pop(0)
-                    del LiteLinear._DEQUANT_CACHE[oldest_id]
-                
-                LiteLinear._DEQUANT_CACHE[layer_id] = weight
-                LiteLinear._CACHE_ORDER.append(layer_id)
-            
-            return torch.nn.functional.linear(x, weight, self.bias)
-
+        # Dispatch to quantization config apply
         return self.quant_config.apply(self, x)
 
     def load_weights(self, weights_iter):

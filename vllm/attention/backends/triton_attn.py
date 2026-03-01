@@ -15,6 +15,7 @@ class TritonAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = getattr(config, "num_key_value_heads", self.num_heads)
         self.scale = self.head_dim**-0.5
+        self.head_size = self.head_dim
         
         # Linear projections using LiteLinear
         from vllm.model_executor.layers.lite_linear import LiteLinear
@@ -34,19 +35,25 @@ class TritonAttention(nn.Module):
         ], dim=-1)
         
         # 2. Paged Attention Execution (Call Triton Kernel)
+        # Ensure q, k, v are in [num_tokens, num_heads, head_dim] format
+        q = q.view(-1, self.num_heads, self.head_size)
+        k = k.view(-1, self.num_kv_heads, self.head_size)
+        v = v.view(-1, self.num_kv_heads, self.head_size)
+
         # For LitevLLM, we directly call the Triton paged_attention_kernel
-        # Simplified for now: assuming kernel exists in vllm.attention.ops.triton_paged_attn
         try:
             from vllm.attention.ops.triton_paged_attn import triton_paged_attention
             # Check if block_tables is available in attn_metadata
-            block_tables = attn_metadata.get("block_tables", None)
-            if block_tables is None and hasattr(attn_metadata, "block_tables"):
-                 block_tables = attn_metadata.block_tables
+            block_tables = None
+            if isinstance(attn_metadata, dict):
+                block_tables = attn_metadata.get("block_tables", None)
+            elif hasattr(attn_metadata, "block_tables"):
+                block_tables = attn_metadata.block_tables
 
             output = triton_paged_attention(
                 q, k, v, kv_cache,
-                attn_metadata["slot_mapping"],
-                attn_metadata["seq_lens"],
+                attn_metadata["slot_mapping"] if isinstance(attn_metadata, dict) else attn_metadata.slot_mapping,
+                attn_metadata["seq_lens"] if isinstance(attn_metadata, dict) else attn_metadata.seq_lens,
                 block_tables,
                 self.scale
             )
@@ -54,4 +61,7 @@ class TritonAttention(nn.Module):
             # Fallback to a functional mock if kernel is not yet rebuilt
             output = torch.zeros_like(q) 
             
+        # Reshape output back to [batch, seq, hidden]
+        # In decoding, seq is 1
+        output = output.view(hidden_states.shape)
         return self.o_proj(output)
