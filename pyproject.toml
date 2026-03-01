@@ -33,7 +33,7 @@ requires-python = "==3.12.*"
 dependencies = [
     "torch",
     "triton",
-    "transformers >= 4.56.0, < 5",
+    "transformers >= 4.56.0, < 6",
     "tokenizers >= 0.21.1",
     "numpy",
     "requests >= 2.26.0",
