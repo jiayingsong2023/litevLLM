@@ -5,10 +5,6 @@ from typing import Optional, Any
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 class LiteLinear(nn.Module):
-    _DEQUANT_CACHE = {}
-    _CACHE_ORDER = []
-    _MAX_CACHE_SIZE = 128
-
     def __init__(
         self,
         input_size: int,
@@ -24,9 +20,11 @@ class LiteLinear(nn.Module):
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
         self.prefix = prefix
-        self.qweight = None
-        self.qscales = None
-        self.qtype = "q4_0"
+        
+        # LoRA 权重占位符
+        self.lora_a: Optional[torch.Tensor] = None
+        self.lora_b: Optional[torch.Tensor] = None
+        self.lora_scaling: float = 1.0
 
         if self.quant_config is None:
             self.weight = nn.Parameter(
@@ -42,12 +40,27 @@ class LiteLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def set_lora(self, lora_a: torch.Tensor, lora_b: torch.Tensor, scaling: float = 1.0):
+        """为当前层注入 LoRA 权重"""
+        self.lora_a = lora_a # [rank, in]
+        self.lora_b = lora_b # [out, rank]
+        self.lora_scaling = scaling
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. 主路径 (Base Weight)
         if self.quant_config is None:
-            return torch.nn.functional.linear(x, self.weight, self.bias)
-        
-        # Dispatch to quantization config apply
-        return self.quant_config.apply(self, x)
+            res = torch.nn.functional.linear(x, self.weight, self.bias)
+        else:
+            res = self.quant_config.apply(self, x)
+            
+        # 2. LoRA 旁路路径 (X @ A.T @ B.T * scaling)
+        if self.lora_a is not None and self.lora_b is not None:
+            # 这里的计算量非常小 (rank 通常为 8 或 16)
+            lora_res = torch.nn.functional.linear(x, self.lora_a)
+            lora_res = torch.nn.functional.linear(lora_res, self.lora_b)
+            res += lora_res * self.lora_scaling
+            
+        return res
 
     def load_weights(self, weights_iter):
         if self.quant_config is None:
