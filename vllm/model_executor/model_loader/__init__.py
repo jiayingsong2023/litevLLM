@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.models.registry import ModelRegistry
+from transformers import AutoTokenizer
 
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     """LitevLLM: Simplified model loader."""
@@ -14,6 +15,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     # 2. Instantiate model on GPU
     model = model_cls(vllm_config).cuda().half()
     
-    # 3. Weights loading logic is typically called by the Engine, 
-    # but here we return the initialized model.
     return model
+
+def get_tokenizer(model_config: Any, **kwargs):
+    """LitevLLM: Unified tokenizer loader."""
+    return AutoTokenizer.from_pretrained(model_config.model, trust_remote_code=True, **kwargs)
