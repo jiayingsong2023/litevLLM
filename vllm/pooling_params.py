@@ -1,58 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass, field
+from typing import List, Optional, Any
 
-from copy import deepcopy
-from typing import Annotated, Any
-
-import msgspec
-
-from vllm.config import ModelConfig, PoolerConfig
-from vllm.sampling_params import RequestOutputKind
-from vllm.tasks import PoolingTask
-
-class PoolingParams(
-    msgspec.Struct,
-    omit_defaults=True,  # type: ignore[call-arg]
-    array_like=True,
-):  # type: ignore[call-arg]
-
-    # --8<-- [start:common-pooling-params]
-    truncate_prompt_tokens: Annotated[int, msgspec.Meta(ge=-1)] | None = None
-    use_activation: bool | None = None
-    # --8<-- [end:common-pooling-params]
-
-    ## for embeddings models
-    # --8<-- [start:embed-pooling-params]
-    dimensions: int | None = None
-    # --8<-- [end:embed-pooling-params]
-
-    ## for classification, scoring and rerank
-    # --8<-- [start:classify-pooling-params]
-    # --8<-- [end:classify-pooling-params]
-
-    ## for step pooling models
-    step_tag_id: int | None = None
-    returned_token_ids: list[int] | None = None
-
-    ## Internal use only
-    task: PoolingTask | None = None
+@dataclass
+class PoolingParams:
+    """Parameters for pooling operations."""
+    truncate_prompt_tokens: Optional[int] = None
+    use_activation: bool = False
+    dimensions: Optional[int] = None
+    step_tag_id: Optional[int] = None
+    returned_token_ids: Optional[List[int]] = None
+    
+    task: Any = None
     requires_token_ids: bool = False
-    skip_reading_prefix_cache: bool | None = None
-    extra_kwargs: dict[str, Any] | None = None
-    output_kind: RequestOutputKind = RequestOutputKind.FINAL_ONLY
-
-    @property
-    def all_parameters(self) -> list[str]:
-        return ["dimensions", "use_activation"]
-
-    @property
-    def valid_parameters(self):
-        return {
-            "embed": ["dimensions", "use_activation"],
-            "classify": ["use_activation"],
-            "score": ["use_activation"],
-            "token_embed": ["dimensions", "use_activation"],
-            "token_classify": ["use_activation"],
-        }
+    skip_reading_prefix_cache: bool = False
+    extra_kwargs: dict = field(default_factory=dict)
+    output_kind: str = "final_only"
 
     def clone(self) -> "PoolingParams":
+        return PoolingParams(
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            use_activation=self.use_activation,
+            dimensions=self.dimensions,
+            step_tag_id=self.step_tag_id,
+            returned_token_ids=self.returned_token_ids,
+            task=self.task,
+            requires_token_ids=self.requires_token_ids,
+            skip_reading_prefix_cache=self.skip_reading_prefix_cache,
+            extra_kwargs=self.extra_kwargs.copy(),
+            output_kind=self.output_kind
+        )

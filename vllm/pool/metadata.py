@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
 import torch
 
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
-from vllm.utils.platform_utils import is_pin_memory_available
-
-pin_memory = is_pin_memory_available()
 
 @dataclass
 class PoolingCursor:
-    index: list[int]
+    index: List[int]
     first_token_indices_gpu: torch.Tensor
     last_token_indices_gpu: torch.Tensor
     prompt_lens_cpu: torch.Tensor
@@ -39,10 +37,19 @@ class PoolingCursor:
 class PoolingStates:
     def __init__(self):
         # for chunked prefill with ALL pooling
-        self.hidden_states_cache: list[torch.Tensor] = []
+        self.hidden_states_cache: List[torch.Tensor] = []
 
     def clean(self):
         self.hidden_states_cache.clear()
 
 @dataclass
 class PoolingMetadata:
+    """Metadata for pooling operations."""
+    seq_groups: List[int]
+    seq_data: dict
+    pooling_params: PoolingParams
+    cursor: Optional[PoolingCursor] = None
+    
+    def __post_init__(self):
+        # Initialization logic if needed
+        pass
