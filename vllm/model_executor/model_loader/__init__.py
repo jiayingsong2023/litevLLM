@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.models.registry import ModelRegistry
-from transformers import AutoTokenizer
 
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     """LitevLLM: Simplified model loader."""
@@ -18,5 +17,6 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     return model
 
 def get_tokenizer(model_config: Any, **kwargs):
-    """LitevLLM: Unified tokenizer loader."""
-    return AutoTokenizer.from_pretrained(model_config.model, trust_remote_code=True, **kwargs)
+    """LitevLLM: Unified tokenizer loader via Registry."""
+    from vllm.tokenizers.registry import get_tokenizer as registry_get_tokenizer
+    return registry_get_tokenizer(model_config, **kwargs)

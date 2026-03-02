@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
-
-    from vllm.config import VllmConfig
-    from vllm.tokenizers import TokenizerLike
-else:
-    VllmConfig = object
-    TokenizerLike = object
+from typing import List, Tuple, Any
+import torch
 
 class StructuredOutputOptions(enum.Enum):
     JSON = enum.auto()
@@ -23,54 +13,41 @@ class StructuredOutputOptions(enum.Enum):
     CHOICE = enum.auto()
     STRUCTURAL_TAG = enum.auto()
 
-StructuredOutputKey = tuple[StructuredOutputOptions, str]
+StructuredOutputKey = Tuple[StructuredOutputOptions, str]
 
 class StructuredOutputGrammar(ABC):
-        Determines whether the provided tokens are accepted for the
-        given request.
+    @abstractmethod
+    def accept_tokens(self, request_id: str, tokens: List[int]) -> bool:
+        pass
 
-        Args:
-            request_id (str): The unique identifier for the request.
-            tokens (list[int]): A list of token IDs to evaluate.
+    @abstractmethod
+    def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
+        pass
 
-        Returns:
-            bool: True if the tokens are accepted, False otherwise.
-        Validates the provided tokens against the grammar.
-        Will not advance the FSM.
+    @abstractmethod
+    def is_terminated(self) -> bool:
+        pass
 
-        Args:
-            tokens (list[int]): A list of token IDs to validate.
+    @abstractmethod
+    def reset(self):
+        pass
 
-        Returns:
-            list[int]: A list of accepted token IDs. Will be a prefix
-                of the input tokens, and empty if none are accepted.
-        Rolls back the state of the grammar by a specified number of tokens.
-        Will also revert counters for the number of processed tokens.
-
-        Args:
-            num_tokens (int): The number of tokens to roll back.
-        Fills the bitmask for a specific batch index.
-
-        Args:
-            bitmask (torch.Tensor): The bitmask to fill
-            batch_index (int): The index in the bitmask to fill
-        Checks whether the structured output process has terminated.
-
-        Returns:
-            bool: True if the process is terminated, False otherwise.
-        Resets the state of the structured output grammar.
-
-    vllm_config: VllmConfig
-    tokenizer: TokenizerLike
+@dataclass
+class StructuredOutputBackend(ABC):
+    vllm_config: Any
+    tokenizer: Any
     vocab_size: int
 
     @abstractmethod
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
+        pass
 
     @abstractmethod
-    def allocate_token_bitmask(self, max_num_seqs: int) -> "torch.Tensor":
+    def allocate_token_bitmask(self, max_num_seqs: int) -> torch.Tensor:
+        pass
 
     @abstractmethod
     def destroy(self):
+        pass
