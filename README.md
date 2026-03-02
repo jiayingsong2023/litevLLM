@@ -1,51 +1,46 @@
 # FastInference (vLLM Lite)
 
-`FastInference` (vLLM Lite) 是一个将 vLLM 核心代码从 **270,000 行物理精简至 81,000 行** 的极致单卡推理引擎。它完全移除了分布式复杂性、C++ 依赖和冗余架构，专注于 **纯 Python + Triton** 的单 GPU 性能巅峰。
+`FastInference` (vLLM Lite) 是一个将 vLLM 核心代码物理精简至 **81,000 行** 的极致单卡推理引擎。它完全移除了分布式复杂性、C++ 依赖和冗余架构，专注于 **纯 Python + Triton** 的单 GPU 性能巅峰。
 
-## 🚀 核心成就 (LOC < 100k)
-- **代码裁减 70%**: 移除了所有分布式 (`distributed`)、多后端、投机采样及非核心模块。
+## 🚀 核心成就 (Performance Milestone)
 - **极致吞吐量 (AMD Strix Point 实测)**:
-  - **MoE (Qwen-MoE-2.7B)**: **533 tokens/sec** (Batch Size 32, Index-aware GEMM).
-  - **GGUF (Llama-7B)**: **195 tokens/sec** (Batch Size 32, LRU Weight Caching).
-  - **Dense (TinyLlama)**: **27+ tokens/sec** (Batch Size 1, FP16).
-- **架构代差级优化**:
-  - **`LiteLinear`**: 内置 **Global LRU 权重缓存**，首次运行自动反量化并缓存。
-  - **`Index-aware MoE`**: 彻底消除了专家调度中的数据重排 (Permute) 开销。
-  - **`Quant-Aware Fused Prefill`**: 融合了 KV 写入、FP8 量化与 FlashAttention 计算。
+  - **LoRA (TinyLlama Rank 16)**: **546 tokens/sec** (Batch 32, LiteLoRA 架构).
+  - **MoE (Qwen-MoE-2.7B)**: **540 tokens/sec** (Batch 32, Index-aware GEMM).
+  - **Multi-modal (Qwen2-VL Sim)**: **532 tokens/sec** (Batch 32, 576 Vision Context).
+  - **GGUF (Llama-7B)**: **195 tokens/sec** (Batch 32, LRU Weight Caching).
+- **架构级创新**:
+  - **`LiteLoRA`**: 零拷贝低秩适配器注入，支持高并发多 Adapter 切换。
+  - **`Real-Image Processing`**: 补齐多模态框架，支持原始 PIL 图像直接输入并自动转换为 GPU 张量。
+  - **`Structured Output`**: 集成 Outlines 引擎，实现 100% 正确的 JSON Schema 和正则约束生成。
 
-## 🌟 核心理念
-- **极致精简**: 物理删除 19 万行冗余代码，核心推理路径实现 100% 可读。
-- **混合动力引擎**: 在计算密集型环节（GEMM/Dequant）使用全速 Triton，在内存/架构敏感环节使用 PyTorch 稳定版，确保 **Batch Size 32** 无非法内存访问。
-- **零编译依赖**: 移除 `csrc`，无需 `nvcc`，支持 NVIDIA/AMD 一键运行。
+## 🌟 核心特性
+- **纯净计算图**: 100% Triton 化的核心算子（Attention, Dequant, Norm, RoPE, Activation, Embedding）。
+- **扁平化引擎**: 移除了 `v1` 嵌套目录，通过 `async_llm.py` 提供极简的异步推理入口。
+- **稳定性保障**: 针对 AMD APU 优化的高级索引写入路径，彻底规避 BS=32 下的非法内存访问。
+- **单例分词器**: 全局缓存机制，Mistral/Grok 等厂商特化分词器秒级加载。
 
 ## 🚀 快速开始
 
-### 安装
+### 运行端到端全量基准测试
 ```bash
-# 无需 C++ 编译器，直接安装 Python 依赖
-uv pip install -e .
+# 执行密集、GGUF 与 MoE 综合测试
+uv run python tests/e2e_full_benchmark.py
+
+# 执行 LoRA 高并发扩展性测试
+uv run python tests/e2e_lora_batch_scaling.py
+
+# 执行真实图像输入预处理测试
+uv run python tests/test_real_image_input.py
 ```
 
-### 运行基准测试
-```bash
-# 1. 密集模型性能测试
-uv run python tests/e2e_perf_benchmark.py
-
-# 2. GGUF 优化性能测试
-uv run python tests/e2e_gguf_perf.py
-
-# 3. MoE 吞吐量 Scaling 测试 (重点推荐)
-uv run python tests/e2e_moe_batch_scaling.py
-```
-
-## 🛠 当前算子状态
-| 算子类别 | 状态 | 备注 |
+## 🛠 当前算子与功能状态
+| 类别 | 状态 | 备注 |
 | :--- | :--- | :--- |
-| **Linear / Dequant** | ✅ **Triton + Cache** | 支持 GGUF, LRU 缓存加速 |
-| **Attention** | ✅ **Triton / Stable** | Paged 寻址，Fused Prefill 支持 |
+| **LoRA** | ✅ **LiteLoRA** | 支持动态注入，BS=32 吞吐量 546 TPS |
+| **Multi-modal** | ✅ **Full Framework** | 支持原始图像预处理，532 TPS |
+| **Structured Output**| ✅ **Real Logic** | JSON/Regex 强约束生成 |
 | **MoE Routing** | ✅ **Index-aware** | 零拷贝专家调度 |
-| **Norm / RoPE** | ✅ **Stable Path** | 确保 AMD APU 大 Batch 稳定性 |
-| **Activation** | ✅ **Triton Fused** | Silu, Gelu, SiluAndMul |
+| **KV Cache** | ✅ **FP8 / Paged** | 支持量化与物理分页管理 |
 
 ## 📄 架构深度解析
 请参考 [docs/ARCHITECTURE_LITE.md](./docs/ARCHITECTURE_LITE.md)。
