@@ -44,12 +44,21 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 # Initialize the engine (automatically uses Triton and LRU caching)
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-# Generate outputs
-outputs = llm.generate(prompts, sampling_params)
+## 💡 Hugging Face Tips
 
-for output in outputs:
-    print(f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}")
+### Automatic Mirror (For China Users)
+If you cannot connect to Hugging Face Hub, use the official mirror by setting this environment variable before starting:
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
 ```
+
+### Offline Mode
+To run FastInference in a completely firewalled environment:
+1. Pre-download the model: `huggingface-cli download meta-llama/Llama-3-8B`
+2. Run with the local path: `llm = LLM(model="/path/to/local/model")`
+3. Force offline mode: `export HF_HUB_OFFLINE=1`
+
+## Online Serving
 
 ## Online Serving
 
