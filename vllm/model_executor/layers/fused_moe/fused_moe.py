@@ -24,19 +24,12 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
     output = torch.zeros_like(hidden_states)
     
     # Flatten topk_ids and topk_weights to simplify processing
-    # flattened_ids: [M * topk]
-    # flattened_weights: [M * topk]
-    # original_token_indices: [M * topk] (repeating 0,0,0,1,1,1...)
     flattened_ids = topk_ids.view(-1)
     flattened_weights = topk_weights.view(-1)
     token_indices = torch.arange(M, device=hidden_states.device).repeat_interleave(topk)
     
     # Find active experts to avoid looping over all E
     active_experts = flattened_ids.unique()
-    
-    # We use a temporary buffer for intermediate activations
-    # intermediate shape: [M * topk, N]
-    # In a fully fused version, this would be in shared memory
     
     for expert_idx in active_experts:
         expert_idx_item = expert_idx.item()
@@ -50,14 +43,11 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
         expert_weights = flattened_weights[slot_indices]
         
         # --- GEMM 1 ---
-        # input: hidden_states[expert_token_indices]
-        # weight: w1[expert_idx]
         tokens = hidden_states.index_select(0, expert_token_indices)
         res = torch.nn.functional.linear(tokens, w1[expert_idx_item])
         res = torch.nn.functional.silu(res)
         
         # --- GEMM 2 ---
-        # output: output[expert_token_indices] += (res @ w2[expert_idx]) * expert_weights
         res = torch.nn.functional.linear(res, w2[expert_idx_item])
         
         # Weighted accumulation
