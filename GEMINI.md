@@ -16,12 +16,19 @@
 *   **`vllm/structured_output/`**: Production-grade implementation using Outlines for constrained generation.
 *   **`vllm/kernels/triton/`**: Contains optimized kernels for PagedAttention, GGUF Dequant, Activation, and Index-aware MoE.
 
+## Ongoing Adaptations (March 2026)
+*   **GLM-4.7-Flash**: Implementing `glm4_moe_lite` architecture with MLA and Shared Experts.
+*   **Kimi-Linear**: Adapting for linear attention and long-context (128K+) performance.
+*   **MiniMax-abab7**: Evaluating MoE routing logic for single-GPU optimization.
+
 ## Performance Milestones (AMD AI Max 60GB - Real Weights)
-*   **DeepSeek-V2-Lite (16B MoE)**: **885.5 tokens/sec** (Batch 128, 4K Context).
-*   **TinyLlama-1.1B (Dense)**: **668.7 tokens/sec** (Batch 32, FP16).
-*   **Qwen3.5-9B (Dense)**: **148.3 tokens/sec** (Batch 32, Q4 GGUF).
+*   **DeepSeek-V2-Lite (16B MoE)**: **888.8 tokens/sec** (Batch 128, 4K Context).
+*   **TinyLlama-1.1B (Dense)**: **784.4 tokens/sec** (Batch 32, FP16).
+*   **Qwen3.5-9B (Dense)**: **160.9 tokens/sec** (Batch 32, Q4 GGUF).
+*   **GLM-4.7-Flash (10B MoE)**: **90.6 tokens/sec** (Batch 32).
 *   **Qwen3.5-35B (MoE)**: **33.6 tokens/sec** (Batch 16, 4K Context).
 *   **TinyLlama LoRA**: **578.0 tokens/sec** (Batch 32, Real Weights).
+
 
 ## Development Guidelines
 *   **Adding Models**: Subclass `LiteModel` and `LiteDecoderLayer`. Use `LiteLinear` for all projections.

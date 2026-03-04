@@ -130,7 +130,7 @@ if __name__ == "__main__":
         ("GLM-4.7-Flash-GGUF", "models/GLM-4.7-Flash-GGUF", 32),
         ("DeepSeek-V2-Lite-GGUF", "models/DeepSeek-V2-Lite-GGUF", 32),
         ("Kimi-Linear-48B-GGUF", "models/Kimi-Linear-48B-GGUF", 4),
-        ("Qwen3.5-35B-MoE-GGUF", "models/Qwen3.5-35B-MoE-GGUF", 1),
+        ("Qwen3.5-35B-MoE-GGUF", "models/Qwen3.5-35B-MoE-GGUF", 32),
     ]
     
     results = {}

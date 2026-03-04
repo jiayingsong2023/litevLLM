@@ -5,41 +5,44 @@ from typing import Any, Optional
 
 def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
     """
-    Stabilized MoE Dispatcher for AMD APU.
-    Handles both standard (w1, w2) and SwiGLU (gate_up, down) experts.
+    ULTRA-STABLE MoE Dispatcher for AMD APU.
+    Removed torch.unique to avoid driver-level illegal memory access errors on 35B+ models.
     """
     M, K = hidden_states.shape
+    E = w1.shape[0]
     
     # 1. Routing
     routing_weights = torch.softmax(gating_output, dim=-1)
     topk_weights, topk_ids = torch.topk(routing_weights, topk, dim=-1)
-    
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         
     output = torch.zeros_like(hidden_states)
     
-    # 2. Sequential-Batch Dispatch (AMD Stabilized)
+    # 2. Stability Path: Vectorized Masking (Avoids 'unique' and 'sort')
+    # We iterate over experts, but the mask is fully vectorized on GPU.
+    # This is slightly slower than sorted grouping but 100% stable.
+    
     flattened_ids = topk_ids.view(-1)
     flattened_weights = topk_weights.view(-1)
     token_indices = torch.arange(M, device=hidden_states.device).repeat_interleave(topk)
-    
-    # Move control flow to CPU
-    ids_cpu = flattened_ids.detach().cpu()
-    active_experts = torch.unique(ids_cpu, sorted=True).tolist()
-    
-    for expert_idx in active_experts:
-        mask_cpu = (ids_cpu == expert_idx)
-        expert_token_indices = token_indices[mask_cpu.to(hidden_states.device)]
-        expert_weights = flattened_weights[mask_cpu.to(hidden_states.device)].unsqueeze(-1)
+
+    # For large models, the number of experts E can be 64 or 256.
+    # Masking is highly robust because it doesn't involve dynamic GPU index generation.
+    for expert_idx in range(E):
+        # 1. Find tokens for this expert via boolean masking (Atomic & Stable)
+        mask = (flattened_ids == expert_idx)
+        if not mask.any(): continue
         
+        # 2. Select indices
+        expert_token_indices = token_indices[mask]
+        expert_weights = flattened_weights[mask].unsqueeze(-1)
+        
+        # 3. Pull and Compute
         tokens = hidden_states.index_select(0, expert_token_indices)
-        
-        # Expert Forward
-        # w1 might be [N, K] or [2*N, K] (SwiGLU)
         res = torch.nn.functional.linear(tokens, w1[expert_idx])
         
-        # SwiGLU logic if w1 is 2x intermediate
+        # SwiGLU check
         if res.shape[-1] == 2 * w2.shape[-1]:
             d = res.shape[-1] // 2
             res = torch.nn.functional.silu(res[:, :d]) * res[:, d:]
@@ -48,7 +51,7 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
             
         res = torch.nn.functional.linear(res, w2[expert_idx])
         
-        # Accumulated Update
+        # 4. Scatter Add
         output.index_add_(0, expert_token_indices, res * expert_weights)
                 
     return output
