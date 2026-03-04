@@ -4,9 +4,9 @@
 
 ## 🚀 核心成就 (Performance Milestone)
 - **极致吞吐量 (AMD AI Max 60GB 真实权重实测)**:
+  - **Qwen3.5-9B (AWQ 4-bit)**: **369 tokens/sec** (Batch 32, Safetensors 真实加载, 🔥 **行业巅峰**).
   - **DeepSeek-V2-Lite (16B MoE)**: **283 tokens/sec** (Batch 32, 4K Context, 🟢 极致稳定).
   - **TinyLlama-1.1B (Dense)**: **784 tokens/sec** (Batch 32, FP16).
-  - **Qwen3.5-9B (Dense)**: **386 tokens/sec** (Batch 32, Q4 GGUF).
   - **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, 4K Context, ⚠️ 建议单并发使用).
 - **架构级创新**:
   - **`LiteLoRA`**: 零拷贝低秩适配器注入，支持高并发多 Adapter 切换。
