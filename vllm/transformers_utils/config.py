@@ -165,8 +165,7 @@ def thinker_uses_mrope(config: PretrainedConfig) -> bool:
     return 0
 
 def is_encoder_decoder(config: PretrainedConfig) -> bool:
-    Detect if the model with this config is used with interleaved attention.
-    Update kwargs for AutoConfig initialization based on model_type
+    """Remap config attributes based on _CONFIG_ATTRS_MAPPING."""
     for old_attr, new_attr in _CONFIG_ATTRS_MAPPING.items():
         if hasattr(config, old_attr):
             if not hasattr(config, new_attr):
@@ -224,7 +223,7 @@ def get_config(
     trust_remote_code: bool,
     revision: str | None = None,
     code_revision: str | None = None,
-    config_format: str | ConfigFormat = "auto",
+    config_format: str = "auto",
     hf_overrides_kw: dict[str, Any] | None = None,
     hf_overrides_fn: Callable[[PretrainedConfig], PretrainedConfig] | None = None,
     **kwargs,
@@ -593,7 +592,7 @@ def try_get_generation_config(
     model: str,
     trust_remote_code: bool,
     revision: str | None = None,
-    config_format: str | ConfigFormat = "auto",
+    config_format: str = "auto",
 ) -> GenerationConfig | None:
     # GGUF files don't have generation_config.json - their config is embedded
     # in the file header. Skip all filesystem lookups to avoid re-reading the
