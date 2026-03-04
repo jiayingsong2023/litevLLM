@@ -4,11 +4,10 @@
 
 ## 🚀 核心成就 (Performance Milestone)
 - **极致吞吐量 (AMD AI Max 60GB 真实权重实测)**:
-  - **DeepSeek-V2-Lite (16B MoE)**: **888.8 tokens/sec** (Batch 128, 4K Context, MLA 架构).
-  - **TinyLlama-1.1B (Dense)**: **784.4 tokens/sec** (Batch 32, FP16).
-  - **Qwen3.5-9B (Dense)**: **160.9 tokens/sec** (Batch 32, Q4 GGUF).
-  - **GLM-4.7-Flash (10B MoE)**: **90.6 tokens/sec** (Batch 32, Q4 GGUF).
-  - **Qwen3.5-35B (MoE)**: **33.6 tokens/sec** (Batch 16, 4K Context, 3B Active).
+  - **DeepSeek-V2-Lite (16B MoE)**: **283 tokens/sec** (Batch 32, 4K Context, 🟢 极致稳定).
+  - **TinyLlama-1.1B (Dense)**: **784 tokens/sec** (Batch 32, FP16).
+  - **Qwen3.5-9B (Dense)**: **386 tokens/sec** (Batch 32, Q4 GGUF).
+  - **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, 4K Context, ⚠️ 建议单并发使用).
 - **架构级创新**:
   - **`LiteLoRA`**: 零拷贝低秩适配器注入，支持高并发多 Adapter 切换。
   - **`Real-Image Processing`**: 补齐多模态框架，支持原始 PIL 图像直接输入并自动转换为 GPU 张量。
