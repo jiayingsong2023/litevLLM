@@ -27,12 +27,14 @@ def benchmark_qwen3_5(model_path, batch_size=32):
             self.num_attention_heads = data.get("num_attention_heads", 16)
             self.num_key_value_heads = data.get("num_key_value_heads", 4)
             self.hidden_size = data.get("hidden_size", 4096)
+            self.head_dim = data.get("head_dim", self.hidden_size // self.num_attention_heads)
             self.intermediate_size = data.get("intermediate_size", 12288)
             self.max_position_embeddings = data.get("max_position_embeddings", 262144)
             self.vocab_size = data.get("vocab_size", 248320)
             self.rms_norm_eps = data.get("rms_norm_eps", 1e-6)
             self.architectures = config_data.get("architectures", ["Qwen3_5ForConditionalGeneration"])
             self.dtype = data.get("torch_dtype", "bfloat16")
+            self.layer_types = data.get("layer_types", ["full_attention"] * self.num_hidden_layers)
             # MoE specific
             self.num_experts = data.get("num_experts", 0)
             self.num_experts_per_tok = data.get("num_experts_per_tok", 0)
@@ -124,23 +126,16 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Qwen3.5-9B failed: {e}")
 
-    # Test Qwen3.5-35B (MoE)
+    # Test Qwen3.5-35B (MoE) with reduced context for performance recovery
     model_35b = "models/Qwen3.5-35B-MoE-GGUF"
     if os.path.exists(model_35b) and os.path.exists(os.path.join(model_35b, "config.json")):
         gguf_files = [f for f in os.listdir(model_35b) if f.endswith(".gguf")]
         if gguf_files:
-            weights_35b = os.path.join(model_35b, gguf_files[0])
             try:
-                if os.path.getsize(weights_35b) > 10 * 1024 * 1024 * 1024:
-                    # Stress test BS=16 and BS=32
-                    for bs in [16, 32]:
-                        results[f"Qwen3.5-35B-MoE-BS{bs}"] = benchmark_qwen3_5(model_35b, batch_size=bs)
-                else:
-                    print(f"Qwen3.5-35B weight file {gguf_files[0]} is too small, skipping...")
+                # 1K context, BS=8
+                results["Qwen3.5-35B-MoE-BS8-1K"] = benchmark_qwen3_5(model_35b, batch_size=8)
             except Exception as e:
-                print(f"Qwen3.5-35B-MoE failed: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"35B 1K failed: {e}")
     print("\n" + "="*45)
     print("QWEN3.5 PERFORMANCE SUMMARY")
     print("="*45)

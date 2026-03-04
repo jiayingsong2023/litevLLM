@@ -38,44 +38,69 @@ class AWQConfig(QuantizationConfig):
         cached_weight = _GLOBAL_GGUF_CACHE.get(layer.weight_id)
         
         if cached_weight is None:
-            # High-performance path: Hybrid Selection
-            if x.shape[0] > 1:
-                # AMD Stability Patch: Ensure metadata before dequant
-                # Handle potential None if weights weren't loaded correctly
-                if layer.qweight is None:
-                    return torch.nn.functional.linear(x, torch.zeros((layer.output_size, layer.input_size), device=x.device, dtype=x.dtype), layer.bias)
-                
-                qweight = layer.qweight.contiguous()
-                scales = layer.scales.contiguous()
-                # Some AWQ models don't have zeros (symmetric)
-                qzeros = layer.qzeros.contiguous() if layer.qzeros is not None else torch.zeros((qweight.shape[0] // self.group_size, qweight.shape[1]), device=qweight.device, dtype=torch.int32)
-                
-                cached_weight = awq_dequantize_triton(
-                    qweight, scales, qzeros
-                ).transpose(0, 1) 
-                _GLOBAL_GGUF_CACHE.put(layer.weight_id, cached_weight)
+            if layer.qweight is None:
+                return torch.nn.functional.linear(x, torch.zeros((layer.output_size, layer.input_size), device=x.device, dtype=x.dtype), layer.bias)
+            
+            qweight = layer.qweight.contiguous()
+            scales = layer.scales.contiguous()
+            K, M = layer.input_size, layer.output_size
+            n_rows_q = qweight.shape[0]
+            n_cols_q = qweight.shape[1] * 8
+            
+            if layer.qzeros is not None:
+                qzeros = layer.qzeros.contiguous()
             else:
-                # Single-token fused path
-                if layer.qweight is None: return torch.zeros_like(x)
-                orig_shape = x.shape
-                x_2d = x.reshape(-1, orig_shape[-1])
-                qzeros = layer.qzeros if layer.qzeros is not None else torch.zeros((layer.qweight.shape[0] // self.group_size, layer.qweight.shape[1]), device=x.device, dtype=torch.int32)
-                out = awq_gemm_triton(x_2d, layer.qweight, layer.scales, qzeros, split_k_iters=1)
-                return out.reshape(orig_shape[:-1] + (out.shape[-1],))
+                fill_value = -2004318072
+                if scales.shape[0] == n_rows_q:
+                    qzeros = torch.full((n_rows_q, n_cols_q // self.group_size // 8 + 1), fill_value, device=qweight.device, dtype=torch.int32)
+                else:
+                    qzeros = torch.full((n_rows_q // self.group_size, n_cols_q // 8), fill_value, device=qweight.device, dtype=torch.int32)
+            
+            dequantized = awq_dequantize_triton(qweight, scales, qzeros, self.group_size)
+            if dequantized.shape[0] == K:
+                cached_weight = dequantized.transpose(0, 1).contiguous()
+            else:
+                cached_weight = dequantized.contiguous()
+            _GLOBAL_GGUF_CACHE.put(layer.weight_id, cached_weight)
 
         return torch.nn.functional.linear(x, cached_weight, layer.bias)
 
-    def load_weights(self, layer: nn.Module, weights_iter):
+    def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
+        if expert_idx is not None and layer.qweight is None:
+            K, N = layer.input_size, layer.output_size
+            layer.qweight = nn.Parameter(torch.zeros((N, K // 8), device="cuda", dtype=torch.int32), requires_grad=False)
+            layer.scales = nn.Parameter(torch.zeros((N, K // self.group_size), device="cuda", dtype=torch.float16), requires_grad=False)
+            layer.qzeros = None
+
         for name, loaded_weight in weights_iter:
-            # Support both standard AWQ and Qwen-style Safetensors naming
-            if any(x in name for x in ["qweight", "weight_packed"]):
-                layer.qweight = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
-            elif any(x in name for x in ["qzeros", "weight_zeros"]): # Some use weight_zeros
-                layer.qzeros = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
-            elif any(x in name for x in ["scales", "weight_scale"]):
-                layer.scales = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
-            elif "bias" in name:
-                layer.bias = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+            if expert_idx is not None:
+                num_experts = 256
+                if "w1" in layer.prefix:
+                    inter_size = layer.output_size // (num_experts * 2)
+                    start_n = expert_idx * (inter_size * 2) + (part * inter_size if part is not None else 0)
+                    end_n = start_n + inter_size
+                else:
+                    inter_size = layer.output_size // num_experts
+                    start_n = expert_idx * inter_size
+                    end_n = start_n + inter_size
+                
+                if any(x in name for x in ["qweight", "weight_packed"]):
+                    layer.qweight.data[start_n : end_n, :].copy_(loaded_weight)
+                elif any(x in name for x in ["scales", "weight_scale"]):
+                    layer.scales.data[start_n : end_n, :].copy_(loaded_weight)
+                elif any(x in name for x in ["qzeros", "weight_zeros"]):
+                    if layer.qzeros is None:
+                        layer.qzeros = nn.Parameter(torch.zeros((layer.output_size, layer.input_size // self.group_size // 8 + 1), device="cuda", dtype=torch.int32), requires_grad=False)
+                    layer.qzeros.data[start_n : end_n, :].copy_(loaded_weight)
+            else:
+                if any(x in name for x in ["qweight", "weight_packed"]):
+                    layer.qweight = nn.Parameter(loaded_weight, requires_grad=False)
+                elif any(x in name for x in ["qzeros", "weight_zeros"]):
+                    layer.qzeros = nn.Parameter(loaded_weight, requires_grad=False)
+                elif any(x in name for x in ["scales", "weight_scale"]):
+                    layer.scales = nn.Parameter(loaded_weight, requires_grad=False)
+                elif "bias" in name:
+                    layer.bias = nn.Parameter(loaded_weight, requires_grad=False)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AWQConfig":
