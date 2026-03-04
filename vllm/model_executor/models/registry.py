@@ -8,13 +8,14 @@ class _ModelRegistry:
             "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
             "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
             "QWen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
-            "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
             "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
             "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
             "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
             "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
             "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
             "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForConditionalGeneration"),
+            "Glm4MoeLiteForCausalLM": ("glm", "Glm4MoeLiteForCausalLM"),
+            "GlmForCausalLM": ("glm", "GlmForCausalLM"),
         }
 
     def resolve_model_cls(self, architectures: list, model_config: Any) -> Tuple[Type[nn.Module], str]:

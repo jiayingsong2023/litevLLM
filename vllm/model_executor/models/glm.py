@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Kimi-Linear: LitevLLM Optimized Implementation.
-Supports kimi_linear architecture with Hybrid MLA and KDA layers.
-Uses Global LRU Cache for Experts to fit 48B model in 60GB VRAM.
+GLM-4.7-Flash: LitevLLM Optimized Implementation.
+Supports glm4_moe_lite architecture with MLA and Shared Experts.
+Uses Global LRU Cache for Experts to save VRAM.
 """
 import torch
 import torch.nn as nn
@@ -12,10 +12,9 @@ from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.layers.activation import Silu
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
 from vllm.model_executor.models.lite_base import LiteModel, LiteDecoderLayer
-from vllm.attention.backends.triton_attn import TritonAttention
 
-class KimiAttention(nn.Module):
-    def __init__(self, config: Any, layer_id: int, quant_config: Optional[Any] = None, prefix: str = ""):
+class GlmMLA(nn.Module):
+    def __init__(self, config: Any, quant_config: Optional[Any] = None, prefix: str = ""):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -52,37 +51,38 @@ class KimiAttention(nn.Module):
 
         return self.o_proj(output.view(-1, self.num_heads * self.v_head_dim)).view(hidden_states.shape)
 
-class CachedKimiExperts(nn.Module):
+class CachedGlmExperts(nn.Module):
     def __init__(self, config, quant_config, prefix):
         super().__init__()
         self.config = config
-        self.w1 = LiteLinear(config.hidden_size, config.num_experts * config.moe_intermediate_size, 
+        self.w1 = LiteLinear(config.hidden_size, config.n_routed_experts * config.moe_intermediate_size, 
                             bias=False, quant_config=quant_config, prefix=f"{prefix}.experts_w1")
-        self.w2 = LiteLinear(config.moe_intermediate_size, config.num_experts * config.hidden_size, 
+        self.w2 = LiteLinear(config.moe_intermediate_size, config.n_routed_experts * config.hidden_size, 
                             bias=False, quant_config=quant_config, prefix=f"{prefix}.experts_w2")
 
     def forward(self, x, router_logits):
         from vllm.model_executor.layers.quantization.gguf import _GLOBAL_GGUF_CACHE
+        # Trigger cache
         self.w1(x[:1])
         self.w2(torch.zeros((1, self.config.moe_intermediate_size), device=x.device, dtype=x.dtype))
         
         w1_tensor = _GLOBAL_GGUF_CACHE.get(self.w1.weight_id)
         w2_tensor = _GLOBAL_GGUF_CACHE.get(self.w2.weight_id)
         
-        w1_reshaped = w1_tensor.view(self.config.num_experts, self.config.moe_intermediate_size, -1)
-        w2_reshaped = w2_tensor.view(self.config.num_experts, -1, self.config.moe_intermediate_size)
+        w1_reshaped = w1_tensor.view(self.config.n_routed_experts, self.config.moe_intermediate_size, -1)
+        w2_reshaped = w2_tensor.view(self.config.n_routed_experts, -1, self.config.moe_intermediate_size)
         
-        return fused_moe(x, w1_reshaped, w2_reshaped, router_logits, topk=self.config.num_experts_per_token)
+        return fused_moe(x, w1_reshaped, w2_reshaped, router_logits, topk=self.config.num_experts_per_tok)
 
-class KimiMoE(nn.Module):
+class GlmMoE(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
         self.config = config
-        self.gate = LiteLinear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = CachedKimiExperts(config, quant_config, prefix)
+        self.gate = LiteLinear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.experts = CachedGlmExperts(config, quant_config, prefix)
         
-        if getattr(config, "num_shared_experts", 0) > 0:
-            shared_dim = config.moe_intermediate_size * config.num_shared_experts
+        if getattr(config, "n_shared_experts", 0) > 0:
+            shared_dim = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = LiteLinear(config.hidden_size, 2 * shared_dim, bias=False, 
                                            quant_config=quant_config, prefix=f"{prefix}.shared_experts.gate_up_proj")
             self.shared_down = LiteLinear(shared_dim, config.hidden_size, bias=False, 
@@ -105,23 +105,13 @@ class KimiMoE(nn.Module):
             
         return routed_out.view(orig_shape)
 
-class KimiLayer(nn.Module):
+class GlmLayer(nn.Module):
     def __init__(self, config, layer_id, quant_config=None, prefix=""):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        if layer_id in config.linear_attn_config["full_attn_layers"]:
-            self.self_attn = KimiAttention(config, layer_id, quant_config=quant_config, prefix=f"{prefix}.self_attn")
-        else:
-            # For KDA layers, we still use KimiAttention as proxy for memory testing
-            # Real KDA implementation would be integrated here
-            self.self_attn = KimiAttention(config, layer_id, quant_config=quant_config, prefix=f"{prefix}.self_attn")
-            
-        if layer_id >= getattr(config, "first_k_dense_replace", 0):
-            self.mlp = KimiMoE(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
-        else:
-            self.mlp = KimiMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.self_attn = GlmMLA(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
+        self.mlp = GlmMoE(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
 
     def forward(self, hidden_states, positions, kv_cache, attn_metadata):
         residual = hidden_states
@@ -134,27 +124,13 @@ class KimiLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
-class KimiMLP(nn.Module):
-    def __init__(self, config, quant_config=None, prefix=""):
-        super().__init__()
-        self.gate_up_proj = LiteLinear(config.hidden_size, 2 * config.intermediate_size, bias=False, 
-                                     quant_config=quant_config, prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = LiteLinear(config.intermediate_size, config.hidden_size, bias=False, 
-                                   quant_config=quant_config, prefix=f"{prefix}.down_proj")
-        self.act_fn = Silu()
-
-    def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        return self.down_proj(self.act_fn(gate) * up)
-
-class KimiLinearForCausalLM(nn.Module):
+class Glm4MoeLiteForCausalLM(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            KimiLayer(config, i, quant_config=vllm_config.quant_config, prefix=f"{prefix}.layers.{i}")
+            GlmLayer(config, i, quant_config=vllm_config.quant_config, prefix=f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -166,3 +142,5 @@ class KimiLinearForCausalLM(nn.Module):
             hidden_states = self.layers[i](hidden_states, positions, kv_caches[i], attn_metadata)
         hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
+
+class GlmForCausalLM(Glm4MoeLiteForCausalLM): pass

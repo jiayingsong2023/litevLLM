@@ -23,7 +23,6 @@ class GGUFWeightCache:
             return
         
         if len(self.cache) >= self.max_size:
-            # print(f"DEBUG: GGUF Cache Full, evicting oldest")
             self.cache.popitem(last=False)
             
         self.cache[weight_id] = weight
@@ -33,7 +32,7 @@ class GGUFWeightCache:
         torch.cuda.empty_cache()
 
 # Global instance
-_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_cache_size=384) # Optimized for large MoE at BS=32
+_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_cache_size=128) # Balanced for AMD AI Max
 
 def clear_gguf_cache():
     _GLOBAL_GGUF_CACHE.clear()
@@ -64,7 +63,25 @@ class GGUFConfig(QuantizationConfig):
                 )
 
             from vllm.kernels.triton.gguf_dequant import gguf_dequantize
-            cached_weight = gguf_dequantize(layer.qweight, layer.qscales, layer.qtype)
+            
+            # --- AMD Stability Fix: Segmented Dequantization ---
+            # Large weights (like Qwen3.5 12K dim) can cause HIP errors if dequantized at once.
+            # We dequantize in chunks if the output features are too high.
+            out_features = layer.qweight.shape[0]
+            if out_features > 4096:
+                chunk_size = 2048
+                dequantized_chunks = []
+                for i in range(0, out_features, chunk_size):
+                    end = min(i + chunk_size, out_features)
+                    q_chunk = layer.qweight[i:end].contiguous()
+                    s_chunk = layer.qscales[i:end].contiguous()
+                    dequantized_chunks.append(gguf_dequantize(q_chunk, s_chunk, layer.qtype))
+                cached_weight = torch.cat(dequantized_chunks, dim=0)
+            else:
+                cached_weight = gguf_dequantize(layer.qweight.contiguous(), 
+                                               layer.qscales.contiguous(), 
+                                               layer.qtype)
+            
             _GLOBAL_GGUF_CACHE.put(layer.weight_id, cached_weight)
             
         return torch.nn.functional.linear(x, cached_weight, layer.bias)
