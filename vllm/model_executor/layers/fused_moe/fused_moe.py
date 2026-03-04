@@ -5,10 +5,9 @@ from typing import Any, Optional
 
 def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
     """
-    ULTRA-STABLE DUAL-MODE DISPATCHER (Final Version)
-    Optimized for AMD Strix Point (gfx1151).
-    - Tier 1/2 (< 256 experts): Full GPU performance.
-    - Tier 3 (>= 256 experts): Serial CPU-GPU synchronized stability.
+    Intelligent Tiered MoE Dispatcher.
+    - Tier 1/2: Full GPU Vectorization (High TPS).
+    - Tier 3 (Massive Models): Logical Serialized Dispatch (Ollama-style Stability).
     """
     M, K = hidden_states.shape
     E = w1.shape[0]
@@ -21,11 +20,12 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
         
     output = torch.zeros_like(hidden_states)
     
-    # 2. Tier Selection
-    use_ultra_stability = (E >= 256)
+    # 2. Strategy Selection
+    # For massive models (e.g. Qwen-35B, Kimi-48B), use Serialized Dispatch to ensure stability.
+    use_serialized_mode = (E >= 256 or K > 4096 or M > 128)
     
-    if not use_ultra_stability:
-        # --- PERFORMANCE PATH ---
+    if not use_serialized_mode:
+        # --- ASYNC VECTORIZED PATH (Standard Performance) ---
         flattened_ids = topk_ids.view(-1)
         flattened_weights = topk_weights.view(-1)
         token_indices = torch.arange(M, device=hidden_states.device).repeat_interleave(topk)
@@ -35,63 +35,59 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
         sorted_weights = flattened_weights[sorting_indices]
         
         unique_ids, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+        unique_ids_list = unique_ids.tolist()
+        counts_list = counts.tolist()
         
         curr_offset = 0
-        for i in range(len(unique_ids)):
-            expert_idx = unique_ids[i].item()
-            count = counts[i].item()
+        for i, expert_idx in enumerate(unique_ids_list):
+            count = counts_list[i]
             start, end = curr_offset, curr_offset + count
             curr_offset += count
             
-            idx = sorted_token_indices[start:end]
-            w = sorted_weights[start:end].unsqueeze(-1)
+            group_token_indices = sorted_token_indices[start:end]
+            group_weights = sorted_weights[start:end].unsqueeze(-1)
             
-            tokens = hidden_states.index_select(0, idx)
+            tokens = hidden_states.index_select(0, group_token_indices)
             res = torch.nn.functional.linear(tokens, w1[expert_idx])
-            # SwiGLU
             if res.shape[-1] == 2 * w2.shape[-1]:
                 d = res.shape[-1] // 2
                 res = torch.nn.functional.silu(res[:, :d]) * res[:, d:]
             else:
                 res = torch.nn.functional.silu(res)
             res = torch.nn.functional.linear(res, w2[expert_idx])
-            output.index_add_(0, idx, res * w)
+            output.index_add_(0, group_token_indices, res * group_weights)
     else:
-        # --- ULTRA-STABILITY PATH (For 35B/48B) ---
-        # 1. Force Sync and Move to CPU to avoid dynamic GPU index errors
+        # --- OLLAMA-STYLE SERIALIZED PATH (Ultimate Stability) ---
+        # We process one token at a time to minimize memory pressure.
+        # This is essentially 'Sequential Batching' at the lowest level.
         torch.cuda.synchronize()
-        ids_cpu = topk_ids.detach().cpu()
-        weights_cpu = topk_weights.detach().cpu()
-        active_experts = torch.unique(ids_cpu).tolist()
         
-        for expert_idx in active_experts:
-            # 2. Find indices on CPU (Guaranteed stable)
-            mask_cpu = (ids_cpu == expert_idx)
-            # Find which row in the batch and which top-k slot
-            matched_indices = mask_cpu.nonzero(as_tuple=True)
-            batch_indices = matched_indices[0].to(hidden_states.device)
-            slot_indices = matched_indices[1]
+        for m in range(M):
+            # Extract top-k for THIS token
+            token_expert_ids = topk_ids[m]
+            token_expert_weights = topk_weights[m]
+            token_hidden = hidden_states[m:m+1]
             
-            # Get weights for this expert
-            expert_weights = weights_cpu[mask_cpu].to(hidden_states.device).unsqueeze(-1)
+            token_output = torch.zeros_like(token_hidden)
             
-            # 3. Step-by-step GPU execution with explicit barriers
-            tokens = hidden_states.index_select(0, batch_indices)
-            res = torch.nn.functional.linear(tokens, w1[expert_idx])
-            
-            # SwiGLU logic
-            if res.shape[-1] == 2 * w2.shape[-1]:
-                d = res.shape[-1] // 2
-                res = torch.nn.functional.silu(res[:, :d]) * res[:, d:]
-            else:
-                res = torch.nn.functional.silu(res)
+            for k in range(topk):
+                expert_idx = token_expert_ids[k].item()
+                weight = token_expert_weights[k].item()
                 
-            res = torch.nn.functional.linear(res, w2[expert_idx])
+                # Step-by-step linear call
+                res = torch.nn.functional.linear(token_hidden, w1[expert_idx])
+                if res.shape[-1] == 2 * w2.shape[-1]:
+                    d = res.shape[-1] // 2
+                    res = torch.nn.functional.silu(res[:, :d]) * res[:, d:]
+                else:
+                    res = torch.nn.functional.silu(res)
+                res = torch.nn.functional.linear(res, w2[expert_idx])
+                
+                token_output += res * weight
+                # Explicit barrier after each expert projection for huge models
+                torch.cuda.synchronize()
             
-            # 4. Safe accumulation
-            output.index_add_(0, batch_indices, res * expert_weights)
-            # Final barrier for this expert
-            torch.cuda.synchronize()
+            output[m] = token_output
                 
     return output
 
