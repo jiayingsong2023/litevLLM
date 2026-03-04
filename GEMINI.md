@@ -16,13 +16,12 @@
 *   **`vllm/structured_output/`**: Production-grade implementation using Outlines for constrained generation.
 *   **`vllm/kernels/triton/`**: Contains optimized kernels for PagedAttention, GGUF Dequant, Activation, and Index-aware MoE.
 
-## Performance Milestones (AMD AI Max 60GB)
+## Performance Milestones (AMD AI Max 60GB - Real Weights)
 *   **DeepSeek-V2-Lite (16B MoE)**: **885.5 tokens/sec** (Batch 128, 4K Context).
-*   **Qwen3.5-9B (Dense)**: **196.3 tokens/sec** (Batch 32).
-*   **Qwen3.5-35B (MoE)**: **66.6 tokens/sec** (Batch 32, 4K Context).
-*   **TinyLlama LoRA**: **546.4 tokens/sec** (Batch 32).
-*   **Qwen-MoE**: **540.9 tokens/sec** (Batch 32).
-*   **Multimodal (576 vision context)**: **532.4 tokens/sec** (Batch 32).
+*   **TinyLlama-1.1B (Dense)**: **668.7 tokens/sec** (Batch 32, FP16).
+*   **Qwen3.5-9B (Dense)**: **148.3 tokens/sec** (Batch 32, Q4 GGUF).
+*   **Qwen3.5-35B (MoE)**: **33.6 tokens/sec** (Batch 16, 4K Context).
+*   **TinyLlama LoRA**: **578.0 tokens/sec** (Batch 32, Real Weights).
 
 ## Development Guidelines
 *   **Adding Models**: Subclass `LiteModel` and `LiteDecoderLayer`. Use `LiteLinear` for all projections.
