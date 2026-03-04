@@ -33,7 +33,7 @@ class GGUFWeightCache:
         torch.cuda.empty_cache()
 
 # Global instance
-_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_cache_size=256) # Maximize for 35B
+_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_cache_size=384) # Optimized for large MoE at BS=32
 
 def clear_gguf_cache():
     _GLOBAL_GGUF_CACHE.clear()

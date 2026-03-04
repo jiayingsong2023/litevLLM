@@ -13,11 +13,11 @@ class RMSNorm(nn.Module):
             x = x + residual
             
         input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        out = self.weight * x.to(input_dtype)
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+        out = self.weight * x_fp32.to(input_dtype)
         
-        if residual is not None:
-            return out, x.to(input_dtype) # 简化 residual 返回
+        # FINAL STABILITY: Never return a tuple unless explicitly asked for.
+        # However, the current code base might have older calls expecting a single value.
         return out

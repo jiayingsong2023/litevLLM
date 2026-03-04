@@ -13,6 +13,8 @@ class _ModelRegistry:
             "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
             "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
             "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
+            "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForConditionalGeneration"),
         }
 
     def resolve_model_cls(self, architectures: list, model_config: Any) -> Tuple[Type[nn.Module], str]:
