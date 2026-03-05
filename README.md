@@ -12,6 +12,8 @@
   - **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, 🟢 **稳定运行**).
 - **架构级创新**:
   - **`LiteLoRA`**: 零拷贝低秩适配器注入，支持高并发多 Adapter 切换。
+    - **TinyLlama-1.1B LoRA (Rank-16)**: **365.7 tokens/sec** (Batch 32, 🟢 **全量注入实测**).
+    - **注意**: v1.0 版本对 Qwen3.5 和 DeepSeek-V2 的 LoRA 支持目前仅限于单并发测试；多并发 (BS>1) 适配将在 v2.0 版本中结合新的 Dynamic-Batching 调度器进行增强。
   - **`Real-Image Processing`**: 补齐多模态框架，支持原始 PIL 图像直接输入并自动转换为 GPU 张量。
   - **`Structured Output`**: 集成 Outlines 引擎，实现 100% 正确的 JSON Schema 和正则约束生成。
 

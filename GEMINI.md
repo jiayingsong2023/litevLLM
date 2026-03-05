@@ -28,6 +28,8 @@
 *   **Qwen3.5-9B (GGUF)**: **240.6 tokens/sec** (Batch 32, Q4_K).
 *   **Qwen3.5-9B (AWQ 4-bit)**: **147.7 tokens/sec** (Batch 32, Safetensors Load).
 *   **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, GGUF - 🟢 Stable).
+*   **TinyLlama LoRA (Rank-16)**: **365.7 tokens/sec** (Batch 32, Real Weights - 🟢 Verified).
+*   **Qwen3.5/DeepSeek LoRA**: **Stable at Batch 1** (Multi-Batch support targeted for v2.0).
 
 
 ## Development Guidelines

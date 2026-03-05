@@ -27,34 +27,61 @@ class LiteLinear(nn.Module):
             if bias: self.bias = nn.Parameter(torch.empty(output_size), requires_grad=False)
             else: self.register_parameter('bias', None)
         self.weight_id = id(self)
+        self.adapters: Dict[int, Tuple[torch.Tensor, torch.Tensor, float]] = {}
+
+    def add_adapter(self, aid: int, lora_a: torch.Tensor, lora_b: torch.Tensor, scaling: float = 1.0):
+        self.adapters[aid] = (lora_a.to("cuda").half(), lora_b.to("cuda").half(), scaling)
+
+    def set_lora(self, lora_a: torch.Tensor, lora_b: torch.Tensor, scaling: float = 1.0):
+        self.add_adapter(aid=1, lora_a=lora_a, lora_b=lora_b, scaling=scaling)
 
     def forward(self, x: torch.Tensor, lora_mapping: Optional[torch.Tensor] = None) -> torch.Tensor:
         if x.shape[-1] != self.input_size:
             if x.shape[-1] < self.input_size: x = torch.nn.functional.pad(x, (0, self.input_size - x.shape[-1]))
             else: x = x[..., :self.input_size]
-        if self.quant_config is None: return torch.nn.functional.linear(x, self.weight, self.bias)
-        return self.quant_config.apply(self, x)
+        
+        if self.quant_config is None: res = torch.nn.functional.linear(x, self.weight, self.bias)
+        else: res = self.quant_config.apply(self, x)
+            
+        # --- ATOMIC LOCALIZED LORA ROUTING ---
+        if lora_mapping is not None and self.adapters:
+            r_f = res.view(-1, res.shape[-1])
+            x_f = x.view(-1, x.shape[-1])
+            n_tok = x_f.shape[0]
+            m_1d = lora_mapping.flatten()
+            bsz = m_1d.shape[0]
+            
+            # Use a local loop-bound expansion factor
+            factor = n_tok // bsz if n_tok > bsz else 1
+
+            for aid, (la, lb, scaling) in self.adapters.items():
+                # Generate mask ATOMICALLY inside the loop to avoid stale refs
+                if factor > 1:
+                    local_mask = (m_1d.repeat_interleave(factor) == int(aid))
+                else:
+                    local_mask = (m_1d == int(aid))
+                
+                # Final physical dimension check
+                if local_mask.shape[0] == n_tok and local_mask.any():
+                    delta = (x_f[local_mask].to(torch.float32) @ la.t().to(torch.float32)) @ lb.t().to(torch.float32)
+                    r_f[local_mask] += delta.to(r_f.dtype) * scaling
+            
+            return r_f.view_as(res)
+                    
+        return res
 
     def load_weights(self, weights_iter, expert_idx=None, part=None):
-        # Peak at weight dimensions to detect forced quantization
         for name, loaded_weight in list(weights_iter):
-            # If loaded weight is 1/8 size of expected, it's packed AWQ
             if self.quant_config is None and (loaded_weight.shape[0] * 8 == self.output_size or loaded_weight.shape[1] * 8 == self.input_size):
-                # EMERGENCY: Layer was initialized as FP16 but weights are AWQ
-                print(f">>> LiteLinear: Emergency Quantization conversion for {self.prefix}")
                 from vllm.model_executor.layers.quantization.awq import AWQConfig
-                self.quant_config = AWQConfig()
-                self.quant_config.init_layer(self)
-
+                self.quant_config = AWQConfig(); self.quant_config.init_layer(self)
         if self.quant_config is not None:
             if hasattr(self.quant_config, "load_weights"):
                 import inspect; sig = inspect.signature(self.quant_config.load_weights)
                 if "expert_idx" in sig.parameters: self.quant_config.load_weights(self, weights_iter, expert_idx=expert_idx, part=part)
                 else: self.quant_config.load_weights(self, weights_iter)
             return
-
         for name, loaded_weight in weights_iter:
-            # Dimension Healing
             w_out, w_in = loaded_weight.shape[0], loaded_weight.shape[1]
             if w_out != self.output_size and expert_idx is None:
                 self.output_size = w_out
