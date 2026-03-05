@@ -1,96 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 import torch.nn as nn
-from typing import Dict, OrderedDict
-from collections import OrderedDict
+from typing import Any, Dict, Optional, List
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.kernels.triton.gguf_dequant import gguf_dequantize
 
 class GGUFWeightCache:
-    """Global LRU Cache for dequantized GGUF weights to prevent OOM."""
-    def __init__(self, max_cache_size: int = 256):
-        self.cache: OrderedDict[int, torch.Tensor] = OrderedDict()
-        self.max_size = max_cache_size
+    def __init__(self, max_size=128):
+        self.cache = {}
+        self.max_size = max_size
+    def get(self, key): return self.cache.get(key)
+    def put(self, key, value):
+        if len(self.cache) >= self.max_size: self.cache.pop(next(iter(self.cache)))
+        self.cache[key] = value
+    def clear(self): self.cache.clear()
 
-    def get(self, weight_id: int) -> torch.Tensor:
-        if weight_id in self.cache:
-            self.cache.move_to_end(weight_id)
-            return self.cache[weight_id]
-        return None
+_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_size=256)
 
-    def put(self, weight_id: int, weight: torch.Tensor):
-        if weight_id in self.cache:
-            self.cache.move_to_end(weight_id)
-            return
-        
-        if len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)
-            
-        self.cache[weight_id] = weight
-    
-    def clear(self):
-        self.cache.clear()
-        torch.cuda.empty_cache()
-
-# Global instance
-_GLOBAL_GGUF_CACHE = GGUFWeightCache(max_cache_size=128) # Balanced for AMD AI Max
-
-def clear_gguf_cache():
-    _GLOBAL_GGUF_CACHE.clear()
+def clear_gguf_cache(): _GLOBAL_GGUF_CACHE.clear()
 
 class GGUFConfig(QuantizationConfig):
+    def __init__(self):
+        super().__init__()
+        self.pack_factor = 1
+
     def get_name(self) -> str: return "gguf"
 
     def init_layer(self, layer: nn.Module):
-        layer.qweight = None
-        layer.qscales = None
-        layer.qtype = "q4_0"
-        layer.weight_id = id(layer) 
+        layer.qweight = None; layer.qzeros = None; layer.scales = None; layer.weight_id = id(layer)
 
     def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
         cached_weight = _GLOBAL_GGUF_CACHE.get(layer.weight_id)
-        
         if cached_weight is None:
-            if layer.qweight is None:
-                in_features = x.shape[-1]
-                out_features = layer.output_size
-                layer.qweight = nn.Parameter(
-                    torch.zeros((out_features, in_features // 2), device=x.device, dtype=torch.uint8),
-                    requires_grad=False
-                )
-                layer.qscales = nn.Parameter(
-                    torch.ones((out_features,), device=x.device, dtype=torch.float16),
-                    requires_grad=False
-                )
-
-            from vllm.kernels.triton.gguf_dequant import gguf_dequantize
-            
-            # --- AMD Stability Fix: Segmented Dequantization ---
-            # Large weights (like Qwen3.5 12K dim) can cause HIP errors if dequantized at once.
-            # We dequantize in chunks if the output features are too high.
-            out_features = layer.qweight.shape[0]
-            if out_features > 4096:
-                chunk_size = 2048
-                dequantized_chunks = []
-                for i in range(0, out_features, chunk_size):
-                    end = min(i + chunk_size, out_features)
-                    q_chunk = layer.qweight[i:end].contiguous()
-                    s_chunk = layer.qscales[i:end].contiguous()
-                    dequantized_chunks.append(gguf_dequantize(q_chunk, s_chunk, layer.qtype))
-                cached_weight = torch.cat(dequantized_chunks, dim=0)
-            else:
-                cached_weight = gguf_dequantize(layer.qweight.contiguous(), 
-                                               layer.qscales.contiguous(), 
-                                               layer.qtype)
-            
+            if layer.qweight is None: return torch.zeros((x.shape[0], layer.output_size), device=x.device, dtype=x.dtype)
+            cached_weight = gguf_dequantize(layer.qweight, layer.scales, 2) # Default Q4_K
             _GLOBAL_GGUF_CACHE.put(layer.weight_id, cached_weight)
-            
         return torch.nn.functional.linear(x, cached_weight, layer.bias)
 
-    def load_weights(self, layer: nn.Module, weights_iter):
+    def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
         for name, loaded_weight in weights_iter:
-            if "weight" in name:
-                layer.qweight = nn.Parameter(loaded_weight, requires_grad=False)
-            elif "bias" in name:
-                layer.bias = nn.Parameter(loaded_weight, requires_grad=False)
-            elif "scales" in name:
-                layer.qscales = nn.Parameter(loaded_weight, requires_grad=False)
+            if "weight" in name: layer.qweight = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+            elif "scales" in name: layer.scales = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+            elif "bias" in name: layer.bias = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "GGUFConfig":
+        return cls()

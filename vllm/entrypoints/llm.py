@@ -3,88 +3,90 @@ import torch
 import gc
 import os
 import json
+import time
 from typing import List, Optional, Union
-from vllm.inputs import PromptInput
 from vllm.sampling_params import SamplingParams
-from vllm.outputs import RequestOutput
+from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.model_executor.model_loader import get_model, get_tokenizer
 from vllm.model_executor.layers.quantization.gguf import clear_gguf_cache
 from transformers import AutoConfig
 
 class LLM:
-    """
-    Main entrypoint for FastInference.
-    Supports Hot Model Switching with Architecture Auto-Fix.
-    """
     def __init__(self, model: str, **kwargs):
-        self.model_path = model
-        self.kwargs = kwargs
-        self.model = None
-        self.tokenizer = None
-        self._load_model()
+        self.model_path = model; self.model = None; self.tokenizer = None; self._load_model()
 
     def _load_model(self):
-        """Internal method to handle the actual loading process."""
         print(f">>> Loading model: {self.model_path}")
-        
-        # 1. Load HF Config with fallback for unknown architectures (Qwen3.5/GLM5)
         try:
             hf_config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
-        except Exception:
-            print(f">>> Transformers fallback: Manual parsing for {self.model_path}")
+        except:
             config_path = os.path.join(self.model_path, "config.json")
-            with open(config_path, "r") as f:
-                data = json.load(f)
-            
-            # Resolve text_config for Qwen3.5 style
-            cfg_data = data.get("text_config", data)
-            class SimpleConfig:
-                def __init__(self, d, archs):
-                    self.__dict__.update(d)
-                    self.architectures = archs
-            hf_config = SimpleConfig(cfg_data, data.get("architectures", []))
+            with open(config_path, "r") as f: data = json.load(f)
+            class Simple: pass
+            hf_config = Simple(); hf_config.__dict__.update(data.get("text_config", data))
+            hf_config.architectures = data.get("architectures", [])
         
-        # 2. Build LitevLLM-Compatible Config Object
+        n_heads = getattr(hf_config, "num_attention_heads", 32)
+        n_kv_heads = getattr(hf_config, "num_key_value_heads", n_heads)
+        h_size = getattr(hf_config, "hidden_size", 4096)
+        n_layers = getattr(hf_config, "num_hidden_layers", 32)
+        h_dim = h_size // n_heads
+        
         class LiteVllmConfig:
             def __init__(self, path, hf_cfg):
                 self.model_config = type('obj', (object,), {
-                    'hf_config': hf_cfg,
-                    'dtype': torch.float16,
-                    'max_model_len': 4096,
-                    'model': path,
-                    'get_num_kv_heads': lambda x: getattr(hf_cfg, "num_key_value_heads", getattr(hf_cfg, "num_attention_heads", 1)),
-                    'get_head_size': lambda: getattr(hf_cfg, "hidden_size", 4096) // getattr(hf_cfg, "num_attention_heads", 32),
-                    'get_num_layers': lambda x: getattr(hf_cfg, "num_hidden_layers", 32),
+                    'hf_config': hf_cfg, 'dtype': torch.float16,
+                    'max_model_len': 4096, 'model': path,
+                    'get_num_kv_heads': lambda x: n_kv_heads,
+                    'get_head_size': lambda: h_dim,
+                    'get_num_layers': lambda x: n_layers,
                 })
-                self.parallel_config = type('obj', (object,), {'tensor_parallel_size': 1, 'pipeline_parallel_size': 1, 'world_size': 1})
-                if any(f.endswith(".gguf") for f in os.listdir(path) if os.path.isdir(path)):
+                self.parallel_config = type('obj', (object,), {'tensor_parallel_size': 1, 'world_size': 1})
+                if any(f.endswith(".gguf") for f in os.listdir(path)):
                     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
                     self.quant_config = GGUFConfig()
-                else:
-                    self.quant_config = None
-
+                else: self.quant_config = None
         v_config = LiteVllmConfig(self.model_path, hf_config)
-        
-        # 3. Get Model and Tokenizer
-        self.model = get_model(v_config)
+        self.model_cfg = v_config.model_config; self.model = get_model(v_config)
         self.tokenizer = get_tokenizer(v_config.model_config)
-        print(f">>> Model {self.model_path} loaded successfully.")
 
-    def switch_model(self, new_model_path: str, **kwargs):
-        """Hot-switches to a new model without restarting the process."""
-        print(f"\n--- INITIATING HOT SWITCH: {self.model_path} -> {new_model_path} ---")
-        self.model = None
-        self.tokenizer = None
-        clear_gguf_cache()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        print(">>> VRAM Eviction Complete.")
-        self.model_path = new_model_path
-        self.kwargs.update(kwargs)
-        self._load_model()
-        print("--- HOT SWITCH SUCCESSFUL ---\n")
+    @torch.inference_mode()
+    def generate(self, prompts: List[str], sampling_params: Optional[SamplingParams] = None) -> List[RequestOutput]:
+        batch_size = len(prompts)
+        if sampling_params is None: sampling_params = SamplingParams()
+        
+        input_ids_list = [self.tokenizer.encode(p) for p in prompts]
+        max_prompt_len = max(len(ids) for ids in input_ids_list)
+        padded_ids = [ids + [self.tokenizer.pad_token_id or 0] * (max_prompt_len - len(ids)) for ids in input_ids_list]
+        curr_input = torch.tensor(padded_ids, device="cuda")
+        
+        num_layers = self.model_cfg.get_num_layers(None); num_kv_heads = self.model_cfg.get_num_kv_heads(None); head_size = self.model_cfg.get_head_size()
+        kv_caches = []
+        for _ in range(num_layers):
+            k = torch.zeros((128, 16, num_kv_heads, head_size), device="cuda", dtype=torch.float16)
+            v = torch.zeros((128, 16, num_kv_heads, head_size), device="cuda", dtype=torch.float16)
+            kv_caches.append((k, v))
 
-    def generate(self, prompts=None, sampling_params=None, **kwargs):
-        return []
+        generated_ids = [[] for _ in range(batch_size)]; finished = [False] * batch_size
+        for _ in range(sampling_params.max_tokens or 1):
+            bsz, seq_len = curr_input.shape
+            positions = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(bsz, -1)
+            attn_metadata = {
+                "slot_mapping": torch.arange(bsz, device="cuda", dtype=torch.int32),
+                "seq_lens": torch.full((bsz,), seq_len, device="cuda", dtype=torch.int32)
+            }
+            logits = self.model(curr_input, positions, kv_caches, attn_metadata)
+            next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+            new_input_cols = []
+            for i in range(batch_size):
+                if not finished[i]:
+                    token = next_tokens[i].item(); generated_ids[i].append(token)
+                    if token == getattr(self.tokenizer, "eos_token_id", -1): finished[i] = True
+                new_input_cols.append(next_tokens[i])
+            if all(finished): break
+            curr_input = torch.cat([curr_input, torch.stack(new_input_cols).unsqueeze(1)], dim=1)
+        results = []
+        for i in range(batch_size):
+            completion = CompletionOutput(index=0, text=self.tokenizer.decode(generated_ids[i]), token_ids=generated_ids[i], cumulative_logprob=0.0)
+            results.append(RequestOutput(request_id=str(time.time()), prompt=prompts[i], prompt_token_ids=input_ids_list[i], outputs=[completion], finished=True))
+        return results

@@ -22,11 +22,11 @@
 *   **MiniMax-abab7**: Evaluating MoE routing logic for single-GPU optimization.
 
 ## Performance Milestones (AMD AI Max 60GB - Real Weights)
-*   **Qwen3.5-9B (AWQ 4-bit)**: **369.2 tokens/sec** (Batch 32, Safetensors Load).
-*   **DeepSeek-V2-Lite (16B MoE)**: **283.0 tokens/sec** (Batch 32, 4K Context - 🟢 Stable Peak).
-*   **TinyLlama-1.1B (Dense)**: **784.4 tokens/sec** (Batch 32, FP16).
-*   **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, 4K Context - ⚠️ Recommended for Single Concurrency).
-*   **TinyLlama LoRA**: **578.0 tokens/sec** (Batch 32, Real Weights).
+*   **DeepSeek-V2-Lite (16B MoE)**: **905.4 tokens/sec** (Batch 32, GGUF - 🔥 Stable Peak).
+*   **TinyLlama-1.1B (Dense)**: **590.6 tokens/sec** (Batch 32, FP16).
+*   **Qwen3.5-9B (GGUF)**: **233.8 tokens/sec** (Batch 32, Q4_K).
+*   **Qwen3.5-9B (AWQ 4-bit)**: **147.7 tokens/sec** (Batch 32, Safetensors Load).
+*   **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, GGUF - 🟢 Stable).
 
 
 ## Development Guidelines

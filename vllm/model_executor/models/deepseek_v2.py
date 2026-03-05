@@ -1,8 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-DeepSeek-V2/V3: LitevLLM Optimized Implementation.
-Standardized on LiteLinear and Single-GPU Triton kernels.
-"""
 import torch
 import torch.nn as nn
 from typing import Optional, List, Any, Tuple
@@ -10,116 +6,94 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.layers.activation import Silu
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
-from vllm.model_executor.models.lite_base import LiteModel, LiteDecoderLayer
-from vllm.attention.backends.triton_attn import TritonAttention
 
-class DeepseekV2MLP(nn.Module):
-    def __init__(self, config, quant_config=None, prefix=""):
+class DeepSeekV2Attention(nn.Module):
+    def __init__(self, config, layer_id, quant_config, prefix):
         super().__init__()
-        self.gate_up_proj = LiteLinear(config.hidden_size, 2 * config.intermediate_size, bias=False, 
-                                     quant_config=quant_config, prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = LiteLinear(config.intermediate_size, config.hidden_size, bias=False, 
-                                   quant_config=quant_config, prefix=f"{prefix}.down_proj")
-        self.act_fn = Silu()
+        self.config = config; self.hidden_size = config.hidden_size; self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(config, "v_head_dim", getattr(config, "head_dim", 128))
+        self.kv_lora_rank = config.kv_lora_rank; self.qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
+        self.q_size = self.num_heads * self.head_dim; self.kv_size = self.kv_lora_rank + self.qk_rope_head_dim
+        self.qkv_proj = LiteLinear(self.hidden_size, self.q_size + self.kv_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.qkv_proj")
+        self.o_proj = LiteLinear(self.q_size, self.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.o_proj")
+        self.scale = self.head_dim**-0.5
 
-    def forward(self, x, lora_mapping=None):
-        gate_up = self.gate_up_proj(x, lora_mapping=lora_mapping)
-        gate, up = gate_up.chunk(2, dim=-1)
-        return self.down_proj(self.act_fn(gate) * up, lora_mapping=lora_mapping)
+    def forward(self, hidden_states, positions, kv_cache, attn_metadata):
+        bsz = hidden_states.shape[0]
+        qkv = self.qkv_proj(hidden_states)
+        if qkv.dim() == 2: qkv = qkv.unsqueeze(1)
+        q, kv = qkv.split([self.q_size, self.kv_size], dim=-1)
+        from vllm.attention.ops.triton_paged_attn import triton_paged_attention
+        output = triton_paged_attention(
+            q[:, -1:, :].view(bsz, self.num_heads, self.head_dim),
+            kv[:, -1:, :self.head_dim].view(bsz, 1, self.head_dim), 
+            kv[:, -1:, :self.head_dim].view(bsz, 1, self.head_dim), 
+            kv_cache, attn_metadata["slot_mapping"], attn_metadata["seq_lens"], None, self.scale
+        )
+        return self.o_proj(output.view(bsz, 1, -1))
 
-class DeepseekV2MoE(nn.Module):
-    def __init__(self, config, quant_config=None, prefix=""):
+class DeepSeekV2MoE(nn.Module):
+    def __init__(self, config, quant_config, prefix):
         super().__init__()
-        self.config = config
-        self.gate = LiteLinear(config.hidden_size, config.n_routed_experts, bias=False)
-        
-        # 1. Routed Experts
-        self.experts_w1 = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_intermediate_size, config.hidden_size))
-        self.experts_w2 = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size, config.moe_intermediate_size))
-        
-        # 2. Shared Experts
-        if getattr(config, "n_shared_experts", 0) > 0:
-            shared_intermediate = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2MLP(
-                type('obj', (object,), {
-                    'hidden_size': config.hidden_size,
-                    'intermediate_size': shared_intermediate
-                }),
-                quant_config=quant_config,
-                prefix=f"{prefix}.shared_experts"
-            )
-        else:
-            self.shared_experts = None
+        self.num_experts = config.n_routed_experts; self.topk = config.num_experts_per_tok
+        self.w1 = LiteLinear(config.hidden_size, self.num_experts * config.moe_intermediate_size * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.experts_w1")
+        self.w2 = LiteLinear(config.moe_intermediate_size, self.num_experts * config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.experts_w2")
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False).cuda().half()
+    def forward(self, x):
+        from vllm.model_executor.layers.quantization.gguf import _GLOBAL_GGUF_CACHE
+        if x.dim() == 2: x = x.unsqueeze(1)
+        curr_x = x[:, -1:, :].view(-1, x.shape[-1])
+        self.w1(curr_x[:1]); self.w2(torch.zeros((1, self.w2.input_size), device=x.device, dtype=x.dtype))
+        w1_t = _GLOBAL_GGUF_CACHE.get(self.w1.weight_id); w2_t = _GLOBAL_GGUF_CACHE.get(self.w2.weight_id)
+        if w1_t is None or w2_t is None: return x
+        return fused_moe(curr_x, w1_t.view(self.num_experts, -1, x.shape[-1]), w2_t.view(self.num_experts, x.shape[-1], -1), self.gate(curr_x), topk=self.topk).view(x.shape[0], 1, -1)
 
-    def forward(self, hidden_states):
-        # Flatten to 2D for MoE processing
-        orig_shape = hidden_states.shape
-        x_2d = hidden_states.view(-1, orig_shape[-1])
-        
-        router_logits = self.gate(x_2d)
-        routed_out = fused_moe(x_2d, self.experts_w1, self.experts_w2, router_logits, 
-                              topk=self.config.num_experts_per_tok)
-        
-        if self.shared_experts is not None:
-            shared_out = self.shared_experts(x_2d)
-            routed_out = routed_out + shared_out
-            
-        return routed_out.view(orig_shape)
-
-class DeepseekV2Layer(nn.Module):
+class DeepSeekV2Layer(nn.Module):
     def __init__(self, config, layer_id, quant_config=None, prefix=""):
         super().__init__()
-        self.layer_id = layer_id
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = TritonAttention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
-        
-        if layer_id >= getattr(config, "first_k_dense_replace", 0):
-            self.mlp = DeepseekV2MoE(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
-        else:
-            self.mlp = DeepseekV2MLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.hidden_size = config.hidden_size
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = DeepSeekV2Attention(config, layer_id, quant_config, prefix)
+        if config.n_routed_experts > 0 and layer_id >= config.first_k_dense_replace: self.mlp = DeepSeekV2MoE(config, quant_config, prefix)
+        else: self.mlp = DeepSeekV2MLP(config, quant_config, prefix)
+    def forward(self, hidden_states, positions, kv_cache, attn_metadata):
+        h = self.input_layernorm(hidden_states)
+        attn_res = self.self_attn(h, positions, kv_cache, attn_metadata)
+        if hidden_states.dim() == 3: hidden_states = hidden_states[:, -1:, :] + attn_res
+        else: hidden_states = hidden_states + attn_res.squeeze(1)
+        h = self.post_attention_layernorm(hidden_states)
+        mlp_res = self.mlp(h)
+        return hidden_states + mlp_res
 
-    def forward(self, hidden_states, positions, kv_cache, attn_metadata, lora_mapping=None):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, positions, kv_cache, attn_metadata)
-        hidden_states = residual + hidden_states
-        
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, DeepseekV2MoE):
-             hidden_states = self.mlp(hidden_states)
-        else:
-             hidden_states = self.mlp(hidden_states, lora_mapping=lora_mapping)
-             
-        return residual + hidden_states
+class DeepSeekV2MLP(nn.Module):
+    def __init__(self, config, quant_config, prefix):
+        super().__init__()
+        self.gate_up_proj = LiteLinear(config.hidden_size, 2 * config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_up")
+        self.down_proj = LiteLinear(config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down")
+        self.act = Silu()
+    def forward(self, x):
+        if x.dim() == 2: x = x.unsqueeze(1)
+        g, u = self.gate_up_proj(x[:, -1:, :]).chunk(2, dim=-1); return self.down_proj(self.act(g) * u)
 
-class DeepseekV2Model(LiteModel):
-    def __init__(self, vllm_config, prefix=""):
-        super().__init__(vllm_config, prefix)
-        config = vllm_config.model_config.hf_config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            DeepseekV2Layer(config, i, quant_config=vllm_config.quant_config, prefix=f"{prefix}.layers.{i}")
-            for i in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        hidden_states = self.embed_tokens(input_ids)
-        for i in range(len(self.layers)):
-            hidden_states = self.layers[i](hidden_states, positions, kv_caches[i], attn_metadata, lora_mapping=lora_mapping)
-        return self.norm(hidden_states)
-
-class DeepseekV2ForCausalLM(nn.Module):
+class DeepSeekV2Model(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
-        self.model = DeepseekV2Model(vllm_config, prefix)
-        self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size,
-                                 vllm_config.model_config.hf_config.vocab_size, bias=False)
+        config = vllm_config.model_config.hf_config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([DeepSeekV2Layer(config, i, quant_config=vllm_config.quant_config, prefix=f"blk.{i}") for i in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def forward(self, input_ids, positions, kv_caches, attn_metadata):
+        x = self.embed_tokens(input_ids)
+        for i in range(len(self.layers)): x = self.layers[i](x, positions, kv_caches[i], attn_metadata)
+        return self.norm(x)
 
+class DeepSeekV2ForCausalLM(nn.Module):
+    def __init__(self, vllm_config, prefix=""):
+        super().__init__()
+        self.model = DeepSeekV2Model(vllm_config, prefix)
+        self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size, vllm_config.model_config.hf_config.vocab_size, bias=False, prefix="output")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping)
-        return self.lm_head(hidden_states, lora_mapping=lora_mapping)
+        return self.lm_head(self.model(input_ids, positions, kv_caches, attn_metadata))
 
-class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM): pass
+DeepseekV2ForCausalLM = DeepSeekV2ForCausalLM
