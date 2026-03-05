@@ -37,3 +37,46 @@
 *   **No C++**: Never add code that requires a C++ compiler.
 *   **Multi-modal**: Use `MultiModalInputProcessor` for any new modality support.
 *   **No Distributed**: The engine is strictly single-GPU. `vllm/distributed` contains minimal shims only.
+## Environment & Script Workflow (uv-first)
+To keep dependency resolution and execution consistent across contributors, this project uses **uv** as the default toolchain.
+
+### 1) Install and sync dependencies
+```bash
+# Install uv (if not installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create/update virtual environment from lockfile/pyproject
+uv sync
+```
+
+### 2) Run Python scripts
+Always run scripts through `uv run` so they execute in the managed environment:
+```bash
+uv run python tests/e2e_full_benchmark.py
+uv run python tests/lite_smoke_test.py
+uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-GGUF
+```
+
+### 3) Add or update dependencies
+Use `uv` commands instead of `pip install`:
+```bash
+# Add runtime dependency
+uv add <package>
+
+# Add development dependency
+uv add --dev <package>
+
+# Lock dependency graph after updates
+uv lock
+```
+
+### 4) Test and quality commands
+```bash
+uv run pytest -q
+uv run python -m py_compile vllm/engine/async_llm.py
+```
+
+### 5) Team convention
+* Prefer `uv run python ...` over `python ...`.
+* Prefer `uv add` / `uv sync` over manual `pip` operations.
+* Commit updated `uv.lock` whenever dependency changes are introduced.

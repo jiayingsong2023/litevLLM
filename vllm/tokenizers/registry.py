@@ -58,3 +58,9 @@ def cached_get_tokenizer(model_config: Any, **kwargs) -> TokenizerLike:
 
 def cached_tokenizer_from_config(vllm_config: Any) -> TokenizerLike:
     return TokenizerRegistry.get_tokenizer(vllm_config.model_config)
+
+
+def tokenizer_args_from_config(model_config: Any) -> dict[str, Any]:
+    return {
+        "trust_remote_code": getattr(model_config, "trust_remote_code", True),
+    }

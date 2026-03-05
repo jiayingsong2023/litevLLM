@@ -65,3 +65,9 @@ RENDERER_REGISTRY = RendererRegistry(
         for mode, (mod_relname, cls_name) in _VLLM_RENDERERS.items()
     }
 )
+
+
+def renderer_from_config(config: "ModelConfig") -> BaseRenderer:
+    renderer_mode = getattr(config, "renderer_mode", None) or "hf"
+    tokenizer_kwargs = tokenizer_args_from_config(config)
+    return RENDERER_REGISTRY.load_renderer(renderer_mode, config, tokenizer_kwargs)

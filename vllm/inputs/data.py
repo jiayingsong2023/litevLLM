@@ -11,4 +11,10 @@ class TokensPrompt(_CommonKeys):
     prompt_token_ids: List[int]
     prompt: Optional[str]
 
-PromptInput = Union[str, TextPrompt, TokensPrompt]
+class EmbedsPrompt(_CommonKeys):
+    prompt_embeds: List[float]
+    prompt: Optional[str]
+
+
+PromptInput = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt]
+PromptType = PromptInput

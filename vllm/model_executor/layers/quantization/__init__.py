@@ -20,7 +20,6 @@ QuantizationMethods = Literal[
     "gguf",
     "gptq_marlin",
     "awq_marlin",
-    "gptq",
     "compressed-tensors",
     "bitsandbytes",
     "experts_int8",
@@ -74,6 +73,12 @@ def register_quantization_config(quantization: str):
     return _wrapper
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
+    if quantization == "gptq":
+        raise ImportError(
+            "Quantization method gptq is not available in this Lite build. "
+            "Please use awq, awq_marlin, gptq_marlin, or gguf."
+        )
+
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
@@ -133,11 +138,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     try:
         from .gguf import GGUFConfig
         method_to_config["gguf"] = GGUFConfig
-    except ImportError: pass
-
-    try:
-        from .gptq import GPTQConfig
-        method_to_config["gptq"] = GPTQConfig
     except ImportError: pass
 
     try:

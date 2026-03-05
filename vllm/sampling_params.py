@@ -41,3 +41,10 @@ class SamplingParams:
     structured_outputs: Optional[StructuredOutputsParams] = None
     detokenize: bool = True
     output_kind: str = RequestOutputKind.FINAL_ONLY
+
+
+@dataclass
+class BeamSearchParams:
+    beam_width: int = 1
+    max_tokens: Optional[int] = 16
+    ignore_eos: bool = False

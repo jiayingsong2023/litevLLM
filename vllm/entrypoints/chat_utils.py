@@ -1,14 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
-import json
 from pathlib import Path
-from typing import Any, List, Optional, Union, Dict
+from typing import Any, Dict, List, Literal, Optional, TypeAlias, Union
 from vllm.logger import init_logger
+from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
 class ChatTemplateResolutionError(ValueError):
     pass
+
+
+def make_tool_call_id() -> str:
+    return f"call_{random_uuid()}"
+
+
+ChatTemplateContentFormatOption: TypeAlias = Literal["auto", "text", "openai"]
+ChatCompletionMessageParam: TypeAlias = Dict[str, Any]
+ConversationMessage: TypeAlias = Dict[str, Any]
 
 def load_chat_template(
     chat_template: Optional[Union[Path, str]] = None,

@@ -39,7 +39,6 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput, ScoringRequestOutput
 from vllm.tokenizers import TokenizerLike
-from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.utils.async_utils import make_async, merge_async_iterators
 
 logger = init_logger(__name__)
@@ -198,7 +197,7 @@ class ServingScores(OpenAIServing):
         if len(data_1) == 1:
             data_1 = data_1 * len(data_2)
 
-        if isinstance(tokenizer, MistralTokenizer):
+        if tokenizer.__class__.__name__ == "MistralTokenizer":
             raise ValueError("MistralTokenizer not supported for cross-encoding")
 
         tok_kwargs = request.build_tok_params(model_config).get_encode_kwargs()

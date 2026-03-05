@@ -150,14 +150,26 @@ class OpenAIServingTokenization(OpenAIServing):
     async def get_tokenizer_info(
         self,
     ) -> TokenizerInfoResponse | ErrorResponse:
-        return self._get_tokenizer_config()
+        try:
+            return TokenizerInfoResponse(**self._get_tokenizer_config())
+        except Exception as e:
+            return self.create_error_response(str(e))
 
     def _get_tokenizer_config(self) -> dict[str, Any]:
+        tokenizer = self.renderer.get_tokenizer()
+        tokenizer_class = tokenizer.__class__.__name__
+
+        config_payload: dict[str, Any] = {"tokenizer_class": tokenizer_class}
+        init_kwargs = getattr(tokenizer, "init_kwargs", None)
+        if isinstance(init_kwargs, dict):
+            config_payload.update(self._make_json_serializable(init_kwargs))
+        return config_payload
+
+    def _make_json_serializable(self, obj: Any) -> Any:
         if hasattr(obj, "content"):
-            return obj.content
-        elif isinstance(obj, dict):
+            return self._make_json_serializable(obj.content)
+        if isinstance(obj, dict):
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
+        if isinstance(obj, list):
             return [self._make_json_serializable(item) for item in obj]
-        else:
-            return obj
+        return obj

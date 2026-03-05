@@ -25,6 +25,15 @@
 
 ## 🚀 快速开始
 
+### 0. 环境准备（uv）
+```bash
+# 安装 uv（如未安装）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 同步项目依赖并创建虚拟环境
+uv sync
+```
+
 ### 运行端到端全量基准测试
 ```bash
 # 执行密集、GGUF 与 MoE 综合测试
@@ -49,6 +58,9 @@ uv run python tests/test_real_image_input.py
 ## 📄 架构深度解析
 请参考 [docs/ARCHITECTURE_LITE.md](./docs/ARCHITECTURE_LITE.md)。
 
+## 📌 稳定性修复说明
+请参考 [docs/STABILITY_WORK_SUMMARY.md](./docs/STABILITY_WORK_SUMMARY.md)。
+
 ## 🛠️ 使用指南 (Usage)
 ### 1. 离线批处理推理 (Offline Batch Inference)
 ```python
@@ -65,6 +77,18 @@ for output in outputs:
 ```bash
 # 启动极致性能的 OpenAI 兼容服务器
 uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-GGUF
+```
+
+### 4. 依赖管理（uv）
+```bash
+# 新增运行时依赖
+uv add <package>
+
+# 新增开发依赖
+uv add --dev <package>
+
+# 更新锁文件
+uv lock
 ```
 
 ### 3. 模型热切换 (Hot Switching)
