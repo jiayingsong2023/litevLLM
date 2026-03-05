@@ -5,6 +5,9 @@ from typing import Optional, Any, Dict, Tuple, Callable
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 class LiteLinear(nn.Module):
+    """
+    Final LiteLinear with Index-Add LoRA Support.
+    """
     def __init__(
         self,
         input_size: int,
@@ -43,30 +46,34 @@ class LiteLinear(nn.Module):
         if self.quant_config is None: res = torch.nn.functional.linear(x, self.weight, self.bias)
         else: res = self.quant_config.apply(self, x)
             
-        # --- ATOMIC LOCALIZED LORA ROUTING ---
+        # --- ROBUST MULTI-LORA DISPATCH ---
         if lora_mapping is not None and self.adapters:
-            r_f = res.view(-1, res.shape[-1])
-            x_f = x.view(-1, x.shape[-1])
-            n_tok = x_f.shape[0]
+            orig_shape = res.shape
+            res_2d = res.view(-1, orig_shape[-1])
+            x_2d = x.view(-1, x.shape[-1])
+            n_tokens = res_2d.shape[0]
             m_1d = lora_mapping.flatten()
             bsz = m_1d.shape[0]
             
-            # Use a local loop-bound expansion factor
-            factor = n_tok // bsz if n_tok > bsz else 1
+            factor = n_tokens // bsz if n_tokens > bsz else 1
 
-            for aid, (la, lb, scaling) in self.adapters.items():
-                # Generate mask ATOMICALLY inside the loop to avoid stale refs
-                if factor > 1:
-                    local_mask = (m_1d.repeat_interleave(factor) == int(aid))
-                else:
-                    local_mask = (m_1d == int(aid))
+            for aid in torch.unique(m_1d):
+                aid_int = int(aid.item())
+                if aid_int == 0: continue
                 
-                # Final physical dimension check
-                if local_mask.shape[0] == n_tok and local_mask.any():
-                    delta = (x_f[local_mask].to(torch.float32) @ la.t().to(torch.float32)) @ lb.t().to(torch.float32)
-                    r_f[local_mask] += delta.to(r_f.dtype) * scaling
+                adapter = self.adapters.get(aid_int)
+                if adapter:
+                    la, lb, scaling = adapter
+                    if factor > 1: mask = (m_1d.repeat_interleave(factor) == aid_int)
+                    else: mask = (m_1d == aid_int)
+                    
+                    if mask.any() and mask.shape[0] == n_tokens:
+                        # (X_masked @ A.T) @ B.T
+                        lora_delta = (x_2d[mask].to(torch.float32) @ la.t().to(torch.float32)) @ lb.t().to(torch.float32)
+                        indices = torch.nonzero(mask).flatten()
+                        res_2d.index_add_(0, indices, lora_delta.to(res_2d.dtype), alpha=scaling)
             
-            return r_f.view_as(res)
+            return res_2d.view(orig_shape)
                     
         return res
 
