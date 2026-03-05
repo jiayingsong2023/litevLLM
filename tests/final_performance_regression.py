@@ -57,7 +57,8 @@ if __name__ == "__main__":
         ("models/TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B (Dense FP16)"),
         ("models/Qwen3.5-9B-GGUF", "Qwen3.5-9B (GGUF)"),
         ("models/Qwen3.5-9B-AWQ", "Qwen3.5-9B (AWQ Real)"),
-        ("models/DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite (MoE GGUF)")
+        ("models/DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite (MoE GGUF)"),
+        ("models/GLM-4.7-Flash-GGUF", "GLM-4.7-Flash (MoE GGUF)")
     ]
     
     results = {}
