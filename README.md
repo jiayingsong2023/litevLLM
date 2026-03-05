@@ -61,6 +61,25 @@ uv run python tests/test_real_image_input.py
 ## 📌 稳定性修复说明
 请参考 [docs/STABILITY_WORK_SUMMARY.md](./docs/STABILITY_WORK_SUMMARY.md)。
 
+## 📘 API 文档
+请参考 [docs/API_REFERENCE.md](./docs/API_REFERENCE.md)。
+
+## ⚙️ Qwen3.5 策略默认值（固定策略）
+
+- `Qwen3.5-9B (Dense)`：默认使用 **aggressive**（高吞吐优先）
+  - 默认等价于 `FASTINFERENCE_QWEN9_AGGRESSIVE=1`
+  - 如需切回稳定策略，可设置：`FASTINFERENCE_QWEN9_STABLE=1`
+- `Qwen3.5-35B (MoE)`：默认使用 **stable**（可用性优先）
+  - 线性层保持稳定优先配置，适合大模型长时间运行
+  - MoE grouped 路径默认仅在 `BS>=2` 启用（`BS=1` 走 decode-only 快路径）
+
+示例（强制 9B 稳定模式）：
+
+```bash
+FASTINFERENCE_QWEN9_STABLE=1 \
+uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-GGUF
+```
+
 ## 🛠️ 使用指南 (Usage)
 ### 1. 离线批处理推理 (Offline Batch Inference)
 ```python
