@@ -1,9 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import glob
+import hashlib
+import json
+import os
+import tempfile
+from collections import defaultdict
+from collections.abc import Generator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import IO, Callable
+
+import filelock
+import huggingface_hub
+import numpy as np
+import torch
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file, save_file
+from tqdm.auto import tqdm
+
+from vllm import envs
+from vllm.config import LoadConfig, ModelConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
+
+logger = init_logger(__name__)
+temp_dir = os.path.expanduser("~/.cache/vllm/locks")
+LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
+
+
+def enable_hf_transfer() -> None:
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
         try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
+            # Enable HF transfer acceleration when available.
+            import hf_transfer  # type: ignore # noqa: F401
 
             huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
         except ImportError:
@@ -119,6 +152,9 @@ def convert_bin_to_safetensor_file(
     sf_size = os.stat(sf_filename).st_size
     pt_size = os.stat(pt_filename).st_size
     if (sf_size - pt_size) / pt_size > 0.01:
+        raise RuntimeError(
+            f"Safetensor size mismatch looks suspicious: {sf_filename} vs {pt_filename}"
+        )
 
     # check if the tensors are the same
     reloaded = load_file(sf_filename)
@@ -575,37 +611,21 @@ def multi_thread_pt_weights_iterator(
     pt_load_map_location: str | dict[str, str] = "cpu",
     max_workers: int = 4,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    Return GGUF mapped weight's name and its quant type
-    Iterate over the quant weights in the model gguf files and convert
-    them to torch tensors.
-    Be careful of the order of yielding weight types and weights data,
-    we have to yield all weight types first before yielding any weights.
-    Otherwise it would cause issue when loading weights with for packed
-    layer with different quant types.
-
-    PySafeSlice object supports indexing, which is done before loading the
-    actual tensor and can reduce the amount of memory being read into the
-    memory. However, it does not support more advanced functionalities
-    like `.view()` or `.t()`. Therefore, if we need to modify the loaded
-    tensor with these more complicated operators, we need to convert to
-    tensor first.
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
+    """Fallback PT iterator; keeps deterministic shard order."""
+    # Keep this implementation simple and robust for Lite single-GPU path.
+    for bin_file in tqdm(
+        hf_weights_files,
+        desc="Loading pt checkpoint shards",
+        disable=not enable_tqdm(use_tqdm_on_load),
+        bar_format=_BAR_FORMAT,
+    ):
+        state = torch.load(
+            bin_file,
+            map_location=pt_load_map_location,
+            weights_only=True,
+        )
+        yield from state.items()
+        del state
 
 def row_parallel_weight_loader(
     param: torch.Tensor, loaded_weight: torch.Tensor
@@ -625,27 +645,99 @@ def row_parallel_weight_loader(
 def composed_weight_loader(
     loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
 ) -> LoaderFunction:
+    """Compose a tensor transform with a weight loader."""
+    def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        return loader(param, fn(loaded_weight))
+    return _loader
 
-    The model weights must be randomly initialized for accurate performance
-    measurements. Additionally, the model weights should not cause NaNs in the
-    forward pass. We empirically found that initializing the weights with
-    values between -1e-3 and 1e-3 works well for most models.
 
-    We use per-parameter random seed, so that dummy weights are consistent,
-    even if the model is partitioned across multiple devices. When the seed
-    is fixed, the random values generated by this function only depends on
-    the parameter's number of elements and its data type.
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    """Load a weight tensor into parameter with strict shape checks."""
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        param.data.fill_(loaded_weight.item())
+        return
+    if param.size() != loaded_weight.size():
+        raise RuntimeError(
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
+    param.data.copy_(loaded_weight)
 
-    This function handles the remapping of FP8 k/v_scale parameter names.
-    It detects if the given name ends with a suffix and attempts to remap
-    it to the expected name format in the model. If the remapped name is not
-    found in the params_dict, a warning is printed and None is returned.
 
-    Args:
-        name (str): The original loaded checkpoint parameter name.
-        params_dict (dict): Dictionary containing the model's named parameters.
+def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+    """Return a TP-aware shard loader with a safe single-rank fallback."""
+    def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        if loaded_weight.size() == param.size():
+            return default_weight_loader(param, loaded_weight)
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_world = get_tensor_model_parallel_world_size()
+        except Exception:
+            tp_rank = 0
+            tp_world = 1
 
-    Returns:
-        str: The remapped parameter name if successful, or the original name
-             if no remapping is needed.
-        None: If the remapped name is not found in params_dict.
+        if tp_world <= 1:
+            narrowed = loaded_weight.narrow(shard_axis, 0, param.size(shard_axis))
+            return default_weight_loader(param, narrowed)
+
+        full_dim = loaded_weight.size(shard_axis)
+        shard_dim = param.size(shard_axis)
+        if full_dim % tp_world != 0:
+            narrowed = loaded_weight.narrow(shard_axis, 0, shard_dim)
+            return default_weight_loader(param, narrowed)
+        start = tp_rank * shard_dim
+        narrowed = loaded_weight.narrow(shard_axis, start, shard_dim)
+        return default_weight_loader(param, narrowed)
+
+    return _loader
+
+
+def initialize_dummy_weights(model: torch.nn.Module) -> None:
+    """Initialize model weights deterministically for dummy loader path."""
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(1234)
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            values = torch.empty_like(param, device="cpu").uniform_(
+                -1e-3,
+                1e-3,
+                generator=generator,
+            )
+            param.data.copy_(values.to(device=param.device, dtype=param.dtype))
+
+
+def pt_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    pt_load_map_location: str | dict[str, str] = "cpu",
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    for bin_file in tqdm(
+        hf_weights_files,
+        desc="Loading pt checkpoint shards",
+        disable=not enable_tqdm(use_tqdm_on_load),
+        bar_format=_BAR_FORMAT,
+    ):
+        state = torch.load(bin_file, map_location=pt_load_map_location, weights_only=True)
+        yield from state.items()
+        del state
+
+
+def multi_thread_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    max_workers: int = 4,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    # Lite path: keep behavior deterministic and reuse single-thread iterator.
+    del max_workers
+    yield from safetensors_weights_iterator(hf_weights_files, use_tqdm_on_load)
+
+
+def fastsafetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    yield from safetensors_weights_iterator(hf_weights_files, use_tqdm_on_load)

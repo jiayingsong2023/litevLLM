@@ -6,37 +6,36 @@ import gc
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.layers.quantization.gguf import clear_gguf_cache
 
-def benchmark_deepseek_v2_lite(model_path, batch_size):
-    print(f"\n>>> Benchmarking Real DeepSeek-V2-Lite: Batch Size = {batch_size}")
+def benchmark_glm_4_7_flash(model_path, batch_size):
+    print(f"\n>>> Benchmarking Real GLM-4.7-Flash: Batch Size = {batch_size}")
     
     clear_gguf_cache()
     gc.collect()
 
-    # 1. Manual Config based on downloaded config.json
-    class DeepseekV2LiteConfig:
+    # 1. Config based on GLM-4.7-Flash GGUF metadata
+    class GLM47FlashConfig:
         def __init__(self):
-            self.num_hidden_layers = 27
-            self.num_attention_heads = 16
-            self.num_key_value_heads = 16
+            self.num_hidden_layers = 28
+            self.num_attention_heads = 40 
+            self.num_key_value_heads = 20
             self.hidden_size = 2048
             self.intermediate_size = 10944
-            self.max_position_embeddings = 163840
-            self.vocab_size = 102400
+            self.max_position_embeddings = 131072
+            self.vocab_size = 154880
             self.rms_norm_eps = 1e-6
             self.n_routed_experts = 64
-            self.n_shared_experts = 2
             self.num_experts_per_tok = 6
-            self.moe_intermediate_size = 1408
-            self.qk_nope_head_dim = 128
+            self.moe_intermediate_size = 1536
+            self.qk_nope_head_dim = 64 # Corrected: 64 + 64 = 128
             self.qk_rope_head_dim = 64
             self.v_head_dim = 128
-            self.q_lora_rank = None
             self.kv_lora_rank = 512
+            self.q_lora_rank = 768
             self.first_k_dense_replace = 1
             self.architectures = ["DeepseekV2ForCausalLM"]
             self.dtype = "bfloat16"
     
-    hf_config = DeepseekV2LiteConfig()
+    hf_config = GLM47FlashConfig()
     
     class FakeVllmConfig:
         def __init__(self):
@@ -62,21 +61,18 @@ def benchmark_deepseek_v2_lite(model_path, batch_size):
     v_config = FakeVllmConfig()
     
     # 2. Initialize Model
-    print("Loading model weights (GGUF Optimized)...")
+    print("Loading model weights (GGUF + Optimized Paths)...")
     model = get_model(v_config).cuda().half()
     
     # 3. Prepare Inputs
     input_ids = torch.ones((batch_size, 1), device="cuda", dtype=torch.long)
     positions = torch.zeros(batch_size, device="cuda", dtype=torch.long) + 10
     
-    num_heads = hf_config.num_attention_heads
-    num_kv_heads = hf_config.num_key_value_heads
-    head_size = hf_config.hidden_size // num_heads
-    
+    head_size = 128 # Standard for these models
     kv_caches = []
     for _ in range(hf_config.num_hidden_layers):
-        k_cache = torch.zeros((128, 16, num_kv_heads, head_size), device="cuda", dtype=torch.float16)
-        v_cache = torch.zeros((128, 16, num_kv_heads, head_size), device="cuda", dtype=torch.float16)
+        k_cache = torch.zeros((128, 16, hf_config.num_key_value_heads, head_size), device="cuda", dtype=torch.float16)
+        v_cache = torch.zeros((128, 16, hf_config.num_key_value_heads, head_size), device="cuda", dtype=torch.float16)
         kv_caches.append((k_cache, v_cache))
 
     attn_metadata = {
@@ -87,13 +83,13 @@ def benchmark_deepseek_v2_lite(model_path, batch_size):
 
     # 4. Warmup
     print("Warmup...")
-    for _ in range(5):
+    for _ in range(3):
         with torch.inference_mode():
             model(input_ids, positions, kv_caches, attn_metadata)
     torch.cuda.synchronize()
 
     # 5. Benchmark
-    iters = 20
+    iters = 15
     print(f"Running {iters} iterations...")
     start_time = time.time()
     for _ in range(iters):
@@ -114,20 +110,18 @@ def benchmark_deepseek_v2_lite(model_path, batch_size):
     return total_tps
 
 if __name__ == "__main__":
-    model_path = "models/DeepSeek-V2-Lite-GGUF"
-    results = {}
+    model_path = "models/GLM-4.7-Flash-GGUF"
     
-    for bs in [1, 8, 32, 64, 128]:
+    # 开启平衡模式 (Dynamic LRU Cache)
+    os.environ["FASTINFERENCE_MOE_CACHE_MODE"] = "dynamic"
+    os.environ["FASTINFERENCE_MOE_LRU_SIZE"] = "16" 
+    os.environ["FASTINFERENCE_DEEPSEEK_GROUPED_MOE"] = "1"
+    
+    # 仅测试 BS=32
+    for bs in [32]:
         try:
-            results[bs] = benchmark_deepseek_v2_lite(model_path, bs)
+            benchmark_glm_4_7_flash(model_path, bs)
         except Exception as e:
             print(f"Batch Size {bs} failed: {e}")
             import traceback
             traceback.print_exc()
-
-    print("\n" + "="*45)
-    print("REAL DEEPSEEK-V2-LITE PERFORMANCE SUMMARY")
-    print("="*45)
-    for bs, tps in results.items():
-        print(f"Batch Size {bs:3}: {tps:8.2f} tokens/sec")
-    print("="*45)

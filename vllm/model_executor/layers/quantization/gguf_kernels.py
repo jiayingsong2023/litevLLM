@@ -5,8 +5,18 @@ import numpy as np
 import os
 from collections import OrderedDict
 from gguf import dequantize, GGMLQuantizationType
-from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
-from vllm.kernels.triton.gguf_gemm import matmul_q4_k_vec
+try:
+    from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
+except ImportError:
+    dequant_q4_k_triton = None
+try:
+    from vllm.kernels.triton.gguf_gemm import matmul_q4_k_vec
+except ImportError:
+    matmul_q4_k_vec = None
+try:
+    from vllm.kernels.triton.gguf_gemm import matmul_q4_k_tokens
+except ImportError:
+    matmul_q4_k_tokens = None
 
 # LRU Cache to store dequantized weights on GPU
 # Default size is increased to 300 to reduce cache thrashing on 7B models.
@@ -14,6 +24,9 @@ from vllm.kernels.triton.gguf_gemm import matmul_q4_k_vec
 # Users can override this via VLLM_GGUF_CACHE_SIZE env var.
 _CACHE_CAPACITY = int(os.environ.get("VLLM_GGUF_CACHE_SIZE", "300"))
 _DEQUANT_CACHE = OrderedDict()
+_ENABLE_Q4K_TRITON_DEQUANT = os.environ.get("FASTINFERENCE_GGUF_Q4K_TRITON_DEQUANT", "0") == "1"
+_ENABLE_Q4K_FUSED_GEMM = os.environ.get("FASTINFERENCE_GGUF_Q4K_FUSED", "0") == "1"
+_Q4K_FUSED_MAX_TOKENS = int(os.environ.get("FASTINFERENCE_GGUF_Q4K_FUSED_MAX_TOKENS", "4"))
 
 def ggml_dequantize_fallback(
     W: torch.Tensor, 
@@ -47,7 +60,11 @@ def ggml_dequantize_fallback(
         m_total = m
 
     # Q4_K (Type 12) 使用原生 Triton 内核
-    if quant_type == 12:
+    if (
+        quant_type == 12
+        and _ENABLE_Q4K_TRITON_DEQUANT
+        and dequant_q4_k_triton is not None
+    ):
         res_flat = dequant_q4_k_triton(W_flat, m_total, n, dtype)
     else:
         # print(f"Fallback dequant for type {quant_type} (m_total={m_total}, n={n})")
@@ -63,6 +80,7 @@ def ggml_dequantize_fallback(
         _DEQUANT_CACHE.popitem(last=False)  # Remove first (least recently used)
         
     return res
+
 
 def ggml_mul_mat_vec_a8_fallback(
     W: torch.Tensor,
@@ -81,6 +99,29 @@ def ggml_mul_mat_vec_a8_fallback(
     # Only applies if X is effectively a vector or small batch (which we treat as vec loop)
     # Check if X is [tokens, hidden] and tokens is small
     num_tokens = X.numel() // n
+
+    # Experimental fused path for decode-only/small token batches.
+    # Disabled by default to keep strict numerical behavior unchanged.
+    if (
+        _ENABLE_Q4K_FUSED_GEMM
+        and quant_type == 12
+        and matmul_q4_k_tokens is not None
+        and X.dim() in (1, 2)
+        and num_tokens <= _Q4K_FUSED_MAX_TOKENS
+        and n % 256 == 0
+    ):
+        x_tokens = X.view(1, -1) if X.dim() == 1 else X
+        out_tokens = torch.empty(
+            (x_tokens.shape[0], row),
+            dtype=x_tokens.dtype,
+            device=x_tokens.device,
+        )
+        try:
+            matmul_q4_k_tokens(W, x_tokens, out_tokens, n)
+            return out_tokens if X.dim() == 2 else out_tokens.view(1, row)
+        except RuntimeError:
+            # Fallback to stable dequant+matmul path.
+            pass
     
     # NOTE: The Fused Kernel implementation is currently functional but slow (~1.6 t/s).
     # We disable it for now to favor the Dequant+Matmul path (~30 t/s) which is
@@ -94,6 +135,8 @@ def ggml_mul_mat_vec_a8_fallback(
     weight = ggml_dequantize_fallback(W, quant_type, row, n, X.dtype)
     # X shape [num_tokens, n] or [n]
     # weight shape [row, n]
+    if X.dim() == 1 or num_tokens == 1:
+        return torch.mv(weight, X.view(-1)).view(num_tokens, row)
     return torch.matmul(X, weight.t())
 
 def ggml_mul_mat_a8_fallback(

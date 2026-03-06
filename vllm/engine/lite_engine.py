@@ -3,8 +3,10 @@ import asyncio
 import time
 import torch
 import torch.nn as nn
+import copy
 from typing import Any, AsyncIterator, Dict, List, Optional, Union, Tuple
 from vllm.config import VllmConfig
+from vllm.engine.loadtime_policy import select_loadtime_policy
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput, CompletionOutput
@@ -17,11 +19,19 @@ class LiteEngine:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = torch.device("cuda:0")
+        requested_policy_mode = str(
+            getattr(vllm_config, "runtime_policy_mode", "auto")
+        ).lower()
         
         # 1. Load Model
         print(f">>> LiteEngine: Loading {self.model_config.model}...")
         self.model = get_model(vllm_config=self.vllm_config)
         self.tokenizer = None 
+        self.execution_policy = select_loadtime_policy(
+            model_config=self.model_config,
+            quant_config=getattr(vllm_config, "quant_config", None),
+            policy_mode=requested_policy_mode,  # type: ignore[arg-type]
+        )
         
         # 2. Extract REAL dimensions from model_config
         self.num_layers = self.model_config.get_num_layers(None)
@@ -40,10 +50,22 @@ class LiteEngine:
         self._request_streams: Dict[str, asyncio.Queue] = {}
 
     def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams):
+        effective_sampling_params = copy.deepcopy(sampling_params)
+        max_tokens = effective_sampling_params.max_tokens
+        if max_tokens is None:
+            effective_sampling_params.max_tokens = self.execution_policy.max_tokens_cap
+        else:
+            effective_sampling_params.max_tokens = min(
+                max_tokens,
+                self.execution_policy.max_tokens_cap,
+            )
+
         input_ids = self.tokenizer.encode(prompt)
         self._requests[request_id] = {
             "input_ids": input_ids, "generated_ids": [],
-            "sampling_params": sampling_params, "finished": False, "prompt": prompt
+            "sampling_params": effective_sampling_params,
+            "finished": False,
+            "prompt": prompt,
         }
         self._running_ids.append(request_id)
         self._request_streams[request_id] = asyncio.Queue()
@@ -59,7 +81,7 @@ class LiteEngine:
     def step(self) -> List[RequestOutput]:
         if not self._running_ids: return []
         results = []
-        active_ids = list(self._running_ids)
+        active_ids = list(self._running_ids[: self.execution_policy.max_active_requests])
         for rid in active_ids:
             req = self._requests[rid]
             try:

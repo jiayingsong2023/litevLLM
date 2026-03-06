@@ -43,8 +43,45 @@ class LiteLinear(nn.Module):
             if x.shape[-1] < self.input_size: x = torch.nn.functional.pad(x, (0, self.input_size - x.shape[-1]))
             else: x = x[..., :self.input_size]
         
-        if self.quant_config is None: res = torch.nn.functional.linear(x, self.weight, self.bias)
-        else: res = self.quant_config.apply(self, x)
+        # --- FP8 ACCELERATION PATH ---
+        import os
+        fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
+        
+        if fp8_enabled and self.quant_config is None and hasattr(self, "weight"):
+            # Lazy initialize FP8 weight cache
+            if not hasattr(self, "_fp8_weight"):
+                from vllm.model_executor.layers.fused_moe.fused_moe import _convert_to_fp8_with_scales
+                # Check if dimensions are divisible by 64 (Triton kernel requirement)
+                if self.output_size % 64 == 0 and self.input_size % 64 == 0:
+                    print(f"[LiteLinear] Pre-converting {self.prefix} to FP8...")
+                    f8_w, f8_s = _convert_to_fp8_with_scales(self.weight.data)
+                    self._fp8_weight = f8_w
+                    self._fp8_scale = f8_s
+                else:
+                    self._fp8_weight = None # Incompatible dimensions
+            
+            if self._fp8_weight is not None:
+                from vllm.kernels.triton.fp8_gemm import fp8_block_gemm
+                x_f8 = x.to(torch.float8_e4m3fn)
+                # Input scale: simple global scale for now
+                x_scale = torch.ones((x.view(-1, x.shape[-1]).shape[0], x.shape[-1] // 64), 
+                                   device="cuda", dtype=torch.float32) * (x.abs().max() / 448.0)
+                
+                res = fp8_block_gemm(x_f8.view(-1, x.shape[-1]), self._fp8_weight.T, 
+                                   x_scale, self._fp8_scale)
+                res = res.view(*x.shape[:-1], self.output_size)
+                if self.bias is not None:
+                    res += self.bias
+                
+                # Apply LoRA if needed (below)
+            else:
+                if x.dtype != self.weight.dtype: x = x.to(self.weight.dtype)
+                res = torch.nn.functional.linear(x, self.weight, self.bias)
+        elif self.quant_config is None:
+            if x.dtype != self.weight.dtype: x = x.to(self.weight.dtype)
+            res = torch.nn.functional.linear(x, self.weight, self.bias)
+        else:
+            res = self.quant_config.apply(self, x)
             
         # --- ROBUST MULTI-LORA DISPATCH ---
         if lora_mapping is not None and self.adapters:

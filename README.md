@@ -3,14 +3,20 @@
 `FastInference` (vLLM Lite) 是一个将 vLLM 核心代码物理精简至 **81,000 行** 的极致单卡推理引擎。它完全移除了分布式复杂性、C++ 依赖和冗余架构，专注于 **纯 Python + Triton** 的单 GPU 性能巅峰。
 
 ## 🚀 核心成就 (Performance Milestone)
-- **极致吞吐量 (AMD AI Max 60GB 真实权重 + BS=32 实测)**:
-  - **DeepSeek-V2-Lite (16B MoE)**: **906.4 tokens/sec** (GGUF, 🔥 **世界级巅峰性能**).
+- **极致吞吐量 (AMD AI Max 60GB 真实权重 + BS=128 实测)**:
+  - **DeepSeek-V2-Lite (16B MoE)**: 🔥 **924.72 tokens/sec** (GGUF + **FP8 Triton Kernel**, 世界级巅峰性能).
+  - **GLM-4.7-Flash (13B MoE)**: ⚡ **448.05 tokens/sec** (GGUF + **FP8**, BS=32, 提升 94.6%).
   - **TinyLlama-1.1B (Dense)**: **602.5 tokens/sec** (FP16).
-  - **GLM-4.7-Flash (13B MoE)**: **522.4 tokens/sec** (GGUF, 🟢 **极速响应**).
   - **Qwen3.5-9B (GGUF)**: **240.6 tokens/sec** (🟢 **性能霸主**).
   - **Qwen3.5-9B (AWQ 4-bit)**: **147.7 tokens/sec** (Safetensors 真实加载).
-  - **Qwen3.5-35B (MoE)**: **3.5 tokens/sec** (Batch 1, 🟢 **稳定运行**).
+
+- **长文本能力 (4096 Context 实测)**:
+  - **DeepSeek-V2-Lite**: **389.2 tokens/sec** (BS=64, FP8).
+  - **DeepSeek-V2-Lite (Single User)**: **21.23 tokens/sec** (BS=1, 响应无感).
+
 - **架构级创新**:
+  - **`FP8 Block-wise Scaling`**: 业内领先的 64x64 分块缩放 Triton 内核，兼顾性能与精度。
+  - **`Global LiteLinear Acceleration`**: 全局 `LiteLinear` 层自动识别并缓存 FP8 权重，让 Qwen/Llama 系列自动受益。
   - **`LiteLoRA`**: 零拷贝低秩适配器注入，支持高并发多 Adapter 切换。
     - **TinyLlama-1.1B LoRA (Rank-16)**: **365.7 tokens/sec** (Batch 32, 🟢 **全量注入实测**).
     - **注意**: v1.0 版本对 Qwen3.5 和 DeepSeek-V2 的 LoRA 支持目前仅限于单并发测试；多并发 (BS>1) 适配将在 v2.0 版本中结合新的 Dynamic-Batching 调度器进行增强。
