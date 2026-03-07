@@ -71,28 +71,25 @@ class DeepSeekV2MoE(nn.Module):
         self.w2 = LiteLinear(config.moe_intermediate_size, self.num_experts * config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.ffn_down_exps")
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False).cuda().half()
         self._expert_triplet_cache: "OrderedDict[tuple[int, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
-        self._max_expert_cache_size = int(os.environ.get("FASTINFERENCE_DEEPSEEK_MOE_CACHE_SIZE", "128"))
+        
         self._prewarm_budget = int(os.environ.get("FASTINFERENCE_DEEPSEEK_MOE_PREWARM", str(max(self.topk * 2, 16))))
         self._prewarm_done = False
         self._grouped_moe_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_GROUPED_MOE", "1") == "1"
         self._grouped_moe_fallback = os.environ.get("FASTINFERENCE_DEEPSEEK_GROUPED_MOE_FALLBACK", "1") == "1"
         self._grouped_moe_min_tokens = int(os.environ.get("FASTINFERENCE_DEEPSEEK_GROUPED_MOE_MIN_TOKENS", "2"))
-        
+
         # Performance Tiers Control
-        # Mode options: "full" (all cached), "dynamic" (LRU cache), "off" (real-time)
         self._cache_mode = os.environ.get("FASTINFERENCE_MOE_CACHE_MODE", "dynamic").lower()
-        
-        # FP8 Acceleration Control (Tier 0)
         self._fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
-        
-        # Override legacy fused_moe flag if set
-        if os.environ.get("FASTINFERENCE_DEEPSEEK_FUSED_MOE") == "1":
-            self._cache_mode = "full"
-        
-        # LRU Cache Size (used in "dynamic" mode)
         self._max_expert_cache_size = int(os.environ.get("FASTINFERENCE_MOE_LRU_SIZE", "32"))
         
+        # FP8 LRU Cache for DeepSeek-V2 MoE (Isolated)
+        from vllm.model_executor.layers.fused_moe.fused_moe import FP8ExpertCache
+        self._fp8_lru_cache = FP8ExpertCache(max_size=self._max_expert_cache_size)
+
         self._fused_moe_enabled = (self._cache_mode == "full")
+        self._predequant_done = False
+        
         self._all_experts_w1: Optional[torch.Tensor] = None
         self._all_experts_w1_up: Optional[torch.Tensor] = None
         self._all_experts_w2: Optional[torch.Tensor] = None
@@ -104,8 +101,6 @@ class DeepSeekV2MoE(nn.Module):
         self._w1_scales: Optional[torch.Tensor] = None
         self._w1_up_scales: Optional[torch.Tensor] = None
         self._w2_scales: Optional[torch.Tensor] = None
-        
-        self._predequant_done = False
         
         if self._cache_mode == "full":
             tag = "FULL + FP8" if self._fp8_enabled else "FULL"
@@ -153,26 +148,24 @@ class DeepSeekV2MoE(nn.Module):
                 # Allocation for Block Scales (assuming 64x64 blocks for our Triton kernel)
                 # Scale per block: [Experts, Out//64, In//64]
                 BS = 64
-                self._w1_scales = torch.ones((self.num_experts, inter_size // BS, input_size // BS), device="cuda", dtype=torch.float32)
-                self._w1_up_scales = torch.ones((self.num_experts, inter_size // BS, input_size // BS), device="cuda", dtype=torch.float32)
-                self._w2_scales = torch.ones((self.num_experts, input_size // BS, inter_size // BS), device="cuda", dtype=torch.float32)
                 
-                def convert_to_fp8_with_scales(fp16_weights, fp8_out, scales):
-                    for i in range(self.num_experts):
-                        w = fp16_weights[i]
-                        # Simplified scaling: max per block
-                        # In real world, we'd use a kernel for this. For init, we do it via torch.
-                        for r in range(scales.shape[1]):
-                            for c in range(scales.shape[2]):
-                                block = w[r*BS:(r+1)*BS, c*BS:(c+1)*BS]
-                                s = block.abs().max().clamp(min=1e-12).item() / 448.0 # FP8 max is 448
-                                scales[i, r, c] = s
-                                fp8_out[i, r*BS:(r+1)*BS, c*BS:(c+1)*BS].copy_((block / s).to(f8_type))
+                # Optimized vectorized conversion for all experts at once
+                def convert_all_to_fp8(fp16_weights):
+                    num_exp, out_dim, in_dim = fp16_weights.shape
+                    # Reshape to blocks
+                    w_blocks = fp16_weights.view(num_exp, out_dim // BS, BS, in_dim // BS, BS).permute(0, 1, 3, 2, 4)
+                    # Calculate scales
+                    scales = (w_blocks.abs().max(dim=-1)[0].max(dim=-1)[0].clamp(min=1e-12) / 448.0)
+                    # Quantize
+                    w_fp8 = (w_blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+                    # Reshape back
+                    w_fp8 = w_fp8.permute(0, 1, 3, 2, 4).reshape(num_exp, out_dim, in_dim)
+                    return w_fp8, scales
 
-                # Quick conversion (note: this is slow during init, but fast during inference)
-                convert_to_fp8_with_scales(self._all_experts_w1, self._all_experts_w1_fp8, self._w1_scales)
-                convert_to_fp8_with_scales(self._all_experts_w1_up, self._all_experts_w1_up_fp8, self._w1_up_scales)
-                convert_to_fp8_with_scales(self._all_experts_w2, self._all_experts_w2_fp8, self._w2_scales)
+                print(f"[DeepSeek MoE] Converting experts to FP8 (Vectorized)...")
+                self._all_experts_w1_fp8, self._w1_scales = convert_all_to_fp8(self._all_experts_w1)
+                self._all_experts_w1_up_fp8, self._w1_up_scales = convert_all_to_fp8(self._all_experts_w1_up)
+                self._all_experts_w2_fp8, self._w2_scales = convert_all_to_fp8(self._all_experts_w2)
                 
                 # Free FP16 if in full mode to save space
                 if self._cache_mode == "full":
@@ -282,44 +275,58 @@ class DeepSeekV2MoE(nn.Module):
         unique_ids, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
         output = torch.zeros_like(curr_x)
 
-        # --- Tier 0: FP8 Input Preparation ---
-        if self._fp8_enabled and self._predequant_done:
+        # Tier 0: FP8 Input Preparation
+        if self._fp8_enabled and (self._predequant_done or self._cache_mode == "dynamic"):
             from vllm.kernels.triton.fp8_gemm import fp8_block_gemm
-            # Convert inputs to FP8 once
-            # Note: For real max-perf, we need per-token scaling for inputs
-            # For this milestone, we use a global scale for Warmup
             x_f8 = curr_x.to(torch.float8_e4m3fn)
-            x_scale = torch.ones((num_tokens, curr_x.shape[1] // 64), device="cuda", dtype=torch.float32) * (curr_x.abs().max() / 448.0)
+            # Efficient block scaling [num_tokens, input_size // 64]
+            x_scale = (curr_x.abs().max(dim=-1, keepdim=True)[0] / 448.0).expand(-1, curr_x.shape[1] // 64).contiguous()
         
         curr_off = 0
-        for i in range(len(unique_ids)):
-            expert_id = int(unique_ids[i].item())
-            count = int(counts[i].item())
+        # Optimization: Pull unique_ids and counts to CPU list ONCE to avoid multiple syncs in the loop
+        unique_ids_list = unique_ids.tolist()
+        counts_list = counts.tolist()
+        
+        for i in range(len(unique_ids_list)):
+            expert_id = unique_ids_list[i]
+            count = counts_list[i]
             
             token_indices = sorted_token_ids[curr_off : curr_off + count]
-            route_weights = sorted_weights[curr_off : curr_off + count].unsqueeze(-1)
+            route_weights = sorted_weights[curr_off : curr_off + count].view(-1, 1)
             curr_off += count
             
-            hidden_batch = curr_x.index_select(0, token_indices)
-            
             # --- FP8 Optimized Path ---
-            if self._fp8_enabled and self._predequant_done and self._all_experts_w1_fp8 is not None:
+            if self._fp8_enabled and (self._predequant_done or self._cache_mode == "dynamic"):
+                # ... (cache retrieval logic remains same, it's efficient)
+                
+                # Retrieve from cache
+                if self._predequant_done and self._all_experts_w1_fp8 is not None:
+                    w1_f8, w1_s = self._all_experts_w1_fp8[expert_id], self._w1_scales[expert_id]
+                    w1_up_f8, w1_up_s = self._all_experts_w1_up_fp8[expert_id], self._w1_up_scales[expert_id]
+                    w2_f8, w2_s = self._all_experts_w2_fp8[expert_id], self._w2_scales[expert_id]
+                else:
+                    # Dynamic Mode: Fetch from Isolated LRU
+                    gate_w, up_w, down_w = self._get_expert_triplet(expert_id, curr_x.dtype)
+                    w1_f8, w1_s = self._fp8_lru_cache.get(f"ds_w1_{id(self)}_{expert_id}", gate_w, None)
+                    w1_up_f8, w1_up_s = self._fp8_lru_cache.get(f"ds_w1up_{id(self)}_{expert_id}", up_w, None)
+                    w2_f8, w2_s = self._fp8_lru_cache.get(f"ds_w2_{id(self)}_{expert_id}", down_w, None)
+
                 batch_f8 = x_f8.index_select(0, token_indices)
                 batch_scales = x_scale.index_select(0, token_indices)
                 
-                # W1/W1_Up: [count, inter]
-                # We reuse our fp8_block_gemm kernel
-                gate_act = fp8_block_gemm(batch_f8, self._all_experts_w1_fp8[expert_id].T, batch_scales, self._w1_scales[expert_id])
-                up_act = fp8_block_gemm(batch_f8, self._all_experts_w1_up_fp8[expert_id].T, batch_scales, self._w1_up_scales[expert_id])
+                # FP8 GEMMs
+                gate_act = fp8_block_gemm(batch_f8, w1_f8.T, batch_scales, w1_s)
+                up_act = fp8_block_gemm(batch_f8, w1_up_f8.T, batch_scales, w1_up_s)
                 
                 mixed = torch.nn.functional.silu(gate_act) * up_act
                 
-                # W2: [count, hidden]
+                # Intermediate FP8 quantization
                 mixed_f8 = mixed.to(torch.float8_e4m3fn)
-                mixed_scale = torch.ones((count, mixed.shape[1] // 64), device="cuda", dtype=torch.float32) * (mixed.abs().max() / 448.0)
-                expert_out = fp8_block_gemm(mixed_f8, self._all_experts_w2_fp8[expert_id].T, mixed_scale, self._w2_scales[expert_id])
+                mixed_scale = (mixed.abs().max(dim=-1, keepdim=True)[0] / 448.0).expand(count, mixed.shape[1] // 64).contiguous()
+                expert_out = fp8_block_gemm(mixed_f8, w2_f8.T, mixed_scale, w2_s)
             else:
                 # Standard FP16 Path
+                hidden_batch = curr_x.index_select(0, token_indices)
                 if self._predequant_done and self._all_experts_w1 is not None:
                     gate_w, up_w, down_w = self._all_experts_w1[expert_id], self._all_experts_w1_up[expert_id], self._all_experts_w2[expert_id]
                 else:
@@ -330,7 +337,7 @@ class DeepSeekV2MoE(nn.Module):
                 mixed = torch.nn.functional.silu(gate_act) * up_act
                 expert_out = mixed @ down_w.transpose(0, 1)
             
-            output.index_add_(0, token_indices, expert_out.to(output.dtype) * route_weights)
+            output.index_add_(0, token_indices, (expert_out.to(output.dtype) * route_weights))
         return output
 
     def forward(self, x, lora_mapping=None):

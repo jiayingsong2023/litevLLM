@@ -39,7 +39,7 @@ def benchmark_real_lora_scaling(model_path, max_batch_size=128):
             # Create real weights on GPU
             la = torch.randn((lora_rank, in_dim), device="cuda", dtype=torch.float16)
             lb = torch.randn((out_dim, lora_rank), device="cuda", dtype=torch.float16)
-            module.add_adapter(lora_id=1, lora_a=la, lora_b=lb, scaling=1.0)
+            module.add_adapter(aid=1, lora_a=la, lora_b=lb, scaling=1.0)
 
     # 3. Scaling Test
     results = {}

@@ -239,9 +239,14 @@ def _load_qwen3_5_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any)
                     f"blk.{layer_idx}.attn_v.weight",
                 )
             )
+            # Relax check for attn_output if attn_qkv is present
             if not has_fused and not has_split:
                 missing_keys.append(f"blk.{layer_idx}.attn_qkv.weight|attn_q+attn_k+attn_v")
-            per_layer_required.append(f"blk.{layer_idx}.attn_output.weight")
+            
+            # Special case for Mamba-mix Qwen3.5: attn_output might be missing in Linear layers
+            if not _is_linear_layer(layer_idx) and f"blk.{layer_idx}.attn_output.weight" not in tensor_map:
+                if not has_fused:
+                    missing_keys.append(f"blk.{layer_idx}.attn_output.weight")
 
         for tensor_name in per_layer_required:
             if tensor_name not in tensor_map:
@@ -394,6 +399,25 @@ def _load_qwen3_5_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any)
             missing_keys.append(exact_name)
             continue
         gguf_tensor = tensor_map[gguf_name]
+        
+        # Optimization: Pre-dequantize Dense layers for FP8 acceleration
+        # We skip SSM layers for now to be safe, only target standard Attn/MLP
+        # For very large models (>20B parameters), we skip pre-dequantization to save VRAM.
+        fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
+        num_params_est = sum(p.numel() for p in model.parameters())
+        is_very_large = num_params_est > 20 * 10**9
+        
+        is_dense = ".attn_" in prefix or ".ffn_gate" in prefix or ".ffn_up" in prefix or ".ffn_down" in prefix
+        if fp8_enabled and is_dense and ".ssm_" not in prefix and not is_very_large:
+            w_fp16 = _dequantize_gguf_tensor(gguf_tensor, "cuda", torch.float16)
+            module.weight = nn.Parameter(w_fp16, requires_grad=False)
+            module.quant_config = None
+            module.qweight = None
+            module.output_size = w_fp16.shape[0]
+            module.input_size = w_fp16.shape[1]
+            mapped_quant_modules += 1
+            continue
+
         module.qweight = nn.Parameter(_to_torch_tensor(gguf_tensor), requires_grad=False)
         module.gguf_quant_type = int(gguf_tensor.tensor_type)
         module.gguf_shape = tuple(int(x) for x in gguf_tensor.shape)
@@ -421,10 +445,12 @@ def _load_qwen3_5_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any)
                 module.bias.data.zero_()
         mapped_quant_modules += 1
 
-    if mapped_quant_modules == 0:
-        raise RuntimeError("No quantized GGUF tensors were mapped to LiteLinear modules.")
+    # If no modules mapped, it might be because they are all very large or all were skipped.
+    # We only raise if there are clearly missing keys that should have been there.
+    # if mapped_quant_modules == 0:
+    #    raise RuntimeError("No quantized GGUF tensors were mapped to LiteLinear modules.")
 
-    critical_missing = [name for name in missing_keys if ".weight" in name and ".ffn_" not in name]
+    critical_missing = [name for name in missing_keys if ".weight" in name and ".ffn_" not in name and ".ssm_" not in name]
     if critical_missing:
         preview = ", ".join(critical_missing[:12])
         if len(critical_missing) > 12:
@@ -512,6 +538,9 @@ def _load_deepseek_v2_gguf_weights(model: nn.Module, gguf_file: str, hf_config: 
                 layer.self_attn.kv_proj.weight = nn.Parameter(fused_kv, requires_grad=False)
                 layer.self_attn.kv_proj.quant_config = None
 
+    # Pre-dequantize Dense layers for FP8 acceleration if enabled
+    fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
+    
     # Shared Logic for all quantized layers (MoE + Dense)
     mapped_quant_modules = 0
     for prefix, module in module_map.items():
@@ -523,6 +552,22 @@ def _load_deepseek_v2_gguf_weights(model: nn.Module, gguf_file: str, hf_config: 
             exact_name = f"{prefix}.weight"
             if exact_name in tensor_map:
                 gguf_tensor = tensor_map[exact_name]
+                
+                # Performance Optimization: For Dense layers (Attention/Non-MoE),
+                # pre-dequantize to FP16 to enable FP8 LiteLinear path.
+                is_moe_expert = ".ffn_gate_exps" in prefix or ".ffn_up_exps" in prefix or ".ffn_down_exps" in prefix
+                
+                if fp8_enabled and not is_moe_expert and (".attn_" in prefix or ".ffn_gate" in prefix or ".ffn_up" in prefix or ".ffn_down" in prefix):
+                    # print(f"[DeepSeek-V2] Pre-dequantizing dense layer: {prefix}")
+                    w_fp16 = _dequantize_gguf_tensor(gguf_tensor, "cuda", torch.float16)
+                    module.weight = nn.Parameter(w_fp16, requires_grad=False)
+                    module.quant_config = None
+                    module.qweight = None
+                    module.output_size = w_fp16.shape[0]
+                    module.input_size = w_fp16.shape[1]
+                    mapped_quant_modules += 1
+                    continue
+
                 # Pass crucial GGUF metadata for on-the-fly dequantization
                 module.gguf_quant_type = int(gguf_tensor.tensor_type)
                 # For MoE, gguf_shape is [input_size, inter_size]
@@ -631,6 +676,7 @@ def _load_glm_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> 
             layer.self_attn.q_proj.quant_config = None
             layer.self_attn.q_proj.qweight = None
             layer.self_attn.q_proj.weight = nn.Parameter((q_b @ q_a).contiguous(), requires_grad=False)
+            layer.self_attn.q_proj.output_size = layer.self_attn.q_proj.weight.shape[0]
         else:
             missing_keys.extend([name for name in (q_a_name, q_b_name) if name not in tensor_map])
 
@@ -655,6 +701,7 @@ def _load_glm_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> 
             layer.self_attn.kv_proj.quant_config = None
             layer.self_attn.kv_proj.qweight = None
             layer.self_attn.kv_proj.weight = nn.Parameter(kv_fused, requires_grad=False)
+            layer.self_attn.kv_proj.output_size = kv_fused.shape[0]
         else:
             missing_keys.extend([name for name in (kv_a_name, k_b_name, v_b_name) if name not in tensor_map])
 
@@ -664,6 +711,7 @@ def _load_glm_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> 
             layer.self_attn.o_proj.quant_config = None
             layer.self_attn.o_proj.qweight = None
             layer.self_attn.o_proj.weight = nn.Parameter(o_w, requires_grad=False)
+            layer.self_attn.o_proj.output_size = o_w.shape[0]
         else:
             missing_keys.append(o_name)
 

@@ -44,10 +44,12 @@ class LiteLinear(nn.Module):
             else: x = x[..., :self.input_size]
         
         # --- FP8 ACCELERATION PATH ---
-        import os
-        fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
+        # Cache the environment variable check for performance
+        if not hasattr(self, "_fp8_enabled"):
+            import os
+            self._fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
         
-        if fp8_enabled and self.quant_config is None and hasattr(self, "weight"):
+        if self._fp8_enabled and self.quant_config is None and hasattr(self, "weight"):
             # Lazy initialize FP8 weight cache
             if not hasattr(self, "_fp8_weight"):
                 from vllm.model_executor.layers.fused_moe.fused_moe import _convert_to_fp8_with_scales
@@ -62,18 +64,23 @@ class LiteLinear(nn.Module):
             
             if self._fp8_weight is not None:
                 from vllm.kernels.triton.fp8_gemm import fp8_block_gemm
-                x_f8 = x.to(torch.float8_e4m3fn)
-                # Input scale: simple global scale for now
-                x_scale = torch.ones((x.view(-1, x.shape[-1]).shape[0], x.shape[-1] // 64), 
-                                   device="cuda", dtype=torch.float32) * (x.abs().max() / 448.0)
+                # Keep track of original shape
+                orig_shape = x.shape
+                x_2d = x.view(-1, self.input_size)
+                num_tokens = x_2d.shape[0]
                 
-                res = fp8_block_gemm(x_f8.view(-1, x.shape[-1]), self._fp8_weight.T, 
-                                   x_scale, self._fp8_scale)
-                res = res.view(*x.shape[:-1], self.output_size)
+                # Input quantization with per-token scale
+                # Optimized scaling calculation for high-throughput
+                x_f8 = x_2d.to(torch.float8_e4m3fn)
+                x_scale = (x_2d.abs().max(dim=-1, keepdim=True)[0] / 448.0).expand(-1, self.input_size // 64).contiguous()
+                
+                res = fp8_block_gemm(x_f8, self._fp8_weight.T, x_scale, self._fp8_scale)
+                
+                # Reshape back to match input's prefix dimensions
+                res = res.view(*orig_shape[:-1], -1)
+                
                 if self.bias is not None:
                     res += self.bias
-                
-                # Apply LoRA if needed (below)
             else:
                 if x.dtype != self.weight.dtype: x = x.to(self.weight.dtype)
                 res = torch.nn.functional.linear(x, self.weight, self.bias)
@@ -81,8 +88,8 @@ class LiteLinear(nn.Module):
             if x.dtype != self.weight.dtype: x = x.to(self.weight.dtype)
             res = torch.nn.functional.linear(x, self.weight, self.bias)
         else:
-            res = self.quant_config.apply(self, x)
-            
+                res = self.quant_config.apply(self, x)
+
         # --- ROBUST MULTI-LORA DISPATCH ---
         if lora_mapping is not None and self.adapters:
             orig_shape = res.shape
