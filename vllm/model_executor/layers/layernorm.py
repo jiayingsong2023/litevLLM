@@ -9,15 +9,14 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x, residual=None):
-        if residual is not None:
-            x = x + residual
+        if residual is not None: x = x + residual
+        
+        # AUTO-DEVICE ALIGNMENT
+        if self.weight.device != x.device:
+            self.weight.data = self.weight.to(x.device)
             
         input_dtype = x.dtype
         x_fp32 = x.to(torch.float32)
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         x_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
-        out = self.weight * x_fp32.to(input_dtype)
-        
-        # FINAL STABILITY: Never return a tuple unless explicitly asked for.
-        # However, the current code base might have older calls expecting a single value.
-        return out
+        return self.weight * x_fp32.to(input_dtype)
