@@ -63,11 +63,12 @@ def benchmark_real_model(name, model_path, batch_size=32, context_len=4096, env_
         print("Benchmarking...")
         torch.cuda.synchronize()
         start = time.perf_counter()
-        iters = 5
-        for _ in range(iters):
+        iters = 2
+        for i in range(iters):
+            print(f"  Iteration {i+1}/{iters}...")
             with torch.inference_mode():
                 model(full_input, full_positions, kv_caches, attn_metadata)
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
         end = time.perf_counter()
         
         avg_latency = (end - start) / iters

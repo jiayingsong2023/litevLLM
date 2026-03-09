@@ -91,4 +91,8 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(vllm_config, prefix)
         self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size, vllm_config.model_config.hf_config.vocab_size, bias=False, prefix="output")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        return self.lm_head(self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping), lora_mapping=lora_mapping)
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping)
+        # ONLY PROJECT THE LAST TOKEN
+        # hidden_states: (Batch, Seq, Hidden) -> (Batch, 1, Hidden)
+        last_hidden = hidden_states[:, -1:, :]
+        return self.lm_head(last_hidden, lora_mapping=lora_mapping)

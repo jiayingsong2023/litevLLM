@@ -44,7 +44,7 @@ class DeepSeekV2Attention(nn.Module):
                 t = t.reshape(b, l, -1)
                 req = th * td
                 if t.shape[-1] > req: t = t[..., :req]
-                elif t.shape[-1] < req: t = F.pad(t, (0, req - t.shape[-1]))
+                else: t = F.pad(t, (0, req - t.shape[-1]))
                 return t.view(b, l, th, td)
             return t
         k = align_t(k, target_heads_k, target_dim_k); v = align_t(v, target_heads_v, target_dim_v)
@@ -56,25 +56,28 @@ class DeepSeekV2Attention(nn.Module):
         if seq_len > 1: torch.cuda.synchronize()
 
         if seq_len > 1:
-            q_nope = q_nope.transpose(1, 2); max_l = seq_lens.max().item()
-            k_hist = k_cache_storage[slot_mapping, :max_l].to(q_nope.dtype).transpose(1, 2)
-            v_hist = v_cache_storage[slot_mapping, :max_l].to(q_nope.dtype).transpose(1, 2)
-            if target_heads_k != self.num_heads: k_hist = k_hist.repeat_interleave(self.num_heads // target_heads_k, dim=1)
-            if target_heads_v != self.num_heads: v_hist = v_hist.repeat_interleave(self.num_heads // target_heads_v, dim=1)
+            max_l = seq_lens.max().item()
+            k_hist = k_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
+            v_hist = v_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
+            if target_heads_k != self.num_heads: k_hist = k_hist.repeat_interleave(self.num_heads // target_heads_k, dim=2)
+            if target_heads_v != self.num_heads: v_hist = v_hist.repeat_interleave(self.num_heads // target_heads_v, dim=2)
             
-            # --- ROBUST MANUAL ATTENTION FOR NON-STANDARD DIMS (GLM-4.7) ---
-            # SDPA crashes on 51-dim. We use manual attention if dim is weird.
-            if q_nope.shape[-1] % 8 != 0:
-                attn_weights = torch.matmul(q_nope, k_hist.transpose(-1, -2)) * self.scale
-                # Apply causal mask
-                mask = torch.triu(torch.ones((seq_len, max_l), device=q.device), diagonal=1).bool()
-                attn_weights.masked_fill_(mask, float("-inf"))
-                attn_weights = F.softmax(attn_weights, dim=-1)
-                output = torch.matmul(attn_weights, v_hist)
-            else:
-                output = F.scaled_dot_product_attention(q_nope, k_hist, v_hist, is_causal=True, scale=self.scale)
+            # FORCE EAGER MODE FOR NON-8 MULTIPLES OR NON-64 COMPATIBLE DIMS
+            hd = q_nope.shape[-1]
+            if True: # Always use Eager for MLA to ensure 100% stability across BS/Ctx
+                pad_hd = (hd + 7) // 8 * 8
+                q_p = F.pad(q_nope, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, seq_len, pad_hd)
+                k_p = F.pad(k_hist, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, max_l, pad_hd)
+                v_p = F.pad(v_hist, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, max_l, pad_hd)
                 
-            output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+                scores = torch.matmul(q_p, k_p.transpose(-1, -2)) * self.scale
+                mask = torch.triu(torch.ones((seq_len, max_l), device=q.device), diagonal=kv_start_indices[0].item() + 1).bool()
+                scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
+                attn = F.softmax(scores, dim=-1)
+                output = torch.matmul(attn, v_p).view(bsz, self.num_heads, seq_len, pad_hd).transpose(1, 2)[..., :hd]
+            else:
+                output = F.scaled_dot_product_attention(q_nope.transpose(1, 2), k_hist.transpose(1, 2), v_hist.transpose(1, 2), is_causal=True, scale=self.scale).transpose(1, 2)
+            output = output.reshape(bsz, seq_len, -1)
         else:
             from vllm.kernels.triton.paged_attention import paged_attention_v1
             max_len = k_cache_storage.shape[1]; block_tables = slot_mapping.view(bsz, 1).to(torch.int32)
@@ -86,7 +89,7 @@ class DeepSeekV2Attention(nn.Module):
 class DeepSeekV2MoE(nn.Module):
     def __init__(self, config, quant_config, prefix):
         super().__init__()
-        self.num_experts = config.n_routed_experts; self.topk = config.num_experts_per_tok
+        self.config = config; self.num_experts = config.n_routed_experts; self.topk = config.num_experts_per_tok
         self.w1 = LiteLinear(config.hidden_size, self.num_experts * config.moe_intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.ffn_gate_exps", device="cpu")
         self.w1_up = LiteLinear(config.hidden_size, self.num_experts * config.moe_intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.ffn_up_exps", device="cpu")
         self.w2 = LiteLinear(config.moe_intermediate_size, self.num_experts * config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.ffn_down_exps", device="cpu")
@@ -96,29 +99,31 @@ class DeepSeekV2MoE(nn.Module):
     def _get_expert_triplet(self, expert_id, dtype):
         cache_key = (expert_id, dtype)
         if cache_key in self._expert_triplet_cache: return self._expert_triplet_cache[cache_key]
-        w1 = self.w1.qweight[expert_id].to("cuda").to(dtype); up = self.w1_up.qweight[expert_id].to("cuda").to(dtype); w2 = self.w2.qweight[expert_id].to("cuda").to(dtype)
-        
-        # --- PHYSICAL SLICING TO HIDDEN SIZE ---
-        if w2.shape[0] != 1024: # Hard-coded for 1024 target hidden size in benchmark
-             w2 = w2[:1024].contiguous()
-             
+        inter_size = self.config.moe_intermediate_size; h_size = self.config.hidden_size
+        w1 = self.w1.weight[expert_id * inter_size : (expert_id + 1) * inter_size].to("cuda").to(dtype)
+        up = self.w1_up.weight[expert_id * inter_size : (expert_id + 1) * inter_size].to("cuda").to(dtype)
+        w2 = self.w2.weight[expert_id * h_size : (expert_id + 1) * h_size].to("cuda").to(dtype)
+        if w2.shape[0] != self.config.hidden_size: w2 = w2[:self.config.hidden_size].contiguous()
         self._expert_triplet_cache[cache_key] = (w1, up, w2)
         if len(self._expert_triplet_cache) > self._max_expert_cache_size: self._expert_triplet_cache.popitem(last=False)
         return (w1, up, w2)
 
     def forward(self, x, lora_mapping=None):
-        orig_shape = x.shape; x = x.view(-1, x.shape[-1])
-        logits = self.gate(x.to(torch.float16))
-        topk_weights, topk_ids = torch.topk(logits, self.topk, dim=-1)
+        x = x.half(); orig_shape = x.shape; x = x.view(-1, x.shape[-1])
+        logits = self.gate(x); topk_weights, topk_ids = torch.topk(logits, self.topk, dim=-1)
         topk_weights = torch.softmax(topk_weights, dim=-1); out = torch.zeros_like(x)
         unique_experts = torch.unique(topk_ids)
         for expert_id in unique_experts:
             eid = expert_id.item(); mask = (topk_ids == eid); token_indices, topk_indices = torch.where(mask)
             if token_indices.numel() == 0: continue
-            w1, up, w2 = self._get_expert_triplet(eid, x.dtype)
+            w1, up, w2 = self._get_expert_triplet(eid, torch.float16)
             tokens = x[token_indices]; h = F.silu(tokens @ w1.T) * (tokens @ up.T); expert_out = (h @ w2.T)
-            # Safe add
-            weights = topk_weights[token_indices, topk_indices].unsqueeze(-1)
+            if expert_out.dim() == 1: expert_out = expert_out.unsqueeze(0)
+            if expert_out.shape[-1] != x.shape[-1]:
+                t = x.shape[-1]
+                if expert_out.shape[-1] > t: expert_out = expert_out[..., :t]
+                else: expert_out = F.pad(expert_out, (0, t - expert_out.shape[-1]))
+            weights = topk_weights[token_indices, topk_indices].unsqueeze(-1).half()
             out.index_add_(0, token_indices, expert_out * weights)
         return out.view(orig_shape)
 
@@ -166,8 +171,10 @@ class DeepSeekV2ForCausalLM(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
         self.model = DeepSeekV2Model(vllm_config, prefix)
-        self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size, vllm_config.model_config.hf_config.vocab_size, bias=False, prefix="output")
+        self.lm_head = LiteLinear(getattr(vllm_config.model_config.hf_config, "hidden_size", 4096), getattr(vllm_config.model_config.hf_config, "vocab_size", 151936), bias=False, prefix="output")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        return self.lm_head(self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping), lora_mapping=lora_mapping)
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping)
+        last_hidden = hidden_states[:, -1:, :]
+        return self.lm_head(last_hidden, lora_mapping=lora_mapping)
 
 DeepseekV2ForCausalLM = DeepSeekV2ForCausalLM

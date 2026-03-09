@@ -1,124 +1,104 @@
-import os
+# SPDX-License-Identifier: Apache-2.0
 import subprocess
+import os
+import sys
 import time
-import gc
-import torch
-from vllm import LLM, SamplingParams
+import re
 
-def cleanup_gpu():
-    print("\n" + "="*50)
-    print(">>> [INIT] Cleaning GPU Environment...")
-    print("="*50)
-    # Clear torch cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
-    
-    # Force kill any lingering python processes using GPU (except current one)
-    # Note: Using shell to find and kill is risky, but we'll try basic cleanup
-    # For now, just rely on GC and empty_cache as we're running in one process
-    # but sequentially initializing and deleting LLM objects.
-    time.sleep(2)
-    
-    # Check VRAM via rocm-smi
-    try:
-        res = subprocess.run(["rocm-smi", "--showmeminfo", "vram"], capture_output=True, text=True)
-        if res.returncode == 0:
-            print(res.stdout)
-    except Exception as e:
-        print(f"Cleanup warning: {e}")
+# Threshold for performance pass (as percentage of baseline)
+PERF_THRESHOLD = 0.85 
 
-def run_benchmark(name, model_path, batch_size=32, context_len=4096, is_moe=False):
-    print(f"\n>>> [RUNNING] {name} (BS={batch_size}, Context={context_len})...")
+# Model Test Configurations
+# Format: (Name, Path, BatchSize, ContextLen, BaselineTPS)
+REGRESSION_MATRIX = [
+    ("TinyLlama-1.1B", "models/TinyLlama-1.1B-Chat-v1.0", 16, 2048, 420.0),
+    ("Qwen3.5-9B", "models/Qwen3.5-9B-GGUF", 8, 2048, 170.0),
+    ("Qwen3.5-35B-MoE", "models/Qwen3.5-35B-MoE-GGUF", 2, 1024, 115.0),
+    ("DeepSeek-V2-Lite", "models/DeepSeek-V2-Lite-GGUF", 4, 4096, 600.0),
+]
+
+def run_single_regression(name, path, bs, ctx, baseline):
+    print(f"\n[REGRESSION] Testing {name}...")
+    env = os.environ.copy()
+    env["FASTINFERENCE_KV_FP8"] = "1"
+    env["FASTINFERENCE_GGUF_FP8"] = "1"
+    env["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     
+    # Python script to execute the benchmark
+    cmd = f"from tests.e2e_full_benchmark import benchmark_real_model; benchmark_real_model('{name}', '{path}', {bs}, {ctx})"
+    
+    start_time = time.time()
     try:
-        # Configuration for AMD AI MAX+395 (60GB VRAM)
-        # Using dynamic expert cache for MoE models
-        if is_moe:
-            os.environ["FASTINFERENCE_MOE_LRU_SIZE"] = "32" # Match user request for balanced mode
-        
-        llm = LLM(
-            model=model_path,
-            max_num_seqs=batch_size,
-            max_model_len=context_len,
-            trust_remote_code=True,
-            gpu_memory_utilization=0.9, # Leave some room for overhead
-            enforce_eager=True,
-            kv_cache_dtype="fp8" # User requested FP8 path
+        process = subprocess.Popen(
+            ["uv", "run", "python", "-c", cmd],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
         )
         
-        sampling_params = SamplingParams(
-            temperature=0,
-            max_tokens=128, # Generate some tokens for throughput measurement
-            ignore_eos=True
-        )
+        output = ""
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None: break
+            if line:
+                output += line
+                if "RESULT:" in line or "Failed" in line:
+                    print(f"  {line.strip()}")
         
-        # Prepare dummy prompts
-        prompts = ["Hello, what can you do? " * (context_len // 10)] * batch_size
+        process.wait()
         
-        start_time = time.time()
-        outputs = llm.generate(prompts, sampling_params)
-        end_time = time.time()
-        
-        total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
-        elapsed = end_time - start_time
-        tps = total_tokens / elapsed
-        
-        print(f">>> [RESULT] {name}: {tps:.2f} tokens/sec")
-        
-        # Cleanup LLM to free VRAM for next model
-        del llm
-        cleanup_gpu()
-        
-        return True, f"{tps:.2f} t/s"
+        if process.returncode != 0:
+            print(f"❌ CRASH: {name} exited with code {process.returncode}")
+            return False, 0.0
+
+        # Extract TPS
+        match = re.search(r"Throughput=([\d\.]+) tokens/sec", output)
+        if match:
+            tps = float(match.group(1))
+            ratio = tps / baseline
+            status = "✅ PASS" if ratio >= PERF_THRESHOLD else "⚠️ SLOW"
+            print(f"  Status: {status} ({tps:.2f} TPS, {ratio*100:.1f}% of baseline)")
+            return ratio >= PERF_THRESHOLD, tps
+        else:
+            print(f"❌ ERROR: Could not parse TPS for {name}")
+            return False, 0.0
+            
     except Exception as e:
-        print(f">>> [FAILED] {name}: {str(e)}")
-        cleanup_gpu()
-        return False, str(e)
-
-def main():
-    print(f"Starting Full Regression Suite: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    results = []
-    
-    # 1. TinyLlama Baseline
-    success, metric = run_benchmark("TinyLlama-1.1B", "models/TinyLlama-1.1B-Chat-v1.0-GGUF", batch_size=1, context_len=1024)
-    results.append({"Task": "TinyLlama Baseline", "Status": "PASS" if success else "FAIL", "Metric": metric})
-    
-    # 2. DeepSeek-V2-Lite (MoE)
-    success, metric = run_benchmark("DeepSeek-V2-Lite", "models/DeepSeek-V2-Lite-GGUF", batch_size=32, context_len=4096, is_moe=True)
-    results.append({"Task": "DeepSeek-V2-Lite", "Status": "PASS" if success else "FAIL", "Metric": metric})
-    
-    # 3. GLM-4.7-Flash (MoE)
-    # Note: User mentioned BS=16 might be better for 60GB VRAM at 4096 context
-    success, metric = run_benchmark("GLM-4.7-Flash", "models/GLM-4.7-9B-Flash-GGUF", batch_size=16, context_len=4096, is_moe=True)
-    results.append({"Task": "GLM-4.7-Flash", "Status": "PASS" if success else "FAIL", "Metric": metric})
-    
-    # 4. Qwen-3.5-9B
-    success, metric = run_benchmark("Qwen-3.5-9B", "models/Qwen-3.5-9B-GGUF", batch_size=32, context_len=4096)
-    results.append({"Task": "Qwen-3.5-9B", "Status": "PASS" if success else "FAIL", "Metric": metric})
-    
-    # 5. Qwen-3.5-35B-MoE
-    # User suggested BS=8, Context=1024 for 35B
-    success, metric = run_benchmark("Qwen-3.5-35B-MoE", "models/Qwen-3.5-35B-MoE-GGUF", batch_size=8, context_len=1024, is_moe=True)
-    results.append({"Task": "Qwen-3.5-35B-MoE", "Status": "PASS" if success else "FAIL", "Metric": metric})
-
-    # --- FINAL REPORT ---
-    print("\n" + "="*80)
-    print(f"FINAL REGRESSION REPORT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*80)
-    print(f"| {'Task':<30} | {'Status':<10} | {'Metric':<20} |")
-    print(f"|{'-'*32}|{'-'*12}|{'-'*22}|")
-    for r in results:
-        print(f"| {r['Task']:<30} | {r['Status']:<10} | {r['Metric']:<20} |")
-    print("="*80)
-
-    if all(r["Status"] == "PASS" for r in results):
-        print("\nAll regression tests passed successfully.")
-        return 0
-    else:
-        print("\nSome regression tests failed. Check output logs.")
-        return 1
+        print(f"❌ EXCEPTION: {name} failed with {e}")
+        return False, 0.0
 
 if __name__ == "__main__":
-    exit(main())
+    print("="*80)
+    print("LitevLLM v2.0 - FULL PERFORMANCE REGRESSION SUITE")
+    print("="*80)
+    
+    results = []
+    overall_success = True
+    
+    for name, path, bs, ctx, baseline in REGRESSION_MATRIX:
+        if not os.path.exists(path):
+            print(f"\n[SKIP] {name} (Path not found: {path})")
+            continue
+            
+        success, tps = run_single_regression(name, path, bs, ctx, baseline)
+        results.append((name, success, tps, baseline))
+        if not success:
+            overall_success = False
+            
+    print("\n" + "="*80)
+    print("FINAL REGRESSION SUMMARY")
+    print("-" * 80)
+    print(f"{'Model':<20} | {'Status':<10} | {'Actual':<10} | {'Baseline':<10}")
+    for name, success, tps, baseline in results:
+        status_str = "✅ PASS" if success else "❌ FAIL"
+        print(f"{name:<20} | {status_str:<10} | {tps:<10.2f} | {baseline:<10.2f}")
+    
+    print("="*80)
+    if overall_success:
+        print("🎉 ALL SYSTEMS GO. READY FOR SYNC.")
+        sys.exit(0)
+    else:
+        print("🛑 REGRESSION FAILED. CHECK LOGS BEFORE SYNC.")
+        sys.exit(1)

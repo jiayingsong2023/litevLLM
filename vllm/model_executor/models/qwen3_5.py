@@ -102,9 +102,12 @@ class Qwen3_5ForCausalLM(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
         self.model = Qwen3_5Model(vllm_config, prefix)
-        self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size, vllm_config.model_config.hf_config.vocab_size, bias=False, prefix="output")
+        self.lm_head = LiteLinear(getattr(vllm_config.model_config.hf_config, "hidden_size", 4096), getattr(vllm_config.model_config.hf_config, "vocab_size", 151936), bias=False, prefix="output")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        return self.lm_head(self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping), lora_mapping=lora_mapping)
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping)
+        # ONLY PROJECT LAST TOKEN
+        last_hidden = hidden_states[:, -1:, :]
+        return self.lm_head(last_hidden, lora_mapping=lora_mapping)
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM): pass
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForCausalLM): pass

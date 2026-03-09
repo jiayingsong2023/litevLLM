@@ -19,8 +19,13 @@ def _load_param_from_gguf_tensor(param: Any, gguf_tensor: Any) -> None:
     if actual_param is None: return
     source = _dequantize_gguf_tensor(gguf_tensor, str(actual_param.device), actual_param.dtype)
     if source is None: return
+    
     if source.shape == actual_param.shape:
         actual_param.data.copy_(source); return
+        
+    # Only transpose if at least 2D
+    if source.dim() >= 2 and source.transpose(-1, -2).shape == actual_param.shape:
+        actual_param.data.copy_(source.transpose(-1, -2).contiguous()); return
     with torch.no_grad():
         flat_source = source.reshape(-1); flat_param = actual_param.data.reshape(-1)
         n = min(flat_source.numel(), flat_param.numel())
@@ -29,6 +34,7 @@ def _load_param_from_gguf_tensor(param: Any, gguf_tensor: Any) -> None:
 def _load_qwen3_5_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None:
     reader = gguf.GGUFReader(gguf_file); tensor_map = {t.name: t for t in reader.tensors}
     num_layers = int(getattr(hf_config, "num_hidden_layers", 0))
+    # Global
     _load_param_from_gguf_tensor(model.model.embed_tokens, tensor_map.get("token_embd.weight"))
     _load_param_from_gguf_tensor(model.model.norm, tensor_map.get("output_norm.weight"))
     _load_param_from_gguf_tensor(model.lm_head, tensor_map.get("output.weight"))
@@ -36,16 +42,26 @@ def _load_qwen3_5_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any)
         prefix = f"blk.{i}"; layer = model.model.layers[i]
         _load_param_from_gguf_tensor(layer.input_layernorm, tensor_map.get(f"{prefix}.attn_norm.weight"))
         _load_param_from_gguf_tensor(layer.post_attention_layernorm, tensor_map.get(f"{prefix}.post_attention_norm.weight"))
+        
+        # Attention
         qkv_obj = None
         for attr in ["qkv_proj", "kv_proj", "attn_qkv", "attn_q"]:
             if hasattr(layer.self_attn, attr): qkv_obj = getattr(layer.self_attn, attr); break
         for k in [f"{prefix}.attn_qkv.weight", f"{prefix}.self_attn.qkv_proj.weight", f"{prefix}.attn_q.weight", f"{prefix}.attn_kv_a_mqa.weight"]:
             if k in tensor_map: _load_param_from_gguf_tensor(qkv_obj, tensor_map[k]); break
         _load_param_from_gguf_tensor(layer.self_attn.o_proj, tensor_map.get(f"{prefix}.attn_output.weight"))
-        if hasattr(layer.mlp, "gate_up_proj"):
+        
+        # MLP / MoE
+        if hasattr(layer.mlp, "gate_up_proj"): # Dense
             for k in [f"{prefix}.ffn_up.weight", f"{prefix}.ffn_gate.weight"]:
                 if k in tensor_map: _load_param_from_gguf_tensor(layer.mlp.gate_up_proj, tensor_map[k]); break
             _load_param_from_gguf_tensor(layer.mlp.down_proj, tensor_map.get(f"{prefix}.ffn_down.weight"))
+        elif hasattr(layer.mlp, "w1"): # DeepSeek MoE
+            _load_param_from_gguf_tensor(layer.mlp.w1, tensor_map.get(f"{prefix}.ffn_gate_exps.weight"))
+            _load_param_from_gguf_tensor(layer.mlp.w1_up, tensor_map.get(f"{prefix}.ffn_up_exps.weight"))
+            _load_param_from_gguf_tensor(layer.mlp.w2, tensor_map.get(f"{prefix}.ffn_down_exps.weight"))
+            _load_param_from_gguf_tensor(layer.mlp.gate, tensor_map.get(f"{prefix}.ffn_gate_inp.weight"))
+        
         if i % 8 == 0: torch.cuda.empty_cache()
 
 def get_tokenizer(model_name: str, **kwargs: Any): return AutoTokenizer.from_pretrained(model_name, **kwargs)
@@ -65,7 +81,6 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     if not hasattr(c, "num_key_value_heads"): setattr(c, "num_key_value_heads", getattr(c, "num_kv_heads", getattr(c, "multi_query_group_num", 32)))
 
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(c, "architectures", ["LlamaForCausalLM"]), model_config)
-    # CREATE ON CUDA, BUT INDIVIDUAL LAYERS WILL SELF-OFFLOAD TO CPU IN __INIT__
     model = model_cls(vllm_config)
     model_path = model_config.model
     if os.path.isdir(model_path):

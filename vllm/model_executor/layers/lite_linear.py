@@ -19,12 +19,9 @@ class LiteLinear(nn.Module):
         self.input_size = input_size; self.output_size = output_size; self.prefix = prefix
         self.quant_config = quant_config; self._bias_enabled = bias; self.on_load_callback = on_load_callback
         
-        # AGGRESSIVE OFFLOAD: Force CPU for very large layers like Embedding/Head in large models
         target_device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         if "embed_tokens" in prefix or "output" in prefix or "lm_head" in prefix:
-            if input_size > 32000 or output_size > 32000: # Typical large vocab models
-                print(f">>> LiteLinear: Offloading large layer {prefix} to CPU")
-                target_device = "cpu"
+            if input_size > 32000 or output_size > 32000: target_device = "cpu"
 
         if self.quant_config is None:
             self.weight = nn.Parameter(torch.empty(output_size, input_size, device=target_device), requires_grad=False)
@@ -40,21 +37,29 @@ class LiteLinear(nn.Module):
         
         self.weight_id = id(self); self.adapters: Dict[int, Tuple[torch.Tensor, torch.Tensor, float]] = {}
 
-    def add_adapter(self, aid: int, lora_a: torch.Tensor, lora_b: torch.Tensor, scaling: float = 1.0):
-        self.adapters[aid] = (lora_a.to("cuda").half(), lora_b.to("cuda").half(), scaling)
-
     def forward(self, x: torch.Tensor, lora_mapping: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # 1. Input Tiling / Padding
         if x.shape[-1] != self.input_size:
             if x.shape[-1] < self.input_size: x = torch.nn.functional.pad(x, (0, self.input_size - x.shape[-1]))
             else: x = x[..., :self.input_size]
         
-        # Ensure weight is moved only if absolutely necessary
         if self.quant_config is None:
             w, b = self.weight, self.bias
             if w.device != x.device:
-                # For offloaded layers, we must compute on CPU or move small chunk
-                # For benchmark, we move the weight (expensive but avoids crash)
                 w = w.to(x.device); b = b.to(x.device) if b is not None else None
+            
+            # 2. Output Tiling for Large Matrix (Memory Efficiency)
+            # If output_size is massive (e.g. LM Head), we split the matmul to keep intermediate memory low
+            if self.output_size > 65536 and x.numel() // self.input_size > 1:
+                tile_size = 32768
+                outputs = []
+                for start in range(0, self.output_size, tile_size):
+                    end = min(start + tile_size, self.output_size)
+                    w_tile = w[start:end, :]
+                    b_tile = b[start:end] if b is not None else None
+                    outputs.append(torch.nn.functional.linear(x, w_tile, b_tile))
+                return torch.cat(outputs, dim=-1)
+            
             return torch.nn.functional.linear(x, w, b)
         else:
             return self.quant_config.apply(self, x)
