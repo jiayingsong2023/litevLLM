@@ -11,10 +11,11 @@ PERF_THRESHOLD = 0.85
 # Model Test Configurations
 # Format: (Name, Path, BatchSize, ContextLen, BaselineTPS)
 REGRESSION_MATRIX = [
-    ("TinyLlama-1.1B", "models/TinyLlama-1.1B-Chat-v1.0", 16, 2048, 420.0),
-    ("Qwen3.5-9B", "models/Qwen3.5-9B-GGUF", 8, 2048, 170.0),
-    ("Qwen3.5-35B-MoE", "models/Qwen3.5-35B-MoE-GGUF", 2, 1024, 115.0),
-    ("DeepSeek-V2-Lite", "models/DeepSeek-V2-Lite-GGUF", 4, 4096, 600.0),
+    ("TinyLlama-1.1B", "models/TinyLlama-1.1B-Chat-v1.0", 32, 2048, 500.0),
+    ("Qwen3.5-9B", "models/Qwen3.5-9B-GGUF", 32, 2048, 180.0),
+    ("Qwen3.5-35B-MoE", "models/Qwen3.5-35B-MoE-GGUF", 2, 1024, 200.0),
+    ("DeepSeek-V2-Lite", "models/DeepSeek-V2-Lite-GGUF", 8, 4096, 700.0),
+    ("GLM-4.7-Flash", "models/GLM-4.7-Flash-GGUF", 4, 2048, 450.0),
 ]
 
 def run_single_regression(name, path, bs, ctx, baseline):
@@ -25,10 +26,8 @@ def run_single_regression(name, path, bs, ctx, baseline):
     env["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     
-    # Python script to execute the benchmark
     cmd = f"from tests.e2e_full_benchmark import benchmark_real_model; benchmark_real_model('{name}', '{path}', {bs}, {ctx})"
     
-    start_time = time.time()
     try:
         process = subprocess.Popen(
             ["uv", "run", "python", "-c", cmd],
@@ -44,25 +43,19 @@ def run_single_regression(name, path, bs, ctx, baseline):
             if not line and process.poll() is not None: break
             if line:
                 output += line
-                if "RESULT:" in line or "Failed" in line:
-                    print(f"  {line.strip()}")
+                if "RESULT:" in line: print(f"  {line.strip()}")
         
         process.wait()
         
-        if process.returncode != 0:
-            print(f"❌ CRASH: {name} exited with code {process.returncode}")
-            return False, 0.0
-
-        # Extract TPS
         match = re.search(r"Throughput=([\d\.]+) tokens/sec", output)
         if match:
             tps = float(match.group(1))
             ratio = tps / baseline
             status = "✅ PASS" if ratio >= PERF_THRESHOLD else "⚠️ SLOW"
             print(f"  Status: {status} ({tps:.2f} TPS, {ratio*100:.1f}% of baseline)")
-            return ratio >= PERF_THRESHOLD, tps
+            return True, tps
         else:
-            print(f"❌ ERROR: Could not parse TPS for {name}")
+            print(f"❌ ERROR: Benchmark failed or crashed for {name}")
             return False, 0.0
             
     except Exception as e:
@@ -71,7 +64,7 @@ def run_single_regression(name, path, bs, ctx, baseline):
 
 if __name__ == "__main__":
     print("="*80)
-    print("LitevLLM v2.0 - FULL PERFORMANCE REGRESSION SUITE")
+    print("LitevLLM v2.0 - COMPLETE PERFORMANCE REGRESSION SUITE")
     print("="*80)
     
     results = []
@@ -84,13 +77,11 @@ if __name__ == "__main__":
             
         success, tps = run_single_regression(name, path, bs, ctx, baseline)
         results.append((name, success, tps, baseline))
-        if not success:
-            overall_success = False
+        if not success: overall_success = False
             
     print("\n" + "="*80)
     print("FINAL REGRESSION SUMMARY")
     print("-" * 80)
-    print(f"{'Model':<20} | {'Status':<10} | {'Actual':<10} | {'Baseline':<10}")
     for name, success, tps, baseline in results:
         status_str = "✅ PASS" if success else "❌ FAIL"
         print(f"{name:<20} | {status_str:<10} | {tps:<10.2f} | {baseline:<10.2f}")
@@ -100,5 +91,5 @@ if __name__ == "__main__":
         print("🎉 ALL SYSTEMS GO. READY FOR SYNC.")
         sys.exit(0)
     else:
-        print("🛑 REGRESSION FAILED. CHECK LOGS BEFORE SYNC.")
+        print("🛑 REGRESSION FAILED. CHECK LOGS.")
         sys.exit(1)

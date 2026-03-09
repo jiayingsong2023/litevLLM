@@ -25,12 +25,7 @@ class DeepSeekV2Attention(nn.Module):
         bsz, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states, lora_mapping=lora_mapping).view(bsz, seq_len, self.num_heads, -1)
         kv = self.kv_proj(hidden_states, lora_mapping=lora_mapping)
-        actual_q_nope_dim = q.shape[-1] - self.qk_rope_head_dim
-        q_nope = q[..., :actual_q_nope_dim]
-        k = kv[..., :actual_q_nope_dim].view(bsz, seq_len, 1, actual_q_nope_dim)
-        v = kv[..., actual_q_nope_dim:].view(bsz, seq_len, 1, -1)
-        actual_v_dim = v.shape[-1]
-
+        
         k_cache_storage, v_cache_storage = kv_cache 
         slot_mapping = attn_metadata["slot_mapping"]
         kv_start_indices = attn_metadata["kv_start_indices"]; seq_lens = attn_metadata["seq_lens"]
@@ -38,6 +33,12 @@ class DeepSeekV2Attention(nn.Module):
         target_heads_k, target_dim_k = k_cache_storage.shape[2], k_cache_storage.shape[3]
         target_heads_v, target_dim_v = v_cache_storage.shape[2], v_cache_storage.shape[3]
 
+        # Force alignment based on STORAGE
+        actual_q_nope_dim = target_dim_k
+        q_nope = q[..., :actual_q_nope_dim]
+        k = kv[..., :actual_q_nope_dim].view(bsz, seq_len, 1, actual_q_nope_dim)
+        v = kv[..., actual_q_nope_dim:].view(bsz, seq_len, 1, -1)
+        
         def align_t(t, th, td):
             b, l, h, d = t.shape
             if h != th or d != td:
@@ -48,6 +49,7 @@ class DeepSeekV2Attention(nn.Module):
                 return t.view(b, l, th, td)
             return t
         k = align_t(k, target_heads_k, target_dim_k); v = align_t(v, target_heads_v, target_dim_v)
+        q_nope = F.pad(q_nope, (0, target_dim_k - q_nope.shape[-1])) if q_nope.shape[-1] < target_dim_k else q_nope[..., :target_dim_k]
 
         for i in range(bsz):
             slot = slot_mapping[i]; start = kv_start_indices[i]; end = start + seq_len
@@ -57,32 +59,21 @@ class DeepSeekV2Attention(nn.Module):
 
         if seq_len > 1:
             max_l = seq_lens.max().item()
-            k_hist = k_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
-            v_hist = v_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
-            if target_heads_k != self.num_heads: k_hist = k_hist.repeat_interleave(self.num_heads // target_heads_k, dim=2)
-            if target_heads_v != self.num_heads: v_hist = v_hist.repeat_interleave(self.num_heads // target_heads_v, dim=2)
-            
-            # FORCE EAGER MODE FOR NON-8 MULTIPLES OR NON-64 COMPATIBLE DIMS
-            hd = q_nope.shape[-1]
-            if True: # Always use Eager for MLA to ensure 100% stability across BS/Ctx
-                pad_hd = (hd + 7) // 8 * 8
-                q_p = F.pad(q_nope, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, seq_len, pad_hd)
-                k_p = F.pad(k_hist, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, max_l, pad_hd)
-                v_p = F.pad(v_hist, (0, pad_hd - hd)).transpose(1, 2).reshape(-1, max_l, pad_hd)
-                
-                scores = torch.matmul(q_p, k_p.transpose(-1, -2)) * self.scale
-                mask = torch.triu(torch.ones((seq_len, max_l), device=q.device), diagonal=kv_start_indices[0].item() + 1).bool()
-                scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
-                attn = F.softmax(scores, dim=-1)
-                output = torch.matmul(attn, v_p).view(bsz, self.num_heads, seq_len, pad_hd).transpose(1, 2)[..., :hd]
-            else:
-                output = F.scaled_dot_product_attention(q_nope.transpose(1, 2), k_hist.transpose(1, 2), v_hist.transpose(1, 2), is_causal=True, scale=self.scale).transpose(1, 2)
-            output = output.reshape(bsz, seq_len, -1)
+            k_h = k_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
+            v_h = v_cache_storage[slot_mapping, :max_l].to(q_nope.dtype)
+            if target_heads_k != self.num_heads: k_h = k_h.repeat_interleave(self.num_heads // target_heads_k, dim=2)
+            if target_heads_v != self.num_heads: v_h = v_h.repeat_interleave(self.num_heads // target_heads_v, dim=2)
+            q_e, k_e, v_e = q_nope.transpose(1, 2), k_h.transpose(1, 2), v_h.transpose(1, 2)
+            scores = torch.matmul(q_e, k_e.transpose(-1, -2)) * self.scale
+            mask = torch.triu(torch.ones((seq_len, max_l), device=q.device), diagonal=kv_start_indices[0].item() + 1).bool()
+            scores.masked_fill_(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            attn = F.softmax(scores, dim=-1)
+            output = torch.matmul(attn, v_e).transpose(1, 2).reshape(bsz, seq_len, -1)
         else:
             from vllm.kernels.triton.paged_attention import paged_attention_v1
-            max_len = k_cache_storage.shape[1]; block_tables = slot_mapping.view(bsz, 1).to(torch.int32)
+            max_l = k_cache_storage.shape[1]; block_tables = slot_mapping.view(bsz, 1).to(torch.int32)
             output = torch.empty((bsz, self.num_heads, target_dim_v), device=q.device, dtype=q.dtype)
-            paged_attention_v1(output, q_nope.view(bsz, self.num_heads, actual_q_nope_dim), k_cache_storage, v_cache_storage, target_heads_k, self.scale, block_tables, seq_lens, block_size=max_len, max_seq_len=max_len, alibi_slopes=None, kv_cache_dtype="fp8" if k_cache_storage.dtype == torch.float8_e4m3fn else "fp16", k_scale=None, v_scale=None)
+            paged_attention_v1(output, q_nope.view(bsz, self.num_heads, actual_q_nope_dim), k_cache_storage, v_cache_storage, target_heads_k, self.scale, block_tables, seq_lens, block_size=max_l, max_seq_len=max_l, alibi_slopes=None, kv_cache_dtype="fp8" if k_cache_storage.dtype == torch.float8_e4m3fn else "fp16", k_scale=None, v_scale=None)
             output = output.view(bsz, 1, -1)
         return self.o_proj(output, lora_mapping=lora_mapping)
 

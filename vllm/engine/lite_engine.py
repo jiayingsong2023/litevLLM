@@ -35,7 +35,6 @@ class LiteEngine:
         )
         
         # 2. Extract REAL dimensions from loaded model
-        # Try to find actual dimensions from the first attention layer
         try:
             first_layer = None
             if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
@@ -46,6 +45,13 @@ class LiteEngine:
             if first_layer and hasattr(first_layer, "self_attn"):
                 self.num_kv_heads = first_layer.self_attn.num_kv_heads
                 self.head_size = first_layer.self_attn.head_dim
+                
+                # FORCE ALIGNMENT TO 8 FOR HARDWARE STABILITY
+                if self.head_size % 8 != 0:
+                    old_hs = self.head_size
+                    self.head_size = (self.head_size + 7) // 8 * 8
+                    print(f">>> LiteEngine: Hard-aligning head_size {old_hs} -> {self.head_size} for stability")
+                
                 print(f">>> LiteEngine: Detected Model Dimensions: {self.num_kv_heads} heads, {self.head_size} head_dim")
             else:
                 self.num_kv_heads = self.model_config.get_num_kv_heads(None)
