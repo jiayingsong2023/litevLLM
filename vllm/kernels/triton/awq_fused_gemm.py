@@ -5,7 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def awq_fused_gemm_kernel(
-    a_ptr, b_ptr, scales_ptr, zeros_ptr, c_ptr,
+    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
     stride_bn, stride_bk,
@@ -14,10 +14,6 @@ def awq_fused_gemm_kernel(
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    """
-    Fused AWQ GEMM Kernel (Standard AWQ Layout).
-    A: [M, K], B (Packed): [N, K // 8], Scales: [N, K // group_size]
-    """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -52,21 +48,16 @@ def awq_fused_gemm_kernel(
         current_k = k * BLOCK_K + offs_k
         group_idx = current_k // group_size
         
-        # Scales/Zeros: [N, K // group_size]
-        s_ptrs = scales_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
-        z_ptrs = zeros_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
+        s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
+        z_ptrs = z_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
         
         scales = tl.load(s_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=1.0)
         z_packed = tl.load(z_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=0)
         
-        # Unpack zeros (often packed along the group dimension or N)
-        # For this prototype, we follow the same shift as weights
         zeros = (z_packed >> ((group_idx[None, :] % 8) * 4)) & 0xF
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
 
-        # A [M, K] @ B.T [K, N] -> C [M, N]
-        # B is [N, K], so tl.dot(a, b.T)
         accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         a_ptrs += BLOCK_K * stride_ak
@@ -78,22 +69,24 @@ def awq_fused_gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
-def awq_fused_gemm(a, qweight, scales, qzeros, group_size):
+def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
     M, K = a.shape
-    # qweight is [N, K // 8]
     N = qweight.shape[0]
-
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
-
+    if out is None:
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    else:
+        c = out
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
     awq_fused_gemm_kernel[grid](
-        a, qweight, scales, qzeros, c,
-        M, N, K, group_size,
-        a.stride(0), a.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        qzeros.stride(0), qzeros.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=32
+        a_ptr=a, b_ptr=qweight, s_ptr=scales, z_ptr=qzeros, c_ptr=c,
+        M=M, N=N, K=K, group_size=group_size,
+        stride_am=a.stride(0), stride_ak=a.stride(1),
+        stride_bn=qweight.stride(0), stride_bk=qweight.stride(1),
+        stride_sn=scales.stride(0), stride_sk=scales.stride(1),
+        stride_zn=qzeros.stride(0), stride_zk=qzeros.stride(1),
+        stride_cm=c.stride(0), stride_cn=c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=2
     )
     return c

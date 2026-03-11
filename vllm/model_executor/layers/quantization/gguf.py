@@ -45,18 +45,15 @@ class GGUFConfig(QuantizationConfig):
 
         if not isinstance(weight, GGUFWeight):
             if qweight is None:
-                # PERFORMANCE BENCHMARK FALLBACK (Temporary for MLA/Complex MoE)
-                # print(f"DEBUG: Missing weights for {getattr(layer, 'prefix', 'unknown')}")
-                # For safety in real runs, we don't mock unless explicitly in benchmark mode
-                # But here we keep the pass-through logic for unquantized layers
+                # Last resort fallback: check if it's an unquantized layer
                 if hasattr(layer, "weight") and not isinstance(layer.weight, (GGUFWeight, type(None))):
                     if layer.weight.numel() > 1:
                         return torch.nn.functional.linear(x, layer.weight, layer.bias)
-                
-                # Emergency mock for missing MoE experts in perf benchmarks
-                qweight = torch.zeros((layer.output_size, layer.input_size // 4), device=x.device, dtype=torch.int32)
-                scales = torch.ones((layer.output_size, 1), device=x.device, dtype=torch.float16)
-            
+
+                raise RuntimeError(
+                    f"GGUF weight is not ready for layer '{getattr(layer, 'prefix', '<unknown>')}'. "
+                )
+
             weight = GGUFWeight(
                 qweight, 
                 scales if scales is not None else torch.ones(1, device=qweight.device), 
@@ -64,8 +61,9 @@ class GGUFConfig(QuantizationConfig):
             )
             if hasattr(layer, "weight"):
                 layer.weight = weight
-            
+
         return weight.matmul(x, layer.bias)
+
 
     def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
         for name, loaded_weight in weights_iter:
