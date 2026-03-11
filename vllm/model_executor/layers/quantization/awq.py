@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import TYPE_CHECKING, Any, Union, Optional, List
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton, awq_gemm_triton
+from vllm.model_executor.layers.quantization.tensor import AWQWeight
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -30,43 +30,30 @@ class AWQConfig(QuantizationConfig):
         layer.qweight = None
         layer.qzeros = None
         layer.scales = None
-        layer.weight_id = id(layer)
 
     def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.gguf import _GLOBAL_GGUF_CACHE
+        from vllm.model_executor.layers.quantization.tensor import AWQWeight
         
-        cached_weight = _GLOBAL_GGUF_CACHE.get(layer.weight_id)
-        
-        if cached_weight is None:
-            if layer.qweight is None:
-                return torch.nn.functional.linear(x, torch.zeros((layer.output_size, layer.input_size), device=x.device, dtype=x.dtype), layer.bias)
+        weight = getattr(layer, "weight", None)
+        if not isinstance(weight, AWQWeight):
+            if getattr(layer, "qweight", None) is None:
+                 # Fallback/Safety for empty layers during initialization
+                 return torch.nn.functional.linear(x, torch.zeros((layer.output_size, layer.input_size), device=x.device, dtype=x.dtype), layer.bias)
             
-            qweight = layer.qweight.contiguous()
-            scales = layer.scales.contiguous()
-            K, M = layer.input_size, layer.output_size
-            n_rows_q = qweight.shape[0]
-            n_cols_q = qweight.shape[1] * 8
+            weight = AWQWeight(
+                layer.qweight,
+                layer.scales,
+                getattr(layer, "qzeros", None),
+                self.group_size
+            )
+            # If layer is a real LiteLinear, store it. If mock, just keep it for this call.
+            if hasattr(layer, "weight"):
+                layer.weight = weight
             
-            if layer.qzeros is not None:
-                qzeros = layer.qzeros.contiguous()
-            else:
-                fill_value = -2004318072
-                if scales.shape[0] == n_rows_q:
-                    qzeros = torch.full((n_rows_q, n_cols_q // self.group_size // 8 + 1), fill_value, device=qweight.device, dtype=torch.int32)
-                else:
-                    qzeros = torch.full((n_rows_q // self.group_size, n_cols_q // 8), fill_value, device=qweight.device, dtype=torch.int32)
-            
-            dequantized = awq_dequantize_triton(qweight, scales, qzeros, self.group_size)
-            if dequantized.shape[0] == K:
-                cached_weight = dequantized.transpose(0, 1).contiguous()
-            else:
-                cached_weight = dequantized.contiguous()
-            _GLOBAL_GGUF_CACHE.put(layer.weight_id, cached_weight)
-
-        return torch.nn.functional.linear(x, cached_weight, layer.bias)
+        return weight.matmul(x, layer.bias)
 
     def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
-        if expert_idx is not None and layer.qweight is None:
+        if expert_idx is not None and getattr(layer, "qweight", None) is None:
             K, N = layer.input_size, layer.output_size
             layer.qweight = nn.Parameter(torch.zeros((N, K // 8), device="cuda", dtype=torch.int32), requires_grad=False)
             layer.scales = nn.Parameter(torch.zeros((N, K // self.group_size), device="cuda", dtype=torch.float16), requires_grad=False)

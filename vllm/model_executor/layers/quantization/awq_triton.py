@@ -61,9 +61,10 @@ def awq_dequantize_kernel(
     
     # Store
     ptr_out = out_ptr + offs_k[:, None] * stride_out + offs_n[None, :] * stride_on
-    tl.store(ptr_out, res.to(tl.float16), (offs_k[:, None] < n_rows) & (offs_n[None, :] < n_cols))
+    # We cast to float32 first then to the target output dtype to ensure accuracy
+    tl.store(ptr_out, res.to(out_ptr.dtype.element_ty), (offs_k[:, None] < n_rows) & (offs_n[None, :] < n_cols))
 
-def awq_dequantize_triton(qweight, scales, zeros, group_size=128):
+def awq_dequantize_triton(qweight, scales, zeros, group_size=128, out_dtype=torch.float16):
     # Determine Layout
     # qweight: [R, C/8]
     # scales: [SR, SC]
@@ -77,7 +78,7 @@ def awq_dequantize_triton(qweight, scales, zeros, group_size=128):
     else:
         group_along_row = True
 
-    output = torch.empty((n_rows, n_cols), device=qweight.device, dtype=torch.float16)
+    output = torch.empty((n_rows, n_cols), device=qweight.device, dtype=out_dtype)
     grid = lambda META: (triton.cdiv(n_cols, META['BLOCK_N']), triton.cdiv(n_rows, META['BLOCK_K']))
     
     awq_dequantize_kernel[grid](
@@ -92,6 +93,8 @@ def awq_dequantize_triton(qweight, scales, zeros, group_size=128):
     )
     return output
 
-def awq_gemm_triton(input, qweight, scales, zeros, group_size=128, split_k_iters=1):
-    w = awq_dequantize_triton(qweight, scales, zeros, group_size)
+def awq_gemm_triton(input, qweight, scales, zeros, group_size=128, split_k_iters=1, out_dtype=torch.float16):
+    w = awq_dequantize_triton(qweight, scales, zeros, group_size, out_dtype=out_dtype)
+    if w.dtype == torch.float8_e4m3fn:
+        w = w.to(input.dtype)
     return torch.matmul(input, w.t())

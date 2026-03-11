@@ -6,9 +6,11 @@ from vllm.model_executor.layers.lite_linear import LiteLinear
 
 class TestLitevLLM(unittest.TestCase):
     def test_lite_linear_init(self):
-        """Verify LiteLinear can be initialized without distributed env."""
-        linear = LiteLinear(128, 256, bias=True)
-        x = torch.randn(1, 128, device="cuda")
+        """Verify LiteLinear can be initialized and run forward."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Running test on {device}...")
+        linear = LiteLinear(128, 256, bias=True, device=device)
+        x = torch.randn(1, 128, device=device)
         y = linear(x)
         self.assertEqual(y.shape, (1, 256))
         print("LiteLinear Init & Forward: SUCCESS")

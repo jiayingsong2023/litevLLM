@@ -79,11 +79,69 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = LlamaMLP(config, quant_config, prefix)
     def forward(self, hidden_states, positions, kv_cache, attn_metadata, lora_mapping=None):
+        # 1. Check for Fast Dispatch path (pre-bound)
+        if hasattr(self, "_fast_forward"):
+            return self._fast_forward(hidden_states, positions, kv_cache, attn_metadata)
+
         h = self.input_layernorm(hidden_states)
         hidden_states = hidden_states + self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping=lora_mapping)
         h = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + self.mlp(h, lora_mapping=lora_mapping)
         return hidden_states
+
+    def compile_fast_dispatch(self):
+        """
+        Pre-binds weight pointers and Triton kernels to minimize Python overhead.
+        """
+        from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm
+        from vllm.kernels.triton.rmsnorm_awq_fused import rmsnorm_awq_fused_linear
+        from vllm.model_executor.layers.quantization.tensor import AWQWeight
+        
+        # Pre-extract weights for AWQ
+        def _ensure_and_get_awq_data(proj):
+            if hasattr(proj, "quant_config") and proj.quant_config:
+                 device = proj.qweight.device if hasattr(proj, "qweight") and proj.qweight is not None else "cuda"
+                 dummy_x = torch.zeros((1, proj.input_size), device=device, dtype=torch.float16)
+                 proj.quant_config.apply(proj, dummy_x)
+            
+            if isinstance(proj.weight, AWQWeight):
+                return proj.weight.qweight, proj.weight.scales, proj.weight.qzeros, proj.weight.group_size
+            return None
+
+        # 1. Attention Pre-binds (Fused RMSNorm + QKV)
+        self._input_norm_w = self.input_layernorm.weight
+        self._input_norm_eps = self.input_layernorm.variance_epsilon
+        self._qkv_data = _ensure_and_get_awq_data(self.self_attn.qkv_proj)
+        self._o_data = _ensure_and_get_awq_data(self.self_attn.o_proj)
+        
+        # 2. MLP Pre-binds (Fused Post-Norm + GateUp)
+        self._post_norm_w = self.post_attention_layernorm.weight
+        self._post_norm_eps = self.post_attention_layernorm.variance_epsilon
+        self._gate_up_data = _ensure_and_get_awq_data(self.mlp.gate_up_proj)
+        self._down_data = _ensure_and_get_awq_data(self.mlp.down_proj)
+
+        def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
+            # A. Attention Block (Macro-Fusion 1)
+            h_flat = hidden_states.view(-1, hidden_states.shape[-1])
+            # RMSNorm + QKV Proj Fused
+            qkv = rmsnorm_awq_fused_linear(h_flat, *self._qkv_data, self._input_norm_w, self._input_norm_eps)
+            
+            # O-proj (Standard Fused AWQ for now)
+            attn_out = awq_fused_gemm(qkv[..., :hidden_states.shape[-1]], *self._o_data)
+            hidden_states = hidden_states + attn_out.view(hidden_states.shape)
+            
+            # B. MLP Block (Macro-Fusion 2)
+            h_flat = hidden_states.view(-1, hidden_states.shape[-1])
+            # RMSNorm + GateUp Proj Fused
+            gate_up = rmsnorm_awq_fused_linear(h_flat, *self._gate_up_data, self._post_norm_w, self._post_norm_eps)
+            
+            gate, up = gate_up.chunk(2, dim=-1)
+            mlp_out = awq_fused_gemm(torch.nn.functional.silu(gate) * up, *self._down_data)
+            hidden_states = hidden_states + mlp_out.view(hidden_states.shape)
+            
+            return hidden_states
+
+        self._fast_forward = _fast_forward
 
 class LlamaForCausalLM(nn.Module):
     def __init__(self, vllm_config, prefix=""):

@@ -43,12 +43,17 @@ class LiteLinear(nn.Module):
             if x.shape[-1] < self.input_size: x = torch.nn.functional.pad(x, (0, self.input_size - x.shape[-1]))
             else: x = x[..., :self.input_size]
         
+        # 2. Unified Quantized Matmul Path
+        from vllm.model_executor.layers.quantization.tensor import QuantizedLinearWeight
+        if isinstance(self.weight, QuantizedLinearWeight):
+            return self.weight.matmul(x, self.bias)
+
         if self.quant_config is None:
             w, b = self.weight, self.bias
             if w.device != x.device:
                 w = w.to(x.device); b = b.to(x.device) if b is not None else None
             
-            # 2. Output Tiling for Large Matrix (Memory Efficiency)
+            # 3. Output Tiling for Large Matrix (Memory Efficiency)
             # If output_size is massive (e.g. LM Head), we split the matmul to keep intermediate memory low
             if self.output_size > 65536 and x.numel() // self.input_size > 1:
                 tile_size = 32768

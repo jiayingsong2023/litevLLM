@@ -13,9 +13,10 @@ PERF_THRESHOLD = 0.85
 REGRESSION_MATRIX = [
     ("TinyLlama-1.1B", "models/TinyLlama-1.1B-Chat-v1.0", 32, 2048, 500.0),
     ("Qwen3.5-9B", "models/Qwen3.5-9B-GGUF", 32, 2048, 180.0),
-    ("Qwen3.5-35B-MoE", "models/Qwen3.5-35B-MoE-GGUF", 2, 1024, 200.0),
+    ("Qwen3.5-9B-AWQ", "models/Qwen3.5-9B-AWQ", 32, 2048, 60.0),
     ("DeepSeek-V2-Lite", "models/DeepSeek-V2-Lite-GGUF", 8, 4096, 700.0),
     ("GLM-4.7-Flash", "models/GLM-4.7-Flash-GGUF", 4, 2048, 450.0),
+    ("Qwen3.5-35B-MoE", "models/Qwen3.5-35B-MoE-GGUF", 1, 1024, 200.0),
 ]
 
 def run_single_regression(name, path, bs, ctx, baseline):
