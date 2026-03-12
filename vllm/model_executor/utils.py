@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-    This method is used to set attributes on a weight tensor. This method
-    will not overwrite existing attributes.
+import torch
+import torch.nn as nn
+from typing import Dict, Any, Optional
 
-    Args:
-        weight: The weight tensor.
-        weight_attrs: A dictionary of attributes to set on the weight tensor.
-    Replace a parameter of a layer while maintaining the ability to reload the weight.
-    Called within implementations of the `process_weights_after_loading` method.
+def set_weight_attrs(weight: torch.Tensor, weight_attrs: Dict[str, Any]) -> None:
+    """Set attributes on a weight tensor without overwriting existing ones."""
+    for key, value in weight_attrs.items():
+        if not hasattr(weight, key):
+            setattr(weight, key, value)
 
-    This function should not be called on weights which are tied/shared
+def replace_submodule(model: nn.Module, module_name: str, new_module: nn.Module) -> None:
+    """Replace a submodule by name."""
+    parts = module_name.split(".")
+    for part in parts[:-1]:
+        model = getattr(model, part)
+    setattr(model, parts[-1], new_module)
 
-    Args:
-        layer: Layer containing parameter to replace
-        param_name: Name of parameter to replace
-        new_data: New data of the new parameter, or None to set the parameter to None
+def maybe_disable_graph_partition(model: nn.Module) -> None:
+    """Dummy implementation for LitevLLM compatibility."""
+    pass

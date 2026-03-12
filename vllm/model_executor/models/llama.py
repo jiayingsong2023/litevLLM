@@ -6,123 +6,89 @@ from typing import Optional, List, Any, Tuple
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.config import VllmConfig
+from .lite_config import LiteConfig
 
-class LlamaMLP(nn.Module):
-    def __init__(self, config, quant_config, prefix=""):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_up_proj = LiteLinear(self.hidden_size, self.intermediate_size * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_up_proj")
-        self.down_proj = LiteLinear(self.intermediate_size, self.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj")
-    def forward(self, x, lora_mapping=None):
-        gate_up = self.gate_up_proj(x, lora_mapping=lora_mapping)
-        gate, up = gate_up.chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up, lora_mapping=lora_mapping)
+def _get_eps(config):
+    return getattr(config, "rms_norm_eps", getattr(config, "layer_norm_epsilon", 1e-6))
 
-class LlamaAttention(nn.Module):
-    def __init__(self, config, quant_config, prefix=""):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.qkv_proj = LiteLinear(self.hidden_size, (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.attn.qkv_proj")
-        self.o_proj = LiteLinear(self.hidden_size, self.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.attn.o_proj")
-    def forward(self, x, positions, kv_cache, attn_metadata, lora_mapping=None):
-        return self.o_proj(x, lora_mapping=lora_mapping)
+def get_rotary_embedding(config: LiteConfig):
+    from vllm.model_executor.layers.rotary_embedding.base import get_rope
+    head_size = config.hidden_size // config.num_attention_heads
+    return get_rope(head_size=head_size, rotary_dim=head_size, max_position=config.max_position_embeddings, 
+                    base=config.rope_theta, is_neox_style=True)
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, quant_config, prefix=""):
+    def __init__(self, config: LiteConfig, quant_config, prefix=""):
         super().__init__()
-        self.prefix = prefix
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = LlamaAttention(config, quant_config, prefix)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = LlamaMLP(config, quant_config, prefix)
-    
-    def forward(self, hidden_states, positions, kv_cache, attn_metadata, lora_mapping=None):
-        if hasattr(self, "_fast_forward"):
-            return self._fast_forward(hidden_states, positions, kv_cache, attn_metadata)
-        h = self.input_layernorm(hidden_states)
-        hidden_states = hidden_states + self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping=lora_mapping)
-        h = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + self.mlp(h, lora_mapping=lora_mapping)
-        return hidden_states
+        self.config = config
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
+        self.self_attn = type('obj', (object,), {
+            'num_heads': config.num_attention_heads, 'num_kv_heads': config.num_key_value_heads,
+            'head_dim': config.hidden_size // config.num_attention_heads,
+            'scale': (config.hidden_size // config.num_attention_heads)**-0.5,
+            'q_size': config.num_attention_heads * (config.hidden_size // config.num_attention_heads),
+            'kv_size': config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
+        })
+        # Use STANDARD naming for GGUF/HF compatibility (model.layers.i.self_attn.q_proj)
+        self.self_attn.q_proj = LiteLinear(config.hidden_size, self.self_attn.q_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_proj")
+        self.self_attn.k_proj = LiteLinear(config.hidden_size, self.self_attn.kv_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.k_proj")
+        self.self_attn.v_proj = LiteLinear(config.hidden_size, self.self_attn.kv_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.v_proj")
+        self.self_attn.o_proj = LiteLinear(self.self_attn.q_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.o_proj")
+        self.rotary_emb = get_rotary_embedding(config)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
+        self.mlp = type('obj', (object,), {
+            'gate_proj': LiteLinear(config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"),
+            'up_proj': LiteLinear(config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"),
+            'down_proj': LiteLinear(config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj")
+        })
 
-    def compile_fast_dispatch(self, batch_size=32):
-        from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm
-        from vllm.kernels.triton.rmsnorm_awq_fused import rmsnorm_awq_fused_linear
-        from vllm.model_executor.layers.quantization.tensor import AWQWeight
-        
-        def _ensure_and_get_awq_data(proj):
-            # Safe data extraction for AWQ
-            if proj is None: return None
-            if hasattr(proj, "quant_config") and proj.quant_config:
-                 device = proj.qweight.device if hasattr(proj, "qweight") and proj.qweight is not None else "cuda"
-                 dummy_x = torch.zeros((1, proj.input_size), device=device, dtype=torch.float16)
-                 proj.quant_config.apply(proj, dummy_x)
-            if isinstance(proj.weight, AWQWeight):
-                return proj.weight.qweight, proj.weight.scales, proj.weight.qzeros, proj.weight.group_size
-            return None
+    def forward(self, x, positions, kv_cache, attn_metadata, lora_mapping=None):
+        if hasattr(self, "_fast_forward") and self._fast_forward is not None:
+            return self._fast_forward(x, positions, kv_cache, attn_metadata)
+        return self._standard_forward(x, positions, kv_cache, attn_metadata, lora_mapping)
 
-        # 1. Attention Pre-binds
-        self._input_norm_w = getattr(self.input_layernorm, 'weight', None)
-        self._input_norm_eps = getattr(self.input_layernorm, 'variance_epsilon', 1e-6)
-        self._qkv_data = _ensure_and_get_awq_data(getattr(self.self_attn, 'qkv_proj', None))
-        self._o_data = _ensure_and_get_awq_data(getattr(self.self_attn, 'o_proj', None))
-        
-        # 2. MLP Pre-binds
-        self._post_norm_w = getattr(self.post_attention_layernorm, 'weight', None)
-        self._post_norm_eps = getattr(self.post_attention_layernorm, 'variance_epsilon', 1e-6)
-        self._gate_up_data = _ensure_and_get_awq_data(getattr(self.mlp, 'gate_up_proj', None))
-        self._down_data = _ensure_and_get_awq_data(getattr(self.mlp, 'down_proj', None))
+    def _standard_forward(self, x, positions, kv_cache, attn_metadata, lora_mapping=None):
+        h = self.input_layernorm(x)
+        q = self.self_attn.q_proj(h); k = self.self_attn.k_proj(h); v = self.self_attn.v_proj(h)
+        bs, seq = q.shape[:2]
+        q = q.view(bs, seq, self.self_attn.num_heads, self.self_attn.head_dim); k = k.view(bs, seq, self.self_attn.num_kv_heads, self.self_attn.head_dim); v = v.view(bs, seq, self.self_attn.num_kv_heads, self.self_attn.head_dim)
+        q, k = self.rotary_emb(positions, q, k)
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None) if not isinstance(attn_metadata, dict) else attn_metadata.get("slot_mapping")
+        if slot_mapping is not None and kv_cache is not None:
+            from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
+            from vllm.kernels.triton.paged_attention import paged_attention_v1
+            k_cache, v_cache = kv_cache
+            reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, slot_mapping, "auto")
+            attn_in = torch.empty((bs * seq, self.self_attn.num_heads, self.self_attn.head_dim), device=q.device, dtype=q.dtype)
+            paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_kv_heads, self.self_attn.scale, getattr(attn_metadata, "block_tables", None), getattr(attn_metadata, "seq_lens", None), k_cache.shape[1], 4096, None, "auto", None, None)
+            out = attn_in.view(bs, seq, -1)
+        else: out = q.view(bs, seq, -1)
+        hidden_states = x + self.self_attn.o_proj(out)
+        h = self.post_attention_layernorm(hidden_states); gate = self.mlp.gate_proj(h); up = self.mlp.up_proj(h)
+        return hidden_states + self.mlp.down_proj(F.silu(gate) * up)
 
-        def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
-            # SAFETY CHECK: Fallback if any data is missing (handles model edge cases)
-            if self._qkv_data is None or self._input_norm_w is None:
-                return self.forward(hidden_states, positions, kv_cache, attn_metadata)
-            
-            h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            # Macro-Fusion 1: RMSNorm + QKV
-            qkv = rmsnorm_awq_fused_linear(h_flat, *self._qkv_data, self._input_norm_w, self._input_norm_eps)
-            
-            # Simplified Attention out
-            attn_out = awq_fused_gemm(qkv[..., :hidden_states.shape[-1]], *self._o_data)
-            hidden_states = hidden_states + attn_out.view(hidden_states.shape)
-            
-            if self._gate_up_data is None or self._post_norm_w is None:
-                return hidden_states
-
-            h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            # Macro-Fusion 2: PostNorm + GateUp
-            gate_up = rmsnorm_awq_fused_linear(h_flat, *self._gate_up_data, self._post_norm_w, self._post_norm_eps)
-            gate, up = gate_up.chunk(2, dim=-1)
-            mlp_out = awq_fused_gemm(F.silu(gate) * up, *self._down_data)
-            hidden_states = hidden_states + mlp_out.view(hidden_states.shape)
-            return hidden_states
-
-        self._fast_forward = _fast_forward
+    def compile_fast_dispatch(self):
+        self._fast_forward = None
 
 class LlamaModel(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, hf_config, quant_config, prefix="model"):
         super().__init__()
-        hf_config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        device = getattr(vllm_config, 'device', 'cuda')
-        self.embed_tokens = nn.Embedding(hf_config.vocab_size, hf_config.hidden_size).to(device)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(hf_config, quant_config, f"{prefix}.blk.{i}").to(device) for i in range(hf_config.num_hidden_layers)])
-        self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps).to(device)
-    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        if input_ids.dtype == torch.long: hidden_states = self.embed_tokens(input_ids)
-        else: hidden_states = input_ids
-        for i in range(len(self.layers)): hidden_states = self.layers[i](hidden_states, positions, kv_caches[i], attn_metadata, lora_mapping=lora_mapping)
-        return self.norm(hidden_states)
+        self.config = LiteConfig(hf_config)
+        self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        # Fix: ensure prefix join is clean (no model..layers)
+        self.layers = nn.ModuleList([LlamaDecoderLayer(self.config, quant_config, f"{prefix}.layers.{i}") for i in range(self.config.num_hidden_layers)])
+        self.norm = RMSNorm(self.config.hidden_size, eps=_get_eps(self.config))
+    def forward(self, input_ids, positions, kv_caches, attn_metadata):
+        if input_ids.dtype == torch.long: x = self.embed_tokens(input_ids)
+        else: x = input_ids
+        for i in range(len(self.layers)): x = self.layers[i](x, positions, kv_caches[i], attn_metadata)
+        return self.norm(x)
 
 class LlamaForCausalLM(nn.Module):
-    def __init__(self, vllm_config, prefix=""):
+    def __init__(self, vllm_config, prefix="model"):
         super().__init__()
-        self.model = LlamaModel(vllm_config, prefix)
-        self.lm_head = LiteLinear(vllm_config.model_config.hf_config.hidden_size, vllm_config.model_config.hf_config.vocab_size, bias=False, prefix="output")
+        self.model = LlamaModel(vllm_config.model_config.hf_config, vllm_config.quant_config, "model")
+        self.lm_head = LiteLinear(self.model.config.hidden_size, self.model.config.vocab_size, bias=False, prefix="lm_head")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping=lora_mapping)
-        last_hidden = hidden_states[:, -1:, :]
-        return self.lm_head(last_hidden, lora_mapping=lora_mapping)
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
+        return self.lm_head(hidden_states[:, -1:, :])
