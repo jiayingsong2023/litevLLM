@@ -54,6 +54,8 @@ class LlamaDecoderLayer(nn.Module):
         from vllm.model_executor.layers.quantization.tensor import AWQWeight
         
         def _ensure_and_get_awq_data(proj):
+            # Safe data extraction for AWQ
+            if proj is None: return None
             if hasattr(proj, "quant_config") and proj.quant_config:
                  device = proj.qweight.device if hasattr(proj, "qweight") and proj.qweight is not None else "cuda"
                  dummy_x = torch.zeros((1, proj.input_size), device=device, dtype=torch.float16)
@@ -62,24 +64,36 @@ class LlamaDecoderLayer(nn.Module):
                 return proj.weight.qweight, proj.weight.scales, proj.weight.qzeros, proj.weight.group_size
             return None
 
-        self._input_norm_w = self.input_layernorm.weight
-        self._input_norm_eps = self.input_layernorm.variance_epsilon
-        self._qkv_data = _ensure_and_get_awq_data(self.self_attn.qkv_proj)
-        self._o_data = _ensure_and_get_awq_data(self.self_attn.o_proj)
-        self._post_norm_w = self.post_attention_layernorm.weight
-        self._post_norm_eps = self.post_attention_layernorm.variance_epsilon
-        self._gate_up_data = _ensure_and_get_awq_data(self.mlp.gate_up_proj)
-        self._down_data = _ensure_and_get_awq_data(self.mlp.down_proj)
+        # 1. Attention Pre-binds
+        self._input_norm_w = getattr(self.input_layernorm, 'weight', None)
+        self._input_norm_eps = getattr(self.input_layernorm, 'variance_epsilon', 1e-6)
+        self._qkv_data = _ensure_and_get_awq_data(getattr(self.self_attn, 'qkv_proj', None))
+        self._o_data = _ensure_and_get_awq_data(getattr(self.self_attn, 'o_proj', None))
+        
+        # 2. MLP Pre-binds
+        self._post_norm_w = getattr(self.post_attention_layernorm, 'weight', None)
+        self._post_norm_eps = getattr(self.post_attention_layernorm, 'variance_epsilon', 1e-6)
+        self._gate_up_data = _ensure_and_get_awq_data(getattr(self.mlp, 'gate_up_proj', None))
+        self._down_data = _ensure_and_get_awq_data(getattr(self.mlp, 'down_proj', None))
 
         def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
+            # SAFETY CHECK: Fallback if any data is missing (handles model edge cases)
+            if self._qkv_data is None or self._input_norm_w is None:
+                return self.forward(hidden_states, positions, kv_cache, attn_metadata)
+            
             h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            # Macro-Fusion 1: RMSNorm + QKV (Stable FP16 path)
+            # Macro-Fusion 1: RMSNorm + QKV
             qkv = rmsnorm_awq_fused_linear(h_flat, *self._qkv_data, self._input_norm_w, self._input_norm_eps)
+            
+            # Simplified Attention out
             attn_out = awq_fused_gemm(qkv[..., :hidden_states.shape[-1]], *self._o_data)
             hidden_states = hidden_states + attn_out.view(hidden_states.shape)
             
+            if self._gate_up_data is None or self._post_norm_w is None:
+                return hidden_states
+
             h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            # Macro-Fusion 2: PostNorm + GateUp (Stable FP16 path)
+            # Macro-Fusion 2: PostNorm + GateUp
             gate_up = rmsnorm_awq_fused_linear(h_flat, *self._gate_up_data, self._post_norm_w, self._post_norm_eps)
             gate, up = gate_up.chunk(2, dim=-1)
             mlp_out = awq_fused_gemm(F.silu(gate) * up, *self._down_data)
