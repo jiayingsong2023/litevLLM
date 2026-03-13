@@ -34,7 +34,7 @@ def run_peak_audit_ladder():
     print("Compiling Slice-Mode Dispatch...")
     layer.eval(); layer.compile_fast_dispatch()
     
-    ladder = [8]
+    ladder = [16]
     for bs in ladder:
         print(f"\nClimbing to BS={bs}...")
         try:

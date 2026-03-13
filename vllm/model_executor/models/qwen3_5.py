@@ -30,7 +30,7 @@ class Qwen2DecoderLayer(nn.Module):
         h = self.input_layernorm(x); q = self.q_proj(h); return self.o_proj(q) + x
 
     def compile_fast_dispatch(self):
-        """Ultra-Performance Slice-Mode Closure: Explicit Memory Management."""
+        """Ultra-Performance Closure with Pre-translated PagedAttention Caching."""
         from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm
         from vllm.kernels.triton.gguf_tiled_fused_gemm import gguf_fused_gemm
         from vllm.kernels.triton.lite_rmsnorm import lite_rmsnorm
@@ -41,7 +41,7 @@ class Qwen2DecoderLayer(nn.Module):
         def _get_op(proj):
             q_type, d = proj.get_fast_data()
             if q_type == "awq": return lambda x, out=None: awq_fused_gemm(x, *d, out=out)
-            if q_type == "gguf": return lambda x, out=None: gguf_fused_gemm(x, d[0], out=out)
+            if q_type == "gguf": return lambda x, out=None: gguf_tiled_fused_gemm.gguf_fused_gemm(x, d[0], out=out)
             return lambda x, out=None: F.linear(x, d[0], out=out)
 
         self._q_op = _get_op(self.q_proj); self._k_op = _get_op(self.k_proj); self._v_op = _get_op(self.v_proj)
@@ -53,11 +53,26 @@ class Qwen2DecoderLayer(nn.Module):
         def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
             bs = hidden_states.shape[0]
             
-            # --- 1. ATTENTION INPUT NORM ---
+            # --- 1. PRE-TRANSLATE PHYSICAL POINTERS (Once per Layer or Step) ---
+            # Extract base pointers for KV Cache
+            k_cache, v_cache = kv_cache
+            k_base = k_cache.data_ptr(); v_base = v_cache.data_ptr()
+            
+            # Stride info
+            k_block_stride = k_cache.stride(0) * k_cache.element_size()
+            v_block_stride = v_cache.stride(0) * v_cache.element_size()
+            
+            # Calculate physical pointers for all blocks in the batch
+            # Note: For production, we'd use a small Triton kernel to do this faster
+            bt = attn_metadata.block_tables
+            max_blocks = bt.shape[1]
+            k_ptrs = k_base + bt.to(torch.int64) * k_block_stride
+            v_ptrs = v_base + bt.to(torch.int64) * v_block_stride
+            
+            # --- 2. ATTENTION STAGE ---
             h_norm = buf_mgr.get_slice("a", bs, h_size, offset_dim=0)
             lite_rmsnorm(hidden_states.view(-1, h_size), in_w, eps, out=h_norm)
             
-            # --- 2. Q, K, V PROJECTIONS (BUFFER B) ---
             q_buf = buf_mgr.get_slice("b", bs, n_h * h_d, offset_dim=0)
             k_buf = buf_mgr.get_slice("b", bs, n_kv * h_d, offset_dim=h_size)
             v_buf = buf_mgr.get_slice("b", bs, n_kv * h_d, offset_dim=h_size * 2)
@@ -67,28 +82,22 @@ class Qwen2DecoderLayer(nn.Module):
             q = q_buf.view(bs, 1, n_h, h_d).contiguous(); k = k_buf.view(bs, 1, n_kv, h_d).contiguous(); v = v_buf.view(bs, 1, n_kv, h_d).contiguous()
             q, k = rotary(positions, q, k)
             
-            # --- 3. PAGED ATTENTION (RE-USE BUFFER A) ---
             from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
             from vllm.kernels.triton.paged_attention import paged_attention_v1
-            reshape_and_cache(k.view(-1, n_kv, h_d).contiguous(), v.view(-1, n_kv, h_d).contiguous(), kv_cache[0], kv_cache[1], attn_metadata.slot_mapping, "auto")
+            reshape_and_cache(k.view(-1, n_kv, h_d).contiguous(), v.view(-1, n_kv, h_d).contiguous(), k_cache, v_cache, attn_metadata.slot_mapping, "auto")
             
-            # Re-use Buffer A (offset 0) for attention output
             attn_out = buf_mgr.get_slice_3d("a", bs, n_h, h_d, offset_dim=0)
-            paged_attention_v1(attn_out, q.view(bs, n_h, h_d).contiguous(), kv_cache[0], kv_cache[1], n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, kv_cache[0].shape[1], 4096, None, "auto")
+            # CALLING PAGED ATTENTION V1 WITH CACHED PTRS
+            paged_attention_v1(attn_out, q.view(bs, n_h, h_d).contiguous(), k_cache, v_cache, n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, k_cache.shape[1], 4096, None, "auto", k_ptrs=k_ptrs, v_ptrs=v_ptrs)
             
-            # --- 4. OUTPUT PROJECTION & RESIDUAL ---
             hidden_states = hidden_states + self._o_op(attn_out.view(bs, -1).contiguous()).view(hidden_states.shape)
             
-            # --- 5. MLP STAGE ---
-            h_norm_post = buf_mgr.get_slice("a", bs, h_size, offset_dim=0) # Re-use Buffer A
+            # --- 3. MLP STAGE ---
+            h_norm_post = buf_mgr.get_slice("a", bs, h_size, offset_dim=0)
             lite_rmsnorm(hidden_states.view(-1, h_size), post_w, eps, out=h_norm_post)
-            
-            gate_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=0) # Re-use Buffer B
-            up_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=i_size)
-            
+            gate_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=0); up_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=i_size)
             self._gate_op(h_norm_post, out=gate_buf); self._up_op(h_norm_post, out=up_buf)
             
-            # Final result computed from Buffer B results
             mlp_out = self._down_op((F.silu(gate_buf) * up_buf).contiguous())
             return hidden_states + mlp_out.view(hidden_states.shape)
             
