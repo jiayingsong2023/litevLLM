@@ -30,10 +30,13 @@ class Qwen2DecoderLayer(nn.Module):
         h = self.input_layernorm(x); q = self.q_proj(h); return self.o_proj(q) + x
 
     def compile_fast_dispatch(self):
+        """Ultra-Performance Slice-Mode Closure: Explicit Memory Management."""
         from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm
         from vllm.kernels.triton.gguf_tiled_fused_gemm import gguf_fused_gemm
+        from vllm.kernels.triton.lite_rmsnorm import lite_rmsnorm
+        
         buf_mgr = LiteBufferManager()
-        buf_mgr.init_pool(max_batch=32, max_hidden=self.config.hidden_size, device="cuda")
+        buf_mgr.init_pool(max_batch=32, max_hidden=self.config.hidden_size, max_intermediate=32768, device="cuda")
 
         def _get_op(proj):
             q_type, d = proj.get_fast_data()
@@ -44,37 +47,51 @@ class Qwen2DecoderLayer(nn.Module):
         self._q_op = _get_op(self.q_proj); self._k_op = _get_op(self.k_proj); self._v_op = _get_op(self.v_proj)
         self._o_op = _get_op(self.o_proj); self._gate_op = _get_op(self.gate_proj); self._up_op = _get_op(self.up_proj); self._down_op = _get_op(self.down_proj)
         in_w = self.input_layernorm.weight; post_w = self.post_attention_layernorm.weight; eps = self.input_layernorm.variance_epsilon
-        rotary = self.rotary_emb; n_h = self.num_heads; n_kv = self.num_kv_heads; h_d = self.head_dim; scale = self.scale
+        rotary = self.rotary_emb; n_h = self.num_heads; n_kv = self.num_kv_heads; h_d = self.head_dim; scale = self.scale; h_size = self.config.hidden_size; i_size = self.config.intermediate_size
 
         @torch.inference_mode()
         def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
-            bs = hidden_states.shape[0]; h_flat = hidden_states.view(-1, hidden_states.shape[-1])
+            bs = hidden_states.shape[0]
             
-            # Static Buffers
-            q_buf_2d = buf_mgr.get_fused_act(bs, n_h * h_d)
-            k_buf_2d = buf_mgr.get_hidden_2d(bs, n_kv * h_d)
-            v_buf_2d = buf_mgr.raw_hidden_b[bs:bs*2, :n_kv * h_d] # Offset slice
-            attn_out_3d = buf_mgr.get_hidden_3d(bs, n_h, h_d)
+            # --- 1. ATTENTION INPUT NORM ---
+            h_norm = buf_mgr.get_slice("a", bs, h_size, offset_dim=0)
+            lite_rmsnorm(hidden_states.view(-1, h_size), in_w, eps, out=h_norm)
             
-            h_norm = F.rms_norm(h_flat, (h_flat.shape[-1],), in_w, eps)
-            q = self._q_op(h_norm, out=q_buf_2d)
-            k = self._k_op(h_norm, out=k_buf_2d)
-            v = self._v_op(h_norm, out=v_buf_2d)
+            # --- 2. Q, K, V PROJECTIONS (BUFFER B) ---
+            q_buf = buf_mgr.get_slice("b", bs, n_h * h_d, offset_dim=0)
+            k_buf = buf_mgr.get_slice("b", bs, n_kv * h_d, offset_dim=h_size)
+            v_buf = buf_mgr.get_slice("b", bs, n_kv * h_d, offset_dim=h_size * 2)
             
-            q = q.view(bs, 1, n_h, h_d).contiguous(); k = k.view(bs, 1, n_kv, h_d).contiguous(); v = v.view(bs, 1, n_kv, h_d).contiguous()
+            self._q_op(h_norm, out=q_buf); self._k_op(h_norm, out=k_buf); self._v_op(h_norm, out=v_buf)
+            
+            q = q_buf.view(bs, 1, n_h, h_d).contiguous(); k = k_buf.view(bs, 1, n_kv, h_d).contiguous(); v = v_buf.view(bs, 1, n_kv, h_d).contiguous()
             q, k = rotary(positions, q, k)
             
+            # --- 3. PAGED ATTENTION (RE-USE BUFFER A) ---
             from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
             from vllm.kernels.triton.paged_attention import paged_attention_v1
             reshape_and_cache(k.view(-1, n_kv, h_d).contiguous(), v.view(-1, n_kv, h_d).contiguous(), kv_cache[0], kv_cache[1], attn_metadata.slot_mapping, "auto")
             
-            paged_attention_v1(attn_out_3d, q.view(bs, n_h, h_d).contiguous(), kv_cache[0], kv_cache[1], n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, kv_cache[0].shape[1], 4096, None, "auto")
+            # Re-use Buffer A (offset 0) for attention output
+            attn_out = buf_mgr.get_slice_3d("a", bs, n_h, h_d, offset_dim=0)
+            paged_attention_v1(attn_out, q.view(bs, n_h, h_d).contiguous(), kv_cache[0], kv_cache[1], n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, kv_cache[0].shape[1], 4096, None, "auto")
             
-            hidden_states = hidden_states + self._o_op(attn_out_3d.view(bs, -1).contiguous()).view(hidden_states.shape)
-            h_flat = hidden_states.view(-1, hidden_states.shape[-1]); h_norm_post = F.rms_norm(h_flat, (h_flat.shape[-1],), post_w, eps)
-            gate = self._gate_op(h_norm_post); up = self._up_op(h_norm_post)
-            mlp_out = self._down_op((F.silu(gate) * up).contiguous())
+            # --- 4. OUTPUT PROJECTION & RESIDUAL ---
+            hidden_states = hidden_states + self._o_op(attn_out.view(bs, -1).contiguous()).view(hidden_states.shape)
+            
+            # --- 5. MLP STAGE ---
+            h_norm_post = buf_mgr.get_slice("a", bs, h_size, offset_dim=0) # Re-use Buffer A
+            lite_rmsnorm(hidden_states.view(-1, h_size), post_w, eps, out=h_norm_post)
+            
+            gate_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=0) # Re-use Buffer B
+            up_buf = buf_mgr.get_slice("b", bs, i_size, offset_dim=i_size)
+            
+            self._gate_op(h_norm_post, out=gate_buf); self._up_op(h_norm_post, out=up_buf)
+            
+            # Final result computed from Buffer B results
+            mlp_out = self._down_op((F.silu(gate_buf) * up_buf).contiguous())
             return hidden_states + mlp_out.view(hidden_states.shape)
+            
         self._fast_forward = _fast_forward
 
 class Qwen2Model(nn.Module):

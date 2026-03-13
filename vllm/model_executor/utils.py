@@ -5,8 +5,8 @@ from typing import Dict, Any, Optional
 
 class LiteBufferManager:
     """
-    Static Buffer Manager for LitevLLM.
-    Handles 3D slices for Attention and 2D slices for MLP.
+    Production-grade Static Buffer Manager.
+    Pre-allocates based on the LARGEST expected dimension (MLP intermediate size).
     """
     _instance = None
     
@@ -16,27 +16,26 @@ class LiteBufferManager:
             cls._instance._initialized = False
         return cls._instance
 
-    def init_pool(self, max_batch: int = 32, max_hidden: int = 8192, device: str = "cuda"):
+    def init_pool(self, max_batch: int = 32, max_hidden: int = 8192, max_intermediate: int = 32768, device: str = "cuda"):
         if self._initialized: return
-        # Pre-allocate large buffers
-        self.raw_hidden_a = torch.zeros((max_batch, max_hidden), device=device, dtype=torch.float16)
-        self.raw_hidden_b = torch.zeros((max_batch, max_hidden), device=device, dtype=torch.float16)
-        self.raw_fused_act = torch.zeros((max_batch, max_hidden * 4), device=device, dtype=torch.float16)
+        self.max_batch = max_batch
         
-        # Touch
-        self.raw_hidden_a.zero_(); self.raw_hidden_b.zero_(); self.raw_fused_act.zero_()
+        # Buffer A: Primary (used for Norm outputs and attention results)
+        self.raw_a = torch.zeros((max_batch, max_intermediate), device=device, dtype=torch.float16)
+        # Buffer B: Secondary (used for parallel MLP Gate/Up projections)
+        # Size must handle 2 * intermediate_size for non-overlapping Gate/Up
+        self.raw_b = torch.zeros((max_batch, max_intermediate * 2), device=device, dtype=torch.float16)
+        
+        self.raw_a.zero_(); self.raw_b.zero_()
         self._initialized = True
-        print(f"LiteBufferManager: Static pool ready (BS={max_batch}, H={max_hidden})")
+        print(f"LiteBufferManager: Production pool ready (BS={max_batch}, MaxDim={max_intermediate})")
 
-    def get_hidden_3d(self, bs: int, n_h: int, h_d: int):
-        """Returns [bs, n_h, h_d] slice."""
-        return self.raw_hidden_a[:bs, :n_h * h_d].view(bs, n_h, h_d)
+    def get_slice(self, buffer_id: str, bs: int, dim: int, offset_dim: int = 0):
+        base = self.raw_a if buffer_id == "a" else self.raw_b
+        return base[:bs, offset_dim : offset_dim + dim]
 
-    def get_hidden_2d(self, bs: int, dim: int):
-        return self.raw_hidden_b[:bs, :dim]
-
-    def get_fused_act(self, bs: int, dim: int):
-        return self.raw_fused_act[:bs, :dim]
+    def get_slice_3d(self, buffer_id: str, bs: int, n_h: int, h_d: int, offset_dim: int = 0):
+        return self.get_slice(buffer_id, bs, n_h * h_d, offset_dim).view(bs, n_h, h_d)
 
 def set_weight_attrs(weight: torch.Tensor, weight_attrs: Dict[str, Any]) -> None:
     for key, value in weight_attrs.items():
