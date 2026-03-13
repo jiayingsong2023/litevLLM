@@ -9,7 +9,7 @@ def clear_gguf_cache():
     _GLOBAL_WEIGHT_CACHE.clear()
 
 class GGUFConfig(QuantizationConfig):
-    def __init__(self, prefer_fused: bool = False):
+    def __init__(self, prefer_fused: bool = True):
         super().__init__()
         self.pack_factor = 1
         self.prefer_fused = prefer_fused
@@ -27,16 +27,15 @@ class GGUFConfig(QuantizationConfig):
         if weight is None:
             qweight = getattr(layer, "qweight", None)
             if qweight is None:
-                # Fallback to standard linear if normal weight exists
                 if hasattr(layer, "weight") and layer.weight is not None and layer.weight.numel() > 1:
                     return torch.nn.functional.linear(x, layer.weight, layer.bias)
                 raise RuntimeError(f"GGUF weight not ready for layer '{getattr(layer, 'prefix', '<unknown>')}'")
             
-            # Wrap with our balanced GGUFWeight
+            # Use our GPU-native GGUFWeight wrapper
             weight = GGUFWeight(
                 qweight, 
                 getattr(layer, "scales", torch.ones(1, device=qweight.device)), 
-                getattr(layer, "gguf_quant_type", None),
+                getattr(layer, "gguf_quant_type", 2), # Default to Q4_0
                 prefer_fused=self.prefer_fused
             )
             layer._quant_weight = weight
@@ -45,8 +44,9 @@ class GGUFConfig(QuantizationConfig):
 
     def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
         for name, loaded_weight in weights_iter:
+            # We store as raw bytes (uint8) for our Triton kernels
             if "weight" in name: 
-                layer.qweight = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+                layer.qweight = nn.Parameter(loaded_weight.view(torch.uint8).contiguous(), requires_grad=False)
             elif "scales" in name: 
                 layer.scales = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
             elif "bias" in name: 

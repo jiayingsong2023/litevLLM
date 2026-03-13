@@ -6,6 +6,7 @@ import os
 from typing import Optional, List, Any, Tuple
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
+from vllm.model_executor.utils import LiteBufferManager
 from .lite_config import LiteConfig
 
 class Qwen2DecoderLayer(nn.Module):
@@ -26,76 +27,54 @@ class Qwen2DecoderLayer(nn.Module):
 
     def forward(self, x, positions, kv_cache, attn_metadata):
         if hasattr(self, "_fast_forward"): return self._fast_forward(x, positions, kv_cache, attn_metadata)
-        h = self.input_layernorm(x)
-        q = self.q_proj(h); k = self.k_proj(h); v = self.v_proj(h)
-        bs, seq = q.shape[:2]
-        q, k = self.rotary_emb(positions, q.view(bs,seq,self.num_heads,-1), k.view(bs,seq,self.num_kv_heads,-1))
-        return self.o_proj(q.reshape(bs,seq,-1)) + x
+        h = self.input_layernorm(x); q = self.q_proj(h); return self.o_proj(q) + x
 
     def compile_fast_dispatch(self):
         from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm
-        from vllm.model_executor.layers.quantization.gguf_kernels import ggml_mul_mat_a8_fallback
-        
-        TILE_AWQ = 1024; TILE_GGUF = 1152 # 36 blocks of 32
+        from vllm.kernels.triton.gguf_tiled_fused_gemm import gguf_fused_gemm
+        buf_mgr = LiteBufferManager()
+        buf_mgr.init_pool(max_batch=32, max_hidden=self.config.hidden_size, device="cuda")
 
-        def _get_tiles(proj):
+        def _get_op(proj):
             q_type, d = proj.get_fast_data()
-            if q_type == "fp16": return "fp16", d[0]
-            
-            tiles = []
-            if q_type == "awq":
-                qw, sc, qz, gs = d
-                for s in range(0, proj.input_size, TILE_AWQ):
-                    e = min(s + TILE_AWQ, proj.input_size)
-                    tiles.append((qw[:, s//8:e//8].contiguous(), sc[:, s//gs:e//gs].contiguous(), qz[:, s//gs//8:e//gs//8+1].contiguous() if qz is not None else None, gs, s, e))
-                return "awq", tiles
-            
-            if q_type == "gguf":
-                qw, sc, qt, pref = d
-                for s in range(0, proj.input_size, TILE_GGUF):
-                    e = min(s + TILE_GGUF, proj.input_size)
-                    # GGUF Q4_0: 18 bytes per 32 weights
-                    qw_t = qw[:, (s//32)*18 : (e//32)*18].contiguous()
-                    tiles.append((qw_t, sc, qt, proj.output_size, s, e))
-                return "gguf", tiles
-            return "fp16", d[0]
+            if q_type == "awq": return lambda x, out=None: awq_fused_gemm(x, *d, out=out)
+            if q_type == "gguf": return lambda x, out=None: gguf_fused_gemm(x, d[0], out=out)
+            return lambda x, out=None: F.linear(x, d[0], out=out)
 
-        q_t_type, q_t = _get_tiles(self.q_proj); k_t_type, k_t = _get_tiles(self.k_proj); v_t_type, v_t = _get_tiles(self.v_proj)
-        g_t_type, g_t = _get_tiles(self.gate_proj); u_t_type, u_t = _get_tiles(self.up_proj)
-        o_type, o_d = self.o_proj.get_fast_data(); d_type, d_d = self.down_proj.get_fast_data()
+        self._q_op = _get_op(self.q_proj); self._k_op = _get_op(self.k_proj); self._v_op = _get_op(self.v_proj)
+        self._o_op = _get_op(self.o_proj); self._gate_op = _get_op(self.gate_proj); self._up_op = _get_op(self.up_proj); self._down_op = _get_op(self.down_proj)
         in_w = self.input_layernorm.weight; post_w = self.post_attention_layernorm.weight; eps = self.input_layernorm.variance_epsilon
         rotary = self.rotary_emb; n_h = self.num_heads; n_kv = self.num_kv_heads; h_d = self.head_dim; scale = self.scale
-
-        def _run_op(x, t_type, tiles):
-            if t_type == "fp16": return F.linear(x, tiles)
-            if t_type == "awq": return sum(awq_fused_gemm(x[:, t[4]:t[5]].contiguous(), *t[:4]) for t in tiles)
-            if t_type == "gguf": return sum(ggml_mul_mat_a8_fallback(t[0], x[:, t[4]:t[5]].contiguous(), t[2], t[3]) for t in tiles)
-            return 0
 
         @torch.inference_mode()
         def _fast_forward(hidden_states, positions, kv_cache, attn_metadata):
             bs = hidden_states.shape[0]; h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            h_norm = F.rms_norm(h_flat, (h_flat.shape[-1],), in_w, eps)
             
-            q = _run_op(h_norm, q_t_type, q_t); k = _run_op(h_norm, k_t_type, k_t); v = _run_op(h_norm, v_t_type, v_t)
+            # Static Buffers
+            q_buf_2d = buf_mgr.get_fused_act(bs, n_h * h_d)
+            k_buf_2d = buf_mgr.get_hidden_2d(bs, n_kv * h_d)
+            v_buf_2d = buf_mgr.raw_hidden_b[bs:bs*2, :n_kv * h_d] # Offset slice
+            attn_out_3d = buf_mgr.get_hidden_3d(bs, n_h, h_d)
+            
+            h_norm = F.rms_norm(h_flat, (h_flat.shape[-1],), in_w, eps)
+            q = self._q_op(h_norm, out=q_buf_2d)
+            k = self._k_op(h_norm, out=k_buf_2d)
+            v = self._v_op(h_norm, out=v_buf_2d)
+            
             q = q.view(bs, 1, n_h, h_d).contiguous(); k = k.view(bs, 1, n_kv, h_d).contiguous(); v = v.view(bs, 1, n_kv, h_d).contiguous()
             q, k = rotary(positions, q, k)
             
             from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
             from vllm.kernels.triton.paged_attention import paged_attention_v1
             reshape_and_cache(k.view(-1, n_kv, h_d).contiguous(), v.view(-1, n_kv, h_d).contiguous(), kv_cache[0], kv_cache[1], attn_metadata.slot_mapping, "auto")
-            attn_in = torch.empty((bs, n_h, h_d), device=q.device, dtype=q.dtype)
-            paged_attention_v1(attn_in, q.view(bs, n_h, h_d).contiguous(), kv_cache[0], kv_cache[1], n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, kv_cache[0].shape[1], 4096, None, "auto")
             
-            # Output & MLP
-            attn_out = _run_op(attn_in.view(bs, -1).contiguous(), o_type, o_d if o_type=="fp16" else [(*o_d, 0, attn_in.view(bs,-1).shape[-1])])
-            hidden_states = hidden_states + attn_out.view(hidden_states.shape)
-            h_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            h_norm_post = F.rms_norm(h_flat, (h_flat.shape[-1],), post_w, eps)
-            gate = _run_op(h_norm_post, g_t_type, g_t); up = _run_op(h_norm_post, u_t_type, u_t)
-            mlp_out = _run_op((F.silu(gate) * up).contiguous(), d_type, d_d if d_type=="fp16" else [(*d_d, 0, gate.shape[-1])])
+            paged_attention_v1(attn_out_3d, q.view(bs, n_h, h_d).contiguous(), kv_cache[0], kv_cache[1], n_kv, scale, attn_metadata.block_tables, attn_metadata.seq_lens, kv_cache[0].shape[1], 4096, None, "auto")
+            
+            hidden_states = hidden_states + self._o_op(attn_out_3d.view(bs, -1).contiguous()).view(hidden_states.shape)
+            h_flat = hidden_states.view(-1, hidden_states.shape[-1]); h_norm_post = F.rms_norm(h_flat, (h_flat.shape[-1],), post_w, eps)
+            gate = self._gate_op(h_norm_post); up = self._up_op(h_norm_post)
+            mlp_out = self._down_op((F.silu(gate) * up).contiguous())
             return hidden_states + mlp_out.view(hidden_states.shape)
-            
         self._fast_forward = _fast_forward
 
 class Qwen2Model(nn.Module):
