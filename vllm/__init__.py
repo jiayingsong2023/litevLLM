@@ -13,4 +13,10 @@ from vllm.pooling_params import PoolingParams
 from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.entrypoints.llm import LLM
 
-__all__ = ["SamplingParams", "PoolingParams", "TextPrompt", "TokensPrompt", "LLM"]
+def clear_cache():
+    """Clears global Triton weight caches."""
+    from vllm.model_executor.layers.quantization.tensor import _GLOBAL_WEIGHT_CACHE
+    _GLOBAL_WEIGHT_CACHE.clear()
+    import torch; torch.cuda.empty_cache()
+
+__all__ = ["SamplingParams", "PoolingParams", "TextPrompt", "TokensPrompt", "LLM", "clear_cache"]

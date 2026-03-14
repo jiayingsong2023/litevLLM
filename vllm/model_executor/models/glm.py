@@ -21,9 +21,43 @@ class GLMAttention(nn.Module):
         self.query_key_value = LiteLinear(config.hidden_size, (self.num_heads + 2 * self.num_kv_heads) * self.head_dim, bias=True, quant_config=quant_config, prefix=f"{prefix}.self_attn.query_key_value")
         self.dense = LiteLinear(self.num_heads * self.head_dim, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.dense")
 
-    def forward(self, x):
+    def forward(self, x, kv_cache, attn_metadata):
         qkv = self.query_key_value(x)
-        return self.dense(x)
+        bs, seq, _ = x.shape
+        n_tokens = bs * seq
+        # GLM architecture: qkv splitting
+        q = qkv[..., :self.num_heads * self.head_dim]
+        k = qkv[..., self.num_heads * self.head_dim : (self.num_heads + self.num_kv_heads) * self.head_dim]
+        v = qkv[..., (self.num_heads + self.num_kv_heads) * self.head_dim :]
+        
+        k_cache, v_cache = kv_cache
+        from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
+        from vllm.kernels.triton.paged_attention import paged_attention_v1
+        
+        # Mapping to KV cache
+        slot_mapping = attn_metadata["slot_mapping"]
+        reshape_and_cache(k.view(-1, self.num_kv_heads, self.head_dim), 
+                          v.view(-1, self.num_kv_heads, self.head_dim), 
+                          k_cache, v_cache, slot_mapping, "auto")
+        
+        attn_out = torch.empty((n_tokens, self.num_heads, self.head_dim), device=q.device, dtype=q.dtype)
+        block_tables = attn_metadata["block_tables"]
+        seq_lens = attn_metadata["seq_lens"]
+
+        if seq > 1:
+            end_pos = seq_lens[0].item()
+            start_pos = end_pos - seq
+            seq_lens_ext = torch.arange(start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32)
+            block_tables_ext = block_tables.expand(seq, -1).contiguous()
+            paged_attention_v1(attn_out, q.view(n_tokens, self.num_heads, self.head_dim).contiguous(), 
+                              k_cache, v_cache, self.num_kv_heads, self.head_dim**-0.5, 
+                              block_tables_ext, seq_lens_ext, 16, 4096, None, "auto")
+        else:
+            paged_attention_v1(attn_out, q.view(n_tokens, self.num_heads, self.head_dim).contiguous(), 
+                              k_cache, v_cache, self.num_kv_heads, self.head_dim**-0.5, 
+                              block_tables, seq_lens, 16, 4096, None, "auto")
+        
+        return self.dense(attn_out.view(bs, seq, -1))
 
 class GLMDecoderLayer(nn.Module):
     def __init__(self, config: LiteConfig, quant_config, prefix=""):
@@ -40,7 +74,8 @@ class GLMDecoderLayer(nn.Module):
     def forward(self, hidden_states, positions, kv_cache, attn_metadata, lora_mapping=None):
         if hasattr(self, "_fast_forward") and self._fast_forward is not None:
             return self._fast_forward(hidden_states, positions, kv_cache, attn_metadata)
-        h = self.input_layernorm(hidden_states); attn_out = self.self_attn(h)
+        h = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(h, kv_cache, attn_metadata)
         hidden_states = hidden_states + attn_out; h = self.post_attention_layernorm(hidden_states)
         gate_up = self.mlp.gate_up_proj(h); gate, up = gate_up.chunk(2, dim=-1)
         return hidden_states + self.mlp.down_proj(F.silu(gate) * up)

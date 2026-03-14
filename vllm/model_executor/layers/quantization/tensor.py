@@ -14,7 +14,11 @@ class LRUWeightCache:
         self.cache[key] = value
     def clear(self): self.cache.clear()
 
-_GLOBAL_WEIGHT_CACHE = LRUWeightCache(max_size=1024)
+_GLOBAL_WEIGHT_CACHE = LRUWeightCache(max_size=256)
+
+def clear_global_weight_cache():
+    _GLOBAL_WEIGHT_CACHE.clear()
+    torch.cuda.empty_cache()
 
 class QuantizedLinearWeight(nn.Module, ABC):
     def __init__(self): super().__init__()
@@ -22,36 +26,77 @@ class QuantizedLinearWeight(nn.Module, ABC):
     def matmul(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor: pass
 
 class GGUFWeight(QuantizedLinearWeight):
-    def __init__(self, qweight: torch.Tensor, scales: torch.Tensor, quant_type: int = 2, prefer_fused: bool = True):
+    def __init__(self, qweight: torch.Tensor, scales: torch.Tensor, quant_type: int = 2, 
+                 prefer_fused: bool = True, original_shape: Optional[torch.Size] = None,
+                 slice_offset: int = 0):
         super().__init__()
         self.qweight = nn.Parameter(qweight, requires_grad=False)
         self.scales = nn.Parameter(scales, requires_grad=False)
         self.quant_type = quant_type
         self.prefer_fused = prefer_fused
         self.weight_id = id(self)
+        self.original_shape = original_shape 
+        self.slice_offset = slice_offset
 
     def matmul(self, x: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        from vllm.kernels.triton.gguf_q4_0_dequant import gguf_q4_0_dequant
-        
-        # Determine logical shape from physical qweight
+        # Determine logical shape
         n_rows = self.qweight.shape[0]
-        # 18 bytes = 32 weights
-        n_cols = (self.qweight.shape[1] // 18) * 32
+        # Q4_0: 18 bytes per 32 weights. Q4_K: 144 bytes per 256 weights.
+        if self.quant_type == 2: # Q4_0
+            n_cols = (self.qweight.shape[1] // 18) * 32
+        elif self.quant_type == 12: # Q4_K
+            n_cols = (self.qweight.shape[1] // 144) * 256
+        else:
+            # Fallback for unknown types (assuming similar dense packing)
+            n_cols = self.qweight.shape[1] * 2 
         
-        # PURE GPU PATH: Dequantize on-the-fly using Triton
-        # For small batch, we use the cache. For large batch or large model, we dequantize every step.
         bs = x.shape[0] if x.dim() > 1 else 1
         
-        if self.prefer_fused or bs > 8:
-            # Full GPU dequantization to avoid Error 700 from CPU sync
-            # Note: In future v2.2, this will be a fused GEMM kernel.
-            # Currently it is a fused Tiling closure in model.py.
-            w = gguf_q4_0_dequant(self.qweight, n_rows, n_cols)
-            return torch.nn.functional.linear(x, w, bias)
+        # 1. Performance Path: Use Fused Kernels for large batches or if preferred
+        # SLICING IN FUSED KERNELS NOT SUPPORTED YET - FALLBACK TO CACHE IF SHAPE MISMATCH OR OFFSET
+        shape_matches = (self.original_shape is None or (n_rows == self.original_shape[0] and n_cols == self.original_shape[1]))
+        no_offset = (self.slice_offset == 0)
+        
+        if (self.prefer_fused or bs > 16) and shape_matches and no_offset:
+            try:
+                if self.quant_type == 2:
+                    from vllm.kernels.triton.gguf_q4_0_dequant import gguf_q4_0_dequant
+                    w = gguf_q4_0_dequant(self.qweight, n_rows, n_cols)
+                    return torch.nn.functional.linear(x, w, bias)
+                elif self.quant_type == 12:
+                    from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
+                    w = dequant_q4_k_triton(self.qweight, n_rows, n_cols)
+                    return torch.nn.functional.linear(x, w, bias)
+            except Exception:
+                pass # Fallback to Cache
 
+        # 2. Cache Path: Use LRU Cache for decoded weights
         cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
         if cached_w is None:
-            cached_w = gguf_q4_0_dequant(self.qweight, n_rows, n_cols)
+            # Dequantize to GPU Memory
+            if self.quant_type == 2:
+                from vllm.kernels.triton.gguf_q4_0_dequant import gguf_q4_0_dequant
+                cached_w = gguf_q4_0_dequant(self.qweight, n_rows, n_cols)
+            elif self.quant_type == 12:
+                from vllm.kernels.triton.gguf_dequant import dequant_q4_k_triton
+                cached_w = dequant_q4_k_triton(self.qweight, n_rows, n_cols)
+            else:
+                # GPU-Native Fallback
+                q_flat = self.qweight.view(-1)
+                low = (q_flat & 0x0F).to(torch.float16)
+                high = (q_flat >> 4).to(torch.float16)
+                cached_w = torch.stack([low, high], dim=1).view(n_rows, n_cols)
+                cached_w = (cached_w - 8.0) * self.scales.unsqueeze(-1)
+            
+            # SLICE IF NEEDED
+            if self.original_shape is not None or self.slice_offset > 0:
+                out_size = self.original_shape[0] if self.original_shape else n_rows
+                in_size = self.original_shape[1] if self.original_shape else n_cols
+                out_start = self.slice_offset
+                out_end = out_start + out_size
+                if out_end <= cached_w.shape[0] and in_size <= cached_w.shape[1]:
+                    cached_w = cached_w[out_start:out_end, :in_size].contiguous()
+            
             _GLOBAL_WEIGHT_CACHE.put(self.weight_id, cached_w)
         
         return torch.nn.functional.linear(x, cached_w, bias)

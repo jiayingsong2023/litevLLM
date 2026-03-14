@@ -14,6 +14,10 @@ class RMSNorm(nn.Module):
         # AUTO-DEVICE ALIGNMENT
         if self.weight.device != x.device:
             self.weight.data = self.weight.to(x.device)
+        
+        # In rare cases, residual might have device mismatch during mock tests
+        if residual is not None and residual.device != x.device:
+            residual = residual.to(x.device)
             
         input_dtype = x.dtype
         x_fp32 = x.to(torch.float32)

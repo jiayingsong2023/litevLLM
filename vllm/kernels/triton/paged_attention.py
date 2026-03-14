@@ -82,10 +82,10 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_kv_heads, scale, 
     
     s_k = key_cache.stride(); s_v = value_cache.stride()
     if len(s_k) == 5:
-        stride_k_block, stride_k_head, stride_k_dim, stride_k_token, stride_k_x = s_k
+        stride_k_block, stride_k_token, stride_k_head, stride_k_dim, stride_k_x = s_k
         kv_x = key_cache.shape[-1]
     else:
-        stride_k_block, stride_k_head, stride_k_dim, stride_k_token = s_k
+        stride_k_block, stride_k_token, stride_k_head, stride_k_dim = s_k
         stride_k_x = 1; kv_x = 1
         
     grid = (num_seqs * num_heads,)
@@ -99,7 +99,7 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_kv_heads, scale, 
         out.stride(0), out.stride(1), out.stride(2),
         query.stride(0), query.stride(1), query.stride(2),
         stride_k_block, stride_k_head, stride_k_dim, stride_k_token, stride_k_x,
-        s_v[0], s_v[1], s_v[2], s_v[3],
+        s_v[0], s_v[2], s_v[3], s_v[1], # Stride V: block, head, dim, token
         block_tables.stride(0), block_tables.stride(1), seq_lens.stride(0),
         k_scale, v_scale, 
         IS_FP8=is_fp8, IS_CACHED=is_cached, BLOCK_D=head_size, BLOCK_N=block_size, KV_X=kv_x

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
-from typing import AsyncGenerator, List, Optional, Union
+from typing import AsyncGenerator, List, Optional, Union, Any
 from vllm.config import VllmConfig
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -42,8 +42,8 @@ class AsyncLLM(EngineClient):
                 print(f"!!! AsyncLLM Loop Error: {e}")
             
             # Crucial: Allow the event loop to switch context
-            # Increased sleep slightly to prevent event loop starvation
-            await asyncio.sleep(0.01) 
+            # Use 0 to yield control without fixed delay
+            await asyncio.sleep(0) 
 
     def _ensure_loop(self):
         if not self._loop_running:
@@ -55,10 +55,12 @@ class AsyncLLM(EngineClient):
         prompt: str,
         sampling_params: SamplingParams,
         request_id: str,
+        lora_request: Optional[Any] = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
         self._ensure_loop()
-        self.engine.add_request(request_id, prompt, sampling_params)
+        lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
+        self.engine.add_request(request_id, prompt, sampling_params, lora_id=lora_id)
         
         # Stream results back to API
         async for output in self.engine.get_request_stream(request_id):

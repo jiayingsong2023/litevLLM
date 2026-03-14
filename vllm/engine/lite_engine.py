@@ -64,23 +64,28 @@ class LiteEngine:
         self.num_layers = self.model_config.get_num_layers(None)
         self.max_model_len = min(self.model_config.get_max_model_len(), 4096)
         
-        # 3. Pre-allocate Contiguous KV Cache
+        # 3. Pre-allocate Block-based KV Cache (Fix for AMD Illegal Memory Access)
+        self.block_size = 16
         self.max_active_requests = self.execution_policy.max_active_requests
+        self.num_blocks_per_seq = self.max_model_len // self.block_size
+        self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
+        
         self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
         if self.kv_dtype_str == "1":
-            print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [DEFAULT]")
+            print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = torch.float8_e4m3fn
         else:
+            print(f">>>> LiteEngine: KV Cache using FP16 [STABLE]")
             self.kv_dtype = torch.float16
             
-        print(f">>>> LiteEngine: Allocating KV Cache ({self.max_active_requests} slots, {self.max_model_len} ctx, {self.num_layers} layers, dtype={self.kv_dtype})")
+        print(f">>>> LiteEngine: Allocating KV Cache ({self.max_active_requests} slots, {self.max_model_len} ctx, {self.num_layers} layers [16-token blocks], dtype={self.kv_dtype})")
         
         self.kv_caches = []
         for _ in range(self.num_layers):
-            # Shape: (MaxBatch, MaxLen, Heads, HeadDim)
-            k = torch.zeros((self.max_active_requests, self.max_model_len, self.num_kv_heads, self.head_size), 
+            # Shape: (num_total_blocks, block_size, heads, head_size)
+            k = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
                           device=self.device, dtype=self.kv_dtype)
-            v = torch.zeros((self.max_active_requests, self.max_model_len, self.num_kv_heads, self.head_size), 
+            v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         
@@ -90,7 +95,7 @@ class LiteEngine:
         self._request_slots: Dict[str, int] = {} # Map req_id -> slot_idx
         self._request_streams: Dict[str, asyncio.Queue] = {}
 
-    def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams):
+    def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id: Optional[str] = None):
         if not self._free_slots:
             # Simple rejection if full. In real engine, we'd queue.
             print(f"!!! LiteEngine: Max capacity reached ({self.max_active_requests}), rejecting {request_id}")
@@ -111,7 +116,8 @@ class LiteEngine:
             "prompt": prompt,
             "slot_idx": slot_idx,
             "seq_len": 0, # Current length in KV cache
-            "is_prefill": True
+            "is_prefill": True,
+            "lora_id": lora_id
         }
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
@@ -172,16 +178,25 @@ class LiteEngine:
             
             is_last_chunk = (processed_len + this_chunk_len >= len(all_input_ids))
             
+            # Physical block indices for this slot
+            start_block = slot_idx * self.num_blocks_per_seq
+            block_table = torch.arange(start_block, start_block + self.num_blocks_per_seq, device=self.device, dtype=torch.int32)
+            
+            # Map logical positions to physical tokens
+            slot_mapping = slot_idx * self.max_model_len + torch.arange(processed_len, processed_len + this_chunk_len, device=self.device, dtype=torch.long)
+
             attn_metadata = {
-                "slot_mapping": torch.tensor([slot_idx], device=self.device, dtype=torch.long),
+                "slot_mapping": slot_mapping,
                 "seq_lens": torch.tensor([processed_len + this_chunk_len], device=self.device, dtype=torch.int32),
                 "is_prefill": True,
-                "kv_start_indices": torch.tensor([processed_len], device=self.device, dtype=torch.int32)
+                "kv_start_indices": torch.tensor([processed_len], device=self.device, dtype=torch.int32),
+                "block_tables": block_table.unsqueeze(0),
             }
             positions = torch.arange(processed_len, processed_len + this_chunk_len, device=self.device).unsqueeze(0)
             
             try:
-                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata)
+                lora_id = req.get("lora_id")
+                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_id)
                 
                 if is_last_chunk:
                     # Finally generate the first token
@@ -218,15 +233,27 @@ class LiteEngine:
             curr_input = torch.tensor(input_tokens, device=self.device) # (B, 1)
             positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1) # (B, 1)
             
+            # Generate block tables for batch
+            batch_block_tables = []
+            for S in slot_indices:
+                start_block = S * self.num_blocks_per_seq
+                batch_block_tables.append(torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32))
+            block_tables = torch.stack(batch_block_tables).to(self.device)
+
+            # slot_mapping maps batch tokens to physical indices
+            slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
+
             attn_metadata = {
-                "slot_mapping": torch.tensor(slot_indices, device=self.device, dtype=torch.long),
+                "slot_mapping": slot_mapping,
                 "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
+                "block_tables": block_tables,
                 "is_prefill": False,
                 "kv_start_indices": torch.tensor(pos_indices, device=self.device, dtype=torch.int32) # Write at pos
             }
             
             try:
-                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata)
+                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
+                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
                 # logits: (B, 1, Vocab)
                 next_tokens = torch.argmax(logits[:, -1, :], dim=-1).tolist()
                 

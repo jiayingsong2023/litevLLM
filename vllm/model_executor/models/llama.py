@@ -49,7 +49,7 @@ class LlamaDecoderLayer(nn.Module):
 
     def _standard_forward(self, x, positions, kv_cache, attn_metadata, lora_mapping=None):
         h = self.input_layernorm(x)
-        q = self.self_attn.q_proj(h); k = self.self_attn.k_proj(h); v = self.self_attn.v_proj(h)
+        q = self.self_attn.q_proj(h, lora_mapping); k = self.self_attn.k_proj(h, lora_mapping); v = self.self_attn.v_proj(h, lora_mapping)
         bs, seq = q.shape[:2]
         q = q.view(bs, seq, self.self_attn.num_heads, self.self_attn.head_dim); k = k.view(bs, seq, self.self_attn.num_kv_heads, self.self_attn.head_dim); v = v.view(bs, seq, self.self_attn.num_kv_heads, self.self_attn.head_dim)
         q, k = self.rotary_emb(positions, q, k)
@@ -59,13 +59,26 @@ class LlamaDecoderLayer(nn.Module):
             from vllm.kernels.triton.paged_attention import paged_attention_v1
             k_cache, v_cache = kv_cache
             reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, slot_mapping, "auto")
+            
             attn_in = torch.empty((bs * seq, self.self_attn.num_heads, self.self_attn.head_dim), device=q.device, dtype=q.dtype)
-            paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_kv_heads, self.self_attn.scale, getattr(attn_metadata, "block_tables", None), getattr(attn_metadata, "seq_lens", None), k_cache.shape[1], 4096, None, "auto", None, None)
+            block_tables = attn_metadata.get("block_tables", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "block_tables", None)
+            seq_lens = attn_metadata.get("seq_lens", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "seq_lens", None)
+            is_prefill = attn_metadata.get("is_prefill", False) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "is_prefill", False)
+            
+            # CRITICAL: For chunked prefill (seq > 1), we must expand metadata for the kernel
+            if seq > 1 and is_prefill:
+                end_pos = seq_lens[0].item()
+                start_pos = end_pos - seq
+                seq_lens_ext = torch.arange(start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32)
+                block_tables_ext = block_tables.expand(seq, -1).contiguous()
+                paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_kv_heads, self.self_attn.scale, block_tables_ext, seq_lens_ext, k_cache.shape[1], 4096, None, "auto", None, None)
+            else:
+                paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_kv_heads, self.self_attn.scale, block_tables, seq_lens, k_cache.shape[1], 4096, None, "auto", None, None)
             out = attn_in.view(bs, seq, -1)
         else: out = q.view(bs, seq, -1)
-        hidden_states = x + self.self_attn.o_proj(out)
-        h = self.post_attention_layernorm(hidden_states); gate = self.mlp.gate_proj(h); up = self.mlp.up_proj(h)
-        return hidden_states + self.mlp.down_proj(F.silu(gate) * up)
+        hidden_states = x + self.self_attn.o_proj(out, lora_mapping)
+        h = self.post_attention_layernorm(hidden_states); gate = self.mlp.gate_proj(h, lora_mapping); up = self.mlp.up_proj(h, lora_mapping)
+        return hidden_states + self.mlp.down_proj(F.silu(gate) * up, lora_mapping)
 
     def compile_fast_dispatch(self):
         self._fast_forward = None
@@ -78,10 +91,10 @@ class LlamaModel(nn.Module):
         # Fix: ensure prefix join is clean (no model..layers)
         self.layers = nn.ModuleList([LlamaDecoderLayer(self.config, quant_config, f"{prefix}.layers.{i}") for i in range(self.config.num_hidden_layers)])
         self.norm = RMSNorm(self.config.hidden_size, eps=_get_eps(self.config))
-    def forward(self, input_ids, positions, kv_caches, attn_metadata):
+    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
         if input_ids.dtype == torch.long: x = self.embed_tokens(input_ids)
         else: x = input_ids
-        for i in range(len(self.layers)): x = self.layers[i](x, positions, kv_caches[i], attn_metadata)
+        for i in range(len(self.layers)): x = self.layers[i](x, positions, kv_caches[i], attn_metadata, lora_mapping)
         return self.norm(x)
 
 class LlamaForCausalLM(nn.Module):
@@ -90,5 +103,5 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(vllm_config.model_config.hf_config, vllm_config.quant_config, "model")
         self.lm_head = LiteLinear(self.model.config.hidden_size, self.model.config.vocab_size, bias=False, prefix="lm_head")
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
-        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
-        return self.lm_head(hidden_states[:, -1:, :])
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping)
+        return self.lm_head(hidden_states[:, -1:, :], lora_mapping)

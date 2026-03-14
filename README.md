@@ -3,23 +3,25 @@
 `FastInference` (vLLM Lite) 是一个将 vLLM 核心代码物理精简至 **81,000 行** 的极致单卡推理引擎。它完全移除了分布式复杂性、C++ 依赖和冗余架构，专注于 **纯 Python + Triton** 的单 GPU 性能巅峰。
 
 ## 🚀 核心成就 (v2.0 Performance Milestones)
-在 v2.0 版本中，我们通过重构核心调度器与显存管理，实现了性能与稳定性的双重突破：
+在 v2.0 版本中，我们针对 AMD AI Max (gfx1151) 进行了架构级深度优化，实现了全链路真实负载下的高性能与极致稳定性：
 
-- **极致吞吐量 (AMD Strix Point 60GB 真实权重 + BS=32 实测)**:
-  - **Qwen3.5-35B-MoE**: 🚀 **113.80 tokens/sec** (FP8 Expert Cache + Continuous Batching, 较 v1.0 提升 **32倍**).
-  - **TinyLlama-1.1B (Dense)**: **536.22 tokens/sec** (Stable at 4096 Context).
-  - **Qwen3.5-9B (GGUF)**: **155.15 tokens/sec** (含动态维度对齐保护).
-  - **DeepSeek-V2-Lite**: **82.87 tokens/sec** (MLA 混合路径 + FP8 专家).
+- **端到端性能实测 (AMD AI Max+395 60.75GB - 真实权重负载)**:
+  | 模型 (Real Weights) | 配置 | 吞吐量 (Aggregate TPS) | 状态 |
+  | :--- | :--- | :--- | :--- |
+  | **TinyLlama-1.1B** | BS=8, 2048ctx | **185.45** | ✅ [STABLE] |
+  | **DeepSeek-V2-Lite** | BS=8, 2048ctx | **128.73** | ✅ [REAL MLA/MoE] |
+  | **GLM-4.7-Flash** | BS=8, 2048ctx | **78.87** | ✅ [FULL 47-LAYER] |
+  | **Qwen3.5-9B (GGUF)** | BS=8, 2048ctx | **50.20** | ✅ [STABLE] |
+  | **Qwen3.5-35B-MoE** | BS=1, 1024ctx | **31.11** | ✅ [HIGH MEM ADAPT] |
 
-- **长文本能力 (4096 Context 深度加固)**:
-  - **稳定性突破**: 通过 **分块异步写入** 与 **显式 CUDA 同步锁**，彻底解决了 AMD GPU 在长序列下的 `hipErrorIllegalAddress` 崩溃问题。
-  - **Chunked Prefill**: 实现了长 Prompt 的自动切片处理，大幅降低多并发下的 TTFT（首字延迟）。
+- **硬件稳定性突破 (AMD Hardware Guard)**:
+  - **Metadata Expansion**: 针对并行预填充阶段实现了元数据展开，确保 PagedAttention 核函数在处理 Chunked Prefill 时具备精准的物理偏移索引。
+  - **Block-based KV Cache**: 将显存布局重构为固定的 **16-token blocks**，彻底解决了 AMD GPU 在处理超长 contiguous 序列时触发的 `hipErrorIllegalAddress` (Illegal Memory Access) 崩溃。
+  - **Aggressive VRAM Policy**: 支持最高 **92%** 的显存预分配策略，并默认启用 **FP8 (E4M3) KV Cache**，使 35B 以上模型能在 60GB 显存内顺畅运行。
 
 - **架构级创新**:
-  - **`True Continuous Batching`**: 重写了 `LiteEngine` 调度器，支持 Prefill 与 Decode 的高效并发流水线。
-  - **`Default FP8 KV Cache`**: 全局默认开启 FP8 量化缓存，显存利用率提升 100%。
-  - **`GGUF-to-FP8 Dequant`**: 权重反量化直转 FP8，规避了中间 FP16 张量导致的显存峰值溢出。
-  - **`Self-Healing ModelLoader`**: 具备自动属性映射与维度校准功能，完美适配非标准导出的 GGUF 权重。
+  - **`Self-Healing ModelLoader`**: 具备自动架构检测功能，能正确识别并同步 DeepSeek/GLM 等非 Llama 架构的层数、专家数与维度信息。
+  - **`GGUF-to-FP8 Dequant`**: 权重加载时即时转存为最优计算格式，大幅降低中间显存峰值。
 
 ## 🌟 核心特性
 - **纯净计算图**: 100% Triton 化的核心算子，完全剥离 C++ 编译依赖。
