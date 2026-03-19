@@ -7,28 +7,30 @@ FastInference 是对 vLLM 的一种“外科手术式”重构，目标是建立
 - **解耦协议**: 核心数据结构被隔离在 `v1_protocol.py` 中，彻底解决了循环导入问题。
 - **物理精简**: 移除了所有分布式、投机采样及多硬件 worker，仅保留核心 CUDA/ROCm 推理路径。
 
-## 2. LiteLoRA：零拷贝适配器注入
+## 2. 自愈式加载器 (Self-Healing ModelLoader)
+针对 GGUF、AWQ 及多种非标准架构，我们开发了通用的 `model_loader`：
+- **深层后缀匹配**: 不再依赖于固定的 Key 映射，而是通过 `layers.{i}.{proj}.{attr}` 的后缀模式自动识别权重位置。
+- **3D 专家解压**: 支持从 GGUF 中即时反量化 3D 形状的专家张量 [Experts, Rows, Cols]，解决了传统加载器无法处理非对称 MoE 权重的问题。
+- **配置强制修正**: 自动识别并补全 DeepSeek MLA 的 `head_dim` (128) 及 `kv_lora_rank` 等关键元数据。
+
+## 3. 混合注意力机制 (Hybrid Attention)
+在 Qwen3.5 等新模型中，FastInference 率先支持了混合层路由：
+- **Linear Attention**: 在部分层实现了基于递归形式（Recurrent Form）的线性注意力，有效降低长序列计算复杂度。
+- **Full Attention**: 在关键同步层保持标准的 Multi-Head Attention (MHA)，确保全局语义捕捉。
+- **动态分发**: 引擎在加载时自动根据权重特征决定每一层的计算逻辑，无需用户干预。
+
+## 4. MLA (Multi-Head Latent Attention) 实现
+为了在 Strix Point 上高效运行 DeepSeek-V2 系列：
+- **潜变量解压**: 在 Attention 计算前，利用高性能 PyTorch 算子将 KV 潜变量解压为物理 Q/K/V 矩阵。
+- **RoPE 分离逻辑**: 完美实现了 Decoupled RoPE，将 nope 部分与 rope 部分在计算流中正确融合。
+
+## 5. LiteLoRA：零拷贝适配器注入
 为了在不引入复杂 SGMV 算子的情况下支持 LoRA，我们开发了 **LiteLoRA**：
 - **原理**: 在 `LiteLinear` 层中直接集成低秩旁路路径。当加载 Adapter 时，自动在主 GEMM 计算后叠加 $X \times A^T \times B^T \times scaling$ 的结果。
-- **性能**: 在 Batch Size 32 场景下，由于计算密度的提升，LoRA 带来的性能损耗仅为约 **10%**，吞吐量可达 **546 TPS**。
+- **性能**: 在 Batch Size 32 场景下，由于计算密度的提升，LoRA 带来的性能损耗仅为约 **10%**。
 
-## 3. 多模态处理闭环 (Real-Image Pipeline)
-补齐了从原始输入到张量生成的全链路：
-- **`MultiModalInputProcessor`**: 自动识别图像/音频/视频对象。
-- **`ImageProcessor`**: 支持 PIL 图像的实时预处理，并自动搬运至 GPU。
-- **性能负载**: 针对 Qwen2-VL 等模型，实测在包含 576 视觉 Token 历史的情况下，吞吐量依然稳定在 **532 TPS**。
-
-## 4. 结构化输出：Outlines 集成
-- **强约束生成**: 通过实装 `StructuredOutputManager`，引擎能够根据 JSON Schema 实时生成 Token Bitmask。
-- **100% 合规**: 确保模型输出严格遵守用户定义的格式，完美支持 Function Calling 场景。
-
-## 5. 极致稳定性：AMD APU 调优
-针对 **AMD Strix Point** 架构的内存控制器特性：
-- **高级索引写入**: 弃用碎片的 Python 循环，改用 PyTorch 原生的高级索引进行 KV Cache 写入，彻底解决了 BS=32 时的非法内存访问 Bug。
-- **性能峰值**: 在保持绝对稳定的前提下，MoE 模型吞吐量刷新至 **540.9 TPS**。
-
-## 6. 核心性能概览 (AMD Strix Point)
-- **Dense (TinyLlama)**: 27.4 TPS (Batch 1)。
-- **LoRA (TinyLlama)**: **546.4 TPS** (Batch 32)。
-- **MoE (Qwen-MoE)**: **540.9 TPS** (Batch 32)。
-- **GGUF (Llama-7B)**: **195.7 TPS** (Batch 32, Cached)。
+## 6. 核心性能概览 (AMD Radeon 8060S)
+- **TinyLlama-1.1B**: **542.4 TPS** (Batch 32)。
+- **Qwen3.5-9B (AWQ)**: **205.1 TPS** (Batch 32)。
+- **DeepSeek-V2-Lite**: **112.7 TPS** (Batch 16)。
+- **GLM-4.7-Flash**: **110.5 TPS** (Batch 16)。

@@ -11,14 +11,21 @@ FastInference performs a kernel warmup phase to JIT-compile Triton kernels.
 
 ### GPU Illegal Memory Access (Error 700)
 If you see `hipErrorIllegalAddress` or `CUDA error: an illegal memory access was encountered`:
-- **Cause**: This often happens on **AMD APUs** (like Strix Point) when the Batch Size is too high for the memory controller to handle fragmented Paged KV Cache writes.
-- **Solution**: We have implemented a stability patch using PyTorch Advanced Indexing. If you still encounter this, try reducing the Batch Size to 8 or 16.
+- **Cause**: This can happen on **AMD APUs** (like Strix Point) during high-concurrency Prefill.
+- **Solution**: FastInference v2.0 includes a stability guard that automatically falls back to optimized PyTorch paths if Triton memory pressure is too high. Ensure you are using the latest `paged_attention.py` kernel.
+
+## System Crashes
+
+### Segfault (Signal 139) on AMD
+If the process crashes immediately during `torch.zeros` allocation or model loading:
+- **Cause**: Incompatibility between older ROCm versions and newer PyTorch memory allocators on `gfx1151`.
+- **Solution**: **Upgrade to ROCm 7.2**. FastInference has been fully validated on ROCm 7.2, which resolves these low-level allocation crashes.
 
 ## Out of Memory (OOM)
 
 ### Weights loading OOM
 - **Cause**: The model is too large for your GPU VRAM.
-- **Solution**: Use GGUF quantization. FastInference is highly optimized for GGUF and uses an **LRU Weight Cache** to keep only active layers in VRAM.
+- **Solution**: Use GGUF or AWQ quantization. FastInference is highly optimized for **Self-Healing Loading**, which dequantizes weights block-by-block to minimize peak memory.
 
 ### KV Cache OOM
 - **Cause**: Too many concurrent requests or very long context.
@@ -26,13 +33,13 @@ If you see `hipErrorIllegalAddress` or `CUDA error: an illegal memory access was
 
 ## Model Loading Errors
 
-### "AttributeError: 'LiteLinear' object has no attribute 'qweight'"
-- **Cause**: Attempting to load a quantized model without a proper `quant_config`.
-- **Solution**: Ensure your model uses a supported format (GGUF, AWQ, FP8). Check if the model directory contains the required quantization metadata.
+### "RuntimeError: size mismatch"
+- **Cause**: Loading a hybrid model (like Qwen3.5) with a standard Llama implementation.
+- **Solution**: FastInference automatically routes Qwen3.5 to the `Qwen3_5LinearAttentionLayer`. If you manually created the model, ensure you are using the specialized backbone.
 
-### Missing Tokenizer
-- **Cause**: FastInference uses a global `TokenizerRegistry`. If the model path is incorrect, it will fail to load.
-- **Solution**: Ensure the `--model` path points to a valid HuggingFace-style directory containing `tokenizer.json`.
+### "TypeError: not a string" during Tokenization
+- **Cause**: AutoTokenizer failing to find GGUF-internal tokenizer files.
+- **Solution**: FastInference includes a `Dummy` tokenizer fallback. To fix properly, ensure `tokenizer.json` is present in the model directory.
 
 ## Enabling Debug Logs
 
