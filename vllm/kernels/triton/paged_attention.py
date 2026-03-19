@@ -6,20 +6,20 @@ import triton.language as tl
 @triton.jit
 def _paged_attention_kernel(
     Out_ptr, Q_ptr, K_ptr, V_ptr, 
-    BlockTables_ptr,  # Optional if IS_CACHED
+    BlockTables_ptr,
     SeqLens_ptr,
-    K_Ptrs_ptr, V_Ptrs_ptr, # Pre-translated physical pointers (int64)
+    K_Ptrs_ptr, V_Ptrs_ptr,
     scale, num_seqs, num_heads, num_kv_heads, head_size: tl.constexpr,
     block_size: tl.constexpr, max_num_blocks_per_seq,
     stride_out_seq, stride_out_head, stride_out_dim,
     stride_q_seq, stride_q_head, stride_q_dim,
-    stride_k_block, stride_k_head, stride_k_dim, stride_k_token, stride_k_x,
-    stride_v_block, stride_v_head, stride_v_dim, stride_v_token,
+    stride_k_block, stride_k_token, stride_k_head, stride_k_dim,
+    stride_v_block, stride_v_token, stride_v_head, stride_v_dim,
     stride_bt_seq, stride_bt_block, stride_sl_seq,
     k_scale, v_scale,
     IS_FP8: tl.constexpr,
-    IS_CACHED: tl.constexpr, # NEW: Skip logic-to-physical translation
-    BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr, KV_X: tl.constexpr,
+    IS_CACHED: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
     seq_idx = pid // num_heads; head_idx = pid % num_heads
@@ -32,15 +32,11 @@ def _paged_attention_kernel(
     m_i = -float('inf'); l_i = 1.0; acc = tl.zeros([BLOCK_D], dtype=tl.float32)
     num_blocks = (seq_len + block_size - 1) // block_size
     
-    # Offsets for internal block data
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D); offs_n_2d = offs_n[:, None]; offs_d_2d = offs_d[None, :]
 
     for i in range(0, num_blocks):
-        # 1. Resolve Physical Block Pointer
         if IS_CACHED:
-            # Load pre-translated base pointer for this block
-            # Layout of K_Ptrs: [num_seqs, max_num_blocks_per_seq]
             k_base_ptr = tl.load(K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(tl.pointer_type(tl.float16))
             v_base_ptr = tl.load(V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(tl.pointer_type(tl.float16))
         else:
@@ -52,8 +48,8 @@ def _paged_attention_kernel(
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
         
-        # 2. Load K (Relative to block base)
-        off_k = kv_head_idx * stride_k_head + (offs_d_2d // KV_X) * stride_k_dim + offs_n_2d * stride_k_token + (offs_d_2d % KV_X) * stride_k_x
+        # New Layout: [Block, Token, Head, Dim]
+        off_k = offs_n_2d * stride_k_token + kv_head_idx * stride_k_head + offs_d_2d * stride_k_dim
         k = tl.load(k_base_ptr + off_k, mask=block_mask[:, None], other=0.0)
         if IS_FP8: k = (k.to(tl.float32) * k_scale)
         
@@ -63,8 +59,7 @@ def _paged_attention_kernel(
         alpha = tl.exp(m_i - m_new); exp_qk = tl.exp(qk - m_new)
         l_curr = tl.sum(exp_qk, axis=0); l_new = alpha * l_i + l_curr
         
-        # 3. Load V (Relative to block base)
-        off_v = kv_head_idx * stride_v_head + offs_d_2d * stride_v_dim + offs_n_2d * stride_v_token
+        off_v = offs_n_2d * stride_v_token + kv_head_idx * stride_v_head + offs_d_2d * stride_v_dim
         v = tl.load(v_base_ptr + off_v, mask=block_mask[:, None], other=0.0)
         if IS_FP8: v = (v.to(tl.float32) * v_scale)
         
@@ -75,34 +70,28 @@ def _paged_attention_kernel(
     off_out = seq_idx * stride_out_seq + head_idx * stride_out_head + tl.arange(0, BLOCK_D) * stride_out_dim
     tl.store(Out_ptr + off_out, out)
 
-def paged_attention_v1(out, query, key_cache, value_cache, num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, **kwargs):
-    num_seqs, num_heads, head_size = query.shape
+def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, **kwargs):
+    num_seqs, _num_heads_check, head_size = query.shape
+    num_kv_heads = kwargs.get("num_kv_heads", num_heads)
     is_fp8 = "fp8" in str(kv_cache_dtype).lower()
     is_cached = k_ptrs is not None
     
     s_k = key_cache.stride(); s_v = value_cache.stride()
-    if len(s_k) == 5:
-        stride_k_block, stride_k_token, stride_k_head, stride_k_dim, stride_k_x = s_k
-        kv_x = key_cache.shape[-1]
-    else:
-        stride_k_block, stride_k_token, stride_k_head, stride_k_dim = s_k
-        stride_k_x = 1; kv_x = 1
-        
     grid = (num_seqs * num_heads,)
     _paged_attention_kernel[grid](
         out, query, key_cache, value_cache, 
-        block_tables if not is_cached else out, # dummy if cached
-        seq_lens,
-        k_ptrs if is_cached else out, # dummy if not
-        v_ptrs if is_cached else out,
-        scale, num_seqs, num_heads, num_kv_heads, head_size, block_size, block_tables.shape[1],
+        block_tables if not is_cached else out, seq_lens,
+        k_ptrs if is_cached else out, v_ptrs if is_cached else out,
+        scale, num_seqs, num_heads, num_kv_heads, head_size, block_size, block_tables.shape[1] if block_tables is not None else 0,
         out.stride(0), out.stride(1), out.stride(2),
         query.stride(0), query.stride(1), query.stride(2),
-        stride_k_block, stride_k_head, stride_k_dim, stride_k_token, stride_k_x,
-        s_v[0], s_v[2], s_v[3], s_v[1], # Stride V: block, head, dim, token
-        block_tables.stride(0), block_tables.stride(1), seq_lens.stride(0),
+        s_k[0], s_k[1], s_k[2], s_k[3],
+        s_v[0], s_v[1], s_v[2], s_v[3],
+        block_tables.stride(0) if block_tables is not None else 0,
+        block_tables.stride(1) if block_tables is not None else 0,
+        seq_lens.stride(0),
         k_scale, v_scale, 
-        IS_FP8=is_fp8, IS_CACHED=is_cached, BLOCK_D=head_size, BLOCK_N=block_size, KV_X=kv_x
+        IS_FP8=is_fp8, IS_CACHED=is_cached, BLOCK_D=head_size, BLOCK_N=block_size
     )
 
 def paged_attention_v2(*args, **kwargs):

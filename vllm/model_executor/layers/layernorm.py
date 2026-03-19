@@ -8,16 +8,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, x, residual=None):
-        if residual is not None: x = x + residual
-        
+    def forward(self, x):
         # AUTO-DEVICE ALIGNMENT
         if self.weight.device != x.device:
             self.weight.data = self.weight.to(x.device)
-        
-        # In rare cases, residual might have device mismatch during mock tests
-        if residual is not None and residual.device != x.device:
-            residual = residual.to(x.device)
             
         input_dtype = x.dtype
         x_fp32 = x.to(torch.float32)

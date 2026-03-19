@@ -31,7 +31,7 @@ def awq_dequantize_kernel(
     
     # Unpack 4-bit
     shift = (offs_n[None, :] % 8) * 4
-    q = (q_packed >> shift) & 0xF
+    q = (q_packed.to(tl.int32) >> shift) & 0xF
     
     # Load scales and zeros
     if GROUP_ALONG_ROW:
@@ -50,11 +50,7 @@ def awq_dequantize_kernel(
     scales = tl.load(ptr_s, mask=mask_s)
     z_packed = tl.load(ptr_z, mask=mask_s)
     z_shift = (group_idx % 8) * 4 if not GROUP_ALONG_ROW else (offs_n[None, :] % 8) * 4
-    # Simplification: if GROUP_ALONG_ROW, zeros are packed along N. 
-    # If not, zeros are packed along the group dimension.
-    # This part is tricky, let's assume symmetric for now if it gets too complex, 
-    # but we try to match the common case.
-    zeros = (z_packed >> z_shift) & 0xF
+    zeros = (z_packed.to(tl.int32) >> z_shift) & 0xF
     
     # Compute
     res = (q.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)

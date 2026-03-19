@@ -26,26 +26,29 @@ class RotaryEmbedding(nn.Module, ABC):
         self.dtype = dtype
         
         self.use_flashinfer = False
-        cache = self._compute_cos_sin_cache()
-        self.register_buffer("cos_sin_cache", cache.to(dtype), persistent=False)
+        cos, sin = self._compute_cos_sin_cache()
+        self.register_buffer("cos_cached", cos.to(dtype), persistent=False)
+        self.register_buffer("sin_cached", sin.to(dtype), persistent=False)
         self.apply_rotary_emb = ApplyRotaryEmb(is_neox_style=self.is_neox_style)
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         inv_freq = 1.0 / (base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim))
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
+    def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        return cos, sin
 
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        # Ensure positions is on same device
+        if positions.device != self.cos_cached.device:
+            positions = positions.to(self.cos_cached.device)
+        cos = self.cos_cached[positions]
+        sin = self.sin_cached[positions]
         return self.apply_rotary_emb.forward_native(query, cos, sin), \
                self.apply_rotary_emb.forward_native(key, cos, sin)
 

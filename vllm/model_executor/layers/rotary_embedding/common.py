@@ -141,17 +141,16 @@ class ApplyRotaryEmb(CustomOp):
         sin = sin.unsqueeze(-2).to(x.dtype)
 
         if is_neox_style:
-            x1, x2 = torch.chunk(x, 2, dim=-1)
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
+            output = torch.cat((o1, o2), dim=-1)
         else:
             x1 = x[..., ::2]
             x2 = x[..., 1::2]
-
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-
-        if is_neox_style:
-            output = torch.cat((o1, o2), dim=-1)
-        else:
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
             output = torch.stack((o1, o2), dim=-1).flatten(-2)
 
         if enable_fp32_compute:

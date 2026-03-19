@@ -14,9 +14,11 @@ class AWQConfig(QuantizationConfig):
     def get_name(self) -> str: return "awq"
 
     def init_layer(self, layer: nn.Module):
-        layer.qweight = None
-        layer.scales = None
-        layer.qzeros = None
+        # Register as parameters with 2D dummy size so they have valid strides
+        # AWQ weights and zeros MUST be integers for bitwise shifts
+        layer.qweight = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
+        layer.scales = nn.Parameter(torch.zeros((1, 1), dtype=torch.float16), requires_grad=False)
+        layer.qzeros = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
         layer._quant_weight = None
 
     def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:

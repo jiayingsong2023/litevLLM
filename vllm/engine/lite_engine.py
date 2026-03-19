@@ -27,6 +27,7 @@ class LiteEngine:
         # 1. Load Model
         print(f">>> LiteEngine: Loading {self.model_config.model}...")
         self.model = get_model(vllm_config=self.vllm_config)
+        print(f">>> LiteEngine: Model Type: {type(self.model)}")
         self.tokenizer = None 
         self.execution_policy = select_loadtime_policy(
             model_config=self.model_config,
@@ -36,30 +37,42 @@ class LiteEngine:
         
         # 2. Extract REAL dimensions from loaded model
         try:
+            # Prefer actual model attributes (set by loader)
+            inner_model = getattr(self.model, "model", self.model)
             first_layer = None
-            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-                first_layer = self.model.model.layers[0]
-            elif hasattr(self.model, "layers"):
-                first_layer = self.model.layers[0]
+            if hasattr(inner_model, "layers") and len(inner_model.layers) > 0:
+                first_layer = inner_model.layers[0]
             
-            if first_layer and hasattr(first_layer, "self_attn"):
-                self.num_kv_heads = first_layer.self_attn.num_kv_heads
-                self.head_size = first_layer.self_attn.head_dim
+            if first_layer:
+                # Standard attributes we set in llama.py / qwen3_5.py
+                self.num_attention_heads = getattr(first_layer, "num_heads", 0)
+                self.num_kv_heads = getattr(first_layer, "num_kv_heads", 0)
+                self.head_size = getattr(first_layer, "head_dim", 0)
                 
-                # FORCE ALIGNMENT TO 8 FOR HARDWARE STABILITY
-                if self.head_size % 8 != 0:
-                    old_hs = self.head_size
-                    self.head_size = (self.head_size + 7) // 8 * 8
-                    print(f">>> LiteEngine: Hard-aligning head_size {old_hs} -> {self.head_size} for stability")
-                
-                print(f">>> LiteEngine: Detected Model Dimensions: {self.num_kv_heads} heads, {self.head_size} head_dim")
-            else:
+                # If not found, try nested self_attn
+                if self.num_attention_heads == 0 and hasattr(first_layer, "self_attn"):
+                    self.num_attention_heads = getattr(first_layer.self_attn, "num_heads", 0)
+                    self.num_kv_heads = getattr(first_layer.self_attn, "num_kv_heads", 0)
+                    self.head_size = getattr(first_layer.self_attn, "head_dim", 0)
+
+            # Fallback to config if model inspection failed
+            if self.num_attention_heads == 0:
                 self.num_kv_heads = self.model_config.get_num_kv_heads(None)
                 self.head_size = self.model_config.get_head_size()
+                self.num_attention_heads = getattr(self.model_config.hf_config, "num_attention_heads", self.num_kv_heads)
+            
+            # FORCE ALIGNMENT TO 8 FOR HARDWARE STABILITY
+            if self.head_size % 8 != 0:
+                old_hs = self.head_size
+                self.head_size = (self.head_size + 7) // 8 * 8
+                print(f">>> LiteEngine: Hard-aligning head_size {old_hs} -> {self.head_size} for stability")
+            
+            print(f">>> LiteEngine: Verified Dimensions: {self.num_attention_heads} Q-heads, {self.num_kv_heads} KV-heads, {self.head_size} head_dim")
         except Exception as e:
             print(f">>> LiteEngine: Dimension detection failed ({e}), using defaults")
             self.num_kv_heads = self.model_config.get_num_kv_heads(None)
             self.head_size = self.model_config.get_head_size()
+            self.num_attention_heads = self.num_kv_heads
 
         self.num_layers = self.model_config.get_num_layers(None)
         self.max_model_len = min(self.model_config.get_max_model_len(), 4096)
@@ -71,23 +84,25 @@ class LiteEngine:
         self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
         
         self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
-        if self.kv_dtype_str == "1":
+        if self.kv_dtype_str == "0":
+            print(f">>>> LiteEngine: KV Cache forced to FP16 for Precision [DEBUG]")
+            self.kv_dtype = torch.float16
+        else:
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = torch.float8_e4m3fn
-        else:
-            print(f">>>> LiteEngine: KV Cache using FP16 [STABLE]")
-            self.kv_dtype = torch.float16
             
-        print(f">>>> LiteEngine: Allocating KV Cache ({self.max_active_requests} slots, {self.max_model_len} ctx, {self.num_layers} layers [16-token blocks], dtype={self.kv_dtype})")
+        print(f">>>> LiteEngine: Allocating KV Cache on {self.device} ({self.max_active_requests} slots, {self.max_model_len} ctx, {self.num_layers} layers [16-token blocks], dtype={self.kv_dtype})")
         
         self.kv_caches = []
-        for _ in range(self.num_layers):
+        for i in range(self.num_layers):
+            print(f"    Allocating layer {i}...")
             # Shape: (num_total_blocks, block_size, heads, head_size)
             k = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
                           device=self.device, dtype=self.kv_dtype)
             v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
+        print(">>>> LiteEngine: KV Cache allocated successfully.")
         
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._running_ids: List[str] = []
