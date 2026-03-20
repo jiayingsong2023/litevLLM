@@ -43,19 +43,52 @@ class GLMAttention(nn.Module):
         attn_out = torch.empty((n_tokens, self.num_heads, self.head_dim), device=q.device, dtype=q.dtype)
         block_tables = attn_metadata["block_tables"]
         seq_lens = attn_metadata["seq_lens"]
+        is_prefill = attn_metadata.get("is_prefill", False)
 
-        if seq > 1:
+        # Use consistent block size with cache layout
+        block_size = k_cache.shape[1]
+
+        if seq > 1 and is_prefill:
+            # Chunked prefill path: expand metadata per token, mirroring Llama behavior.
             end_pos = seq_lens[0].item()
             start_pos = end_pos - seq
             seq_lens_ext = torch.arange(start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32)
             block_tables_ext = block_tables.expand(seq, -1).contiguous()
-            paged_attention_v1(attn_out, q.view(n_tokens, self.num_heads, self.head_dim).contiguous(), 
-                              k_cache, v_cache, self.num_kv_heads, self.head_dim**-0.5, 
-                              block_tables_ext, seq_lens_ext, 16, 4096, None, "auto")
+            paged_attention_v1(
+                attn_out,
+                q.view(n_tokens, self.num_heads, self.head_dim).contiguous(),
+                k_cache,
+                v_cache,
+                self.num_heads,
+                self.head_dim**-0.5,
+                block_tables_ext,
+                seq_lens_ext,
+                block_size,
+                4096,
+                None,
+                "auto",
+                None,
+                None,
+                num_kv_heads=self.num_kv_heads,
+            )
         else:
-            paged_attention_v1(attn_out, q.view(n_tokens, self.num_heads, self.head_dim).contiguous(), 
-                              k_cache, v_cache, self.num_kv_heads, self.head_dim**-0.5, 
-                              block_tables, seq_lens, 16, 4096, None, "auto")
+            paged_attention_v1(
+                attn_out,
+                q.view(n_tokens, self.num_heads, self.head_dim).contiguous(),
+                k_cache,
+                v_cache,
+                self.num_heads,
+                self.head_dim**-0.5,
+                block_tables,
+                seq_lens,
+                block_size,
+                4096,
+                None,
+                "auto",
+                None,
+                None,
+                num_kv_heads=self.num_kv_heads,
+            )
         
         return self.dense(attn_out.view(bs, seq, -1))
 

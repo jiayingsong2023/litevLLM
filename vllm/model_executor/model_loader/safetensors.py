@@ -27,9 +27,26 @@ class SafetensorsAligner:
                     if any(x in hf_key for x in ["weight_shape", "bias_shape", "scale_shape"]): continue
                     
                     tensor = f.get_tensor(hf_key)
-                    clean_key = hf_key.replace("model.language_model.", "").replace("linear_attn.", "self_attn.").replace("full_attn.", "self_attn.")
-                    
                     found = False
+                    # Legacy flat key ...linear_attn.norm -> Qwen3_5RMSNormGated.weight (before linear_attn->self_attn rewrite)
+                    if hf_key.endswith(".linear_attn.norm") and not hf_key.endswith(".linear_attn.norm.weight"):
+                        layer_m = re.search(r"layers\.(\d+)\.", hf_key)
+                        if layer_m:
+                            layer_idx = layer_m.group(1)
+                            for p_name, param in model.named_parameters():
+                                if not p_name.endswith(".linear_attn.norm.weight"):
+                                    continue
+                                if f"layers.{layer_idx}." not in p_name:
+                                    continue
+                                if param.shape == tensor.shape:
+                                    param.data.copy_(tensor)
+                                    found = True
+                                    break
+                    if found:
+                        del tensor
+                        continue
+
+                    clean_key = hf_key.replace("model.language_model.", "").replace("linear_attn.", "self_attn.").replace("full_attn.", "self_attn.")
                     # 1. Module Path Matching
                     for mod_name, module in module_map.items():
                         m_clean = mod_name if not mod_name.startswith("model.") else mod_name[6:]

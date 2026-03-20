@@ -6,7 +6,7 @@ from vllm.engine.async_llm import AsyncLLM
 from vllm.sampling_params import SamplingParams
 from vllm.config import VllmConfig
 
-async def test_async_streaming():
+async def run_async_streaming_demo():
     print("=== STARTING ASYNC STREAMING TEST ===")
     model_path = "models/TinyLlama-1.1B-Chat-v1.0"
     
@@ -51,4 +51,4 @@ async def test_async_streaming():
     engine.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(test_async_streaming())
+    asyncio.run(run_async_streaming_demo())

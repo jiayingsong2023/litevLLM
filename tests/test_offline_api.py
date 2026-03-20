@@ -3,7 +3,7 @@ from vllm import LLM, SamplingParams
 import torch
 import os
 
-def test_model(model_path, name):
+def run_model_smoke(model_path, name):
     print(f"\n>>> TESTING MODEL: {name} ({model_path})")
     try:
         # 1. Initialize
@@ -38,6 +38,6 @@ if __name__ == "__main__":
     
     for path, name in models:
         if os.path.exists(path):
-            test_model(path, name)
+            run_model_smoke(path, name)
         else:
             print(f"Skipping {name}, path not found: {path}")

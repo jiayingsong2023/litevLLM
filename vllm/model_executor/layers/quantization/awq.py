@@ -19,6 +19,9 @@ class AWQConfig(QuantizationConfig):
         layer.qweight = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
         layer.scales = nn.Parameter(torch.zeros((1, 1), dtype=torch.float16), requires_grad=False)
         layer.qzeros = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
+        # Propagate default group size so that layout checks and kernels can use it.
+        if not hasattr(layer, "group_size"):
+            layer.group_size = self.group_size
         layer._quant_weight = None
 
     def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -34,12 +37,27 @@ class AWQConfig(QuantizationConfig):
                     return torch.nn.functional.linear(x, layer.weight, layer.bias)
                 raise RuntimeError(f"AWQ weight not ready for layer '{getattr(layer, 'prefix', '<unknown>')}'")
 
+            # Determine effective group size for this layer
+            effective_group_size = getattr(layer, "group_size", self.group_size)
+
+            # Optional sanity check: ensure packed columns are divisible by group size.
+            try:
+                n_rows, n_cols_packed = qweight.shape
+                n_cols = n_cols_packed * 8
+                if n_cols % effective_group_size != 0:
+                    raise RuntimeError(
+                        f"AWQ group_size={effective_group_size} does not divide "
+                        f"dequantized columns ({n_cols}) for layer '{getattr(layer, 'prefix', '<unknown>')}'"
+                    )
+            except Exception as e:
+                raise RuntimeError(f"AWQ layout check failed for layer '{getattr(layer, 'prefix', '<unknown>')}': {e}")
+
             # Build the wrapper once
             weight = AWQWeight(
                 qweight, 
                 getattr(layer, "scales"), 
                 getattr(layer, "qzeros"),
-                getattr(layer, "group_size", 128)
+                effective_group_size,
             )
             layer._quant_weight = weight
 
@@ -54,4 +72,19 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AWQConfig":
-        return cls()
+        # HF / compressed-tensors often nest group_size under config_groups.*.weights
+        weight_bits = int(config.get("weight_bits", config.get("bits", 4)))
+        group_size = int(config.get("group_size", 128))
+        groups = config.get("config_groups")
+        if isinstance(groups, dict):
+            for g in groups.values():
+                if not isinstance(g, dict):
+                    continue
+                w = g.get("weights")
+                if isinstance(w, dict):
+                    if w.get("group_size") is not None:
+                        group_size = int(w["group_size"])
+                    if w.get("num_bits") is not None:
+                        weight_bits = int(w["num_bits"])
+                    break
+        return cls(weight_bits=weight_bits, group_size=group_size)

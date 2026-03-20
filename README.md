@@ -39,6 +39,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
+> **约定**：本仓库内所有 Python 脚本、pytest 与 `python -m ...` 均应通过 **`uv run`** 执行（见 `.cursor/rules/uv-python.mdc`），勿直接用系统 `python3`/`pip`，以免环境与依赖不一致。
+
 ### 1. 运行语义完整性审计
 ```bash
 # 验证模型精度是否与官方对齐 (1.0000 CosSim)

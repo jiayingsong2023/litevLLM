@@ -29,8 +29,17 @@ class DeepseekV2MoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, seq, h = x.shape
         x_flat = x.view(-1, h)
-        shared_out = self.shared_experts.down_proj(F.silu(self.shared_experts.gate_proj(x)) * self.shared_experts.up_proj(x))
-        if self.experts_gate.numel() == 0: return shared_out
+        shared_out = self.shared_experts.down_proj(
+            F.silu(self.shared_experts.gate_proj(x)) * self.shared_experts.up_proj(x)
+        )
+
+        # If routed experts are not present in this checkpoint, fall back to shared experts only.
+        if (
+            self.experts_gate.numel() == 0
+            or self.experts_up.numel() == 0
+            or self.experts_down.numel() == 0
+        ):
+            return shared_out
         
         router_logits = self.router(x_flat)
         routing_weights = F.softmax(router_logits, dim=-1)
@@ -64,12 +73,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.qk_nope_dim = getattr(config, "qk_nope_head_dim", 64)
         self.qk_rope_dim = getattr(config, "qk_rope_head_dim", 64)
         self.v_head_dim = getattr(config, "v_head_dim", 128)
-        self.q_lora_rank = getattr(config, "q_lora_rank", 768)
+        raw_q_lora_rank = getattr(config, "q_lora_rank", None)
+        self.q_lora_rank = raw_q_lora_rank if raw_q_lora_rank is not None else 0
+        self.use_q_lora = self.q_lora_rank > 0
         self.kv_lora_rank = getattr(config, "kv_lora_rank", 512)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
-        self.q_a_proj = LiteLinear(config.hidden_size, self.q_lora_rank, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_a_proj")
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
-        self.q_b_proj = LiteLinear(self.q_lora_rank, self.num_heads * (self.qk_nope_dim + self.qk_rope_dim), bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_b_proj")
+        if self.use_q_lora:
+            self.q_a_proj = LiteLinear(config.hidden_size, self.q_lora_rank, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_a_proj")
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
+            self.q_b_proj = LiteLinear(self.q_lora_rank, self.num_heads * (self.qk_nope_dim + self.qk_rope_dim), bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_b_proj")
+        else:
+            # Some DeepSeek V2 Lite checkpoints set q_lora_rank to null and use a direct q projection.
+            self.q_proj = LiteLinear(
+                config.hidden_size,
+                self.num_heads * (self.qk_nope_dim + self.qk_rope_dim),
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn.q_proj",
+            )
+            self.q_a_proj = None
+            self.q_a_layernorm = None
+            self.q_b_proj = None
         self.kv_a_proj = LiteLinear(config.hidden_size, self.kv_lora_rank + self.qk_rope_dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.kv_a_proj")
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
         self.kv_b_proj = LiteLinear(self.kv_lora_rank, self.num_heads * (self.qk_nope_dim + self.v_head_dim), bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.kv_b_proj")
@@ -87,7 +111,10 @@ class DeepseekV2DecoderLayer(nn.Module):
     def forward(self, x, positions, kv_cache, attn_metadata):
         h = self.input_layernorm(x)
         bs, seq, _ = h.shape
-        q_full = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(h)))
+        if self.use_q_lora:
+            q_full = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(h)))
+        else:
+            q_full = self.q_proj(h)
         q_nope, q_rope = torch.split(q_full, [self.num_heads * self.qk_nope_dim, self.num_heads * self.qk_rope_dim], dim=-1)
         q_nope = q_nope.view(bs, seq, self.num_heads, self.qk_nope_dim)
         q_rope = q_rope.view(bs, seq, self.num_heads, self.qk_rope_dim)

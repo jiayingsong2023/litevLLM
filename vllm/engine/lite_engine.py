@@ -76,7 +76,25 @@ class LiteEngine:
 
         self.num_layers = self.model_config.get_num_layers(None)
         self.max_model_len = min(self.model_config.get_max_model_len(), 4096)
-        
+
+        # Prefill chunk size: Qwen3.5 hybrid (linear + full attn) must see the full prompt in one
+        # forward for correct hidden-state continuity; sub-layer carries alone cannot fix per-chunk
+        # re-embedding. Override with FASTINFERENCE_LITE_PREFILL_CHUNK (e.g. 512) if VRAM-limited.
+        env_chunk = os.environ.get("FASTINFERENCE_LITE_PREFILL_CHUNK", "").strip()
+        if env_chunk:
+            self._prefill_chunk_size = max(1, int(env_chunk))
+        else:
+            from vllm.model_executor.models.qwen3_5 import (
+                Qwen3_5ForConditionalGeneration,
+            )
+
+            if isinstance(self.model, Qwen3_5ForConditionalGeneration):
+                self._prefill_chunk_size = self.max_model_len
+            else:
+                self._prefill_chunk_size = int(
+                    getattr(self.execution_policy, "chunked_prefill_size", 512)
+                )
+
         # 3. Pre-allocate Block-based KV Cache (Fix for AMD Illegal Memory Access)
         self.block_size = 16
         self.max_active_requests = self.execution_policy.max_active_requests
@@ -103,12 +121,50 @@ class LiteEngine:
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         print(">>>> LiteEngine: KV Cache allocated successfully.")
-        
+
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._running_ids: List[str] = []
         self._free_slots = list(range(self.max_active_requests))
         self._request_slots: Dict[str, int] = {} # Map req_id -> slot_idx
         self._request_streams: Dict[str, asyncio.Queue] = {}
+
+    @property
+    def active_request_count(self) -> int:
+        """Number of in-flight requests (for debugging / test harness guards)."""
+        return len(self._running_ids)
+
+    @staticmethod
+    def _stack_per_layer_carries(
+        req_dicts: List[Dict[str, Any]], num_layers: int, key: str
+    ) -> List[Optional[torch.Tensor]]:
+        """Batch (B, ...) tensors per layer for Qwen3.5 linear-attn streaming state."""
+        stacked: List[Optional[torch.Tensor]] = []
+        for li in range(num_layers):
+            parts = [r[key][li] for r in req_dicts]
+            if all(p is None for p in parts):
+                stacked.append(None)
+            else:
+                if any(p is None for p in parts):
+                    raise RuntimeError(
+                        f"Mixed None/non-None in batched decode for {key}[layer={li}]"
+                    )
+                # Each request stores (1, ...) slices; concatenate batch dim, do not stack
+                # (stack would produce (B, 1, ...) and break Qwen3.5 conv carry cat).
+                stacked.append(torch.cat(parts, dim=0))
+        return stacked
+
+    @staticmethod
+    def _split_per_layer_carries(
+        stacked: List[Optional[torch.Tensor]],
+        req_dicts: List[Dict[str, Any]],
+        key: str,
+    ) -> None:
+        for li, t in enumerate(stacked):
+            for i, r in enumerate(req_dicts):
+                if t is None:
+                    r[key][li] = None
+                else:
+                    r[key][li] = t[i : i + 1].contiguous()
 
     def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id: Optional[str] = None):
         if not self._free_slots:
@@ -124,15 +180,18 @@ class LiteEngine:
         slot_idx = self._free_slots.pop(0)
         
         self._requests[request_id] = {
-            "input_ids": input_ids, 
+            "input_ids": input_ids,
             "generated_ids": [],
             "sampling_params": effective_sampling_params,
             "finished": False,
             "prompt": prompt,
             "slot_idx": slot_idx,
-            "seq_len": 0, # Current length in KV cache
+            "seq_len": 0,  # Current length in KV cache
             "is_prefill": True,
-            "lora_id": lora_id
+            "lora_id": lora_id,
+            # Qwen3.5 linear-attn: recurrent delta-net state + causal conv tail (per layer).
+            "linear_attn_carry": [None] * self.num_layers,
+            "linear_conv_carry": [None] * self.num_layers,
         }
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
@@ -166,7 +225,7 @@ class LiteEngine:
             else: decodes.append(rid)
         
         results = []
-        chunk_size = int(getattr(self.execution_policy, "chunked_prefill_size", 512))
+        chunk_size = self._prefill_chunk_size
 
         # 2. Execute
         # STRATEGY: One Prefill Chunk OR Batch All Decodes
@@ -206,6 +265,8 @@ class LiteEngine:
                 "is_prefill": True,
                 "kv_start_indices": torch.tensor([processed_len], device=self.device, dtype=torch.int32),
                 "block_tables": block_table.unsqueeze(0),
+                "linear_attn_carry": req["linear_attn_carry"],
+                "linear_conv_carry": req["linear_conv_carry"],
             }
             positions = torch.arange(processed_len, processed_len + this_chunk_len, device=self.device).unsqueeze(0)
             
@@ -258,17 +319,34 @@ class LiteEngine:
             # slot_mapping maps batch tokens to physical indices
             slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
 
+            req_dicts = [self._requests[rid] for rid in decodes]
+            attn_carry_batch = self._stack_per_layer_carries(
+                req_dicts, self.num_layers, "linear_attn_carry"
+            )
+            conv_carry_batch = self._stack_per_layer_carries(
+                req_dicts, self.num_layers, "linear_conv_carry"
+            )
             attn_metadata = {
                 "slot_mapping": slot_mapping,
                 "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
                 "block_tables": block_tables,
                 "is_prefill": False,
-                "kv_start_indices": torch.tensor(pos_indices, device=self.device, dtype=torch.int32) # Write at pos
+                "kv_start_indices": torch.tensor(
+                    pos_indices, device=self.device, dtype=torch.int32
+                ),
+                "linear_attn_carry": attn_carry_batch,
+                "linear_conv_carry": conv_carry_batch,
             }
-            
+
             try:
                 lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
                 logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
+                self._split_per_layer_carries(
+                    attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
+                )
+                self._split_per_layer_carries(
+                    attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
+                )
                 # logits: (B, 1, Vocab)
                 next_tokens = torch.argmax(logits[:, -1, :], dim=-1).tolist()
                 

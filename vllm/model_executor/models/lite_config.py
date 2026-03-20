@@ -14,6 +14,11 @@ class LiteConfig:
         self.intermediate_size = getattr(hf_config, "intermediate_size", 11008)
         self.num_attention_heads = getattr(hf_config, "num_attention_heads", 32)
         self.num_key_value_heads = getattr(hf_config, "num_key_value_heads", self.num_attention_heads)
+        # Qwen3.5 / some checkpoints expose explicit head_dim (may differ from hidden/num_heads).
+        _hd = getattr(hf_config, "head_dim", None)
+        if _hd is None:
+            _hd = self.hidden_size // max(1, self.num_attention_heads)
+        self.head_dim = int(_hd)
         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", 32)
         self.vocab_size = getattr(hf_config, "vocab_size", 32000)
         
@@ -31,6 +36,14 @@ class LiteConfig:
         self.kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
         self.qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", None)
         self.v_head_dim = getattr(hf_config, "v_head_dim", None)
+
+        # Qwen3.5 linear-attention (GatedDeltaNet) text config
+        self.linear_num_value_heads = getattr(hf_config, "linear_num_value_heads", 32)
+        self.linear_num_key_heads = getattr(hf_config, "linear_num_key_heads", 16)
+        self.linear_key_head_dim = getattr(hf_config, "linear_key_head_dim", 128)
+        self.linear_value_head_dim = getattr(hf_config, "linear_value_head_dim", 128)
+        self.linear_conv_kernel_dim = getattr(hf_config, "linear_conv_kernel_dim", 4)
+        self.hidden_act = getattr(hf_config, "hidden_act", "silu")
 
     @classmethod
     def from_model_config(cls, model_config: Any) -> "LiteConfig":

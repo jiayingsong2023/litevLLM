@@ -112,7 +112,7 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
-        if model_type in ("qwen2_moe", "qwen3_moe"):
+        if model_type in ("qwen2_moe", "qwen3_moe", "qwen3_5_moe"):
             model_type = model_type.replace("_", "")
             # GGUF layer map assumes that we will have a merged expert weights
             # so we need to map them manually

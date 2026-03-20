@@ -67,20 +67,37 @@ def run_single_benchmark(model_name, layer, config, batch_size, num_layers, devi
     hs = config.hidden_size
     x = torch.randn((batch_size, 1, hs), device=device, dtype=dtype)
     pos = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-    kv = (torch.zeros(1, 16, 32, 64, device=device, dtype=dtype), torch.zeros(1, 16, 32, 64, device=device, dtype=dtype))
-    meta = {"slot_mapping": torch.arange(batch_size, device=device, dtype=torch.int32), "block_tables": torch.zeros(batch_size, 1, device=device, dtype=torch.int32), "seq_lens": torch.ones(batch_size, device=device, dtype=torch.int32)}
+    # Use paged_attention-friendly cache/meta shapes for Llama-like layers.
+    # NOTE: this benchmark does not validate correctness; it only verifies kernels can run end-to-end.
+    block_size = 16
+    max_model_len = 4096
+    num_blocks_per_seq = max_model_len // block_size
+
+    num_kv_heads = getattr(config, "num_key_value_heads", 32)
+    head_dim = hs // max(1, getattr(config, "num_attention_heads", 32))
+
+    # Allocate enough cache blocks to keep slot_mapping/block_tables in bounds.
+    kv = (
+        torch.zeros((num_blocks_per_seq, block_size, num_kv_heads, head_dim), device=device, dtype=dtype),
+        torch.zeros((num_blocks_per_seq, block_size, num_kv_heads, head_dim), device=device, dtype=dtype),
+    )
+    # Map all tokens to physical block 0 (safe in-bounds); attention outputs may be identical across batch,
+    # but runtime safety is what we need for regression.
+    meta = {
+        "slot_mapping": torch.zeros((batch_size,), device=device, dtype=torch.int32),
+        "block_tables": torch.zeros((batch_size, num_blocks_per_seq), device=device, dtype=torch.int32),
+        "seq_lens": torch.ones((batch_size,), device=device, dtype=torch.int32),
+    }
     
     with torch.inference_mode():
         for _ in range(2): 
-            try: layer(x, pos, kv, meta)
-            except: layer(x)
+            layer(x, pos, kv, meta)
     torch.cuda.synchronize()
     
     iters = 10; start = time.perf_counter()
     with torch.inference_mode():
         for _ in range(iters):
-            try: layer(x, pos, kv, meta)
-            except: layer(x)
+            layer(x, pos, kv, meta)
     torch.cuda.synchronize()
     lat_ms = (time.perf_counter() - start) / iters * 1000
     tps = batch_size / ((lat_ms * num_layers) / 1000)
