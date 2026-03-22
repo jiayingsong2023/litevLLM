@@ -1,12 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-LitevLLM Semantic Integrity Verification Suite.
-Compares LitevLLM (Triton/LiteEngine) against Hugging Face (PyTorch) 
-to ensure absolute numerical alignment and semantic correctness.
+LitevLLM Semantic Integrity Verification Suite (Tier A / regression).
+Compares LitevLLM (Triton/LiteEngine) against Hugging Face (PyTorch) on prefill logits
+and greedy tokens. Use this when debugging kernels, loaders (e.g. GGUF), or
+implementation drift.
+
+Product acceptance is better expressed by Tier B (readable completions under normal
+prompts); see docs/INFERENCE_ACCURACY.md and scripts/quality_bar_spotcheck.py. Low CosSim vs an
+FP16 HF baseline does not always mean unusable output for quantized checkpoints, but
+gibberish or HF-normal vs Lite-broken behavior still indicates a bug to fix in the
+Lite path.
+
+Use ``--hf-same-as-lite`` to load the HF reference from the **same** directory as
+``--model`` (e.g. AWQ/GGUF tree). That isolates Lite vs HF *implementation* drift;
+use a separate ``--hf-model`` FP16/BF16 tree only when checking against an unquantized baseline.
 """
 import json
 import torch
 import torch.nn.functional as F
+
+# HF Qwen3.5 reference on CPU: disable flash-linear-attention import so GatedDeltaNet uses
+# torch_chunk_gated_delta_rule (FLA/Triton on CPU tensors raises on ROCm/CUDA builds).
+import transformers.utils.import_utils as _transformers_import_utils
+
+_transformers_import_utils.is_flash_linear_attention_available = lambda: False  # noqa: E731
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, AutoConfig
 from vllm.config import VllmConfig, ModelConfig, CacheConfig, SchedulerConfig, LoadConfig
 from vllm.engine.lite_engine import LiteEngine
@@ -16,9 +34,6 @@ import argparse
 import os
 import sys
 from typing import Any, Callable, List, Optional
-# Debug: check where vllm is loaded from
-import vllm.model_executor.models.llama
-print(f"DEBUG: Loaded vllm.llama from: {vllm.model_executor.models.llama.__file__}")
 
 
 def _lite_engine_step_budget(
@@ -60,6 +75,11 @@ PRESETS = {
         "quant": "none",
     },
     # Qwen 3.5 9B GGUF
+    "qwen35_9b_fp16": {
+        "prompt": "The capital of France is",
+        "max_new_tokens": 10,
+        "quant": "none",
+    },
     "qwen35_9b_gguf": {
         "prompt": "The capital of France is",
         "max_new_tokens": 10,
@@ -186,6 +206,9 @@ def _load_hf_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str):
         torch_dtype=dtype,
         trust_remote_code=True,
     )
+    # Avoid flash-linear-attention / Triton on CPU or mixed-device Qwen3.5 (illegal access on some ROCm setups).
+    if getattr(hf_config, "model_type", "") == "qwen3_5":
+        common["attn_implementation"] = "eager"
     if hf_device == "cpu":
         load_kw = {**common, "low_cpu_mem_usage": True}
         try:
@@ -264,6 +287,19 @@ def run_alignment_test(
     
     print("[1/3] Loading LitevLLM (Python/Triton)...")
     engine = LiteEngine(v_cfg)
+    
+    # [DEBUG] Verify weight loading
+    try:
+        if hasattr(engine.model, "model") and hasattr(engine.model.model, "embed_tokens"):
+            emb = engine.model.model.embed_tokens.weight.data
+            print(f"[DEBUG] embed_tokens.weight[0,:5]: {emb[0,:5].tolist()}")
+            if emb.abs().mean() < 1e-6:
+                print("[WARNING] embed_tokens.weight is all zero!")
+        if hasattr(engine.model, "lm_head"):
+            lmh = engine.model.lm_head.weight.data
+            print(f"[DEBUG] lm_head.weight[0,:5]: {lmh[0,:5].tolist()}")
+    except Exception as e:
+        print(f"[DEBUG] Weight inspection failed: {e}")
     from vllm.model_executor.model_loader import get_tokenizer
 
     # When comparing quantized Lite vs FP16/BF16 baseline, use baseline tokenizer so token ids match HF.
@@ -288,11 +324,19 @@ def run_alignment_test(
         if not no_hf:
             hf_load_path = hf_model_path if hf_model_path else model_path
             dtype = _resolve_hf_torch_dtype(hf_load_path)
-            # Separate baseline on GPU + Lite on GPU causes VRAM pressure and ROCm illegal access; force CPU.
-            if hf_model_path and hf_device != "cpu":
+            # When --hf-model points to a *different* tree than --model (e.g. AWQ Lite vs FP16 HF), keep HF on CPU
+            # to avoid two large models on one GPU (ROCm OOM / illegal access).
+            # When paths are the *same*, HF Transformers may use CUDA-only FLA kernels (chunk_gated_delta_rule);
+            # CPU tensors fail there — allow explicit --hf-device cuda.
+            _hf_differs_from_lite = (
+                hf_model_path is not None
+                and os.path.abspath(os.path.realpath(hf_model_path))
+                != os.path.abspath(os.path.realpath(model_path))
+            )
+            if hf_model_path and hf_device != "cpu" and _hf_differs_from_lite:
                 print(
-                    f"  [Note] With --hf-model, loading HF on {hf_device} alongside Lite on GPU risks "
-                    "OOM / HIP illegal access. Forcing HF to CPU."
+                    f"  [Note] --hf-model is a different directory than --model; loading HF on {hf_device} "
+                    "alongside Lite on GPU risks OOM / HIP illegal access. Forcing HF to CPU."
                 )
                 hf_device = "cpu"
 
@@ -522,12 +566,23 @@ if __name__ == "__main__":
         help="Separate HF/PyTorch baseline directory (e.g. FP16/BF16). Lite still uses --model.",
     )
     parser.add_argument(
+        "--hf-same-as-lite",
+        action="store_true",
+        help=(
+            "Load Hugging Face reference from the same path as --model (same checkpoint/quant). "
+            "Compares Lite vs HF implementations without mixing in a different FP16/BF16 tree. "
+            "If set, --hf-model is ignored."
+        ),
+    )
+    parser.add_argument(
         "--hf-device",
         type=str,
         default=None,
         choices=["auto", "cuda", "cpu"],
         help="Where to load HF reference. Default: cpu if --hf-model is set. "
-        "If --hf-model is set, cuda/auto are forced to cpu (Lite+HF on one GPU risks ROCm illegal access).",
+        "If --hf-model points to a *different* directory than --model, non-cpu choices are forced to cpu "
+        "(VRAM / ROCm safety). If --hf-model is the *same* path as --model, you may use cuda — required "
+        "for Qwen3.5 HF + FLA (chunk_gated_delta_rule) which fails on CPU tensors.",
     )
     parser.add_argument(
         "--activation-audit",
@@ -550,6 +605,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.hf_same_as_lite and args.no_hf:
+        parser.error("--hf-same-as-lite cannot be used with --no-hf")
+
+    effective_hf_model_path: Optional[str] = args.hf_model
+    if args.hf_same_as_lite:
+        effective_hf_model_path = args.model
+        if args.hf_model:
+            print(
+                f"[Config] --hf-same-as-lite: ignoring --hf-model={args.hf_model!r}, "
+                f"HF reference = --model ({args.model!r})"
+            )
+
     # Resolve preset-driven defaults
     preset_cfg = PRESETS.get(args.preset) if args.preset is not None else None
     effective_quant = args.quant
@@ -571,12 +638,18 @@ if __name__ == "__main__":
 
     hf_device = args.hf_device
     if hf_device is None:
-        hf_device = "cpu" if args.hf_model else "auto"
+        hf_device = "cpu" if (args.hf_model or args.hf_same_as_lite) else "auto"
 
     print(
         f"[Config] preset={args.preset}, quant={effective_quant}, "
         f"max_new_tokens={effective_max_new_tokens}, hf_device={hf_device}"
     )
+    if effective_hf_model_path and not args.no_hf:
+        same = os.path.abspath(effective_hf_model_path) == os.path.abspath(args.model)
+        print(
+            f"[Config] HF reference path: {effective_hf_model_path!r} "
+            f"({'same weights as Lite' if same else 'different from --model'})"
+        )
 
     success = run_alignment_test(
         args.model,
@@ -584,7 +657,7 @@ if __name__ == "__main__":
         prompt=effective_prompt,
         max_new_tokens=effective_max_new_tokens,
         no_hf=args.no_hf,
-        hf_model_path=args.hf_model,
+        hf_model_path=effective_hf_model_path,
         hf_device=hf_device,
         activation_audit=args.activation_audit,
         activation_audit_max_passes=args.activation_audit_max_passes,

@@ -1,5 +1,7 @@
 # Tests
 
+日常「续写是否可读」的抽检入口见 **[`docs/INFERENCE_ACCURACY.md`](../docs/INFERENCE_ACCURACY.md)** 与 **`scripts/quality_bar_spotcheck.py`**（不对比 HF）。本目录中的 **`verify_semantic_integrity.py`** 偏 **A 档**（与 HF 数值对比），用于内核与加载器回归；两档关系与命令见该文档 **§1、§5**。
+
 ## 卡住的整模验证进程（`verify_semantic_integrity.py`）
 
 该脚本会加载完整模型 + KV，若路径错误、显存不足或引擎死循环，进程可能长时间占满 CPU/GPU。在**本机**终端执行：

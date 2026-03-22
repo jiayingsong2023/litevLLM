@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+from math import prod
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Union
@@ -21,7 +22,38 @@ from vllm.model_executor.layers.quantization.tensor import (
 
 def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, target_shape: Optional[torch.Size] = None) -> Optional[torch.Tensor]:
     q_type = int(gguf_tensor.tensor_type)
-    if q_type in [0, 1]: return torch.from_numpy(np.array(gguf_tensor.data, copy=True)).to(device=device).to(dtype=dtype)
+    # F32 (0) and F16 (1): row-major bytes match GGUF metadata shape; do NOT view(target_shape)
+    # first — that scrambles layout when GGUF order is the transpose of PyTorch (e.g. embed, Linear).
+    if q_type in [0, 1]:
+        raw = torch.from_numpy(np.array(gguf_tensor.data, copy=True)).to(device=device)
+        tname = str(getattr(gguf_tensor, "name", "") or "")
+        # Depthwise conv1d: GGUF dims may not match PyTorch Conv1d layout; contiguous bytes match HF
+        # when viewed as target_shape [C, 1, K] (see scripts/qwen35_gguf_alignment_audit.py).
+        if "ssm_conv1d.weight" in tname and target_shape is not None and len(target_shape) == 3:
+            if raw.numel() == prod(target_shape):
+                try:
+                    return raw.view(*target_shape).to(dtype=dtype)
+                except Exception:
+                    pass
+        gs = tuple(int(x) for x in gguf_tensor.shape)
+        expected = prod(gs) if gs else 0
+        if gs and raw.numel() == expected:
+            res = raw.view(*gs)
+        else:
+            res = raw
+        res = res.to(dtype=dtype)
+        if res.ndim == 2 and target_shape is not None and len(target_shape) == 2:
+            tr, tc = target_shape[0], target_shape[1]
+            if res.shape == (tr, tc):
+                return res
+            if res.shape == (tc, tr):
+                return res.T.contiguous()
+        if target_shape is not None:
+            try:
+                return res.view(target_shape)
+            except Exception:
+                return res
+        return res
     
     if target_shape is not None:
         if len(target_shape) == 1: R, C = 1, target_shape[0]
@@ -32,24 +64,202 @@ def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, t
             R = 1
             for dim in target_shape[:-1]: R *= dim
     else:
-        # Physical fallback
+        # Physical fallback from GGUF shape (note: GGUF shape is reversed)
         ps = gguf_tensor.shape
         C = ps[0]
         R = 1
         for dim in ps[1:]: R *= dim
 
-    qweight = torch.from_numpy(np.array(gguf_tensor.data, copy=True)).to(device=device)
+    # Universal dequant via gguf library — handles Q4_K, Q6_K, Q5_K, Q8_0, IQ, BF16, etc.
     try:
-        if q_type == 12:
-            from vllm.model_executor.layers.quantization.tensor import dequantize_q4k_pytorch
-            res = dequantize_q4k_pytorch(qweight, R, C)
-            return res.view(target_shape) if target_shape is not None else res
-        if q_type == 14:
-            from vllm.model_executor.layers.quantization.tensor import dequantize_q6k_pytorch
-            res = dequantize_q6k_pytorch(qweight, R, C)
-            return res.view(target_shape) if target_shape is not None else res
-    except: return None
-    return None
+        from gguf import dequantize as gguf_dequantize, GGMLQuantizationType
+        w_np = np.array(gguf_tensor.data, copy=True)
+        dequant_np = gguf_dequantize(w_np, GGMLQuantizationType(q_type))
+        res = torch.from_numpy(np.array(dequant_np, copy=True)).to(device=device, dtype=dtype)
+        # gguf.dequantize returns row-major logical weights, often already [out, in] for Linear
+        # (e.g. token_embd (V,H)) even when GGUF tensor metadata lists the transpose (H,V).
+        # Reshaping to metadata dims would permute elements and destroy alignment vs HF.
+        if target_shape is not None and len(target_shape) == 2:
+            tr, tc = int(target_shape[0]), int(target_shape[1])
+            if res.ndim == 2 and res.numel() == tr * tc:
+                if res.shape == (tr, tc):
+                    return res
+                if res.shape == (tc, tr):
+                    return res.T.contiguous()
+        # Reshape using GGUF metadata when layout is still ambiguous (e.g. flattened).
+        gs = tuple(int(x) for x in gguf_tensor.shape)
+        if len(gs) == 2 and res.numel() == gs[0] * gs[1]:
+            res = res.reshape(gs[0], gs[1])
+        elif len(gs) == 1 and res.numel() == gs[0]:
+            res = res.reshape(gs[0])
+        else:
+            total = R * C
+            if res.numel() >= total:
+                res = res.view(-1)[:total].view(R, C)
+            else:
+                out = torch.zeros(total, device=res.device, dtype=dtype)
+                out[:res.numel()] = res.view(-1)
+                res = out.view(R, C)
+        # Map GGUF 2D layout -> PyTorch [out, in] when target_shape is the transpose.
+        if target_shape is not None and res.ndim == 2 and len(target_shape) == 2:
+            tr, tc = target_shape[0], target_shape[1]
+            if res.shape == (tr, tc):
+                return res
+            if res.shape == (tc, tr):
+                return res.T.contiguous()
+        if target_shape is not None:
+            try:
+                return res.view(target_shape)
+            except Exception:
+                return res
+        return res
+    except Exception as e:
+        print(f"    [Warning] gguf dequant failed for type={q_type}: {e}")
+        return None
+
+def _reorder_v_heads_ggml_to_hf(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_per_k: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """
+    Convert GGML tiled V-head layout back to Hugging Face grouped layout.
+
+    llama.cpp export (_LinearAttentionVReorderBase) maps grouped -> tiled via
+    reshape(..., num_k_heads, num_v_per_k, head_dim) then swap dims (inverse uses
+    reshape(..., num_v_per_k, num_k_heads, head_dim) then swap — not the same as forward).
+    """
+    shape = list(tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    t = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return t.permute(*perm).contiguous().reshape(*shape)
+
+
+def _qwen35_linear_attn_gguf_to_hf(
+    source: torch.Tensor,
+    gguf_tensor_name: str,
+    hf_config: Any,
+) -> torch.Tensor:
+    """
+    Undo GGML V-head tiling for Qwen3.5 linear-attn tensors (see llama.cpp
+    Qwen3_5TextModel / _LinearAttentionVReorderBase).
+    """
+    mt = getattr(hf_config, "model_type", "") or ""
+    if mt not in ("qwen3_5", "qwen3_5_text"):
+        return source
+    num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
+    num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
+    if num_k <= 0 or num_v <= 0 or num_k == num_v:
+        return source
+    head_k_dim = int(getattr(hf_config, "linear_key_head_dim", 0) or 0)
+    head_v_dim = int(getattr(hf_config, "linear_value_head_dim", 0) or 0)
+    if head_k_dim <= 0 or head_v_dim <= 0:
+        return source
+    num_v_per_k = num_v // num_k
+    if num_v_per_k * num_k != num_v:
+        return source
+
+    q_dim = head_k_dim * num_k
+    k_dim = head_k_dim * num_k
+    v_dim = head_v_dim * num_v
+
+    if "attn_qkv.weight" in gguf_tensor_name:
+        if source.shape[0] != q_dim + k_dim + v_dim:
+            return source
+        q = source[:q_dim]
+        k = source[q_dim : q_dim + k_dim]
+        v = source[q_dim + k_dim :]
+        v = _reorder_v_heads_ggml_to_hf(v, 0, num_k, num_v_per_k, head_v_dim)
+        return torch.cat([q, k, v], dim=0)
+    if "attn_gate.weight" in gguf_tensor_name:
+        if source.shape[0] != v_dim:
+            return source
+        return _reorder_v_heads_ggml_to_hf(source, 0, num_k, num_v_per_k, head_v_dim)
+    if "ssm_out.weight" in gguf_tensor_name:
+        return _reorder_v_heads_ggml_to_hf(source, 1, num_k, num_v_per_k, head_v_dim)
+    if "ssm_alpha.weight" in gguf_tensor_name or "ssm_beta.weight" in gguf_tensor_name:
+        if source.shape[0] != num_v:
+            return source
+        return _reorder_v_heads_ggml_to_hf(source, 0, num_k, num_v_per_k, 1)
+    return source
+
+
+def _qwen35_rms_norm_weight_gguf_to_hf(
+    source: torch.Tensor,
+    gguf_tensor_name: str,
+    hf_config: Any,
+) -> torch.Tensor:
+    """
+    llama.cpp Qwen3Next/Qwen3.5 conversion adds +1 to RMSNorm .weight for GGML, except
+    GatedDeltaNet linear_attn.norm (blk.*.ssm_norm.weight). Hugging Face checkpoints store
+    the raw scale without that offset.
+    """
+    mt = getattr(hf_config, "model_type", "") or ""
+    if mt not in ("qwen3_5", "qwen3_5_text"):
+        return source
+    if "norm.weight" not in gguf_tensor_name:
+        return source
+    # HF linear_attn gated norm is not shifted in convert_hf_to_gguf
+    if "ssm_norm.weight" in gguf_tensor_name:
+        return source
+    if "linear_attn.norm" in gguf_tensor_name:
+        return source
+    if source.ndim == 1:
+        return source - 1
+    return source
+
+
+def _qwen35_linear_attn_1d_gguf_to_hf(
+    source: torch.Tensor,
+    hf_config: Any,
+) -> torch.Tensor:
+    """A_log / dt_bias: reorder num_v_heads elements from tiled to grouped."""
+    mt = getattr(hf_config, "model_type", "") or ""
+    if mt not in ("qwen3_5", "qwen3_5_text"):
+        return source
+    num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
+    num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
+    if num_k <= 0 or num_v <= 0 or num_k == num_v:
+        return source
+    num_v_per_k = num_v // num_k
+    if source.ndim != 1 or source.shape[0] != num_v:
+        return source
+    return _reorder_v_heads_ggml_to_hf(source.unsqueeze(-1), 0, num_k, num_v_per_k, 1).squeeze(-1)
+
+
+def _qwen35_conv1d_channels_gguf_to_hf(
+    conv_weight: torch.Tensor,
+    hf_config: Any,
+) -> torch.Tensor:
+    """
+    Reorder V channel block in depthwise conv1d [C, 1, K] along dim 0 (see llama.cpp).
+    """
+    mt = getattr(hf_config, "model_type", "") or ""
+    if mt not in ("qwen3_5", "qwen3_5_text"):
+        return conv_weight
+    num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
+    num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
+    head_k_dim = int(getattr(hf_config, "linear_key_head_dim", 0) or 0)
+    head_v_dim = int(getattr(hf_config, "linear_value_head_dim", 0) or 0)
+    if num_k <= 0 or num_v <= 0 or num_k == num_v or head_k_dim <= 0 or head_v_dim <= 0:
+        return conv_weight
+    num_v_per_k = num_v // num_k
+    qk_channels = head_k_dim * num_k * 2
+    if conv_weight.ndim != 3 or conv_weight.shape[0] < qk_channels + 1:
+        return conv_weight
+    data = conv_weight.squeeze(1)
+    qk_part = data[:qk_channels]
+    v_part = data[qk_channels:]
+    v_part = _reorder_v_heads_ggml_to_hf(v_part, 0, num_k, num_v_per_k, head_v_dim)
+    out = torch.cat([qk_part, v_part], dim=0).unsqueeze(1)
+    return out.contiguous()
+
 
 def _try_load_legacy_flat_linear_attn_norm_from_safetensors(
     p_name: str,
@@ -85,65 +295,209 @@ def _try_load_legacy_flat_linear_attn_norm_from_safetensors(
     return False
 
 
-def _load_param_from_gguf_tensor(param: Any, gguf_tensor: Any, slice_offset: int = 0) -> None:
+def _load_param_from_gguf_tensor(
+    param: Any,
+    gguf_tensor: Any,
+    slice_offset: int = 0,
+    hf_config: Optional[Any] = None,
+) -> None:
     actual_param = param; logical_shape = None
     if isinstance(param, LiteLinear): logical_shape = torch.Size([param.output_size, param.input_size]); actual_param = param.weight
     elif isinstance(param, nn.Module) and hasattr(param, "weight"): actual_param = param.weight
     if not isinstance(actual_param, torch.Tensor) and logical_shape is None: return
     target_shape = logical_shape if logical_shape is not None else actual_param.shape
+    # Use universal dequant via gguf library
     source = _dequantize_gguf_tensor(gguf_tensor, "cpu", torch.float16, target_shape)
     if source is None: return
+
+    tname = str(getattr(gguf_tensor, "name", "") or "")
+    if hf_config is not None and any(
+        x in tname for x in ("attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight", "ssm_beta.weight")
+    ):
+        source = _qwen35_linear_attn_gguf_to_hf(source, tname, hf_config)
+    if hf_config is not None:
+        source = _qwen35_rms_norm_weight_gguf_to_hf(source, tname, hf_config)
+
+    # Special case for ssm_conv1d.weight which is often [kernel, channels] in GGUF
+    # but [channels, 1, kernel] in PyTorch nn.Conv1d(groups=channels)
+    if "ssm_conv1d.weight" in gguf_tensor.name:
+        if source.ndim == 2 and source.shape[0] < source.shape[1]:
+            # [4, 8192] -> [8192, 1, 4]
+            source = source.T.unsqueeze(1)
+        elif source.ndim == 1:
+            # Flattened?
+            pass
+
     if isinstance(param, LiteLinear):
-        if param.weight.numel() == 0 or param.weight.shape != source.shape: param.weight = nn.Parameter(source.to(dtype=torch.float16), requires_grad=False)
-        else: param.weight.data.copy_(source.to(dtype=param.weight.dtype))
-    elif isinstance(actual_param, torch.Tensor):
-        if actual_param.shape == source.shape: actual_param.data.copy_(source)
+        # Module-level load: can replace the Parameter
+        if param.weight.numel() == 0 or param.weight.shape != source.shape:
+            param.weight = nn.Parameter(source.to(dtype=torch.float16), requires_grad=False)
         else:
+            param.weight.data.copy_(source.to(dtype=param.weight.dtype))
+    if isinstance(actual_param, nn.Parameter):
+        # Parameter update
+        if actual_param.numel() == 0:
+            # Resize empty parameter
+            actual_param.data = source.to(dtype=actual_param.dtype)
+            print(f"    [Verify] {gguf_tensor.name} resized to {actual_param.shape}, numel={actual_param.numel()}")
+        elif actual_param.shape == source.shape:
+            actual_param.data.copy_(source)
+        else:
+            # Heuristic mapping (legacy); prefer correct layout from _dequantize_gguf_tensor.
             try:
-                if source.shape[0] == actual_param.shape[1] and source.shape[1] >= actual_param.shape[0]: actual_param.data.copy_(source[:, :actual_param.shape[0]].T)
-                elif source.shape[1] == actual_param.shape[1] and source.shape[0] >= actual_param.shape[0]: actual_param.data.copy_(source[:actual_param.shape[0], :])
-            except: pass
+                o, i = actual_param.shape[0], actual_param.shape[1]
+                if source.ndim == 2 and source.shape == (i, o):
+                    actual_param.data.copy_(source.T.contiguous())
+                elif source.shape[0] == actual_param.shape[1] and source.shape[1] >= actual_param.shape[0]:
+                    actual_param.data.copy_(source[:, :actual_param.shape[0]].T)
+                elif source.shape[1] == actual_param.shape[1] and source.shape[0] >= actual_param.shape[0]:
+                    actual_param.data.copy_(source[:actual_param.shape[0], :])
+            except Exception:
+                pass
+    elif isinstance(actual_param, torch.Tensor):
+        if actual_param.shape == source.shape:
+            actual_param.data.copy_(source)
 
 def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None:
     print(f">>> Mapping GGUF weights from {gguf_file}...")
     reader = gguf.GGUFReader(gguf_file); tensor_map = {t.name: t for t in reader.tensors}
+    # Per-layer only (global tensors loaded once below — avoids N× redundant embed/lm_head writes).
     map_rules = {
-        "token_embd.weight": ["model.embed_tokens.weight"],
-        "output_norm.weight": ["model.norm.weight"],
-        "output.weight": ["lm_head.weight"],
         "blk.{i}.attn_norm.weight": ["model.layers.{i}.input_layernorm.weight"],
         "blk.{i}.ffn_norm.weight": ["model.layers.{i}.post_attention_layernorm.weight"],
+        # Qwen3.5 GGUF uses 'post_attention_norm' instead of 'ffn_norm'
+        "blk.{i}.post_attention_norm.weight": ["model.layers.{i}.post_attention_layernorm.weight"],
+        # DeepSeek V2 MLA layers
         "blk.{i}.attn_q_a.weight": ["model.layers.{i}.self_attn.q_a_proj.weight"],
         "blk.{i}.attn_q_a_norm.weight": ["model.layers.{i}.self_attn.q_a_layernorm.weight"],
         "blk.{i}.attn_q_b.weight": ["model.layers.{i}.self_attn.q_b_proj.weight"],
         "blk.{i}.attn_kv_a_mqa.weight": ["model.layers.{i}.self_attn.kv_a_proj.weight"],
         "blk.{i}.attn_kv_a_norm.weight": ["model.layers.{i}.self_attn.kv_a_layernorm.weight"],
         "blk.{i}.attn_output.weight": ["model.layers.{i}.self_attn.o_proj.weight"],
+        # Qwen3.5 full-attention layers (standard GGUF names)
+        "blk.{i}.attn_q.weight": ["model.layers.{i}.self_attn.q_proj.weight"],
+        "blk.{i}.attn_k.weight": ["model.layers.{i}.self_attn.k_proj.weight"],
+        "blk.{i}.attn_v.weight": ["model.layers.{i}.self_attn.v_proj.weight"],
+        "blk.{i}.attn_q_norm.weight": ["model.layers.{i}.self_attn.q_norm.weight"],
+        "blk.{i}.attn_k_norm.weight": ["model.layers.{i}.self_attn.k_norm.weight"],
+        # Qwen3.5 linear-attention / GatedDeltaNet (SSM-style GGUF names)
+        "blk.{i}.attn_qkv.weight": ["model.layers.{i}.linear_attn.in_proj_qkv.weight"],
+        "blk.{i}.attn_gate.weight": ["model.layers.{i}.linear_attn.in_proj_z.weight"],
+        "blk.{i}.ssm_norm.weight": ["model.layers.{i}.linear_attn.norm.weight"],
+        "blk.{i}.ssm_out.weight": ["model.layers.{i}.linear_attn.out_proj.weight"],
+        "blk.{i}.ssm_alpha.weight": ["model.layers.{i}.linear_attn.in_proj_a.weight"],
+        "blk.{i}.ssm_beta.weight": ["model.layers.{i}.linear_attn.in_proj_b.weight"],
+        # Qwen3.5 legacy HF-style GGUF export
+        "blk.{i}.linear_attn.norm.weight": ["model.layers.{i}.linear_attn.norm.weight"],
+        # Qwen3.5 standard MLP (dense non-MoE layers)
+        "blk.{i}.ffn_gate.weight": ["model.layers.{i}.mlp.gate_proj.weight"],
+        "blk.{i}.ffn_up.weight": ["model.layers.{i}.mlp.up_proj.weight"],
+        "blk.{i}.ffn_down.weight": ["model.layers.{i}.mlp.down_proj.weight"],
+        # MoE
         "blk.{i}.ffn_gate_inp.weight": ["model.layers.{i}.mlp.router.weight"],
         "blk.{i}.ffn_gate_shexp.weight": ["model.layers.{i}.mlp.shared_experts.gate_proj.weight"],
         "blk.{i}.ffn_up_shexp.weight": ["model.layers.{i}.mlp.shared_experts.up_proj.weight"],
         "blk.{i}.ffn_down_shexp.weight": ["model.layers.{i}.mlp.shared_experts.down_proj.weight"],
-        # Qwen3.5 GatedDeltaNet linear layers (HF-style GGUF export)
-        "blk.{i}.linear_attn.norm.weight": ["model.layers.{i}.linear_attn.norm.weight"],
     }
     modules = dict(model.named_modules()); params = dict(model.named_parameters())
-    
-    # Metadata for MoE shapes
-    num_experts = getattr(hf_config, "n_routed_experts", 64)
+
+    # Global tensors (not tied to blk.{i}): load once.
+    global_map = {
+        "token_embd.weight": ["model.embed_tokens.weight"],
+        "output_norm.weight": ["model.norm.weight"],
+        "output.weight": ["lm_head.weight"],
+    }
+    loaded_count = 0
+    for g_key, m_paths in global_map.items():
+        if g_key not in tensor_map:
+            continue
+        for m_path in m_paths:
+            m_base = m_path.rsplit(".", 1)[0] if "." in m_path else m_path
+            if m_base in modules:
+                print(f"    [Load Module] {g_key} -> {m_base}")
+                _load_param_from_gguf_tensor(modules[m_base], tensor_map[g_key], hf_config=hf_config)
+                loaded_count += 1
+                break
+            if m_path in params:
+                print(f"    [Load Param] {g_key} -> {m_path}")
+                _load_param_from_gguf_tensor(params[m_path], tensor_map[g_key], hf_config=hf_config)
+                loaded_count += 1
+                break
+
+    # Metadata for MoE shapes — support both DeepSeek and Qwen naming
+    num_experts = getattr(hf_config, "num_experts",
+                  getattr(hf_config, "n_routed_experts", 64))
     moe_inter = getattr(hf_config, "moe_intermediate_size", 1536)
     hidden = getattr(hf_config, "hidden_size", 2048)
     
     num_layers = getattr(hf_config, "num_hidden_layers", 28)
-    loaded_count = 0
     for i in range(num_layers):
         for g_pat, m_paths in map_rules.items():
             g_key = g_pat.format(i=i)
             if g_key in tensor_map:
                 for m_path in m_paths:
                     target_path = m_path.format(i=i)
-                    if target_path in params: _load_param_from_gguf_tensor(params[target_path], tensor_map[g_key]); loaded_count += 1; break
                     m_base = target_path.rsplit(".", 1)[0] if "." in target_path else target_path
-                    if m_base in modules: _load_param_from_gguf_tensor(modules[m_base], tensor_map[g_key]); loaded_count += 1; break
+                    if m_base in modules:
+                        print(f"    [Load Module] {g_key} -> {m_base}")
+                        _load_param_from_gguf_tensor(modules[m_base], tensor_map[g_key], hf_config=hf_config)
+                        loaded_count += 1
+                        break
+                    elif target_path in params:
+                        print(f"    [Load Param] {g_key} -> {target_path}")
+                        _load_param_from_gguf_tensor(params[target_path], tensor_map[g_key], hf_config=hf_config)
+                        loaded_count += 1
+                        break
+
+        # --- Qwen3.5 special tensors (non-LiteLinear: scalars, biases, conv1d) ---
+
+        # ssm_a -> linear_attn.A_log (1D float32, not quantized)
+        ssm_a_key = f"blk.{i}.ssm_a"
+        a_log_path = f"model.layers.{i}.linear_attn.A_log"
+        if ssm_a_key in tensor_map and a_log_path in params:
+            src = _dequantize_gguf_tensor(tensor_map[ssm_a_key], "cpu", torch.float32,
+                                          target_shape=params[a_log_path].shape)
+            if src is not None:
+                src = _qwen35_linear_attn_1d_gguf_to_hf(src, hf_config)
+                params[a_log_path].data.copy_(src.to(dtype=params[a_log_path].dtype))
+                loaded_count += 1
+
+        # ssm_dt.bias -> linear_attn.dt_bias (1D float32, not quantized)
+        dt_bias_key = f"blk.{i}.ssm_dt.bias"
+        dt_bias_path = f"model.layers.{i}.linear_attn.dt_bias"
+        if dt_bias_key in tensor_map and dt_bias_path in params:
+            src = _dequantize_gguf_tensor(tensor_map[dt_bias_key], "cpu", torch.float32,
+                                          target_shape=params[dt_bias_path].shape)
+            if src is not None:
+                src = _qwen35_linear_attn_1d_gguf_to_hf(src, hf_config)
+                params[dt_bias_path].data.copy_(src.to(dtype=params[dt_bias_path].dtype))
+                loaded_count += 1
+
+        # ssm_conv1d.weight -> linear_attn.conv1d.weight
+        # GGUF stores conv1d as F32, shape metadata is reversed.
+        # PyTorch Conv1d(groups=channels) expects [channels, 1, kernel_size]
+        conv_key = f"blk.{i}.ssm_conv1d.weight"
+        conv_path = f"model.layers.{i}.linear_attn.conv1d.weight"
+        if conv_key in tensor_map and conv_path in params:
+            tgt_param = params[conv_path]
+            gguf_t = tensor_map[conv_key]
+            try:
+                # F32 conv: use same path as audit — raw.view(metadata) can disagree with HF;
+                # view to target [C,1,K] matches safetensors byte order.
+                src_conv = _dequantize_gguf_tensor(
+                    gguf_t,
+                    "cpu",
+                    tgt_param.dtype,
+                    target_shape=tgt_param.shape,
+                )
+                if src_conv is not None and src_conv.shape == tgt_param.shape:
+                    src_conv = _qwen35_conv1d_channels_gguf_to_hf(src_conv, hf_config)
+                    tgt_param.data.copy_(src_conv.to(dtype=tgt_param.dtype))
+                    loaded_count += 1
+                elif src_conv is None:
+                    print(f"    [Warning] Conv1d dequant failed layer {i}")
+            except Exception as e:
+                print(f"    [Warning] Conv1d load failed layer {i}: {e}")
 
         # Legacy GGUF: flat tensor name blk.N.linear_attn.norm -> norm.weight module
         legacy_lin_norm = f"blk.{i}.linear_attn.norm"
@@ -179,6 +533,20 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                         p_name = f"experts_{e_type}"
                         setattr(m_moe, p_name, nn.Parameter(ge, requires_grad=False)); loaded_count += 1
         if i % 4 == 0: gc.collect()
+
+    # Report unmapped GGUF tensors for debugging
+    mapped_prefixes = set()
+    for pat in map_rules:
+        for i in range(num_layers):
+            mapped_prefixes.add(pat.format(i=i))
+    special_prefixes = set()
+    for i in range(num_layers):
+        for sp in ["ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"]:
+            special_prefixes.add(f"blk.{i}.{sp}")
+    all_mapped = mapped_prefixes | special_prefixes | {"token_embd.weight", "output_norm.weight", "output.weight"}
+    unmapped = [n for n in tensor_map if n not in all_mapped]
+    if unmapped:
+        print(f">>> [Info] {len(unmapped)} GGUF tensors not mapped (may be MoE experts or unused): {unmapped[:10]}{'...' if len(unmapped) > 10 else ''}")
     print(f">>> GGUF Weight loading complete. Loaded {loaded_count} parameters.")
 
 
@@ -394,6 +762,20 @@ def _load_safetensors(model: nn.Module, model_path: str):
 
     print(f">>> Safetensors loading complete. Loaded {loaded_count} parameters.")
 
+def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
+    """
+    Match Hugging Face checkpoint dtype from config (e.g. text_config.dtype / torch_dtype).
+    Default float16 for older checkpoints without explicit dtype.
+    """
+    for attr in ("dtype", "torch_dtype"):
+        ds = getattr(hf_config, attr, None)
+        if isinstance(ds, str) and "bfloat16" in ds.lower():
+            return torch.bfloat16
+        if ds is torch.bfloat16:
+            return torch.bfloat16
+    return torch.float16
+
+
 def get_tokenizer(model: Union[str, Any], **kwargs: Any):
     name = model.model if hasattr(model, "model") else model
     if hasattr(model, "trust_remote_code"): kwargs["trust_remote_code"] = model.trust_remote_code
@@ -428,7 +810,13 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
     model = model_cls(vllm_config)
     gguf_files = [f for f in os.listdir(cfg.model) if f.endswith(".gguf")]
-    if gguf_files: _load_gguf_weights(model, os.path.join(cfg.model, gguf_files[0]), cfg.hf_config)
-    else: _load_safetensors(model, cfg.model)
-    print(">>> Moving model to CUDA...")
-    model.to(device="cuda", dtype=torch.float16); return model.eval()
+    if gguf_files:
+        _load_gguf_weights(model, os.path.join(cfg.model, gguf_files[0]), cfg.hf_config)
+        # Match HF text dtype (Qwen3.5 is usually bfloat16); dequant uses fp16/bf16 tensors.
+        target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
+    else:
+        _load_safetensors(model, cfg.model)
+        target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
+    print(f">>> Moving model to CUDA (dtype={target_dtype})...")
+    model.to(device="cuda", dtype=target_dtype)
+    return model.eval()

@@ -9,7 +9,10 @@ class LiteConfig:
     into a unified schema used by LiteDecoderLayer.
     """
     def __init__(self, hf_config: Any):
-        # 1. Base Dimensions
+        self.hf_config = hf_config
+        # Some HF configs set rope_parameters explicitly to null; treat as empty dict.
+        _rp = getattr(hf_config, "rope_parameters", None)
+        self.rope_parameters = _rp if isinstance(_rp, dict) else {}
         self.hidden_size = getattr(hf_config, "hidden_size", 4096)
         self.intermediate_size = getattr(hf_config, "intermediate_size", 11008)
         self.num_attention_heads = getattr(hf_config, "num_attention_heads", 32)
@@ -29,7 +32,14 @@ class LiteConfig:
         # 3. Context & RoPE
         self.max_position_embeddings = getattr(hf_config, "max_position_embeddings", 
                                        getattr(hf_config, "max_model_len", 2048))
-        self.rope_theta = getattr(hf_config, "rope_theta", 10000.0)
+        
+        # Qwen3.5 / Llama3 often hide rope_theta inside rope_parameters dict
+        self.rope_theta = float(getattr(hf_config, "rope_theta", 
+                                 self.rope_parameters.get("rope_theta", 10000.0)))
+        
+        # Qwen3.5 partial rotary
+        self.partial_rotary_factor = getattr(hf_config, "partial_rotary_factor", 
+                                     self.rope_parameters.get("partial_rotary_factor", 1.0))
         
         # 4. Multi-modal / Specialized (DeepSeek/MLA)
         self.q_lora_rank = getattr(hf_config, "q_lora_rank", None)

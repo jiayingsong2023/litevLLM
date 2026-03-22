@@ -26,7 +26,9 @@
 ## 🌟 核心特性
 - **纯净计算图**: 100% Triton 化的核心算子，完全剥离 C++ 编译依赖。
 - **混合加速路径**: Prefill 阶段利用硬件最强 SDPA 内核，Decode 阶段全量回归项目手写高性能 **Triton PagedAttention**。
-- **语义审计系统**: 内置 `verify_semantic_integrity.py` 审计工具，支持与 HuggingFace 官方输出进行 1:1 数值对齐。
+- **双轨质量验收**（详见 [`docs/INFERENCE_ACCURACY.md`](docs/INFERENCE_ACCURACY.md)）：
+  - **主验收（B 档）**：典型 prompt 下续写是否**可读、可理解**——用 `scripts/quality_bar_spotcheck.py` 做固定 prompt 抽检（配合人工判读）。
+  - **回归 / 排障（A 档）**：`tests/verify_semantic_integrity.py` 与 Hugging Face 参考对比 prefill logits / greedy token，用于内核与加载路径调试；量化与 HF 参考不一致时，数值接近度**不等于**产品观感。若输出仍为乱码，应继续修引擎或权重路径，而不是仅降低预期。
 
 ## 🚀 快速开始
 
@@ -41,13 +43,20 @@ uv sync
 
 > **约定**：本仓库内所有 Python 脚本、pytest 与 `python -m ...` 均应通过 **`uv run`** 执行（见 `.cursor/rules/uv-python.mdc`），勿直接用系统 `python3`/`pip`，以免环境与依赖不一致。
 
-### 1. 运行语义完整性审计
+### 1. 观感抽检（B 档，推荐日常入口）
 ```bash
-# 验证模型精度是否与官方对齐 (1.0000 CosSim)
+# 固定 prompt 续写 + 可读性/连贯性粗筛（不对比 HF）
+PYTHONPATH=. uv run python scripts/quality_bar_spotcheck.py \
+  --model models/<YOUR_MODEL> --quant awq|gguf|none --prompt-subset minimal
+```
+
+### 2. 与 HF 数值对比（A 档，内核 / 加载器回归）
+```bash
+# 与 HF 参考对比 prefill / greedy（见 docs/INFERENCE_ACCURACY.md 与 tests/README.md）
 PYTHONPATH=. uv run python tests/verify_semantic_integrity.py --model models/TinyLlama-1.1B-Chat-v1.0 --quant none
 ```
 
-### 2. 运行性能回归测试
+### 3. 运行性能回归测试
 ```bash
 # 执行全量架构的单层吞吐量测试
 PYTHONPATH=. uv run python tests/full_perf_regression.py

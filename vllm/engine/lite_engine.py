@@ -15,6 +15,65 @@ from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
+
+def _sample_token_from_logits(
+    logits_1d: torch.Tensor,
+    sp: SamplingParams,
+    generated_ids: List[int],
+    generator: Optional[torch.Generator],
+) -> int:
+    """
+    Greedy argmax when temperature <= 0; otherwise temperature scaling, optional
+    repetition_penalty, top-k / top-p filtering, then multinomial sampling.
+    """
+    logits = logits_1d.float().clone()
+    rp = float(getattr(sp, "repetition_penalty", 1.0) or 1.0)
+    if rp > 1.0 and generated_ids:
+        for tid in set(int(t) for t in generated_ids):
+            if 0 <= tid < logits.numel():
+                if logits[tid] > 0:
+                    logits[tid] /= rp
+                else:
+                    logits[tid] *= rp
+
+    temp = float(getattr(sp, "temperature", 0.0) or 0.0)
+    if temp <= 1e-6:
+        return int(torch.argmax(logits).item())
+
+    logits = logits / max(temp, 1e-6)
+
+    top_k = int(getattr(sp, "top_k", -1) or -1)
+    if 0 < top_k < logits.numel():
+        k = min(top_k, logits.numel())
+        _, top_idx = torch.topk(logits, k)
+        keep = torch.zeros_like(logits, dtype=torch.bool)
+        keep[top_idx] = True
+        logits = logits.masked_fill(~keep, float("-inf"))
+
+    top_p = float(getattr(sp, "top_p", 1.0) or 1.0)
+    if top_p < 1.0 - 1e-6:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumprobs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_remove = cumprobs > top_p
+        sorted_remove[1:] = sorted_remove[:-1].clone()
+        sorted_remove[0] = False
+        if sorted_remove.all():
+            sorted_remove[:] = True
+            sorted_remove[0] = False
+        removed_idx = sorted_indices[sorted_remove]
+        logits = logits.clone()
+        logits[removed_idx] = float("-inf")
+
+    probs = torch.softmax(logits, dim=-1)
+    psum = probs.sum()
+    if not torch.isfinite(psum) or psum <= 0:
+        return int(torch.argmax(logits_1d.float()).item())
+    if generator is not None:
+        return int(torch.multinomial(probs, 1, generator=generator).item())
+    return int(torch.multinomial(probs, 1).item())
+
+
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
@@ -103,8 +162,17 @@ class LiteEngine:
         
         self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
         if self.kv_dtype_str == "0":
-            print(f">>>> LiteEngine: KV Cache forced to FP16 for Precision [DEBUG]")
-            self.kv_dtype = torch.float16
+            from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+
+            if isinstance(self.model, Qwen3_5ForConditionalGeneration):
+                # Match model activations (bf16) so paged decode aligns with HF; fp16 KV drifts logits.
+                print(
+                    ">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5 + FASTINFERENCE_KV_FP8=0)"
+                )
+                self.kv_dtype = torch.bfloat16
+            else:
+                print(">>>> LiteEngine: KV Cache dtype float16 (FASTINFERENCE_KV_FP8=0)")
+                self.kv_dtype = torch.float16
         else:
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = torch.float8_e4m3fn
@@ -179,6 +247,12 @@ class LiteEngine:
         input_ids = self.tokenizer.encode(prompt)
         slot_idx = self._free_slots.pop(0)
         
+        rng: Optional[torch.Generator] = None
+        seed = getattr(effective_sampling_params, "seed", None)
+        if seed is not None:
+            rng = torch.Generator(device=self.device)
+            rng.manual_seed(int(seed))
+
         self._requests[request_id] = {
             "input_ids": input_ids,
             "generated_ids": [],
@@ -189,6 +263,7 @@ class LiteEngine:
             "seq_len": 0,  # Current length in KV cache
             "is_prefill": True,
             "lora_id": lora_id,
+            "rng": rng,
             # Qwen3.5 linear-attn: recurrent delta-net state + causal conv tail (per layer).
             "linear_attn_carry": [None] * self.num_layers,
             "linear_conv_carry": [None] * self.num_layers,
@@ -275,8 +350,13 @@ class LiteEngine:
                 logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_id)
                 
                 if is_last_chunk:
-                    # Finally generate the first token
-                    next_token = torch.argmax(logits[0, -1, :]).item()
+                    # First generated token: respect SamplingParams (temperature, top_p, etc.)
+                    next_token = _sample_token_from_logits(
+                        logits[0, -1, :],
+                        req["sampling_params"],
+                        req["generated_ids"],
+                        req.get("rng"),
+                    )
                     req["generated_ids"].append(next_token)
                     req["seq_len"] = processed_len + this_chunk_len
                     req["is_prefill"] = False
@@ -347,12 +427,16 @@ class LiteEngine:
                 self._split_per_layer_carries(
                     attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
                 )
-                # logits: (B, 1, Vocab)
-                next_tokens = torch.argmax(logits[:, -1, :], dim=-1).tolist()
-                
+                # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
                 for i, rid in enumerate(decodes):
-                    token = next_tokens[i]
-                    self._requests[rid]["generated_ids"].append(token)
+                    req_i = self._requests[rid]
+                    token = _sample_token_from_logits(
+                        logits[i, -1, :],
+                        req_i["sampling_params"],
+                        req_i["generated_ids"],
+                        req_i.get("rng"),
+                    )
+                    req_i["generated_ids"].append(token)
                     self._requests[rid]["seq_len"] += 1
                     self._process_completion(rid, token, results)
                     

@@ -6,8 +6,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .base import RotaryEmbeddingBase
-from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
+from .base import RotaryEmbedding
 
 @triton.jit
 def _triton_mrope_forward(
@@ -177,11 +176,135 @@ def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.T
     x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
     return x_t
 
-class MRotaryEmbedding(RotaryEmbeddingBase):
+def _apply_interleaved_mrope_hf(
+    freqs: torch.Tensor, mrope_section: list[int]
+) -> torch.Tensor:
+    """Match Hugging Face Qwen3_5TextRotaryEmbedding.apply_interleaved_mrope (text path)."""
+    # freqs: (3, bs, seq_len, head_dim // 2)
+    freqs_t = freqs[0].clone()
+    for dim, offset in enumerate((1, 2), start=1):
+        length = mrope_section[dim] * 3
+        idx = slice(offset, length, 3)
+        freqs_t[..., idx] = freqs[dim, ..., idx]
+    return freqs_t
 
-        Args:
-            positions:
-                [num_tokens,] (text only) or
-                [3, num_tokens] (T/H/W positions with multimodal inputs)
-            query: [num_tokens, num_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
+
+def _apply_rotary_pos_emb_qwen35_hf(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match transformers.models.qwen3_5.modeling_qwen3_5.apply_rotary_pos_emb."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
+
+
+class MRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        mrope_section: list[int],
+        mrope_interleaved: bool = True,
+    ) -> None:
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
+                         is_neox_style, dtype)
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+
+    def _forward_hf_mrope(
+        self,
+        position_ids: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Hugging Face Qwen3_5TextRotaryEmbedding path: position_ids shape (3, batch, seq).
+        query/key are passed as (1, batch*seq, num_heads, head_size) from Qwen3_5FullAttentionLayer.
+        """
+        device = position_ids.device
+        dtype = query.dtype
+        _, batch, seq_len = position_ids.shape
+        n_tok = query.shape[1]
+        if n_tok != batch * seq_len:
+            raise RuntimeError(
+                f"MRoPE: expected n_tokens={batch * seq_len}, got query.shape[1]={n_tok}"
+            )
+
+        dim = self.rotary_dim
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+                / float(dim)
+            )
+        )
+        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(
+            3, position_ids.shape[1], -1, 1
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+        freqs = _apply_interleaved_mrope_hf(freqs, list(self.mrope_section))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=dtype)
+        sin = emb.sin().to(dtype=dtype)
+
+        # (1, B*L, nh, hd) -> (B, nh, L, hd)
+        q_4 = query.squeeze(0).view(batch, seq_len, -1, self.head_size).transpose(1, 2)
+        k_4 = key.squeeze(0).view(batch, seq_len, -1, self.head_size).transpose(1, 2)
+        q_out, k_out = _apply_rotary_pos_emb_qwen35_hf(q_4, k_4, cos, sin, unsqueeze_dim=1)
+        q_out = q_out.transpose(1, 2).reshape(1, n_tok, -1, self.head_size)
+        k_out = k_out.transpose(1, 2).reshape(1, n_tok, -1, self.head_size)
+        return q_out, k_out
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # HF Qwen3.5 text: (3, batch, seq) with identical rows for plain text
+        if positions.ndim == 3 and positions.shape[0] == 3:
+            return self._forward_hf_mrope(positions, query, key)
+
+        if positions.device != self.cos_cached.device:
+            positions = positions.to(self.cos_cached.device)
+        if positions.ndim > 1:
+            positions_flat = positions.view(-1)
+        else:
+            positions_flat = positions
+
+        cos = self.cos_cached[positions_flat]
+        sin = self.sin_cached[positions_flat]
+
+        # Partial RoPE: only rotate first rotary_dim dimensions
+        rd = self.rotary_dim
+        q_rot = query[..., :rd]
+        k_rot = key[..., :rd]
+        q_rest = query[..., rd:]
+        k_rest = key[..., rd:]
+
+        q_rot_out = self.apply_rotary_emb.forward_native(q_rot, cos, sin)
+        k_rot_out = self.apply_rotary_emb.forward_native(k_rot, cos, sin)
+
+        q_out = torch.cat([q_rot_out, q_rest], dim=-1)
+        k_out = torch.cat([k_rot_out, k_rest], dim=-1)
+        return q_out, k_out

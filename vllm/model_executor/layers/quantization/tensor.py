@@ -23,30 +23,41 @@ class LRUWeightCache:
 _GLOBAL_WEIGHT_CACHE = LRUWeightCache(max_size=512)
 
 def dequantize_q4k_pytorch(qweight: torch.Tensor, n_rows: int, n_cols: int) -> torch.Tensor:
+    """Accurate Q4_K dequantization using gguf library reference implementation."""
     try:
-        bytes_per_row = qweight.numel() // n_rows; n_blocks = bytes_per_row // 144
-        qw_view = qweight.view(n_rows, n_blocks, 144)
-        d = qw_view[:, :, 0:2].contiguous().view(torch.float16).to(torch.float32)
-        dmin = qw_view[:, :, 2:4].contiguous().view(torch.float16).to(torch.float32)
-        qs = qw_view[:, :, 16:144]
-        qs_low = (qs & 0x0F).to(torch.float32); qs_high = ((qs >> 4) & 0x0F).to(torch.float32)
-        w_low = qs_low * d - dmin; w_high = qs_high * d - dmin
-        res = torch.stack([w_low, w_high], dim=-1).view(n_rows, n_blocks * 256)
-        if res.shape[1] > n_cols: res = res[:, :n_cols]
-        elif res.shape[1] < n_cols: res = torch.cat([res, torch.zeros((n_rows, n_cols - res.shape[1]), device=res.device, dtype=res.dtype)], dim=1)
-        return res.to(torch.float16)
-    except Exception as e: raise RuntimeError(f"Q4_K Dequant Error: {e} ({qweight.shape}, R:{n_rows}, C:{n_cols})")
+        from gguf import dequantize, GGMLQuantizationType
+        import numpy as np
+        w_np = qweight.cpu().numpy()
+        dequant_np = dequantize(w_np, GGMLQuantizationType.Q4_K)
+        res = torch.from_numpy(np.array(dequant_np, copy=True)).to(device=qweight.device, dtype=torch.float16)
+        # Reshape with safety — gguf.dequantize returns flat or 2D
+        total = n_rows * n_cols
+        if res.numel() >= total:
+            return res.view(-1)[:total].view(n_rows, n_cols)
+        else:
+            out = torch.zeros(total, device=res.device, dtype=res.dtype)
+            out[:res.numel()] = res.view(-1)
+            return out.view(n_rows, n_cols)
+    except Exception as e:
+        raise RuntimeError(f"Q4_K Dequant Error: {e} ({qweight.shape}, R:{n_rows}, C:{n_cols})")
 
 def dequantize_q6k_pytorch(qweight: torch.Tensor, n_rows: int, n_cols: int) -> torch.Tensor:
+    """Accurate Q6_K dequantization using gguf library reference implementation."""
     try:
-        n_blocks = qweight.numel() // (n_rows * 210); qw_view = qweight.view(n_rows, n_blocks, 210)
-        ql = qw_view[:, :, 0:128]; qh = qw_view[:, :, 128:192]; d = qw_view[:, :, 208:210].contiguous().view(torch.float16).to(torch.float32)
-        ql_low = (ql & 0x0F).to(torch.float32); ql_high = ((ql >> 4) & 0x0F).to(torch.float32)
-        res_low = (ql_low - 32.0) * d; res_high = (ql_high - 32.0) * d
-        res = torch.stack([res_low, res_high], dim=-1).view(n_rows, n_blocks * 256)
-        if res.shape[1] > n_cols: res = res[:, :n_cols]
-        return res.to(torch.float16)
-    except Exception as e: raise RuntimeError(f"Q6_K Dequant Error: {e}")
+        from gguf import dequantize, GGMLQuantizationType
+        import numpy as np
+        w_np = qweight.cpu().numpy()
+        dequant_np = dequantize(w_np, GGMLQuantizationType.Q6_K)
+        res = torch.from_numpy(np.array(dequant_np, copy=True)).to(device=qweight.device, dtype=torch.float16)
+        total = n_rows * n_cols
+        if res.numel() >= total:
+            return res.view(-1)[:total].view(n_rows, n_cols)
+        else:
+            out = torch.zeros(total, device=res.device, dtype=res.dtype)
+            out[:res.numel()] = res.view(-1)
+            return out.view(n_rows, n_cols)
+    except Exception as e:
+        raise RuntimeError(f"Q6_K Dequant Error: {e} ({qweight.shape}, R:{n_rows}, C:{n_cols})")
 
 def dequantize_awq_pytorch(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, group_size: int = 128) -> torch.Tensor:
     try:

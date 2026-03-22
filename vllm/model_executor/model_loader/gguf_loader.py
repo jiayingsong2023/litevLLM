@@ -112,26 +112,38 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
-        if model_type in ("qwen2_moe", "qwen3_moe", "qwen3_5_moe"):
-            model_type = model_type.replace("_", "")
-            # GGUF layer map assumes that we will have a merged expert weights
-            # so we need to map them manually
+        if model_type == "qwen3_5":
             for idx in range(config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
-                )
-                sideload_params.append(
-                    re.compile(
-                        f"model\\.layers\\.{idx}"
-                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
-                    )
-                )
+                # Linear Attention Layer Mappings
+                gguf_to_hf_name_map[f"blk.{idx}.attn_norm.weight"] = f"model.layers.{idx}.input_layernorm.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_qkv.weight"] = f"model.layers.{idx}.linear_attn.in_proj_qkv.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_gate.weight"] = f"model.layers.{idx}.linear_attn.in_proj_z.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_out.weight"] = f"model.layers.{idx}.linear_attn.out_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_conv1d.weight"] = f"model.layers.{idx}.linear_attn.conv1d.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = f"model.layers.{idx}.linear_attn.A_log"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = f"model.layers.{idx}.linear_attn.dt_bias"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_alpha.weight"] = f"model.layers.{idx}.linear_attn.in_proj_a.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_beta.weight"] = f"model.layers.{idx}.linear_attn.in_proj_b.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_norm.weight"] = f"model.layers.{idx}.linear_attn.norm.weight"
+                
+                # Full Attention Layer Mappings
+                gguf_to_hf_name_map[f"blk.{idx}.attn_q.weight"] = f"model.layers.{idx}.self_attn.q_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_k.weight"] = f"model.layers.{idx}.self_attn.k_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_v.weight"] = f"model.layers.{idx}.self_attn.v_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_output.weight"] = f"model.layers.{idx}.self_attn.o_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_q_norm.weight"] = f"model.layers.{idx}.self_attn.q_norm.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.attn_k_norm.weight"] = f"model.layers.{idx}.self_attn.k_norm.weight"
+
+                # MLP and Post-Attention Norm (Universal)
+                gguf_to_hf_name_map[f"blk.{idx}.post_attention_norm.weight"] = f"model.layers.{idx}.post_attention_layernorm.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate.weight"] = f"model.layers.{idx}.mlp.gate_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up.weight"] = f"model.layers.{idx}.mlp.up_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down.weight"] = f"model.layers.{idx}.mlp.down_proj.weight"
+            
+            # Global Mappings
+            gguf_to_hf_name_map["token_embd.weight"] = "model.embed_tokens.weight"
+            gguf_to_hf_name_map["output_norm.weight"] = "model.norm.weight"
+            gguf_to_hf_name_map["output.weight"] = "lm_head.weight"
 
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():

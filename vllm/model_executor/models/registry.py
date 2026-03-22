@@ -19,6 +19,8 @@ class _ModelRegistry:
         }
 
     def resolve_model_cls(self, architectures: list, model_config: Any) -> Tuple[Type[nn.Module], str]:
+        if architectures is None:
+            architectures = []
         for arch in architectures:
             if arch in self.models:
                 mod_name, cls_name = self.models[arch]

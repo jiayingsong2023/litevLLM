@@ -41,6 +41,41 @@ If the process crashes immediately during `torch.zeros` allocation or model load
 - **Cause**: AutoTokenizer failing to find GGUF-internal tokenizer files.
 - **Solution**: FastInference includes a `Dummy` tokenizer fallback. To fix properly, ensure `tokenizer.json` is present in the model directory.
 
+## Quality expectations (观感 vs strict HF alignment)
+
+For a practical bar (“outputs look reasonable” vs bit-exact alignment with Hugging Face), see **[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md)** — recommended spot-check prompts and when lowering the strictness is **not** enough.
+
+To run the tier-B spot-check script (Lite-only, fixed prompts): `uv run python scripts/quality_bar_spotcheck.py --model <path> --quant awq|gguf|none` (see INFERENCE_ACCURACY.md).
+
+## Semantic integrity (`tests/verify_semantic_integrity.py`)
+
+### Comparing Lite vs HF with the **same** checkpoint (`--hf-same-as-lite`)
+
+Use this when you want to isolate **implementation** differences (Lite vs Hugging Face) instead of mixing in a separate FP16/BF16 tree:
+
+```bash
+uv run python tests/verify_semantic_integrity.py \
+  --model models/Qwen3.5-9B-AWQ \
+  --preset qwen35_9b_awq \
+  --hf-same-as-lite
+```
+
+- If set, **`--hf-model` is ignored** and the HF reference is loaded from the same path as `--model`.
+- **AWQ / packed checkpoints**: `transformers` may print a load report with **MISSING** / **UNEXPECTED** keys (e.g. `weight_packed` vs `weight`). In that case HF is **not** applying the same tensors as Lite, and prefill CosSim vs HF is **not meaningful** until HF uses a loader that matches the checkpoint format (e.g. the same compressed-tensors / AWQ path the hub expects).
+
+### Comparing Lite vs an unquantized baseline
+
+Use a separate FP16/BF16 directory:
+
+```bash
+uv run python tests/verify_semantic_integrity.py \
+  --model models/Qwen3.5-9B-AWQ \
+  --preset qwen35_9b_awq \
+  --hf-model models/Qwen3.5-9B-FP16
+```
+
+Interpretation: low CosSim here can be **quantization + dtype** vs FP16, not only Lite bugs.
+
 ## Enabling Debug Logs
 
 To see exactly what the Triton kernels and scheduler are doing:

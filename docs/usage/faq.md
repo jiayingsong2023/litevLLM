@@ -27,3 +27,9 @@ A: This is a known hardware constraint when running large batches. We have inclu
 > Q: Can I run multiple LoRA adapters concurrently?
 
 A: Yes. Our **Multi-adapter LiteLoRA** architecture supports routing different tokens in the same batch to different adapters with zero-copy overhead. We have benchmarked this at **663 TPS** with 3 concurrent adapters.
+
+---
+
+> Q: Must inference match Hugging Face logits exactly?
+
+A: **No** for many product use cases. You can aim for **semantically reasonable** outputs (readable, on-topic) instead of strict numerical alignment. See **[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md)** for two-tier expectations, spot-check prompts, and when garbled output still means a bug—not “lower expectations.”
