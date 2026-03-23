@@ -2,12 +2,13 @@
 import asyncio
 import time
 import os
+from collections import Counter
 import torch
 import torch.nn as nn
 import copy
-from typing import Any, AsyncIterator, Dict, List, Optional, Union, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 from vllm.config import VllmConfig
-from vllm.engine.loadtime_policy import select_loadtime_policy
+from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput, CompletionOutput
@@ -16,11 +17,150 @@ from vllm.sampling_params import SamplingParams
 logger = init_logger(__name__)
 
 
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    f8 = getattr(torch, "float8_e4m3fn", None)
+    if f8 is not None and dtype == f8:
+        return 1
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    if dtype == torch.float32:
+        return 4
+    return 2
+
+
+def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
+    ctx = max(floor, int(ctx))
+    return max(block_size, (ctx // block_size) * block_size)
+
+
+def _resolve_kv_max_model_len(
+    model_config: Any,
+    vllm_config: VllmConfig,
+    block_size: int,
+) -> int:
+    """Cap KV / slot stride by model config, scheduler, and optional env."""
+    mc = model_config.get_max_model_len()
+    sched = getattr(vllm_config.scheduler_config, "max_model_len", mc)
+    cap = min(int(mc), int(sched), 4096)
+    env = os.environ.get("FASTINFERENCE_KV_MAX_MODEL_LEN", "").strip()
+    if env:
+        cap = min(cap, max(block_size, int(env)))
+    return _align_kv_ctx_len(cap, block_size)
+
+
+def _resolve_kv_max_active_requests(
+    execution_policy_max: int,
+    vllm_config: VllmConfig,
+) -> int:
+    """Match paged KV pool to scheduler concurrency (and optional env)."""
+    sched_seqs = getattr(vllm_config.scheduler_config, "max_num_seqs", execution_policy_max)
+    out = min(int(execution_policy_max), int(sched_seqs))
+    env = os.environ.get("FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS", "").strip()
+    if env:
+        out = min(out, max(1, int(env)))
+    return max(1, out)
+
+
+def _hf_config_eos_token_ids(hf_config: Optional[Any]) -> List[int]:
+    """`config.json` / `text_config` may list eos_token_id(s) that differ from tokenizer.eos_token_id."""
+    if hf_config is None:
+        return []
+    eos = getattr(hf_config, "eos_token_id", None)
+    if eos is None:
+        return []
+    if isinstance(eos, (list, tuple)):
+        return [int(x) for x in eos]
+    return [int(eos)]
+
+
+def _eos_stop_token_ids_for_sampling(
+    tokenizer: Any,
+    sp: SamplingParams,
+    hf_config: Optional[Any] = None,
+) -> List[int]:
+    """
+    Merge tokenizer EOS, HF config EOS (e.g. Qwen3.5 GGUF: text_config vs tokenizer), and
+    user stop_token_ids so we stop / mask consistently with how the checkpoint was trained.
+    """
+    out: List[int] = []
+    seen: set[int] = set()
+
+    def _add(tid: int) -> None:
+        if tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        if isinstance(eos, (list, tuple)):
+            for x in eos:
+                _add(int(x))
+        else:
+            _add(int(eos))
+    for tid in _hf_config_eos_token_ids(hf_config):
+        _add(tid)
+    for tid in getattr(sp, "stop_token_ids", None) or ():
+        _add(int(tid))
+    return out
+
+
+def _decode_generated_text(tokenizer: Any, token_ids: List[int], sp: SamplingParams) -> str:
+    skip = bool(getattr(sp, "skip_special_tokens", True))
+    spaces = bool(getattr(sp, "spaces_between_special_tokens", True))
+    try:
+        return tokenizer.decode(
+            token_ids,
+            skip_special_tokens=skip,
+            spaces_between_special_tokens=spaces,
+            clean_up_tokenization_spaces=True,
+        )
+    except TypeError:
+        try:
+            return tokenizer.decode(
+                token_ids,
+                skip_special_tokens=skip,
+                spaces_between_special_tokens=spaces,
+            )
+        except TypeError:
+            try:
+                return tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=skip,
+                    clean_up_tokenization_spaces=True,
+                )
+            except TypeError:
+                return tokenizer.decode(token_ids, skip_special_tokens=skip)
+
+
+def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> None:
+    """
+    Optional bump when callers leave min_tokens at 0 (SamplingParams default).
+    Default is off (same as explicit min_tokens=0: immediate EOS allowed).
+    Set FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS=1 (or higher) to reduce
+    first-token EOS on chat-style models (e.g. Qwen3.5 + GGUF).
+    """
+    if int(getattr(sp, "min_tokens", 0) or 0) != 0:
+        return
+    raw = os.environ.get("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "0")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if raw == "" or str(raw).lower() in ("0", "false", "off", "no"):
+        return
+    try:
+        sp.min_tokens = max(0, int(raw))
+    except ValueError:
+        sp.min_tokens = 1
+    mt = int(getattr(sp, "min_tokens", 0) or 0)
+    if mt > max_new_tokens:
+        sp.min_tokens = max(0, max_new_tokens)
+
+
 def _sample_token_from_logits(
     logits_1d: torch.Tensor,
     sp: SamplingParams,
     generated_ids: List[int],
     generator: Optional[torch.Generator],
+    eos_token_ids_to_mask: Optional[List[int]] = None,
 ) -> int:
     """
     Greedy argmax when temperature <= 0; otherwise temperature scaling, optional
@@ -35,6 +175,29 @@ def _sample_token_from_logits(
                     logits[tid] /= rp
                 else:
                     logits[tid] *= rp
+
+    fp = float(getattr(sp, "frequency_penalty", 0.0) or 0.0)
+    if abs(fp) > 1e-12 and generated_ids:
+        for tid, cnt in Counter(int(t) for t in generated_ids).items():
+            if 0 <= tid < logits.numel():
+                logits[tid] -= fp * float(cnt)
+
+    pp = float(getattr(sp, "presence_penalty", 0.0) or 0.0)
+    if abs(pp) > 1e-12 and generated_ids:
+        for tid in set(int(t) for t in generated_ids):
+            if 0 <= tid < logits.numel():
+                logits[tid] -= pp
+
+    if not getattr(sp, "ignore_eos", False) and eos_token_ids_to_mask:
+        mt = int(getattr(sp, "min_tokens", 0) or 0)
+        if len(generated_ids) < mt:
+            for tid in eos_token_ids_to_mask:
+                if 0 <= tid < logits.numel():
+                    logits[tid] = float("-inf")
+    elif getattr(sp, "ignore_eos", False) and eos_token_ids_to_mask:
+        for tid in eos_token_ids_to_mask:
+            if 0 <= tid < logits.numel():
+                logits[tid] = float("-inf")
 
     temp = float(getattr(sp, "temperature", 0.0) or 0.0)
     if temp <= 1e-6:
@@ -134,7 +297,10 @@ class LiteEngine:
             self.num_attention_heads = self.num_kv_heads
 
         self.num_layers = self.model_config.get_num_layers(None)
-        self.max_model_len = min(self.model_config.get_max_model_len(), 4096)
+        _bs = 16  # must match self.block_size below (paged KV physical block)
+        self.max_model_len = _resolve_kv_max_model_len(
+            self.model_config, self.vllm_config, _bs
+        )
 
         # Prefill chunk size: Qwen3.5 hybrid (linear + full attn) must see the full prompt in one
         # forward for correct hidden-state continuity; sub-layer carries alone cannot fix per-chunk
@@ -154,9 +320,12 @@ class LiteEngine:
                     getattr(self.execution_policy, "chunked_prefill_size", 512)
                 )
 
-        # 3. Pre-allocate Block-based KV Cache (Fix for AMD Illegal Memory Access)
+        # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
         self.block_size = 16
-        self.max_active_requests = self.execution_policy.max_active_requests
+        self.max_active_requests = _resolve_kv_max_active_requests(
+            self.execution_policy.max_active_requests,
+            self.vllm_config,
+        )
         self.num_blocks_per_seq = self.max_model_len // self.block_size
         self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
         
@@ -177,8 +346,25 @@ class LiteEngine:
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = torch.float8_e4m3fn
             
-        print(f">>>> LiteEngine: Allocating KV Cache on {self.device} ({self.max_active_requests} slots, {self.max_model_len} ctx, {self.num_layers} layers [16-token blocks], dtype={self.kv_dtype})")
-        
+        elem_nbytes = _dtype_nbytes(self.kv_dtype)
+        kv_theory_bytes = (
+            self.num_layers
+            * 2
+            * self.num_total_blocks
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * elem_nbytes
+        )
+        print(
+            f">>>> LiteEngine: Allocating KV Cache on {self.device} "
+            f"({self.max_active_requests} seq slots, {self.max_model_len} tokens/seq cap, "
+            f"{self.num_layers} layers, block={self.block_size} tok, dtype={self.kv_dtype}, "
+            f"~{kv_theory_bytes / (1024**3):.3f} GiB theoretical)"
+        )
+
+        mem_before_kv = int(torch.cuda.memory_allocated(self.device))
+
         self.kv_caches = []
         for i in range(self.num_layers):
             print(f"    Allocating layer {i}...")
@@ -189,6 +375,25 @@ class LiteEngine:
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         print(">>>> LiteEngine: KV Cache allocated successfully.")
+
+        mem_after_kv = int(torch.cuda.memory_allocated(self.device))
+        kv_delta_bytes = mem_after_kv - mem_before_kv
+        total_gb = mem_after_kv / (1024**3)
+        weights_gb = mem_before_kv / (1024**3)
+        kv_delta_gb = kv_delta_bytes / (1024**3)
+        gpu_total_gb = get_total_gpu_memory_gb()
+        print(
+            ">>>> LiteEngine: GPU memory breakdown (torch.cuda.memory_allocated; "
+            "host RSS not included — large GGUF load is often CPU anon-rss):"
+        )
+        print(f"     before_KV (weights + overhead): {weights_gb:.3f} GiB")
+        print(f"     KV pool (delta alloc):          {kv_delta_gb:.3f} GiB  (theory {kv_theory_bytes / (1024**3):.3f} GiB)")
+        print(f"     after_KV total:                 {total_gb:.3f} GiB  /  GPU cap ~{gpu_total_gb:.1f} GiB")
+        if gpu_total_gb > 0 and total_gb > 0.85 * gpu_total_gb:
+            print(
+                "     [Warn] Total allocated is high vs GPU size; reduce FASTINFERENCE_KV_MAX_MODEL_LEN "
+                "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_FP8=1, or --frugal scheduling."
+            )
 
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._running_ids: List[str] = []
@@ -243,6 +448,7 @@ class LiteEngine:
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
         max_tokens = min(max_tokens, self.execution_policy.max_tokens_cap)
+        _apply_lite_default_min_tokens(effective_sampling_params, max_tokens)
 
         input_ids = self.tokenizer.encode(prompt)
         slot_idx = self._free_slots.pop(0)
@@ -351,11 +557,17 @@ class LiteEngine:
                 
                 if is_last_chunk:
                     # First generated token: respect SamplingParams (temperature, top_p, etc.)
+                    eos_mask = _eos_stop_token_ids_for_sampling(
+                        self.tokenizer,
+                        req["sampling_params"],
+                        getattr(self.model_config, "hf_config", None),
+                    )
                     next_token = _sample_token_from_logits(
                         logits[0, -1, :],
                         req["sampling_params"],
                         req["generated_ids"],
                         req.get("rng"),
+                        eos_token_ids_to_mask=eos_mask,
                     )
                     req["generated_ids"].append(next_token)
                     req["seq_len"] = processed_len + this_chunk_len
@@ -430,11 +642,17 @@ class LiteEngine:
                 # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
                 for i, rid in enumerate(decodes):
                     req_i = self._requests[rid]
+                    eos_mask = _eos_stop_token_ids_for_sampling(
+                        self.tokenizer,
+                        req_i["sampling_params"],
+                        getattr(self.model_config, "hf_config", None),
+                    )
                     token = _sample_token_from_logits(
                         logits[i, -1, :],
                         req_i["sampling_params"],
                         req_i["generated_ids"],
                         req_i.get("rng"),
+                        eos_token_ids_to_mask=eos_mask,
                     )
                     req_i["generated_ids"].append(token)
                     self._requests[rid]["seq_len"] += 1
@@ -449,10 +667,30 @@ class LiteEngine:
 
     def _process_completion(self, rid, next_token, results):
         req = self._requests[rid]
-        if next_token == getattr(self.tokenizer, "eos_token_id", -1) or len(req["generated_ids"]) >= (req["sampling_params"].max_tokens or 16):
+        sp = req["sampling_params"]
+        eos_ids = _eos_stop_token_ids_for_sampling(
+            self.tokenizer,
+            sp,
+            getattr(self.model_config, "hf_config", None),
+        )
+        max_tok = int(sp.max_tokens or 16)
+        gen_len = len(req["generated_ids"])
+        min_tok = int(getattr(sp, "min_tokens", 0) or 0)
+
+        if getattr(sp, "ignore_eos", False):
+            if gen_len >= max_tok:
+                req["finished"] = True
+        elif next_token in eos_ids and gen_len >= min_tok:
             req["finished"] = True
-        
-        completion = CompletionOutput(index=0, text=self.tokenizer.decode(req["generated_ids"]), token_ids=req["generated_ids"], cumulative_logprob=0.0)
+        elif gen_len >= max_tok:
+            req["finished"] = True
+
+        completion = CompletionOutput(
+            index=0,
+            text=_decode_generated_text(self.tokenizer, req["generated_ids"], sp),
+            token_ids=req["generated_ids"],
+            cumulative_logprob=0.0,
+        )
         out = RequestOutput(request_id=rid, prompt=req["prompt"], prompt_token_ids=req["input_ids"], outputs=[completion], finished=req["finished"])
         self._request_streams[rid].put_nowait(out)
         results.append(out)

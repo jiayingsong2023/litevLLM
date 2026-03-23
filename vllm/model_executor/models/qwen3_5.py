@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # GatedDeltaNet helpers below align with Hugging Face `modeling_qwen3_5.py` (torch fallback path).
 import os
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,16 @@ from typing import Optional, List, Any, Tuple
 from vllm.model_executor.layers.lite_linear import LiteLinear
 from .lite_config import LiteConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
+from vllm.model_executor.moe_fp8_utils import (
+    dims_ok_for_moe_fp8,
+    fp8_scale_shape_2d,
+    moe_expert_lru_size,
+    moe_fp8_dequant_to_linear_weight,
+    qwen35_moe_fp8_enabled,
+    qwen35_moe_offload_enabled,
+    qwen35_moe_packed_gguf_enabled,
+)
+from vllm.model_executor.moe_gguf_packed import dequant_packed_rows_to_fp16
 
 
 def _env_truthy(name: str) -> bool:
@@ -340,6 +351,268 @@ class Qwen3_5RMSNorm(nn.Module):
         return output.type_as(x)
 
 
+def qwen35_layer_type(layer_idx: int, config: LiteConfig) -> str:
+    """Match HF ``Qwen3_5MoeTextConfig`` / dense ``Qwen3_5TextConfig`` layer_types pattern."""
+    lt = getattr(config, "layer_types", None)
+    if isinstance(lt, list) and layer_idx < len(lt):
+        return str(lt[layer_idx])
+    interval = int(getattr(config, "full_attention_interval", 4) or 4)
+    return "linear_attention" if bool((layer_idx + 1) % interval) else "full_attention"
+
+
+class Qwen3_5MoeTopKRouterLite(nn.Module):
+    """Aligned with HF ``Qwen3_5MoeTopKRouter``."""
+
+    def __init__(self, config: LiteConfig):
+        super().__init__()
+        self.top_k = int(config.num_experts_per_tok)
+        self.num_experts = int(config.num_experts)
+        self.hidden_dim = int(config.hidden_size)
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight)
+        router_logits = F.softmax(router_logits, dtype=torch.float32, dim=-1)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        router_scores = router_top_value
+        return router_logits, router_scores, router_indices
+
+
+class Qwen3_5MoeExpertsLite(nn.Module):
+    """Aligned with HF ``Qwen3_5MoeExperts`` (loop over hit experts).
+
+    Optional GGUF packed uint8 (FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1): load-time RSS avoids full-blob dequant.
+    Optional FP8 block weights (FASTINFERENCE_QWEN35_MOE_FP8=1) halve expert weight bytes (incompatible with packed).
+    Optional CPU offload + GPU LRU (FASTINFERENCE_QWEN35_MOE_OFFLOAD=1) lowers GPU residency.
+    """
+
+    def __init__(self, config: LiteConfig):
+        super().__init__()
+        self.num_experts = int(config.num_experts)
+        self.hidden_dim = int(config.hidden_size)
+        self.intermediate_dim = int(config.moe_intermediate_size)
+        f8 = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else None
+        self.moe_gguf_packed = bool(qwen35_moe_packed_gguf_enabled())
+        if self.moe_gguf_packed and qwen35_moe_fp8_enabled():
+            raise ValueError(
+                "FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 is incompatible with FASTINFERENCE_QWEN35_MOE_FP8=1; "
+                "disable one of them."
+            )
+        self.fp8_moe = bool(
+            f8 is not None
+            and qwen35_moe_fp8_enabled()
+            and dims_ok_for_moe_fp8(self.hidden_dim, self.intermediate_dim)
+            and not self.moe_gguf_packed
+        )
+        self.moe_cpu_offload = bool(
+            self.fp8_moe and qwen35_moe_offload_enabled()
+        )
+        self.lru_size = moe_expert_lru_size()
+        self._lru_gpu: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = (
+            OrderedDict()
+        )
+
+        if self.moe_gguf_packed:
+            self.register_buffer("_gate_exp_packed", torch.empty(0, dtype=torch.uint8))
+            self.register_buffer("_up_exp_packed", torch.empty(0, dtype=torch.uint8))
+            self.register_buffer("_down_exp_packed", torch.empty(0, dtype=torch.uint8))
+            self.register_buffer("_gguf_qtype_gate", torch.tensor(0, dtype=torch.int32))
+            self.register_buffer("_gguf_qtype_up", torch.tensor(0, dtype=torch.int32))
+            self.register_buffer("_gguf_qtype_down", torch.tensor(0, dtype=torch.int32))
+        elif self.fp8_moe and self.moe_cpu_offload:
+            ou, inn = fp8_scale_shape_2d(2 * self.intermediate_dim, self.hidden_dim)
+            ou_d, inn_d = fp8_scale_shape_2d(self.hidden_dim, self.intermediate_dim)
+            self.register_buffer(
+                "_gate_up_fp8_cpu",
+                torch.empty(
+                    self.num_experts,
+                    2 * self.intermediate_dim,
+                    self.hidden_dim,
+                    dtype=f8,
+                ).pin_memory(),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_gate_up_scale_cpu",
+                torch.empty(self.num_experts, ou, inn, dtype=torch.float32).pin_memory(),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_down_fp8_cpu",
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_dim,
+                    self.intermediate_dim,
+                    dtype=f8,
+                ).pin_memory(),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_down_scale_cpu",
+                torch.empty(self.num_experts, ou_d, inn_d, dtype=torch.float32).pin_memory(),
+                persistent=True,
+            )
+            # Placeholders so load / state_dict can target stable keys (overwritten by loader).
+            self.register_buffer("_gate_up_proj_placeholder", torch.empty(0), persistent=False)
+            self.register_buffer("_down_proj_placeholder", torch.empty(0), persistent=False)
+        elif self.fp8_moe:
+            ou, inn = fp8_scale_shape_2d(2 * self.intermediate_dim, self.hidden_dim)
+            ou_d, inn_d = fp8_scale_shape_2d(self.hidden_dim, self.intermediate_dim)
+            self.gate_up_proj = nn.Parameter(
+                torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, dtype=f8)
+            )
+            self.gate_up_scale = nn.Parameter(
+                torch.empty(self.num_experts, ou, inn, dtype=torch.float32)
+            )
+            self.down_proj = nn.Parameter(
+                torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim, dtype=f8)
+            )
+            self.down_scale = nn.Parameter(torch.empty(self.num_experts, ou_d, inn_d, dtype=torch.float32))
+        else:
+            self.gate_up_proj = nn.Parameter(
+                torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+            )
+            self.down_proj = nn.Parameter(
+                torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+            )
+
+    def _apply(self, fn):
+        # Keep pinned CPU expert buffers on CPU when moving the rest of the model to CUDA.
+        skip = {"_gate_up_fp8_cpu", "_gate_up_scale_cpu", "_down_fp8_cpu", "_down_scale_cpu"}
+        for module in self.children():
+            module._apply(fn)
+        for name, param in self._parameters.items():
+            if param is not None:
+                self._parameters[name] = fn(param)
+        for name, buf in self._buffers.items():
+            if name in skip:
+                continue
+            if buf is not None:
+                self._buffers[name] = fn(buf)
+        return self
+
+    def _lru_get_expert_fp8_gpu(
+        self, expert_idx: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if expert_idx in self._lru_gpu:
+            self._lru_gpu.move_to_end(expert_idx)
+            return self._lru_gpu[expert_idx]
+        g = self._gate_up_fp8_cpu[expert_idx].to(device=device, non_blocking=True)
+        gs = self._gate_up_scale_cpu[expert_idx].to(device=device, non_blocking=True)
+        d = self._down_fp8_cpu[expert_idx].to(device=device, non_blocking=True)
+        ds = self._down_scale_cpu[expert_idx].to(device=device, non_blocking=True)
+        tpl = (g, gs, d, ds)
+        self._lru_gpu[expert_idx] = tpl
+        if len(self._lru_gpu) > self.lru_size:
+            self._lru_gpu.popitem(last=False)
+        return tpl
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        dev = hidden_states.device
+        hid_dtype = hidden_states.dtype
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            if self.moe_gguf_packed:
+                qg = int(self._gguf_qtype_gate.item())
+                qu = int(self._gguf_qtype_up.item())
+                qd = int(self._gguf_qtype_down.item())
+                ei = int(expert_idx)
+                r0 = ei * self.intermediate_dim
+                r1 = r0 + self.intermediate_dim
+                gate_w = dequant_packed_rows_to_fp16(
+                    self._gate_exp_packed, r0, r1, self.hidden_dim, qg
+                ).to(device=dev, dtype=hid_dtype)
+                up_w = dequant_packed_rows_to_fp16(
+                    self._up_exp_packed, r0, r1, self.hidden_dim, qu
+                ).to(device=dev, dtype=hid_dtype)
+                w_gu = torch.cat([gate_w, up_w], dim=0)
+                gate, up = F.linear(current_state, w_gu).chunk(2, dim=-1)
+                current_hidden_states = F.silu(gate) * up
+                rd0 = ei * self.hidden_dim
+                rd1 = rd0 + self.hidden_dim
+                down_w = dequant_packed_rows_to_fp16(
+                    self._down_exp_packed, rd0, rd1, self.intermediate_dim, qd
+                ).to(device=dev, dtype=hid_dtype)
+                current_hidden_states = F.linear(current_hidden_states, down_w)
+            elif self.moe_cpu_offload:
+                g_fp8, g_s, d_fp8, d_s = self._lru_get_expert_fp8_gpu(int(expert_idx), dev)
+                w_g = moe_fp8_dequant_to_linear_weight(g_fp8, g_s, hid_dtype)
+                gate, up = F.linear(current_state, w_g).chunk(2, dim=-1)
+                current_hidden_states = F.silu(gate) * up
+                w_d = moe_fp8_dequant_to_linear_weight(d_fp8, d_s, hid_dtype)
+                current_hidden_states = F.linear(current_hidden_states, w_d)
+            elif self.fp8_moe:
+                w_g = moe_fp8_dequant_to_linear_weight(
+                    self.gate_up_proj[expert_idx], self.gate_up_scale[expert_idx], hid_dtype
+                )
+                gate, up = F.linear(current_state, w_g).chunk(2, dim=-1)
+                current_hidden_states = F.silu(gate) * up
+                w_d = moe_fp8_dequant_to_linear_weight(
+                    self.down_proj[expert_idx], self.down_scale[expert_idx], hid_dtype
+                )
+                current_hidden_states = F.linear(current_hidden_states, w_d)
+            else:
+                gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                current_hidden_states = F.silu(gate) * up
+                current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
+class Qwen3_5MoeSparseMoeBlock(nn.Module):
+    """Aligned with HF ``Qwen3_5MoeSparseMoeBlock`` (shared expert order + gate scaling)."""
+
+    def __init__(self, config: LiteConfig, quant_config, prefix: str = ""):
+        super().__init__()
+        self.config = config
+        self.gate = Qwen3_5MoeTopKRouterLite(config)
+        self.experts = Qwen3_5MoeExpertsLite(config)
+        sh = int(config.shared_expert_intermediate_size)
+        self.shared_expert = nn.Module()
+        self.shared_expert.gate_proj = LiteLinear(
+            config.hidden_size, sh, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.gate_proj"
+        )
+        self.shared_expert.up_proj = LiteLinear(
+            config.hidden_size, sh, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.up_proj"
+        )
+        self.shared_expert.down_proj = LiteLinear(
+            sh, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.down_proj"
+        )
+        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+        shared_expert_output = self.shared_expert.down_proj(
+            F.silu(self.shared_expert.gate_proj(hidden_states_reshaped)) * self.shared_expert.up_proj(hidden_states_reshaped)
+        )
+        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+        expert_output = expert_output + shared_expert_output
+        return expert_output.reshape(batch_size, sequence_length, hidden_dim)
+
+
 def _fp16_safe_abs_max() -> float:
     return float(torch.finfo(torch.float16).max) * 0.92
 
@@ -403,10 +676,13 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
     applies causal conv streaming + recurrent delta-net state across decode / chunked prefill.
     """
 
-    def __init__(self, config: LiteConfig, quant_config, prefix="", layer_idx: int = 0):
+    def __init__(
+        self, config: LiteConfig, quant_config, prefix="", layer_idx: int = 0, use_moe: bool = False
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self._use_moe = use_moe
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -468,16 +744,19 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         self.linear_attn.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
-        self.mlp = nn.Module()
-        self.mlp.gate_proj = LiteLinear(
-            config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
-        )
-        self.mlp.up_proj = LiteLinear(
-            config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
-        )
-        self.mlp.down_proj = LiteLinear(
-            config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
-        )
+        if use_moe:
+            self.mlp = Qwen3_5MoeSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+        else:
+            self.mlp = nn.Module()
+            self.mlp.gate_proj = LiteLinear(
+                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
+            )
+            self.mlp.up_proj = LiteLinear(
+                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
+            )
+            self.mlp.down_proj = LiteLinear(
+                config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
+            )
 
     def forward(self, x, positions, kv_cache, attn_metadata):
         input_dtype = x.dtype
@@ -612,7 +891,10 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         hidden_states = residual + attn_delta
         
         h_post = self.post_attention_layernorm(hidden_states)
-        mlp_out = self.mlp.down_proj(F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post))
+        if self._use_moe:
+            mlp_out = self.mlp(h_post)
+        else:
+            mlp_out = self.mlp.down_proj(F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post))
         return hidden_states + mlp_out
 
 class Qwen3_5FullAttentionLayer(nn.Module):
@@ -621,9 +903,10 @@ class Qwen3_5FullAttentionLayer(nn.Module):
     sigmoid gate on attention output before o_proj.
     """
 
-    def __init__(self, config: LiteConfig, quant_config, prefix=""):
+    def __init__(self, config: LiteConfig, quant_config, prefix="", use_moe: bool = False):
         super().__init__()
         self.config = config
+        self._use_moe = use_moe
         self.hidden_act = getattr(config, "hidden_act", "silu")
         eps = getattr(config, "rms_norm_eps", 1e-6)
         self.num_heads = config.num_attention_heads
@@ -650,16 +933,19 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         self.self_attn.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=eps)
         self.self_attn.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=eps)
-        self.mlp = nn.Module()
-        self.mlp.gate_proj = LiteLinear(
-            config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
-        )
-        self.mlp.up_proj = LiteLinear(
-            config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
-        )
-        self.mlp.down_proj = LiteLinear(
-            config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
-        )
+        if use_moe:
+            self.mlp = Qwen3_5MoeSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+        else:
+            self.mlp = nn.Module()
+            self.mlp.gate_proj = LiteLinear(
+                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
+            )
+            self.mlp.up_proj = LiteLinear(
+                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
+            )
+            self.mlp.down_proj = LiteLinear(
+                config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
+            )
         rope_params = getattr(config, "rope_parameters", {})
         mrope_section = rope_params.get("mrope_section")
         rotary_dim = int(config.head_dim * getattr(config, "partial_rotary_factor", 1.0))
@@ -794,6 +1080,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             hidden_states = x + attn_out
 
         h_post = self.post_attention_layernorm(hidden_states)
+        if self._use_moe:
+            mlp_out = self.mlp(h_post)
+            return hidden_states + mlp_out
         if self._use_full_attn_stabilizer:
             gp = self.mlp.gate_proj(h_post).float()
             up = self.mlp.up_proj(h_post).float()
@@ -857,6 +1146,28 @@ class Qwen2Model(nn.Module):
                 )
         self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
 
+
+class Qwen2MoEModel(nn.Module):
+    """Qwen3.5 MoE text: same attention stack as ``Qwen2Model`` but sparse MoE FFN (HF-aligned)."""
+
+    def __init__(self, hf_config, quant_config):
+        super().__init__()
+        self.config = LiteConfig(hf_config)
+        self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.layers = nn.ModuleList()
+        for i in range(self.config.num_hidden_layers):
+            if qwen35_layer_type(i, self.config) == "linear_attention":
+                self.layers.append(
+                    Qwen3_5LinearAttentionLayer(
+                        self.config, quant_config, f"model.layers.{i}", layer_idx=i, use_moe=True
+                    )
+                )
+            else:
+                self.layers.append(
+                    Qwen3_5FullAttentionLayer(self.config, quant_config, f"model.layers.{i}", use_moe=True)
+                )
+        self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
+
 class Qwen3_5ForConditionalGeneration(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
@@ -873,4 +1184,17 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             x = self.model.layers[i](x, positions, kv_caches[i], attn_metadata)
         return self.lm_head(self.model.norm(x))
 
-class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration): pass
+class Qwen3_5MoeForConditionalGeneration(nn.Module):
+    def __init__(self, vllm_config, prefix=""):
+        super().__init__()
+        self.model = Qwen2MoEModel(vllm_config.model_config.hf_config, vllm_config.quant_config)
+        self.lm_head = nn.Linear(self.model.config.hidden_size, self.model.config.vocab_size, bias=False)
+
+    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
+        rp = getattr(self.model.config, "rope_parameters", None) or {}
+        if positions is not None and positions.ndim == 2 and rp.get("mrope_section"):
+            positions = positions.unsqueeze(0).expand(3, -1, -1).contiguous()
+        x = self.model.embed_tokens(input_ids)
+        for i in range(len(self.model.layers)):
+            x = self.model.layers[i](x, positions, kv_caches[i], attn_metadata)
+        return self.lm_head(self.model.norm(x))

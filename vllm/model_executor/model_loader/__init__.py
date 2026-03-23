@@ -19,13 +19,33 @@ from vllm.model_executor.layers.quantization.tensor import (
     dequantize_symmetric_packed_int4_pytorch,
     GGUFWeight,
 )
+from vllm.model_executor.moe_fp8_utils import fp8_block_quantize_2d, moe_fp8_block_size
+from vllm.model_executor.moe_gguf_packed import (
+    gguf_quant_type_supported_for_moe_packed,
+    numpy_gguf_data_to_packed_2d,
+)
+
+# --- GGUF load peak RSS (why "temporary buffers" matter) ---
+# For each quantized tensor, gguf.dequantize() builds a full float32 numpy array (dequant_np),
+# then we materialize a torch tensor (often FP16). Peak RSS is dominated by:
+#   (1) compressed tensor bytes still reachable from GGUFReader.tensor_map,
+#   (2) dequant_np (full logical size, float32),
+#   (3) torch tensor after from_numpy / dtype cast (may duplicate if cast copies),
+#   (4) MoE: full [E, I, H] gate and up tensors before copy into Parameters (sequential ge vs ue halves (2)).
+# Mitigations: del ge/ue as soon as possible, gc.collect() per layer, avoid extra cats/temps in FP8 path.
+# Optional FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1: keep ffn_*_exps as uint8 packed rows (no full-blob dequant at load).
+
 
 def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, target_shape: Optional[torch.Size] = None) -> Optional[torch.Tensor]:
     q_type = int(gguf_tensor.tensor_type)
     # F32 (0) and F16 (1): row-major bytes match GGUF metadata shape; do NOT view(target_shape)
     # first — that scrambles layout when GGUF order is the transpose of PyTorch (e.g. embed, Linear).
     if q_type in [0, 1]:
-        raw = torch.from_numpy(np.array(gguf_tensor.data, copy=True)).to(device=device)
+        # Prefer asarray + from_numpy over always copy=True (reduces peak RSS when buffer is writable).
+        w_np = np.asarray(gguf_tensor.data)
+        if not getattr(w_np, "flags", None) or not w_np.flags.writeable:
+            w_np = w_np.copy()
+        raw = torch.from_numpy(w_np).to(device=device)
         tname = str(getattr(gguf_tensor, "name", "") or "")
         # Depthwise conv1d: GGUF dims may not match PyTorch Conv1d layout; contiguous bytes match HF
         # when viewed as target_shape [C, 1, K] (see scripts/qwen35_gguf_alignment_audit.py).
@@ -73,9 +93,14 @@ def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, t
     # Universal dequant via gguf library — handles Q4_K, Q6_K, Q5_K, Q8_0, IQ, BF16, etc.
     try:
         from gguf import dequantize as gguf_dequantize, GGMLQuantizationType
-        w_np = np.array(gguf_tensor.data, copy=True)
+        w_np = np.asarray(gguf_tensor.data)
+        if not getattr(w_np, "flags", None) or not w_np.flags.writeable:
+            w_np = w_np.copy()
         dequant_np = gguf_dequantize(w_np, GGMLQuantizationType(q_type))
-        res = torch.from_numpy(np.array(dequant_np, copy=True)).to(device=device, dtype=dtype)
+        del w_np
+        # One numpy->torch bridge; avoid redundant np.array(..., copy=True) on dequant output.
+        res = torch.from_numpy(dequant_np).to(device=device, dtype=dtype)
+        # Note: do not del dequant_np here — from_numpy may share storage with float32 CPU tensors.
         # gguf.dequantize returns row-major logical weights, often already [out, in] for Linear
         # (e.g. token_embd (V,H)) even when GGUF tensor metadata lists the transpose (H,V).
         # Reshaping to metadata dims would permute elements and destroy alignment vs HF.
@@ -151,7 +176,7 @@ def _qwen35_linear_attn_gguf_to_hf(
     Qwen3_5TextModel / _LinearAttentionVReorderBase).
     """
     mt = getattr(hf_config, "model_type", "") or ""
-    if mt not in ("qwen3_5", "qwen3_5_text"):
+    if mt not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
         return source
     num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
     num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
@@ -201,7 +226,7 @@ def _qwen35_rms_norm_weight_gguf_to_hf(
     the raw scale without that offset.
     """
     mt = getattr(hf_config, "model_type", "") or ""
-    if mt not in ("qwen3_5", "qwen3_5_text"):
+    if mt not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
         return source
     if "norm.weight" not in gguf_tensor_name:
         return source
@@ -221,7 +246,7 @@ def _qwen35_linear_attn_1d_gguf_to_hf(
 ) -> torch.Tensor:
     """A_log / dt_bias: reorder num_v_heads elements from tiled to grouped."""
     mt = getattr(hf_config, "model_type", "") or ""
-    if mt not in ("qwen3_5", "qwen3_5_text"):
+    if mt not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
         return source
     num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
     num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
@@ -241,7 +266,7 @@ def _qwen35_conv1d_channels_gguf_to_hf(
     Reorder V channel block in depthwise conv1d [C, 1, K] along dim 0 (see llama.cpp).
     """
     mt = getattr(hf_config, "model_type", "") or ""
-    if mt not in ("qwen3_5", "qwen3_5_text"):
+    if mt not in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
         return conv_weight
     num_k = int(getattr(hf_config, "linear_num_key_heads", 0) or 0)
     num_v = int(getattr(hf_config, "linear_num_value_heads", 0) or 0)
@@ -357,6 +382,10 @@ def _load_param_from_gguf_tensor(
     elif isinstance(actual_param, torch.Tensor):
         if actual_param.shape == source.shape:
             actual_param.data.copy_(source)
+    try:
+        del source
+    except NameError:
+        pass
 
 def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None:
     print(f">>> Mapping GGUF weights from {gguf_file}...")
@@ -393,11 +422,14 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         "blk.{i}.ffn_gate.weight": ["model.layers.{i}.mlp.gate_proj.weight"],
         "blk.{i}.ffn_up.weight": ["model.layers.{i}.mlp.up_proj.weight"],
         "blk.{i}.ffn_down.weight": ["model.layers.{i}.mlp.down_proj.weight"],
-        # MoE
-        "blk.{i}.ffn_gate_inp.weight": ["model.layers.{i}.mlp.router.weight"],
-        "blk.{i}.ffn_gate_shexp.weight": ["model.layers.{i}.mlp.shared_experts.gate_proj.weight"],
-        "blk.{i}.ffn_up_shexp.weight": ["model.layers.{i}.mlp.shared_experts.up_proj.weight"],
-        "blk.{i}.ffn_down_shexp.weight": ["model.layers.{i}.mlp.shared_experts.down_proj.weight"],
+        # Qwen3.5 MoE (HF: mlp.gate / mlp.experts / mlp.shared_expert / mlp.shared_expert_gate)
+        "blk.{i}.ffn_gate_inp.weight": ["model.layers.{i}.mlp.gate.weight"],
+        "blk.{i}.ffn_gate_shexp.weight": ["model.layers.{i}.mlp.shared_expert.gate_proj.weight"],
+        "blk.{i}.ffn_up_shexp.weight": ["model.layers.{i}.mlp.shared_expert.up_proj.weight"],
+        "blk.{i}.ffn_down_shexp.weight": ["model.layers.{i}.mlp.shared_expert.down_proj.weight"],
+        # llama.cpp may name this ffn_gate_sw_shexp or ffn_gate_inp_shexp (same HF tensor)
+        "blk.{i}.ffn_gate_sw_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
+        "blk.{i}.ffn_gate_inp_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
     }
     modules = dict(model.named_modules()); params = dict(model.named_parameters())
 
@@ -518,21 +550,178 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                 m_path = f"model.layers.{i}.self_attn.kv_b_proj"
                 if m_path in modules: modules[m_path].weight = nn.Parameter(fused_kv_b, requires_grad=False); loaded_count += 1
         
-        # PROPER MOE EXPERT LOADING
-        for e_type in ["gate", "up", "down"]:
-            ge_key = f"blk.{i}.ffn_{e_type}_exps.weight"
-            if ge_key in tensor_map:
-                if e_type in ["gate", "up"]: t_shape = torch.Size([num_experts, moe_inter, hidden])
-                else: t_shape = torch.Size([num_experts, hidden, moe_inter])
-                
-                ge = _dequantize_gguf_tensor(tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape)
-                if ge is not None:
-                    m_moe_path = f"model.layers.{i}.mlp"
-                    if m_moe_path in modules:
-                        m_moe = modules[m_moe_path]
-                        p_name = f"experts_{e_type}"
-                        setattr(m_moe, p_name, nn.Parameter(ge, requires_grad=False)); loaded_count += 1
-        if i % 4 == 0: gc.collect()
+        # MoE routed experts: fuse gate+up -> gate_up_proj (HF), load down_proj
+        ge_key = f"blk.{i}.ffn_gate_exps.weight"
+        ue_key = f"blk.{i}.ffn_up_exps.weight"
+        de_key = f"blk.{i}.ffn_down_exps.weight"
+        m_moe_path = f"model.layers.{i}.mlp"
+        if ge_key in tensor_map and ue_key in tensor_map and m_moe_path in modules:
+            m_moe = modules[m_moe_path]
+            exp_mod = getattr(m_moe, "experts", None)
+            if exp_mod is None:
+                pass
+            elif getattr(exp_mod, "moe_gguf_packed", False):
+                if de_key not in tensor_map:
+                    raise RuntimeError(
+                        f"MoE packed GGUF requires {de_key} in the GGUF file (layer {i})."
+                    )
+                t_shape_g = torch.Size([num_experts, moe_inter, hidden])
+                t_shape_d = torch.Size([num_experts, hidden, moe_inter])
+                ge_t = tensor_map[ge_key]
+                ue_t = tensor_map[ue_key]
+                qg = int(ge_t.tensor_type)
+                qu = int(ue_t.tensor_type)
+                if not gguf_quant_type_supported_for_moe_packed(qg) or not gguf_quant_type_supported_for_moe_packed(
+                    qu
+                ):
+                    raise RuntimeError(
+                        f"MoE packed GGUF requires quant types Q4_0/Q4_K/Q6_K; got gate={qg} up={qu}"
+                    )
+                gate_np = numpy_gguf_data_to_packed_2d(np.asarray(ge_t.data), tuple(t_shape_g), qg)
+                up_np = numpy_gguf_data_to_packed_2d(np.asarray(ue_t.data), tuple(t_shape_g), qu)
+                exp_mod.register_buffer(
+                    "_gate_exp_packed",
+                    torch.from_numpy(np.ascontiguousarray(gate_np)).to(torch.uint8),
+                )
+                exp_mod.register_buffer(
+                    "_up_exp_packed",
+                    torch.from_numpy(np.ascontiguousarray(up_np)).to(torch.uint8),
+                )
+                exp_mod.register_buffer("_gguf_qtype_gate", torch.tensor(qg, dtype=torch.int32))
+                exp_mod.register_buffer("_gguf_qtype_up", torch.tensor(qu, dtype=torch.int32))
+                loaded_count += 1
+                de_t = tensor_map[de_key]
+                qd = int(de_t.tensor_type)
+                if not gguf_quant_type_supported_for_moe_packed(qd):
+                    raise RuntimeError(
+                        f"MoE packed GGUF requires quant types Q4_0/Q4_K/Q6_K; got down={qd}"
+                    )
+                down_np = numpy_gguf_data_to_packed_2d(np.asarray(de_t.data), tuple(t_shape_d), qd)
+                exp_mod.register_buffer(
+                    "_down_exp_packed",
+                    torch.from_numpy(np.ascontiguousarray(down_np)).to(torch.uint8),
+                )
+                exp_mod.register_buffer("_gguf_qtype_down", torch.tensor(qd, dtype=torch.int32))
+                loaded_count += 1
+            elif getattr(exp_mod, "moe_cpu_offload", False) and getattr(exp_mod, "fp8_moe", False):
+                t_shape_g = torch.Size([num_experts, moe_inter, hidden])
+                t_shape_d = torch.Size([num_experts, hidden, moe_inter])
+                dst_g = exp_mod._gate_up_fp8_cpu
+                dst_gs = exp_mod._gate_up_scale_cpu
+                dst_d = exp_mod._down_fp8_cpu
+                dst_ds = exp_mod._down_scale_cpu
+                ge = _dequantize_gguf_tensor(
+                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ge_ok = ge is not None
+                ue = _dequantize_gguf_tensor(
+                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ue_ok = ue is not None
+                if ge_ok and ue_ok:
+                    br = moe_inter // moe_fp8_block_size()
+                    for e in range(num_experts):
+                        wf8_g, sg = fp8_block_quantize_2d(ge[e].contiguous())
+                        wf8_u, su = fp8_block_quantize_2d(ue[e].contiguous())
+                        dst_g[e, :moe_inter].copy_(wf8_g)
+                        dst_g[e, moe_inter:].copy_(wf8_u)
+                        dst_gs[e, :br].copy_(sg)
+                        dst_gs[e, br:].copy_(su)
+                    loaded_count += 1
+                del ge, ue
+                if de_key in tensor_map:
+                    de = _dequantize_gguf_tensor(
+                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    )
+                    if de is not None:
+                        for e in range(num_experts):
+                            wf8, sf = fp8_block_quantize_2d(de[e].contiguous())
+                            dst_d[e].copy_(wf8)
+                            dst_ds[e].copy_(sf)
+                        loaded_count += 1
+                    del de
+            elif getattr(exp_mod, "fp8_moe", False):
+                t_shape_g = torch.Size([num_experts, moe_inter, hidden])
+                t_shape_d = torch.Size([num_experts, hidden, moe_inter])
+                dst = exp_mod.gate_up_proj.data
+                dst_s = exp_mod.gate_up_scale.data
+                dt_w = dst.dtype
+                ge = _dequantize_gguf_tensor(
+                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ge_ok = ge is not None
+                ue = _dequantize_gguf_tensor(
+                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ue_ok = ue is not None
+                if ge_ok and ue_ok:
+                    br = moe_inter // moe_fp8_block_size()
+                    for e in range(num_experts):
+                        wf8_g, sg = fp8_block_quantize_2d(ge[e].contiguous())
+                        wf8_u, su = fp8_block_quantize_2d(ue[e].contiguous())
+                        dst[e, :moe_inter].copy_(wf8_g.to(dtype=dt_w))
+                        dst[e, moe_inter:].copy_(wf8_u.to(dtype=dt_w))
+                        dst_s[e, :br].copy_(sg)
+                        dst_s[e, br:].copy_(su)
+                    loaded_count += 1
+                del ge, ue
+                if de_key in tensor_map:
+                    de = _dequantize_gguf_tensor(
+                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    )
+                    if de is not None:
+                        ddst = exp_mod.down_proj.data
+                        ddst_s = exp_mod.down_scale.data
+                        for e in range(num_experts):
+                            wf8, sf = fp8_block_quantize_2d(de[e].contiguous())
+                            ddst[e].copy_(wf8.to(dtype=ddst.dtype))
+                            ddst_s[e].copy_(sf)
+                        loaded_count += 1
+                    del de
+            elif hasattr(exp_mod, "gate_up_proj") and hasattr(exp_mod, "down_proj"):
+                t_shape_g = torch.Size([num_experts, moe_inter, hidden])
+                t_shape_d = torch.Size([num_experts, hidden, moe_inter])
+                dst = exp_mod.gate_up_proj.data
+                dt = dst.dtype
+                # Dequant gate and up sequentially so ge and ue are never both resident (halves peak RSS).
+                ge = _dequantize_gguf_tensor(
+                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ge_ok = ge is not None
+                if ge_ok:
+                    dst[:, :moe_inter, :].copy_(ge.to(dtype=dt))
+                del ge
+                ue = _dequantize_gguf_tensor(
+                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                )
+                ue_ok = ue is not None
+                if ue_ok:
+                    dst[:, moe_inter:, :].copy_(ue.to(dtype=dt))
+                del ue
+                if ge_ok and ue_ok:
+                    loaded_count += 1
+                de = None
+                if de_key in tensor_map:
+                    de = _dequantize_gguf_tensor(
+                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    )
+                if de is not None:
+                    exp_mod.down_proj.data.copy_(de.to(dtype=exp_mod.down_proj.dtype))
+                    loaded_count += 1
+                del de
+        if getattr(hf_config, "model_type", "") == "qwen3_5_moe_text":
+            gc.collect()
+        elif i % 4 == 0:
+            gc.collect()
+
+    _has_shexp_gate = ("blk.0.ffn_gate_sw_shexp.weight" in tensor_map) or (
+        "blk.0.ffn_gate_inp_shexp.weight" in tensor_map
+    )
+    if getattr(hf_config, "model_type", "") == "qwen3_5_moe_text" and not _has_shexp_gate:
+        print(
+            ">>> [Info] Qwen3.5 MoE GGUF: no blk.*.ffn_gate_sw_shexp / ffn_gate_inp_shexp; "
+            "shared_expert_gate not loaded from GGUF (defaults retained)."
+        )
 
     # Report unmapped GGUF tensors for debugging
     mapped_prefixes = set()
@@ -542,6 +731,8 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
     special_prefixes = set()
     for i in range(num_layers):
         for sp in ["ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"]:
+            special_prefixes.add(f"blk.{i}.{sp}")
+        for sp in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
             special_prefixes.add(f"blk.{i}.{sp}")
     all_mapped = mapped_prefixes | special_prefixes | {"token_embd.weight", "output_norm.weight", "output.weight"}
     unmapped = [n for n in tensor_map if n not in all_mapped]
@@ -762,6 +953,32 @@ def _load_safetensors(model: nn.Module, model_path: str):
 
     print(f">>> Safetensors loading complete. Loaded {loaded_count} parameters.")
 
+def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> None:
+    """
+    Move model to CUDA, then cast floating tensors to target_dtype without corrupting
+    Qwen3.5 MoE FP8 expert weights or their float32 block scales.
+    """
+    model.to(device="cuda")
+    f8 = getattr(torch, "float8_e4m3fn", None)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if f8 is not None and p.dtype == f8:
+                continue
+            if ".mlp.experts.gate_up_scale" in name or ".mlp.experts.down_scale" in name:
+                continue
+            if not p.is_floating_point():
+                continue
+            p.data = p.data.to(dtype=target_dtype)
+        for name, b in model.named_buffers():
+            if "_gate_up_fp8_cpu" in name or "_gate_up_scale_cpu" in name:
+                continue
+            if "_down_fp8_cpu" in name or "_down_scale_cpu" in name:
+                continue
+            if not b.is_floating_point():
+                continue
+            b.copy_(b.to(dtype=target_dtype))
+
+
 def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
     """
     Match Hugging Face checkpoint dtype from config (e.g. text_config.dtype / torch_dtype).
@@ -818,5 +1035,5 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         _load_safetensors(model, cfg.model)
         target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
     print(f">>> Moving model to CUDA (dtype={target_dtype})...")
-    model.to(device="cuda", dtype=target_dtype)
+    _apply_cuda_then_hf_dtype(model, target_dtype)
     return model.eval()

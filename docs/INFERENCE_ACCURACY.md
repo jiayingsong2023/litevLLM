@@ -50,6 +50,8 @@
 | `blk.{i}.ssm_conv1d.weight` | `linear_attn.conv1d` | `[conv_dim, 1, kernel]` |
 | `blk.{i}.ffn_*.weight` | `mlp.*` | 见 MLP 标准形状 |
 
+**Qwen3.5 35B MoE（`Qwen3_5MoeForConditionalGeneration` / `model_type: qwen3_5_moe_text`）**：FFN 为 HF 同构的稀疏 MoE 块（`mlp.gate`、`mlp.experts.gate_up_proj` / `down_proj`、`mlp.shared_expert`、`mlp.shared_expert_gate`）。GGUF 中路由为 `ffn_gate_inp`；专家 `ffn_gate_exps` 与 `ffn_up_exps` 在加载时 `concat` 为 `gate_up_proj`；共享专家为 `ffn_*_shexp`；可选 `ffn_gate_sw_shexp` 对应 `shared_expert_gate`（若缺失则保留初始化并打日志）。线性注意力相关的 V 头逆重排与 RMSNorm `-1` 校正对 `qwen3_5_moe_text` 与稠密 `qwen3_5` 相同。验收：`scripts/qwen35_gguf_alignment_audit.py --moe`、`verify_semantic_integrity --preset qwen35_35b_moe_gguf`（需本地 GGUF + HF 参考；**显存**大，可先跑权重 CosSim 审计）。
+
 HF `state_dict` 常用前缀 `model.language_model.layers.*`；审计脚本会尝试两种前缀。
 
 ### 3.2 二维权重与 `ssm_conv1d`
@@ -104,6 +106,18 @@ PYTHONPATH=. uv run python tests/verify_semantic_integrity.py \
   --hf-model models/Qwen3.5-9B-FP16
 ```
 
+**Qwen3.5 35B MoE GGUF**（需本地路径与足够显存；可先跑 `--moe` 审计）：
+
+```bash
+export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-0}"
+PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
+  --gguf /path/to/Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --hf-dir /path/to/Qwen3.5-35B-A3B --moe
+PYTHONPATH=. uv run python tests/verify_semantic_integrity.py \
+  --model /path/to/qwen35-moe.gguf --preset qwen35_35b_moe_gguf \
+  --hf-model /path/to/Qwen3.5-35B-A3B --hf-device cuda
+```
+
 **逐层 / 最后一层 hidden**：
 
 ```bash
@@ -140,17 +154,17 @@ PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
 
 ## 6. 推荐抽检 Prompt（B 档）
 
-建议温度 **0～0.7**，每模型至少 **3～5 条**。
+建议温度 **0～0.7**，每模型至少 **3～5 条**。对 **Qwen Instruct** 等对话模型，`scripts/quality_bar_spotcheck.py` 默认使用 ``--chat-template auto``，将每条提示包装为 **user** 轮（与裸续写相比通常更连贯）。
 
 ### 英文常识
 
-1. `The capital of France is`
+1. `What is the capital of France? Answer in a few words.`
 2. `Explain what a binary search tree is in one short paragraph.`
 3. `Write a Python function that returns the sum of a list of integers.`
 
 ### 中文
 
-1. `法国的首都是`
+1. `法国的首都是哪里？请用一句话回答。`
 2. `用两三句话解释什么是梯度下降。`
 3. `请用 Python 写一个简单的 Hello World 程序。`
 
@@ -172,7 +186,7 @@ PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
 | P0 | 主干前向与 HF 不一致（与量化无关） | 先收紧 FP16/BF16 同目录 A 档、RoPE、解码循环 |
 | P1 | GGUF 映射 / 反量化 / 布局 | `model_loader/__init__.py`、§2、§3、`qwen35_gguf_alignment_audit.py` |
 | P2 | AWQ pack / matmul | `tensor.py`、`qwen3_5.py` |
-| P3 | 工具与可见性 | spotcheck、本文档 |
+| P3 | 工具与可见性 | `quality_bar_spotcheck.py`、本文档；**MoE packed vs 稠密 logits**：`scripts/qwen35_moe_packed_lite_logits_audit.py`（`dump`/`diff`/`weight-parity`） |
 
 对比 GGUF 与 HF 前请确认 **同源 revision**；否则 CosSim 低可能来自权重差异而非实现 bug。
 

@@ -78,6 +78,11 @@ def main() -> int:
         action="store_true",
         help="Run depthwise conv1d on random input (GGUF vs HF weights)",
     )
+    parser.add_argument(
+        "--moe",
+        action="store_true",
+        help="Also audit Qwen3.5 MoE FFN tensors (gate / fused experts / shared / optional gate_sw)",
+    )
     args = parser.parse_args()
 
     import gguf
@@ -198,6 +203,103 @@ def main() -> int:
                 )
                 c2, m2 = _cosine_and_maxerr(y_hf, y_lite)
                 print(f"  conv1d output (random x): CosSim={c2:.6f} MaxErr={m2:.6f}")
+
+    if args.moe:
+        print("\n=== Qwen3.5 MoE FFN (HF-aligned names) ===\n")
+        E = int(getattr(hf_config, "num_experts", 0) or 0)
+        H = int(getattr(hf_config, "hidden_size", 0) or 0)
+        inter = int(getattr(hf_config, "moe_intermediate_size", 0) or 0)
+        sh = int(getattr(hf_config, "shared_expert_intermediate_size", 0) or 0)
+        if not (E and H and inter and sh):
+            print("  [SKIP] Missing num_experts/hidden_size/moe_intermediate_size/shared_expert_intermediate_size in config")
+        else:
+
+            def _cmp(gguf_name: str, hf_rel: str, tgt_shape: torch.Size, fused: torch.Tensor | None = None) -> None:
+                nonlocal ok
+                if fused is None and gguf_name not in tensor_map:
+                    print(f"  [SKIP] {gguf_name} not in GGUF")
+                    return
+                src = (
+                    fused
+                    if fused is not None
+                    else ml._dequantize_gguf_tensor(tensor_map[gguf_name], "cpu", torch.float16, tgt_shape)
+                )
+                if src is None:
+                    print(f"  [FAIL] {gguf_name}: dequant returned None")
+                    ok = False
+                    return
+                cand = [_hf_layer0_key(hf_rel), f"model.layers.0.{hf_rel}"]
+                try:
+                    hf_key, hf_w = _resolve_hf_weight_key(args.hf_dir, cand)
+                except KeyError as e:
+                    print(f"  [WARN] {gguf_name}: {e}")
+                    return
+                hf_w = hf_w.to(torch.float16)
+                if src.shape != hf_w.shape:
+                    print(f"  [SHAPE] {gguf_name}: dequant {tuple(src.shape)} vs HF {tuple(hf_w.shape)}")
+                    ok = False
+                    return
+                cos, mx = _cosine_and_maxerr(src, hf_w)
+                status = "OK" if cos > 0.999 and mx < 0.5 else "CHECK"
+                print(f"  {gguf_name} -> {hf_key}: CosSim={cos:.6f} MaxErr={mx:.6f} [{status}]")
+                if cos < 0.99:
+                    ok = False
+
+            _cmp("blk.0.ffn_gate_inp.weight", "mlp.gate.weight", torch.Size([E, H]))
+            ge = "blk.0.ffn_gate_exps.weight"
+            ue = "blk.0.ffn_up_exps.weight"
+            if ge in tensor_map and ue in tensor_map:
+                g_half = ml._dequantize_gguf_tensor(
+                    tensor_map[ge], "cpu", torch.float16, torch.Size([E, inter, H])
+                )
+                u_half = ml._dequantize_gguf_tensor(
+                    tensor_map[ue], "cpu", torch.float16, torch.Size([E, inter, H])
+                )
+                if g_half is not None and u_half is not None:
+                    fused_gu = torch.cat([g_half, u_half], dim=1)
+                    _cmp(ge, "mlp.experts.gate_up_proj", torch.Size([E, 2 * inter, H]), fused=fused_gu)
+                else:
+                    print("  [FAIL] ffn_gate_exps / ffn_up_exps dequant")
+                    ok = False
+            else:
+                print("  [SKIP] MoE gate/up expert tensors missing")
+
+            _cmp("blk.0.ffn_down_exps.weight", "mlp.experts.down_proj", torch.Size([E, H, inter]))
+            _cmp("blk.0.ffn_gate_shexp.weight", "mlp.shared_expert.gate_proj.weight", torch.Size([sh, H]))
+            _cmp("blk.0.ffn_up_shexp.weight", "mlp.shared_expert.up_proj.weight", torch.Size([sh, H]))
+            _cmp("blk.0.ffn_down_shexp.weight", "mlp.shared_expert.down_proj.weight", torch.Size([H, sh]))
+
+            sw_name = None
+            for cand in ("blk.0.ffn_gate_sw_shexp.weight", "blk.0.ffn_gate_inp_shexp.weight"):
+                if cand in tensor_map:
+                    sw_name = cand
+                    break
+            if sw_name is not None:
+                src = ml._dequantize_gguf_tensor(
+                    tensor_map[sw_name], "cpu", torch.float16, torch.Size([1, H])
+                )
+                if src is not None:
+                    try:
+                        hf_key, hf_w = _resolve_hf_weight_key(
+                            args.hf_dir,
+                            [
+                                _hf_layer0_key("mlp.shared_expert_gate.weight"),
+                                "model.layers.0.mlp.shared_expert_gate.weight",
+                            ],
+                        )
+                        hf_w = hf_w.to(torch.float16)
+                        cos, mx = _cosine_and_maxerr(src, hf_w)
+                        print(f"  {sw_name} -> {hf_key}: CosSim={cos:.6f} MaxErr={mx:.6f}")
+                    except KeyError as e:
+                        print(f"  [WARN] {sw_name}: HF key {e}")
+                else:
+                    print(f"  [FAIL] {sw_name}: dequant None")
+                    ok = False
+            else:
+                print(
+                    "  [INFO] blk.0.ffn_gate_sw_shexp / ffn_gate_inp_shexp not in GGUF "
+                    "(optional; HF may still define shared_expert_gate)"
+                )
 
     print("\n=== Done ===")
     return 0 if ok else 1

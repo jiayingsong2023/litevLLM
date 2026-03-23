@@ -14,6 +14,15 @@ Lite path.
 Use ``--hf-same-as-lite`` to load the HF reference from the **same** directory as
 ``--model`` (e.g. AWQ/GGUF tree). That isolates Lite vs HF *implementation* drift;
 use a separate ``--hf-model`` FP16/BF16 tree only when checking against an unquantized baseline.
+
+Optional: ``--apply-chat-template auto|on`` wraps the prompt like Tier-B spotcheck; ``--prefill-only``
+skips full greedy generation and only checks last prefill logits vs HF (CosSim + argmax).
+
+For **Lite GGUF or AWQ vs separate HF FP16** (``--hf-model`` pointing to a different tree), cosine uses a
+relaxed floor (``PREFILL_COSIM_MIN_*_VS_FP16``); argmax must still match. Same-directory Lite vs HF
+(``--hf-same-as-lite`` or no ``--hf-model``) keeps the strict ``PREFILL_COSIM_MIN``. **35B MoE GGUF** usually cannot
+load a matching HF model for logits compare; use **9B GGUF vs 9B FP16** here, or
+``scripts/qwen35_moe_packed_lite_logits_audit.py`` (packed vs dense) on the 35B tree.
 """
 import json
 import torch
@@ -31,9 +40,37 @@ from vllm.engine.lite_engine import LiteEngine
 from vllm.sampling_params import SamplingParams
 import time
 import argparse
+import math
 import os
 import sys
 from typing import Any, Callable, List, Optional
+
+# Prefill-only audit: HF reference logits must align within this cosine floor (aligned vocab slice).
+# Same-precision Lite vs HF (e.g. both FP16).
+PREFILL_COSIM_MIN = 0.998
+# Lite GGUF vs HF FP16 baseline: quantization shifts logits; argmax match is primary.
+PREFILL_COSIM_MIN_GGUF_VS_FP16 = 0.99
+# Lite AWQ vs HF FP16 baseline: INT4 groupwise weights vs BF16 reference; same rationale as GGUF vs FP16.
+PREFILL_COSIM_MIN_AWQ_VS_FP16 = 0.99
+
+
+def prefill_cosine_floor_for_hf_compare(
+    model_path: str,
+    hf_model_path: Optional[str],
+    quant_type: str,
+) -> float:
+    """Cosine floor for prefill-only Lite vs HF when HF may use a different checkpoint than Lite."""
+    if hf_model_path is None:
+        return PREFILL_COSIM_MIN
+    if os.path.abspath(os.path.realpath(hf_model_path)) == os.path.abspath(
+        os.path.realpath(model_path)
+    ):
+        return PREFILL_COSIM_MIN
+    if quant_type == "gguf":
+        return PREFILL_COSIM_MIN_GGUF_VS_FP16
+    if quant_type == "awq":
+        return PREFILL_COSIM_MIN_AWQ_VS_FP16
+    return PREFILL_COSIM_MIN
 
 
 def _lite_engine_step_budget(
@@ -174,6 +211,69 @@ def _resolve_hf_torch_dtype(config_path_dir: str) -> torch.dtype:
     return torch.float16
 
 
+def _looks_like_preformatted_chat(text: str) -> bool:
+    s = text.lstrip()
+    if len(s) >= 12 and "<|im_start|>" in s[:400]:
+        return True
+    if s.startswith("<|") and "user" in s[:120].lower():
+        return True
+    return False
+
+
+def apply_chat_template_for_verify(raw_prompt: str, tokenizer: Any, mode: str) -> str:
+    """
+    Wrap plain text as a single user turn when mode is auto/on (align with Tier-B spotcheck).
+    mode: off | auto | on
+    """
+    if mode == "off":
+        return raw_prompt
+    tpl = getattr(tokenizer, "chat_template", None)
+    if not tpl:
+        if mode == "on":
+            print(
+                "  [Warning] --apply-chat-template on but tokenizer has no chat_template; using raw prompt."
+            )
+        return raw_prompt
+    if mode == "auto":
+        print(
+            "  [Verify] --apply-chat-template auto: wrapping prompt as user message (tokenizer has chat_template)."
+        )
+    else:
+        print("  [Verify] --apply-chat-template on: wrapping prompt as user message.")
+    if _looks_like_preformatted_chat(raw_prompt):
+        return raw_prompt
+    try:
+        try:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": raw_prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": raw_prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+    except Exception as e:
+        print(f"  [Warning] chat template failed: {e}; using raw prompt.")
+        return raw_prompt
+
+
+def prefill_hf_alignment_pass(
+    cos_sim: Optional[float],
+    lite_argmax: Optional[int],
+    hf_argmax: Optional[int],
+    cos_min: float = PREFILL_COSIM_MIN,
+) -> bool:
+    if cos_sim is None or lite_argmax is None or hf_argmax is None:
+        return False
+    if not math.isfinite(cos_sim):
+        return False
+    return (cos_sim >= cos_min) and (int(lite_argmax) == int(hf_argmax))
+
+
 def compare_logits_aligned(lite_logits: torch.Tensor, ref_logits: torch.Tensor):
     """Align vocab dims, skip NaN/Inf; return (cos_sim, max_err) or (nan, nan) if unusable."""
     a = lite_logits.float().flatten()
@@ -241,12 +341,21 @@ def run_alignment_test(
     activation_audit: bool = False,
     activation_audit_max_passes: Optional[int] = None,
     disable_qwen35_stabilizers: bool = False,
+    apply_chat_template: str = "off",
+    prefill_only: bool = False,
 ):
     print(f"\n" + "="*60)
     print(f"AUDITING: {os.path.basename(model_path)} (Quant: {quant_type})")
     if hf_model_path:
         print(f"  HF baseline: {hf_model_path}")
         print(f"  HF device: {hf_device}")
+    mp_low = model_path.lower()
+    if quant_type == "gguf" and ("35b" in mp_low or "moe" in mp_low):
+        print(
+            "  [Note] 35B MoE GGUF: full HF logits comparison is often infeasible on one machine; "
+            "prefer 9B GGUF vs 9B FP16 here, or scripts/qwen35_moe_packed_lite_logits_audit.py "
+            "(packed vs dense) on this checkpoint."
+        )
     print("="*60)
 
     device = "cuda"
@@ -306,6 +415,7 @@ def run_alignment_test(
     tokenizer_source = hf_model_path if hf_model_path else model_path
     tokenizer = get_tokenizer(tokenizer_source, trust_remote_code=True)
     engine.tokenizer = tokenizer
+    prompt = apply_chat_template_for_verify(prompt, tokenizer, apply_chat_template)
 
     _act_sniffer = None
     if activation_audit:
@@ -380,6 +490,10 @@ def run_alignment_test(
             print(f"[2/3] HF Reference will load after Lite prefill (path={hf_load_path}, device={hf_device})...")
 
         # 3. Execution & Comparison (Greedy)
+        prefill_cos_sim: Optional[float] = None
+        prefill_lite_argmax: Optional[int] = None
+        prefill_hf_argmax: Optional[int] = None
+
         input_ids_tokens = tokenizer.encode(prompt, return_tensors="pt")
         print(f"  Input Tokens: {input_ids_tokens[0].tolist()}")
         prompt_token_len = int(input_ids_tokens.shape[1])
@@ -388,7 +502,10 @@ def run_alignment_test(
             engine, prompt_token_len, max_new_tokens
         )
 
-        print(f"[3/3] Running Generation Audit...")
+        if prefill_only:
+            print("[3/3] Running Prefill Audit (full multi-token generation skipped)...")
+        else:
+            print(f"[3/3] Running Generation Audit...")
 
         # Prefill logits: when --hf-model is set, run Lite FIRST while GPU is not shared with HF.
         lite_prefill_logits_cpu = None
@@ -445,6 +562,9 @@ def run_alignment_test(
                 cos_sim, max_err = compare_logits_aligned(lite_prefill_logits_cpu, hf_logits_cmp)
                 print(f"  Prefill Logits -> CosSim: {cos_sim:.6f}, MaxErr: {max_err:.6f}")
                 print(f"  Prefill Token: HF={hf_token} | Lite={lite_prefill_token}")
+                prefill_cos_sim = cos_sim
+                prefill_lite_argmax = lite_prefill_token
+                prefill_hf_argmax = hf_token
 
         elif hf_model is not None:
             hf_eval_device = next(hf_model.parameters()).device
@@ -486,55 +606,86 @@ def run_alignment_test(
             cos_sim, max_err = compare_logits_aligned(lite_logits, hf_logits_cmp)
             print(f"  Prefill Logits -> CosSim: {cos_sim:.6f}, MaxErr: {max_err:.6f}")
             print(f"  Prefill Token: HF={hf_token} | Lite={lite_token}")
-    
-        # Multi-token Generation Audit
-        # LitevLLM for full sequence
-        engine.add_request(
-            "audit_full",
-            prompt,
-            SamplingParams(max_tokens=max_new_tokens, temperature=0.0),
-        )
-        full_lite_out = _run_lite_steps_until(
-            engine,
-            "Full greedy generation audit",
-            step_budget_full,
-            lambda outs: (
-                outs[0].outputs[0] if outs and outs[0].finished else None
-            ),
-        )
+            prefill_cos_sim = cos_sim
+            prefill_lite_argmax = lite_token
+            prefill_hf_argmax = hf_token
 
-        lite_text = full_lite_out.text
-        print(f"  LitevLLM Output: '{lite_text}'")
-        print(f"  Lite Tokens: {full_lite_out.token_ids}")
-
-        if hf_model is not None:
-            hf_eval_device = next(hf_model.parameters()).device
-            input_ids_hf = input_ids_tokens.to(hf_eval_device)
-            gen_kwargs = {"max_new_tokens": max_new_tokens, "do_sample": False}
-            pad_id = getattr(tokenizer, "pad_token_id", None)
-            if pad_id is None:
-                pad_id = getattr(tokenizer, "eos_token_id", None)
-            if pad_id is not None:
-                gen_kwargs["pad_token_id"] = pad_id
-            attn_mask_gen = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
-            gen_kwargs["attention_mask"] = attn_mask_gen
-            hf_full_gen = hf_model.generate(input_ids_hf, **gen_kwargs)
-            hf_text = tokenizer.decode(hf_full_gen[0][input_ids_hf.shape[-1]:])
-            print(f"  HF Reference:   '{hf_text}'")
-        
-            match = (lite_text.strip() == hf_text.strip())
-            if match:
-                print("  ✅ PASS: Semantic Integrity Verified.")
+        if prefill_only:
+            if hf_model is not None and prefill_cos_sim is not None:
+                cos_floor = prefill_cosine_floor_for_hf_compare(
+                    model_path, hf_model_path, quant_type
+                )
+                audit_result = prefill_hf_alignment_pass(
+                    prefill_cos_sim,
+                    prefill_lite_argmax,
+                    prefill_hf_argmax,
+                    cos_min=cos_floor,
+                )
+                if audit_result:
+                    print(
+                        f"  ✅ PASS: Prefill aligns vs HF (CosSim>={cos_floor}, argmax match)."
+                    )
+                else:
+                    print(
+                        f"  ❌ FAIL: Prefill mismatch vs HF (need CosSim>={cos_floor} "
+                        "and matching greedy argmax)."
+                    )
             else:
-                print("  ❌ FAIL: Semantic Drift Detected.")
-                lite_tokens = full_lite_out.token_ids
-                hf_tokens = hf_full_gen[0][input_ids_hf.shape[-1]:].tolist()
-                print(f"  Lite Tokens: {lite_tokens}")
-                print(f"  HF Tokens:   {hf_tokens}")
-            audit_result = match
+                print(
+                    "  [Info] Prefill-only run: no HF prefill comparison (no_hf or HF load failed)."
+                )
+                audit_result = True
         else:
-            print("  [Info] Completed LitevLLM-only run (no reference comparison).")
-            audit_result = True
+            # Multi-token Generation Audit — Lite full greedy sequence
+            engine.add_request(
+                "audit_full",
+                prompt,
+                SamplingParams(max_tokens=max_new_tokens, temperature=0.0),
+            )
+            full_lite_out = _run_lite_steps_until(
+                engine,
+                "Full greedy generation audit",
+                step_budget_full,
+                lambda outs: (
+                    outs[0].outputs[0] if outs and outs[0].finished else None
+                ),
+            )
+
+            lite_text = full_lite_out.text
+            print(f"  LitevLLM Output: '{lite_text}'")
+            print(f"  Lite Tokens: {full_lite_out.token_ids}")
+
+            if hf_model is not None:
+                hf_eval_device = next(hf_model.parameters()).device
+                input_ids_hf = input_ids_tokens.to(hf_eval_device)
+                gen_kwargs = {"max_new_tokens": max_new_tokens, "do_sample": False}
+                pad_id = getattr(tokenizer, "pad_token_id", None)
+                if pad_id is None:
+                    pad_id = getattr(tokenizer, "eos_token_id", None)
+                if pad_id is not None:
+                    gen_kwargs["pad_token_id"] = pad_id
+                attn_mask_gen = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+                gen_kwargs["attention_mask"] = attn_mask_gen
+                hf_full_gen = hf_model.generate(input_ids_hf, **gen_kwargs)
+                hf_text = tokenizer.decode(
+                    hf_full_gen[0][input_ids_hf.shape[-1]:],
+                    skip_special_tokens=True,
+                )
+                print(f"  HF Reference:   '{hf_text}'")
+
+                match = (lite_text.strip() == hf_text.strip())
+                if match:
+                    print("  ✅ PASS: Semantic Integrity Verified.")
+                else:
+                    print("  ❌ FAIL: Semantic Drift Detected.")
+                    lite_tokens = full_lite_out.token_ids
+                    hf_tokens = hf_full_gen[0][input_ids_hf.shape[-1]:].tolist()
+                    print(f"  Lite Tokens: {lite_tokens}")
+                    print(f"  HF Tokens:   {hf_tokens}")
+                audit_result = match
+            else:
+                print("  [Info] Completed LitevLLM-only run (no reference comparison).")
+                audit_result = True
     finally:
         if _act_sniffer is not None:
             _act_sniffer.detach()
@@ -603,6 +754,23 @@ if __name__ == "__main__":
             "(sets FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP / FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER)."
         ),
     )
+    parser.add_argument(
+        "--apply-chat-template",
+        type=str,
+        choices=("off", "auto", "on"),
+        default="off",
+        help=(
+            "Wrap --prompt as a single user turn via tokenizer.apply_chat_template when available "
+            "(align with Tier-B spotcheck). Default off: raw prompt string."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-only",
+        action="store_true",
+        help=(
+            "Only compare last prefill logits + greedy first token vs HF; skip full multi-token audit."
+        ),
+    )
     args = parser.parse_args()
 
     if args.hf_same_as_lite and args.no_hf:
@@ -642,7 +810,8 @@ if __name__ == "__main__":
 
     print(
         f"[Config] preset={args.preset}, quant={effective_quant}, "
-        f"max_new_tokens={effective_max_new_tokens}, hf_device={hf_device}"
+        f"max_new_tokens={effective_max_new_tokens}, hf_device={hf_device}, "
+        f"apply_chat_template={args.apply_chat_template}, prefill_only={args.prefill_only}"
     )
     if effective_hf_model_path and not args.no_hf:
         same = os.path.abspath(effective_hf_model_path) == os.path.abspath(args.model)
@@ -662,6 +831,8 @@ if __name__ == "__main__":
         activation_audit=args.activation_audit,
         activation_audit_max_passes=args.activation_audit_max_passes,
         disable_qwen35_stabilizers=args.disable_qwen35_stabilizers,
+        apply_chat_template=args.apply_chat_template,
+        prefill_only=args.prefill_only,
     )
     if not success:
         exit(1)

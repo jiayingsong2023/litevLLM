@@ -55,6 +55,18 @@ class LiteConfig:
         self.linear_conv_kernel_dim = getattr(hf_config, "linear_conv_kernel_dim", 4)
         self.hidden_act = getattr(hf_config, "hidden_act", "silu")
 
+        # Qwen3.5 MoE text (e.g. Qwen3_5MoeTextConfig / qwen3_5_moe_text)
+        self.model_type = getattr(hf_config, "model_type", "") or ""
+        self.num_experts = int(getattr(hf_config, "num_experts", 0) or 0)
+        self.num_experts_per_tok = int(getattr(hf_config, "num_experts_per_tok", 0) or 0)
+        self.moe_intermediate_size = int(getattr(hf_config, "moe_intermediate_size", 0) or 0)
+        self.shared_expert_intermediate_size = int(
+            getattr(hf_config, "shared_expert_intermediate_size", 0) or 0
+        )
+        _lt = getattr(hf_config, "layer_types", None)
+        self.layer_types: Optional[list] = _lt if isinstance(_lt, list) else None
+        self.full_attention_interval = int(getattr(hf_config, "full_attention_interval", 4) or 4)
+
     @classmethod
     def from_model_config(cls, model_config: Any) -> "LiteConfig":
         if hasattr(model_config, "hf_config") and model_config.hf_config is not None:
