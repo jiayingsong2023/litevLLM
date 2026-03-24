@@ -68,9 +68,28 @@ class CachedHfTokenizer(TokenizerLike):
         download_dir: str | None = None,
         **kwargs,
     ) -> HfTokenizer:
+        tok_path = str(path_or_repo_id)
+        try:
+            from vllm.model_executor.models.deepseek_hf_reference import (
+                resolve_deepseek_hf_chat_dir,
+            )
+
+            ref = resolve_deepseek_hf_chat_dir(tok_path)
+            if ref:
+                tok_path = ref
+        except Exception:
+            pass
+        try:
+            from vllm.model_executor.models.deepseek_v2 import (
+                patch_deepseek_config_json_for_tokenizer,
+            )
+
+            patch_deepseek_config_json_for_tokenizer(tok_path)
+        except Exception:
+            pass
         try:
             tokenizer = AutoTokenizer.from_pretrained(
-                path_or_repo_id,
+                tok_path,
                 *args,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
@@ -99,7 +118,7 @@ class CachedHfTokenizer(TokenizerLike):
         # The special_tokens in tokenizer should also be
         # controlled by do_lower_case in encoder_config
         encoder_config = get_sentence_transformer_tokenizer_config(
-            path_or_repo_id, revision
+            tok_path, revision
         )
         if isinstance(encoder_config, dict) and encoder_config.get(
             "do_lower_case", False

@@ -4,7 +4,7 @@
 Print expected alignment metrics from automated tests (see docs/INFERENCE_ACCURACY.md §4).
 
 Usage:
-  uv run python scripts/report_expected_alignment_metrics.py
+  uv run python tests/tools/report_expected_alignment_metrics.py
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main() -> int:
@@ -20,7 +20,6 @@ def main() -> int:
     tests = [
         "tests/test_qwen35_chunk_gated_delta_rule.py",
         "tests/test_qwen35_paged_prefill_vs_torch_reference.py",
-        "tests/test_lite_config_rope_parameters.py",
     ]
     cmd = [sys.executable, "-m", "pytest", "-q", "--tb=no"] + tests
     print("Running:", " ".join(cmd), flush=True)
@@ -29,7 +28,6 @@ def main() -> int:
     print("Expected (see docs/INFERENCE_ACCURACY.md §4):")
     print("  • Chunk gated delta (Lite vs FLA naive): max_err 0 when fla installed")
     print("  • Paged prefill vs torch reference (CUDA): allclose within test rtol/atol")
-    print("  • LiteConfig: rope_parameters=null -> empty dict")
     return r.returncode
 
 

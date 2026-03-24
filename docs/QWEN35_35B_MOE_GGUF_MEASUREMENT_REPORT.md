@@ -75,7 +75,7 @@ print('MoE block forward OK:', tuple(y.shape))
 ```bash
 export FASTINFERENCE_KV_FP8=0
 export MODEL=/path/to/Qwen3.5-35B-A3B-GGUF   # 含 config + tokenizer + .gguf
-PYTHONPATH=. uv run python scripts/quality_bar_spotcheck.py \
+PYTHONPATH=. uv run python tests/tools/quality_bar_spotcheck.py \
   --model "$MODEL" --quant gguf \
   --prompt-subset minimal --max-new-tokens 96 --temperature 0
 ```
@@ -85,7 +85,7 @@ PYTHONPATH=. uv run python scripts/quality_bar_spotcheck.py \
 ### 4.2 权重对齐（CosSim）
 
 ```bash
-PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
+PYTHONPATH=. uv run python tests/tools/qwen35_gguf_alignment_audit.py \
   --gguf /path/to/model.gguf \
   --hf-dir /path/to/Qwen3.5-35B-A3B-HF \
   --moe

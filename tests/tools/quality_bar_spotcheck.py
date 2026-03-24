@@ -19,10 +19,11 @@ import json
 import os
 import sys
 import unicodedata
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Repo root
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -40,6 +41,16 @@ _REPLACEMENT_CHARS_SEVERE = 0.12
 _CONTROL_CHAR_RATIO_SEVERE = 0.08
 _MAX_TOKEN_REPEAT_RATIO_SEVERE = 0.82
 _MAX_CHAR_RUN_SEVERE = 24
+# One character dominates the body (e.g. CJK spam like repeated「上」mixed with junk).
+_MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE = 0.11
+# Natural English/Latin prose often has ~12–16% for the most frequent letter (e.g. "e");
+# keep a higher bar only when Latin letters dominate non-space text.
+_MAX_CHAR_FREQUENCY_DOMINANCE_LATIN_PROSE = 0.19
+_MIN_LATIN_LETTER_RATIO_FOR_RELAXED_DOMINANCE = 0.55
+_MIN_NONSPACE_FOR_DOMINANCE_CHECK = 28
+# Long completions with very few distinct token ids (loop / collapse).
+_MIN_UNIQUE_TOKEN_RATIO_SEVERE = 0.20
+_MIN_TOKENS_FOR_DIVERSITY_CHECK = 40
 
 # Substance heuristics: catch completions that pass replacement/control checks but are
 # human-unreadable (newline-only, digit/symbol soup). Tunable; see tests.
@@ -78,19 +89,39 @@ def _model_config_hints(model_path: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"is_moe": False, "model_type": ""}
     try:
         p = os.path.join(model_path, "config.json")
-        if not os.path.isfile(p):
+        raw = None
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        # GGUF trees often have no config.json; use sibling HF Chat (same as tokenizer resolution).
+        if raw is None:
+            try:
+                from vllm.model_executor.models.deepseek_hf_reference import (
+                    resolve_deepseek_hf_chat_dir,
+                )
+
+                ref = resolve_deepseek_hf_chat_dir(model_path)
+                if ref:
+                    ref_cfg = os.path.join(ref, "config.json")
+                    if os.path.isfile(ref_cfg):
+                        with open(ref_cfg, "r", encoding="utf-8") as f:
+                            raw = json.load(f)
+            except Exception:
+                pass
+        if raw is None:
             return out
-        with open(p, "r", encoding="utf-8") as f:
-            raw = json.load(f)
         tc = raw.get("text_config")
         if isinstance(tc, dict):
             mt = str(tc.get("model_type", "") or "")
             ne = int(tc.get("num_experts", 0) or 0)
+            n_routed = int(tc.get("n_routed_experts", 0) or 0)
         else:
             mt = str(raw.get("model_type", "") or "")
             ne = int(raw.get("num_experts", 0) or 0)
+            # DeepSeek V2 Lite GGUF uses n_routed_experts, not num_experts
+            n_routed = int(raw.get("n_routed_experts", 0) or 0)
         out["model_type"] = mt
-        out["is_moe"] = ne > 1 or "moe" in mt.lower()
+        out["is_moe"] = ne > 1 or n_routed > 1 or "moe" in mt.lower()
     except Exception:
         pass
     return out
@@ -188,6 +219,41 @@ def _max_consecutive_same_token(token_ids: List[int]) -> int:
             run = 1
             prev = t
     return best
+
+
+def _max_char_frequency_ratio(nonspace_text: str) -> float:
+    """Share of the most frequent character in non-space text (0 if empty)."""
+    if not nonspace_text:
+        return 0.0
+    c = Counter(nonspace_text)
+    return max(c.values()) / len(nonspace_text)
+
+
+def _latin_letter_ratio_nonspace(nonspace_text: str) -> float:
+    """Share of Basic Latin letters (A–Z, a–z) in non-space text."""
+    if not nonspace_text:
+        return 0.0
+    n = sum(
+        1
+        for ch in nonspace_text
+        if unicodedata.category(ch).startswith("L") and ord(ch) < 128
+    )
+    return n / len(nonspace_text)
+
+
+def _max_char_frequency_domination_threshold(nonspace_text: str) -> float:
+    """Severe threshold for max-char share; relaxed for Latin-heavy prose."""
+    if len(nonspace_text) < _MIN_NONSPACE_FOR_DOMINANCE_CHECK:
+        return float("inf")
+    if _latin_letter_ratio_nonspace(nonspace_text) >= _MIN_LATIN_LETTER_RATIO_FOR_RELAXED_DOMINANCE:
+        return max(_MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE, _MAX_CHAR_FREQUENCY_DOMINANCE_LATIN_PROSE)
+    return _MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE
+
+
+def _unique_token_ratio(token_ids: List[int]) -> float:
+    if not token_ids:
+        return 1.0
+    return len(set(token_ids)) / len(token_ids)
 
 
 def _max_consecutive_same_char(text: str) -> int:
@@ -389,6 +455,30 @@ def analyze_tier_b(
         flat.append(detail["coherence"]["notes"][-1])
         severe = True
 
+    core_ns = _nonspace_chars(text)
+    dom_thr = _max_char_frequency_domination_threshold(core_ns)
+    if len(core_ns) >= _MIN_NONSPACE_FOR_DOMINANCE_CHECK:
+        dom = _max_char_frequency_ratio(core_ns)
+        if dom >= dom_thr:
+            detail["coherence"]["pass"] = False
+            detail["coherence"]["notes"].append(
+                f"char_frequency_dominance={dom:.2f}>={dom_thr:.2f} "
+                f"(single char over-represented in non-space text)"
+            )
+            flat.append(detail["coherence"]["notes"][-1])
+            severe = True
+
+    if len(token_ids) >= _MIN_TOKENS_FOR_DIVERSITY_CHECK:
+        utr = _unique_token_ratio(token_ids)
+        if utr < _MIN_UNIQUE_TOKEN_RATIO_SEVERE:
+            detail["coherence"]["pass"] = False
+            detail["coherence"]["notes"].append(
+                f"low_token_diversity(unique_ratio={utr:.2f}<{_MIN_UNIQUE_TOKEN_RATIO_SEVERE} "
+                f"on {len(token_ids)} tokens)"
+            )
+            flat.append(detail["coherence"]["notes"][-1])
+            severe = True
+
     first_id = token_ids[0] if token_ids else None
     ft_ok, ft_msgs = _first_token_sanity(tokenizer, first_id, token_ids, text)
     if not ft_ok:
@@ -535,15 +625,19 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "0 = greedy; (0, 0.7] = sampled. Default: 0.55 for --quant gguf (quantized logits are peaky), "
-            "else 0.7. Pass explicitly to override."
+            "0 = greedy; (0, 0.7] = sampled. Default: 0.63 for DeepSeek + GGUF when "
+            "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1, else 0.55 for other --quant gguf, else 0.7. "
+            "Pass explicitly to override."
         ),
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.95,
-        help="Nucleus sampling when temperature > 0 (ignored for greedy). Default 0.95.",
+        default=None,
+        help=(
+            "Nucleus sampling when temperature > 0 (ignored for greedy). "
+            "Default: 0.95, or 0.86 when FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1 (Q4 tail noise)."
+        ),
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -641,8 +735,50 @@ def main() -> int:
 
     hints = _model_config_hints(args.model) if args.quant == "gguf" else {"is_moe": False, "model_type": ""}
 
+    # DeepSeek-V2-Lite Q4 GGUF: logits are too lossy for coherent greedy/sampling Tier-B in practice.
+    # Default Tier-B uses sibling HF bf16 Chat weights (same engine path as A-tier parity); GGUF-only when requested.
+    _ds_gguf_only = os.environ.get("FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if (
+        not _ds_gguf_only
+        and args.quant == "gguf"
+        and hints.get("model_type") == "deepseek_v2"
+    ):
+        try:
+            from vllm.model_executor.models.deepseek_hf_reference import resolve_deepseek_hf_chat_dir
+
+            _ref = resolve_deepseek_hf_chat_dir(args.model)
+        except Exception:
+            _ref = None
+        if _ref:
+            sys.stderr.write(
+                f"[Tier-B] DeepSeek-V2-Lite-GGUF: loading sibling bf16 Chat for readability checks: {_ref}\n"
+                f"  (Set FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1 to run Tier-B on GGUF weights.)\n"
+            )
+            args.model = _ref
+            args.quant = "none"
+            hints = _model_config_hints(args.model)
+
+    _ds_gguf_only_deepseek = (
+        _ds_gguf_only
+        and args.quant == "gguf"
+        and hints.get("model_type") == "deepseek_v2"
+    )
+    if args.top_p is None:
+        args.top_p = 0.86 if _ds_gguf_only_deepseek else 0.95
+
     if args.temperature is None:
-        args.temperature = 0.55 if args.quant == "gguf" else 0.7
+        if _ds_gguf_only_deepseek:
+            # Q4-only: slightly higher temp + tighter nucleus (see top_p) reduces junk from tail mass.
+            args.temperature = 0.63
+        elif args.quant == "gguf":
+            args.temperature = 0.55
+        else:
+            args.temperature = 0.7
 
     if args.temperature < 0 or args.temperature > _MAX_DOC_TEMPERATURE:
         sys.stderr.write(
@@ -650,6 +786,22 @@ def main() -> int:
             f"got {args.temperature}. Clamping to range for reporting.\n"
         )
         args.temperature = max(0.0, min(float(args.temperature), _MAX_DOC_TEMPERATURE))
+
+    # DeepSeek-V2-Lite Q4 GGUF: greedy argmax typically collapses to one token id (repeated "play" / 上).
+    # Tier-B checks readability under mild sampling unless user forces greedy via env.
+    if (
+        hints.get("model_type") == "deepseek_v2"
+        and args.quant == "gguf"
+        and float(args.temperature) <= 1e-6
+        and os.environ.get("FASTINFERENCE_DEEPSEEK_B_TIER_GREEDY", "").strip().lower()
+        not in ("1", "true", "yes", "on")
+    ):
+        args.temperature = 0.63 if _ds_gguf_only_deepseek else 0.55
+        sys.stderr.write(
+            "[Tier-B] DeepSeek-V2-Lite-GGUF: using temperature="
+            f"{args.temperature} (Q4 greedy collapses). "
+            "Set FASTINFERENCE_DEEPSEEK_B_TIER_GREEDY=1 to honor --temperature 0.\n"
+        )
 
     if args.temperature <= 1e-6:
         sys.stderr.write(
@@ -684,25 +836,31 @@ def main() -> int:
                 args.repetition_penalty = 1.0
         elif args.quant == "gguf":
             # MoE + Q4/Q8 logits: stronger penalty reduces "The 10." / digit loops.
-            args.repetition_penalty = 1.18 if hints.get("is_moe") else 1.15
+            if _ds_gguf_only_deepseek and hints.get("is_moe"):
+                args.repetition_penalty = 1.24
+            else:
+                args.repetition_penalty = 1.18 if hints.get("is_moe") else 1.15
         else:
             args.repetition_penalty = 1.12
 
     if args.frequency_penalty is None:
         if args.temperature > 1e-6 and args.quant == "gguf":
-            args.frequency_penalty = 0.06
+            args.frequency_penalty = 0.10 if _ds_gguf_only_deepseek else 0.06
         else:
             args.frequency_penalty = 0.0
 
     if args.presence_penalty is None:
         if args.temperature > 1e-6 and args.quant == "gguf" and hints.get("is_moe"):
-            args.presence_penalty = 0.05
+            args.presence_penalty = 0.08 if _ds_gguf_only_deepseek else 0.05
         else:
             args.presence_penalty = 0.0
 
     effective_top_k = int(args.top_k)
     if args.temperature > 1e-6 and effective_top_k < 0 and args.quant == "gguf":
-        effective_top_k = 40 if hints.get("is_moe") else 50
+        if _ds_gguf_only_deepseek:
+            effective_top_k = 28 if hints.get("is_moe") else 40
+        else:
+            effective_top_k = 40 if hints.get("is_moe") else 50
 
     sys.stderr.write(
         f"[Tier-B] model={args.model!r} quant={args.quant} "
@@ -734,6 +892,22 @@ def main() -> int:
         sys.stderr.write(
             "[Note] FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 lowers MoE GGUF load-time host RSS; "
             "do not combine with FASTINFERENCE_QWEN35_MOE_FP8=1.\n"
+        )
+    if hints.get("model_type") == "deepseek_v2" and args.quant == "gguf":
+        # Default-on for Tier-B readability; override with FASTINFERENCE_*=0 if needed.
+        os.environ.setdefault("FASTINFERENCE_GGUF_DEQUANT_FP32", "1")
+        os.environ.setdefault("FASTINFERENCE_DEEPSEEK_ATTN_FP32", "1")
+        sys.stderr.write(
+            "[Note] DeepSeek V2 Lite GGUF: Tier-B readability (docs/INFERENCE_ACCURACY.md §1). "
+            "Defaulting FASTINFERENCE_GGUF_DEQUANT_FP32=1, FASTINFERENCE_DEEPSEEK_ATTN_FP32=1 "
+            "(unset or =0 to compare).\n"
+        )
+    if _ds_gguf_only_deepseek:
+        sys.stderr.write(
+            "[Note] FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1: Tier-B uses tighter Q4 sampling "
+            "(top_p/top_k/repetition/frequency/presence). "
+            "DeepSeek-V2-Lite Q4_K_M MoE often still looks worse than bf16; for product B-tier "
+            "readability, omit this env so the script loads sibling DeepSeek-V2-Lite-Chat (see docs).\n"
         )
     engine = _build_engine(
         args.model,

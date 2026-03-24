@@ -30,10 +30,14 @@ def run_model_smoke(model_path, name):
         return False
 
 if __name__ == "__main__":
+    # Keep in sync with tests/e2e_full_benchmark.py MODELS (Tier-B / smoke coverage).
     models = [
-        ("models/Qwen3.5-9B-GGUF", "Qwen3.5-9B-GGUF"),
-        ("models/DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-GGUF"),
-        ("models/Qwen3.5-9B-AWQ", "Qwen3.5-9B-AWQ") # THE FINAL CHALLENGE
+        ("models/TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B (Dense)"),
+        ("models/Qwen3.5-9B-GGUF", "Qwen3.5-9B (GGUF Q4)"),
+        ("models/Qwen3.5-9B-AWQ", "Qwen3.5-9B (AWQ INT4)"),
+        ("models/DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite (MoE)"),
+        ("models/GLM-4.7-Flash-GGUF", "GLM-4.7-Flash (MoE)"),
+        ("models/Qwen3.5-35B-MoE-GGUF", "Qwen3.5-35B (Large MoE)"),
     ]
     
     for path, name in models:

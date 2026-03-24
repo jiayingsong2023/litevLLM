@@ -11,11 +11,11 @@ Optional: per-layer submodule hooks on ``model.layers.{i}`` outputs to see where
 Requires the same prompt tokenization as other audits; uses LiteEngine prefill path for Lite.
 
 Usage:
-  PYTHONPATH=. uv run python scripts/verify_qwen35_final_hidden_alignment.py \\
+  PYTHONPATH=. uv run python tests/tools/verify_qwen35_final_hidden_alignment.py \\
     --model models/Qwen3.5-9B-FP16 --hf-model models/Qwen3.5-9B-FP16 --quant none
 
   # Optional: also print CosSim for each layer output (last token position)
-  PYTHONPATH=. uv run python scripts/verify_qwen35_final_hidden_alignment.py \\
+  PYTHONPATH=. uv run python tests/tools/verify_qwen35_final_hidden_alignment.py \\
     --model models/Qwen3.5-9B-FP16 --hf-model models/Qwen3.5-9B-FP16 --quant none --per-layer
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 

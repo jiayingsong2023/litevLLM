@@ -46,7 +46,7 @@ If the process crashes immediately during `torch.zeros` allocation or model load
 
 For a practical bar (“outputs look reasonable” vs bit-exact alignment with Hugging Face), see **[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md)** — recommended spot-check prompts and when lowering the strictness is **not** enough.
 
-To run the tier-B spot-check script (Lite-only, fixed prompts): `uv run python scripts/quality_bar_spotcheck.py --model <path> --quant awq|gguf|none` (see INFERENCE_ACCURACY.md).
+To run the tier-B spot-check script (Lite-only, fixed prompts): `uv run python tests/tools/quality_bar_spotcheck.py --model <path> --quant awq|gguf|none` (see INFERENCE_ACCURACY.md).
 
 ## Semantic integrity (`tests/verify_semantic_integrity.py`)
 

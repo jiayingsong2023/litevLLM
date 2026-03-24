@@ -1,4 +1,4 @@
-# `scripts/` 说明
+# `tests/tools/` 抽检与对齐工具
 
 ## 是否需要提交到 Git（GitHub）
 
@@ -14,7 +14,7 @@
 ## 环境约定
 
 - 在**仓库根目录**执行；Python 脚本需 **`PYTHONPATH=.`**（或使用下文 `uv run` 示例）。
-- 依赖与虚拟环境以项目 **`uv`** / `pyproject.toml` 为准：`uv run python scripts/<name>.py`。
+- 依赖与虚拟环境以项目 **`uv`** / `pyproject.toml` 为准：`uv run python tests/tools/<name>.py`。
 - 多数脚本需要本地模型目录（如 `models/...`），路径由参数或环境变量指定。
 
 更完整的验收档位与命令索引见 **[`docs/INFERENCE_ACCURACY.md`](../docs/INFERENCE_ACCURACY.md)**。
@@ -32,6 +32,9 @@
 | [`qwen35_gated_delta_conv_alignment.py`](qwen35_gated_delta_conv_alignment.py) | 在权重一致时，检查 GatedDeltaNet 前向中 conv+SiLU 与 HF 对齐。 |
 | [`qwen35_chunk_gated_delta_alignment.py`](qwen35_chunk_gated_delta_alignment.py) | Chunk 规则与 FLA naive 等参考实现对比。 |
 | [`verify_qwen35_final_hidden_alignment.py`](verify_qwen35_final_hidden_alignment.py) | 最后一层 / 逐层 hidden 与 HF 的 CosSim（可选 `--per-layer`）。 |
+| [`qwen35_moe_packed_lite_logits_audit.py`](qwen35_moe_packed_lite_logits_audit.py) | 35B MoE GGUF：`dump` / `diff` / `weight-parity`（packed vs dense）。 |
+| [`compare_hf_lite_deepseek_logits.py`](compare_hf_lite_deepseek_logits.py)、[`compare_hf_lite_deepseek_layer_hiddens.py`](compare_hf_lite_deepseek_layer_hiddens.py) | DeepSeek-V2-Lite：HF vs Lite 末位 logits / 逐层 hidden。 |
+| [`diagnose_deepseek_hf_lite_logits.py`](diagnose_deepseek_hf_lite_logits.py) | DeepSeek 分层诊断（指向上述 compare 脚本）。 |
 
 ---
 
@@ -39,14 +42,14 @@
 
 ```bash
 # B 档（观感，贪婪）
-PYTHONPATH=. uv run python scripts/quality_bar_spotcheck.py \
+PYTHONPATH=. uv run python tests/tools/quality_bar_spotcheck.py \
   --model models/Qwen3.5-9B-FP16 --quant none --prompt-subset minimal --temperature 0
 
 # 一键 shell（B 档）
-MODEL=models/Qwen3.5-9B-FP16 bash scripts/run_inference_quality_suite.sh
+MODEL=models/Qwen3.5-9B-FP16 bash tests/tools/run_inference_quality_suite.sh
 
 # GGUF 权重审计
-PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
+PYTHONPATH=. uv run python tests/tools/qwen35_gguf_alignment_audit.py \
   --gguf /path/to/model.gguf --hf-dir /path/to/FP16 --conv-check
 ```
 
@@ -54,5 +57,5 @@ PYTHONPATH=. uv run python scripts/qwen35_gguf_alignment_audit.py \
 
 ## 与 `tests/` 的区别
 
-- **`scripts/`**：偏**人工或本地驱动**的抽检、审计、对齐脚本，参数灵活，模型路径常由用户指定。
-- **`tests/`**：**pytest** 等自动化测试（如 **`verify_semantic_integrity.py`** 做 **A 档** HF 对比），适合 CI；与 `scripts/` 互补，见 [`tests/README.md`](../tests/README.md)。
+- **`tests/tools/`**：偏**人工或本地驱动**的抽检、审计、对齐脚本，参数灵活，模型路径常由用户指定。
+- **`tests/`**：**pytest** 等自动化测试（如 **`verify_semantic_integrity.py`** 做 **A 档** HF 对比），适合 CI；与 `tests/tools/` 互补，见 [`tests/README.md`](../tests/README.md)。

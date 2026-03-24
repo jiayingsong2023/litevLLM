@@ -309,11 +309,15 @@ class LiteEngine:
         if env_chunk:
             self._prefill_chunk_size = max(1, int(env_chunk))
         else:
+            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
             from vllm.model_executor.models.qwen3_5 import (
                 Qwen3_5ForConditionalGeneration,
             )
 
             if isinstance(self.model, Qwen3_5ForConditionalGeneration):
+                self._prefill_chunk_size = self.max_model_len
+            elif isinstance(self.model, DeepseekV2ForCausalLM):
+                # MLA attention in Lite has no paged-KV path yet; full prompt in one forward.
                 self._prefill_chunk_size = self.max_model_len
             else:
                 self._prefill_chunk_size = int(
@@ -459,7 +463,7 @@ class LiteEngine:
             rng = torch.Generator(device=self.device)
             rng.manual_seed(int(seed))
 
-        self._requests[request_id] = {
+        req_dict: Dict[str, Any] = {
             "input_ids": input_ids,
             "generated_ids": [],
             "sampling_params": effective_sampling_params,
@@ -474,6 +478,41 @@ class LiteEngine:
             "linear_attn_carry": [None] * self.num_layers,
             "linear_conv_carry": [None] * self.num_layers,
         }
+        try:
+            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+            if isinstance(self.model, DeepseekV2ForCausalLM):
+                hf = self.model_config.hf_config
+                nh = int(getattr(hf, "num_attention_heads", 16))
+                qk = int(getattr(hf, "qk_nope_head_dim", 128)) + int(
+                    getattr(hf, "qk_rope_head_dim", 64)
+                )
+                vd = int(getattr(hf, "v_head_dim", 128))
+                act_dtype = next(self.model.parameters()).dtype
+                mla_kv = []
+                for _ in range(self.num_layers):
+                    mla_kv.append(
+                        (
+                            torch.zeros(
+                                self.max_model_len,
+                                nh,
+                                qk,
+                                device=self.device,
+                                dtype=act_dtype,
+                            ),
+                            torch.zeros(
+                                self.max_model_len,
+                                nh,
+                                vd,
+                                device=self.device,
+                                dtype=act_dtype,
+                            ),
+                        )
+                    )
+                req_dict["mla_kv"] = mla_kv
+        except Exception:
+            pass
+        self._requests[request_id] = req_dict
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
         self._request_streams[request_id] = asyncio.Queue()
@@ -549,6 +588,12 @@ class LiteEngine:
                 "linear_attn_carry": req["linear_attn_carry"],
                 "linear_conv_carry": req["linear_conv_carry"],
             }
+            if req.get("mla_kv") is not None:
+                attn_metadata["mla_kv"] = req["mla_kv"]
+                attn_metadata["mla_prefill_kv_range"] = (
+                    processed_len,
+                    processed_len + this_chunk_len,
+                )
             positions = torch.arange(processed_len, processed_len + this_chunk_len, device=self.device).unsqueeze(0)
             
             try:
@@ -582,86 +627,173 @@ class LiteEngine:
                 self._free_request(rid)
 
         elif decodes:
-            # Batch ALL decodes
-            input_tokens = []
-            slot_indices = []
-            seq_lens = []
-            pos_indices = []
-            
-            for rid in decodes:
-                req = self._requests[rid]
-                last_token = req["generated_ids"][-1]
-                input_tokens.append([last_token])
-                slot_indices.append(req["slot_idx"])
-                
-                current_len = req["seq_len"]
-                seq_lens.append(current_len + 1) # Including new token
-                pos_indices.append(current_len)
-                
-            curr_input = torch.tensor(input_tokens, device=self.device) # (B, 1)
-            positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1) # (B, 1)
-            
-            # Generate block tables for batch
-            batch_block_tables = []
-            for S in slot_indices:
-                start_block = S * self.num_blocks_per_seq
-                batch_block_tables.append(torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32))
-            block_tables = torch.stack(batch_block_tables).to(self.device)
+            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
 
-            # slot_mapping maps batch tokens to physical indices
-            slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
+            # DeepSeek MLA: single-token decode with per-request mla_kv (O(T) per step).
+            if isinstance(self.model, DeepseekV2ForCausalLM):
+                results_ds: List[Any] = []
+                for rid in decodes:
+                    req = self._requests[rid]
+                    try:
+                        last_token = req["generated_ids"][-1]
+                        curr_input = torch.tensor(
+                            [[last_token]], device=self.device, dtype=torch.long
+                        )
+                        pos = req["seq_len"]
+                        positions = torch.tensor(
+                            [[pos]], device=self.device, dtype=torch.long
+                        )
+                        slot_idx = req["slot_idx"]
+                        start_block = slot_idx * self.num_blocks_per_seq
+                        block_table = torch.arange(
+                            start_block,
+                            start_block + self.num_blocks_per_seq,
+                            device=self.device,
+                            dtype=torch.int32,
+                        )
+                        slot_mapping = torch.tensor(
+                            [slot_idx * self.max_model_len + pos],
+                            device=self.device,
+                            dtype=torch.long,
+                        )
+                        attn_metadata = {
+                            "slot_mapping": slot_mapping,
+                            "seq_lens": torch.tensor(
+                                [pos + 1], device=self.device, dtype=torch.int32
+                            ),
+                            "is_prefill": False,
+                            "kv_start_indices": torch.tensor(
+                                [pos], device=self.device, dtype=torch.int32
+                            ),
+                            "block_tables": block_table.unsqueeze(0),
+                            "linear_attn_carry": req["linear_attn_carry"],
+                            "linear_conv_carry": req["linear_conv_carry"],
+                        }
+                        if req.get("mla_kv") is not None:
+                            attn_metadata["mla_kv"] = req["mla_kv"]
+                            attn_metadata["mla_cached_len"] = pos
+                        logits = self.model(
+                            curr_input,
+                            positions,
+                            self.kv_caches,
+                            attn_metadata,
+                            lora_mapping=req.get("lora_id"),
+                        )
+                        eos_mask = _eos_stop_token_ids_for_sampling(
+                            self.tokenizer,
+                            req["sampling_params"],
+                            getattr(self.model_config, "hf_config", None),
+                        )
+                        token = _sample_token_from_logits(
+                            logits[0, -1, :],
+                            req["sampling_params"],
+                            req["generated_ids"],
+                            req.get("rng"),
+                            eos_token_ids_to_mask=eos_mask,
+                        )
+                        req["generated_ids"].append(token)
+                        req["seq_len"] += 1
+                        self._process_completion(rid, token, results_ds)
+                    except Exception as e:
+                        print(f"!!! LiteEngine Error (Decode DeepSeek): {e}")
+                        import traceback
 
-            req_dicts = [self._requests[rid] for rid in decodes]
-            attn_carry_batch = self._stack_per_layer_carries(
-                req_dicts, self.num_layers, "linear_attn_carry"
-            )
-            conv_carry_batch = self._stack_per_layer_carries(
-                req_dicts, self.num_layers, "linear_conv_carry"
-            )
-            attn_metadata = {
-                "slot_mapping": slot_mapping,
-                "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
-                "block_tables": block_tables,
-                "is_prefill": False,
-                "kv_start_indices": torch.tensor(
-                    pos_indices, device=self.device, dtype=torch.int32
-                ),
-                "linear_attn_carry": attn_carry_batch,
-                "linear_conv_carry": conv_carry_batch,
-            }
+                        traceback.print_exc()
+                        self._free_request(rid)
+                results.extend(results_ds)
+            else:
+                # Batch ALL decodes
+                input_tokens = []
+                slot_indices = []
+                seq_lens = []
+                pos_indices = []
 
-            try:
-                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
-                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
-                self._split_per_layer_carries(
-                    attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
-                )
-                self._split_per_layer_carries(
-                    attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
-                )
-                # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
-                for i, rid in enumerate(decodes):
-                    req_i = self._requests[rid]
-                    eos_mask = _eos_stop_token_ids_for_sampling(
-                        self.tokenizer,
-                        req_i["sampling_params"],
-                        getattr(self.model_config, "hf_config", None),
+                for rid in decodes:
+                    req = self._requests[rid]
+                    last_token = req["generated_ids"][-1]
+                    input_tokens.append([last_token])
+                    slot_indices.append(req["slot_idx"])
+
+                    current_len = req["seq_len"]
+                    seq_lens.append(current_len + 1)  # Including new token
+                    pos_indices.append(current_len)
+
+                curr_input = torch.tensor(input_tokens, device=self.device)  # (B, 1)
+                positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1)  # (B, 1)
+
+                # Generate block tables for batch
+                batch_block_tables = []
+                for S in slot_indices:
+                    start_block = S * self.num_blocks_per_seq
+                    batch_block_tables.append(
+                        torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32)
                     )
-                    token = _sample_token_from_logits(
-                        logits[i, -1, :],
-                        req_i["sampling_params"],
-                        req_i["generated_ids"],
-                        req_i.get("rng"),
-                        eos_token_ids_to_mask=eos_mask,
+                block_tables = torch.stack(batch_block_tables).to(self.device)
+
+                # slot_mapping maps batch tokens to physical indices
+                slot_mapping = torch.tensor(
+                    [s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+
+                req_dicts = [self._requests[rid] for rid in decodes]
+                attn_carry_batch = self._stack_per_layer_carries(
+                    req_dicts, self.num_layers, "linear_attn_carry"
+                )
+                conv_carry_batch = self._stack_per_layer_carries(
+                    req_dicts, self.num_layers, "linear_conv_carry"
+                )
+                attn_metadata = {
+                    "slot_mapping": slot_mapping,
+                    "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
+                    "block_tables": block_tables,
+                    "is_prefill": False,
+                    "kv_start_indices": torch.tensor(
+                        pos_indices, device=self.device, dtype=torch.int32
+                    ),
+                    "linear_attn_carry": attn_carry_batch,
+                    "linear_conv_carry": conv_carry_batch,
+                }
+
+                try:
+                    lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
+                    logits = self.model(
+                        curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping
                     )
-                    req_i["generated_ids"].append(token)
-                    self._requests[rid]["seq_len"] += 1
-                    self._process_completion(rid, token, results)
-                    
-            except Exception as e:
-                print(f"!!! LiteEngine Error (Decode): {e}"); import traceback; traceback.print_exc()
-                # Fail all involved? Or try to isolate? For Lite, just fail.
-                for rid in decodes: self._free_request(rid)
+                    self._split_per_layer_carries(
+                        attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
+                    )
+                    self._split_per_layer_carries(
+                        attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
+                    )
+                    # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
+                    for i, rid in enumerate(decodes):
+                        req_i = self._requests[rid]
+                        eos_mask = _eos_stop_token_ids_for_sampling(
+                            self.tokenizer,
+                            req_i["sampling_params"],
+                            getattr(self.model_config, "hf_config", None),
+                        )
+                        token = _sample_token_from_logits(
+                            logits[i, -1, :],
+                            req_i["sampling_params"],
+                            req_i["generated_ids"],
+                            req_i.get("rng"),
+                            eos_token_ids_to_mask=eos_mask,
+                        )
+                        req_i["generated_ids"].append(token)
+                        self._requests[rid]["seq_len"] += 1
+                        self._process_completion(rid, token, results)
+
+                except Exception as e:
+                    print(f"!!! LiteEngine Error (Decode): {e}")
+                    import traceback
+
+                    traceback.print_exc()
+                    # Fail all involved? Or try to isolate? For Lite, just fail.
+                    for rid in decodes:
+                        self._free_request(rid)
 
         return results
 

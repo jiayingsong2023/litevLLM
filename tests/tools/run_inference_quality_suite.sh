@@ -3,14 +3,15 @@
 # Tier-B greedy spot-check + optional A-tier (see docs/INFERENCE_ACCURACY.md §5).
 #
 # Usage (from repo root):
-#   MODEL=models/Qwen3.5-9B-FP16 bash scripts/run_inference_quality_suite.sh
-#   RUN_A_TIER=1 MODEL=... bash scripts/run_inference_quality_suite.sh
+#   MODEL=models/Qwen3.5-9B-FP16 bash tests/tools/run_inference_quality_suite.sh
+#   MODEL=models/DeepSeek-V2-Lite-GGUF bash tests/tools/run_inference_quality_suite.sh gguf
+#   RUN_A_TIER=1 MODEL=... bash tests/tools/run_inference_quality_suite.sh
 #
 # Optional second argument: quant mode (default: none)
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-0}"
@@ -29,7 +30,7 @@ if [[ ! -d "$MODEL" ]]; then
   exit 0
 fi
 
-uv run python scripts/quality_bar_spotcheck.py \
+uv run python tests/tools/quality_bar_spotcheck.py \
   --model "$MODEL" \
   --quant "$QUANT" \
   --prompt-subset minimal \

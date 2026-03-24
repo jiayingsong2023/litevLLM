@@ -5,7 +5,7 @@ Compare HF Qwen3_5GatedDeltaNet causal conv path vs Lite Qwen3_5LinearAttentionL
 with identical weights (dense FP16/BF16). Validates first-chunk prefill conv (seq_len>1).
 
 Usage:
-  uv run python scripts/qwen35_gated_delta_conv_alignment.py --hf-dir models/Qwen3.5-9B-FP16
+  uv run python tests/tools/qwen35_gated_delta_conv_alignment.py --hf-dir models/Qwen3.5-9B-FP16
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _pair_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:

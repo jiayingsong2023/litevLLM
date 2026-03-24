@@ -9,7 +9,7 @@ Optional: ``FASTINFERENCE_QWEN35_USE_FLA_CHUNK=1`` uses the fused CUDA kernel fr
 ``flash-linear-attention`` (small numeric differences vs naive are possible).
 
 Usage:
-  uv run python scripts/qwen35_chunk_gated_delta_alignment.py
+  uv run python tests/tools/qwen35_chunk_gated_delta_alignment.py
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _pair_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:

@@ -8,17 +8,17 @@ MoE GGUF packed path: audits for Lite logits vs dense load and for raw weight pa
 Compare Lite prefill logits when loading the same GGUF with packed MoE vs dense MoE experts.
 Use two processes (dense load often needs more host RAM).
 
-  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 uv run python scripts/qwen35_moe_packed_lite_logits_audit.py dump \\
+  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
     --model models/Qwen3.5-35B-MoE-GGUF --out /tmp/lite_packed.pt
 
-  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=0 uv run python scripts/qwen35_moe_packed_lite_logits_audit.py dump \\
+  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=0 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
     --model models/Qwen3.5-35B-MoE-GGUF --out /tmp/lite_dense.pt --frugal
 
-  uv run python scripts/qwen35_moe_packed_lite_logits_audit.py diff /tmp/lite_packed.pt /tmp/lite_dense.pt
+  uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py diff /tmp/lite_packed.pt /tmp/lite_dense.pt
 
 ## C) Offline stats (no second run)
 
-  uv run python scripts/qwen35_moe_packed_lite_logits_audit.py stats /tmp/lite_packed.pt
+  uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py stats /tmp/lite_packed.pt
 
 Prints finite ratio, NaN/Inf counts, mean/std, argmax, top-5 logits (sanity without HF).
 
@@ -29,7 +29,7 @@ High CosSim + low MaxAbs on logits_last => packed MoE weights do not change the 
 
 Verifies slice dequant from packed bytes matches full-tensor dequant for one expert:
 
-  uv run python scripts/qwen35_moe_packed_lite_logits_audit.py weight-parity \\
+  uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py weight-parity \\
     --gguf models/Qwen3.5-35B-MoE-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_M.gguf --layer 0 --expert 0
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 

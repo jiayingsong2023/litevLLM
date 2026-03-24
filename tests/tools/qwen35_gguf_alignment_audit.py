@@ -4,12 +4,12 @@
 Audit GGUF dequant + layout vs Hugging Face safetensors for Qwen3.5 9B.
 
 Usage (from repo root, with uv):
-  uv run python scripts/qwen35_gguf_alignment_audit.py \\
+  uv run python tests/tools/qwen35_gguf_alignment_audit.py \\
     --gguf models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf \\
     --hf-dir models/Qwen3.5-9B-FP16
 
 Optional conv check:
-  uv run python scripts/qwen35_gguf_alignment_audit.py ... --conv-check
+  uv run python tests/tools/qwen35_gguf_alignment_audit.py ... --conv-check
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple
 import torch
 
 # Repo root on PYTHONPATH
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _load_hf_tensor(hf_dir: str, key: str) -> torch.Tensor:

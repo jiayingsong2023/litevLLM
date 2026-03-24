@@ -34,6 +34,8 @@ from vllm.model_executor.moe_gguf_packed import (
 #   (4) MoE: full [E, I, H] gate and up tensors before copy into Parameters (sequential ge vs ue halves (2)).
 # Mitigations: del ge/ue as soon as possible, gc.collect() per layer, avoid extra cats/temps in FP8 path.
 # Optional FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1: keep ffn_*_exps as uint8 packed rows (no full-blob dequant at load).
+# Optional FASTINFERENCE_GGUF_DEQUANT_FP32 / FASTINFERENCE_GGUF_DEQUANT_FP8: see _gguf_intermediate_dequant_dtype
+# (DeepSeek GGUF: pass target_shape into _dequantize_gguf_for_load for 2D layers so metadata transpose does not scramble Q/KV weights).
 
 
 def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, target_shape: Optional[torch.Size] = None) -> Optional[torch.Tensor]:
@@ -48,7 +50,7 @@ def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, t
         raw = torch.from_numpy(w_np).to(device=device)
         tname = str(getattr(gguf_tensor, "name", "") or "")
         # Depthwise conv1d: GGUF dims may not match PyTorch Conv1d layout; contiguous bytes match HF
-        # when viewed as target_shape [C, 1, K] (see scripts/qwen35_gguf_alignment_audit.py).
+        # when viewed as target_shape [C, 1, K] (see tests/tools/qwen35_gguf_alignment_audit.py).
         if "ssm_conv1d.weight" in tname and target_shape is not None and len(target_shape) == 3:
             if raw.numel() == prod(target_shape):
                 try:
@@ -141,6 +143,83 @@ def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, t
     except Exception as e:
         print(f"    [Warning] gguf dequant failed for type={q_type}: {e}")
         return None
+
+
+def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
+    """
+    Match Hugging Face checkpoint dtype from config (e.g. text_config.dtype / torch_dtype).
+    Default float16 for older checkpoints without explicit dtype.
+    """
+    for attr in ("dtype", "torch_dtype"):
+        ds = getattr(hf_config, attr, None)
+        if isinstance(ds, str) and "bfloat16" in ds.lower():
+            return torch.bfloat16
+        if ds is torch.bfloat16:
+            return torch.bfloat16
+    return torch.float16
+
+
+def _gguf_fp8_e4m3_dtype() -> Optional[torch.dtype]:
+    return getattr(torch, "float8_e4m3fn", None)
+
+
+def _is_fp8_intermediate(dtype: torch.dtype) -> bool:
+    f8 = _gguf_fp8_e4m3_dtype()
+    return f8 is not None and dtype == f8
+
+
+def _gguf_intermediate_dequant_dtype(hf_config: Optional[Any]) -> torch.dtype:
+    """
+    Intermediate dtype after gguf library dequant (still CPU; then cast to HF storage dtype).
+
+    - FASTINFERENCE_GGUF_DEQUANT_FP32=1: float32 (max HF alignment, highest load-time RAM).
+    - FASTINFERENCE_GGUF_DEQUANT_FP32=0: float16 (low RAM).
+    - Default for deepseek_v2: float16 (better logits vs optional FP8 intermediates).
+    - FASTINFERENCE_GGUF_DEQUANT_FP8=1: use float8_e4m3fn when available (lower peak RAM).
+    """
+    env_fp32 = os.environ.get("FASTINFERENCE_GGUF_DEQUANT_FP32", "").strip().lower()
+    if env_fp32 in ("1", "true", "yes", "on"):
+        return torch.float32
+    if env_fp32 in ("0", "false", "no", "off"):
+        return torch.float16
+
+    env_fp8 = os.environ.get("FASTINFERENCE_GGUF_DEQUANT_FP8", "").strip().lower()
+    if hf_config is not None and getattr(hf_config, "model_type", "") == "deepseek_v2":
+        if env_fp8 in ("1", "true", "yes", "on"):
+            f8 = _gguf_fp8_e4m3_dtype()
+            if f8 is not None:
+                return f8
+        return torch.float16
+    return torch.float16
+
+
+def _dequantize_gguf_for_load(
+    gguf_tensor: Any,
+    hf_config: Optional[Any],
+    target_shape: Optional[torch.Size] = None,
+) -> Optional[torch.Tensor]:
+    idt = _gguf_intermediate_dequant_dtype(hf_config)
+    t: Optional[torch.Tensor] = None
+    try:
+        t = _dequantize_gguf_tensor(gguf_tensor, "cpu", idt, target_shape)
+    except Exception as e:
+        if _is_fp8_intermediate(idt):
+            print(f"    [Info] GGUF intermediate FP8 failed ({e}); retrying float16.")
+            t = _dequantize_gguf_tensor(gguf_tensor, "cpu", torch.float16, target_shape)
+        else:
+            print(f"    [Warning] GGUF dequant failed: {e}")
+            return None
+    if t is None and _is_fp8_intermediate(idt):
+        t = _dequantize_gguf_tensor(gguf_tensor, "cpu", torch.float16, target_shape)
+    if t is None:
+        return None
+    if hf_config is None:
+        return t.to(torch.float16)
+    stor = _resolve_model_dtype_from_hf_config(hf_config)
+    if stor not in (torch.float16, torch.bfloat16):
+        stor = torch.float16
+    return t.to(stor)
+
 
 def _reorder_v_heads_ggml_to_hf(
     tensor: torch.Tensor,
@@ -331,8 +410,13 @@ def _load_param_from_gguf_tensor(
     elif isinstance(param, nn.Module) and hasattr(param, "weight"): actual_param = param.weight
     if not isinstance(actual_param, torch.Tensor) and logical_shape is None: return
     target_shape = logical_shape if logical_shape is not None else actual_param.shape
-    # Use universal dequant via gguf library
-    source = _dequantize_gguf_tensor(gguf_tensor, "cpu", torch.float16, target_shape)
+    stor_dtype = (
+        _resolve_model_dtype_from_hf_config(hf_config) if hf_config is not None else torch.float16
+    )
+    if stor_dtype not in (torch.float16, torch.bfloat16):
+        stor_dtype = torch.float16
+    # FP32 intermediate dequant + cast to HF storage dtype (see _dequantize_gguf_for_load).
+    source = _dequantize_gguf_for_load(gguf_tensor, hf_config, target_shape)
     if source is None: return
 
     tname = str(getattr(gguf_tensor, "name", "") or "")
@@ -356,7 +440,7 @@ def _load_param_from_gguf_tensor(
     if isinstance(param, LiteLinear):
         # Module-level load: can replace the Parameter
         if param.weight.numel() == 0 or param.weight.shape != source.shape:
-            param.weight = nn.Parameter(source.to(dtype=torch.float16), requires_grad=False)
+            param.weight = nn.Parameter(source.to(dtype=stor_dtype), requires_grad=False)
         else:
             param.weight.data.copy_(source.to(dtype=param.weight.dtype))
     if isinstance(actual_param, nn.Parameter):
@@ -397,12 +481,30 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         # Qwen3.5 GGUF uses 'post_attention_norm' instead of 'ffn_norm'
         "blk.{i}.post_attention_norm.weight": ["model.layers.{i}.post_attention_layernorm.weight"],
         # DeepSeek V2 MLA layers
-        "blk.{i}.attn_q_a.weight": ["model.layers.{i}.self_attn.q_a_proj.weight"],
-        "blk.{i}.attn_q_a_norm.weight": ["model.layers.{i}.self_attn.q_a_layernorm.weight"],
-        "blk.{i}.attn_q_b.weight": ["model.layers.{i}.self_attn.q_b_proj.weight"],
-        "blk.{i}.attn_kv_a_mqa.weight": ["model.layers.{i}.self_attn.kv_a_proj.weight"],
-        "blk.{i}.attn_kv_a_norm.weight": ["model.layers.{i}.self_attn.kv_a_layernorm.weight"],
-        "blk.{i}.attn_output.weight": ["model.layers.{i}.self_attn.o_proj.weight"],
+        "blk.{i}.attn_q_a.weight": [
+            "model.layers.{i}.self_attn.q_a_proj.weight",
+            "model.layers.{i}.q_a_proj.weight",
+        ],
+        "blk.{i}.attn_q_a_norm.weight": [
+            "model.layers.{i}.self_attn.q_a_layernorm.weight",
+            "model.layers.{i}.q_a_layernorm.weight",
+        ],
+        "blk.{i}.attn_q_b.weight": [
+            "model.layers.{i}.self_attn.q_b_proj.weight",
+            "model.layers.{i}.q_b_proj.weight",
+        ],
+        "blk.{i}.attn_kv_a_mqa.weight": [
+            "model.layers.{i}.self_attn.kv_a_proj.weight",
+            "model.layers.{i}.kv_a_proj.weight",
+        ],
+        "blk.{i}.attn_kv_a_norm.weight": [
+            "model.layers.{i}.self_attn.kv_a_layernorm.weight",
+            "model.layers.{i}.kv_a_layernorm.weight",
+        ],
+        "blk.{i}.attn_output.weight": [
+            "model.layers.{i}.self_attn.o_proj.weight",
+            "model.layers.{i}.o_proj.weight",
+        ],
         # Qwen3.5 full-attention layers (standard GGUF names)
         "blk.{i}.attn_q.weight": ["model.layers.{i}.self_attn.q_proj.weight"],
         "blk.{i}.attn_k.weight": ["model.layers.{i}.self_attn.k_proj.weight"],
@@ -423,10 +525,23 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         "blk.{i}.ffn_up.weight": ["model.layers.{i}.mlp.up_proj.weight"],
         "blk.{i}.ffn_down.weight": ["model.layers.{i}.mlp.down_proj.weight"],
         # Qwen3.5 MoE (HF: mlp.gate / mlp.experts / mlp.shared_expert / mlp.shared_expert_gate)
-        "blk.{i}.ffn_gate_inp.weight": ["model.layers.{i}.mlp.gate.weight"],
-        "blk.{i}.ffn_gate_shexp.weight": ["model.layers.{i}.mlp.shared_expert.gate_proj.weight"],
-        "blk.{i}.ffn_up_shexp.weight": ["model.layers.{i}.mlp.shared_expert.up_proj.weight"],
-        "blk.{i}.ffn_down_shexp.weight": ["model.layers.{i}.mlp.shared_expert.down_proj.weight"],
+        # DeepSeek V2 MoE uses mlp.router for ffn_gate_inp and mlp.shared_experts.* for shexp.
+        "blk.{i}.ffn_gate_inp.weight": [
+            "model.layers.{i}.mlp.router.weight",
+            "model.layers.{i}.mlp.gate.weight",
+        ],
+        "blk.{i}.ffn_gate_shexp.weight": [
+            "model.layers.{i}.mlp.shared_experts.gate_proj.weight",
+            "model.layers.{i}.mlp.shared_expert.gate_proj.weight",
+        ],
+        "blk.{i}.ffn_up_shexp.weight": [
+            "model.layers.{i}.mlp.shared_experts.up_proj.weight",
+            "model.layers.{i}.mlp.shared_expert.up_proj.weight",
+        ],
+        "blk.{i}.ffn_down_shexp.weight": [
+            "model.layers.{i}.mlp.shared_experts.down_proj.weight",
+            "model.layers.{i}.mlp.shared_expert.down_proj.weight",
+        ],
         # llama.cpp may name this ffn_gate_sw_shexp or ffn_gate_inp_shexp (same HF tensor)
         "blk.{i}.ffn_gate_sw_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
         "blk.{i}.ffn_gate_inp_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
@@ -536,20 +651,83 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         target_lin_norm_w = f"model.layers.{i}.linear_attn.norm.weight"
         if legacy_lin_norm in tensor_map and target_lin_norm_w in params:
             tgt = params[target_lin_norm_w]
-            src = _dequantize_gguf_tensor(tensor_map[legacy_lin_norm], "cpu", torch.float16, target_shape=tgt.shape)
+            src = _dequantize_gguf_for_load(tensor_map[legacy_lin_norm], hf_config, target_shape=tgt.shape)
             if src is not None and src.shape == tgt.shape:
                 tgt.data.copy_(src.to(dtype=tgt.dtype))
                 loaded_count += 1
 
         kb_key = f"blk.{i}.attn_k_b.weight"; vb_key = f"blk.{i}.attn_v_b.weight"
         if kb_key in tensor_map and vb_key in tensor_map:
-            kb = _dequantize_gguf_tensor(tensor_map[kb_key], "cpu", torch.float16)
-            vb = _dequantize_gguf_tensor(tensor_map[vb_key], "cpu", torch.float16)
+            kb = _dequantize_gguf_for_load(tensor_map[kb_key], hf_config)
+            vb = _dequantize_gguf_for_load(tensor_map[vb_key], hf_config)
             if kb is not None and vb is not None:
                 fused_kv_b = torch.cat([kb, vb], dim=0)
-                m_path = f"model.layers.{i}.self_attn.kv_b_proj"
-                if m_path in modules: modules[m_path].weight = nn.Parameter(fused_kv_b, requires_grad=False); loaded_count += 1
-        
+                for m_path in (
+                    f"model.layers.{i}.kv_b_proj",
+                    f"model.layers.{i}.self_attn.kv_b_proj",
+                ):
+                    if m_path in modules:
+                        modules[m_path].weight = nn.Parameter(fused_kv_b, requires_grad=False)
+                        loaded_count += 1
+                        break
+
+        # DeepSeek V2 Lite GGUF: attn_kv_b is a single fused tensor; llama.cpp layout may pad columns.
+        if getattr(hf_config, "model_type", "") == "deepseek_v2":
+            kvb_key = f"blk.{i}.attn_kv_b.weight"
+            for kvp_base in (f"model.layers.{i}.kv_b_proj", f"model.layers.{i}.self_attn.kv_b_proj"):
+                if kvb_key not in tensor_map or kvp_base not in modules:
+                    continue
+                ll = modules[kvp_base]
+                if not isinstance(ll, LiteLinear):
+                    continue
+                out_f, in_f = int(ll.output_size), int(ll.input_size)
+                # Pass target_shape so Q4_K dequant is not reshaped to mismatched GGUF metadata dims.
+                src = _dequantize_gguf_for_load(
+                    tensor_map[kvb_key], hf_config, target_shape=torch.Size([out_f, in_f])
+                )
+                if src is None or src.ndim != 2:
+                    continue
+                stor = _resolve_model_dtype_from_hf_config(hf_config)
+                if stor not in (torch.float16, torch.bfloat16):
+                    stor = torch.float16
+                # GGUF often stores [in_f, out_f_padded]; HF Linear is [out_f, in_f].
+                if src.shape[0] == in_f and src.shape[1] >= out_f:
+                    w = src.T[:out_f, :].contiguous()
+                elif src.shape[1] == in_f and src.shape[0] >= out_f:
+                    w = src[:out_f, :].contiguous()
+                else:
+                    continue
+                ll.weight = nn.Parameter(w.to(dtype=stor), requires_grad=False)
+                loaded_count += 1
+                break
+
+            # Padded Q projection: GGUF [out_f, in_f_padded] e.g. (2048, 3072) -> (2048, 2048).
+            aq_key = f"blk.{i}.attn_q.weight"
+            for qp_base in (f"model.layers.{i}.q_proj", f"model.layers.{i}.self_attn.q_proj"):
+                if aq_key not in tensor_map or qp_base not in modules:
+                    continue
+                ll = modules[qp_base]
+                if not isinstance(ll, LiteLinear):
+                    continue
+                out_f, in_f = int(ll.output_size), int(ll.input_size)
+                src = _dequantize_gguf_for_load(
+                    tensor_map[aq_key], hf_config, target_shape=torch.Size([out_f, in_f])
+                )
+                if src is None or src.ndim != 2:
+                    continue
+                stor = _resolve_model_dtype_from_hf_config(hf_config)
+                if stor not in (torch.float16, torch.bfloat16):
+                    stor = torch.float16
+                if src.shape[0] == out_f and src.shape[1] >= in_f:
+                    w = src[:, :in_f].contiguous()
+                elif src.shape[1] == out_f and src.shape[0] >= in_f:
+                    w = src[:in_f, :].T.contiguous()
+                else:
+                    continue
+                ll.weight = nn.Parameter(w.to(dtype=stor), requires_grad=False)
+                loaded_count += 1
+                break
+
         # MoE routed experts: fuse gate+up -> gate_up_proj (HF), load down_proj
         ge_key = f"blk.{i}.ffn_gate_exps.weight"
         ue_key = f"blk.{i}.ffn_up_exps.weight"
@@ -559,7 +737,24 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
             m_moe = modules[m_moe_path]
             exp_mod = getattr(m_moe, "experts", None)
             if exp_mod is None:
-                pass
+                # DeepSeekV2MoE: stacked expert weights (no nested `experts` submodule).
+                if getattr(hf_config, "model_type", "") == "deepseek_v2" and de_key in tensor_map:
+                    t_shape_g = torch.Size([num_experts, moe_inter, hidden])
+                    t_shape_d = torch.Size([num_experts, hidden, moe_inter])
+                    ge = _dequantize_gguf_for_load(
+                        tensor_map[ge_key], hf_config, target_shape=t_shape_g
+                    )
+                    ue = _dequantize_gguf_for_load(
+                        tensor_map[ue_key], hf_config, target_shape=t_shape_g
+                    )
+                    de = _dequantize_gguf_for_load(
+                        tensor_map[de_key], hf_config, target_shape=t_shape_d
+                    )
+                    if ge is not None and ue is not None and de is not None:
+                        m_moe.experts_gate = nn.Parameter(ge.contiguous(), requires_grad=False)
+                        m_moe.experts_up = nn.Parameter(ue.contiguous(), requires_grad=False)
+                        m_moe.experts_down = nn.Parameter(de.contiguous(), requires_grad=False)
+                        loaded_count += 3
             elif getattr(exp_mod, "moe_gguf_packed", False):
                 if de_key not in tensor_map:
                     raise RuntimeError(
@@ -610,12 +805,12 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                 dst_gs = exp_mod._gate_up_scale_cpu
                 dst_d = exp_mod._down_fp8_cpu
                 dst_ds = exp_mod._down_scale_cpu
-                ge = _dequantize_gguf_tensor(
-                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                ge = _dequantize_gguf_for_load(
+                    tensor_map[ge_key], hf_config, target_shape=t_shape_g
                 )
                 ge_ok = ge is not None
-                ue = _dequantize_gguf_tensor(
-                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                ue = _dequantize_gguf_for_load(
+                    tensor_map[ue_key], hf_config, target_shape=t_shape_g
                 )
                 ue_ok = ue is not None
                 if ge_ok and ue_ok:
@@ -630,8 +825,8 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     loaded_count += 1
                 del ge, ue
                 if de_key in tensor_map:
-                    de = _dequantize_gguf_tensor(
-                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    de = _dequantize_gguf_for_load(
+                        tensor_map[de_key], hf_config, target_shape=t_shape_d
                     )
                     if de is not None:
                         for e in range(num_experts):
@@ -646,12 +841,12 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                 dst = exp_mod.gate_up_proj.data
                 dst_s = exp_mod.gate_up_scale.data
                 dt_w = dst.dtype
-                ge = _dequantize_gguf_tensor(
-                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                ge = _dequantize_gguf_for_load(
+                    tensor_map[ge_key], hf_config, target_shape=t_shape_g
                 )
                 ge_ok = ge is not None
-                ue = _dequantize_gguf_tensor(
-                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                ue = _dequantize_gguf_for_load(
+                    tensor_map[ue_key], hf_config, target_shape=t_shape_g
                 )
                 ue_ok = ue is not None
                 if ge_ok and ue_ok:
@@ -666,8 +861,8 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     loaded_count += 1
                 del ge, ue
                 if de_key in tensor_map:
-                    de = _dequantize_gguf_tensor(
-                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    de = _dequantize_gguf_for_load(
+                        tensor_map[de_key], hf_config, target_shape=t_shape_d
                     )
                     if de is not None:
                         ddst = exp_mod.down_proj.data
@@ -684,15 +879,15 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                 dst = exp_mod.gate_up_proj.data
                 dt = dst.dtype
                 # Dequant gate and up sequentially so ge and ue are never both resident (halves peak RSS).
-                ge = _dequantize_gguf_tensor(
-                    tensor_map[ge_key], "cpu", torch.float16, target_shape=t_shape_g
+                ge = _dequantize_gguf_for_load(
+                    tensor_map[ge_key], hf_config, target_shape=t_shape_g
                 )
                 ge_ok = ge is not None
                 if ge_ok:
                     dst[:, :moe_inter, :].copy_(ge.to(dtype=dt))
                 del ge
-                ue = _dequantize_gguf_tensor(
-                    tensor_map[ue_key], "cpu", torch.float16, target_shape=t_shape_g
+                ue = _dequantize_gguf_for_load(
+                    tensor_map[ue_key], hf_config, target_shape=t_shape_g
                 )
                 ue_ok = ue is not None
                 if ue_ok:
@@ -702,8 +897,8 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     loaded_count += 1
                 de = None
                 if de_key in tensor_map:
-                    de = _dequantize_gguf_tensor(
-                        tensor_map[de_key], "cpu", torch.float16, target_shape=t_shape_d
+                    de = _dequantize_gguf_for_load(
+                        tensor_map[de_key], hf_config, target_shape=t_shape_d
                     )
                 if de is not None:
                     exp_mod.down_proj.data.copy_(de.to(dtype=exp_mod.down_proj.dtype))
@@ -733,6 +928,8 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         for sp in ["ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"]:
             special_prefixes.add(f"blk.{i}.{sp}")
         for sp in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
+            special_prefixes.add(f"blk.{i}.{sp}")
+        for sp in ("attn_kv_b.weight", "attn_q.weight"):
             special_prefixes.add(f"blk.{i}.{sp}")
     all_mapped = mapped_prefixes | special_prefixes | {"token_embd.weight", "output_norm.weight", "output.weight"}
     unmapped = [n for n in tensor_map if n not in all_mapped]
@@ -815,6 +1012,80 @@ def _param_copy_key_allowed(
     )
 
 
+def _safetensors_dense_key_aliases(target: str) -> list[str]:
+    """
+    HF checkpoints sometimes use different submodule names than Lite's flattened ModuleList.
+    DeepSeek V2: ``kv_a_proj_with_mqa`` (HF) vs ``kv_a_proj`` (Lite under ``layers.{i}``).
+    """
+    alts: list[str] = [target]
+    m = re.match(r"layers\.(\d+)\.kv_a_proj\.weight$", target)
+    if m:
+        alts.append(f"layers.{m.group(1)}.self_attn.kv_a_proj_with_mqa.weight")
+    return alts
+
+
+def _load_deepseek_v2_moe_hf_safetensors_stacked(model: nn.Module, model_path: str) -> int:
+    """
+    HF stores routed experts as ``mlp.experts.{e}.{gate,up}_proj``; Lite uses stacked
+    ``experts_gate`` / ``experts_up`` / ``experts_down`` (same layout as GGUF fuse).
+    """
+    hf_config = getattr(model, "config", None)
+    if hf_config is None or getattr(hf_config, "model_type", "") != "deepseek_v2":
+        return 0
+    first_dense = int(getattr(hf_config, "first_k_dense_replace", 1))
+    n_layers = int(getattr(hf_config, "num_hidden_layers", 0))
+    n_exp = int(getattr(hf_config, "n_routed_experts", 64))
+    sf_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
+    if not sf_files:
+        return 0
+    merged: Dict[str, torch.Tensor] = {}
+    from safetensors.torch import load_file
+
+    for fn in sf_files:
+        sd = load_file(os.path.join(model_path, fn), device="cpu")
+        for k, v in sd.items():
+            if ".mlp.experts." in k and k.endswith(".weight"):
+                merged[k] = v
+        del sd
+        gc.collect()
+    modules = dict(model.named_modules())
+    dtype = _resolve_model_dtype_from_hf_config(hf_config)
+    loaded = 0
+    for li in range(first_dense, n_layers):
+        g_stack: list[torch.Tensor] = []
+        u_stack: list[torch.Tensor] = []
+        d_stack: list[torch.Tensor] = []
+        ok = True
+        for e in range(n_exp):
+            gk = f"model.layers.{li}.mlp.experts.{e}.gate_proj.weight"
+            uk = f"model.layers.{li}.mlp.experts.{e}.up_proj.weight"
+            dk = f"model.layers.{li}.mlp.experts.{e}.down_proj.weight"
+            if gk not in merged or uk not in merged or dk not in merged:
+                ok = False
+                break
+            g_stack.append(merged[gk])
+            u_stack.append(merged[uk])
+            d_stack.append(merged[dk])
+        if not ok:
+            print(f">>> DeepSeek MoE skip layer {li}: missing expert weights in safetensors")
+            continue
+        m_moe = modules.get(f"model.layers.{li}.mlp")
+        if m_moe is None:
+            continue
+        gate_t = torch.stack(g_stack, dim=0).to(dtype=dtype)
+        up_t = torch.stack(u_stack, dim=0).to(dtype=dtype)
+        down_t = torch.stack(d_stack, dim=0).to(dtype=dtype)
+        m_moe.experts_gate = nn.Parameter(gate_t, requires_grad=False)
+        m_moe.experts_up = nn.Parameter(up_t, requires_grad=False)
+        m_moe.experts_down = nn.Parameter(down_t, requires_grad=False)
+        loaded += 3
+    if loaded:
+        print(
+            f">>> DeepSeek MoE (HF safetensors): stacked {loaded // 3} layers of routed experts"
+        )
+    return loaded
+
+
 def _load_safetensors(model: nn.Module, model_path: str):
     from safetensors.torch import load_file
     sf_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
@@ -860,7 +1131,25 @@ def _load_safetensors(model: nn.Module, model_path: str):
                                 k, idx, use_lm_layers
                             ):
                                 continue
-                            if k.endswith(f".{proj}.{s}") or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}.{s}"): found_v = sd[k]; break
+                            # DeepSeek MoE: shared_experts.* must not match mlp.experts.{e}.* (same *.gate_proj.weight).
+                            if "shared_experts" in m_name and "shared_experts" not in k:
+                                continue
+                            _key_match = k.endswith(f".{proj}.{s}") or k.endswith(
+                                f".{proj.replace('self_attn', 'linear_attn')}.{s}"
+                            )
+                            # DeepSeek V2 HF: kv_a_proj_with_mqa vs Lite layers.{i}.kv_a_proj
+                            if proj == "kv_a_proj" and s == "weight":
+                                _key_match = _key_match or k.endswith(
+                                    ".self_attn.kv_a_proj_with_mqa.weight"
+                                )
+                            # DeepSeek V2 HF: mlp.gate -> Lite mlp.router (routed gate)
+                            if proj == "router" and s == "weight":
+                                _key_match = _key_match or k.endswith(
+                                    f".layers.{idx}.mlp.gate.weight"
+                                )
+                            if _key_match:
+                                found_v = sd[k]
+                                break
                             if "linear_attn" in k and k.endswith(f".{s}") and proj in k:
                                 if not any(x in k for x in ["packed", "scale", "zero"]): found_v = sd[k]; break
                         elif idx is None and "layers." not in k:
@@ -892,16 +1181,19 @@ def _load_safetensors(model: nn.Module, model_path: str):
                 continue
             target = p_name[6:] if p_name.startswith("model.") else p_name
             copied = False
-            for k in sd_keys:
-                if not _param_copy_key_allowed(k, target, use_lm_layers):
-                    continue
-                if k == target or k.endswith("." + target):
-                    if p.shape == sd[k].shape:
-                        p.data.copy_(sd[k].to(dtype=p.dtype))
-                        loaded_count += 1
-                        loaded_params.add(p_name)
-                        copied = True
-                        break
+            for alt in _safetensors_dense_key_aliases(target):
+                for k in sd_keys:
+                    if not _param_copy_key_allowed(k, alt, use_lm_layers):
+                        continue
+                    if k == alt or k.endswith("." + alt):
+                        if p.shape == sd[k].shape:
+                            p.data.copy_(sd[k].to(dtype=p.dtype))
+                            loaded_count += 1
+                            loaded_params.add(p_name)
+                            copied = True
+                            break
+                if copied:
+                    break
             if not copied and _try_load_legacy_flat_linear_attn_norm_from_safetensors(p_name, p, sd_keys, sd):
                 loaded_count += 1
                 loaded_params.add(p_name)
@@ -951,6 +1243,8 @@ def _load_safetensors(model: nn.Module, model_path: str):
                 f"keys={list(comps.keys())} (need both qweight and scales)"
             )
 
+    loaded_count += _load_deepseek_v2_moe_hf_safetensors_stacked(model, model_path)
+
     print(f">>> Safetensors loading complete. Loaded {loaded_count} parameters.")
 
 def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> None:
@@ -979,35 +1273,67 @@ def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> No
             b.copy_(b.to(dtype=target_dtype))
 
 
-def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
-    """
-    Match Hugging Face checkpoint dtype from config (e.g. text_config.dtype / torch_dtype).
-    Default float16 for older checkpoints without explicit dtype.
-    """
-    for attr in ("dtype", "torch_dtype"):
-        ds = getattr(hf_config, attr, None)
-        if isinstance(ds, str) and "bfloat16" in ds.lower():
-            return torch.bfloat16
-        if ds is torch.bfloat16:
-            return torch.bfloat16
-    return torch.float16
-
-
 def get_tokenizer(model: Union[str, Any], **kwargs: Any):
     name = model.model if hasattr(model, "model") else model
-    if hasattr(model, "trust_remote_code"): kwargs["trust_remote_code"] = model.trust_remote_code
-    try: return AutoTokenizer.from_pretrained(name, **kwargs)
-    except:
-        try: return AutoTokenizer.from_pretrained(name, use_fast=False, **kwargs)
-        except:
-            class Dummy:
-                def __init__(self): self.vocab_size = 154880; self.eos_token_id = 151329; self.pad_token_id = 151329
-                def encode(self, t, **kwargs): 
-                    ids = [1, 2, 3, 4, 5] * 2
-                    if kwargs.get("return_tensors") == "pt": return torch.tensor([ids])
-                    return ids
-                def decode(self, ids, **kwargs): return " [Dummy Output] "
-            return Dummy()
+    path = str(name)
+    tokenizer_path = path
+    try:
+        from vllm.model_executor.models.deepseek_hf_reference import resolve_deepseek_hf_chat_dir
+
+        ref = resolve_deepseek_hf_chat_dir(path)
+        if ref:
+            tokenizer_path = ref
+            print(f">>> Tokenizer: using HF reference directory {tokenizer_path} (sibling of GGUF tree)")
+    except Exception:
+        pass
+    if hasattr(model, "trust_remote_code"):
+        kwargs["trust_remote_code"] = model.trust_remote_code
+    try:
+        from vllm.model_executor.models.deepseek_v2 import patch_deepseek_config_json_for_tokenizer
+
+        patch_deepseek_config_json_for_tokenizer(tokenizer_path)
+    except Exception:
+        pass
+    try:
+        return AutoTokenizer.from_pretrained(tokenizer_path, **kwargs)
+    except Exception:
+        try:
+            return AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False, **kwargs)
+        except Exception:
+            pass
+    # GGUF trees often ship tokenizer.json + tokenizer_config.json but config.json may fail
+    # newer transformers validation (e.g. rope_parameters, architecture checks).
+    tc_path = os.path.join(tokenizer_path, "tokenizer_config.json")
+    if os.path.isfile(tc_path):
+        try:
+            with open(tc_path, encoding="utf-8") as f:
+                tc = json.load(f)
+            tcls = str(tc.get("tokenizer_class") or "")
+            if "LlamaTokenizerFast" in tcls:
+                from transformers import LlamaTokenizerFast
+
+                try:
+                    return LlamaTokenizerFast.from_pretrained(tokenizer_path, fix_mistral_regex=True)
+                except TypeError:
+                    return LlamaTokenizerFast.from_pretrained(tokenizer_path)
+        except Exception:
+            pass
+    class Dummy:
+        def __init__(self):
+            self.vocab_size = 154880
+            self.eos_token_id = 151329
+            self.pad_token_id = 151329
+
+        def encode(self, t, **kwargs):
+            ids = [1, 2, 3, 4, 5] * 2
+            if kwargs.get("return_tensors") == "pt":
+                return torch.tensor([ids])
+            return ids
+
+        def decode(self, ids, **kwargs):
+            return " [Dummy Output] "
+
+    return Dummy()
 
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
@@ -1022,8 +1348,32 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
                 for k, v in data["text_config"].items(): setattr(cfg.hf_config, k, v)
             cfg.hf_config.layer_types = data.get("text_config", {}).get("layer_types", [])
     if getattr(cfg.hf_config, "model_type", "") == "deepseek_v2":
+        try:
+            from vllm.model_executor.models.deepseek_hf_reference import (
+                merge_hf_reference_config_into_loaded_config,
+                resolve_deepseek_hf_chat_dir,
+            )
+
+            ref_dir = resolve_deepseek_hf_chat_dir(cfg.model)
+            if ref_dir:
+                merge_hf_reference_config_into_loaded_config(
+                    cfg.hf_config, os.path.join(ref_dir, "config.json")
+                )
+                print(
+                    f">>> DeepSeek GGUF: merged RoPE/special-token fields from HF reference {ref_dir}"
+                )
+        except Exception:
+            pass
         setattr(cfg.hf_config, "num_key_value_heads", getattr(cfg.hf_config, "num_attention_heads", 40))
-        setattr(cfg.hf_config, "head_dim", 128)
+        # HF DeepseekV2 RoPE/YaRN uses qk_rope_head_dim as head_dim (not full qk_nope+v dim).
+        setattr(
+            cfg.hf_config,
+            "head_dim",
+            int(getattr(cfg.hf_config, "qk_rope_head_dim", 64)),
+        )
+        from vllm.model_executor.models.deepseek_v2 import _normalize_deepseek_rope_config
+
+        _normalize_deepseek_rope_config(cfg.hf_config)
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
     model = model_cls(vllm_config)
     gguf_files = [f for f in os.listdir(cfg.model) if f.endswith(".gguf")]
