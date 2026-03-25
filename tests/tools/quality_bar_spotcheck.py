@@ -127,6 +127,13 @@ def _model_config_hints(model_path: str) -> Dict[str, Any]:
     return out
 
 
+def _looks_like_qwen35_35b_awq(model_path: str, quant: str) -> bool:
+    if quant != "awq":
+        return False
+    b = os.path.basename(os.path.abspath(model_path)).lower()
+    return "qwen3.5-35b-awq" in b or ("qwen3.5" in b and "35b" in b and "awq" in b)
+
+
 def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
     cfg_path = os.path.join(model_path, "config.json")
     group_size, bits = 128, 4
@@ -734,6 +741,7 @@ def main() -> int:
         return 2
 
     hints = _model_config_hints(args.model) if args.quant == "gguf" else {"is_moe": False, "model_type": ""}
+    is_qwen35_35b_awq = _looks_like_qwen35_35b_awq(args.model, args.quant)
 
     # DeepSeek-V2-Lite Q4 GGUF: logits are too lossy for coherent greedy/sampling Tier-B in practice.
     # Default Tier-B uses sibling HF bf16 Chat weights (same engine path as A-tier parity); GGUF-only when requested.
@@ -769,10 +777,17 @@ def main() -> int:
         and hints.get("model_type") == "deepseek_v2"
     )
     if args.top_p is None:
-        args.top_p = 0.86 if _ds_gguf_only_deepseek else 0.95
+        if is_qwen35_35b_awq:
+            # Tighter nucleus reduces tail-noise loops on 35B AWQ + FP8.
+            args.top_p = 0.85
+        else:
+            args.top_p = 0.86 if _ds_gguf_only_deepseek else 0.95
 
     if args.temperature is None:
-        if _ds_gguf_only_deepseek:
+        if is_qwen35_35b_awq:
+            # Mild stochasticity is more readable than greedy on this setup.
+            args.temperature = 0.35
+        elif _ds_gguf_only_deepseek:
             # Q4-only: slightly higher temp + tighter nucleus (see top_p) reduces junk from tail mass.
             args.temperature = 0.63
         elif args.quant == "gguf":
@@ -808,6 +823,14 @@ def main() -> int:
             "[Note] Greedy decoding (--temperature 0): top_p has no effect on token choice.\n"
         )
 
+    if is_qwen35_35b_awq and args.max_new_tokens == 96:
+        # Keep continuations shorter by default to avoid late-stage degeneration.
+        args.max_new_tokens = 16
+        sys.stderr.write(
+            "[Tier-B] Qwen3.5-35B-AWQ: defaulting --max-new-tokens to 16 "
+            "(override explicitly if you need longer generations).\n"
+        )
+
     prompts = _resolve_prompts(args)
     if not prompts:
         sys.stderr.write("[Error] No prompts to run (empty subset or file).\n")
@@ -828,7 +851,9 @@ def main() -> int:
         max_len = 2048
 
     if args.repetition_penalty is None:
-        if args.temperature <= 1e-6:
+        if is_qwen35_35b_awq:
+            args.repetition_penalty = 1.24
+        elif args.temperature <= 1e-6:
             # Mild penalty even for greedy on MoE GGUF: reduces degenerate same-token / digit runs.
             if args.quant == "gguf" and hints.get("is_moe"):
                 args.repetition_penalty = 1.08
@@ -844,23 +869,30 @@ def main() -> int:
             args.repetition_penalty = 1.12
 
     if args.frequency_penalty is None:
-        if args.temperature > 1e-6 and args.quant == "gguf":
+        if is_qwen35_35b_awq:
+            args.frequency_penalty = 0.08
+        elif args.temperature > 1e-6 and args.quant == "gguf":
             args.frequency_penalty = 0.10 if _ds_gguf_only_deepseek else 0.06
         else:
             args.frequency_penalty = 0.0
 
     if args.presence_penalty is None:
-        if args.temperature > 1e-6 and args.quant == "gguf" and hints.get("is_moe"):
+        if is_qwen35_35b_awq:
+            args.presence_penalty = 0.08
+        elif args.temperature > 1e-6 and args.quant == "gguf" and hints.get("is_moe"):
             args.presence_penalty = 0.08 if _ds_gguf_only_deepseek else 0.05
         else:
             args.presence_penalty = 0.0
 
     effective_top_k = int(args.top_k)
-    if args.temperature > 1e-6 and effective_top_k < 0 and args.quant == "gguf":
-        if _ds_gguf_only_deepseek:
-            effective_top_k = 28 if hints.get("is_moe") else 40
-        else:
-            effective_top_k = 40 if hints.get("is_moe") else 50
+    if args.temperature > 1e-6 and effective_top_k < 0:
+        if is_qwen35_35b_awq:
+            effective_top_k = 20
+        elif args.quant == "gguf":
+            if _ds_gguf_only_deepseek:
+                effective_top_k = 28 if hints.get("is_moe") else 40
+            else:
+                effective_top_k = 40 if hints.get("is_moe") else 50
 
     sys.stderr.write(
         f"[Tier-B] model={args.model!r} quant={args.quant} "

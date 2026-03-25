@@ -10,19 +10,32 @@ class LiteLinear(nn.Module):
         self.output_size = output_size
         self.prefix = prefix
         self.quant_config = quant_config
-        
+
         # Lazy initialization: Parameter exists but is empty until loaded
         self.weight = nn.Parameter(torch.empty(0), requires_grad=False)
         if bias:
             self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
         else:
             self.register_parameter('bias', None)
-            
+
+        if self.quant_config is not None and hasattr(self.quant_config, "init_layer"):
+            self.quant_config.init_layer(self)
+
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if self.quant_config is not None and hasattr(self.quant_config, "apply"):
+            qweight = getattr(self, "qweight", None)
+            cached_quant_weight = getattr(self, "_quant_weight", None)
+            has_quant_ready = (
+                (qweight is not None and getattr(qweight, "numel", lambda: 0)() > 1)
+                or cached_quant_weight is not None
+            )
+            if has_quant_ready:
+                return self.quant_config.apply(self, x)
+
         if self.weight.numel() == 0:
             # Fallback for empty/unloaded weights
             return torch.zeros((*x.shape[:-1], self.output_size), device=x.device, dtype=x.dtype)
-            
+
         return torch.nn.functional.linear(x, self.weight, getattr(self, 'bias', None))
 
     def get_fast_data(self) -> Tuple[str, tuple]:

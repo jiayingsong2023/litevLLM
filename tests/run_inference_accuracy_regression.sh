@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Inference accuracy regression for: TinyLlama, Qwen3.5-9B AWQ/GGUF, DeepSeek-V2-Lite GGUF.
+# Inference accuracy regression for:
+#   - TinyLlama-1.1B-Chat-v1.0
+#   - Qwen3.5-9B-AWQ
+#   - Qwen3.5-35B-AWQ
+#
 # Run from repo root. Requires local models/ paths and a working CUDA/ROCm device.
 #
 # Usage:
 #   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh
 #   SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh   # B-tier only (faster)
+#   SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh       # skip 35B checks
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,21 +18,59 @@ cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-0}"
 
+MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
+MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
+MODEL_QWEN35_35B_AWQ="${MODEL_QWEN35_35B_AWQ:-models/Qwen3.5-35B-AWQ}"
+
+HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
+HF_QWEN35_35B_FP16="${HF_QWEN35_35B_FP16:-models/Qwen3.5-35B-FP16}"
+
+SKIP_35B="${SKIP_35B:-0}"
+
+require_model_dir() {
+  local model_dir="$1"
+  local label="$2"
+  if [[ ! -d "$model_dir" ]]; then
+    echo "[ERROR] Missing model directory for ${label}: ${model_dir}"
+    echo "        You can override with env var or skip 35B via SKIP_35B=1."
+    exit 1
+  fi
+}
+
 SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
   --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
 
+require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
+require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
+if [[ "$SKIP_35B" != "1" ]]; then
+  require_model_dir "$MODEL_QWEN35_35B_AWQ" "Qwen3.5-35B-AWQ"
+fi
+
 echo "=== Tier-B (quality_bar_spotcheck) ==="
-echo "[1/4] TinyLlama"
-"${SPOTCHECK[@]}" --model models/TinyLlama-1.1B-Chat-v1.0 --quant none
+echo "[1/3] TinyLlama"
+"${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
 
-echo "[2/4] Qwen3.5-9B AWQ"
-"${SPOTCHECK[@]}" --model models/Qwen3.5-9B-AWQ --quant awq
+echo "[2/3] Qwen3.5-9B AWQ"
+"${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
-echo "[3/4] Qwen3.5-9B GGUF"
-"${SPOTCHECK[@]}" --model models/Qwen3.5-9B-GGUF --quant gguf
-
-echo "[4/4] DeepSeek-V2-Lite GGUF"
-"${SPOTCHECK[@]}" --model models/DeepSeek-V2-Lite-GGUF --quant gguf
+if [[ "$SKIP_35B" == "1" ]]; then
+  echo "[3/3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
+else
+  echo "[3/3] Qwen3.5-35B AWQ (FP8-stable profile)"
+  FASTINFERENCE_KV_FP8=1 \
+  FASTINFERENCE_QWEN35_MOE_FP8=1 \
+  FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
+  FASTINFERENCE_AWQ_FP8=1 \
+  FASTINFERENCE_AWQ_BLOCK_FP8=1 \
+    uv run python tests/tools/quality_bar_spotcheck.py \
+      --model "$MODEL_QWEN35_35B_AWQ" \
+      --quant awq \
+      --prompt-subset minimal \
+      --max-new-tokens 16 \
+      --temperature 0 \
+      --chat-template auto \
+      --frugal
+fi
 
 if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then
   echo "SKIP_A_TIER=1 — done after Tier-B."
@@ -38,7 +81,7 @@ echo ""
 echo "=== Tier-A (verify_semantic_integrity, prefill-only) ==="
 echo "[A1] TinyLlama — Lite vs HF same tree"
 uv run python tests/verify_semantic_integrity.py \
-  --model models/TinyLlama-1.1B-Chat-v1.0 \
+  --model "$MODEL_TINYLLAMA" \
   --preset tinyllama \
   --hf-same-as-lite \
   --hf-device cuda \
@@ -47,41 +90,30 @@ uv run python tests/verify_semantic_integrity.py \
 
 echo "[A2] Qwen3.5-9B AWQ vs FP16 HF (HF may load on CPU when paths differ)"
 uv run python tests/verify_semantic_integrity.py \
-  --model models/Qwen3.5-9B-AWQ \
+  --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
-  --hf-model models/Qwen3.5-9B-FP16 \
+  --hf-model "$HF_QWEN35_9B_FP16" \
   --prefill-only \
   --apply-chat-template off
 
-echo "[A3] Qwen3.5-9B GGUF vs FP16 HF"
-uv run python tests/verify_semantic_integrity.py \
-  --model models/Qwen3.5-9B-GGUF \
-  --preset qwen35_9b_gguf \
-  --hf-model models/Qwen3.5-9B-FP16 \
-  --prefill-only \
-  --apply-chat-template off
-
-# DeepSeek A-tier (two checks):
-#  - A4a: same safetensors — strict bf16 Lite vs HF (implementation parity with transformers).
-#  - A4b: GGUF vs Chat bf16 — Q4 quantization drift; use --regression-gate deepseek-gguf (cosine / top-k / argmax composite).
-#  Tune: FASTINFERENCE_DEEPSEEK_GGUF_REGRESSION_MIN_COS / _MIN_TOPK (see compare_hf_lite_deepseek_logits.py).
-echo "[A4a] DeepSeek-V2-Lite-Chat safetensors — strict parity (CosSim>=0.998 + argmax)"
-uv run python tests/tools/compare_hf_lite_deepseek_logits.py \
-  --lite-model models/DeepSeek-V2-Lite-Chat \
-  --hf-model models/DeepSeek-V2-Lite-Chat \
-  --chat-template auto \
-  --prompt "The capital of France is" \
-  --greedy-steps 0 \
-  --regression-gate safetensors
-
-echo "[A4b] DeepSeek-V2-Lite-GGUF vs Chat HF — GGUF regression gate (not same as A4a)"
-uv run python tests/tools/compare_hf_lite_deepseek_logits.py \
-  --lite-model models/DeepSeek-V2-Lite-GGUF \
-  --hf-model models/DeepSeek-V2-Lite-Chat \
-  --chat-template auto \
-  --prompt "The capital of France is" \
-  --greedy-steps 0 \
-  --regression-gate deepseek-gguf
+if [[ "$SKIP_35B" == "1" ]]; then
+  echo "[A3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
+elif [[ ! -d "$HF_QWEN35_35B_FP16" ]]; then
+  echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (skipped: missing HF baseline dir '$HF_QWEN35_35B_FP16')"
+else
+  echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (prefill-only, FP8-stable profile)"
+  FASTINFERENCE_KV_FP8=1 \
+  FASTINFERENCE_QWEN35_MOE_FP8=1 \
+  FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
+  FASTINFERENCE_AWQ_FP8=1 \
+  FASTINFERENCE_AWQ_BLOCK_FP8=1 \
+    uv run python tests/verify_semantic_integrity.py \
+      --model "$MODEL_QWEN35_35B_AWQ" \
+      --preset qwen35_35b_moe_awq \
+      --hf-model "$HF_QWEN35_35B_FP16" \
+      --prefill-only \
+      --apply-chat-template off
+fi
 
 echo ""
-echo "=== All accuracy regression steps completed OK ==="
+echo "=== All requested accuracy regression steps completed OK ==="

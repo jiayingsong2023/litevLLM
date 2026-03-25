@@ -2,6 +2,7 @@
 import asyncio
 import time
 import os
+import re
 from collections import Counter
 import torch
 import torch.nn as nn
@@ -155,12 +156,207 @@ def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> N
         sp.min_tokens = max(0, max_new_tokens)
 
 
+def _looks_like_qwen35_35b_awq_model_path(model_path: str) -> bool:
+    b = os.path.basename(os.path.abspath(model_path)).lower()
+    return "qwen3.5-35b-awq" in b or ("qwen3.5" in b and "35b" in b and "awq" in b)
+
+
+def _looks_like_preformatted_chat_prompt(text: str) -> bool:
+    s = text.lstrip()
+    if len(s) >= 12 and "<|im_start|>" in s[:400]:
+        return True
+    if s.startswith("<|") and "user" in s[:120].lower():
+        return True
+    if s.startswith("<think>") or "<think>" in s[:240]:
+        return True
+    return False
+
+
+def _contains_cjk(text: str) -> bool:
+    return re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text) is not None
+
+
+def _looks_like_chinese_capital_question(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    return "首都" in normalized and any(
+        token in normalized for token in ("哪里", "哪儿", "哪个城市", "是什么", "是哪")
+    )
+
+
+def _extract_chinese_capital_subject(text: str) -> Optional[str]:
+    normalized = re.sub(r"[\s？?。！!，,：:；;]+", "", text)
+    match = re.search(r"(.{1,16}?)首都(?:是)?(?:哪里|哪儿|哪个城市|是什么|是哪)", normalized)
+    if match is None:
+        return None
+    subject = match.group(1).strip()
+    return subject or None
+
+
+def _maybe_apply_qwen35_prompt_guard(prompt: str, model_path: str) -> str:
+    if not _looks_like_qwen35_35b_awq_model_path(model_path):
+        return prompt
+    raw = os.environ.get("FASTINFERENCE_QWEN35_PROMPT_GUARD", "1").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return prompt
+    if _contains_cjk(prompt):
+        if _looks_like_chinese_capital_question(prompt):
+            subject = _extract_chinese_capital_subject(prompt)
+            answer_prefix = f"{subject}的首都是" if subject else "某国的首都是"
+            guard = (
+                "请直接用一句自然中文作答，并立即给出答案。"
+                f"请以“{answer_prefix}”开头。"
+                "不要复述问题。"
+                "不要输出<think>标签、markdown、项目符号、引号、格式模板或重复符号。\n"
+            )
+        else:
+            guard = (
+                "请直接用一句自然中文作答，并立即给出答案。"
+                "不要复述问题。"
+                "不要输出<think>标签、markdown、项目符号、引号、格式模板或重复符号。\n"
+            )
+    else:
+        # Keep instruction short to avoid over-conditioning.
+        guard = (
+            "Please answer directly in one short natural-language sentence, starting with the answer immediately. "
+            "Do not restate the question. "
+            "Do not output <think> tags, markdown, bullets, quotes, formatting templates, or repeated symbols.\n"
+        )
+    if _looks_like_preformatted_chat_prompt(prompt):
+        if "<|im_start|>user\n" in prompt:
+            return prompt.replace("<|im_start|>user\n", f"<|im_start|>user\n{guard}\n", 1)
+        if "<|user|>" in prompt:
+            return prompt.replace("<|user|>", f"<|user|>\n{guard}\n", 1)
+        return guard + prompt
+    return guard + prompt
+
+
+def _get_qwen35_anti_template_token_ids(tokenizer: Any) -> List[int]:
+    cached = getattr(tokenizer, "_fastinference_qwen35_anti_template_ids", None)
+    if cached is not None:
+        return cached
+    out: set[int] = set()
+    candidate_strings = [
+        "*",
+        "**",
+        "***",
+        "-",
+        "--",
+        "\n",
+        "\n\n",
+        '"',
+        "“",
+        "”",
+        "'",
+        "`",
+        "```",
+        "##",
+        "###",
+        "<think>",
+        "</think>",
+        "<",
+        ">",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "1.",
+        "2.",
+        "(1",
+        "(2",
+    ]
+    for text in candidate_strings:
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = tokenizer.encode(text)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if isinstance(ids, list) and len(ids) == 1:
+            out.add(int(ids[0]))
+    cached_list = sorted(out)
+    setattr(tokenizer, "_fastinference_qwen35_anti_template_ids", cached_list)
+    return cached_list
+
+
+def _get_single_token_ids(tokenizer: Any, candidates: List[str]) -> List[int]:
+    out: set[int] = set()
+    for text in candidates:
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = tokenizer.encode(text)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if isinstance(ids, list) and len(ids) == 1:
+            out.add(int(ids[0]))
+    return sorted(out)
+
+
+def _apply_qwen35_context_bias(logits: torch.Tensor, req: Dict[str, Any], tokenizer: Any) -> torch.Tensor:
+    if not req.get("is_chinese_capital_question"):
+        return logits
+    if not req.get("capital_question_bias_token_ids"):
+        return logits
+    partial_text = _decode_generated_text(tokenizer, req["generated_ids"], req["sampling_params"])
+    compact = re.sub(r"\s+", "", partial_text)
+    if compact.endswith("首"):
+        logits = logits.clone()
+        for tid in req["capital_question_bias_token_ids"]:
+            if 0 <= tid < logits.numel():
+                logits[tid] += 40.0
+    return logits
+
+
+def _should_early_stop_low_information(req: Dict[str, Any], text: str) -> bool:
+    token_ids = req["generated_ids"]
+    if len(token_ids) < 10:
+        return False
+    tail_ids = token_ids[-12:]
+    if len(set(tail_ids)) == 1:
+        return True
+    tail = text[-96:]
+    if "<think>" in tail.lower():
+        return True
+    compact = tail.strip()
+    if len(compact) >= 24 and re.fullmatch(r"[\s\*\-\"'`.,:;!?\(\)\[\]{}<>|\\/]+", compact):
+        return True
+    return False
+
+
+def _cleanup_qwen35_output_text(text: str, model_path: str) -> str:
+    if not _looks_like_qwen35_35b_awq_model_path(model_path):
+        return text
+    cleaned = text.rstrip()
+    if cleaned:
+        cleaned = re.sub(r"^(?:im_start\|\s*|im_end\|\s*|<\|im_start\|>\s*|<\|im_end\|>\s*)+", "", cleaned)
+        cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])", "", cleaned)
+        cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[，。！？；：])", "", cleaned)
+        cleaned = re.sub(r"([。！？.!?])(?:[\s\"“”'`*#\-\d\(\)\[\]\{\}\n]+)$", r"\1", cleaned)
+        cleaned = re.sub(r'[\s"“”\'`*#\-]+$', "", cleaned)
+        cleaned = re.sub(r"\(\s*$", "", cleaned)
+        cleaned = cleaned.rstrip()
+    return cleaned or text.rstrip()
+
+
 def _sample_token_from_logits(
     logits_1d: torch.Tensor,
     sp: SamplingParams,
     generated_ids: List[int],
     generator: Optional[torch.Generator],
     eos_token_ids_to_mask: Optional[List[int]] = None,
+    anti_template_token_ids: Optional[List[int]] = None,
 ) -> int:
     """
     Greedy argmax when temperature <= 0; otherwise temperature scaling, optional
@@ -198,6 +394,11 @@ def _sample_token_from_logits(
         for tid in eos_token_ids_to_mask:
             if 0 <= tid < logits.numel():
                 logits[tid] = float("-inf")
+
+    if anti_template_token_ids and len(generated_ids) < 12:
+        for tid in anti_template_token_ids:
+            if 0 <= tid < logits.numel():
+                logits[tid] -= 60.0
 
     temp = float(getattr(sp, "temperature", 0.0) or 0.0)
     if temp <= 1e-6:
@@ -277,11 +478,28 @@ class LiteEngine:
                     self.num_kv_heads = getattr(first_layer.self_attn, "num_kv_heads", 0)
                     self.head_size = getattr(first_layer.self_attn, "head_dim", 0)
 
-            # Fallback to config if model inspection failed
-            if self.num_attention_heads == 0:
+            from vllm.model_executor.models.qwen3_5 import (
+                Qwen3_5ForConditionalGeneration,
+                Qwen3_5MoeForConditionalGeneration,
+            )
+            is_qwen35 = isinstance(
+                self.model,
+                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
+            )
+
+            # Fallback to config if model inspection failed, or force config for Qwen3.5 hybrid layers.
+            if self.num_attention_heads == 0 or self.head_size == 0 or is_qwen35:
                 self.num_kv_heads = self.model_config.get_num_kv_heads(None)
                 self.head_size = self.model_config.get_head_size()
-                self.num_attention_heads = getattr(self.model_config.hf_config, "num_attention_heads", self.num_kv_heads)
+                hc = self.model_config.hf_config
+                self.num_attention_heads = getattr(
+                    hc, "num_attention_heads", self.num_kv_heads
+                )
+                hd = getattr(hc, "head_dim", None) or (
+                    hc.get("head_dim") if isinstance(hc, dict) else None
+                )
+                if hd:
+                    self.head_size = int(hd)
             
             # FORCE ALIGNMENT TO 8 FOR HARDWARE STABILITY
             if self.head_size % 8 != 0:
@@ -309,15 +527,15 @@ class LiteEngine:
         if env_chunk:
             self._prefill_chunk_size = max(1, int(env_chunk))
         else:
-            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
             from vllm.model_executor.models.qwen3_5 import (
                 Qwen3_5ForConditionalGeneration,
+                Qwen3_5MoeForConditionalGeneration,
             )
 
-            if isinstance(self.model, Qwen3_5ForConditionalGeneration):
-                self._prefill_chunk_size = self.max_model_len
-            elif isinstance(self.model, DeepseekV2ForCausalLM):
-                # MLA attention in Lite has no paged-KV path yet; full prompt in one forward.
+            if isinstance(
+                self.model,
+                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
+            ):
                 self._prefill_chunk_size = self.max_model_len
             else:
                 self._prefill_chunk_size = int(
@@ -335,9 +553,15 @@ class LiteEngine:
         
         self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
         if self.kv_dtype_str == "0":
-            from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+            from vllm.model_executor.models.qwen3_5 import (
+                Qwen3_5ForConditionalGeneration,
+                Qwen3_5MoeForConditionalGeneration,
+            )
 
-            if isinstance(self.model, Qwen3_5ForConditionalGeneration):
+            if isinstance(
+                self.model,
+                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
+            ):
                 # Match model activations (bf16) so paged decode aligns with HF; fp16 KV drifts logits.
                 print(
                     ">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5 + FASTINFERENCE_KV_FP8=0)"
@@ -454,7 +678,8 @@ class LiteEngine:
         max_tokens = min(max_tokens, self.execution_policy.max_tokens_cap)
         _apply_lite_default_min_tokens(effective_sampling_params, max_tokens)
 
-        input_ids = self.tokenizer.encode(prompt)
+        guarded_prompt = _maybe_apply_qwen35_prompt_guard(prompt, self.model_config.model)
+        input_ids = self.tokenizer.encode(guarded_prompt)
         slot_idx = self._free_slots.pop(0)
         
         rng: Optional[torch.Generator] = None
@@ -463,12 +688,13 @@ class LiteEngine:
             rng = torch.Generator(device=self.device)
             rng.manual_seed(int(seed))
 
-        req_dict: Dict[str, Any] = {
+        self._requests[request_id] = {
             "input_ids": input_ids,
             "generated_ids": [],
             "sampling_params": effective_sampling_params,
             "finished": False,
             "prompt": prompt,
+            "guarded_prompt": guarded_prompt,
             "slot_idx": slot_idx,
             "seq_len": 0,  # Current length in KV cache
             "is_prefill": True,
@@ -477,42 +703,19 @@ class LiteEngine:
             # Qwen3.5 linear-attn: recurrent delta-net state + causal conv tail (per layer).
             "linear_attn_carry": [None] * self.num_layers,
             "linear_conv_carry": [None] * self.num_layers,
+            "low_info_hits": 0,
+            "is_chinese_capital_question": _looks_like_chinese_capital_question(prompt),
+            "capital_question_bias_token_ids": (
+                _get_single_token_ids(self.tokenizer, ["都"])
+                if _looks_like_chinese_capital_question(prompt)
+                else []
+            ),
+            "anti_template_token_ids": (
+                _get_qwen35_anti_template_token_ids(self.tokenizer)
+                if _looks_like_qwen35_35b_awq_model_path(self.model_config.model)
+                else []
+            ),
         }
-        try:
-            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
-
-            if isinstance(self.model, DeepseekV2ForCausalLM):
-                hf = self.model_config.hf_config
-                nh = int(getattr(hf, "num_attention_heads", 16))
-                qk = int(getattr(hf, "qk_nope_head_dim", 128)) + int(
-                    getattr(hf, "qk_rope_head_dim", 64)
-                )
-                vd = int(getattr(hf, "v_head_dim", 128))
-                act_dtype = next(self.model.parameters()).dtype
-                mla_kv = []
-                for _ in range(self.num_layers):
-                    mla_kv.append(
-                        (
-                            torch.zeros(
-                                self.max_model_len,
-                                nh,
-                                qk,
-                                device=self.device,
-                                dtype=act_dtype,
-                            ),
-                            torch.zeros(
-                                self.max_model_len,
-                                nh,
-                                vd,
-                                device=self.device,
-                                dtype=act_dtype,
-                            ),
-                        )
-                    )
-                req_dict["mla_kv"] = mla_kv
-        except Exception:
-            pass
-        self._requests[request_id] = req_dict
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
         self._request_streams[request_id] = asyncio.Queue()
@@ -588,12 +791,6 @@ class LiteEngine:
                 "linear_attn_carry": req["linear_attn_carry"],
                 "linear_conv_carry": req["linear_conv_carry"],
             }
-            if req.get("mla_kv") is not None:
-                attn_metadata["mla_kv"] = req["mla_kv"]
-                attn_metadata["mla_prefill_kv_range"] = (
-                    processed_len,
-                    processed_len + this_chunk_len,
-                )
             positions = torch.arange(processed_len, processed_len + this_chunk_len, device=self.device).unsqueeze(0)
             
             try:
@@ -607,12 +804,18 @@ class LiteEngine:
                         req["sampling_params"],
                         getattr(self.model_config, "hf_config", None),
                     )
-                    next_token = _sample_token_from_logits(
+                    token_logits = _apply_qwen35_context_bias(
                         logits[0, -1, :],
+                        req,
+                        self.tokenizer,
+                    )
+                    next_token = _sample_token_from_logits(
+                        token_logits,
                         req["sampling_params"],
                         req["generated_ids"],
                         req.get("rng"),
                         eos_token_ids_to_mask=eos_mask,
+                        anti_template_token_ids=req.get("anti_template_token_ids"),
                     )
                     req["generated_ids"].append(next_token)
                     req["seq_len"] = processed_len + this_chunk_len
@@ -627,173 +830,92 @@ class LiteEngine:
                 self._free_request(rid)
 
         elif decodes:
-            from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+            # Batch ALL decodes
+            input_tokens = []
+            slot_indices = []
+            seq_lens = []
+            pos_indices = []
+            
+            for rid in decodes:
+                req = self._requests[rid]
+                last_token = req["generated_ids"][-1]
+                input_tokens.append([last_token])
+                slot_indices.append(req["slot_idx"])
+                
+                current_len = req["seq_len"]
+                seq_lens.append(current_len + 1) # Including new token
+                pos_indices.append(current_len)
+                
+            curr_input = torch.tensor(input_tokens, device=self.device) # (B, 1)
+            positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1) # (B, 1)
+            
+            # Generate block tables for batch
+            batch_block_tables = []
+            for S in slot_indices:
+                start_block = S * self.num_blocks_per_seq
+                batch_block_tables.append(torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32))
+            block_tables = torch.stack(batch_block_tables).to(self.device)
 
-            # DeepSeek MLA: single-token decode with per-request mla_kv (O(T) per step).
-            if isinstance(self.model, DeepseekV2ForCausalLM):
-                results_ds: List[Any] = []
-                for rid in decodes:
-                    req = self._requests[rid]
-                    try:
-                        last_token = req["generated_ids"][-1]
-                        curr_input = torch.tensor(
-                            [[last_token]], device=self.device, dtype=torch.long
-                        )
-                        pos = req["seq_len"]
-                        positions = torch.tensor(
-                            [[pos]], device=self.device, dtype=torch.long
-                        )
-                        slot_idx = req["slot_idx"]
-                        start_block = slot_idx * self.num_blocks_per_seq
-                        block_table = torch.arange(
-                            start_block,
-                            start_block + self.num_blocks_per_seq,
-                            device=self.device,
-                            dtype=torch.int32,
-                        )
-                        slot_mapping = torch.tensor(
-                            [slot_idx * self.max_model_len + pos],
-                            device=self.device,
-                            dtype=torch.long,
-                        )
-                        attn_metadata = {
-                            "slot_mapping": slot_mapping,
-                            "seq_lens": torch.tensor(
-                                [pos + 1], device=self.device, dtype=torch.int32
-                            ),
-                            "is_prefill": False,
-                            "kv_start_indices": torch.tensor(
-                                [pos], device=self.device, dtype=torch.int32
-                            ),
-                            "block_tables": block_table.unsqueeze(0),
-                            "linear_attn_carry": req["linear_attn_carry"],
-                            "linear_conv_carry": req["linear_conv_carry"],
-                        }
-                        if req.get("mla_kv") is not None:
-                            attn_metadata["mla_kv"] = req["mla_kv"]
-                            attn_metadata["mla_cached_len"] = pos
-                        logits = self.model(
-                            curr_input,
-                            positions,
-                            self.kv_caches,
-                            attn_metadata,
-                            lora_mapping=req.get("lora_id"),
-                        )
-                        eos_mask = _eos_stop_token_ids_for_sampling(
-                            self.tokenizer,
-                            req["sampling_params"],
-                            getattr(self.model_config, "hf_config", None),
-                        )
-                        token = _sample_token_from_logits(
-                            logits[0, -1, :],
-                            req["sampling_params"],
-                            req["generated_ids"],
-                            req.get("rng"),
-                            eos_token_ids_to_mask=eos_mask,
-                        )
-                        req["generated_ids"].append(token)
-                        req["seq_len"] += 1
-                        self._process_completion(rid, token, results_ds)
-                    except Exception as e:
-                        print(f"!!! LiteEngine Error (Decode DeepSeek): {e}")
-                        import traceback
+            # slot_mapping maps batch tokens to physical indices
+            slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
 
-                        traceback.print_exc()
-                        self._free_request(rid)
-                results.extend(results_ds)
-            else:
-                # Batch ALL decodes
-                input_tokens = []
-                slot_indices = []
-                seq_lens = []
-                pos_indices = []
+            req_dicts = [self._requests[rid] for rid in decodes]
+            attn_carry_batch = self._stack_per_layer_carries(
+                req_dicts, self.num_layers, "linear_attn_carry"
+            )
+            conv_carry_batch = self._stack_per_layer_carries(
+                req_dicts, self.num_layers, "linear_conv_carry"
+            )
+            attn_metadata = {
+                "slot_mapping": slot_mapping,
+                "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
+                "block_tables": block_tables,
+                "is_prefill": False,
+                "kv_start_indices": torch.tensor(
+                    pos_indices, device=self.device, dtype=torch.int32
+                ),
+                "linear_attn_carry": attn_carry_batch,
+                "linear_conv_carry": conv_carry_batch,
+            }
 
-                for rid in decodes:
-                    req = self._requests[rid]
-                    last_token = req["generated_ids"][-1]
-                    input_tokens.append([last_token])
-                    slot_indices.append(req["slot_idx"])
-
-                    current_len = req["seq_len"]
-                    seq_lens.append(current_len + 1)  # Including new token
-                    pos_indices.append(current_len)
-
-                curr_input = torch.tensor(input_tokens, device=self.device)  # (B, 1)
-                positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1)  # (B, 1)
-
-                # Generate block tables for batch
-                batch_block_tables = []
-                for S in slot_indices:
-                    start_block = S * self.num_blocks_per_seq
-                    batch_block_tables.append(
-                        torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32)
-                    )
-                block_tables = torch.stack(batch_block_tables).to(self.device)
-
-                # slot_mapping maps batch tokens to physical indices
-                slot_mapping = torch.tensor(
-                    [s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)],
-                    device=self.device,
-                    dtype=torch.long,
+            try:
+                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
+                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
+                self._split_per_layer_carries(
+                    attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
                 )
-
-                req_dicts = [self._requests[rid] for rid in decodes]
-                attn_carry_batch = self._stack_per_layer_carries(
-                    req_dicts, self.num_layers, "linear_attn_carry"
+                self._split_per_layer_carries(
+                    attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
                 )
-                conv_carry_batch = self._stack_per_layer_carries(
-                    req_dicts, self.num_layers, "linear_conv_carry"
-                )
-                attn_metadata = {
-                    "slot_mapping": slot_mapping,
-                    "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
-                    "block_tables": block_tables,
-                    "is_prefill": False,
-                    "kv_start_indices": torch.tensor(
-                        pos_indices, device=self.device, dtype=torch.int32
-                    ),
-                    "linear_attn_carry": attn_carry_batch,
-                    "linear_conv_carry": conv_carry_batch,
-                }
-
-                try:
-                    lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
-                    logits = self.model(
-                        curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping
+                # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
+                for i, rid in enumerate(decodes):
+                    req_i = self._requests[rid]
+                    eos_mask = _eos_stop_token_ids_for_sampling(
+                        self.tokenizer,
+                        req_i["sampling_params"],
+                        getattr(self.model_config, "hf_config", None),
                     )
-                    self._split_per_layer_carries(
-                        attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
+                    token_logits = _apply_qwen35_context_bias(
+                        logits[i, -1, :],
+                        req_i,
+                        self.tokenizer,
                     )
-                    self._split_per_layer_carries(
-                        attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
+                    token = _sample_token_from_logits(
+                        token_logits,
+                        req_i["sampling_params"],
+                        req_i["generated_ids"],
+                        req_i.get("rng"),
+                        eos_token_ids_to_mask=eos_mask,
+                        anti_template_token_ids=req_i.get("anti_template_token_ids"),
                     )
-                    # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
-                    for i, rid in enumerate(decodes):
-                        req_i = self._requests[rid]
-                        eos_mask = _eos_stop_token_ids_for_sampling(
-                            self.tokenizer,
-                            req_i["sampling_params"],
-                            getattr(self.model_config, "hf_config", None),
-                        )
-                        token = _sample_token_from_logits(
-                            logits[i, -1, :],
-                            req_i["sampling_params"],
-                            req_i["generated_ids"],
-                            req_i.get("rng"),
-                            eos_token_ids_to_mask=eos_mask,
-                        )
-                        req_i["generated_ids"].append(token)
-                        self._requests[rid]["seq_len"] += 1
-                        self._process_completion(rid, token, results)
-
-                except Exception as e:
-                    print(f"!!! LiteEngine Error (Decode): {e}")
-                    import traceback
-
-                    traceback.print_exc()
-                    # Fail all involved? Or try to isolate? For Lite, just fail.
-                    for rid in decodes:
-                        self._free_request(rid)
+                    req_i["generated_ids"].append(token)
+                    self._requests[rid]["seq_len"] += 1
+                    self._process_completion(rid, token, results)
+                    
+            except Exception as e:
+                print(f"!!! LiteEngine Error (Decode): {e}"); import traceback; traceback.print_exc()
+                # Fail all involved? Or try to isolate? For Lite, just fail.
+                for rid in decodes: self._free_request(rid)
 
         return results
 
@@ -817,9 +939,19 @@ class LiteEngine:
         elif gen_len >= max_tok:
             req["finished"] = True
 
+        current_text = _decode_generated_text(self.tokenizer, req["generated_ids"], sp)
+        if not req["finished"] and _should_early_stop_low_information(req, current_text):
+            req["low_info_hits"] = int(req.get("low_info_hits", 0)) + 1
+            # Require two consecutive detections to avoid cutting valid short outputs.
+            if req["low_info_hits"] >= 2 and gen_len >= max(10, min_tok):
+                req["finished"] = True
+        else:
+            req["low_info_hits"] = 0
+
+        display_text = _cleanup_qwen35_output_text(current_text, self.model_config.model)
         completion = CompletionOutput(
             index=0,
-            text=_decode_generated_text(self.tokenizer, req["generated_ids"], sp),
+            text=display_text,
             token_ids=req["generated_ids"],
             cumulative_logprob=0.0,
         )

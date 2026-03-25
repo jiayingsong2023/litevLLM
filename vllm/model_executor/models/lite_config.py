@@ -48,6 +48,7 @@ class LiteConfig:
         self.v_head_dim = getattr(hf_config, "v_head_dim", None)
 
         # Qwen3.5 linear-attention (GatedDeltaNet) text config
+        self.attention_bias = getattr(hf_config, "attention_bias", True)
         self.linear_num_value_heads = getattr(hf_config, "linear_num_value_heads", 32)
         self.linear_num_key_heads = getattr(hf_config, "linear_num_key_heads", 16)
         self.linear_key_head_dim = getattr(hf_config, "linear_key_head_dim", 128)

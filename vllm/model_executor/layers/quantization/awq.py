@@ -3,6 +3,10 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional, List
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.tensor import (
+    AWQWeight,
+    PackedInt4Weight,
+)
 
 class AWQConfig(QuantizationConfig):
     def __init__(self, weight_bits: int = 4, group_size: int = 128):
@@ -18,20 +22,19 @@ class AWQConfig(QuantizationConfig):
         # AWQ weights and zeros MUST be integers for bitwise shifts
         layer.qweight = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
         layer.scales = nn.Parameter(torch.zeros((1, 1), dtype=torch.float16), requires_grad=False)
-        layer.qzeros = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
+        layer.qzeros = None
+        layer.weight_shape = None
         # Propagate default group size so that layout checks and kernels can use it.
         if not hasattr(layer, "group_size"):
             layer.group_size = self.group_size
         layer._quant_weight = None
 
     def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.tensor import AWQWeight
-        
         # Check if already built
         weight = getattr(layer, "_quant_weight", None)
         if weight is None:
             qweight = getattr(layer, "qweight", None)
-            if qweight is None:
+            if qweight is None or qweight.numel() <= 1:
                 # Fallback to standard if possible
                 if hasattr(layer, "weight") and layer.weight is not None and layer.weight.numel() > 1:
                     return torch.nn.functional.linear(x, layer.weight, layer.bias)
@@ -39,6 +42,8 @@ class AWQConfig(QuantizationConfig):
 
             # Determine effective group size for this layer
             effective_group_size = getattr(layer, "group_size", self.group_size)
+
+            qzeros = getattr(layer, "qzeros", None)
 
             # Optional sanity check: ensure packed columns are divisible by group size.
             try:
@@ -52,13 +57,24 @@ class AWQConfig(QuantizationConfig):
             except Exception as e:
                 raise RuntimeError(f"AWQ layout check failed for layer '{getattr(layer, 'prefix', '<unknown>')}': {e}")
 
-            # Build the wrapper once
-            weight = AWQWeight(
-                qweight, 
-                getattr(layer, "scales"), 
-                getattr(layer, "qzeros"),
-                effective_group_size,
-            )
+            if qzeros is not None and qzeros.numel() > 1:
+                weight = AWQWeight(
+                    qweight,
+                    getattr(layer, "scales"),
+                    qzeros,
+                    effective_group_size,
+                    prefix=getattr(layer, "prefix", ""),
+                    high_fidelity=bool(getattr(layer, "force_high_fidelity_awq", False)),
+                )
+            else:
+                weight = PackedInt4Weight(
+                    qweight,
+                    getattr(layer, "scales"),
+                    effective_group_size,
+                    original_shape=getattr(layer, "weight_shape", None),
+                    prefix=getattr(layer, "prefix", ""),
+                    high_fidelity=bool(getattr(layer, "force_high_fidelity_awq", False)),
+                )
             layer._quant_weight = weight
 
         return weight.matmul(x, layer.bias)
@@ -68,6 +84,7 @@ class AWQConfig(QuantizationConfig):
             if "qweight" in name: layer.qweight = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
             elif "scales" in name: layer.scales = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
             elif "qzeros" in name: layer.qzeros = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+            elif "weight_shape" in name: layer.weight_shape = tuple(int(x) for x in loaded_weight.view(-1).tolist())
             elif "bias" in name: layer.bias = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
 
     @classmethod

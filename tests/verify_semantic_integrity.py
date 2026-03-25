@@ -149,6 +149,12 @@ PRESETS = {
         "max_new_tokens": 10,
         "quant": "gguf",
     },
+    # Qwen 3.5 35B MoE AWQ (HF safetensors / compressed-tensors; needs enough VRAM for BF16 MoE resident path)
+    "qwen35_35b_moe_awq": {
+        "prompt": "The capital of France is",
+        "max_new_tokens": 10,
+        "quant": "awq",
+    },
     # DeepSeek V2 Lite GGUF
     "deepseek_v2_lite_gguf": {
         "prompt": "The capital of France is",

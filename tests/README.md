@@ -4,7 +4,7 @@
 
 更完整的档位说明见 **[`docs/INFERENCE_ACCURACY.md`](../docs/INFERENCE_ACCURACY.md)**。
 
-## 四模型推理准确度回归（TinyLlama + Qwen3.5 9B AWQ/GGUF + DeepSeek-V2-Lite GGUF）
+## 三模型推理准确度回归（TinyLlama + Qwen3.5 9B AWQ + Qwen3.5 35B AWQ）
 
 在仓库根目录、本地已放置对应 `models/...` 且 GPU 驱动正常时：
 
@@ -12,9 +12,18 @@
 FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh
 ```
 
-仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`
+仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`  
+跳过 35B（本机资源不足时）：`SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh`
 
-A 档中 DeepSeek 为两步：**A4a** 同一 `DeepSeek-V2-Lite-Chat` safetensors 上 Lite vs HF（`--regression-gate safetensors`，与 transformers 实现对齐）；**A4b** `DeepSeek-V2-Lite-GGUF` vs Chat bf16（`--regression-gate deepseek-gguf`，Q4 与 bf16  logits 不要求与 A4a 同等 CosSim）。可调环境变量：`FASTINFERENCE_DEEPSEEK_GGUF_REGRESSION_MIN_COS`、`FASTINFERENCE_DEEPSEEK_GGUF_REGRESSION_MIN_TOPK`。
+默认模型路径可通过环境变量覆盖：
+
+- `MODEL_TINYLLAMA`
+- `MODEL_QWEN35_9B_AWQ`
+- `MODEL_QWEN35_35B_AWQ`
+- `HF_QWEN35_9B_FP16`
+- `HF_QWEN35_35B_FP16`
+
+脚本会对 `Qwen3.5-35B-AWQ` 自动启用稳定运行配置（FP8/KV + MoE offload 相关环境变量），并在缺少 `HF_QWEN35_35B_FP16` 时自动跳过 35B 的 A-tier 对拍。
 
 ## 一键 pytest（默认，不加载整模）
 

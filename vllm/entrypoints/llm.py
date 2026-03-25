@@ -11,6 +11,47 @@ from vllm.model_executor.model_loader import get_model, get_tokenizer
 from vllm.model_executor.layers.quantization.gguf import clear_gguf_cache
 from transformers import AutoConfig
 
+
+def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
+    group_size, bits = 128, 4
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        if not os.path.isfile(config_path):
+            return group_size, bits
+        with open(config_path, "r") as f:
+            raw_config = json.load(f)
+        quantization_config = raw_config.get("quantization_config") or {}
+        config_groups = quantization_config.get("config_groups")
+        if isinstance(config_groups, dict):
+            for group_value in config_groups.values():
+                if not isinstance(group_value, dict):
+                    continue
+                weights_config = group_value.get("weights")
+                if isinstance(weights_config, dict):
+                    if weights_config.get("group_size") is not None:
+                        group_size = int(weights_config["group_size"])
+                    if weights_config.get("num_bits") is not None:
+                        bits = int(weights_config["num_bits"])
+                    break
+        if quantization_config.get("group_size") is not None:
+            group_size = int(quantization_config["group_size"])
+        if quantization_config.get("bits") is not None:
+            bits = int(quantization_config["bits"])
+    except Exception:
+        pass
+    return group_size, bits
+
+
+def _looks_like_awq_quantized_model(hf_config, model_path: str) -> bool:
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        quant_method = str(quantization_config.get("quant_method", "")).lower()
+        if "awq" in quant_method:
+            return True
+        if quantization_config.get("format") == "pack-quantized":
+            return True
+    return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
+
 class LLM:
     def __init__(self, model: str, **kwargs):
         self.model_path = model; self.model = None; self.tokenizer = None; self._load_model()
@@ -45,7 +86,12 @@ class LLM:
                 if any(f.endswith(".gguf") for f in os.listdir(path)):
                     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
                     self.quant_config = GGUFConfig()
-                else: self.quant_config = None
+                elif _looks_like_awq_quantized_model(hf_cfg, path):
+                    from vllm.model_executor.layers.quantization.awq import AWQConfig
+                    group_size, weight_bits = _read_awq_group_size_and_bits(path)
+                    self.quant_config = AWQConfig(weight_bits=weight_bits, group_size=group_size)
+                else:
+                    self.quant_config = None
         v_config = LiteVllmConfig(self.model_path, hf_config)
         self.model_cfg = v_config.model_config; self.model = get_model(v_config)
         self.tokenizer = get_tokenizer(v_config.model_config)
