@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
 from typing import Optional, Any, Dict
+from collections import defaultdict
 
 class LRUWeightCache:
     def __init__(self, max_size=256):
@@ -35,6 +36,9 @@ _USE_BLOCK_FP8_AWQ = os.environ.get("FASTINFERENCE_AWQ_BLOCK_FP8", "1").strip().
 _USE_HIGH_FIDELITY_ALL_AWQ = os.environ.get("FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
+_USE_HIGH_FIDELITY_PREFIX_MATCH = os.environ.get(
+    "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max) if _FP8_DTYPE is not None else None
 _FP8_MIN_SCALE = 1.0 / (_FP8_MAX * 512.0) if _FP8_MAX is not None else None
 _HIGH_FIDELITY_PREFIXES = tuple(
@@ -64,6 +68,24 @@ _HIGH_FIDELITY_PREFIXES = tuple(
     if part.strip()
 )
 
+_AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
+
+
+def _awq_stat_inc(key: str, delta: int = 1) -> None:
+    _AWQ_RUNTIME_STATS[key] += delta
+
+
+def reset_awq_runtime_stats() -> None:
+    _AWQ_RUNTIME_STATS.clear()
+
+
+def get_awq_runtime_stats() -> Dict[str, int]:
+    return dict(_AWQ_RUNTIME_STATS)
+
+
+def clear_global_weight_cache() -> None:
+    _GLOBAL_WEIGHT_CACHE.clear()
+
 
 def _match_weight_dtype(weight: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     if weight.dtype == x.dtype:
@@ -78,6 +100,8 @@ def _can_use_fp8_weight_cache(x: torch.Tensor) -> bool:
 def _should_use_high_fidelity_awq(prefix: str, force_high_fidelity: bool = False) -> bool:
     if force_high_fidelity or _USE_HIGH_FIDELITY_ALL_AWQ:
         return True
+    if not _USE_HIGH_FIDELITY_PREFIX_MATCH:
+        return False
     if not prefix:
         return False
     return any(token in prefix for token in _HIGH_FIDELITY_PREFIXES)
@@ -123,6 +147,7 @@ def _scaled_mm_linear(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _awq_stat_inc("fp8_scaled_mm_attempt")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     x_fp8, x_scale = _quantize_per_tensor_fp8(x_2d)
     output_shape = [x_2d.shape[0], weight_fp8.shape[0]]
@@ -138,7 +163,9 @@ def _scaled_mm_linear(
             weight_scale,
             bias_arg,
         )
+        _awq_stat_inc("fp8_scaled_mm_rocm_kernel_ok")
     except Exception:
+        _awq_stat_inc("fp8_scaled_mm_rocm_kernel_fail")
         output = torch._scaled_mm(
             x_fp8,
             b_mat,
@@ -147,6 +174,7 @@ def _scaled_mm_linear(
             scale_b=weight_scale,
             bias=bias_arg,
         )
+        _awq_stat_inc("fp8_scaled_mm_torch_ok")
         if isinstance(output, tuple):
             output = output[0]
 
@@ -160,6 +188,7 @@ def _linear_from_fp8_cache(
 ) -> torch.Tensor:
     # Fallback for platforms without FP8 GEMM support: keep the persistent cache in FP8,
     # but only materialize the current layer's dense weight for this single matmul.
+    _awq_stat_inc("fp8_cache_to_dense_fallback")
     dense_weight = weight_fp8.to(dtype=x.dtype)
     return torch.nn.functional.linear(x, dense_weight, bias)
 
@@ -170,6 +199,7 @@ def _linear_from_block_fp8_cache(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _awq_stat_inc("block_fp8_cache_to_dense_fallback")
     from vllm.model_executor.moe_fp8_utils import moe_fp8_dequant_to_linear_weight
 
     dense_weight = moe_fp8_dequant_to_linear_weight(weight_fp8, weight_scale, x.dtype)
@@ -182,6 +212,7 @@ def _apply_linear_with_cached_weight(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if isinstance(cached_weight, dict) and cached_weight.get("mode") == "block_fp8":
+        _awq_stat_inc("cached_mode_block_fp8")
         return _linear_from_block_fp8_cache(
             x,
             cached_weight["weight"],
@@ -189,6 +220,7 @@ def _apply_linear_with_cached_weight(
             bias=bias,
         )
     if isinstance(cached_weight, dict) and cached_weight.get("mode") == "fp8":
+        _awq_stat_inc("cached_mode_fp8")
         try:
             return _scaled_mm_linear(
                 x,
@@ -200,9 +232,12 @@ def _apply_linear_with_cached_weight(
             message = str(exc)
             if "torch._scaled_mm is only supported" not in message:
                 raise
+            _awq_stat_inc("fp8_scaled_mm_runtime_unsupported")
             return _linear_from_fp8_cache(x, cached_weight["weight"], bias=bias)
         except AttributeError:
+            _awq_stat_inc("fp8_scaled_mm_attribute_missing")
             return _linear_from_fp8_cache(x, cached_weight["weight"], bias=bias)
+    _awq_stat_inc("cached_mode_dense")
     return torch.nn.functional.linear(x, _match_weight_dtype(cached_weight, x), bias)
 
 def dequantize_q4k_pytorch(qweight: torch.Tensor, n_rows: int, n_cols: int) -> torch.Tensor:
@@ -346,6 +381,7 @@ class AWQWeight(QuantizedLinearWeight):
         super().__init__(); self.qweight = nn.Parameter(qweight, requires_grad=False); self.scales = nn.Parameter(scales, requires_grad=False); self.qzeros = nn.Parameter(qzeros, requires_grad=False); self.group_size = group_size; self.prefix = prefix; self.high_fidelity = high_fidelity
     def matmul(self, x, bias=None):
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
+            _awq_stat_inc("high_fidelity_awq_direct_dequant")
             try:
                 from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
                 dense_weight = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
@@ -376,6 +412,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
 
     def matmul(self, x, bias=None):
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
+            _awq_stat_inc("high_fidelity_packed_int4_direct_dequant")
             dense_weight = dequantize_symmetric_packed_int4(
                 self.qweight,
                 self.scales,

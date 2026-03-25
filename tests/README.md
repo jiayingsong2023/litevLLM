@@ -14,6 +14,7 @@ FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh
 
 仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`  
 跳过 35B（本机资源不足时）：`SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh`
+附带性能诊断（prefill/decode + AWQ fallback 计数）：`RUN_PERF_DIAG=1 bash tests/run_inference_accuracy_regression.sh`
 
 默认模型路径可通过环境变量覆盖：
 
@@ -41,8 +42,7 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 | A 档 logits（HF vs Lite） | `tests/verify_semantic_integrity.py`、`tests/verify_layer0_submodule_alignment.py`、`tests/verify_layerwise_alignment.py` |
 | DeepSeek 末位 logits / 逐层 hidden | `tests/tools/compare_hf_lite_deepseek_logits.py`（A 档宜 **同一 safetensors 目录**；GGUF 对 HF bf16 不做 CosSim≥0.99 要求）、`compare_hf_lite_deepseek_layer_hiddens.py` |
 | Qwen 35B MoE GGUF packed vs dense | `tests/tools/qwen35_moe_packed_lite_logits_audit.py` |
-| Qwen GGUF 张量审计 | `tests/tools/qwen35_gguf_alignment_audit.py` |
-| 性能（多模型 AsyncLLM） | `uv run python tests/e2e_full_benchmark.py` |
+| Qwen GGUF 张量审计 | `tests/tools/qwen35_gguf_alignment_audit.py` || 性能回归（TinyLlama + Qwen3.5 9B/35B AWQ） | `uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq,qwen35_35b_awq --json-out .tmp_perf_regression_awq.json` |
 | 算子 / 量化微基准（合成权重） | `uv run python tests/full_perf_regression.py` |
 | LLM.generate 冒烟（与 e2e 模型列表对齐） | `uv run python tests/test_offline_api.py` |
 

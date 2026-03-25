@@ -340,7 +340,14 @@ def _cleanup_qwen35_output_text(text: str, model_path: str) -> str:
         return text
     cleaned = text.rstrip()
     if cleaned:
-        cleaned = re.sub(r"^(?:im_start\|\s*|im_end\|\s*|<\|im_start\|>\s*|<\|im_end\|>\s*)+", "", cleaned)
+        # Drop templating-marker echoes and their partially decoded fragments.
+        cleaned = re.sub(
+            r"^(?:(?:<\|)?(?:[a-z_]*)(?:im_)?(?:start|end)\|>?\s*|[a-z_]*art\|\s*>?\s*)+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^[>\|\-\s]+", "", cleaned)
         cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])", "", cleaned)
         cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[，。！？；：])", "", cleaned)
         cleaned = re.sub(r"([。！？.!?])(?:[\s\"“”'`*#\-\d\(\)\[\]\{\}\n]+)$", r"\1", cleaned)

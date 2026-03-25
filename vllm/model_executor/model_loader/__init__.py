@@ -923,6 +923,31 @@ def _looks_like_qwen35_35b_awq_model_path(model_path: str) -> bool:
     return "qwen3.5-35b-awq" in base or ("qwen3.5" in base and "35b" in base and "awq" in base)
 
 
+_QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES = (
+    ".linear_attn.in_proj_qkv",
+    ".linear_attn.out_proj",
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+    ".shared_expert.gate_proj",
+    ".shared_expert.up_proj",
+    ".shared_expert.down_proj",
+)
+
+
+def _should_force_high_fidelity_awq_for_qwen35_35b(module_name: str) -> bool:
+    mode = os.environ.get(
+        "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE",
+        "balanced",
+    ).strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return False
+    if mode in ("all", "full"):
+        return ".experts." not in module_name
+    return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES)
+
+
 def _load_safetensors(model: nn.Module, model_path: str):
     from safetensors.torch import load_file
     sf_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
@@ -1047,7 +1072,9 @@ def _load_safetensors(model: nn.Module, model_path: str):
 
             if should_preserve_quant:
                 if _looks_like_qwen35_35b_awq_model_path(model_path):
-                    m.force_high_fidelity_awq = True
+                    m.force_high_fidelity_awq = _should_force_high_fidelity_awq_for_qwen35_35b(
+                        m_name
+                    )
                 m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)
                 m.scales = nn.Parameter(sc.contiguous(), requires_grad=False)
                 qz = comps.get("qzeros")

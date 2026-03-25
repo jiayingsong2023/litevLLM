@@ -26,6 +26,7 @@ HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
 HF_QWEN35_35B_FP16="${HF_QWEN35_35B_FP16:-models/Qwen3.5-35B-FP16}"
 
 SKIP_35B="${SKIP_35B:-0}"
+RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 
 require_model_dir() {
   local model_dir="$1"
@@ -117,3 +118,18 @@ fi
 
 echo ""
 echo "=== All requested accuracy regression steps completed OK ==="
+
+if [[ "$RUN_PERF_DIAG" == "1" ]]; then
+  echo ""
+  echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
+  PERF_MODELS="tinyllama,qwen35_9b_awq"
+  if [[ "$SKIP_35B" != "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},qwen35_35b_awq"
+  fi
+  PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
+  echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
+  uv run python tests/e2e_full_benchmark.py \
+    --models "${PERF_MODELS}" \
+    --json-out "${PERF_JSON}"
+  echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
+fi

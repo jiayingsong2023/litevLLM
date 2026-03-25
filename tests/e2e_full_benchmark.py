@@ -1,124 +1,441 @@
 # SPDX-License-Identifier: Apache-2.0
+import argparse
 import asyncio
-import time
-import torch
+import json
+import math
 import os
-from vllm import LLM, SamplingParams
-from vllm.config import VllmConfig, ModelConfig, LoadConfig
+import time
+from dataclasses import dataclass
+from statistics import median
+from typing import Dict, List, Optional
+
+import torch
+
+from vllm import SamplingParams
+from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.engine.async_llm import AsyncLLM
 
-MODELS = [
-    ("models/TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B (Dense)"),
-    ("models/Qwen3.5-9B-GGUF", "Qwen3.5-9B (GGUF Q4)"),
-    ("models/Qwen3.5-9B-AWQ", "Qwen3.5-9B (AWQ INT4)"),
-    ("models/DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite (MoE)"),
-    ("models/GLM-4.7-Flash-GGUF", "GLM-4.7-Flash (MoE)"),
-    ("models/Qwen3.5-35B-MoE-GGUF", "Qwen3.5-35B (Large MoE)"),
-]
 
-async def run_benchmark(model_path, model_name):
-    # Determine load parameters based on model
-    is_35b = "35B" in model_name
-    batch_size = 1 if is_35b else 8
-    max_new_tokens = 128 # We test generation throughput
-    # We use a long prompt to simulate "content length"
-    content_len = 1024 if is_35b else 2048
-    
-    print(f"\n{'='*60}")
-    print(f"BENCHMARKING: {model_name}")
-    print(f"LOAD: BS={batch_size}, Target Content Length={content_len}")
-    print(f"PATH: {model_path}")
-    if torch.cuda.is_available():
-        print(f"INITIAL MEMORY: {torch.cuda.memory_allocated()/1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
-    print(f"{'='*60}")
-    
-    if not os.path.exists(model_path):
-        print(f"Skipping {model_name}: Path not found.")
-        return
+@dataclass(frozen=True)
+class ModelSpec:
+    key: str
+    model_path: str
+    display_name: str
+    quant: str
+    concurrent_reqs: int
+    prompt_tokens_target: int
+    max_new_tokens: int
+    gpu_memory_utilization: float
+    max_model_len: int
+    max_run_seconds: int
+    stable_env: Dict[str, str]
 
+
+MODEL_SPECS: Dict[str, ModelSpec] = {
+    "tinyllama": ModelSpec(
+        key="tinyllama",
+        model_path="models/TinyLlama-1.1B-Chat-v1.0",
+        display_name="TinyLlama-1.1B (Dense)",
+        quant="none",
+        concurrent_reqs=4,
+        prompt_tokens_target=256,
+        max_new_tokens=32,
+        gpu_memory_utilization=0.92,
+        max_model_len=4096,
+        max_run_seconds=120,
+        stable_env={},
+    ),
+    "qwen35_9b_awq": ModelSpec(
+        key="qwen35_9b_awq",
+        model_path="models/Qwen3.5-9B-AWQ",
+        display_name="Qwen3.5-9B (AWQ INT4)",
+        quant="awq",
+        concurrent_reqs=1,
+        prompt_tokens_target=256,
+        max_new_tokens=24,
+        gpu_memory_utilization=0.92,
+        max_model_len=4096,
+        max_run_seconds=180,
+        stable_env={
+            "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL": "0",
+            "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH": "0",
+            "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE": "off",
+        },
+    ),
+    "qwen35_35b_awq": ModelSpec(
+        key="qwen35_35b_awq",
+        model_path="models/Qwen3.5-35B-AWQ",
+        display_name="Qwen3.5-35B (AWQ INT4)",
+        quant="awq",
+        concurrent_reqs=1,
+        prompt_tokens_target=128,
+        max_new_tokens=12,
+        gpu_memory_utilization=0.90,
+        max_model_len=2048,
+        max_run_seconds=240,
+        stable_env={
+            "FASTINFERENCE_KV_FP8": "1",
+            "FASTINFERENCE_QWEN35_MOE_FP8": "1",
+            "FASTINFERENCE_QWEN35_MOE_OFFLOAD": "1",
+            "FASTINFERENCE_AWQ_FP8": "1",
+            "FASTINFERENCE_AWQ_BLOCK_FP8": "1",
+            "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL": "0",
+            "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH": "0",
+            "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE": "balanced",
+        },
+    ),
+}
+
+
+def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
+    config_path = os.path.join(model_path, "config.json")
+    group_size, bits = 128, 4
     try:
-        # 1. Config Setup (optimized for AMD AI Max)
-        m_cfg = ModelConfig(
-            model=model_path,
-            tokenizer=model_path,
-            tokenizer_mode="auto",
-            trust_remote_code=True,
-            dtype="float16",
-            max_model_len=max(4096, content_len + max_new_tokens)
-        )
-        
-        from vllm.config import CacheConfig, SchedulerConfig, LoadConfig
-        v_cfg = VllmConfig(
-            model_config=m_cfg,
-            cache_config=CacheConfig(block_size=16, gpu_memory_utilization=0.92, swap_space=0),
-            scheduler_config=SchedulerConfig(max_num_batched_tokens=content_len * batch_size, 
-                                           max_num_seqs=batch_size, 
-                                           max_model_len=m_cfg.max_model_len),
-            load_config=LoadConfig(load_format="auto"),
-            quant_config=None,
-        )
-        if any(f.endswith(".gguf") for f in os.listdir(model_path)):
-            from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-            v_cfg.quant_config = GGUFConfig()
+        if not os.path.isfile(config_path):
+            return group_size, bits
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        qc = raw.get("quantization_config") or {}
+        groups = qc.get("config_groups")
+        if isinstance(groups, dict):
+            for g in groups.values():
+                if not isinstance(g, dict):
+                    continue
+                w = g.get("weights")
+                if isinstance(w, dict):
+                    if w.get("group_size") is not None:
+                        group_size = int(w["group_size"])
+                    if w.get("num_bits") is not None:
+                        bits = int(w["num_bits"])
+                    break
+        if qc.get("group_size") is not None:
+            group_size = int(qc["group_size"])
+        if qc.get("bits") is not None:
+            bits = int(qc["bits"])
+    except Exception as exc:
+        print(f"  [Warn] Failed to parse AWQ config ({config_path}): {exc}")
+    return group_size, bits
 
-        # 2. Load Entrypoint
+
+def _build_prompt(target_tokens: int) -> str:
+    sentence = (
+        "Please explain how modern AI systems improve software performance and reliability "
+        "in practical engineering workflows. "
+    )
+    repeat = max(8, target_tokens // 12)
+    return sentence * repeat
+
+
+def _p95(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int(0.95 * (len(ordered) - 1))
+    return ordered[idx]
+
+
+def _finite_values(values: List[float]) -> List[float]:
+    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+
+
+def _apply_temp_env(env_map: Dict[str, str]) -> Dict[str, Optional[str]]:
+    old_env: Dict[str, Optional[str]] = {}
+    for key, value in env_map.items():
+        old_env[key] = os.environ.get(key)
+        os.environ[key] = value
+    return old_env
+
+
+def _restore_env(old_env: Dict[str, Optional[str]]) -> None:
+    for key, value in old_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _build_vllm_config(spec: ModelSpec) -> VllmConfig:
+    model_cfg = ModelConfig(
+        model=spec.model_path,
+        tokenizer=spec.model_path,
+        tokenizer_mode="auto",
+        trust_remote_code=True,
+        dtype="float16",
+        max_model_len=spec.max_model_len,
+    )
+    scheduler_cfg = SchedulerConfig(
+        max_num_batched_tokens=min(8192, spec.max_model_len * spec.concurrent_reqs),
+        max_num_seqs=spec.concurrent_reqs,
+        max_model_len=spec.max_model_len,
+    )
+    cache_cfg = CacheConfig(
+        block_size=16,
+        gpu_memory_utilization=spec.gpu_memory_utilization,
+        swap_space=0,
+    )
+    v_cfg = VllmConfig(
+        model_config=model_cfg,
+        cache_config=cache_cfg,
+        scheduler_config=scheduler_cfg,
+        load_config=LoadConfig(load_format="auto"),
+        quant_config=None,
+    )
+    if spec.quant == "awq":
+        from vllm.model_executor.layers.quantization.awq import AWQConfig
+
+        group_size, bits = _read_awq_group_size_and_bits(spec.model_path)
+        v_cfg.quant_config = AWQConfig(weight_bits=bits, group_size=group_size)
+    return v_cfg
+
+
+async def _run_single_request(
+    llm: AsyncLLM,
+    request_id: str,
+    prompt: str,
+    sampling_params: SamplingParams,
+) -> Dict[str, float]:
+    start = time.perf_counter()
+    first_token_at: Optional[float] = None
+    generated_tokens = 0
+    async for output in llm.generate(prompt, sampling_params, request_id):
+        if output.outputs:
+            generated_tokens = len(output.outputs[0].token_ids)
+            if first_token_at is None and generated_tokens > 0:
+                first_token_at = time.perf_counter()
+    end = time.perf_counter()
+    ttft_ms = ((first_token_at - start) * 1000.0) if first_token_at is not None else float("nan")
+    e2e_ms = (end - start) * 1000.0
+    decode_tokens = max(0, generated_tokens - 1)
+    decode_ms = e2e_ms - ttft_ms if math.isfinite(ttft_ms) else float("nan")
+    decode_tps = (
+        (float(decode_tokens) * 1000.0 / decode_ms)
+        if decode_tokens > 0 and math.isfinite(decode_ms) and decode_ms > 0.0
+        else float("nan")
+    )
+    return {
+        "tokens": float(generated_tokens),
+        "ttft_ms": ttft_ms,
+        "e2e_ms": e2e_ms,
+        "decode_tokens": float(decode_tokens),
+        "decode_ms": decode_ms,
+        "decode_tps": decode_tps,
+    }
+
+
+async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
+    print(f"\n{'=' * 72}")
+    print(f"BENCHMARKING: {spec.display_name}")
+    print(f"PATH: {spec.model_path}")
+    print(
+        "SETUP: "
+        f"concurrency={spec.concurrent_reqs}, prompt_tokens~{spec.prompt_tokens_target}, "
+        f"max_new_tokens={spec.max_new_tokens}, quant={spec.quant}"
+    )
+    if torch.cuda.is_available():
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(
+            "GPU MEMORY: "
+            f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated / {total_mem:.2f} GB total"
+        )
+    print(f"{'=' * 72}")
+
+    if not os.path.isdir(spec.model_path):
+        print("  [Skip] Model directory not found.")
+        return {"skipped": 1.0}
+
+    old_env = _apply_temp_env(spec.stable_env)
+    llm: Optional[AsyncLLM] = None
+    try:
+        from vllm.model_executor.layers.quantization.tensor import (
+            get_awq_runtime_stats,
+            reset_awq_runtime_stats,
+        )
+
+        reset_awq_runtime_stats()
+        v_cfg = _build_vllm_config(spec)
         llm = AsyncLLM.from_vllm_config(v_cfg)
-        sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
-        
-        # Construct long prompt to fill content length
-        base_prompt = "Tell me a long story about AI and the future of human civilization. "
-        repeat_factor = (content_len // 10) # rough estimate
-        long_prompt = base_prompt * (repeat_factor // len(base_prompt.split()) + 1)
-        
-        # 3. Benchmark - Warmup
-        print(f"[{model_name}] Warming up with single request...")
-        async for _ in llm.generate("Hello", sampling_params, "warmup"): pass
-        
-        # 4. Benchmark - Full Concurrent Run
-        print(f"[{model_name}] Running concurrent test (BS={batch_size})...")
-        
-        async def run_single_request(idx):
-            req_id = f"bench_{idx}_{int(time.time())}"
-            tokens = 0
-            async for output in llm.generate(long_prompt, sampling_params, req_id):
-                if output.finished:
-                    tokens = len(output.outputs[0].token_ids)
-            return tokens
+        sampling_params = SamplingParams(max_tokens=spec.max_new_tokens, temperature=0.0)
+        prompt = _build_prompt(spec.prompt_tokens_target)
 
-        start_time = time.perf_counter()
-        # Launch concurrent requests
-        results = await asyncio.gather(*[run_single_request(i) for i in range(batch_size)])
-        end_time = time.perf_counter()
-        
-        duration = end_time - start_time
-        total_tokens = sum(results)
-        tps = total_tokens / duration
-        
-        print(f"  🏆 RESULT: {tps:.2f} aggregate tokens/sec")
-        print(f"  📊 Stats: Total Tokens: {total_tokens}, Total Time: {duration:.2f}s, Avg Latency: {duration*1000/(total_tokens/batch_size):.2f} ms/tok/user")
-        
-        # Cleanup
-        llm.shutdown()
-        if hasattr(llm, "engine"):
-            if hasattr(llm.engine, "model"): del llm.engine.model
-            del llm.engine
-        del llm
-        from vllm.model_executor.layers.quantization.tensor import clear_global_weight_cache
-        clear_global_weight_cache()
-        import gc; gc.collect()
-        torch.cuda.empty_cache()
-        
-    except Exception as e:
-        print(f"  ❌ FAILED: {e}")
-        import traceback; traceback.print_exc()
+        print("  [Warmup] Running one short request...")
+        async for _ in llm.generate("Hello", SamplingParams(max_tokens=8, temperature=0.0), f"{spec.key}_warmup"):
+            pass
 
-async def main():
-    print("================================================================")
-    print("FASTINFERENCE REAL-WEIGHT END-TO-END BENCHMARK (AMD AI MAX+395)")
-    print("================================================================")
-    
-    for path, name in MODELS:
-        await run_benchmark(path, name)
+        print("  [Run] Launching concurrent benchmark requests...")
+        wall_start = time.perf_counter()
+        tasks = [
+            _run_single_request(
+                llm=llm,
+                request_id=f"{spec.key}_{idx}_{int(time.time())}",
+                prompt=prompt,
+                sampling_params=sampling_params,
+            )
+            for idx in range(spec.concurrent_reqs)
+        ]
+        try:
+            request_results = await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=float(spec.max_run_seconds),
+            )
+        except asyncio.TimeoutError:
+            awq_stats = get_awq_runtime_stats()
+            print(
+                f"  [Timeout] Exceeded {spec.max_run_seconds}s for {spec.display_name}; "
+                "marking as timeout in summary."
+            )
+            if awq_stats:
+                print(f"  AWQ_STATS(timeout): {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
+            return {
+                "skipped": 0.0,
+                "timed_out": 1.0,
+                "total_tokens": 0.0,
+                "wall_time_sec": float(spec.max_run_seconds),
+                "aggregate_tps": 0.0,
+                "ttft_p50_ms": float("nan"),
+                "ttft_p95_ms": float("nan"),
+                "e2e_p50_ms": float("nan"),
+                "e2e_p95_ms": float("nan"),
+                "prefill_p50_ms": float("nan"),
+                "prefill_p95_ms": float("nan"),
+                "decode_p50_ms": float("nan"),
+                "decode_p95_ms": float("nan"),
+                "decode_tokens_total": 0.0,
+                "decode_tps_aggregate": 0.0,
+                "decode_tps_p50": float("nan"),
+                "decode_tps_p95": float("nan"),
+                "awq_runtime_stats": awq_stats,
+            }
+        wall_end = time.perf_counter()
+
+        wall_sec = max(1e-6, wall_end - wall_start)
+        total_tokens = int(sum(r["tokens"] for r in request_results))
+        aggregate_tps = float(total_tokens) / wall_sec
+        ttft_list = _finite_values([r["ttft_ms"] for r in request_results])
+        e2e_list = _finite_values([r["e2e_ms"] for r in request_results])
+        decode_ms_list = _finite_values([r["decode_ms"] for r in request_results])
+        decode_tps_list = _finite_values([r["decode_tps"] for r in request_results])
+        decode_tokens_total = float(sum(r["decode_tokens"] for r in request_results))
+        decode_tps_aggregate = (
+            decode_tokens_total / (sum(decode_ms_list) / 1000.0)
+            if decode_tokens_total > 0.0 and decode_ms_list and sum(decode_ms_list) > 0.0
+            else 0.0
+        )
+        awq_stats = get_awq_runtime_stats()
+
+        result = {
+            "skipped": 0.0,
+            "timed_out": 0.0,
+            "total_tokens": float(total_tokens),
+            "wall_time_sec": wall_sec,
+            "aggregate_tps": aggregate_tps,
+            "ttft_p50_ms": median(ttft_list) if ttft_list else float("nan"),
+            "ttft_p95_ms": _p95(ttft_list) if ttft_list else float("nan"),
+            "e2e_p50_ms": median(e2e_list) if e2e_list else float("nan"),
+            "e2e_p95_ms": _p95(e2e_list) if e2e_list else float("nan"),
+            "prefill_p50_ms": median(ttft_list) if ttft_list else float("nan"),
+            "prefill_p95_ms": _p95(ttft_list) if ttft_list else float("nan"),
+            "decode_p50_ms": median(decode_ms_list) if decode_ms_list else float("nan"),
+            "decode_p95_ms": _p95(decode_ms_list) if decode_ms_list else float("nan"),
+            "decode_tokens_total": decode_tokens_total,
+            "decode_tps_aggregate": decode_tps_aggregate,
+            "decode_tps_p50": median(decode_tps_list) if decode_tps_list else float("nan"),
+            "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
+            "awq_runtime_stats": awq_stats,
+        }
+
+        print(
+            "  RESULT: "
+            f"tokens/s={result['aggregate_tps']:.2f}, "
+            f"TTFT p50/p95={result['ttft_p50_ms']:.1f}/{result['ttft_p95_ms']:.1f} ms, "
+            f"E2E p50/p95={result['e2e_p50_ms']:.1f}/{result['e2e_p95_ms']:.1f} ms, "
+            f"Decode p50/p95={result['decode_p50_ms']:.1f}/{result['decode_p95_ms']:.1f} ms, "
+            f"Decode TPS={result['decode_tps_aggregate']:.2f}"
+        )
+        if awq_stats:
+            print(f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
+        return result
+    finally:
+        if llm is not None:
+            llm.shutdown()
+        try:
+            from vllm.model_executor.layers.quantization.tensor import clear_global_weight_cache
+
+            clear_global_weight_cache()
+        except Exception:
+            pass
+        _restore_env(old_env)
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="End-to-end performance benchmark for TinyLlama / Qwen3.5 AWQ models."
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="tinyllama,qwen35_9b_awq,qwen35_35b_awq",
+        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,qwen35_35b_awq",
+    )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default="",
+        help="Optional path to save JSON benchmark summary.",
+    )
+    return parser.parse_args()
+
+
+async def main() -> None:
+    args = _parse_args()
+    model_keys = [k.strip() for k in args.models.split(",") if k.strip()]
+    specs: List[ModelSpec] = []
+    for key in model_keys:
+        if key not in MODEL_SPECS:
+            raise ValueError(f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}")
+        specs.append(MODEL_SPECS[key])
+
+    print("=" * 72)
+    print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
+    print("Targets: TinyLlama + Qwen3.5 9B/35B AWQ")
+    print("=" * 72)
+
+    summary: Dict[str, Dict[str, float]] = {}
+    for spec in specs:
+        summary[spec.key] = await run_benchmark(spec)
+
+    print("\n" + "-" * 72)
+    print("PERF SUMMARY")
+    print("-" * 72)
+    for key in model_keys:
+        r = summary[key]
+        if r.get("skipped", 0.0) == 1.0:
+            print(f"{key:16} | skipped")
+            continue
+        if r.get("timed_out", 0.0) == 1.0:
+            print(f"{key:16} | timeout")
+            continue
+        print(
+            f"{key:16} | tps={r['aggregate_tps']:.2f} | "
+            f"ttft_p50={r['ttft_p50_ms']:.1f}ms | ttft_p95={r['ttft_p95_ms']:.1f}ms | "
+            f"e2e_p50={r['e2e_p50_ms']:.1f}ms | e2e_p95={r['e2e_p95_ms']:.1f}ms | "
+            f"decode_tps={r['decode_tps_aggregate']:.2f}"
+        )
+
+    if args.json_out:
+        payload = {
+            "models": model_keys,
+            "summary": summary,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        print(f"\nJSON summary written to: {args.json_out}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
