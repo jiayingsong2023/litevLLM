@@ -1196,8 +1196,14 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     if os.path.exists(path):
         with open(path, "r") as f:
             data = json.load(f)
+            # Hugging Face deprecates `torch_dtype` on configs in favor of `dtype`; avoid noisy warnings.
+            if "dtype" not in data and "torch_dtype" in data:
+                data["dtype"] = data["torch_dtype"]
             for k, v in data.items():
-                if k != "text_config": setattr(cfg.hf_config, k, v)
+                if k != "text_config":
+                    if k == "torch_dtype":
+                        continue
+                    setattr(cfg.hf_config, k, v)
             if "text_config" in data: 
                 for k, v in data["text_config"].items(): setattr(cfg.hf_config, k, v)
             cfg.hf_config.layer_types = data.get("text_config", {}).get("layer_types", [])

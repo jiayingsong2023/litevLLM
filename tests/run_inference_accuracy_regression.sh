@@ -8,7 +8,7 @@
 # Run from repo root. Requires local models/ paths and a working CUDA/ROCm device.
 #
 # Usage:
-#   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh
+#   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh  # force bf16/fp16 KV (more VRAM)
 #   SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh   # B-tier only (faster)
 #   SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh       # skip 35B checks
 #
@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
-export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-0}"
+export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-1}"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"

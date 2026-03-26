@@ -274,7 +274,7 @@ def run_submodule_audit(
     check_layer0_weights: bool = False,
     compare_post_attn_residual: bool = False,
 ):
-    os.environ["FASTINFERENCE_KV_FP8"] = "0"
+    os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
 
     _print_fairness_banner(quant, model_path, hf_model_path)
 

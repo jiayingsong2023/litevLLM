@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
-export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-0}"
+export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-1}"
 
 MODEL="${MODEL:-models/Qwen3.5-9B-FP16}"
 QUANT="${1:-none}"

@@ -31,6 +31,7 @@ class ModelSpec:
     stable_env: Dict[str, str]
 
 
+# KV cache: FP8 KV (FASTINFERENCE_KV_FP8=1) to save VRAM; aligned with accuracy suite defaults.
 MODEL_SPECS: Dict[str, ModelSpec] = {
     "tinyllama": ModelSpec(
         key="tinyllama",
@@ -43,7 +44,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.92,
         max_model_len=4096,
         max_run_seconds=120,
-        stable_env={},
+        stable_env={"FASTINFERENCE_KV_FP8": "1"},
     ),
     "qwen35_9b_awq": ModelSpec(
         key="qwen35_9b_awq",
@@ -56,11 +57,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.92,
         max_model_len=4096,
         max_run_seconds=180,
-        stable_env={
-            "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL": "0",
-            "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH": "0",
-            "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE": "off",
-        },
+        stable_env={"FASTINFERENCE_KV_FP8": "1"},
     ),
     "qwen35_35b_awq": ModelSpec(
         key="qwen35_35b_awq",
@@ -117,13 +114,24 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
     return group_size, bits
 
 
-def _build_prompt(target_tokens: int) -> str:
+def _build_prompt(tokenizer, target_tokens: int) -> str:
     sentence = (
         "Please explain how modern AI systems improve software performance and reliability "
         "in practical engineering workflows. "
     )
+    target_tokens = max(8, int(target_tokens))
     repeat = max(8, target_tokens // 12)
-    return sentence * repeat
+    prompt_text = sentence * repeat
+    token_ids = tokenizer.encode(prompt_text)
+    if len(token_ids) < target_tokens:
+        # Extend prompt until the target token budget is reached.
+        while len(token_ids) < target_tokens:
+            prompt_text = prompt_text + sentence
+            token_ids = tokenizer.encode(prompt_text)
+    elif len(token_ids) > target_tokens:
+        token_ids = token_ids[:target_tokens]
+        prompt_text = tokenizer.decode(token_ids)
+    return prompt_text
 
 
 def _p95(values: List[float]) -> float:
@@ -246,16 +254,22 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
     old_env = _apply_temp_env(spec.stable_env)
     llm: Optional[AsyncLLM] = None
     try:
-        from vllm.model_executor.layers.quantization.tensor import (
-            get_awq_runtime_stats,
-            reset_awq_runtime_stats,
-        )
+        if spec.quant == "awq":
+            from vllm.model_executor.layers.quantization.tensor import (
+                get_awq_runtime_stats,
+                reset_awq_runtime_stats,
+            )
 
-        reset_awq_runtime_stats()
+            reset_awq_runtime_stats()
         v_cfg = _build_vllm_config(spec)
         llm = AsyncLLM.from_vllm_config(v_cfg)
         sampling_params = SamplingParams(max_tokens=spec.max_new_tokens, temperature=0.0)
-        prompt = _build_prompt(spec.prompt_tokens_target)
+        # Reserve decode room so prefill does not consume the full KV capacity.
+        prompt_budget = min(
+            int(spec.prompt_tokens_target),
+            max(8, int(spec.max_model_len) - int(spec.max_new_tokens) - 1),
+        )
+        prompt = _build_prompt(llm.engine.tokenizer, prompt_budget)
 
         print("  [Warmup] Running one short request...")
         async for _ in llm.generate("Hello", SamplingParams(max_tokens=8, temperature=0.0), f"{spec.key}_warmup"):
@@ -278,7 +292,13 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
                 timeout=float(spec.max_run_seconds),
             )
         except asyncio.TimeoutError:
-            awq_stats = get_awq_runtime_stats()
+            awq_stats: Dict = {}
+            if spec.quant == "awq":
+                from vllm.model_executor.layers.quantization.tensor import (
+                    get_awq_runtime_stats,
+                )
+
+                awq_stats = get_awq_runtime_stats()
             print(
                 f"  [Timeout] Exceeded {spec.max_run_seconds}s for {spec.display_name}; "
                 "marking as timeout in summary."
@@ -320,7 +340,13 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             if decode_tokens_total > 0.0 and decode_ms_list and sum(decode_ms_list) > 0.0
             else 0.0
         )
-        awq_stats = get_awq_runtime_stats()
+        awq_stats = {}
+        if spec.quant == "awq":
+            from vllm.model_executor.layers.quantization.tensor import (
+                get_awq_runtime_stats,
+            )
+
+            awq_stats = get_awq_runtime_stats()
 
         result = {
             "skipped": 0.0,

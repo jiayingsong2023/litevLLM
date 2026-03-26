@@ -67,15 +67,76 @@ class LlamaDecoderLayer(nn.Module):
             seq_lens = attn_metadata.get("seq_lens", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "seq_lens", None)
             is_prefill = attn_metadata.get("is_prefill", False) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "is_prefill", False)
             
-            # CRITICAL: For chunked prefill (seq > 1), we must expand metadata for the kernel
+            # CRITICAL: For chunked prefill (seq > 1), we must expand metadata for the kernel.
+            # Batched prefill (bs > 1) needs per-request seq_lens / block_tables rows (LiteEngine microbatch).
+            max_ctx = int(
+                max(
+                    self.self_attn.num_heads * self.self_attn.head_dim,
+                    getattr(self.config, "max_position_embeddings", 4096),
+                )
+            )
             if seq > 1 and is_prefill:
-                end_pos = seq_lens[0].item()
-                start_pos = end_pos - seq
-                seq_lens_ext = torch.arange(start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32)
-                block_tables_ext = block_tables.expand(seq, -1).contiguous()
-                paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_heads, self.self_attn.scale, block_tables_ext, seq_lens_ext, k_cache.shape[1], 4096, None, "auto", None, None, num_kv_heads=self.self_attn.num_kv_heads)
+                if bs == 1:
+                    end_pos = int(seq_lens[0].item())
+                    start_pos = end_pos - seq
+                    seq_lens_ext = torch.arange(
+                        start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32
+                    )
+                    block_tables_ext = block_tables.expand(seq, -1).contiguous()
+                else:
+                    seq_lens_ext_parts = []
+                    block_tables_ext_parts = []
+                    for bi in range(bs):
+                        end_pos_b = int(seq_lens[bi].item())
+                        start_pos_b = end_pos_b - seq
+                        seq_lens_ext_parts.append(
+                            torch.arange(
+                                start_pos_b + 1,
+                                end_pos_b + 1,
+                                device=q.device,
+                                dtype=torch.int32,
+                            )
+                        )
+                        block_tables_ext_parts.append(
+                            block_tables[bi : bi + 1].expand(seq, -1)
+                        )
+                    seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
+                    block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
+                paged_attention_v1(
+                    attn_in,
+                    q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
+                    k_cache,
+                    v_cache,
+                    self.self_attn.num_heads,
+                    self.self_attn.scale,
+                    block_tables_ext,
+                    seq_lens_ext,
+                    k_cache.shape[1],
+                    max_ctx,
+                    None,
+                    "auto",
+                    None,
+                    None,
+                    num_kv_heads=self.self_attn.num_kv_heads,
+                )
             else:
-                paged_attention_v1(attn_in, q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, self.self_attn.num_heads, self.self_attn.scale, block_tables, seq_lens, k_cache.shape[1], 4096, None, "auto", None, None, num_kv_heads=self.self_attn.num_kv_heads)
+                paged_attention_v1(
+                    attn_in,
+                    q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
+                    k_cache,
+                    v_cache,
+                    self.self_attn.num_heads,
+                    self.self_attn.scale,
+                    block_tables,
+                    seq_lens,
+                    k_cache.shape[1],
+                    max_ctx,
+                    None,
+                    "auto",
+                    None,
+                    None,
+                    num_kv_heads=self.self_attn.num_kv_heads,
+                )
             out = attn_in.view(bs, seq, -1)
         else: out = q.view(bs, seq, -1)
         hidden_states = x + self.self_attn.o_proj(out, lora_mapping)

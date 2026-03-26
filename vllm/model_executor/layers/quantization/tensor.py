@@ -39,6 +39,38 @@ _USE_HIGH_FIDELITY_ALL_AWQ = os.environ.get("FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL
 _USE_HIGH_FIDELITY_PREFIX_MATCH = os.environ.get(
     "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
+_USE_AWQ_DENSE_FALLBACK_CACHE = os.environ.get(
+    "FASTINFERENCE_AWQ_DENSE_FALLBACK_CACHE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _default_awq_dense_fallback_max_gb() -> float:
+    # Large shared-memory iGPU setups can keep a substantially larger dense-fallback
+    # cache, which reduces repeated dequant on decode.
+    if not torch.cuda.is_available():
+        return 4.0
+    try:
+        total_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024**3)
+    except Exception:
+        return 4.0
+    if total_gb >= 48.0:
+        return 14.0
+    if total_gb >= 32.0:
+        return 8.0
+    if total_gb >= 16.0:
+        return 4.0
+    return 2.0
+
+
+_AWQ_DENSE_FALLBACK_MAX_BYTES = int(
+    float(
+        os.environ.get(
+            "FASTINFERENCE_AWQ_DENSE_FALLBACK_MAX_GB",
+            str(_default_awq_dense_fallback_max_gb()),
+        )
+    )
+    * (1024**3)
+)
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max) if _FP8_DTYPE is not None else None
 _FP8_MIN_SCALE = 1.0 / (_FP8_MAX * 512.0) if _FP8_MAX is not None else None
 _HIGH_FIDELITY_PREFIXES = tuple(
@@ -69,6 +101,7 @@ _HIGH_FIDELITY_PREFIXES = tuple(
 )
 
 _AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
+_AWQ_DENSE_FALLBACK_BYTES = 0
 
 
 def _awq_stat_inc(key: str, delta: int = 1) -> None:
@@ -76,7 +109,9 @@ def _awq_stat_inc(key: str, delta: int = 1) -> None:
 
 
 def reset_awq_runtime_stats() -> None:
+    global _AWQ_DENSE_FALLBACK_BYTES
     _AWQ_RUNTIME_STATS.clear()
+    _AWQ_DENSE_FALLBACK_BYTES = 0
 
 
 def get_awq_runtime_stats() -> Dict[str, int]:
@@ -84,7 +119,52 @@ def get_awq_runtime_stats() -> Dict[str, int]:
 
 
 def clear_global_weight_cache() -> None:
+    global _AWQ_DENSE_FALLBACK_BYTES
     _GLOBAL_WEIGHT_CACHE.clear()
+    _AWQ_DENSE_FALLBACK_BYTES = 0
+
+
+def _dtype_cache_key(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "")
+
+
+def _try_get_cached_dense_fallback(
+    cached_weight: dict[str, Any],
+    x: torch.Tensor,
+    builder_fn,
+) -> torch.Tensor:
+    global _AWQ_DENSE_FALLBACK_BYTES
+
+    if not _USE_AWQ_DENSE_FALLBACK_CACHE:
+        _awq_stat_inc("dense_fallback_cache_disabled")
+        return builder_fn()
+
+    if not bool(cached_weight.get("allow_dense_fallback_cache", True)):
+        _awq_stat_inc("dense_fallback_cache_disallowed")
+        return builder_fn()
+
+    key = _dtype_cache_key(x.dtype)
+    dense_cache = cached_weight.setdefault("dense_fallback_cache", {})
+    cached_dense = dense_cache.get(key)
+    if cached_dense is not None:
+        _awq_stat_inc("dense_fallback_cache_hit")
+        return cached_dense
+
+    _awq_stat_inc("dense_fallback_cache_miss")
+    dense_weight = builder_fn()
+    dense_bytes = int(dense_weight.numel() * dense_weight.element_size())
+    if (
+        dense_bytes <= 0
+        or _AWQ_DENSE_FALLBACK_MAX_BYTES <= 0
+        or _AWQ_DENSE_FALLBACK_BYTES + dense_bytes > _AWQ_DENSE_FALLBACK_MAX_BYTES
+    ):
+        _awq_stat_inc("dense_fallback_cache_skip_capacity")
+        return dense_weight
+
+    dense_cache[key] = dense_weight
+    _AWQ_DENSE_FALLBACK_BYTES += dense_bytes
+    _awq_stat_inc("dense_fallback_cache_store")
+    return dense_weight
 
 
 def _match_weight_dtype(weight: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -183,26 +263,37 @@ def _scaled_mm_linear(
 
 def _linear_from_fp8_cache(
     x: torch.Tensor,
-    weight_fp8: torch.Tensor,
+    cached_weight: dict[str, Any],
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Fallback for platforms without FP8 GEMM support: keep the persistent cache in FP8,
     # but only materialize the current layer's dense weight for this single matmul.
     _awq_stat_inc("fp8_cache_to_dense_fallback")
-    dense_weight = weight_fp8.to(dtype=x.dtype)
+    dense_weight = _try_get_cached_dense_fallback(
+        cached_weight,
+        x,
+        lambda: cached_weight["weight"].to(dtype=x.dtype),
+    )
     return torch.nn.functional.linear(x, dense_weight, bias)
 
 
 def _linear_from_block_fp8_cache(
     x: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    weight_scale: torch.Tensor,
+    cached_weight: dict[str, Any],
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _awq_stat_inc("block_fp8_cache_to_dense_fallback")
     from vllm.model_executor.moe_fp8_utils import moe_fp8_dequant_to_linear_weight
 
-    dense_weight = moe_fp8_dequant_to_linear_weight(weight_fp8, weight_scale, x.dtype)
+    dense_weight = _try_get_cached_dense_fallback(
+        cached_weight,
+        x,
+        lambda: moe_fp8_dequant_to_linear_weight(
+            cached_weight["weight"],
+            cached_weight["scale"],
+            x.dtype,
+        ),
+    )
     return torch.nn.functional.linear(x, dense_weight, bias)
 
 
@@ -215,8 +306,7 @@ def _apply_linear_with_cached_weight(
         _awq_stat_inc("cached_mode_block_fp8")
         return _linear_from_block_fp8_cache(
             x,
-            cached_weight["weight"],
-            cached_weight["scale"],
+            cached_weight,
             bias=bias,
         )
     if isinstance(cached_weight, dict) and cached_weight.get("mode") == "fp8":
@@ -233,10 +323,10 @@ def _apply_linear_with_cached_weight(
             if "torch._scaled_mm is only supported" not in message:
                 raise
             _awq_stat_inc("fp8_scaled_mm_runtime_unsupported")
-            return _linear_from_fp8_cache(x, cached_weight["weight"], bias=bias)
+            return _linear_from_fp8_cache(x, cached_weight, bias=bias)
         except AttributeError:
             _awq_stat_inc("fp8_scaled_mm_attribute_missing")
-            return _linear_from_fp8_cache(x, cached_weight["weight"], bias=bias)
+            return _linear_from_fp8_cache(x, cached_weight, bias=bias)
     _awq_stat_inc("cached_mode_dense")
     return torch.nn.functional.linear(x, _match_weight_dtype(cached_weight, x), bias)
 

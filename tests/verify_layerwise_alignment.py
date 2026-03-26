@@ -126,7 +126,7 @@ def run_layerwise_audit(
     quant: str,
     prompt: str,
 ):
-    os.environ["FASTINFERENCE_KV_FP8"] = "0"
+    os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
 
     # 1) Lite engine
     m_cfg = ModelConfig(model=model_path, tokenizer=model_path)

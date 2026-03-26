@@ -405,8 +405,8 @@ def run_alignment_test(
     # HF baseline dtype; refined when hf_load_path is known (see below).
     dtype = torch.float16
 
-    # Force FP16 for audit to avoid quantization noise
-    os.environ["FASTINFERENCE_KV_FP8"] = "0"
+    # Default FP8 KV to save VRAM; set FASTINFERENCE_KV_FP8=0 before launch for bf16/fp16 KV audits.
+    os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
     # Qwen3.5: full-attn defaults to HF-faithful path. Optional legacy ROCm stabilizer:
     #   FASTINFERENCE_QWEN35_FULLATTN_STABILIZER=1
     # Older ablation flags (input cap + residual RMS) only apply when full-attn stabilizer is enabled.

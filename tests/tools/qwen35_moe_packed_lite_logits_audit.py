@@ -44,7 +44,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-os.environ.setdefault("FASTINFERENCE_KV_FP8", "0")
+os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
 
 
 def summarize_logits_last_1d(logits_last: Any) -> Dict[str, Any]:

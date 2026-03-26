@@ -18,6 +18,11 @@ from vllm.sampling_params import SamplingParams
 logger = init_logger(__name__)
 
 
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     f8 = getattr(torch, "float8_e4m3fn", None)
     if f8 is not None and dtype == f8:
@@ -527,12 +532,16 @@ class LiteEngine:
             self.model_config, self.vllm_config, _bs
         )
 
-        # Prefill chunk size: Qwen3.5 hybrid (linear + full attn) must see the full prompt in one
-        # forward for correct hidden-state continuity; sub-layer carries alone cannot fix per-chunk
-        # re-embedding. Override with FASTINFERENCE_LITE_PREFILL_CHUNK (e.g. 512) if VRAM-limited.
+        # Prefill chunk size: enable chunked prefill streaming by default for Qwen3.5.
+        # FASTINFERENCE_LITE_PREFILL_CHUNK can override the chunk length explicitly.
+        # A value <=0 is treated as "full context in one chunk".
         env_chunk = os.environ.get("FASTINFERENCE_LITE_PREFILL_CHUNK", "").strip()
         if env_chunk:
-            self._prefill_chunk_size = max(1, int(env_chunk))
+            env_chunk_int = int(env_chunk)
+            if env_chunk_int <= 0:
+                self._prefill_chunk_size = self.max_model_len
+            else:
+                self._prefill_chunk_size = max(1, env_chunk_int)
         else:
             from vllm.model_executor.models.qwen3_5 import (
                 Qwen3_5ForConditionalGeneration,
@@ -543,7 +552,8 @@ class LiteEngine:
                 self.model,
                 (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
             ):
-                self._prefill_chunk_size = self.max_model_len
+                # Streamline prefill by default while staying conservative for quality.
+                self._prefill_chunk_size = min(self.max_model_len, 1024)
             else:
                 self._prefill_chunk_size = int(
                     getattr(self.execution_policy, "chunked_prefill_size", 512)
@@ -557,6 +567,46 @@ class LiteEngine:
         )
         self.num_blocks_per_seq = self.max_model_len // self.block_size
         self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
+        sched_token_budget = getattr(
+            self.vllm_config.scheduler_config, "max_num_batched_tokens", None
+        )
+        if sched_token_budget is None:
+            self._step_token_budget = max(1, self.max_active_requests)
+        else:
+            self._step_token_budget = max(1, int(sched_token_budget))
+        self._decode_priority_enabled = _env_truthy(
+            "FASTINFERENCE_LITE_DECODE_PRIORITY"
+        ) or os.environ.get("FASTINFERENCE_LITE_DECODE_PRIORITY", "").strip() == ""
+        self._prefill_reserved_tokens = max(
+            0,
+            int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS", "0")),
+        )
+        self._prefill_reserve_backlog = max(
+            1,
+            int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG", "2")),
+        )
+        try:
+            catchup_ratio = float(
+                os.environ.get("FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO", "0.25")
+            )
+        except Exception:
+            catchup_ratio = 0.25
+        self._prefill_catchup_ratio = min(1.0, max(0.0, catchup_ratio))
+        self._prefill_microbatch_size = min(
+            4,
+            max(
+                1,
+                int(os.environ.get("FASTINFERENCE_LITE_PREFILL_MICROBATCH", "2")),
+            ),
+        )
+        print(
+            ">>>> LiteEngine: Step scheduler "
+            f"(token_budget={self._step_token_budget}, decode_priority={self._decode_priority_enabled}, "
+            f"prefill_reserved_tokens={self._prefill_reserved_tokens}, "
+            f"prefill_reserve_backlog={self._prefill_reserve_backlog}, "
+            f"prefill_catchup_ratio={self._prefill_catchup_ratio:.2f}, "
+            f"prefill_microbatch={self._prefill_microbatch_size})"
+        )
         
         self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
         if self.kv_dtype_str == "0":
@@ -687,6 +737,13 @@ class LiteEngine:
 
         guarded_prompt = _maybe_apply_qwen35_prompt_guard(prompt, self.model_config.model)
         input_ids = self.tokenizer.encode(guarded_prompt)
+        if len(input_ids) >= self.max_model_len:
+            print(
+                f"!!! LiteEngine: rejecting {request_id} because prompt tokens "
+                f"({len(input_ids)}) exceed/equal max_model_len ({self.max_model_len}); "
+                "leave at least one decode token slot."
+            )
+            return
         slot_idx = self._free_slots.pop(0)
         
         rng: Optional[torch.Generator] = None
@@ -758,53 +815,159 @@ class LiteEngine:
         chunk_size = self._prefill_chunk_size
 
         # 2. Execute
-        # STRATEGY: One Prefill Chunk OR Batch All Decodes
-        # This serializes Prefills but keeps Decodes at full BS=32 throughput.
-        # Serialization is CRITICAL for AMD stability on long contexts.
-        if prefills:
-            # Run ONE chunk of ONE prefill
-            rid = prefills[0]
-            req = self._requests[rid]
-            slot_idx = req["slot_idx"]
-            all_input_ids = req["input_ids"]
-            
-            # Find how many tokens we have already processed
-            processed_len = req["seq_len"]
-            remaining_len = len(all_input_ids) - processed_len
-            
-            # Current chunk to process
-            this_chunk_len = min(remaining_len, chunk_size)
-            # If we are at the very last chunk, we generate 1 token, so seq_len increases by this_chunk_len
-            # But the model sees 'this_chunk_len' tokens.
-            
-            curr_chunk_ids = all_input_ids[processed_len : processed_len + this_chunk_len]
-            curr_input = torch.tensor([curr_chunk_ids], device=self.device)
-            
-            is_last_chunk = (processed_len + this_chunk_len >= len(all_input_ids))
-            
-            # Physical block indices for this slot
-            start_block = slot_idx * self.num_blocks_per_seq
-            block_table = torch.arange(start_block, start_block + self.num_blocks_per_seq, device=self.device, dtype=torch.int32)
-            
-            # Map logical positions to physical tokens
-            slot_mapping = slot_idx * self.max_model_len + torch.arange(processed_len, processed_len + this_chunk_len, device=self.device, dtype=torch.long)
+        # STRATEGY:
+        # - Decode-priority mode (default): decode first; reserve prefill budget only when
+        #   prefill backlog builds up (or when there is no decode).
+        # - Fallback mixed mode: run one prefill chunk + decode micro-batch in each step.
+        step_token_budget = max(1, int(self._step_token_budget))
+        if self._decode_priority_enabled:
+            prefill_token_budget = 0
+            if prefills and not decodes:
+                prefill_token_budget = min(chunk_size, step_token_budget)
+            elif prefills and len(prefills) >= self._prefill_reserve_backlog:
+                reserve_tokens = max(
+                    self._prefill_reserved_tokens,
+                    int(step_token_budget * self._prefill_catchup_ratio),
+                )
+                prefill_token_budget = min(
+                    step_token_budget,
+                    max(1, reserve_tokens),
+                )
+            decode_limit = min(len(decodes), max(0, step_token_budget - prefill_token_budget))
+        else:
+            if prefills:
+                reserve_tokens = max(1, self._prefill_reserved_tokens or 1)
+                decode_limit = max(
+                    0, min(len(decodes), step_token_budget - reserve_tokens)
+                )
+            else:
+                decode_limit = min(len(decodes), step_token_budget)
+            prefill_token_budget = max(0, step_token_budget - decode_limit)
+        decodes_to_run = decodes[:decode_limit]
+
+        if prefills and prefill_token_budget > 0:
+            # Prefill micro-batch: select requests with the same processed_len so
+            # full-attention path can use a consistent kv_chunk_start.
+            base_processed_len = self._requests[prefills[0]]["seq_len"]
+            candidate_prefills = [
+                rid
+                for rid in prefills
+                if self._requests[rid]["seq_len"] == base_processed_len
+            ]
+            prefill_batch_size = min(self._prefill_microbatch_size, len(candidate_prefills))
+            prefills_to_run = candidate_prefills[:prefill_batch_size]
+
+            # Budget applies to total prefill tokens in this step.
+            # chunk_len * batch_size <= prefill_token_budget.
+            min_remaining = min(
+                len(self._requests[rid]["input_ids"]) - self._requests[rid]["seq_len"]
+                for rid in prefills_to_run
+            )
+            per_req_budget = max(1, prefill_token_budget // max(1, prefill_batch_size))
+            this_chunk_len = min(min_remaining, chunk_size, per_req_budget)
+            if this_chunk_len <= 0:
+                this_chunk_len = 1
+
+            curr_input_rows = []
+            position_rows = []
+            slot_mapping_rows = []
+            block_tables = []
+            seq_lens_prefill = []
+            kv_start_indices = []
+            req_dicts_prefill = [self._requests[rid] for rid in prefills_to_run]
+            is_last_chunk_flags = []
+
+            for rid in prefills_to_run:
+                req = self._requests[rid]
+                slot_idx = req["slot_idx"]
+                all_input_ids = req["input_ids"]
+                processed_len = req["seq_len"]
+                remaining_len = len(all_input_ids) - processed_len
+                is_last_chunk = processed_len + this_chunk_len >= len(all_input_ids)
+                is_last_chunk_flags.append(is_last_chunk)
+
+                curr_chunk_ids = all_input_ids[
+                    processed_len : processed_len + this_chunk_len
+                ]
+                curr_input_rows.append(curr_chunk_ids)
+                position_rows.append(
+                    torch.arange(
+                        processed_len,
+                        processed_len + this_chunk_len,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                )
+                slot_mapping_rows.append(
+                    slot_idx * self.max_model_len
+                    + torch.arange(
+                        processed_len,
+                        processed_len + this_chunk_len,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                )
+                start_block = slot_idx * self.num_blocks_per_seq
+                block_tables.append(
+                    torch.arange(
+                        start_block,
+                        start_block + self.num_blocks_per_seq,
+                        dtype=torch.int32,
+                    )
+                )
+                seq_lens_prefill.append(processed_len + this_chunk_len)
+                kv_start_indices.append(processed_len)
+
+            curr_input = torch.tensor(curr_input_rows, device=self.device)
+            positions = torch.stack(position_rows, dim=0)
+            slot_mapping = torch.cat(slot_mapping_rows, dim=0)
+            block_tables_t = torch.stack(block_tables).to(self.device)
+            attn_carry_prefill = self._stack_per_layer_carries(
+                req_dicts_prefill, self.num_layers, "linear_attn_carry"
+            )
+            conv_carry_prefill = self._stack_per_layer_carries(
+                req_dicts_prefill, self.num_layers, "linear_conv_carry"
+            )
 
             attn_metadata = {
                 "slot_mapping": slot_mapping,
-                "seq_lens": torch.tensor([processed_len + this_chunk_len], device=self.device, dtype=torch.int32),
+                "seq_lens": torch.tensor(
+                    seq_lens_prefill, device=self.device, dtype=torch.int32
+                ),
                 "is_prefill": True,
-                "kv_start_indices": torch.tensor([processed_len], device=self.device, dtype=torch.int32),
-                "block_tables": block_table.unsqueeze(0),
-                "linear_attn_carry": req["linear_attn_carry"],
-                "linear_conv_carry": req["linear_conv_carry"],
+                "kv_start_indices": torch.tensor(
+                    kv_start_indices, device=self.device, dtype=torch.int32
+                ),
+                "block_tables": block_tables_t,
+                "linear_attn_carry": attn_carry_prefill,
+                "linear_conv_carry": conv_carry_prefill,
             }
-            positions = torch.arange(processed_len, processed_len + this_chunk_len, device=self.device).unsqueeze(0)
-            
+
             try:
-                lora_id = req.get("lora_id")
-                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_id)
-                
-                if is_last_chunk:
+                lora_mapping = [self._requests[rid].get("lora_id") for rid in prefills_to_run]
+                logits = self.model(
+                    curr_input,
+                    positions,
+                    self.kv_caches,
+                    attn_metadata,
+                    lora_mapping=lora_mapping,
+                )
+                self._split_per_layer_carries(
+                    attn_metadata["linear_attn_carry"],
+                    req_dicts_prefill,
+                    "linear_attn_carry",
+                )
+                self._split_per_layer_carries(
+                    attn_metadata["linear_conv_carry"],
+                    req_dicts_prefill,
+                    "linear_conv_carry",
+                )
+
+                for i, rid in enumerate(prefills_to_run):
+                    req = self._requests[rid]
+                    req["seq_len"] += this_chunk_len
+                    if not is_last_chunk_flags[i]:
+                        continue
                     # First generated token: respect SamplingParams (temperature, top_p, etc.)
                     eos_mask = _eos_stop_token_ids_for_sampling(
                         self.tokenizer,
@@ -812,7 +975,7 @@ class LiteEngine:
                         getattr(self.model_config, "hf_config", None),
                     )
                     token_logits = _apply_qwen35_context_bias(
-                        logits[0, -1, :],
+                        logits[i, -1, :],
                         req,
                         self.tokenizer,
                     )
@@ -825,25 +988,21 @@ class LiteEngine:
                         anti_template_token_ids=req.get("anti_template_token_ids"),
                     )
                     req["generated_ids"].append(next_token)
-                    req["seq_len"] = processed_len + this_chunk_len
                     req["is_prefill"] = False
                     self._process_completion(rid, next_token, results)
-                else:
-                    # Just update KV cache and stay in prefill mode
-                    req["seq_len"] = processed_len + this_chunk_len
-                    # No output for intermediate chunks in our simplified LiteEngine
             except Exception as e:
                 print(f"!!! LiteEngine Error (Chunked Prefill): {e}"); import traceback; traceback.print_exc()
-                self._free_request(rid)
+                for rid in prefills_to_run:
+                    self._free_request(rid)
 
-        elif decodes:
-            # Batch ALL decodes
+        if decodes_to_run:
+            # Batch decode micro-step under the per-step token budget.
             input_tokens = []
             slot_indices = []
             seq_lens = []
             pos_indices = []
             
-            for rid in decodes:
+            for rid in decodes_to_run:
                 req = self._requests[rid]
                 last_token = req["generated_ids"][-1]
                 input_tokens.append([last_token])
@@ -866,7 +1025,7 @@ class LiteEngine:
             # slot_mapping maps batch tokens to physical indices
             slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
 
-            req_dicts = [self._requests[rid] for rid in decodes]
+            req_dicts = [self._requests[rid] for rid in decodes_to_run]
             attn_carry_batch = self._stack_per_layer_carries(
                 req_dicts, self.num_layers, "linear_attn_carry"
             )
@@ -886,7 +1045,7 @@ class LiteEngine:
             }
 
             try:
-                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes]
+                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes_to_run]
                 logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
                 self._split_per_layer_carries(
                     attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
@@ -895,7 +1054,7 @@ class LiteEngine:
                     attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
                 )
                 # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
-                for i, rid in enumerate(decodes):
+                for i, rid in enumerate(decodes_to_run):
                     req_i = self._requests[rid]
                     eos_mask = _eos_stop_token_ids_for_sampling(
                         self.tokenizer,
@@ -922,7 +1081,7 @@ class LiteEngine:
             except Exception as e:
                 print(f"!!! LiteEngine Error (Decode): {e}"); import traceback; traceback.print_exc()
                 # Fail all involved? Or try to isolate? For Lite, just fail.
-                for rid in decodes: self._free_request(rid)
+                for rid in decodes_to_run: self._free_request(rid)
 
         return results
 

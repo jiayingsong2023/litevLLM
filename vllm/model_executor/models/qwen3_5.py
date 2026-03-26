@@ -1028,10 +1028,34 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         else:
             attn_in = torch.empty((n_tokens, nh, hd), device=q.device, dtype=q.dtype)
             if seq > 1 and is_prefill:
-                end_pos = int(seq_lens[0].item())
-                start_pos = end_pos - seq
-                seq_lens_ext = torch.arange(start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32)
-                block_tables_ext = block_tables.expand(seq, -1).contiguous()
+                if bs == 1:
+                    end_pos = int(seq_lens[0].item())
+                    start_pos = end_pos - seq
+                    seq_lens_ext = torch.arange(
+                        start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32
+                    )
+                    block_tables_ext = block_tables.expand(seq, -1).contiguous()
+                else:
+                    # Batched chunked prefill: flatten tokens in batch-major order.
+                    # Build per-token sequence lengths and matching block-table rows for each request.
+                    seq_lens_ext_parts = []
+                    block_tables_ext_parts = []
+                    for bi in range(bs):
+                        end_pos_b = int(seq_lens[bi].item())
+                        start_pos_b = end_pos_b - seq
+                        seq_lens_ext_parts.append(
+                            torch.arange(
+                                start_pos_b + 1,
+                                end_pos_b + 1,
+                                device=q.device,
+                                dtype=torch.int32,
+                            )
+                        )
+                        block_tables_ext_parts.append(
+                            block_tables[bi : bi + 1].expand(seq, -1)
+                        )
+                    seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
+                    block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
                 paged_attention_v1(
                     attn_in,
                     q.contiguous(),

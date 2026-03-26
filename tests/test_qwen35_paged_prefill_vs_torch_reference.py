@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 # FP16 KV cache avoids FP8 in reshape_and_cache for this test harness.
-os.environ.setdefault("FASTINFERENCE_KV_FP8", "0")
+os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
