@@ -178,7 +178,8 @@ def _awq_stat_set(key: str, value: int) -> None:
 
 
 def _env_awq_prefer_fused_default() -> bool:
-    return _env_truthy("FASTINFERENCE_AWQ_FUSED_GEMM", "0")
+    # Default on: Triton fused dequant+GEMM is the primary AWQ compute path.
+    return _env_truthy("FASTINFERENCE_AWQ_FUSED_GEMM", "1")
 
 
 def _env_awq_fused_gemm_force() -> bool:
@@ -195,7 +196,9 @@ def _env_awq_matmul_cache_before_fused() -> bool:
     """
     if _env_awq_fused_gemm_force():
         return False
-    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "1")
+    # Default off: prefer Triton fused when LRU has materialized weights; set to 1 to use BLAS
+    # on cached FP8/dense (higher steady-state TPS, see awq_cache_prefetch).
+    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "0")
 
 
 def _env_awq_cache_scope() -> str:
@@ -216,11 +219,11 @@ def _env_awq_fused_scope(profile_hint: str) -> str:
         if scope in ("all", "attention_only", "off"):
             return scope
     # Profile-aware default matrix (no override):
-    # - qwen35_9b_awq: safe/balanced=attention_only, throughput=all, strict=off
+    # - qwen35_9b_awq: safe=attention_only, balanced|throughput=all, strict=off
     # - qwen35_35b_awq: safe/balanced=off, throughput=attention_only, strict=off
     if profile_hint == "qwen35_9b_awq":
         default_scope = (
-            "all" if matrix == "throughput"
+            "all" if matrix in ("balanced", "throughput")
             else "off" if matrix == "strict"
             else "attention_only"
         )
