@@ -386,6 +386,8 @@ def run_alignment_test(
     disable_qwen35_stabilizers: bool = False,
     apply_chat_template: str = "off",
     prefill_only: bool = False,
+    awq_force_fused: bool = False,
+    awq_disable_fused: bool = False,
 ):
     print(f"\n" + "="*60)
     print(f"AUDITING: {os.path.basename(model_path)} (Quant: {quant_type})")
@@ -407,6 +409,15 @@ def run_alignment_test(
 
     # Default FP8 KV to save VRAM; set FASTINFERENCE_KV_FP8=0 before launch for bf16/fp16 KV audits.
     os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
+    if quant_type == "awq":
+        if awq_disable_fused:
+            os.environ["FASTINFERENCE_AWQ_FUSED_GEMM"] = "0"
+            os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_FORCE"] = "0"
+            print("  [AWQ] fused GEMM disabled for this audit.")
+        elif awq_force_fused:
+            os.environ["FASTINFERENCE_AWQ_FUSED_GEMM"] = "1"
+            os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_FORCE"] = "1"
+            print("  [AWQ] fused GEMM force-enabled for this audit.")
     # Qwen3.5: full-attn defaults to HF-faithful path. Optional legacy ROCm stabilizer:
     #   FASTINFERENCE_QWEN35_FULLATTN_STABILIZER=1
     # Older ablation flags (input cap + residual RMS) only apply when full-attn stabilizer is enabled.
@@ -835,10 +846,22 @@ if __name__ == "__main__":
             "Only compare last prefill logits + greedy first token vs HF; skip full multi-token audit."
         ),
     )
+    parser.add_argument(
+        "--awq-force-fused",
+        action="store_true",
+        help="Force-enable AWQ fused GEMM path (sets FASTINFERENCE_AWQ_FUSED_GEMM=1 and FORCE=1).",
+    )
+    parser.add_argument(
+        "--awq-disable-fused",
+        action="store_true",
+        help="Force-disable AWQ fused GEMM path for A/B regression checks.",
+    )
     args = parser.parse_args()
 
     if args.hf_same_as_lite and args.no_hf:
         parser.error("--hf-same-as-lite cannot be used with --no-hf")
+    if args.awq_force_fused and args.awq_disable_fused:
+        parser.error("--awq-force-fused and --awq-disable-fused are mutually exclusive")
 
     effective_hf_model_path: Optional[str] = args.hf_model
     if args.hf_same_as_lite:
@@ -897,6 +920,8 @@ if __name__ == "__main__":
         disable_qwen35_stabilizers=args.disable_qwen35_stabilizers,
         apply_chat_template=args.apply_chat_template,
         prefill_only=args.prefill_only,
+        awq_force_fused=args.awq_force_fused,
+        awq_disable_fused=args.awq_disable_fused,
     )
     if not success:
         exit(1)

@@ -11,6 +11,8 @@
 #   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh  # force bf16/fp16 KV (more VRAM)
 #   SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh   # B-tier only (faster)
 #   SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh       # skip 35B checks
+#   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_accuracy_regression.sh
+#     # AWQ matrix presets: safe | balanced | throughput | strict
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,6 +29,7 @@ HF_QWEN35_35B_FP16="${HF_QWEN35_35B_FP16:-models/Qwen3.5-35B-FP16}"
 
 SKIP_35B="${SKIP_35B:-0}"
 RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
+RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 
 require_model_dir() {
   local model_dir="$1"
@@ -61,8 +64,6 @@ else
   FASTINFERENCE_KV_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
-  FASTINFERENCE_AWQ_FP8=1 \
-  FASTINFERENCE_AWQ_BLOCK_FP8=1 \
     uv run python tests/tools/quality_bar_spotcheck.py \
       --model "$MODEL_QWEN35_35B_AWQ" \
       --quant awq \
@@ -106,14 +107,33 @@ else
   FASTINFERENCE_KV_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
-  FASTINFERENCE_AWQ_FP8=1 \
-  FASTINFERENCE_AWQ_BLOCK_FP8=1 \
     uv run python tests/verify_semantic_integrity.py \
       --model "$MODEL_QWEN35_35B_AWQ" \
       --preset qwen35_35b_moe_awq \
       --hf-model "$HF_QWEN35_35B_FP16" \
       --prefill-only \
       --apply-chat-template off
+fi
+
+if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
+  echo ""
+  echo "=== AWQ Fused A/B (RUN_AWQ_FUSED_AB=1) ==="
+  echo "[AB1] Qwen3.5-9B AWQ baseline (fused disabled)"
+  uv run python tests/verify_semantic_integrity.py \
+    --model "$MODEL_QWEN35_9B_AWQ" \
+    --preset qwen35_9b_awq \
+    --hf-model "$HF_QWEN35_9B_FP16" \
+    --prefill-only \
+    --awq-disable-fused \
+    --apply-chat-template off
+  echo "[AB2] Qwen3.5-9B AWQ fused forced"
+  uv run python tests/verify_semantic_integrity.py \
+    --model "$MODEL_QWEN35_9B_AWQ" \
+    --preset qwen35_9b_awq \
+    --hf-model "$HF_QWEN35_9B_FP16" \
+    --prefill-only \
+    --awq-force-fused \
+    --apply-chat-template off
 fi
 
 echo ""

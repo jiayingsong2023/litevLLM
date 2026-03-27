@@ -65,6 +65,7 @@ class AWQConfig(QuantizationConfig):
                     effective_group_size,
                     prefix=getattr(layer, "prefix", ""),
                     high_fidelity=bool(getattr(layer, "force_high_fidelity_awq", False)),
+                    profile_hint=str(getattr(layer, "awq_profile_hint", "")),
                 )
             else:
                 weight = PackedInt4Weight(
@@ -74,6 +75,7 @@ class AWQConfig(QuantizationConfig):
                     original_shape=getattr(layer, "weight_shape", None),
                     prefix=getattr(layer, "prefix", ""),
                     high_fidelity=bool(getattr(layer, "force_high_fidelity_awq", False)),
+                    profile_hint=str(getattr(layer, "awq_profile_hint", "")),
                 )
             layer._quant_weight = weight
 

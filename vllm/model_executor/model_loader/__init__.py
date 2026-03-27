@@ -923,6 +923,19 @@ def _looks_like_qwen35_35b_awq_model_path(model_path: str) -> bool:
     return "qwen3.5-35b-awq" in base or ("qwen3.5" in base and "35b" in base and "awq" in base)
 
 
+def _looks_like_qwen35_9b_awq_model_path(model_path: str) -> bool:
+    base = os.path.basename(os.path.abspath(model_path)).lower()
+    return "qwen3.5-9b-awq" in base or ("qwen3.5" in base and "9b" in base and "awq" in base)
+
+
+def _qwen35_awq_profile_hint_from_model_path(model_path: str) -> str:
+    if _looks_like_qwen35_35b_awq_model_path(model_path):
+        return "qwen35_35b_awq"
+    if _looks_like_qwen35_9b_awq_model_path(model_path):
+        return "qwen35_9b_awq"
+    return ""
+
+
 _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES = (
     ".linear_attn.in_proj_qkv",
     ".linear_attn.out_proj",
@@ -934,17 +947,39 @@ _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES = (
     ".shared_expert.up_proj",
     ".shared_expert.down_proj",
 )
+_QWEN35_35B_RELAXED_HIGH_FIDELITY_SUFFIXES = (
+    ".linear_attn.in_proj_qkv",
+    ".linear_attn.out_proj",
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+)
+
+
+def _awq_policy_matrix_mode() -> str:
+    raw = os.environ.get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
+    if raw not in ("safe", "balanced", "throughput", "strict"):
+        return "balanced"
+    return raw
 
 
 def _should_force_high_fidelity_awq_for_qwen35_35b(module_name: str) -> bool:
-    mode = os.environ.get(
-        "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE",
-        "balanced",
-    ).strip().lower()
+    mode = os.environ.get("FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE", "").strip().lower()
+    if mode == "":
+        matrix = _awq_policy_matrix_mode()
+        if matrix == "strict":
+            mode = "all"
+        elif matrix == "throughput":
+            mode = "relaxed"
+        else:
+            mode = "balanced"
     if mode in ("off", "0", "false", "no"):
         return False
     if mode in ("all", "full"):
         return ".experts." not in module_name
+    if mode in ("relaxed", "fast"):
+        return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_RELAXED_HIGH_FIDELITY_SUFFIXES)
     return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES)
 
 
@@ -1071,6 +1106,7 @@ def _load_safetensors(model: nn.Module, model_path: str):
             should_preserve_quant = isinstance(m, LiteLinear) and quant_name == "awq"
 
             if should_preserve_quant:
+                m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)
                 if _looks_like_qwen35_35b_awq_model_path(model_path):
                     m.force_high_fidelity_awq = _should_force_high_fidelity_awq_for_qwen35_35b(
                         m_name

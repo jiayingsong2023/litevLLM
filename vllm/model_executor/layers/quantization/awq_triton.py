@@ -3,6 +3,63 @@ import torch
 import triton
 import triton.language as tl
 
+
+def awq_fused_capability_check(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    group_size: int,
+) -> tuple[bool, str]:
+    if input.device.type == "cpu":
+        return False, "cpu_input"
+    if qweight.device != input.device:
+        return False, "device_mismatch"
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        return False, f"unsupported_input_dtype_{str(input.dtype)}"
+    if qweight.dim() != 2:
+        return False, "qweight_not_2d"
+    if scales.dim() != 2:
+        return False, "scales_not_2d"
+    if qzeros is None:
+        return False, "qzeros_missing"
+    if qzeros.dim() != 2:
+        return False, "qzeros_not_2d"
+    k = int(qweight.shape[1] * 8)
+    if int(input.shape[-1]) != k:
+        return False, "k_dim_mismatch"
+    if group_size <= 0:
+        return False, "bad_group_size"
+    if k % int(group_size) != 0:
+        return False, "k_not_divisible_by_group"
+    return True, "ok"
+
+
+def packed_int4_fused_capability_check(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> tuple[bool, str]:
+    if input.device.type == "cpu":
+        return False, "cpu_input"
+    if qweight.device != input.device or scales.device != input.device:
+        return False, "device_mismatch"
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        return False, f"unsupported_input_dtype_{str(input.dtype)}"
+    if qweight.dim() != 2:
+        return False, "qweight_not_2d"
+    if scales.dim() != 2:
+        return False, "scales_not_2d"
+    k = int(qweight.shape[1] * 8)
+    if int(input.shape[-1]) != k:
+        return False, "k_dim_mismatch"
+    if group_size <= 0:
+        return False, "bad_group_size"
+    if k % int(group_size) != 0:
+        return False, "k_not_divisible_by_group"
+    return True, "ok"
+
 @triton.jit
 def awq_dequantize_kernel(
     qweight_ptr, scales_ptr, zeros_ptr, out_ptr,
@@ -77,16 +134,21 @@ def awq_dequantize_triton(qweight, scales, zeros, group_size=128, out_dtype=torc
     output = torch.empty((n_rows, n_cols), device=qweight.device, dtype=out_dtype)
     grid = lambda META: (triton.cdiv(n_cols, META['BLOCK_N']), triton.cdiv(n_rows, META['BLOCK_K']))
     
-    awq_dequantize_kernel[grid](
-        qweight, scales, zeros, output,
-        n_rows, n_cols, group_size,
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        zeros.stride(0), zeros.stride(1),
-        output.stride(0), output.stride(1),
-        GROUP_ALONG_ROW=group_along_row,
-        BLOCK_N=64, BLOCK_K=32
-    )
+    try:
+        awq_dequantize_kernel[grid](
+            qweight, scales, zeros, output,
+            n_rows, n_cols, group_size,
+            qweight.stride(0), qweight.stride(1),
+            scales.stride(0), scales.stride(1),
+            zeros.stride(0), zeros.stride(1),
+            output.stride(0), output.stride(1),
+            GROUP_ALONG_ROW=group_along_row,
+            BLOCK_N=64, BLOCK_K=32
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"[AWQ_FALLBACK_DEQUANT] Triton dequant failed: {type(exc).__name__}: {exc}"
+        ) from exc
     return output
 
 def awq_gemm_triton(input, qweight, scales, zeros, group_size=128, split_k_iters=1, out_dtype=torch.float16):

@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 from vllm.model_executor.layers.lite_linear import LiteLinear
+from vllm.model_executor.layers.quantization.tensor import AWQWeight, PackedInt4Weight
 from .lite_config import LiteConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.model_executor.moe_fp8_utils import (
@@ -31,7 +32,7 @@ def _env_qwen35_sdpa_prefill_enabled() -> bool:
     """
     When ON: full-attention prefill uses ``scaled_dot_product_attention`` (faster, may differ slightly from HF).
     Default OFF: prefill uses HF ``eager_attention_forward`` math (repeat_kv + float32 softmax + causal mask).
-    Set FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL=1 to enable SDPA.
+    Set FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL=1 to enable SDPA (e2e_full_benchmark sets this for throughput).
     """
     v = os.environ.get("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0").strip().lower()
     return v in ("1", "true", "yes", "on")
@@ -652,6 +653,113 @@ def _residual_merge_fp16(x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: to
     return y.to(out_dtype)
 
 
+def _env_qwen35_fused_awq_ab() -> bool:
+    """Fuse in_proj_a + in_proj_b into one AWQ GEMM (same K, same out dim per matrix)."""
+    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_AWQ_AB", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _env_qwen35_fused_awq_gate_up() -> bool:
+    """Fuse dense MLP gate_proj + up_proj into one AWQ GEMM, then silu(gate)*up."""
+    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _env_qwen35_fused_self_attn_kv() -> bool:
+    """Fuse self_attn k_proj + v_proj (same output dim) into one quantized GEMM."""
+    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _qwen35_try_fused_awq_pair_matmul(
+    x: torch.Tensor,
+    lin_a: LiteLinear,
+    lin_b: LiteLinear,
+    owner: nn.Module,
+    cache_key: str,
+) -> Optional[torch.Tensor]:
+    """
+    Single quantized matmul for two LiteLinear layers with identical packed layout
+    (same qweight/scales row shape) and same input/output sizes.
+
+    Supports:
+    - Classic AWQ (qweight + scales + qzeros): stacked AWQWeight.
+    - Symmetric packed int4 (qweight + scales, qzeros None): stacked PackedInt4Weight (Qwen3.5 AWQ).
+
+    Returns tensor (..., 2 * out_dim) or None to fall back to two forwards.
+    """
+    if lin_a.input_size != lin_b.input_size or lin_a.output_size != lin_b.output_size:
+        return None
+    ba = getattr(lin_a, "bias", None)
+    bb = getattr(lin_b, "bias", None)
+    fused_bias: Optional[torch.Tensor] = None
+    if ba is not None and bb is not None:
+        fused_bias = torch.cat([ba.reshape(-1), bb.reshape(-1)], dim=0).contiguous()
+    elif ba is not None or bb is not None:
+        return None
+    if getattr(lin_a, "force_high_fidelity_awq", False) or getattr(
+        lin_b, "force_high_fidelity_awq", False
+    ):
+        return None
+    qwa = getattr(lin_a, "qweight", None)
+    qwb = getattr(lin_b, "qweight", None)
+    if qwa is None or qwb is None or qwa.numel() <= 1 or qwb.numel() <= 1:
+        return None
+    if tuple(qwa.shape) != tuple(qwb.shape):
+        return None
+    if tuple(lin_a.scales.shape) != tuple(lin_b.scales.shape):
+        return None
+    gs = int(getattr(lin_a, "group_size", 128))
+    if int(getattr(lin_b, "group_size", 128)) != gs:
+        return None
+
+    za = getattr(lin_a, "qzeros", None)
+    zb = getattr(lin_b, "qzeros", None)
+    has_awq_zeros = (
+        za is not None
+        and zb is not None
+        and za.numel() > 1
+        and zb.numel() > 1
+        and tuple(za.shape) == tuple(zb.shape)
+    )
+    has_symmetric_packed = (za is None or za.numel() <= 1) and (zb is None or zb.numel() <= 1)
+    if not has_awq_zeros and not has_symmetric_packed:
+        return None
+
+    cache_attr = f"_fused_awq_pair_{cache_key}"
+    fused_w = getattr(owner, cache_attr, None)
+    if fused_w is None:
+        q_cat = torch.cat([lin_a.qweight, lin_b.qweight], dim=0).contiguous()
+        s_cat = torch.cat([lin_a.scales, lin_b.scales], dim=0).contiguous()
+        if has_awq_zeros:
+            fused_w = AWQWeight(
+                q_cat,
+                s_cat,
+                torch.cat([lin_a.qzeros, lin_b.qzeros], dim=0).contiguous(),
+                group_size=gs,
+                prefix=getattr(lin_a, "prefix", "") or "fused_pair",
+                high_fidelity=False,
+                profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
+            )
+        else:
+            fused_w = PackedInt4Weight(
+                q_cat,
+                s_cat,
+                group_size=gs,
+                original_shape=getattr(lin_a, "weight_shape", None),
+                prefix=getattr(lin_a, "prefix", "") or "fused_pair",
+                high_fidelity=False,
+                profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
+            )
+        setattr(owner, cache_attr, fused_w)
+
+    lead_shape = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1])
+    out2 = fused_w.matmul(x2, fused_bias)
+    od = int(lin_a.output_size)
+    return out2.reshape(*lead_shape, 2 * od)
+
+
 def _call_litelinear_stable(layer: LiteLinear, x_f32: torch.Tensor, pre_cap: float = 2048.0) -> torch.Tensor:
     """
     Call LiteLinear through its module path (for hook visibility) while limiting fp16 overflow risk.
@@ -805,8 +913,22 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         z = self.linear_attn.in_proj_z(h)
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        b = self.linear_attn.in_proj_b(h)
-        a = self.linear_attn.in_proj_a(h)
+        if _env_qwen35_fused_awq_ab():
+            ab = _qwen35_try_fused_awq_pair_matmul(
+                h,
+                self.linear_attn.in_proj_a,
+                self.linear_attn.in_proj_b,
+                self,
+                "linear_ab",
+            )
+            if ab is not None:
+                a, b = ab.split(self.num_v_heads, dim=-1)
+            else:
+                b = self.linear_attn.in_proj_b(h)
+                a = self.linear_attn.in_proj_a(h)
+        else:
+            b = self.linear_attn.in_proj_b(h)
+            a = self.linear_attn.in_proj_a(h)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -894,7 +1016,26 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         if self._use_moe:
             mlp_out = self.mlp(h_post)
         else:
-            mlp_out = self.mlp.down_proj(F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post))
+            if _env_qwen35_fused_awq_gate_up():
+                gu = _qwen35_try_fused_awq_pair_matmul(
+                    h_post,
+                    self.mlp.gate_proj,
+                    self.mlp.up_proj,
+                    self,
+                    "mlp_gate_up",
+                )
+                if gu is not None:
+                    inter = self.config.intermediate_size
+                    gate, up = gu.split(inter, dim=-1)
+                    mlp_out = self.mlp.down_proj(F.silu(gate) * up)
+                else:
+                    mlp_out = self.mlp.down_proj(
+                        F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post)
+                    )
+            else:
+                mlp_out = self.mlp.down_proj(
+                    F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post)
+                )
         return hidden_states + mlp_out
 
 class Qwen3_5FullAttentionLayer(nn.Module):
@@ -980,12 +1121,30 @@ class Qwen3_5FullAttentionLayer(nn.Module):
 
         # Per-head q_norm (weight dim=head_dim), same as HF.
         q_part = self.self_attn.q_norm(q_part.reshape(bs, -1, nh, hd)).reshape(bs, -1, nh, hd)
-        
-        # K-Norm is often PER-HEAD in GGUF (256 weight)
-        k = self.self_attn.k_proj(h).view(bs, -1, nkv, hd)
-        k = self.self_attn.k_norm(k).reshape(bs, -1, nkv, hd)
-        
-        v = self.self_attn.v_proj(h).view(bs, -1, nkv, hd)
+
+        kv_out = nkv * hd
+        if _env_qwen35_fused_self_attn_kv():
+            kv_merged = _qwen35_try_fused_awq_pair_matmul(
+                h,
+                self.self_attn.k_proj,
+                self.self_attn.v_proj,
+                self,
+                "self_attn_kv",
+            )
+            if kv_merged is not None:
+                k_raw, v_raw = kv_merged.split(kv_out, dim=-1)
+                k = k_raw.view(bs, -1, nkv, hd)
+                k = self.self_attn.k_norm(k).reshape(bs, -1, nkv, hd)
+                v = v_raw.view(bs, -1, nkv, hd)
+            else:
+                k = self.self_attn.k_proj(h).view(bs, -1, nkv, hd)
+                k = self.self_attn.k_norm(k).reshape(bs, -1, nkv, hd)
+                v = self.self_attn.v_proj(h).view(bs, -1, nkv, hd)
+        else:
+            # K-Norm is often PER-HEAD in GGUF (256 weight)
+            k = self.self_attn.k_proj(h).view(bs, -1, nkv, hd)
+            k = self.self_attn.k_norm(k).reshape(bs, -1, nkv, hd)
+            v = self.self_attn.v_proj(h).view(bs, -1, nkv, hd)
 
         q = q_part.reshape(n_tokens, nh, hd)
         k = k.reshape(n_tokens, nkv, hd)
@@ -1114,7 +1273,26 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             mlp_out = _call_litelinear_stable(self.mlp.down_proj, mlp_mid, pre_cap=1536.0)
             return _residual_merge_fp16(hidden_states.float(), mlp_out, input_dtype, 8.0)
 
-        mlp_out = self.mlp.down_proj(F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post))
+        if _env_qwen35_fused_awq_gate_up():
+            gu = _qwen35_try_fused_awq_pair_matmul(
+                h_post,
+                self.mlp.gate_proj,
+                self.mlp.up_proj,
+                self,
+                "mlp_gate_up",
+            )
+            if gu is not None:
+                inter = self.config.intermediate_size
+                gate, up = gu.split(inter, dim=-1)
+                mlp_out = self.mlp.down_proj(F.silu(gate) * up)
+            else:
+                mlp_out = self.mlp.down_proj(
+                    F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post)
+                )
+        else:
+            mlp_out = self.mlp.down_proj(
+                F.silu(self.mlp.gate_proj(h_post)) * self.mlp.up_proj(h_post)
+            )
         return hidden_states + mlp_out
 
     def load_weights(self, weights_iterator):

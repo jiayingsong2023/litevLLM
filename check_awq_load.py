@@ -52,8 +52,6 @@ def _apply_stable_qwen35_35b_awq_env_defaults() -> None:
     os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
     os.environ.setdefault("FASTINFERENCE_QWEN35_MOE_FP8", "1")
     os.environ.setdefault("FASTINFERENCE_QWEN35_MOE_OFFLOAD", "1")
-    os.environ.setdefault("FASTINFERENCE_AWQ_FP8", "1")
-    os.environ.setdefault("FASTINFERENCE_AWQ_BLOCK_FP8", "1")
     os.environ.setdefault("FASTINFERENCE_QWEN35_PROMPT_GUARD", "1")
 
 

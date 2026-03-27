@@ -26,7 +26,6 @@ def _tensor_nbytes(t: Any) -> int:
 class AWQExecutionPolicy:
     prefer_fused: bool
     allow_dense_cache: bool
-    allow_fp8_cache: bool
     cache_scope: str
     fused_scope: str
 
@@ -86,13 +85,6 @@ class LRUWeightCache:
         self.keys.clear()
         self.item_bytes.clear()
         self.current_bytes = 0
-_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
-_USE_FP8_AWQ = os.environ.get("FASTINFERENCE_AWQ_FP8", "1").strip().lower() in (
-    "1", "true", "yes", "on"
-)
-_USE_BLOCK_FP8_AWQ = os.environ.get("FASTINFERENCE_AWQ_BLOCK_FP8", "1").strip().lower() in (
-    "1", "true", "yes", "on"
-)
 _USE_HIGH_FIDELITY_ALL_AWQ = os.environ.get("FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
@@ -136,8 +128,6 @@ _GLOBAL_WEIGHT_CACHE = LRUWeightCache(
     max_size=512,
     max_bytes=0 if _USE_AWQ_LEGACY_CACHE else _AWQ_DENSE_FALLBACK_MAX_BYTES,
 )
-_FP8_MAX = float(torch.finfo(_FP8_DTYPE).max) if _FP8_DTYPE is not None else None
-_FP8_MIN_SCALE = 1.0 / (_FP8_MAX * 512.0) if _FP8_MAX is not None else None
 _HIGH_FIDELITY_PREFIXES = tuple(
     part.strip()
     for part in os.environ.get(
@@ -166,7 +156,6 @@ _HIGH_FIDELITY_PREFIXES = tuple(
 )
 
 _AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
-_AWQ_DENSE_FALLBACK_BYTES = 0
 
 
 def _awq_stat_inc(key: str, delta: int = 1) -> None:
@@ -188,17 +177,17 @@ def _env_awq_fused_gemm_force() -> bool:
 
 def _env_awq_matmul_cache_before_fused() -> bool:
     """
-    When a quantized layer already has a materialized entry in the global LRU
-    (FP8/block or dense), run torch.nn.functional.linear (BLAS) instead of Triton fused.
+    When True and the global LRU already holds materialized weights (FP8/block or dense),
+    run torch.nn.functional.linear (BLAS) instead of Triton fused.
 
-    This matches steady-state performance of the legacy dequant+cache path while keeping
-    packed weights on disk. Disabled when FASTINFERENCE_AWQ_FUSED_GEMM_FORCE=1.
+    Default False: prefer the fused Triton AWQ GEMM path whenever policy allows it. Set
+    FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED=1 if you want BLAS when the cache is hot
+    (e.g. steady-state throughput on some stacks). Disabled when
+    FASTINFERENCE_AWQ_FUSED_GEMM_FORCE=1.
     """
     if _env_awq_fused_gemm_force():
         return False
-    # Default on: when LRU already holds FP8/block+dense materialization, use BLAS (same math as
-    # dequant+cache path; higher steady-state TPS). Set to 0 to always try Triton fused first.
-    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "1")
+    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "0")
 
 
 def _env_awq_cache_scope() -> str:
@@ -267,7 +256,6 @@ def resolve_awq_execution_policy(
     return AWQExecutionPolicy(
         prefer_fused=_env_awq_prefer_fused_default(),
         allow_dense_cache=allow_dense_cache,
-        allow_fp8_cache=_can_use_fp8_weight_cache(x),
         cache_scope=cache_scope,
         fused_scope=fused_scope,
     )
@@ -312,9 +300,7 @@ def should_use_awq_fused_path(
 
 
 def reset_awq_runtime_stats() -> None:
-    global _AWQ_DENSE_FALLBACK_BYTES
     _AWQ_RUNTIME_STATS.clear()
-    _AWQ_DENSE_FALLBACK_BYTES = 0
     _awq_stat_set("awq_matmul_calls", 0)
     _awq_stat_set("awq_fused_attempt", 0)
     _awq_stat_set("awq_fused_success", 0)
@@ -331,64 +317,14 @@ def get_awq_runtime_stats() -> Dict[str, int]:
 
 
 def clear_global_weight_cache() -> None:
-    global _AWQ_DENSE_FALLBACK_BYTES
     _GLOBAL_WEIGHT_CACHE.clear()
-    _AWQ_DENSE_FALLBACK_BYTES = 0
     _awq_stat_set("awq_dense_cache_bytes_current", 0)
-
-
-def _dtype_cache_key(dtype: torch.dtype) -> str:
-    return str(dtype).replace("torch.", "")
-
-
-def _try_get_cached_dense_fallback(
-    cached_weight: dict[str, Any],
-    x: torch.Tensor,
-    builder_fn,
-) -> torch.Tensor:
-    global _AWQ_DENSE_FALLBACK_BYTES
-
-    if not _USE_AWQ_DENSE_FALLBACK_CACHE:
-        _awq_stat_inc("dense_fallback_cache_disabled")
-        return builder_fn()
-
-    if not bool(cached_weight.get("allow_dense_fallback_cache", True)):
-        _awq_stat_inc("dense_fallback_cache_disallowed")
-        return builder_fn()
-
-    key = _dtype_cache_key(x.dtype)
-    dense_cache = cached_weight.setdefault("dense_fallback_cache", {})
-    cached_dense = dense_cache.get(key)
-    if cached_dense is not None:
-        _awq_stat_inc("dense_fallback_cache_hit")
-        return cached_dense
-
-    _awq_stat_inc("dense_fallback_cache_miss")
-    dense_weight = builder_fn()
-    dense_bytes = int(dense_weight.numel() * dense_weight.element_size())
-    if (
-        dense_bytes <= 0
-        or _AWQ_DENSE_FALLBACK_MAX_BYTES <= 0
-        or _AWQ_DENSE_FALLBACK_BYTES + dense_bytes > _AWQ_DENSE_FALLBACK_MAX_BYTES
-    ):
-        _awq_stat_inc("dense_fallback_cache_skip_capacity")
-        return dense_weight
-
-    dense_cache[key] = dense_weight
-    _AWQ_DENSE_FALLBACK_BYTES += dense_bytes
-    _awq_stat_inc("dense_fallback_cache_store")
-    _awq_stat_set("awq_dense_cache_bytes_current", _AWQ_DENSE_FALLBACK_BYTES)
-    return dense_weight
 
 
 def _match_weight_dtype(weight: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     if weight.dtype == x.dtype:
         return weight
     return weight.to(dtype=x.dtype)
-
-
-def _can_use_fp8_weight_cache(x: torch.Tensor) -> bool:
-    return bool(_USE_FP8_AWQ and _FP8_DTYPE is not None and x.device.type != "cpu")
 
 
 def _should_use_high_fidelity_awq(prefix: str, force_high_fidelity: bool = False) -> bool:
@@ -401,146 +337,16 @@ def _should_use_high_fidelity_awq(prefix: str, force_high_fidelity: bool = False
     return any(token in prefix for token in _HIGH_FIDELITY_PREFIXES)
 
 
-def _quantize_per_tensor_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x_f32 = x.to(torch.float32)
-    absmax = x_f32.abs().amax()
-    scale = (absmax / _FP8_MAX).clamp(min=_FP8_MIN_SCALE)
-    x_fp8 = (x_f32 / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
-    return x_fp8.contiguous(), scale.reshape(1).to(dtype=torch.float32, device=x.device)
-
-
-def _build_fp8_weight_cache(dense_weight: torch.Tensor) -> dict[str, torch.Tensor]:
-    if _USE_BLOCK_FP8_AWQ:
-        try:
-            from vllm.model_executor.moe_fp8_utils import (
-                dims_ok_for_moe_fp8,
-                fp8_block_quantize_2d,
-            )
-
-            if dims_ok_for_moe_fp8(dense_weight.shape[1], dense_weight.shape[0]):
-                weight_fp8, weight_scale = fp8_block_quantize_2d(dense_weight.contiguous())
-                return {
-                    "mode": "block_fp8",
-                    "weight": weight_fp8,
-                    "scale": weight_scale,
-                }
-        except Exception:
-            pass
-
-    weight_fp8, weight_scale = _quantize_per_tensor_fp8(dense_weight)
-    return {
-        "mode": "fp8",
-        "weight": weight_fp8,
-        "scale": weight_scale,
-    }
-
-
-def _scaled_mm_linear(
-    x: torch.Tensor,
-    weight_fp8: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    _awq_stat_inc("fp8_scaled_mm_attempt")
-    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    x_fp8, x_scale = _quantize_per_tensor_fp8(x_2d)
-    output_shape = [x_2d.shape[0], weight_fp8.shape[0]]
-    bias_arg = bias.to(dtype=x.dtype) if bias is not None else None
-    b_mat = weight_fp8.t().contiguous()
-
-    try:
-        output = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
-            x_fp8,
-            b_mat,
-            x.dtype,
-            x_scale,
-            weight_scale,
-            bias_arg,
-        )
-        _awq_stat_inc("fp8_scaled_mm_rocm_kernel_ok")
-    except Exception:
-        _awq_stat_inc("fp8_scaled_mm_rocm_kernel_fail")
-        output = torch._scaled_mm(
-            x_fp8,
-            b_mat,
-            out_dtype=x.dtype,
-            scale_a=x_scale,
-            scale_b=weight_scale,
-            bias=bias_arg,
-        )
-        _awq_stat_inc("fp8_scaled_mm_torch_ok")
-        if isinstance(output, tuple):
-            output = output[0]
-
-    return output.view(*x.shape[:-1], weight_fp8.shape[0])
-
-
-def _linear_from_fp8_cache(
-    x: torch.Tensor,
-    cached_weight: dict[str, Any],
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    # Fallback for platforms without FP8 GEMM support: keep the persistent cache in FP8,
-    # but only materialize the current layer's dense weight for this single matmul.
-    _awq_stat_inc("fp8_cache_to_dense_fallback")
-    dense_weight = _try_get_cached_dense_fallback(
-        cached_weight,
-        x,
-        lambda: cached_weight["weight"].to(dtype=x.dtype),
-    )
-    return torch.nn.functional.linear(x, dense_weight, bias)
-
-
-def _linear_from_block_fp8_cache(
-    x: torch.Tensor,
-    cached_weight: dict[str, Any],
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    _awq_stat_inc("block_fp8_cache_to_dense_fallback")
-    from vllm.model_executor.moe_fp8_utils import moe_fp8_dequant_to_linear_weight
-
-    dense_weight = _try_get_cached_dense_fallback(
-        cached_weight,
-        x,
-        lambda: moe_fp8_dequant_to_linear_weight(
-            cached_weight["weight"],
-            cached_weight["scale"],
-            x.dtype,
-        ),
-    )
-    return torch.nn.functional.linear(x, dense_weight, bias)
-
-
 def _apply_linear_with_cached_weight(
     x: torch.Tensor,
     cached_weight: Any,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if isinstance(cached_weight, dict) and cached_weight.get("mode") == "block_fp8":
-        _awq_stat_inc("cached_mode_block_fp8")
-        return _linear_from_block_fp8_cache(
-            x,
-            cached_weight,
-            bias=bias,
+    if isinstance(cached_weight, dict):
+        raise RuntimeError(
+            "FP8/block_fp8 weight cache entries were removed; restart the engine. "
+            "Global LRU now stores dense tensors only (AWQ fallback / GGUF)."
         )
-    if isinstance(cached_weight, dict) and cached_weight.get("mode") == "fp8":
-        _awq_stat_inc("cached_mode_fp8")
-        try:
-            return _scaled_mm_linear(
-                x,
-                cached_weight["weight"],
-                cached_weight["scale"],
-                bias=bias,
-            )
-        except RuntimeError as exc:
-            message = str(exc)
-            if "torch._scaled_mm is only supported" not in message:
-                raise
-            _awq_stat_inc("fp8_scaled_mm_runtime_unsupported")
-            return _linear_from_fp8_cache(x, cached_weight, bias=bias)
-        except AttributeError:
-            _awq_stat_inc("fp8_scaled_mm_attribute_missing")
-            return _linear_from_fp8_cache(x, cached_weight, bias=bias)
     _awq_stat_inc("cached_mode_dense")
     return torch.nn.functional.linear(x, _match_weight_dtype(cached_weight, x), bias)
 
@@ -723,12 +529,11 @@ class AWQWeight(QuantizedLinearWeight):
                     self.scales,
                     self.qzeros,
                     int(self.group_size),
+                    bias=bias,
                 )
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
                     out = out.view(*x.shape[:-1], out.shape[-1])
-                    if bias is not None:
-                        out = out + bias
                     return out
                 _awq_stat_inc(f"awq_fused_fallback_{reason}")
             except Exception as exc:
@@ -748,8 +553,6 @@ class AWQWeight(QuantizedLinearWeight):
             except:
                 cached_w = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
                 _awq_stat_inc("awq_dense_builds")
-            if policy.allow_fp8_cache:
-                cached_w = _build_fp8_weight_cache(cached_w)
             if should_allow_dense_cache(self.prefix, policy):
                 _awq_cache_put(self.weight_id, cached_w)
         return _apply_linear_with_cached_weight(x, cached_w, bias)
@@ -807,12 +610,11 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     self.qweight,
                     self.scales,
                     int(self.group_size),
+                    bias=bias,
                 )
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
                     out = out.view(*x.shape[:-1], out.shape[-1])
-                    if bias is not None:
-                        out = out + bias
                     return out
                 _awq_stat_inc(f"awq_fused_fallback_{reason}")
             except Exception as exc:
@@ -832,8 +634,6 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 original_shape=self.original_shape,
             )
             _awq_stat_inc("awq_dense_builds")
-            if policy.allow_fp8_cache:
-                cached_w = _build_fp8_weight_cache(cached_w)
             if should_allow_dense_cache(self.prefix, policy):
                 _awq_cache_put(self.weight_id, cached_w)
         return _apply_linear_with_cached_weight(x, cached_w, bias)

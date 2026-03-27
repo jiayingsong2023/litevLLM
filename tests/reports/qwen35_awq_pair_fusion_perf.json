@@ -1,0 +1,39 @@
+{
+  "title": "Qwen3.5-9B-AWQ: stacked GEMM fusion (decode micro-benchmark)",
+  "date": "2025-03-27",
+  "hardware_note": "Single-GPU run; decode forward total is the primary comparable metric.",
+  "workload": {
+    "script": "tests/tools/profile_qwen35_layer_breakdown.py",
+    "args": "--phase decode --prompt-tokens 64 --warmup-decode 2 --decode-steps 8",
+    "model": "models/Qwen3.5-9B-AWQ"
+  },
+  "optimizations": {
+    "FASTINFERENCE_QWEN35_FUSED_AWQ_AB": "Fuse linear_attn in_proj_a + in_proj_b (same K/out) into one PackedInt4/AWQ matmul.",
+    "FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP": "Fuse dense MLP gate_proj + up_proj into one matmul; then silu(gate)*up and down_proj."
+  },
+  "implementation": "vllm/model_executor/models/qwen3_5.py — _qwen35_try_fused_awq_pair_matmul (AWQWeight or PackedInt4Weight stacked along output rows).",
+  "results_ms_mean_per_decode_step": {
+    "method": "Same script, 3 runs each after GPU warm; values are decode_forward_total_ms (mean per step).",
+    "baseline_fusion_off": {
+      "FASTINFERENCE_QWEN35_FUSED_AWQ_AB": "0",
+      "FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP": "0",
+      "decode_forward_total_ms_runs": [302.165, 304.126, 300.23],
+      "decode_forward_total_ms_mean": 302.174
+    },
+    "optimized_fusion_on_default": {
+      "FASTINFERENCE_QWEN35_FUSED_AWQ_AB": "1",
+      "FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP": "1",
+      "decode_forward_total_ms_runs": [281.369, 281.942, 277.675],
+      "decode_forward_total_ms_mean": 280.329
+    },
+    "decode_forward_total_speedup_mean_vs_baseline": 1.078
+  },
+  "interpretation": {
+    "primary_metric": "decode_forward_total_ms (CUDA event timers around full forward).",
+    "hook_buckets_note": "When gate+up are fused, gate_proj/up_proj forward hooks no longer fire; fused GEMM time remains inside per-layer hooks. Therefore linear-attn path and MLP hook sub-sums are not directly comparable across modes — use decode_forward_total_ms for A/B."
+  },
+  "quality": {
+    "spotcheck": "tests/tools/quality_bar_spotcheck.py --model models/Qwen3.5-9B-AWQ --quant awq --prompt-subset minimal",
+    "result": "tier_b prompts passed after change"
+  }
+}

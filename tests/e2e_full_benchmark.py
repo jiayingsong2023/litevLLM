@@ -5,7 +5,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 from typing import Dict, List, Optional
 
@@ -51,13 +51,23 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         model_path="models/Qwen3.5-9B-AWQ",
         display_name="Qwen3.5-9B (AWQ INT4)",
         quant="awq",
-        concurrent_reqs=1,
+        # Concurrent async requests ~= batch of independent sequences (decode interleaving).
+        # Default 8; use --qwen9b-concurrent 16 for higher BS on large GPUs.
+        concurrent_reqs=8,
         prompt_tokens_target=256,
         max_new_tokens=24,
         gpu_memory_utilization=0.92,
         max_model_len=4096,
-        max_run_seconds=180,
-        stable_env={"FASTINFERENCE_KV_FP8": "1"},
+        max_run_seconds=480,
+        stable_env={
+            "FASTINFERENCE_KV_FP8": "1",
+            # Stacked GEMM: linear_attn a+b, MLP gate+up, full-attn k+v (defaults ON; set "0" to A/B).
+            "FASTINFERENCE_QWEN35_FUSED_AWQ_AB": "1",
+            "FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP": "1",
+            "FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV": "1",
+            # Prefill: SDPA on first full-attn chunk (faster than eager HF matmul; set "0" for strict HF parity).
+            "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
+        },
     ),
     "qwen35_35b_awq": ModelSpec(
         key="qwen35_35b_awq",
@@ -74,11 +84,10 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             "FASTINFERENCE_KV_FP8": "1",
             "FASTINFERENCE_QWEN35_MOE_FP8": "1",
             "FASTINFERENCE_QWEN35_MOE_OFFLOAD": "1",
-            "FASTINFERENCE_AWQ_FP8": "1",
-            "FASTINFERENCE_AWQ_BLOCK_FP8": "1",
             "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL": "0",
             "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH": "0",
-            "FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE": "balanced",
+            "FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV": "1",
+            "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
     ),
 }
@@ -160,6 +169,20 @@ def _restore_env(old_env: Dict[str, Optional[str]]) -> None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
+    attempts = float(stats.get("awq_fused_attempt", 0))
+    success = float(stats.get("awq_fused_success", 0))
+    ratio = (success / attempts) if attempts > 0 else 0.0
+    return {
+        "awq_fused_attempt": attempts,
+        "awq_fused_success": success,
+        "awq_fused_ratio": ratio,
+        "awq_cache_hits": float(stats.get("awq_cache_hits", 0)),
+        "awq_cache_misses": float(stats.get("awq_cache_misses", 0)),
+        "awq_dense_cache_bytes_peak": float(stats.get("cache_bytes", 0)),
+    }
 
 
 def _build_vllm_config(spec: ModelSpec) -> VllmConfig:
@@ -305,6 +328,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             )
             if awq_stats:
                 print(f"  AWQ_STATS(timeout): {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
+            awq_metrics = _derive_awq_metrics(awq_stats) if awq_stats else {}
             return {
                 "skipped": 0.0,
                 "timed_out": 1.0,
@@ -324,6 +348,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
                 "decode_tps_p50": float("nan"),
                 "decode_tps_p95": float("nan"),
                 "awq_runtime_stats": awq_stats,
+                "awq_metrics": awq_metrics,
             }
         wall_end = time.perf_counter()
 
@@ -335,18 +360,22 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
         decode_ms_list = _finite_values([r["decode_ms"] for r in request_results])
         decode_tps_list = _finite_values([r["decode_tps"] for r in request_results])
         decode_tokens_total = float(sum(r["decode_tokens"] for r in request_results))
+        # Sum of per-request decode_ms overlaps in time when concurrent_reqs>1, so this
+        # denominator is not wall-clock decode duration — use aggregate_tps or decode_tps_p50.
         decode_tps_aggregate = (
             decode_tokens_total / (sum(decode_ms_list) / 1000.0)
             if decode_tokens_total > 0.0 and decode_ms_list and sum(decode_ms_list) > 0.0
             else 0.0
         )
         awq_stats = {}
+        awq_metrics: Dict[str, float] = {}
         if spec.quant == "awq":
             from vllm.model_executor.layers.quantization.tensor import (
                 get_awq_runtime_stats,
             )
 
             awq_stats = get_awq_runtime_stats()
+            awq_metrics = _derive_awq_metrics(awq_stats)
 
         result = {
             "skipped": 0.0,
@@ -367,6 +396,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             "decode_tps_p50": median(decode_tps_list) if decode_tps_list else float("nan"),
             "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
             "awq_runtime_stats": awq_stats,
+            "awq_metrics": awq_metrics,
         }
 
         print(
@@ -375,8 +405,15 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             f"TTFT p50/p95={result['ttft_p50_ms']:.1f}/{result['ttft_p95_ms']:.1f} ms, "
             f"E2E p50/p95={result['e2e_p50_ms']:.1f}/{result['e2e_p95_ms']:.1f} ms, "
             f"Decode p50/p95={result['decode_p50_ms']:.1f}/{result['decode_p95_ms']:.1f} ms, "
-            f"Decode TPS={result['decode_tps_aggregate']:.2f}"
+            f"Decode TPS(agg)={result['decode_tps_aggregate']:.2f}, "
+            f"Decode TPS p50={result['decode_tps_p50']:.2f}"
         )
+        if spec.concurrent_reqs > 1:
+            print(
+                "  [Note] Decode TPS(agg)=total_decode_tokens/sum(decode_ms); with concurrent "
+                "requests those durations overlap, so this is not wall batch decode TPS. "
+                "Prefer tokens/s (aggregate_tps) or decode_tps_p50 for A/B vs kernel work."
+            )
         if awq_stats:
             print(f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
         return result
@@ -413,6 +450,16 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to save JSON benchmark summary.",
     )
+    parser.add_argument(
+        "--qwen9b-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override concurrent request count (batch width) for qwen35_9b_awq only. "
+            "Default from MODEL_SPECS is 8; typical values: 8 or 16 on 48GB+ GPUs."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -423,7 +470,17 @@ async def main() -> None:
     for key in model_keys:
         if key not in MODEL_SPECS:
             raise ValueError(f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}")
-        specs.append(MODEL_SPECS[key])
+        spec = MODEL_SPECS[key]
+        if key == "qwen35_9b_awq" and args.qwen9b_concurrent is not None:
+            n = int(args.qwen9b_concurrent)
+            if n < 1 or n > 64:
+                raise ValueError("--qwen9b-concurrent must be between 1 and 64")
+            spec = replace(
+                spec,
+                concurrent_reqs=n,
+                max_run_seconds=max(spec.max_run_seconds, 60 * n),
+            )
+        specs.append(spec)
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
@@ -436,6 +493,10 @@ async def main() -> None:
 
     print("\n" + "-" * 72)
     print("PERF SUMMARY")
+    print(
+        "(decode_tps = aggregate formula; with concurrent_reqs>1 it is not wall batch TPS — "
+        "see decode_tps_p50 or aggregate_tps)"
+    )
     print("-" * 72)
     for key in model_keys:
         r = summary[key]
@@ -449,7 +510,8 @@ async def main() -> None:
             f"{key:16} | tps={r['aggregate_tps']:.2f} | "
             f"ttft_p50={r['ttft_p50_ms']:.1f}ms | ttft_p95={r['ttft_p95_ms']:.1f}ms | "
             f"e2e_p50={r['e2e_p50_ms']:.1f}ms | e2e_p95={r['e2e_p95_ms']:.1f}ms | "
-            f"decode_tps={r['decode_tps_aggregate']:.2f}"
+            f"decode_tps_agg={r['decode_tps_aggregate']:.2f} | "
+            f"decode_tps_p50={r['decode_tps_p50']:.2f}"
         )
 
     if args.json_out:

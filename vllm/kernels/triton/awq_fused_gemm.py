@@ -106,7 +106,7 @@ _PACKED_FUSED_AUTOTUNE_CONFIGS = [
 
 @triton.jit
 def _awq_native_tiled_gemm_heuristic(
-    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr,
+    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr, bias_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
     stride_bn, stride_bk,
@@ -116,6 +116,7 @@ def _awq_native_tiled_gemm_heuristic(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """
     Native Triton Tiling Implementation for AMD gfx1151.
@@ -173,20 +174,23 @@ def _awq_native_tiled_gemm_heuristic(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+        accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
     # Store Result (output dtype may be bf16 even when tl.dot used fp16 operands)
     if USE_BF16_OUTPUT:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 @triton.jit
 def _packed_int4_symmetric_tiled_gemm_heuristic(
-    a_ptr, b_ptr, s_ptr, c_ptr,
+    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
     stride_bn, stride_bk,
@@ -195,6 +199,7 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -237,26 +242,29 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+        accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
     if USE_BF16_OUTPUT:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 @triton.autotune(
     configs=_PACKED_FUSED_AUTOTUNE_CONFIGS,
-    key=["M", "N", "K", "BF16_DOT", "OUT_BF16"],
+    key=["M", "N", "K", "BF16_DOT", "OUT_BF16", "HAS_BIAS"],
     warmup=8,
     rep=20,
     cache_results=True,
 )
 @triton.jit
 def _packed_int4_symmetric_tiled_gemm_autotuned(
-    a_ptr, b_ptr, s_ptr, c_ptr,
+    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
     stride_bn, stride_bk,
@@ -265,6 +273,7 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     BF16_DOT: tl.constexpr,
     OUT_BF16: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -306,26 +315,29 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+        accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
     if OUT_BF16:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 @triton.autotune(
     configs=_PACKED_FUSED_AUTOTUNE_CONFIGS,
-    key=["M", "N", "K", "BF16_DOT", "OUT_BF16"],
+    key=["M", "N", "K", "BF16_DOT", "OUT_BF16", "HAS_BIAS"],
     warmup=8,
     rep=20,
     cache_results=True,
 )
 @triton.jit
 def _awq_native_tiled_gemm_autotuned(
-    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr,
+    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr, bias_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
     stride_bn, stride_bk,
@@ -335,6 +347,7 @@ def _awq_native_tiled_gemm_autotuned(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     BF16_DOT: tl.constexpr,
     OUT_BF16: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -379,21 +392,39 @@ def _awq_native_tiled_gemm_autotuned(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+        accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
     if OUT_BF16:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
-    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
-def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
+def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
     M, K = a.shape
     N = qweight.shape[0]
-    if out is None: c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    else: c = out
+    if out is None:
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    else:
+        c = out
+
+    has_bias = bias is not None
+    if has_bias:
+        if bias.dim() != 1 or int(bias.shape[0]) != N:
+            raise ValueError(
+                f"awq_fused_gemm: bias must be 1D of size N={N}, got {tuple(bias.shape)}"
+            )
+        bias = bias.contiguous().reshape(N)
+        if bias.device != a.device:
+            raise ValueError("awq_fused_gemm: bias must be on the same device as activations")
+        if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
+    bias_ptr_arg = bias if has_bias else a
 
     use_bf16_dot = _resolve_use_bf16_dot(a, M, N)
     use_bf16_output = a.dtype == torch.bfloat16
@@ -404,15 +435,29 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
         try:
             _awq_native_tiled_gemm_autotuned[grid](
-                a, qweight, scales, qzeros, c,
-                M, N, K, group_size,
-                a.stride(0), a.stride(1),
-                qweight.stride(0), qweight.stride(1),
-                scales.stride(0), scales.stride(1),
-                qzeros.stride(0), qzeros.stride(1) if qzeros is not None else 0,
-                c.stride(0), c.stride(1),
+                a,
+                qweight,
+                scales,
+                qzeros,
+                c,
+                bias_ptr_arg,
+                M,
+                N,
+                K,
+                group_size,
+                a.stride(0),
+                a.stride(1),
+                qweight.stride(0),
+                qweight.stride(1),
+                scales.stride(0),
+                scales.stride(1),
+                qzeros.stride(0),
+                qzeros.stride(1) if qzeros is not None else 0,
+                c.stride(0),
+                c.stride(1),
                 BF16_DOT=bf16_dot,
                 OUT_BF16=out_bf16,
+                HAS_BIAS=has_bias,
             )
             return c
         except Exception:
@@ -422,17 +467,34 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
 
     _awq_native_tiled_gemm_heuristic[grid](
-        a, qweight, scales, qzeros, c,
-        M, N, K, group_size,
-        a.stride(0), a.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        qzeros.stride(0), qzeros.stride(1) if qzeros is not None else 0,
-        c.stride(0), c.stride(1),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        a,
+        qweight,
+        scales,
+        qzeros,
+        c,
+        bias_ptr_arg,
+        M,
+        N,
+        K,
+        group_size,
+        a.stride(0),
+        a.stride(1),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        qzeros.stride(0),
+        qzeros.stride(1) if qzeros is not None else 0,
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
         USE_BF16_DOT=use_bf16_dot,
         USE_BF16_OUTPUT=use_bf16_output,
-        num_warps=num_warps, num_stages=num_stages,
+        HAS_BIAS=has_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return c
 
@@ -443,10 +505,26 @@ def packed_int4_symmetric_fused_gemm(
     scales: torch.Tensor,
     group_size: int,
     out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     m, k = a.shape
     n = qweight.shape[0]
     c = torch.empty((m, n), device=a.device, dtype=a.dtype) if out is None else out
+    has_bias = bias is not None
+    if has_bias:
+        if bias.dim() != 1 or int(bias.shape[0]) != n:
+            raise ValueError(
+                f"packed_int4_symmetric_fused_gemm: bias must be 1D of size N={n}, got {tuple(bias.shape)}"
+            )
+        bias = bias.contiguous().reshape(n)
+        if bias.device != a.device:
+            raise ValueError(
+                "packed_int4_symmetric_fused_gemm: bias must be on the same device as activations"
+            )
+        if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"packed_int4_symmetric_fused_gemm: unsupported bias dtype {bias.dtype}")
+    bias_ptr_arg = bias if has_bias else a
+
     use_bf16_dot = _resolve_use_bf16_dot(a, m, n)
     use_bf16_output = a.dtype == torch.bfloat16
     bf16_dot = 1 if use_bf16_dot else 0
@@ -456,14 +534,26 @@ def packed_int4_symmetric_fused_gemm(
         grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
         try:
             _packed_int4_symmetric_tiled_gemm_autotuned[grid](
-                a, qweight, scales, c,
-                m, n, k, group_size,
-                a.stride(0), a.stride(1),
-                qweight.stride(0), qweight.stride(1),
-                scales.stride(0), scales.stride(1),
-                c.stride(0), c.stride(1),
+                a,
+                qweight,
+                scales,
+                c,
+                bias_ptr_arg,
+                m,
+                n,
+                k,
+                group_size,
+                a.stride(0),
+                a.stride(1),
+                qweight.stride(0),
+                qweight.stride(1),
+                scales.stride(0),
+                scales.stride(1),
+                c.stride(0),
+                c.stride(1),
                 BF16_DOT=bf16_dot,
                 OUT_BF16=out_bf16,
+                HAS_BIAS=has_bias,
             )
             return c
         except Exception:
@@ -472,16 +562,31 @@ def packed_int4_symmetric_fused_gemm(
     block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(m, n, k)
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
     _packed_int4_symmetric_tiled_gemm_heuristic[grid](
-        a, qweight, scales, c,
-        m, n, k, group_size,
-        a.stride(0), a.stride(1),
-        qweight.stride(0), qweight.stride(1),
-        scales.stride(0), scales.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        a,
+        qweight,
+        scales,
+        c,
+        bias_ptr_arg,
+        m,
+        n,
+        k,
+        group_size,
+        a.stride(0),
+        a.stride(1),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
         USE_BF16_DOT=use_bf16_dot,
         USE_BF16_OUTPUT=use_bf16_output,
-        num_warps=num_warps, num_stages=num_stages,
+        HAS_BIAS=has_bias,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return c
 
@@ -493,6 +598,7 @@ def awq_fused_gemm_safe(
     qzeros: torch.Tensor | None,
     group_size: int,
     out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
     if a.dim() != 2:
         return a, False, "input_not_2d"
@@ -512,8 +618,28 @@ def awq_fused_gemm_safe(
         return a, False, "device_mismatch"
     if a.dtype not in (torch.float16, torch.bfloat16):
         return a, False, f"unsupported_dtype_{str(a.dtype)}"
+    if bias is not None:
+        if bias.dim() != 1 or int(bias.numel()) != n:
+            return a, False, "bias_bad_shape"
+        if bias.device != a.device:
+            return a, False, "bias_device_mismatch"
+        if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return a, False, f"unsupported_bias_dtype_{str(bias.dtype)}"
+    a = a.contiguous()
+    qweight = qweight.contiguous()
+    scales = scales.contiguous()
+    qzeros = qzeros.contiguous()
+    bias_arg = bias.contiguous() if bias is not None else None
     try:
-        c = awq_fused_gemm(a, qweight, scales, qzeros, group_size=group_size, out=out)
+        c = awq_fused_gemm(
+            a,
+            qweight,
+            scales,
+            qzeros,
+            group_size=group_size,
+            out=out,
+            bias=bias_arg,
+        )
         if c.shape != (m, n):
             return c, False, "bad_output_shape"
         return c, True, "ok"
@@ -527,6 +653,7 @@ def packed_int4_symmetric_fused_gemm_safe(
     scales: torch.Tensor,
     group_size: int,
     out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
     if a.dim() != 2:
         return a, False, "input_not_2d"
@@ -544,8 +671,26 @@ def packed_int4_symmetric_fused_gemm_safe(
         return a, False, "device_mismatch"
     if a.dtype not in (torch.float16, torch.bfloat16):
         return a, False, f"unsupported_dtype_{str(a.dtype)}"
+    if bias is not None:
+        if bias.dim() != 1 or int(bias.numel()) != n:
+            return a, False, "bias_bad_shape"
+        if bias.device != a.device:
+            return a, False, "bias_device_mismatch"
+        if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return a, False, f"unsupported_bias_dtype_{str(bias.dtype)}"
+    a = a.contiguous()
+    qweight = qweight.contiguous()
+    scales = scales.contiguous()
+    bias_arg = bias.contiguous() if bias is not None else None
     try:
-        c = packed_int4_symmetric_fused_gemm(a, qweight, scales, group_size=group_size, out=out)
+        c = packed_int4_symmetric_fused_gemm(
+            a,
+            qweight,
+            scales,
+            group_size=group_size,
+            out=out,
+            bias=bias_arg,
+        )
         if c.shape != (m, n):
             return c, False, "bad_output_shape"
         return c, True, "ok"
