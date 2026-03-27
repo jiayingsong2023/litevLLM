@@ -83,8 +83,29 @@ def _select_fused_gemm_blocks(
     return block_m, block_n, block_k, num_warps, num_stages
 
 
+def _env_fused_gemm_autotune() -> bool:
+    """Bench candidate tile shapes at first launch per (M,N,K,dot) key; disable to use heuristics only."""
+    return os.environ.get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA; autotune picks best per key.
+_PACKED_FUSED_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+]
+
+
 @triton.jit
-def _awq_native_tiled_gemm_kernel(
+def _awq_native_tiled_gemm_heuristic(
     a_ptr, b_ptr, s_ptr, z_ptr, c_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
@@ -164,7 +185,7 @@ def _awq_native_tiled_gemm_kernel(
 
 
 @triton.jit
-def _packed_int4_symmetric_tiled_gemm_kernel(
+def _packed_int4_symmetric_tiled_gemm_heuristic(
     a_ptr, b_ptr, s_ptr, c_ptr,
     M, N, K, group_size,
     stride_am, stride_ak,
@@ -225,18 +246,182 @@ def _packed_int4_symmetric_tiled_gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
+
+@triton.autotune(
+    configs=_PACKED_FUSED_AUTOTUNE_CONFIGS,
+    key=["M", "N", "K", "BF16_DOT", "OUT_BF16"],
+    warmup=8,
+    rep=20,
+    cache_results=True,
+)
+@triton.jit
+def _packed_int4_symmetric_tiled_gemm_autotuned(
+    a_ptr, b_ptr, s_ptr, c_ptr,
+    M, N, K, group_size,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_sn, stride_sk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BF16_DOT: tl.constexpr,
+    OUT_BF16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid % num_pid_m
+    pid_n = (pid // num_pid_m) % num_pid_n
+
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + (offs_k[None, :] // 8) * stride_bk)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k * BLOCK_K
+        mask_k = offs_k[None, :] < k_remaining
+
+        a = tl.load(a_ptrs, mask=mask_k, other=0.0)
+        b_packed = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & mask_k, other=0)
+        b_unpacked = (b_packed >> ((offs_k[None, :] % 8) * 4)) & 0x0F
+
+        current_k = k * BLOCK_K + offs_k
+        group_idx = current_k // group_size
+        s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
+        scales = tl.load(
+            s_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=1.0,
+        )
+
+        b = (b_unpacked.to(tl.float32) - 8.0) * scales.to(tl.float32)
+        if BF16_DOT:
+            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        else:
+            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += (BLOCK_K // 8) * stride_bk
+
+    if OUT_BF16:
+        c = accumulator.to(tl.bfloat16)
+    else:
+        c = accumulator.to(tl.float16)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+
+
+@triton.autotune(
+    configs=_PACKED_FUSED_AUTOTUNE_CONFIGS,
+    key=["M", "N", "K", "BF16_DOT", "OUT_BF16"],
+    warmup=8,
+    rep=20,
+    cache_results=True,
+)
+@triton.jit
+def _awq_native_tiled_gemm_autotuned(
+    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr,
+    M, N, K, group_size,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_sn, stride_sk,
+    stride_zn, stride_zk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BF16_DOT: tl.constexpr,
+    OUT_BF16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid % num_pid_m
+    pid_n = (pid // num_pid_m) % num_pid_n
+
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + (offs_k[None, :] // 8) * stride_bk)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k * BLOCK_K
+        mask_k = offs_k[None, :] < k_remaining
+
+        a = tl.load(a_ptrs, mask=mask_k, other=0.0)
+
+        b_packed = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & mask_k, other=0)
+        b_unpacked = (b_packed >> ((offs_k[None, :] % 8) * 4)) & 0x0F
+
+        current_k = k * BLOCK_K + offs_k
+        group_idx = current_k // group_size
+        s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
+        z_ptrs = z_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
+
+        scales = tl.load(s_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=1.0)
+        z_packed = tl.load(z_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=0)
+        zeros = (z_packed >> ((group_idx[None, :] % 8) * 4)) & 0x0F
+
+        b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
+
+        if BF16_DOT:
+            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        else:
+            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += (BLOCK_K // 8) * stride_bk
+
+    if OUT_BF16:
+        c = accumulator.to(tl.bfloat16)
+    else:
+        c = accumulator.to(tl.float16)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+
+
 def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
     M, K = a.shape
     N = qweight.shape[0]
     if out is None: c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     else: c = out
 
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(M, N, K)
     use_bf16_dot = _resolve_use_bf16_dot(a, M, N)
     use_bf16_output = a.dtype == torch.bfloat16
+    bf16_dot = 1 if use_bf16_dot else 0
+    out_bf16 = 1 if use_bf16_output else 0
+
+    if _env_fused_gemm_autotune():
+        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+        try:
+            _awq_native_tiled_gemm_autotuned[grid](
+                a, qweight, scales, qzeros, c,
+                M, N, K, group_size,
+                a.stride(0), a.stride(1),
+                qweight.stride(0), qweight.stride(1),
+                scales.stride(0), scales.stride(1),
+                qzeros.stride(0), qzeros.stride(1) if qzeros is not None else 0,
+                c.stride(0), c.stride(1),
+                BF16_DOT=bf16_dot,
+                OUT_BF16=out_bf16,
+            )
+            return c
+        except Exception:
+            pass
+
+    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(M, N, K)
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
 
-    _awq_native_tiled_gemm_kernel[grid](
+    _awq_native_tiled_gemm_heuristic[grid](
         a, qweight, scales, qzeros, c,
         M, N, K, group_size,
         a.stride(0), a.stride(1),
@@ -262,11 +447,31 @@ def packed_int4_symmetric_fused_gemm(
     m, k = a.shape
     n = qweight.shape[0]
     c = torch.empty((m, n), device=a.device, dtype=a.dtype) if out is None else out
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(m, n, k)
     use_bf16_dot = _resolve_use_bf16_dot(a, m, n)
     use_bf16_output = a.dtype == torch.bfloat16
+    bf16_dot = 1 if use_bf16_dot else 0
+    out_bf16 = 1 if use_bf16_output else 0
+
+    if _env_fused_gemm_autotune():
+        grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
+        try:
+            _packed_int4_symmetric_tiled_gemm_autotuned[grid](
+                a, qweight, scales, c,
+                m, n, k, group_size,
+                a.stride(0), a.stride(1),
+                qweight.stride(0), qweight.stride(1),
+                scales.stride(0), scales.stride(1),
+                c.stride(0), c.stride(1),
+                BF16_DOT=bf16_dot,
+                OUT_BF16=out_bf16,
+            )
+            return c
+        except Exception:
+            pass
+
+    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(m, n, k)
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
-    _packed_int4_symmetric_tiled_gemm_kernel[grid](
+    _packed_int4_symmetric_tiled_gemm_heuristic[grid](
         a, qweight, scales, c,
         m, n, k, group_size,
         a.stride(0), a.stride(1),

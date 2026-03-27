@@ -17,13 +17,26 @@ import torch.nn as nn
 from vllm.model_executor.layers.lite_linear import LiteLinear
 
 
+def _default_prefetch_awq_weight_cache() -> bool:
+    """Enable prefetch on GPUs with enough headroom for dense/FP8 LRU (9B-class AWQ)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        total_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024**3)
+    except Exception:
+        return False
+    # ~9B AWQ + KV + LRU headroom; disable with FASTINFERENCE_AWQ_PREFETCH_WEIGHT_CACHE=0 if OOM.
+    return total_gb >= 24.0
+
+
 def _env_prefetch_awq_cache() -> bool:
-    return os.environ.get("FASTINFERENCE_AWQ_PREFETCH_WEIGHT_CACHE", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    raw = os.environ.get("FASTINFERENCE_AWQ_PREFETCH_WEIGHT_CACHE", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    # unset or "auto": heuristic by VRAM
+    return _default_prefetch_awq_weight_cache()
 
 
 def prefetch_awq_weight_caches(model: nn.Module) -> int:
@@ -79,5 +92,5 @@ def maybe_prefetch_awq_weight_caches(model: nn.Module) -> None:
     if n > 0:
         print(
             f">>>> LiteEngine: AWQ weight cache prefetch: materialized {n} quantized layer(s) "
-            f"(FASTINFERENCE_AWQ_PREFETCH_WEIGHT_CACHE=1)"
+            f"(FASTINFERENCE_AWQ_PREFETCH_WEIGHT_CACHE=auto|1)"
         )

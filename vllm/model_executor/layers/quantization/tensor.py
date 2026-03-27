@@ -196,9 +196,9 @@ def _env_awq_matmul_cache_before_fused() -> bool:
     """
     if _env_awq_fused_gemm_force():
         return False
-    # Default off: prefer Triton fused when LRU has materialized weights; set to 1 to use BLAS
-    # on cached FP8/dense (higher steady-state TPS, see awq_cache_prefetch).
-    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "0")
+    # Default on: when LRU already holds FP8/block+dense materialization, use BLAS (same math as
+    # dequant+cache path; higher steady-state TPS). Set to 0 to always try Triton fused first.
+    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "1")
 
 
 def _env_awq_cache_scope() -> str:
