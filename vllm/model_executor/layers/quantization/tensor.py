@@ -3,29 +3,89 @@ import os
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional, Any, Dict
 from collections import defaultdict
 
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tensor_nbytes(t: Any) -> int:
+    if isinstance(t, torch.Tensor):
+        return int(t.numel() * t.element_size())
+    if isinstance(t, dict):
+        return sum(_tensor_nbytes(v) for v in t.values())
+    if isinstance(t, (tuple, list)):
+        return sum(_tensor_nbytes(v) for v in t)
+    return 0
+
+
+@dataclass(frozen=True)
+class AWQExecutionPolicy:
+    prefer_fused: bool
+    allow_dense_cache: bool
+    allow_fp8_cache: bool
+    cache_scope: str
+    fused_scope: str
+
 class LRUWeightCache:
-    def __init__(self, max_size=256):
+    def __init__(self, max_size: int = 256, max_bytes: int = 0):
         self.cache: Dict[int, Any] = {}
         self.keys = []
         self.max_size = max_size
+        self.max_bytes = max(0, int(max_bytes))
+        self.current_bytes = 0
+        self.item_bytes: Dict[int, int] = {}
+
+    def _evict_one(self) -> None:
+        if not self.keys:
+            return
+        old_key = self.keys.pop(0)
+        self.cache.pop(old_key, None)
+        old_bytes = self.item_bytes.pop(old_key, 0)
+        self.current_bytes = max(0, self.current_bytes - old_bytes)
+
     def get(self, key: int) -> Optional[Any]:
         if key in self.cache:
-            self.keys.remove(key); self.keys.append(key)
+            self.keys.remove(key)
+            self.keys.append(key)
             return self.cache[key]
         return None
+
     def put(self, key: int, value: Any):
-        if key in self.cache: return
-        if len(self.keys) >= self.max_size:
-            old_key = self.keys.pop(0); del self.cache[old_key]
-        self.cache[key] = value; self.keys.append(key)
+        if key in self.cache:
+            return
+        value_bytes = _tensor_nbytes(value)
+        if self.max_bytes > 0 and value_bytes > self.max_bytes:
+            return
+        while self.max_size > 0 and len(self.keys) >= self.max_size:
+            self._evict_one()
+        while self.max_bytes > 0 and self.current_bytes + value_bytes > self.max_bytes:
+            if not self.keys:
+                break
+            self._evict_one()
+        if self.max_bytes > 0 and self.current_bytes + value_bytes > self.max_bytes:
+            return
+        self.cache[key] = value
+        self.keys.append(key)
+        self.item_bytes[key] = value_bytes
+        self.current_bytes += value_bytes
+
+    def get_memory_stats(self) -> Dict[str, int]:
+        return {
+            "cache_items": int(len(self.keys)),
+            "cache_bytes": int(self.current_bytes),
+            "cache_max_bytes": int(self.max_bytes),
+            "cache_max_items": int(self.max_size),
+        }
+
     def clear(self):
         self.cache.clear()
         self.keys.clear()
-
-_GLOBAL_WEIGHT_CACHE = LRUWeightCache(max_size=512)
+        self.item_bytes.clear()
+        self.current_bytes = 0
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 _USE_FP8_AWQ = os.environ.get("FASTINFERENCE_AWQ_FP8", "1").strip().lower() in (
     "1", "true", "yes", "on"
@@ -71,6 +131,11 @@ _AWQ_DENSE_FALLBACK_MAX_BYTES = int(
     )
     * (1024**3)
 )
+_USE_AWQ_LEGACY_CACHE = _env_truthy("FASTINFERENCE_AWQ_LEGACY_CACHE", "0")
+_GLOBAL_WEIGHT_CACHE = LRUWeightCache(
+    max_size=512,
+    max_bytes=0 if _USE_AWQ_LEGACY_CACHE else _AWQ_DENSE_FALLBACK_MAX_BYTES,
+)
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max) if _FP8_DTYPE is not None else None
 _FP8_MIN_SCALE = 1.0 / (_FP8_MAX * 512.0) if _FP8_MAX is not None else None
 _HIGH_FIDELITY_PREFIXES = tuple(
@@ -108,20 +173,165 @@ def _awq_stat_inc(key: str, delta: int = 1) -> None:
     _AWQ_RUNTIME_STATS[key] += delta
 
 
+def _awq_stat_set(key: str, value: int) -> None:
+    _AWQ_RUNTIME_STATS[key] = int(value)
+
+
+def _env_awq_prefer_fused_default() -> bool:
+    return _env_truthy("FASTINFERENCE_AWQ_FUSED_GEMM", "0")
+
+
+def _env_awq_fused_gemm_force() -> bool:
+    return _env_truthy("FASTINFERENCE_AWQ_FUSED_GEMM_FORCE", "0")
+
+
+def _env_awq_matmul_cache_before_fused() -> bool:
+    """
+    When a quantized layer already has a materialized entry in the global LRU
+    (FP8/block or dense), run torch.nn.functional.linear (BLAS) instead of Triton fused.
+
+    This matches steady-state performance of the legacy dequant+cache path while keeping
+    packed weights on disk. Disabled when FASTINFERENCE_AWQ_FUSED_GEMM_FORCE=1.
+    """
+    if _env_awq_fused_gemm_force():
+        return False
+    return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "1")
+
+
+def _env_awq_cache_scope() -> str:
+    scope = os.environ.get("FASTINFERENCE_AWQ_CACHE_SCOPE", "all").strip().lower()
+    if scope not in ("all", "attention_only", "off"):
+        return "all"
+    return scope
+
+
+def _env_awq_fused_scope(profile_hint: str) -> str:
+    matrix = os.environ.get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
+    if matrix not in ("safe", "balanced", "throughput", "strict"):
+        matrix = "balanced"
+    # Direct env override always wins.
+    raw_override = os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE")
+    if raw_override is not None and raw_override.strip() != "":
+        scope = raw_override.strip().lower()
+        if scope in ("all", "attention_only", "off"):
+            return scope
+    # Profile-aware default matrix (no override):
+    # - qwen35_9b_awq: safe/balanced=attention_only, throughput=all, strict=off
+    # - qwen35_35b_awq: safe/balanced=off, throughput=attention_only, strict=off
+    if profile_hint == "qwen35_9b_awq":
+        default_scope = (
+            "all" if matrix == "throughput"
+            else "off" if matrix == "strict"
+            else "attention_only"
+        )
+    elif profile_hint == "qwen35_35b_awq":
+        default_scope = "attention_only" if matrix == "throughput" else "off"
+    else:
+        default_scope = "all" if matrix in ("balanced", "throughput") else "attention_only"
+    scope = os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE", default_scope).strip().lower()
+    if scope not in ("all", "attention_only", "off"):
+        return default_scope
+    return scope
+
+
+def _is_attention_like_prefix(prefix: str) -> bool:
+    if not prefix:
+        return False
+    markers = (
+        ".self_attn.",
+        ".linear_attn.",
+        ".attn.",
+        ".q_proj",
+        ".k_proj",
+        ".v_proj",
+        ".o_proj",
+    )
+    return any(m in prefix for m in markers)
+
+
+def resolve_awq_execution_policy(
+    prefix: str,
+    x: torch.Tensor,
+    profile_hint: str = "",
+) -> AWQExecutionPolicy:
+    cache_scope = _env_awq_cache_scope()
+    fused_scope = _env_awq_fused_scope(profile_hint)
+    allow_dense_cache = _USE_AWQ_DENSE_FALLBACK_CACHE
+    if cache_scope == "off":
+        allow_dense_cache = False
+    elif cache_scope == "attention_only" and not _is_attention_like_prefix(prefix):
+        allow_dense_cache = False
+    return AWQExecutionPolicy(
+        prefer_fused=_env_awq_prefer_fused_default(),
+        allow_dense_cache=allow_dense_cache,
+        allow_fp8_cache=_can_use_fp8_weight_cache(x),
+        cache_scope=cache_scope,
+        fused_scope=fused_scope,
+    )
+
+
+def should_allow_dense_cache(prefix: str, policy: AWQExecutionPolicy) -> bool:
+    if not policy.allow_dense_cache:
+        return False
+    if policy.cache_scope == "attention_only":
+        return _is_attention_like_prefix(prefix)
+    return True
+
+
+def should_use_awq_fused_path(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: Optional[torch.Tensor],
+    group_size: int,
+    prefix: str,
+    policy: AWQExecutionPolicy,
+) -> tuple[bool, str]:
+    if not (policy.prefer_fused or _env_awq_fused_gemm_force()):
+        return False, "fused_disabled"
+    if policy.fused_scope == "off" and not _env_awq_fused_gemm_force():
+        return False, "fused_scope_off"
+    if (
+        policy.fused_scope == "attention_only"
+        and not _is_attention_like_prefix(prefix)
+        and not _env_awq_fused_gemm_force()
+    ):
+        return False, "fused_scope_attention_only"
+    try:
+        from vllm.model_executor.layers.quantization.awq_triton import (
+            awq_fused_capability_check,
+        )
+        return awq_fused_capability_check(
+            x, qweight, scales, qzeros, group_size
+        )
+    except Exception as exc:
+        return False, f"fused_capability_check_error:{type(exc).__name__}"
+
+
 def reset_awq_runtime_stats() -> None:
     global _AWQ_DENSE_FALLBACK_BYTES
     _AWQ_RUNTIME_STATS.clear()
     _AWQ_DENSE_FALLBACK_BYTES = 0
+    _awq_stat_set("awq_matmul_calls", 0)
+    _awq_stat_set("awq_fused_attempt", 0)
+    _awq_stat_set("awq_fused_success", 0)
+    _awq_stat_set("awq_cache_hits", 0)
+    _awq_stat_set("awq_cache_misses", 0)
+    _awq_stat_set("awq_dense_builds", 0)
+    _awq_stat_set("awq_dense_cache_bytes_current", 0)
 
 
 def get_awq_runtime_stats() -> Dict[str, int]:
-    return dict(_AWQ_RUNTIME_STATS)
+    out = dict(_AWQ_RUNTIME_STATS)
+    out.update(_GLOBAL_WEIGHT_CACHE.get_memory_stats())
+    return out
 
 
 def clear_global_weight_cache() -> None:
     global _AWQ_DENSE_FALLBACK_BYTES
     _GLOBAL_WEIGHT_CACHE.clear()
     _AWQ_DENSE_FALLBACK_BYTES = 0
+    _awq_stat_set("awq_dense_cache_bytes_current", 0)
 
 
 def _dtype_cache_key(dtype: torch.dtype) -> str:
@@ -164,6 +374,7 @@ def _try_get_cached_dense_fallback(
     dense_cache[key] = dense_weight
     _AWQ_DENSE_FALLBACK_BYTES += dense_bytes
     _awq_stat_inc("dense_fallback_cache_store")
+    _awq_stat_set("awq_dense_cache_bytes_current", _AWQ_DENSE_FALLBACK_BYTES)
     return dense_weight
 
 
@@ -330,6 +541,11 @@ def _apply_linear_with_cached_weight(
     _awq_stat_inc("cached_mode_dense")
     return torch.nn.functional.linear(x, _match_weight_dtype(cached_weight, x), bias)
 
+
+def _awq_cache_put(weight_id: int, value: Any) -> None:
+    _GLOBAL_WEIGHT_CACHE.put(weight_id, value)
+    _awq_stat_set("awq_dense_cache_bytes_current", _GLOBAL_WEIGHT_CACHE.current_bytes)
+
 def dequantize_q4k_pytorch(qweight: torch.Tensor, n_rows: int, n_cols: int) -> torch.Tensor:
     """Accurate Q4_K dequantization using gguf library reference implementation."""
     try:
@@ -463,13 +679,14 @@ class GGUFWeight(QuantizedLinearWeight):
             if self.original_shape is not None or self.slice_offset > 0:
                 os0 = self.original_shape[0] if self.original_shape else n_rows; os1 = self.original_shape[1] if self.original_shape else n_cols
                 cached_w = cached_w[self.slice_offset : self.slice_offset + os0, :os1].contiguous()
-            _GLOBAL_WEIGHT_CACHE.put(self.weight_id, cached_w)
+            _awq_cache_put(self.weight_id, cached_w)
         return _apply_linear_with_cached_weight(x, cached_w, bias)
 
 class AWQWeight(QuantizedLinearWeight):
-    def __init__(self, qweight, scales, qzeros, group_size=128, prefix: str = "", high_fidelity: bool = False):
-        super().__init__(); self.qweight = nn.Parameter(qweight, requires_grad=False); self.scales = nn.Parameter(scales, requires_grad=False); self.qzeros = nn.Parameter(qzeros, requires_grad=False); self.group_size = group_size; self.prefix = prefix; self.high_fidelity = high_fidelity
+    def __init__(self, qweight, scales, qzeros, group_size=128, prefix: str = "", high_fidelity: bool = False, profile_hint: str = ""):
+        super().__init__(); self.qweight = nn.Parameter(qweight, requires_grad=False); self.scales = nn.Parameter(scales, requires_grad=False); self.qzeros = nn.Parameter(qzeros, requires_grad=False); self.group_size = group_size; self.prefix = prefix; self.high_fidelity = high_fidelity; self.profile_hint = profile_hint
     def matmul(self, x, bias=None):
+        _awq_stat_inc("awq_matmul_calls")
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
             _awq_stat_inc("high_fidelity_awq_direct_dequant")
             try:
@@ -478,20 +695,65 @@ class AWQWeight(QuantizedLinearWeight):
             except:
                 dense_weight = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
             return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
+        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        if _env_awq_matmul_cache_before_fused():
+            cached_fast = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+            if cached_fast is not None:
+                _awq_stat_inc("awq_matmul_cached_dense_fastpath")
+                return _apply_linear_with_cached_weight(x, cached_fast, bias)
+        use_fused, fused_reason = should_use_awq_fused_path(
+            x=x,
+            qweight=self.qweight,
+            scales=self.scales,
+            qzeros=self.qzeros,
+            group_size=self.group_size,
+            prefix=self.prefix,
+            policy=policy,
+        )
+        if use_fused:
+            _awq_stat_inc("awq_fused_attempt")
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm_safe
+                out, used_fused, reason = awq_fused_gemm_safe(
+                    x.reshape(-1, x.shape[-1]).contiguous(),
+                    self.qweight,
+                    self.scales,
+                    self.qzeros,
+                    int(self.group_size),
+                )
+                if used_fused:
+                    _awq_stat_inc("awq_fused_success")
+                    out = out.view(*x.shape[:-1], out.shape[-1])
+                    if bias is not None:
+                        out = out + bias
+                    return out
+                _awq_stat_inc(f"awq_fused_fallback_{reason}")
+            except Exception as exc:
+                _awq_stat_inc("awq_fused_exception")
+                _awq_stat_inc(f"awq_fused_exception_{type(exc).__name__}")
+        else:
+            _awq_stat_inc(f"awq_fused_skip_{fused_reason}")
         cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+        if cached_w is not None:
+            _awq_stat_inc("awq_cache_hits")
         if cached_w is None:
+            _awq_stat_inc("awq_cache_misses")
             try:
                 from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
                 cached_w = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
-            except: cached_w = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
-            if _can_use_fp8_weight_cache(x):
+                _awq_stat_inc("awq_dense_builds")
+            except:
+                cached_w = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
+                _awq_stat_inc("awq_dense_builds")
+            if policy.allow_fp8_cache:
                 cached_w = _build_fp8_weight_cache(cached_w)
-            _GLOBAL_WEIGHT_CACHE.put(self.weight_id, cached_w)
+            if should_allow_dense_cache(self.prefix, policy):
+                _awq_cache_put(self.weight_id, cached_w)
         return _apply_linear_with_cached_weight(x, cached_w, bias)
 
 
 class PackedInt4Weight(QuantizedLinearWeight):
-    def __init__(self, qweight, scales, group_size=128, original_shape: Optional[tuple[int, int]] = None, prefix: str = "", high_fidelity: bool = False):
+    def __init__(self, qweight, scales, group_size=128, original_shape: Optional[tuple[int, int]] = None, prefix: str = "", high_fidelity: bool = False, profile_hint: str = ""):
         super().__init__()
         self.qweight = nn.Parameter(qweight, requires_grad=False)
         self.scales = nn.Parameter(scales, requires_grad=False)
@@ -499,8 +761,10 @@ class PackedInt4Weight(QuantizedLinearWeight):
         self.original_shape = original_shape
         self.prefix = prefix
         self.high_fidelity = high_fidelity
+        self.profile_hint = profile_hint
 
     def matmul(self, x, bias=None):
+        _awq_stat_inc("awq_matmul_calls")
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
             _awq_stat_inc("high_fidelity_packed_int4_direct_dequant")
             dense_weight = dequantize_symmetric_packed_int4(
@@ -510,15 +774,63 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 original_shape=self.original_shape,
             )
             return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
+        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        if _env_awq_matmul_cache_before_fused():
+            cached_fast = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+            if cached_fast is not None:
+                _awq_stat_inc("awq_matmul_cached_dense_fastpath")
+                return _apply_linear_with_cached_weight(x, cached_fast, bias)
+        use_fused = False
+        fused_reason = "fused_disabled"
+        if policy.prefer_fused or _env_awq_fused_gemm_force():
+            try:
+                from vllm.model_executor.layers.quantization.awq_triton import (
+                    packed_int4_fused_capability_check,
+                )
+                use_fused, fused_reason = packed_int4_fused_capability_check(
+                    x, self.qweight, self.scales, int(self.group_size)
+                )
+            except Exception as exc:
+                use_fused = False
+                fused_reason = f"fused_capability_check_error:{type(exc).__name__}"
+        if use_fused:
+            _awq_stat_inc("awq_fused_attempt")
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import (
+                    packed_int4_symmetric_fused_gemm_safe,
+                )
+                out, used_fused, reason = packed_int4_symmetric_fused_gemm_safe(
+                    x.reshape(-1, x.shape[-1]).contiguous(),
+                    self.qweight,
+                    self.scales,
+                    int(self.group_size),
+                )
+                if used_fused:
+                    _awq_stat_inc("awq_fused_success")
+                    out = out.view(*x.shape[:-1], out.shape[-1])
+                    if bias is not None:
+                        out = out + bias
+                    return out
+                _awq_stat_inc(f"awq_fused_fallback_{reason}")
+            except Exception as exc:
+                _awq_stat_inc("awq_fused_exception")
+                _awq_stat_inc(f"awq_fused_exception_{type(exc).__name__}")
+        else:
+            _awq_stat_inc(f"awq_fused_skip_{fused_reason}")
         cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+        if cached_w is not None:
+            _awq_stat_inc("awq_cache_hits")
         if cached_w is None:
+            _awq_stat_inc("awq_cache_misses")
             cached_w = dequantize_symmetric_packed_int4(
                 self.qweight,
                 self.scales,
                 group_size=self.group_size,
                 original_shape=self.original_shape,
             )
-            if _can_use_fp8_weight_cache(x):
+            _awq_stat_inc("awq_dense_builds")
+            if policy.allow_fp8_cache:
                 cached_w = _build_fp8_weight_cache(cached_w)
-            _GLOBAL_WEIGHT_CACHE.put(self.weight_id, cached_w)
+            if should_allow_dense_cache(self.prefix, policy):
+                _awq_cache_put(self.weight_id, cached_w)
         return _apply_linear_with_cached_weight(x, cached_w, bias)

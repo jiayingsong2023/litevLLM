@@ -12,6 +12,9 @@ from vllm.config import VllmConfig
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.layers.quantization.awq_cache_prefetch import (
+    maybe_prefetch_awq_weight_caches,
+)
 from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.sampling_params import SamplingParams
 
@@ -679,6 +682,8 @@ class LiteEngine:
                 "     [Warn] Total allocated is high vs GPU size; reduce FASTINFERENCE_KV_MAX_MODEL_LEN "
                 "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_FP8=1, or --frugal scheduling."
             )
+
+        maybe_prefetch_awq_weight_caches(self.model)
 
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._running_ids: List[str] = []
