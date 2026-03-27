@@ -45,7 +45,7 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 | DeepSeek 末位 logits / 逐层 hidden | `tests/tools/compare_hf_lite_deepseek_logits.py`（A 档宜 **同一 safetensors 目录**；GGUF 对 HF bf16 不做 CosSim≥0.99 要求）、`compare_hf_lite_deepseek_layer_hiddens.py` |
 | Qwen 35B MoE GGUF packed vs dense | `tests/tools/qwen35_moe_packed_lite_logits_audit.py` |
 | Qwen GGUF 张量审计 | `tests/tools/qwen35_gguf_alignment_audit.py` || 性能回归（TinyLlama + Qwen3.5 9B/35B AWQ） | `uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq,qwen35_35b_awq --json-out .tmp_perf_regression_awq.json` |
-| 算子 / 量化微基准（合成权重） | `uv run python tests/full_perf_regression.py` |
+| AWQ fused GEMM 微基准（可选） | `uv run python tests/bench_awq_fused_gemm_ab.py` |
 | LLM.generate 冒烟（与 e2e 模型列表对齐） | `uv run python tests/test_offline_api.py` |
 
 ## 整模验证注意事项

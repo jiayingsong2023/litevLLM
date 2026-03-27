@@ -58,8 +58,10 @@ PYTHONPATH=. uv run python tests/verify_semantic_integrity.py --model models/Tin
 
 ### 3. 运行性能回归测试
 ```bash
-# 执行全量架构的单层吞吐量测试
-PYTHONPATH=. uv run python tests/full_perf_regression.py
+# 端到端（真实权重）：TinyLlama + Qwen3.5 9B/35B AWQ
+PYTHONPATH=. uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq --json-out .tmp_e2e_perf.json
+# 可选：仅 AWQ Triton fused GEMM 微基准（非整模）
+PYTHONPATH=. uv run python tests/bench_awq_fused_gemm_ab.py
 ```
 
 ## 🛠 当前算子与功能状态

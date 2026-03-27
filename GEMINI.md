@@ -50,6 +50,6 @@ uv sync
 Always run scripts through `uv run` so they execute in the managed environment:
 ```bash
 uv run python tests/verify_semantic_integrity.py --model models/TinyLlama-1.1B-Chat-v1.0
-uv run python tests/full_perf_regression.py
+uv run python tests/e2e_full_benchmark.py --models tinyllama
 uv run python -m vllm.entrypoints.openai.api_server --model models/TinyLlama-1.1B-Chat-v1.0
 ```
