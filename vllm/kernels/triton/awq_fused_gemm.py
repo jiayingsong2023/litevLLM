@@ -5,14 +5,30 @@ import triton
 import triton.language as tl
 
 
-def _env_awq_fused_gemm_dot_bf16() -> bool:
-    """Prefer bf16 tl.dot when activations are bf16 (avoids fp16 upcast on ROCm/CUDA)."""
-    return os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "1").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
+    """
+    Whether to use bf16 operands in tl.dot (vs fp16).
+
+    On ROCm, bf16 dot can be slower than fp16 dot for narrow decode (small M, moderate N);
+    microbench: use fp16 dot there but still write bf16 output (USE_BF16_OUTPUT).
+
+    FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16:
+      - unset or "auto": heuristic (ROCm narrow decode -> fp16 dot; else bf16 when a is bf16)
+      - "1"/"true"/"on": always bf16 dot when a is bf16
+      - "0"/"false"/"off": always fp16 dot when a is bf16
+    """
+    if a.dtype != torch.bfloat16:
+        return False
+    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # auto
+    if getattr(torch.version, "hip", None) is not None:
+        if m <= 4 and n <= 8192:
+            return False
+    return True
 
 
 def _select_fused_gemm_blocks(
@@ -78,6 +94,7 @@ def _awq_native_tiled_gemm_kernel(
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
 ):
     """
     Native Triton Tiling Implementation for AMD gfx1151.
@@ -135,8 +152,8 @@ def _awq_native_tiled_gemm_kernel(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
-    # Store Result
-    if USE_BF16_DOT:
+    # Store Result (output dtype may be bf16 even when tl.dot used fp16 operands)
+    if USE_BF16_OUTPUT:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
@@ -156,6 +173,7 @@ def _packed_int4_symmetric_tiled_gemm_kernel(
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -198,7 +216,7 @@ def _packed_int4_symmetric_tiled_gemm_kernel(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
-    if USE_BF16_DOT:
+    if USE_BF16_OUTPUT:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
@@ -214,7 +232,8 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
     else: c = out
 
     block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(M, N, K)
-    use_bf16_dot = a.dtype == torch.bfloat16 and _env_awq_fused_gemm_dot_bf16()
+    use_bf16_dot = _resolve_use_bf16_dot(a, M, N)
+    use_bf16_output = a.dtype == torch.bfloat16
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
 
     _awq_native_tiled_gemm_kernel[grid](
@@ -227,6 +246,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None):
         c.stride(0), c.stride(1),
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         USE_BF16_DOT=use_bf16_dot,
+        USE_BF16_OUTPUT=use_bf16_output,
         num_warps=num_warps, num_stages=num_stages,
     )
     return c
@@ -243,7 +263,8 @@ def packed_int4_symmetric_fused_gemm(
     n = qweight.shape[0]
     c = torch.empty((m, n), device=a.device, dtype=a.dtype) if out is None else out
     block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(m, n, k)
-    use_bf16_dot = a.dtype == torch.bfloat16 and _env_awq_fused_gemm_dot_bf16()
+    use_bf16_dot = _resolve_use_bf16_dot(a, m, n)
+    use_bf16_output = a.dtype == torch.bfloat16
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
     _packed_int4_symmetric_tiled_gemm_kernel[grid](
         a, qweight, scales, c,
@@ -254,6 +275,7 @@ def packed_int4_symmetric_fused_gemm(
         c.stride(0), c.stride(1),
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         USE_BF16_DOT=use_bf16_dot,
+        USE_BF16_OUTPUT=use_bf16_output,
         num_warps=num_warps, num_stages=num_stages,
     )
     return c
