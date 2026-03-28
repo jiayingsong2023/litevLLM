@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+import os
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -9,9 +10,13 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.platforms import current_platform
-from vllm.attention.backend import is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+    if kv_cache_dtype == "auto" or kv_cache_dtype is None:
+        return False
+    return "fp8" in kv_cache_dtype.lower() or "int4" in kv_cache_dtype.lower()
 
 class BaseKVCacheMethod(QuantizeMethodBase):
 
@@ -82,12 +87,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                     "Setting it to k_scale. This only matters for "
                     "FP8 Attention backends (flash-attn or flashinfer)."
                 )
-                layer._q_scale.copy_(k_scale)
+                layer._q_scale.copy_(torch.tensor(k_scale))
                 layer._q_scale_float = k_scale
 
             # These are used in the final Attention.forward()
-            layer._k_scale.copy_(k_scale)
-            layer._v_scale.copy_(v_scale)
+            layer._k_scale.copy_(torch.tensor(k_scale))
+            layer._v_scale.copy_(torch.tensor(v_scale))
             layer._k_scale_float = k_scale
             layer._v_scale_float = v_scale
             if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
@@ -123,12 +128,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             )
 
         # These are used in the final Attention.forward()
-        layer._q_scale.copy_(q_scale)
+        layer._q_scale.copy_(torch.tensor(q_scale) if isinstance(q_scale, float) else q_scale)
         layer._q_scale_float = (
             q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
         )
 
-        layer._prob_scale.copy_(prob_scale)
+        layer._prob_scale.copy_(torch.tensor(prob_scale) if isinstance(prob_scale, float) else prob_scale)
         if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
             logger.warning_once(
                 f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
@@ -141,3 +146,32 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         del layer.v_scale
         del layer.q_scale
         del layer.prob_scale
+
+class TurboKVCacheMethod(BaseKVCacheMethod):
+    """
+    TurboQuant INT4 KV Cache method.
+    Optimized for high-throughput single-GPU inference.
+    """
+    def __init__(self, quant_config: QuantizationConfig):
+        super().__init__(quant_config)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # For TurboQuant, we default to 15.0 (max_abs / 15.0) if not provided.
+        # Symmetric quantization to [0, 15] often uses k_scale = max_abs / 15.0
+        k_scale = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
+        v_scale = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
+        
+        if hasattr(layer, "k_scale") and layer.k_scale > 0:
+            k_scale = layer.k_scale.item()
+        if hasattr(layer, "v_scale") and layer.v_scale > 0:
+            v_scale = layer.v_scale.item()
+            
+        layer._k_scale.copy_(torch.tensor(k_scale))
+        layer._v_scale.copy_(torch.tensor(v_scale))
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+        
+        if hasattr(layer, "k_scale"): del layer.k_scale
+        if hasattr(layer, "v_scale"): del layer.v_scale
+        if hasattr(layer, "q_scale"): del layer.q_scale
+        if hasattr(layer, "prob_scale"): del layer.prob_scale

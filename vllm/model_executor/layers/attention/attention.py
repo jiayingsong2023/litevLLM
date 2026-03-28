@@ -136,17 +136,22 @@ def _init_kv_cache_quant(
     )
 
     # See [Note: Register q/k/v/prob scales in state dict]
-    if should_load_quant_weights(quant_method):
-        assert isinstance(quant_method, BaseKVCacheMethod)
-        # TODO (mgoin): kv cache dtype should be specified in the FP8
-        # checkpoint config and become the "auto" behavior
-        if layer.kv_cache_dtype == "fp8_e5m2":
-            raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
+    if should_load_quant_weights(quant_method) or layer.kv_cache_dtype == "int4":
+        if layer.kv_cache_dtype == "int4":
+            from vllm.model_executor.layers.quantization.kv_cache import TurboKVCacheMethod
+            layer.quant_method = TurboKVCacheMethod(quant_config)
+        else:
+            assert isinstance(quant_method, BaseKVCacheMethod)
+            # TODO (mgoin): kv cache dtype should be specified in the FP8
+            # checkpoint config and become the "auto" behavior
+            if layer.kv_cache_dtype == "fp8_e5m2":
+                raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
+            layer.quant_method = quant_method
+        
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.
         # The k/v_scale will then be converted back to native float32
         # values after weight loading.
-        layer.quant_method = quant_method
         layer.quant_method.create_weights(layer)
 
 class Attention(nn.Module, AttentionLayerBase):
@@ -197,9 +202,16 @@ class Attention(nn.Module, AttentionLayerBase):
             if cache_config is not None:
                 cache_config.cache_dtype = "fp8"
                 cache_config.calculate_kv_scales = False
+        
+        # Support TurboQuant INT4 via environment variable or explicit config
+        import os
+        if os.environ.get("FASTINFERENCE_KV_TYPE") == "turbo_int4":
+            kv_cache_dtype = "int4"
+            if cache_config is not None:
+                cache_config.cache_dtype = "int4"
 
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
-            kv_cache_dtype, vllm_config.model_config
+            kv_cache_dtype
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales

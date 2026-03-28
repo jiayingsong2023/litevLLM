@@ -34,16 +34,18 @@ class TritonAttention(nn.Module):
             self.num_kv_heads * self.head_dim
         ], dim=-1)
         
-        # 2. Paged Attention Execution (Call Triton Kernel)
-        # Ensure q, k, v are in [num_tokens, num_heads, head_dim] format
+        # 2. Paged Attention Execution
         q = q.view(-1, self.num_heads, self.head_size)
         k = k.view(-1, self.num_kv_heads, self.head_size)
         v = v.view(-1, self.num_kv_heads, self.head_size)
 
-        # For LitevLLM, we directly call the Triton paged_attention_kernel
+        import os
+        kv_cache_dtype = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
+        k_scale = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
+        v_scale = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
+
         try:
             from vllm.attention.ops.triton_paged_attn import triton_paged_attention
-            # Check if block_tables is available in attn_metadata
             block_tables = None
             if isinstance(attn_metadata, dict):
                 block_tables = attn_metadata.get("block_tables", None)
@@ -55,7 +57,10 @@ class TritonAttention(nn.Module):
                 attn_metadata["slot_mapping"] if isinstance(attn_metadata, dict) else attn_metadata.slot_mapping,
                 attn_metadata["seq_lens"] if isinstance(attn_metadata, dict) else attn_metadata.seq_lens,
                 block_tables,
-                self.scale
+                self.scale,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale
             )
         except ImportError:
             # Fallback to a functional mock if kernel is not yet rebuilt

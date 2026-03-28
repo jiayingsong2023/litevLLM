@@ -1106,6 +1106,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             self.rotary_emb = get_rotary_embedding(config)
         # Legacy ROCm-friendly caps on full-attn matmuls / residuals (off by default for HF parity).
         self._use_full_attn_stabilizer = _env_truthy("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER")
+        self.kv_cache_dtype = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
+        self._k_scale_float = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
+        self._v_scale_float = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
 
     def forward(self, x, positions, kv_cache, attn_metadata):
         input_dtype = x.dtype
@@ -1156,7 +1159,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
         from vllm.kernels.triton.paged_attention import paged_attention_v1
 
-        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], "auto")
+        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], self.kv_cache_dtype, self._k_scale_float, self._v_scale_float)
         block_tables = attn_metadata["block_tables"]
         seq_lens = attn_metadata["seq_lens"]
         is_prefill = attn_metadata.get("is_prefill", False)
@@ -1227,9 +1230,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                     k_cache.shape[1],
                     max_ctx,
                     None,
-                    "auto",
-                    None,
-                    None,
+                    self.kv_cache_dtype,
+                    self._k_scale_float,
+                    self._v_scale_float,
                     num_kv_heads=nkv,
                 )
             else:
@@ -1245,9 +1248,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                     k_cache.shape[1],
                     max_ctx,
                     None,
-                    "auto",
-                    None,
-                    None,
+                    self.kv_cache_dtype,
+                    self._k_scale_float,
+                    self._v_scale_float,
                     num_kv_heads=nkv,
                 )
 

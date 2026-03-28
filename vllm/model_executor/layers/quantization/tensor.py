@@ -278,23 +278,20 @@ def should_use_awq_fused_path(
     prefix: str,
     policy: AWQExecutionPolicy,
 ) -> tuple[bool, str]:
+    if _env_awq_fused_gemm_force():
+        # print(f">>>> DEBUG: Fused path FORCED for {prefix}")
+        return True, "force_on"
     if not (policy.prefer_fused or _env_awq_fused_gemm_force()):
         return False, "fused_disabled"
-    if policy.fused_scope == "off" and not _env_awq_fused_gemm_force():
-        return False, "fused_scope_off"
-    if (
-        policy.fused_scope == "attention_only"
-        and not _is_attention_like_prefix(prefix)
-        and not _env_awq_fused_gemm_force()
-    ):
-        return False, "fused_scope_attention_only"
+    
     try:
         from vllm.model_executor.layers.quantization.awq_triton import (
             awq_fused_capability_check,
         )
-        return awq_fused_capability_check(
+        res, reason = awq_fused_capability_check(
             x, qweight, scales, qzeros, group_size
         )
+        return res, reason
     except Exception as exc:
         return False, f"fused_capability_check_error:{type(exc).__name__}"
 
@@ -496,66 +493,45 @@ class AWQWeight(QuantizedLinearWeight):
         super().__init__(); self.qweight = nn.Parameter(qweight, requires_grad=False); self.scales = nn.Parameter(scales, requires_grad=False); self.qzeros = nn.Parameter(qzeros, requires_grad=False); self.group_size = group_size; self.prefix = prefix; self.high_fidelity = high_fidelity; self.profile_hint = profile_hint
     def matmul(self, x, bias=None):
         _awq_stat_inc("awq_matmul_calls")
-        if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
-            _awq_stat_inc("high_fidelity_awq_direct_dequant")
-            try:
-                from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
-                dense_weight = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
-            except:
-                dense_weight = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
-            return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
-        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
-        if _env_awq_matmul_cache_before_fused():
-            cached_fast = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
-            if cached_fast is not None:
-                _awq_stat_inc("awq_matmul_cached_dense_fastpath")
+        
+        # FAST PATH: Cached Decision
+        if hasattr(self, "_cached_fused_decision"):
+            if self._cached_fused_decision:
+                try:
+                    from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm_safe
+                    out, used_fused, reason = awq_fused_gemm_safe(
+                        x.reshape(-1, x.shape[-1]).contiguous(),
+                        self.qweight, self.scales, self.qzeros, int(self.group_size), bias=bias,
+                    )
+                    if used_fused: return out.view(*x.shape[:-1], out.shape[-1])
+                except: pass
+            # Fallback to cached dense or dequant
+            cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+            if cached_w is not None:
+                # print(f">>>> DEBUG: Using CACHED DENSE for {self.prefix}")
                 return _apply_linear_with_cached_weight(x, cached_fast, bias)
-        use_fused, fused_reason = should_use_awq_fused_path(
-            x=x,
-            qweight=self.qweight,
-            scales=self.scales,
-            qzeros=self.qzeros,
-            group_size=self.group_size,
-            prefix=self.prefix,
-            policy=policy,
+
+        # SLOW PATH: First time resolution
+        if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
+            print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
+            self._cached_fused_decision = False
+            return self._slow_matmul_dequant(x, bias)
+
+        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        use_fused, _ = should_use_awq_fused_path(
+            x=x, qweight=self.qweight, scales=self.scales, qzeros=self.qzeros,
+            group_size=self.group_size, prefix=self.prefix, policy=policy,
         )
-        if use_fused:
-            _awq_stat_inc("awq_fused_attempt")
-            try:
-                from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm_safe
-                out, used_fused, reason = awq_fused_gemm_safe(
-                    x.reshape(-1, x.shape[-1]).contiguous(),
-                    self.qweight,
-                    self.scales,
-                    self.qzeros,
-                    int(self.group_size),
-                    bias=bias,
-                )
-                if used_fused:
-                    _awq_stat_inc("awq_fused_success")
-                    out = out.view(*x.shape[:-1], out.shape[-1])
-                    return out
-                _awq_stat_inc(f"awq_fused_fallback_{reason}")
-            except Exception as exc:
-                _awq_stat_inc("awq_fused_exception")
-                _awq_stat_inc(f"awq_fused_exception_{type(exc).__name__}")
-        else:
-            _awq_stat_inc(f"awq_fused_skip_{fused_reason}")
-        cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
-        if cached_w is not None:
-            _awq_stat_inc("awq_cache_hits")
-        if cached_w is None:
-            _awq_stat_inc("awq_cache_misses")
-            try:
-                from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
-                cached_w = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
-                _awq_stat_inc("awq_dense_builds")
-            except:
-                cached_w = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
-                _awq_stat_inc("awq_dense_builds")
-            if should_allow_dense_cache(self.prefix, policy):
-                _awq_cache_put(self.weight_id, cached_w)
-        return _apply_linear_with_cached_weight(x, cached_w, bias)
+        self._cached_fused_decision = use_fused
+        return self.matmul(x, bias) # Re-run with fast path
+
+    def _slow_matmul_dequant(self, x, bias):
+        try:
+            from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
+            dense_weight = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
+        except:
+            dense_weight = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
+        return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
 
 
 class PackedInt4Weight(QuantizedLinearWeight):
@@ -571,69 +547,42 @@ class PackedInt4Weight(QuantizedLinearWeight):
 
     def matmul(self, x, bias=None):
         _awq_stat_inc("awq_matmul_calls")
+        
+        # FAST PATH: Cached Decision
+        if hasattr(self, "_cached_fused_decision"):
+            if self._cached_fused_decision:
+                try:
+                    from vllm.kernels.triton.awq_fused_gemm import packed_int4_symmetric_fused_gemm_safe
+                    out, used_fused, reason = packed_int4_symmetric_fused_gemm_safe(
+                        x.reshape(-1, x.shape[-1]).contiguous(),
+                        self.qweight, self.scales, int(self.group_size), bias=bias,
+                    )
+                    if used_fused: return out.view(*x.shape[:-1], out.shape[-1])
+                except: pass
+            # Fallback
+            cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+            if cached_w is not None: return _apply_linear_with_cached_weight(x, cached_w, bias)
+
+        # SLOW PATH: Resolution
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
-            _awq_stat_inc("high_fidelity_packed_int4_direct_dequant")
+            print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
+            self._cached_fused_decision = False
             dense_weight = dequantize_symmetric_packed_int4(
-                self.qweight,
-                self.scales,
-                group_size=self.group_size,
-                original_shape=self.original_shape,
+                self.qweight, self.scales, group_size=self.group_size, original_shape=self.original_shape,
             )
             return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
+
         policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
-        if _env_awq_matmul_cache_before_fused():
-            cached_fast = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
-            if cached_fast is not None:
-                _awq_stat_inc("awq_matmul_cached_dense_fastpath")
-                return _apply_linear_with_cached_weight(x, cached_fast, bias)
         use_fused = False
-        fused_reason = "fused_disabled"
         if policy.prefer_fused or _env_awq_fused_gemm_force():
             try:
-                from vllm.model_executor.layers.quantization.awq_triton import (
-                    packed_int4_fused_capability_check,
-                )
-                use_fused, fused_reason = packed_int4_fused_capability_check(
-                    x, self.qweight, self.scales, int(self.group_size)
-                )
-            except Exception as exc:
-                use_fused = False
-                fused_reason = f"fused_capability_check_error:{type(exc).__name__}"
-        if use_fused:
-            _awq_stat_inc("awq_fused_attempt")
-            try:
-                from vllm.kernels.triton.awq_fused_gemm import (
-                    packed_int4_symmetric_fused_gemm_safe,
-                )
-                out, used_fused, reason = packed_int4_symmetric_fused_gemm_safe(
-                    x.reshape(-1, x.shape[-1]).contiguous(),
-                    self.qweight,
-                    self.scales,
-                    int(self.group_size),
-                    bias=bias,
-                )
-                if used_fused:
-                    _awq_stat_inc("awq_fused_success")
-                    out = out.view(*x.shape[:-1], out.shape[-1])
-                    return out
-                _awq_stat_inc(f"awq_fused_fallback_{reason}")
-            except Exception as exc:
-                _awq_stat_inc("awq_fused_exception")
-                _awq_stat_inc(f"awq_fused_exception_{type(exc).__name__}")
-        else:
-            _awq_stat_inc(f"awq_fused_skip_{fused_reason}")
-        cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
-        if cached_w is not None:
-            _awq_stat_inc("awq_cache_hits")
-        if cached_w is None:
-            _awq_stat_inc("awq_cache_misses")
-            cached_w = dequantize_symmetric_packed_int4(
-                self.qweight,
-                self.scales,
-                group_size=self.group_size,
-                original_shape=self.original_shape,
-            )
-            _awq_stat_inc("awq_dense_builds")
-            if should_allow_dense_cache(self.prefix, policy):
-                _awq_cache_put(self.weight_id, cached_w)
-        return _apply_linear_with_cached_weight(x, cached_w, bias)
+                from vllm.model_executor.layers.quantization.awq_triton import packed_int4_fused_capability_check
+                use_fused, reason = packed_int4_fused_capability_check(x, self.qweight, self.scales, int(self.group_size))
+                if not use_fused:
+                    print(f">>>> DEBUG: PackedInt4 NOT capable for {self.prefix}: {reason}")
+            except Exception as e: 
+                print(f">>>> DEBUG: PackedInt4 capability check EXCEPTION for {self.prefix}: {e}")
+                pass
+        
+        self._cached_fused_decision = use_fused
+        return self.matmul(x, bias)

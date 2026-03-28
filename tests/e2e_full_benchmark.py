@@ -38,12 +38,13 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         model_path="models/TinyLlama-1.1B-Chat-v1.0",
         display_name="TinyLlama-1.1B (Dense)",
         quant="none",
-        concurrent_reqs=4,
-        prompt_tokens_target=256,
+        # BS=8, ~4096-token prefill per sequence (reduce concurrent if OOM on smaller GPUs).
+        concurrent_reqs=8,
+        prompt_tokens_target=4096,
         max_new_tokens=32,
         gpu_memory_utilization=0.92,
         max_model_len=4096,
-        max_run_seconds=120,
+        max_run_seconds=600,
         stable_env={"FASTINFERENCE_KV_FP8": "1"},
     ),
     "qwen35_9b_awq": ModelSpec(
@@ -51,14 +52,13 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         model_path="models/Qwen3.5-9B-AWQ",
         display_name="Qwen3.5-9B (AWQ INT4)",
         quant="awq",
-        # Concurrent async requests ~= batch of independent sequences (decode interleaving).
-        # Default 8; use --qwen9b-concurrent 16 for higher BS on large GPUs.
+        # BS=8, ~4096-token prefill; FP8 KV; 48GB+ typical (use --qwen9b-concurrent to tune).
         concurrent_reqs=8,
-        prompt_tokens_target=256,
+        prompt_tokens_target=4096,
         max_new_tokens=24,
         gpu_memory_utilization=0.92,
         max_model_len=4096,
-        max_run_seconds=480,
+        max_run_seconds=960,
         stable_env={
             "FASTINFERENCE_KV_FP8": "1",
             # Stacked GEMM: linear_attn a+b, MLP gate+up, full-attn k+v (defaults ON; set "0" to A/B).
@@ -91,6 +91,41 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         },
     ),
 }
+
+# ROCm/HIP: large BS × long prefill + AWQ Triton + FP8 KV often triggers hipErrorLaunchFailure
+# (often async OOM or kernel fault). Use conservative defaults unless aggressive mode is on.
+_ROCM_E2E_SAFE_CONCURRENT = 4
+_ROCM_E2E_SAFE_PROMPT_TOKENS = 1024
+_ROCM_E2E_SAFE_GPU_MEM_UTIL = 0.85
+
+
+def _is_rocm() -> bool:
+    return bool(getattr(torch.version, "hip", None))
+
+
+def _is_e2e_aggressive(args: argparse.Namespace) -> bool:
+    if getattr(args, "aggressive", False):
+        return True
+    raw = os.environ.get("FASTINFERENCE_E2E_AGGRESSIVE", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSpec:
+    """Downgrade batch/prompt on AMD ROCm unless aggressive mode is enabled."""
+    if aggressive or not _is_rocm():
+        return spec
+    if spec.key not in ("tinyllama", "qwen35_9b_awq"):
+        return spec
+    new_conc = min(spec.concurrent_reqs, _ROCM_E2E_SAFE_CONCURRENT)
+    new_prompt = min(spec.prompt_tokens_target, _ROCM_E2E_SAFE_PROMPT_TOKENS)
+    new_util = min(spec.gpu_memory_utilization, _ROCM_E2E_SAFE_GPU_MEM_UTIL)
+    return replace(
+        spec,
+        concurrent_reqs=new_conc,
+        prompt_tokens_target=new_prompt,
+        gpu_memory_utilization=new_util,
+        max_run_seconds=max(spec.max_run_seconds, 120 * new_conc),
+    )
 
 
 def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
@@ -185,6 +220,14 @@ def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
     }
 
 
+def _effective_prompt_budget(spec: ModelSpec) -> int:
+    """Upper bound on prompt tokens used in the benchmark (matches run_benchmark clamp)."""
+    return min(
+        int(spec.prompt_tokens_target),
+        max(8, int(spec.max_model_len) - int(spec.max_new_tokens) - 1),
+    )
+
+
 def _build_vllm_config(spec: ModelSpec) -> VllmConfig:
     model_cfg = ModelConfig(
         model=spec.model_path,
@@ -194,13 +237,19 @@ def _build_vllm_config(spec: ModelSpec) -> VllmConfig:
         dtype="float16",
         max_model_len=spec.max_model_len,
     )
+    # Allow concurrent long-prefill batches (e.g. BS=8 × CTX≈4096); do not cap at 8192.
+    prompt_cap = _effective_prompt_budget(spec)
+    max_num_batched_tokens = min(
+        262144,
+        max(8192, int(spec.concurrent_reqs) * prompt_cap),
+    )
     scheduler_cfg = SchedulerConfig(
-        max_num_batched_tokens=min(8192, spec.max_model_len * spec.concurrent_reqs),
+        max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=spec.concurrent_reqs,
         max_model_len=spec.max_model_len,
     )
     cache_cfg = CacheConfig(
-        block_size=16,
+        block_size=8,
         gpu_memory_utilization=spec.gpu_memory_utilization,
         swap_space=0,
     )
@@ -451,13 +500,32 @@ def _parse_args() -> argparse.Namespace:
         help="Optional path to save JSON benchmark summary.",
     )
     parser.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Use full MODEL_SPECS (e.g. BS=8, ~4096-token prefill). On ROCm the default is a "
+            "safer profile to avoid HIP launch failures; this flag or FASTINFERENCE_E2E_AGGRESSIVE=1 "
+            "restores aggressive settings (needs ample VRAM)."
+        ),
+    )
+    parser.add_argument(
+        "--tinyllama-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override concurrent request count for tinyllama only. "
+            "Default from MODEL_SPECS is 8 (with ~4096-token prefill)."
+        ),
+    )
+    parser.add_argument(
         "--qwen9b-concurrent",
         type=int,
         default=None,
         metavar="N",
         help=(
             "Override concurrent request count (batch width) for qwen35_9b_awq only. "
-            "Default from MODEL_SPECS is 8; typical values: 8 or 16 on 48GB+ GPUs."
+            "Default from MODEL_SPECS is 8 (with ~4096-token prefill; 48GB+ VRAM typical)."
         ),
     )
     return parser.parse_args()
@@ -465,12 +533,32 @@ def _parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = _parse_args()
+    aggressive = _is_e2e_aggressive(args)
+    if _is_rocm() and not aggressive:
+        print(
+            "[ROCm] Using conservative E2E defaults "
+            f"(concurrent<={_ROCM_E2E_SAFE_CONCURRENT}, prompt<={_ROCM_E2E_SAFE_PROMPT_TOKENS}, "
+            f"gpu_memory_utilization<={_ROCM_E2E_SAFE_GPU_MEM_UTIL}) to reduce HIP launch failures."
+        )
+        print(
+            "       For BS=8 / ~4096-ctx: pass --aggressive or set FASTINFERENCE_E2E_AGGRESSIVE=1 "
+            "(needs large VRAM; if you still see hipErrorLaunchFailure, try AMD_SERIALIZE_KERNEL=3 to locate)."
+        )
     model_keys = [k.strip() for k in args.models.split(",") if k.strip()]
     specs: List[ModelSpec] = []
     for key in model_keys:
         if key not in MODEL_SPECS:
             raise ValueError(f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}")
-        spec = MODEL_SPECS[key]
+        spec = _maybe_apply_rocm_safe_profile(MODEL_SPECS[key], aggressive)
+        if key == "tinyllama" and args.tinyllama_concurrent is not None:
+            n = int(args.tinyllama_concurrent)
+            if n < 1 or n > 64:
+                raise ValueError("--tinyllama-concurrent must be between 1 and 64")
+            spec = replace(
+                spec,
+                concurrent_reqs=n,
+                max_run_seconds=max(spec.max_run_seconds, 60 * n),
+            )
         if key == "qwen35_9b_awq" and args.qwen9b_concurrent is not None:
             n = int(args.qwen9b_concurrent)
             if n < 1 or n > 64:

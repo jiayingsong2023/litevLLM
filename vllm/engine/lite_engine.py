@@ -27,6 +27,8 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
     f8 = getattr(torch, "float8_e4m3fn", None)
     if f8 is not None and dtype == f8:
         return 1
+    if dtype == torch.uint8:
+        return 1
     if dtype in (torch.float16, torch.bfloat16):
         return 2
     if dtype == torch.float32:
@@ -608,8 +610,16 @@ class LiteEngine:
             f"prefill_microbatch={self._prefill_microbatch_size})"
         )
         
-        self.kv_dtype_str = os.environ.get("FASTINFERENCE_KV_FP8", "1")
-        if self.kv_dtype_str == "0":
+        self.kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
+        if self.kv_type == "turbo_int4":
+            print(">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]")
+            self.kv_dtype = torch.uint8
+            self.kv_head_dim = self.head_size // 2
+        elif os.environ.get("FASTINFERENCE_KV_FP8", "1") == "1":
+            print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
+            self.kv_dtype = torch.float8_e4m3fn
+            self.kv_head_dim = self.head_size
+        else:
             from vllm.model_executor.models.qwen3_5 import (
                 Qwen3_5ForConditionalGeneration,
                 Qwen3_5MoeForConditionalGeneration,
@@ -621,15 +631,13 @@ class LiteEngine:
             ):
                 # Match model activations (bf16) so paged decode aligns with HF; fp16 KV drifts logits.
                 print(
-                    ">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5 + FASTINFERENCE_KV_FP8=0)"
+                    ">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5)"
                 )
                 self.kv_dtype = torch.bfloat16
             else:
-                print(">>>> LiteEngine: KV Cache dtype float16 (FASTINFERENCE_KV_FP8=0)")
+                print(">>>> LiteEngine: KV Cache dtype float16")
                 self.kv_dtype = torch.float16
-        else:
-            print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
-            self.kv_dtype = torch.float8_e4m3fn
+            self.kv_head_dim = self.head_size
             
         elem_nbytes = _dtype_nbytes(self.kv_dtype)
         kv_theory_bytes = (
@@ -638,7 +646,7 @@ class LiteEngine:
             * self.num_total_blocks
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
+            * self.kv_head_dim
             * elem_nbytes
         )
         print(
@@ -654,9 +662,9 @@ class LiteEngine:
         for i in range(self.num_layers):
             print(f"    Allocating layer {i}...")
             # Shape: (num_total_blocks, block_size, heads, head_size)
-            k = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
+            k = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.kv_head_dim), 
                           device=self.device, dtype=self.kv_dtype)
-            v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.head_size), 
+            v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.kv_head_dim), 
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         print(">>>> LiteEngine: KV Cache allocated successfully.")
@@ -680,11 +688,25 @@ class LiteEngine:
                 "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_FP8=1, or --frugal scheduling."
             )
 
+        # slot_mapping maps batch tokens to physical indices
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._running_ids: List[str] = []
         self._free_slots = list(range(self.max_active_requests))
         self._request_slots: Dict[str, int] = {} # Map req_id -> slot_idx
         self._request_streams: Dict[str, asyncio.Queue] = {}
+        
+        # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
+        # These will be reused to avoid Python object creation in every decode step.
+        self._fast_input_ids = torch.empty((self.max_active_requests, 1), dtype=torch.long, device=self.device)
+        self._fast_positions = torch.empty((self.max_active_requests, 1), dtype=torch.long, device=self.device)
+        self._fast_slot_mapping = torch.empty((self.max_active_requests,), dtype=torch.long, device=self.device)
+        self._fast_seq_lens = torch.empty((self.max_active_requests,), dtype=torch.int32, device=self.device)
+        self._fast_block_tables = torch.empty((self.max_active_requests, self.num_blocks_per_seq), dtype=torch.int32, device=self.device)
+        
+        # Static block tables (only depends on slot_idx)
+        for s in range(self.max_active_requests):
+            start_block = s * self.num_blocks_per_seq
+            self._fast_block_tables[s] = torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32, device=self.device)
 
     @property
     def active_request_count(self) -> int:
@@ -791,6 +813,72 @@ class LiteEngine:
             yield output
             if output.finished: break
 
+    @torch.inference_mode()
+    def _decode_step_sync(self, decodes: List[str]) -> List[RequestOutput]:
+        bs = len(decodes)
+        # Use sliced pre-allocated tensors
+        input_ids = self._fast_input_ids[:bs]
+        positions = self._fast_positions[:bs]
+        slot_mapping = self._fast_slot_mapping[:bs]
+        seq_lens = self._fast_seq_lens[:bs]
+        
+        # Populate pre-allocated tensors (minimal Python loops)
+        req_dicts = []
+        lora_mapping = []
+        for i, rid in enumerate(decodes):
+            req = self._requests[rid]
+            req_dicts.append(req)
+            input_ids[i, 0] = req["generated_ids"][-1]
+            positions[i, 0] = req["seq_len"]
+            slot_mapping[i] = req["slot_idx"] * self.max_model_len + req["seq_len"]
+            seq_lens[i] = req["seq_len"] + 1
+            lora_mapping.append(req.get("lora_id"))
+
+        # Block tables are static, we just need to slice and gather
+        # self._fast_block_tables has shape (max_active_requests, num_blocks_per_seq)
+        # We need to select the rows corresponding to slot_indices.
+        # This is fast using torch.index_select or advanced indexing.
+        slots_t = torch.tensor([req["slot_idx"] for req in req_dicts], device=self.device)
+        block_tables = self._fast_block_tables.index_select(0, slots_t)
+
+        attn_carry_batch = self._stack_per_layer_carries(req_dicts, self.num_layers, "linear_attn_carry")
+        conv_carry_batch = self._stack_per_layer_carries(req_dicts, self.num_layers, "linear_conv_carry")
+
+        attn_metadata = {
+            "slot_mapping": slot_mapping,
+            "seq_lens": seq_lens,
+            "block_tables": block_tables,
+            "is_prefill": False,
+            "kv_start_indices": positions.squeeze(1).to(torch.int32),
+            "linear_attn_carry": attn_carry_batch,
+            "linear_conv_carry": conv_carry_batch,
+        }
+
+        logits = self.model(input_ids, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
+        
+        self._split_per_layer_carries(attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry")
+        self._split_per_layer_carries(attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry")
+
+        results = []
+        for i, rid in enumerate(decodes):
+            req = self._requests[rid]
+            token_logits = _apply_qwen35_context_bias(logits[i, -1, :], req, self.tokenizer)
+            
+            eos_mask = _eos_stop_token_ids_for_sampling(
+                self.tokenizer, req["sampling_params"], getattr(self.model_config, "hf_config", None)
+            )
+            
+            token = _sample_token_from_logits(
+                token_logits, req["sampling_params"], req["generated_ids"], req.get("rng"),
+                eos_token_ids_to_mask=eos_mask, anti_template_token_ids=req.get("anti_template_token_ids")
+            )
+            
+            req["generated_ids"].append(token)
+            req["seq_len"] += 1
+            self._process_completion(rid, token, results)
+            
+        return results
+
     def _free_request(self, rid: str):
         if rid in self._requests:
             slot = self._requests[rid]["slot_idx"]
@@ -811,6 +899,10 @@ class LiteEngine:
             if self._requests[rid]["is_prefill"]: prefills.append(rid)
             else: decodes.append(rid)
         
+        # SYNC DECODE FAST PATH: When only decodes are present, bypass all Async/Object creation.
+        if decodes and not prefills:
+            return self._decode_step_sync(decodes)
+
         results = []
         chunk_size = self._prefill_chunk_size
 

@@ -22,6 +22,7 @@ class LiteLinear(nn.Module):
             self.quant_config.init_layer(self)
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # Note: Global LRU Caching is now Legacy. Fused AWQ path is preferred.
         if self.quant_config is not None and hasattr(self.quant_config, "apply"):
             qweight = getattr(self, "qweight", None)
             cached_quant_weight = getattr(self, "_quant_weight", None)
