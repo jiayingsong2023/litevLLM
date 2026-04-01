@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.sampling_params import SamplingParams
+from vllm.engine.inference_config import LiteInferenceConfig
 
 logger = init_logger(__name__)
 
@@ -39,6 +40,51 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
 def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
     ctx = max(floor, int(ctx))
     return max(block_size, (ctx // block_size) * block_size)
+
+
+def expand_metadata_for_paged_attention(
+    bs: int,
+    seq: int,
+    is_prefill: bool,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    q_device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Expands seq_lens and block_tables for PagedAttention kernels during prefill.
+    Standardizes 'Chunked Prefill' logic across Llama and Qwen architectures.
+    """
+    if seq > 1 and is_prefill:
+        if bs == 1:
+            end_pos = int(seq_lens[0].item())
+            start_pos = end_pos - seq
+            seq_lens_ext = torch.arange(
+                start_pos + 1, end_pos + 1, device=q_device, dtype=torch.int32
+            )
+            block_tables_ext = block_tables.expand(seq, -1).contiguous()
+        else:
+            # Batched chunked prefill: flatten tokens in batch-major order.
+            seq_lens_ext_parts = []
+            block_tables_ext_parts = []
+            for bi in range(bs):
+                end_pos_b = int(seq_lens[bi].item())
+                start_pos_b = end_pos_b - seq
+                seq_lens_ext_parts.append(
+                    torch.arange(
+                        start_pos_b + 1,
+                        end_pos_b + 1,
+                        device=q_device,
+                        dtype=torch.int32,
+                    )
+                )
+                block_tables_ext_parts.append(
+                    block_tables[bi : bi + 1].expand(seq, -1)
+                )
+            seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
+            block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
+        return seq_lens_ext, block_tables_ext
+    
+    return seq_lens, block_tables
 
 
 def _resolve_kv_max_model_len(
@@ -529,78 +575,66 @@ class LiteEngine:
             self.num_attention_heads = self.num_kv_heads
 
         self.num_layers = self.model_config.get_num_layers(None)
-        _bs = 16  # must match self.block_size below (paged KV physical block)
-        self.max_model_len = _resolve_kv_max_model_len(
-            self.model_config, self.vllm_config, _bs
-        )
-
-        # Prefill chunk size: enable chunked prefill streaming by default for Qwen3.5.
-        # FASTINFERENCE_LITE_PREFILL_CHUNK can override the chunk length explicitly.
-        # A value <=0 is treated as "full context in one chunk".
-        env_chunk = os.environ.get("FASTINFERENCE_LITE_PREFILL_CHUNK", "").strip()
-        if env_chunk:
-            env_chunk_int = int(env_chunk)
-            if env_chunk_int <= 0:
-                self._prefill_chunk_size = self.max_model_len
-            else:
-                self._prefill_chunk_size = max(1, env_chunk_int)
-        else:
-            from vllm.model_executor.models.qwen3_5 import (
-                Qwen3_5ForConditionalGeneration,
-                Qwen3_5MoeForConditionalGeneration,
-            )
-
-            if isinstance(
-                self.model,
-                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
-            ):
-                # Streamline prefill by default while staying conservative for quality.
-                self._prefill_chunk_size = min(self.max_model_len, 1024)
-            else:
-                self._prefill_chunk_size = int(
-                    getattr(self.execution_policy, "chunked_prefill_size", 512)
-                )
-
+        
         # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
-        self.block_size = 16
+        self.inf_config = LiteInferenceConfig.from_env()
+
+        gpu_total_gb = get_total_gpu_memory_gb()
+        is_high_end_gpu = gpu_total_gb > 24.0
+        if is_high_end_gpu:
+            print(f">>>> LiteEngine: High-end GPU detected ({gpu_total_gb:.1f}GB). Enabling aggressive optimization.")
+
+        # Heuristic: TinyLlama is extremely sensitive to KV quantization. 
+        if "tinyllama" in str(self.model_config.model).lower() and self.inf_config.k_scale == 1.0 and self.inf_config.kv_type == "turbo_int4":
+            print(">>>> LiteEngine: TinyLlama detected. Auto-adjusting default KV scale 1.0 -> 0.1 for stability.")
+            self.inf_config.k_scale = 0.1
+            self.inf_config.v_scale = 0.1
+
+        self.block_size = self.inf_config.block_size
+        self.max_model_len = _resolve_kv_max_model_len(self.model_config, self.vllm_config, self.block_size)
+        if self.inf_config.max_model_len:
+            self.max_model_len = _align_kv_ctx_len(min(self.max_model_len, self.inf_config.max_model_len), self.block_size)
+
         self.max_active_requests = _resolve_kv_max_active_requests(
             self.execution_policy.max_active_requests,
             self.vllm_config,
         )
+        # Bumping default concurrency for 32GB+ cards
+        if is_high_end_gpu and self.max_active_requests < 16 and os.environ.get("FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS") is None:
+            print(">>>> LiteEngine: Bumping max_active_requests 4 -> 16 for high-end GPU.")
+            self.max_active_requests = 16
+
+        if self.inf_config.max_active_requests != 4:
+             self.max_active_requests = self.inf_config.max_active_requests
+
         self.num_blocks_per_seq = self.max_model_len // self.block_size
         self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
+
         sched_token_budget = getattr(
             self.vllm_config.scheduler_config, "max_num_batched_tokens", None
         )
-        if sched_token_budget is None:
-            self._step_token_budget = max(1, self.max_active_requests)
+        # High-end GPU can handle more tokens per step
+        default_budget = 8192 if is_high_end_gpu else 4096
+        self._step_token_budget = max(1, int(sched_token_budget)) if sched_token_budget is not None else default_budget
+
+        # Prefill chunk size optimization
+        env_chunk = os.environ.get("FASTINFERENCE_LITE_PREFILL_CHUNK", "").strip()
+        if env_chunk:
+            env_chunk_int = int(env_chunk)
+            self._prefill_chunk_size = env_chunk_int if env_chunk_int > 0 else self.max_model_len
         else:
-            self._step_token_budget = max(1, int(sched_token_budget))
-        self._decode_priority_enabled = _env_truthy(
-            "FASTINFERENCE_LITE_DECODE_PRIORITY"
-        ) or os.environ.get("FASTINFERENCE_LITE_DECODE_PRIORITY", "").strip() == ""
-        self._prefill_reserved_tokens = max(
-            0,
-            int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS", "0")),
-        )
-        self._prefill_reserve_backlog = max(
-            1,
-            int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG", "2")),
-        )
-        try:
-            catchup_ratio = float(
-                os.environ.get("FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO", "0.25")
-            )
-        except Exception:
-            catchup_ratio = 0.25
-        self._prefill_catchup_ratio = min(1.0, max(0.0, catchup_ratio))
-        self._prefill_microbatch_size = min(
-            4,
-            max(
-                1,
-                int(os.environ.get("FASTINFERENCE_LITE_PREFILL_MICROBATCH", "2")),
-            ),
-        )
+            from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
+            if isinstance(self.model, (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)):
+                self._prefill_chunk_size = 2048 if is_high_end_gpu else 1024
+            else:
+                self._prefill_chunk_size = 1024 if is_high_end_gpu else 512
+
+        self._decode_priority_enabled = _env_truthy("FASTINFERENCE_LITE_DECODE_PRIORITY") or os.environ.get("FASTINFERENCE_LITE_DECODE_PRIORITY", "").strip() == ""
+        self._prefill_reserved_tokens = max(0, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS", "0")))
+        self._prefill_reserve_backlog = max(1, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG", "2")))
+        self._prefill_catchup_ratio = min(1.0, max(0.0, float(os.environ.get("FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO", "0.25"))))
+        self._prefill_microbatch_size = min(4, max(1, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_MICROBATCH", "2"))))
+
         print(
             ">>>> LiteEngine: Step scheduler "
             f"(token_budget={self._step_token_budget}, decode_priority={self._decode_priority_enabled}, "
@@ -610,29 +644,21 @@ class LiteEngine:
             f"prefill_microbatch={self._prefill_microbatch_size})"
         )
         
-        self.kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
-        if self.kv_type == "turbo_int4":
+        # Resolve KV Metadata from config
+        if self.inf_config.kv_type == "turbo_int4":
             print(">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]")
             self.kv_dtype = torch.uint8
             self.kv_head_dim = self.head_size // 2
-        elif os.environ.get("FASTINFERENCE_KV_FP8", "1") == "1":
+            print(f">>>> LiteEngine: Using KV scales: K={self.inf_config.k_scale}, V={self.inf_config.v_scale}")
+        elif self.inf_config.kv_type == "fp8":
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = torch.float8_e4m3fn
             self.kv_head_dim = self.head_size
         else:
-            from vllm.model_executor.models.qwen3_5 import (
-                Qwen3_5ForConditionalGeneration,
-                Qwen3_5MoeForConditionalGeneration,
-            )
-
-            if isinstance(
-                self.model,
-                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
-            ):
-                # Match model activations (bf16) so paged decode aligns with HF; fp16 KV drifts logits.
-                print(
-                    ">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5)"
-                )
+            print(">>>> LiteEngine: KV Cache using full precision (BF16/FP16) [ACCURATE]")
+            from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
+            if isinstance(self.model, (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)):
+                print(">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5)")
                 self.kv_dtype = torch.bfloat16
             else:
                 print(">>>> LiteEngine: KV Cache dtype float16")
@@ -852,6 +878,10 @@ class LiteEngine:
             "kv_start_indices": positions.squeeze(1).to(torch.int32),
             "linear_attn_carry": attn_carry_batch,
             "linear_conv_carry": conv_carry_batch,
+            "kv_cache_dtype": self.inf_config.kv_type,
+            "k_scale": self.inf_config.k_scale,
+            "v_scale": self.inf_config.v_scale,
+            "config": self.inf_config,
         }
 
         logits = self.model(input_ids, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
@@ -1004,6 +1034,7 @@ class LiteEngine:
                     torch.arange(
                         start_block,
                         start_block + self.num_blocks_per_seq,
+                        device=self.device,
                         dtype=torch.int32,
                     )
                 )
@@ -1011,8 +1042,8 @@ class LiteEngine:
                 kv_start_indices.append(processed_len)
 
             curr_input = torch.tensor(curr_input_rows, device=self.device)
-            positions = torch.stack(position_rows, dim=0)
-            slot_mapping = torch.cat(slot_mapping_rows, dim=0)
+            positions = torch.stack(position_rows, dim=0).to(self.device)
+            slot_mapping = torch.cat(slot_mapping_rows, dim=0).to(self.device)
             block_tables_t = torch.stack(block_tables).to(self.device)
             attn_carry_prefill = self._stack_per_layer_carries(
                 req_dicts_prefill, self.num_layers, "linear_attn_carry"
@@ -1033,6 +1064,10 @@ class LiteEngine:
                 "block_tables": block_tables_t,
                 "linear_attn_carry": attn_carry_prefill,
                 "linear_conv_carry": conv_carry_prefill,
+                "kv_cache_dtype": self.inf_config.kv_type,
+                "k_scale": self.inf_config.k_scale,
+                "v_scale": self.inf_config.v_scale,
+                "config": self.inf_config,
             }
 
             try:
@@ -1134,6 +1169,10 @@ class LiteEngine:
                 ),
                 "linear_attn_carry": attn_carry_batch,
                 "linear_conv_carry": conv_carry_batch,
+                "kv_cache_dtype": self.inf_config.kv_type,
+                "k_scale": self.inf_config.k_scale,
+                "v_scale": self.inf_config.v_scale,
+                "config": self.inf_config,
             }
 
             try:
@@ -1146,29 +1185,43 @@ class LiteEngine:
                     attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
                 )
                 # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
-                for i, rid in enumerate(decodes_to_run):
-                    req_i = self._requests[rid]
-                    eos_mask = _eos_stop_token_ids_for_sampling(
-                        self.tokenizer,
-                        req_i["sampling_params"],
-                        getattr(self.model_config, "hf_config", None),
-                    )
-                    token_logits = _apply_qwen35_context_bias(
-                        logits[i, -1, :],
-                        req_i,
-                        self.tokenizer,
-                    )
-                    token = _sample_token_from_logits(
-                        token_logits,
-                        req_i["sampling_params"],
-                        req_i["generated_ids"],
-                        req_i.get("rng"),
-                        eos_token_ids_to_mask=eos_mask,
-                        anti_template_token_ids=req_i.get("anti_template_token_ids"),
-                    )
-                    req_i["generated_ids"].append(token)
-                    self._requests[rid]["seq_len"] += 1
-                    self._process_completion(rid, token, results)
+                # OPTIMIZATION: If all requests are greedy (temp=0), we can argmax in one go.
+                is_all_greedy = all(self._requests[rid]["sampling_params"].temperature == 0 for rid in decodes_to_run)
+                
+                if is_all_greedy:
+                    # Parallel Argmax
+                    next_tokens = torch.argmax(logits[:, -1, :], dim=-1).cpu().tolist()
+                    for i, rid in enumerate(decodes_to_run):
+                        req_i = self._requests[rid]
+                        token = next_tokens[i]
+                        req_i["generated_ids"].append(token)
+                        req_i["seq_len"] += 1
+                        self._process_completion(rid, token, results)
+                else:
+                    # Standard fallback for mixed sampling params
+                    for i, rid in enumerate(decodes_to_run):
+                        req_i = self._requests[rid]
+                        eos_mask = _eos_stop_token_ids_for_sampling(
+                            self.tokenizer,
+                            req_i["sampling_params"],
+                            getattr(self.model_config, "hf_config", None),
+                        )
+                        token_logits = _apply_qwen35_context_bias(
+                            logits[i, -1, :],
+                            req_i,
+                            self.tokenizer,
+                        )
+                        token = _sample_token_from_logits(
+                            token_logits,
+                            req_i["sampling_params"],
+                            req_i["generated_ids"],
+                            req_i.get("rng"),
+                            eos_token_ids_to_mask=eos_mask,
+                            anti_template_token_ids=req_i.get("anti_template_token_ids"),
+                        )
+                        req_i["generated_ids"].append(token)
+                        req_i["seq_len"] += 1
+                        self._process_completion(rid, token, results)
                     
             except Exception as e:
                 print(f"!!! LiteEngine Error (Decode): {e}"); import traceback; traceback.print_exc()

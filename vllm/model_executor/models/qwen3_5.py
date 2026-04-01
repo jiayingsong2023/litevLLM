@@ -17,9 +17,7 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_fp8_dequant_to_linear_weight,
     qwen35_moe_fp8_enabled,
     qwen35_moe_offload_enabled,
-    qwen35_moe_packed_gguf_enabled,
 )
-from vllm.model_executor.moe_gguf_packed import dequant_packed_rows_to_fp16
 
 
 def _env_truthy(name: str) -> bool:
@@ -396,17 +394,11 @@ class Qwen3_5MoeExpertsLite(nn.Module):
         self.hidden_dim = int(config.hidden_size)
         self.intermediate_dim = int(config.moe_intermediate_size)
         f8 = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else None
-        self.moe_gguf_packed = bool(qwen35_moe_packed_gguf_enabled())
-        if self.moe_gguf_packed and qwen35_moe_fp8_enabled():
-            raise ValueError(
-                "FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 is incompatible with FASTINFERENCE_QWEN35_MOE_FP8=1; "
-                "disable one of them."
-            )
+        
         self.fp8_moe = bool(
             f8 is not None
             and qwen35_moe_fp8_enabled()
             and dims_ok_for_moe_fp8(self.hidden_dim, self.intermediate_dim)
-            and not self.moe_gguf_packed
         )
         self.moe_cpu_offload = bool(
             self.fp8_moe and qwen35_moe_offload_enabled()
@@ -416,14 +408,15 @@ class Qwen3_5MoeExpertsLite(nn.Module):
             OrderedDict()
         )
 
-        if self.moe_gguf_packed:
-            self.register_buffer("_gate_exp_packed", torch.empty(0, dtype=torch.uint8))
-            self.register_buffer("_up_exp_packed", torch.empty(0, dtype=torch.uint8))
-            self.register_buffer("_down_exp_packed", torch.empty(0, dtype=torch.uint8))
-            self.register_buffer("_gguf_qtype_gate", torch.tensor(0, dtype=torch.int32))
-            self.register_buffer("_gguf_qtype_up", torch.tensor(0, dtype=torch.int32))
-            self.register_buffer("_gguf_qtype_down", torch.tensor(0, dtype=torch.int32))
-        elif self.fp8_moe and self.moe_cpu_offload:
+        # Standard ParameterLists for experts - populated during load
+        self.gate_up_proj = nn.ParameterList([
+            nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)
+        ])
+        self.down_proj = nn.ParameterList([
+            nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)
+        ])
+
+        if self.fp8_moe and self.moe_cpu_offload:
             ou, inn = fp8_scale_shape_2d(2 * self.intermediate_dim, self.hidden_dim)
             ou_d, inn_d = fp8_scale_shape_2d(self.hidden_dim, self.intermediate_dim)
             self.register_buffer(
@@ -531,29 +524,7 @@ class Qwen3_5MoeExpertsLite(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            if self.moe_gguf_packed:
-                qg = int(self._gguf_qtype_gate.item())
-                qu = int(self._gguf_qtype_up.item())
-                qd = int(self._gguf_qtype_down.item())
-                ei = int(expert_idx)
-                r0 = ei * self.intermediate_dim
-                r1 = r0 + self.intermediate_dim
-                gate_w = dequant_packed_rows_to_fp16(
-                    self._gate_exp_packed, r0, r1, self.hidden_dim, qg
-                ).to(device=dev, dtype=hid_dtype)
-                up_w = dequant_packed_rows_to_fp16(
-                    self._up_exp_packed, r0, r1, self.hidden_dim, qu
-                ).to(device=dev, dtype=hid_dtype)
-                w_gu = torch.cat([gate_w, up_w], dim=0)
-                gate, up = F.linear(current_state, w_gu).chunk(2, dim=-1)
-                current_hidden_states = F.silu(gate) * up
-                rd0 = ei * self.hidden_dim
-                rd1 = rd0 + self.hidden_dim
-                down_w = dequant_packed_rows_to_fp16(
-                    self._down_exp_packed, rd0, rd1, self.intermediate_dim, qd
-                ).to(device=dev, dtype=hid_dtype)
-                current_hidden_states = F.linear(current_hidden_states, down_w)
-            elif self.moe_cpu_offload:
+            if self.moe_cpu_offload:
                 g_fp8, g_s, d_fp8, d_s = self._lru_get_expert_fp8_gpu(int(expert_idx), dev)
                 w_g = moe_fp8_dequant_to_linear_weight(g_fp8, g_s, hid_dtype)
                 gate, up = F.linear(current_state, w_g).chunk(2, dim=-1)
@@ -571,9 +542,11 @@ class Qwen3_5MoeExpertsLite(nn.Module):
                 )
                 current_hidden_states = F.linear(current_hidden_states, w_d)
             else:
-                gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                w_gu = self.gate_up_proj[expert_idx].to(device=dev, dtype=hid_dtype)
+                gate, up = F.linear(current_state, w_gu).chunk(2, dim=-1)
                 current_hidden_states = F.silu(gate) * up
-                current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+                w_d = self.down_proj[expert_idx].to(device=dev, dtype=hid_dtype)
+                current_hidden_states = F.linear(current_hidden_states, w_d)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
@@ -651,24 +624,6 @@ def _residual_merge_fp16(x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: to
     y = torch.nan_to_num(y, nan=0.0, posinf=_fp16_safe_abs_max(), neginf=-_fp16_safe_abs_max())
     y = _scale_tensor_to_abs_cap(y, _fp16_safe_abs_max())
     return y.to(out_dtype)
-
-
-def _env_qwen35_fused_awq_ab() -> bool:
-    """Fuse in_proj_a + in_proj_b into one AWQ GEMM (same K, same out dim per matrix)."""
-    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_AWQ_AB", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _env_qwen35_fused_awq_gate_up() -> bool:
-    """Fuse dense MLP gate_proj + up_proj into one AWQ GEMM, then silu(gate)*up."""
-    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _env_qwen35_fused_self_attn_kv() -> bool:
-    """Fuse self_attn k_proj + v_proj (same output dim) into one quantized GEMM."""
-    v = os.environ.get("FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
 
 
 def _qwen35_try_fused_awq_pair_matmul(
@@ -867,6 +822,9 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
             )
 
     def forward(self, x, positions, kv_cache, attn_metadata):
+        inf_config = attn_metadata.get("config") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "config", None)
+        fusion_level = inf_config.fusion_level if inf_config else 2
+
         input_dtype = x.dtype
         residual = x
         h = self.input_layernorm(x)
@@ -913,7 +871,7 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         z = self.linear_attn.in_proj_z(h)
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        if _env_qwen35_fused_awq_ab():
+        if fusion_level >= 1: # Basic fusion (AB)
             ab = _qwen35_try_fused_awq_pair_matmul(
                 h,
                 self.linear_attn.in_proj_a,
@@ -1016,7 +974,7 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         if self._use_moe:
             mlp_out = self.mlp(h_post)
         else:
-            if _env_qwen35_fused_awq_gate_up():
+            if fusion_level >= 2: # Fused GateUp
                 gu = _qwen35_try_fused_awq_pair_matmul(
                     h_post,
                     self.mlp.gate_proj,
@@ -1111,6 +1069,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         self._v_scale_float = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
 
     def forward(self, x, positions, kv_cache, attn_metadata):
+        inf_config = attn_metadata.get("config") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "config", None)
+        fusion_level = inf_config.fusion_level if inf_config else 2
+        
         input_dtype = x.dtype
         h = self.input_layernorm(x)
         bs, seq, _ = h.shape
@@ -1126,7 +1087,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         q_part = self.self_attn.q_norm(q_part.reshape(bs, -1, nh, hd)).reshape(bs, -1, nh, hd)
 
         kv_out = nkv * hd
-        if _env_qwen35_fused_self_attn_kv():
+        if fusion_level >= 2: # Fused self_attn_kv
             kv_merged = _qwen35_try_fused_awq_pair_matmul(
                 h,
                 self.self_attn.k_proj,
@@ -1159,7 +1120,11 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
         from vllm.kernels.triton.paged_attention import paged_attention_v1
 
-        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], self.kv_cache_dtype, self._k_scale_float, self._v_scale_float)
+        kv_cache_dtype = inf_config.kv_type if inf_config else attn_metadata.get("kv_cache_dtype", self.kv_cache_dtype)
+        k_scale = inf_config.k_scale if inf_config else attn_metadata.get("k_scale", self._k_scale_float)
+        v_scale = inf_config.v_scale if inf_config else attn_metadata.get("v_scale", self._v_scale_float)
+
+        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], kv_cache_dtype, k_scale, v_scale)
         block_tables = attn_metadata["block_tables"]
         seq_lens = attn_metadata["seq_lens"]
         is_prefill = attn_metadata.get("is_prefill", False)
@@ -1189,70 +1154,27 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             attn_in = attn_b.transpose(1, 2).reshape(n_tokens, nh, hd).to(dtype=q.dtype).contiguous()
         else:
             attn_in = torch.empty((n_tokens, nh, hd), device=q.device, dtype=q.dtype)
-            if seq > 1 and is_prefill:
-                if bs == 1:
-                    end_pos = int(seq_lens[0].item())
-                    start_pos = end_pos - seq
-                    seq_lens_ext = torch.arange(
-                        start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32
-                    )
-                    block_tables_ext = block_tables.expand(seq, -1).contiguous()
-                else:
-                    # Batched chunked prefill: flatten tokens in batch-major order.
-                    # Build per-token sequence lengths and matching block-table rows for each request.
-                    seq_lens_ext_parts = []
-                    block_tables_ext_parts = []
-                    for bi in range(bs):
-                        end_pos_b = int(seq_lens[bi].item())
-                        start_pos_b = end_pos_b - seq
-                        seq_lens_ext_parts.append(
-                            torch.arange(
-                                start_pos_b + 1,
-                                end_pos_b + 1,
-                                device=q.device,
-                                dtype=torch.int32,
-                            )
-                        )
-                        block_tables_ext_parts.append(
-                            block_tables[bi : bi + 1].expand(seq, -1)
-                        )
-                    seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
-                    block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
-                paged_attention_v1(
-                    attn_in,
-                    q.contiguous(),
-                    k_cache,
-                    v_cache,
-                    nh,
-                    hd**-0.5,
-                    block_tables_ext,
-                    seq_lens_ext,
-                    k_cache.shape[1],
-                    max_ctx,
-                    None,
-                    self.kv_cache_dtype,
-                    self._k_scale_float,
-                    self._v_scale_float,
-                    num_kv_heads=nkv,
-                )
-            else:
-                paged_attention_v1(
-                    attn_in,
-                    q.contiguous(),
-                    k_cache,
-                    v_cache,
-                    nh,
-                    hd**-0.5,
-                    block_tables,
-                    seq_lens,
-                    k_cache.shape[1],
-                    max_ctx,
-                    None,
-                    self.kv_cache_dtype,
-                    self._k_scale_float,
-                    self._v_scale_float,
-                    num_kv_heads=nkv,
-                )
+            from vllm.engine.lite_engine import expand_metadata_for_paged_attention
+            seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
+                bs, seq, is_prefill, seq_lens, block_tables, q.device
+            )
+            paged_attention_v1(
+                attn_in,
+                q.contiguous(),
+                k_cache,
+                v_cache,
+                nh,
+                hd**-0.5,
+                block_tables_ext,
+                seq_lens_ext,
+                k_cache.shape[1],
+                max_ctx,
+                None,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                num_kv_heads=nkv,
+            )
 
         attn_flat = attn_in.reshape(bs, seq, nh * hd)
         gate = gate.reshape(bs, seq, nh * hd)
@@ -1276,7 +1198,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             mlp_out = _call_litelinear_stable(self.mlp.down_proj, mlp_mid, pre_cap=1536.0)
             return _residual_merge_fp16(hidden_states.float(), mlp_out, input_dtype, 8.0)
 
-        if _env_qwen35_fused_awq_gate_up():
+        if fusion_level >= 2: # Fused GateUp
             gu = _qwen35_try_fused_awq_pair_matmul(
                 h_post,
                 self.mlp.gate_proj,

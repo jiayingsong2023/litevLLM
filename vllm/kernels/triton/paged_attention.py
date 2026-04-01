@@ -21,6 +21,7 @@ def _paged_attention_kernel(
     IS_INT4: tl.constexpr,
     IS_CACHED: tl.constexpr,
     BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_ROW_SCALE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     seq_idx = pid // num_heads; head_idx = pid % num_heads
@@ -30,10 +31,10 @@ def _paged_attention_kernel(
     off_q = seq_idx * stride_q_seq + head_idx * stride_q_head + tl.arange(0, BLOCK_D) * stride_q_dim
     
     # Initialize accumulators
-    m_i = -float('inf'); l_i = 1.0
+    m_i = -float('inf'); l_i = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc_low_total = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
-    acc_high_total = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
+    acc_low = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
+    acc_high = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
 
     if IS_INT4:
         offs_d_half = tl.arange(0, BLOCK_D // 2)
@@ -65,8 +66,18 @@ def _paged_attention_kernel(
         if IS_INT4:
             off_k = offs_n_2d * stride_k_token + kv_head_idx * stride_k_head + offs_d_half_2d * stride_k_dim
             k_packed = tl.load(k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_k, mask=block_mask[:, None], other=0).to(tl.uint8)
-            k_l = (k_packed & 0x0F).to(tl.float32) * k_scale
-            k_h = (k_packed >> 4).to(tl.float32) * k_scale
+            
+            # Row-wise scaling if requested
+            if HAS_ROW_SCALE:
+                # In LitevLLM, row-scales for INT4 are stored in a parallel tensor or packed.
+                # For now, let's assume we pass a scale tensor that matches physical slots.
+                # slot_mapping was token_idx -> slot. We need slot -> scale.
+                # THIS IS COMPLEX. Let's stick to Per-Request dynamic scale for now.
+                pass
+
+            # Dequantize from uint8 [0, 15] to float [-8, 7]
+            k_l = ((k_packed & 0x0F).to(tl.float32) - 8.0) * k_scale
+            k_h = (((k_packed >> 4) & 0x0F).to(tl.float32) - 8.0) * k_scale
             qk = tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
         else:
             off_k = offs_n_2d * stride_k_token + kv_head_idx * stride_k_head + offs_d_2d * stride_k_dim
@@ -76,17 +87,26 @@ def _paged_attention_kernel(
 
         qk = tl.where(block_mask, qk, -float('inf'))
         m_curr = tl.max(qk, axis=0); m_new = tl.maximum(m_i, m_curr)
-        alpha = tl.exp(m_i - m_new); exp_qk = tl.exp(qk - m_new)
+        
+        # NaN protection: exp(-inf - (-inf)) is NaN. 
+        # If m_new is still -inf, alpha should be 1.0 (or anything, as exp_qk will be 0)
+        # But correctly, if m_i == m_new, alpha is exp(0) = 1.
+        delta_m = m_i - m_new
+        alpha = tl.exp(delta_m)
+        alpha = tl.where(m_i == m_new, 1.0, alpha)
+        
+        exp_qk = tl.exp(qk - m_new)
         l_curr = tl.sum(exp_qk, axis=0); l_new = alpha * l_i + l_curr
         
         if IS_INT4:
             off_v = offs_n_2d * stride_v_token + kv_head_idx * stride_v_head + offs_d_half_2d * stride_v_dim
             v_packed = tl.load(v_base_ptr.to(tl.pointer_type(tl.uint8)) + off_v, mask=block_mask[:, None], other=0).to(tl.uint8)
-            v_l = (v_packed & 0x0F).to(tl.float32) * v_scale
-            v_h = (v_packed >> 4).to(tl.float32) * v_scale
+            v_l = ((v_packed & 0x0F).to(tl.float32) - 8.0) * v_scale
+            v_h = (((v_packed >> 4) & 0x0F).to(tl.float32) - 8.0) * v_scale
             
-            acc_low_total = acc_low_total * alpha + tl.sum(exp_qk[:, None] * v_l, axis=0)
-            acc_high_total = acc_high_total * alpha + tl.sum(exp_qk[:, None] * v_h, axis=0)
+            # Correct separate accumulation for low/high halves
+            acc_low = acc_low * alpha + tl.sum(exp_qk[:, None] * v_l, axis=0)
+            acc_high = acc_high * alpha + tl.sum(exp_qk[:, None] * v_h, axis=0)
         else:
             off_v = offs_n_2d * stride_v_token + kv_head_idx * stride_v_head + offs_d_2d * stride_v_dim
             v = tl.load(v_base_ptr + off_v, mask=block_mask[:, None], other=0.0)
@@ -95,15 +115,16 @@ def _paged_attention_kernel(
         
         l_i = l_new; m_i = m_new
 
+    off_out_base = seq_idx * stride_out_seq + head_idx * stride_out_head
     if IS_INT4:
-        res_low = (acc_low_total / l_i).to(Out_ptr.dtype.element_ty)
-        res_high = (acc_high_total / l_i).to(Out_ptr.dtype.element_ty)
-        off_out_base = seq_idx * stride_out_seq + head_idx * stride_out_head
-        tl.store(Out_ptr + off_out_base + tl.arange(0, BLOCK_D // 2) * 2 * stride_out_dim, res_low)
-        tl.store(Out_ptr + off_out_base + (tl.arange(0, BLOCK_D // 2) * 2 + 1) * stride_out_dim, res_high)
+        res_low = (acc_low / l_i).to(Out_ptr.dtype.element_ty)
+        res_high = (acc_high / l_i).to(Out_ptr.dtype.element_ty)
+        off_d_half = tl.arange(0, BLOCK_D // 2)
+        tl.store(Out_ptr + off_out_base + (off_d_half * 2) * stride_out_dim, res_low)
+        tl.store(Out_ptr + off_out_base + (off_d_half * 2 + 1) * stride_out_dim, res_high)
     else:
         out = (acc / l_i).to(Out_ptr.dtype.element_ty)
-        off_out = seq_idx * stride_out_seq + head_idx * stride_out_head + tl.arange(0, BLOCK_D) * stride_out_dim
+        off_out = off_out_base + tl.arange(0, BLOCK_D) * stride_out_dim
         tl.store(Out_ptr + off_out, out)
 
 def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, **kwargs):

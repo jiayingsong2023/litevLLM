@@ -45,7 +45,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.92,
         max_model_len=4096,
         max_run_seconds=600,
-        stable_env={"FASTINFERENCE_KV_FP8": "1"},
+        stable_env={"FASTINFERENCE_KV_TYPE": "fp8"},
     ),
     "qwen35_9b_awq": ModelSpec(
         key="qwen35_9b_awq",
@@ -60,11 +60,8 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         max_model_len=4096,
         max_run_seconds=960,
         stable_env={
-            "FASTINFERENCE_KV_FP8": "1",
-            # Stacked GEMM: linear_attn a+b, MLP gate+up, full-attn k+v (defaults ON; set "0" to A/B).
-            "FASTINFERENCE_QWEN35_FUSED_AWQ_AB": "1",
-            "FASTINFERENCE_QWEN35_FUSED_AWQ_GATE_UP": "1",
-            "FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV": "1",
+            "FASTINFERENCE_KV_TYPE": "fp8",
+            "FASTINFERENCE_FUSION_LEVEL": "2",
             # Prefill: SDPA on first full-attn chunk (faster than eager HF matmul; set "0" for strict HF parity).
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
@@ -81,12 +78,10 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         max_model_len=2048,
         max_run_seconds=240,
         stable_env={
-            "FASTINFERENCE_KV_FP8": "1",
+            "FASTINFERENCE_KV_TYPE": "fp8",
             "FASTINFERENCE_QWEN35_MOE_FP8": "1",
             "FASTINFERENCE_QWEN35_MOE_OFFLOAD": "1",
-            "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL": "0",
-            "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH": "0",
-            "FASTINFERENCE_QWEN35_FUSED_SELF_ATTN_KV": "1",
+            "FASTINFERENCE_FUSION_LEVEL": "2",
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
     ),

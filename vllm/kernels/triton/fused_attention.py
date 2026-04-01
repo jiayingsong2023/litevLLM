@@ -3,6 +3,20 @@ import torch
 import triton
 import triton.language as tl
 
+# Robust float8 type resolution for different Triton versions
+def _get_fp8_dtype():
+    # Standard names
+    for name in ["float8e4m3fn", "float8_e4m3fn", "float8e4m3fnuz"]:
+        if hasattr(tl, name):
+            return getattr(tl, name)
+    # Vendor specific or older names
+    for name in ["float8e4nv", "float8e4b8", "float8e4b15"]:
+        if hasattr(tl, name):
+            return getattr(tl, name)
+    return None
+
+FP8_DTYPE = _get_fp8_dtype()
+
 @triton.jit
 def _fused_paged_prefill_attn_kernel(
     Q, K, V,
@@ -21,6 +35,7 @@ def _fused_paged_prefill_attn_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE_CACHE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
 ):
     start_m = tl.program_id(0) * BLOCK_M
     cur_head_idx = tl.program_id(1)
@@ -46,8 +61,8 @@ def _fused_paged_prefill_attn_kernel(
             vc_ptr = V_cache + b_idx * stride_vcb + s_idx * stride_vcs + cur_kv_head_idx * stride_vch + off_d
             
             if IS_FP8:
-                tl.store(kc_ptr, (k_val * k_scale).to(tl.float8e4m3fn))
-                tl.store(vc_ptr, (v_val * v_scale).to(tl.float8e4m3fn))
+                tl.store(kc_ptr, (k_val * k_scale).to(FP8_DTYPE))
+                tl.store(vc_ptr, (v_val * v_scale).to(FP8_DTYPE))
             else:
                 tl.store(kc_ptr, k_val.to(K_cache.dtype.element_ty))
                 tl.store(vc_ptr, v_val.to(V_cache.dtype.element_ty))
@@ -102,5 +117,6 @@ def fused_prefill_attention(
         num_heads, num_kv_heads,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=head_dim,
         BLOCK_SIZE_CACHE=block_size_cache, IS_FP8=is_fp8,
+        FP8_DTYPE=FP8_DTYPE,
         num_warps=4, num_stages=2
     )

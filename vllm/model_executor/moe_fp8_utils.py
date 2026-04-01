@@ -30,13 +30,6 @@ def qwen35_moe_offload_enabled() -> bool:
     )
 
 
-def qwen35_moe_packed_gguf_enabled() -> bool:
-    """MoE GGUF: keep packed uint8 expert weights at load (lowers host RSS peak). Incompatible with FP8 MoE."""
-    from vllm.model_executor.moe_gguf_packed import qwen35_moe_packed_gguf_enabled as _impl
-
-    return _impl()
-
-
 def moe_expert_lru_size() -> int:
     return max(1, int(os.environ.get("FASTINFERENCE_MOE_LRU_SIZE", "32")))
 

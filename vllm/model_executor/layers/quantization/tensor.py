@@ -513,7 +513,7 @@ class AWQWeight(QuantizedLinearWeight):
 
         # SLOW PATH: First time resolution
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
-            print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
+            # print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
             self._cached_fused_decision = False
             return self._slow_matmul_dequant(x, bias)
 
@@ -565,7 +565,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
 
         # SLOW PATH: Resolution
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
-            print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
+            # print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
             self._cached_fused_decision = False
             dense_weight = dequantize_symmetric_packed_int4(
                 self.qweight, self.scales, group_size=self.group_size, original_shape=self.original_shape,
@@ -578,8 +578,8 @@ class PackedInt4Weight(QuantizedLinearWeight):
             try:
                 from vllm.model_executor.layers.quantization.awq_triton import packed_int4_fused_capability_check
                 use_fused, reason = packed_int4_fused_capability_check(x, self.qweight, self.scales, int(self.group_size))
-                if not use_fused:
-                    print(f">>>> DEBUG: PackedInt4 NOT capable for {self.prefix}: {reason}")
+                # if not use_fused:
+                #     print(f">>>> DEBUG: PackedInt4 NOT capable for {self.prefix}: {reason}")
             except Exception as e: 
                 print(f">>>> DEBUG: PackedInt4 capability check EXCEPTION for {self.prefix}: {e}")
                 pass

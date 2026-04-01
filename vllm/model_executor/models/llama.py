@@ -59,84 +59,51 @@ class LlamaDecoderLayer(nn.Module):
         if slot_mapping is not None and kv_cache is not None:
             from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
             from vllm.kernels.triton.paged_attention import paged_attention_v1
+            
+            inf_config = attn_metadata.get("config") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "config", None)
+            kv_cache_dtype = inf_config.kv_type if inf_config else (attn_metadata.get("kv_cache_dtype", "auto") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "kv_cache_dtype", "auto"))
+            k_scale = inf_config.k_scale if inf_config else (attn_metadata.get("k_scale", 1.0) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "k_scale", 1.0))
+            v_scale = inf_config.v_scale if inf_config else (attn_metadata.get("v_scale", 1.0) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "v_scale", 1.0))
+
             k_cache, v_cache = kv_cache
-            reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, slot_mapping, "auto")
+            reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale)
             
             attn_in = torch.empty((bs * seq, self.self_attn.num_heads, self.self_attn.head_dim), device=q.device, dtype=q.dtype)
             block_tables = attn_metadata.get("block_tables", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "block_tables", None)
             seq_lens = attn_metadata.get("seq_lens", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "seq_lens", None)
             is_prefill = attn_metadata.get("is_prefill", False) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "is_prefill", False)
             
+            from vllm.engine.lite_engine import expand_metadata_for_paged_attention
+            
             # CRITICAL: For chunked prefill (seq > 1), we must expand metadata for the kernel.
-            # Batched prefill (bs > 1) needs per-request seq_lens / block_tables rows (LiteEngine microbatch).
             max_ctx = int(
                 max(
                     self.self_attn.num_heads * self.self_attn.head_dim,
                     getattr(self.config, "max_position_embeddings", 4096),
                 )
             )
-            if seq > 1 and is_prefill:
-                if bs == 1:
-                    end_pos = int(seq_lens[0].item())
-                    start_pos = end_pos - seq
-                    seq_lens_ext = torch.arange(
-                        start_pos + 1, end_pos + 1, device=q.device, dtype=torch.int32
-                    )
-                    block_tables_ext = block_tables.expand(seq, -1).contiguous()
-                else:
-                    seq_lens_ext_parts = []
-                    block_tables_ext_parts = []
-                    for bi in range(bs):
-                        end_pos_b = int(seq_lens[bi].item())
-                        start_pos_b = end_pos_b - seq
-                        seq_lens_ext_parts.append(
-                            torch.arange(
-                                start_pos_b + 1,
-                                end_pos_b + 1,
-                                device=q.device,
-                                dtype=torch.int32,
-                            )
-                        )
-                        block_tables_ext_parts.append(
-                            block_tables[bi : bi + 1].expand(seq, -1)
-                        )
-                    seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
-                    block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
-                paged_attention_v1(
-                    attn_in,
-                    q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
-                    k_cache,
-                    v_cache,
-                    self.self_attn.num_heads,
-                    self.self_attn.scale,
-                    block_tables_ext,
-                    seq_lens_ext,
-                    k_cache.shape[1],
-                    max_ctx,
-                    None,
-                    "auto",
-                    None,
-                    None,
-                    num_kv_heads=self.self_attn.num_kv_heads,
-                )
-            else:
-                paged_attention_v1(
-                    attn_in,
-                    q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
-                    k_cache,
-                    v_cache,
-                    self.self_attn.num_heads,
-                    self.self_attn.scale,
-                    block_tables,
-                    seq_lens,
-                    k_cache.shape[1],
-                    max_ctx,
-                    None,
-                    "auto",
-                    None,
-                    None,
-                    num_kv_heads=self.self_attn.num_kv_heads,
-                )
+            
+            seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
+                bs, seq, is_prefill, seq_lens, block_tables, q.device
+            )
+            
+            paged_attention_v1(
+                attn_in,
+                q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
+                k_cache,
+                v_cache,
+                self.self_attn.num_heads,
+                self.self_attn.scale,
+                block_tables_ext,
+                seq_lens_ext,
+                k_cache.shape[1],
+                max_ctx,
+                None,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                num_kv_heads=self.self_attn.num_kv_heads,
+            )
             out = attn_in.view(bs, seq, -1)
         else: out = q.view(bs, seq, -1)
         hidden_states = x + self.self_attn.o_proj(out, lora_mapping)

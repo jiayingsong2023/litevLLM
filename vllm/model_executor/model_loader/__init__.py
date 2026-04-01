@@ -17,7 +17,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.tensor import (
     dequantize_awq_pytorch,
     dequantize_symmetric_packed_int4_pytorch,
-    GGUFWeight,
 )
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
@@ -26,127 +25,6 @@ from vllm.model_executor.moe_fp8_utils import (
     qwen35_moe_fp8_enabled,
     qwen35_moe_offload_enabled,
 )
-from vllm.model_executor.moe_gguf_packed import (
-    gguf_quant_type_supported_for_moe_packed,
-    numpy_gguf_data_to_packed_2d,
-)
-
-# --- GGUF load peak RSS (why "temporary buffers" matter) ---
-# For each quantized tensor, gguf.dequantize() builds a full float32 numpy array (dequant_np),
-# then we materialize a torch tensor (often FP16). Peak RSS is dominated by:
-#   (1) compressed tensor bytes still reachable from GGUFReader.tensor_map,
-#   (2) dequant_np (full logical size, float32),
-#   (3) torch tensor after from_numpy / dtype cast (may duplicate if cast copies),
-#   (4) MoE: full [E, I, H] gate and up tensors before copy into Parameters (sequential ge vs ue halves (2)).
-# Mitigations: del ge/ue as soon as possible, gc.collect() per layer, avoid extra cats/temps in FP8 path.
-# Optional FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1: keep ffn_*_exps as uint8 packed rows (no full-blob dequant at load).
-
-
-def _dequantize_gguf_tensor(gguf_tensor: Any, device: str, dtype: torch.dtype, target_shape: Optional[torch.Size] = None) -> Optional[torch.Tensor]:
-    q_type = int(gguf_tensor.tensor_type)
-    # F32 (0) and F16 (1): row-major bytes match GGUF metadata shape; do NOT view(target_shape)
-    # first — that scrambles layout when GGUF order is the transpose of PyTorch (e.g. embed, Linear).
-    if q_type in [0, 1]:
-        # Prefer asarray + from_numpy over always copy=True (reduces peak RSS when buffer is writable).
-        w_np = np.asarray(gguf_tensor.data)
-        if not getattr(w_np, "flags", None) or not w_np.flags.writeable:
-            w_np = w_np.copy()
-        raw = torch.from_numpy(w_np).to(device=device)
-        tname = str(getattr(gguf_tensor, "name", "") or "")
-        # Depthwise conv1d: GGUF dims may not match PyTorch Conv1d layout; contiguous bytes match HF
-        # when viewed as target_shape [C, 1, K] (see scripts/qwen35_gguf_alignment_audit.py).
-        if "ssm_conv1d.weight" in tname and target_shape is not None and len(target_shape) == 3:
-            if raw.numel() == prod(target_shape):
-                try:
-                    return raw.view(*target_shape).to(dtype=dtype)
-                except Exception:
-                    pass
-        gs = tuple(int(x) for x in gguf_tensor.shape)
-        expected = prod(gs) if gs else 0
-        if gs and raw.numel() == expected:
-            res = raw.view(*gs)
-        else:
-            res = raw
-        res = res.to(dtype=dtype)
-        if res.ndim == 2 and target_shape is not None and len(target_shape) == 2:
-            tr, tc = target_shape[0], target_shape[1]
-            if res.shape == (tr, tc):
-                return res
-            if res.shape == (tc, tr):
-                return res.T.contiguous()
-        if target_shape is not None:
-            try:
-                return res.view(target_shape)
-            except Exception:
-                return res
-        return res
-    
-    if target_shape is not None:
-        if len(target_shape) == 1: R, C = 1, target_shape[0]
-        elif len(target_shape) == 2: R, C = target_shape[0], target_shape[1]
-        else:
-            # 3D: [Experts, Rows, Cols] -> Logical R = Experts*Rows, C = Cols
-            C = target_shape[-1]
-            R = 1
-            for dim in target_shape[:-1]: R *= dim
-    else:
-        # Physical fallback from GGUF shape (note: GGUF shape is reversed)
-        ps = gguf_tensor.shape
-        C = ps[0]
-        R = 1
-        for dim in ps[1:]: R *= dim
-
-    # Universal dequant via gguf library — handles Q4_K, Q6_K, Q5_K, Q8_0, IQ, BF16, etc.
-    try:
-        from gguf import dequantize as gguf_dequantize, GGMLQuantizationType
-        w_np = np.asarray(gguf_tensor.data)
-        if not getattr(w_np, "flags", None) or not w_np.flags.writeable:
-            w_np = w_np.copy()
-        dequant_np = gguf_dequantize(w_np, GGMLQuantizationType(q_type))
-        del w_np
-        # One numpy->torch bridge; avoid redundant np.array(..., copy=True) on dequant output.
-        res = torch.from_numpy(dequant_np).to(device=device, dtype=dtype)
-        # Note: do not del dequant_np here — from_numpy may share storage with float32 CPU tensors.
-        # gguf.dequantize returns row-major logical weights, often already [out, in] for Linear
-        # (e.g. token_embd (V,H)) even when GGUF tensor metadata lists the transpose (H,V).
-        # Reshaping to metadata dims would permute elements and destroy alignment vs HF.
-        if target_shape is not None and len(target_shape) == 2:
-            tr, tc = int(target_shape[0]), int(target_shape[1])
-            if res.ndim == 2 and res.numel() == tr * tc:
-                if res.shape == (tr, tc):
-                    return res
-                if res.shape == (tc, tr):
-                    return res.T.contiguous()
-        # Reshape using GGUF metadata when layout is still ambiguous (e.g. flattened).
-        gs = tuple(int(x) for x in gguf_tensor.shape)
-        if len(gs) == 2 and res.numel() == gs[0] * gs[1]:
-            res = res.reshape(gs[0], gs[1])
-        elif len(gs) == 1 and res.numel() == gs[0]:
-            res = res.reshape(gs[0])
-        else:
-            total = R * C
-            if res.numel() >= total:
-                res = res.view(-1)[:total].view(R, C)
-            else:
-                out = torch.zeros(total, device=res.device, dtype=dtype)
-                out[:res.numel()] = res.view(-1)
-                res = out.view(R, C)
-        # Map GGUF 2D layout -> PyTorch [out, in] when target_shape is the transpose.
-        if target_shape is not None and res.ndim == 2 and len(target_shape) == 2:
-            tr, tc = target_shape[0], target_shape[1]
-            if res.shape == (tr, tc):
-                return res
-            if res.shape == (tc, tr):
-                return res.T.contiguous()
-        if target_shape is not None:
-            try:
-                return res.view(target_shape)
-            except Exception:
-                return res
-        return res
-    except Exception as e:
-        print(f"    [Warning] gguf dequant failed for type={q_type}: {e}")
-        return None
 
 def _reorder_v_heads_ggml_to_hf(
     tensor: torch.Tensor,
@@ -983,11 +861,11 @@ def _should_force_high_fidelity_awq_for_qwen35_35b(module_name: str) -> bool:
     return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES)
 
 
-def _load_safetensors(model: nn.Module, model_path: str):
+def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dtype = torch.float16):
     from safetensors.torch import load_file
     sf_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
     if not sf_files: return
-    print(f">>> Loading Safetensors from {model_path}...")
+    print(f">>> Loading Safetensors from {model_path} (Casting to {target_dtype} on-the-fly)...")
     loaded_count = 0
     attr_map = {
         "qweight": ["weight_packed", "qweight", "weight"],
@@ -1046,42 +924,60 @@ def _load_safetensors(model: nn.Module, model_path: str):
                 if found_v is None:
                     continue
                 if internal == "bias":
-                    if hasattr(m, "bias") and m.bias is not None: m.bias.data.copy_(found_v.to(dtype=m.bias.dtype))
-                    else: m.bias = nn.Parameter(found_v.to(dtype=torch.float16))
+                    # [35B SURVIVAL] Move module shell to GPU before assigning parameter
+                    m.to("cuda")
+                    m.bias = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
                     loaded_count += 1
+                    del sd[k]; torch.cuda.empty_cache()
                 elif internal == "qweight" and found_v.dtype in [torch.float16, torch.bfloat16]:
-                    target_p = m.weight if hasattr(m, "weight") else m
-                    if isinstance(target_p, nn.Parameter):
-                        if target_p.numel() == 0 or target_p.shape != found_v.shape:
-                            if hasattr(m, "weight"):
-                                m.weight = nn.Parameter(found_v.to(dtype=torch.float16), requires_grad=False)
-                        else:
-                            target_p.data.copy_(found_v.to(dtype=target_p.dtype))
-                        loaded_count += 1
-                        loaded_params.add(m_name + ".weight")
+                    m.to("cuda")
+                    if hasattr(m, "weight"): m.weight = None
+                    m.weight = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
+                    loaded_count += 1
+                    loaded_params.add(m_name + ".weight")
+                    del sd[k]; torch.cuda.empty_cache()
                 elif internal in ("qweight", "scales", "qzeros", "weight_shape"):
+                    m.to("cuda")
+                    if hasattr(m, internal): setattr(m, internal, None)
                     if m_name not in awq_accum:
                         awq_accum[m_name] = {}
-                    awq_accum[m_name][internal] = found_v
+                    awq_accum[m_name][internal] = found_v.to(device="cuda")
+                    del sd[k]; torch.cuda.empty_cache()
         for p_name, p in params_dict.items():
             if p_name in loaded_params:
                 continue
             target = p_name[6:] if p_name.startswith("model.") else p_name
             copied = False
-            for k in sd_keys:
+            for k in list(sd.keys()):
                 if not _param_copy_key_allowed(k, target, use_lm_layers):
                     continue
                 if k == target or k.endswith("." + target):
-                    if p.shape == sd[k].shape:
-                        p.data.copy_(sd[k].to(dtype=p.dtype))
+                    parts = p_name.split(".")
+                    obj = model
+                    try:
+                        for part in parts[:-1]:
+                            if hasattr(obj, part): obj = getattr(obj, part)
+                            elif isinstance(obj, (nn.ModuleList, nn.ParameterList, list)) and part.isdigit():
+                                obj = obj[int(part)]
+                            else: obj = getattr(obj, part)
+                        
+                        # Move parent object to GPU before assignment
+                        if isinstance(obj, nn.Module): obj.to("cuda")
+                        
+                        val_on_gpu = nn.Parameter(sd[k].to(device="cuda", dtype=target_dtype), requires_grad=False)
+                        if isinstance(obj, (nn.ModuleList, nn.ParameterList, list)): obj[int(parts[-1])] = val_on_gpu
+                        else: setattr(obj, parts[-1], val_on_gpu)
+                        
                         loaded_count += 1
                         loaded_params.add(p_name)
                         copied = True
+                        del sd[k]; torch.cuda.empty_cache()
                         break
-            if not copied and _try_load_legacy_flat_linear_attn_norm_from_safetensors(p_name, p, sd_keys, sd):
+                    except Exception: continue
+            if not copied and _try_load_legacy_flat_linear_attn_norm_from_safetensors(p_name, p, list(sd.keys()), sd):
                 loaded_count += 1
                 loaded_params.add(p_name)
-        del sd; gc.collect()
+        del sd; gc.collect(); torch.cuda.empty_cache()
 
     for m_name, m in lite_modules.items():
         comps = awq_accum.get(m_name)
@@ -1097,61 +993,35 @@ def _load_safetensors(model: nn.Module, model_path: str):
             continue
         G = K // sc.shape[1]
         try:
-            quant_config = getattr(m, "quant_config", None)
-            quant_name = (
-                quant_config.get_name().lower()
-                if quant_config is not None and hasattr(quant_config, "get_name")
-                else ""
+            # Force preserve quant for all AWQ models to avoid CPU OOM
+            m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)
+            if _looks_like_qwen35_35b_awq_model_path(model_path):
+                m.force_high_fidelity_awq = _should_force_high_fidelity_awq_for_qwen35_35b(
+                    m_name
+                )
+            
+            # Tensors are already on GPU from immediate transfer above
+            m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)
+            m.scales = nn.Parameter(sc.contiguous(), requires_grad=False)
+            qz = comps.get("qzeros")
+            m.qzeros = (
+                nn.Parameter(qz.contiguous(), requires_grad=False)
+                if qz is not None
+                else None
             )
-            should_preserve_quant = isinstance(m, LiteLinear) and quant_name == "awq"
-
-            if should_preserve_quant:
-                m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)
-                if _looks_like_qwen35_35b_awq_model_path(model_path):
-                    m.force_high_fidelity_awq = _should_force_high_fidelity_awq_for_qwen35_35b(
-                        m_name
-                    )
-                m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)
-                m.scales = nn.Parameter(sc.contiguous(), requires_grad=False)
-                qz = comps.get("qzeros")
-                m.qzeros = (
-                    nn.Parameter(qz.contiguous(), requires_grad=False)
-                    if qz is not None
-                    else None
-                )
-                weight_shape = comps.get("weight_shape")
-                m.weight_shape = (
-                    tuple(int(x) for x in weight_shape.view(-1).tolist())
-                    if weight_shape is not None
-                    else None
-                )
-                m.group_size = G
-                if hasattr(m, "_quant_weight"):
-                    m._quant_weight = None
-                loaded_count += 1
-                loaded_params.add(m_name + ".qweight")
-                continue
-
-            if "qzeros" in comps:
-                qz = comps["qzeros"]
-                dq = dequantize_awq_pytorch(qw, sc, qz, group_size=G)
-            else:
-                dq = _dequantize_pack_quantized_int4_symmetric(
-                    qw, sc, comps.get("weight_shape")
-                )
-            wparam = m.weight if hasattr(m, "weight") else None
-            if wparam is None:
-                continue
-            if wparam.numel() == 0 or wparam.shape != dq.shape:
-                m.weight = nn.Parameter(dq.to(dtype=torch.float16), requires_grad=False)
-            else:
-                m.weight.data.copy_(dq.to(dtype=torch.float16))
+            weight_shape = comps.get("weight_shape")
+            m.weight_shape = (
+                tuple(int(x) for x in weight_shape.view(-1).tolist())
+                if weight_shape is not None
+                else None
+            )
+            m.group_size = G
             if hasattr(m, "_quant_weight"):
                 m._quant_weight = None
             loaded_count += 1
-            loaded_params.add(m_name + ".weight")
+            loaded_params.add(m_name + ".qweight")
         except Exception as e:
-            print(f">>> AWQ dequant failed for {m_name}: {e}")
+            print(f">>> AWQ load failed for {m_name}: {e}")
 
     for m_name, comps in awq_accum.items():
         has_q = "qweight" in comps
@@ -1174,25 +1044,38 @@ def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> No
     Move model to CUDA, then cast floating tensors to target_dtype without corrupting
     Qwen3.5 MoE FP8 expert weights or their float32 block scales.
     """
-    model.to(device="cuda")
+    # [35B FIX] We NO LONGER call model.to("cuda") globally here because _load_safetensors 
+    # already moved them layer-by-layer. Calling it again on 35B causes OOM due to peak allocation.
     f8 = getattr(torch, "float8_e4m3fn", None)
+    filter_suffixes = (".mlp.experts.gate_up_scale", ".mlp.experts.down_scale", 
+                       "_gate_up_fp8_cpu", "_gate_up_scale_cpu", 
+                       "_down_fp8_cpu", "_down_scale_cpu")
+    
     with torch.no_grad():
         for name, p in model.named_parameters():
+            if p.device.type != "cuda":
+                p.data = p.data.to(device="cuda")
             if f8 is not None and p.dtype == f8:
                 continue
-            if ".mlp.experts.gate_up_scale" in name or ".mlp.experts.down_scale" in name:
+            if any(name.endswith(s) for s in filter_suffixes):
                 continue
             if not p.is_floating_point():
                 continue
-            p.data = p.data.to(dtype=target_dtype)
+            if p.dtype != target_dtype:
+                p.data = p.data.to(dtype=target_dtype)
+        
         for name, b in model.named_buffers():
-            if "_gate_up_fp8_cpu" in name or "_gate_up_scale_cpu" in name:
-                continue
-            if "_down_fp8_cpu" in name or "_down_scale_cpu" in name:
+            if b.device.type != "cuda":
+                # Some buffers might be on CPU, move them
+                b.data = b.data.to(device="cuda")
+            if any(name.endswith(s) for s in filter_suffixes):
                 continue
             if not b.is_floating_point():
                 continue
-            b.copy_(b.to(dtype=target_dtype))
+            if b.dtype != target_dtype:
+                b.data = b.data.to(dtype=target_dtype)
+                
+    torch.cuda.empty_cache()
 
 
 def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
@@ -1248,14 +1131,32 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         setattr(cfg.hf_config, "head_dim", 128)
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
     model = model_cls(vllm_config)
-    gguf_files = [f for f in os.listdir(cfg.model) if f.endswith(".gguf")]
-    if gguf_files:
-        _load_gguf_weights(model, os.path.join(cfg.model, gguf_files[0]), cfg.hf_config)
-        # Match HF text dtype (Qwen3.5 is usually bfloat16); dequant uses fp16/bf16 tensors.
-        target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
-    else:
-        _load_safetensors(model, cfg.model)
-        target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
-    print(f">>> Moving model to CUDA (dtype={target_dtype})...")
-    _apply_cuda_then_hf_dtype(model, target_dtype)
+    
+    # Pre-resolve target dtype
+    target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
+    
+    # [35B FIX] Pre-cast to target dtype on CPU. Fast and memory-safe for empty tensors.
+    model.to(dtype=target_dtype)
+
+    # [35B OOM FIX] Atomic loading to avoid peaks.
+    _load_safetensors(model, cfg.model, target_dtype=target_dtype)
+    
+    # [35B STABILITY] Final deterministic device and dtype sync.
+    # Essential for rotary_emb caches, missed expert parameters, etc.
+    print(">>> Synchronizing all model parameters to CUDA...")
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if p.device.type != "cuda":
+                p.data = p.data.to(device="cuda", dtype=target_dtype)
+                torch.cuda.empty_cache()
+        for n, b in model.named_buffers():
+            if b.device.type != "cuda":
+                b.data = b.data.to(device="cuda")
+                torch.cuda.empty_cache()
+
+    # Final deterministic cast for consistency
+    if target_dtype == torch.bfloat16: model.bfloat16()
+    elif target_dtype == torch.float16: model.half()
+
+    torch.cuda.empty_cache()
     return model.eval()
