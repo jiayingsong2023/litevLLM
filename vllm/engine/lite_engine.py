@@ -413,6 +413,12 @@ class LiteEngine:
             f"prefill_microbatch={self._prefill_microbatch_size})"
         )
         
+        # Ensure MoE models fallback to FP8 if TurboQuant is selected, due to extreme activation outliers
+        from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
+        if self.inf_config.kv_type == "turbo_int4" and hasattr(self, 'model') and isinstance(self.model, Qwen3_5MoeForConditionalGeneration):
+            print(">>>> [Warning] TurboQuant INT4 KV cache does not support the massive activation outliers found in MoE networks. Automatically falling back to FP8.")
+            self.inf_config.kv_type = "fp8"
+
         # Resolve KV Metadata from config
         if self.inf_config.kv_type == "turbo_int4":
             print(">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]")

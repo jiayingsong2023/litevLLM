@@ -61,7 +61,7 @@ if [[ "$SKIP_35B" == "1" ]]; then
   echo "[3/3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
 else
   echo "[3/3] Qwen3.5-35B AWQ (FP8-stable profile)"
-  FASTINFERENCE_KV_TYPE=turbo_int4 \
+  FASTINFERENCE_KV_TYPE=fp8 \
   FASTINFERENCE_QWEN35_MOE_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
     uv run python tests/tools/quality_bar_spotcheck.py \
