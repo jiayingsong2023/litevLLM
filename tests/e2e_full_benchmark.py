@@ -60,7 +60,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         max_model_len=4096,
         max_run_seconds=960,
         stable_env={
-            "FASTINFERENCE_KV_TYPE": "fp8",
+            "FASTINFERENCE_KV_TYPE": "turbo_int4",
             "FASTINFERENCE_FUSION_LEVEL": "2",
             # Prefill: SDPA on first full-attn chunk (faster than eager HF matmul; set "0" for strict HF parity).
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
@@ -78,7 +78,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         max_model_len=2048,
         max_run_seconds=240,
         stable_env={
-            "FASTINFERENCE_KV_TYPE": "fp8",
+            "FASTINFERENCE_KV_TYPE": "turbo_int4",
             "FASTINFERENCE_QWEN35_MOE_FP8": "1",
             "FASTINFERENCE_QWEN35_MOE_OFFLOAD": "1",
             "FASTINFERENCE_FUSION_LEVEL": "2",

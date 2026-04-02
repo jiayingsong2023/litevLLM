@@ -1002,9 +1002,10 @@ class Qwen3_5FullAttentionLayer(nn.Module):
     sigmoid gate on attention output before o_proj.
     """
 
-    def __init__(self, config: LiteConfig, quant_config, prefix="", use_moe: bool = False):
+    def __init__(self, config: LiteConfig, quant_config, prefix="", layer_idx: int = 0, use_moe: bool = False):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self._use_moe = use_moe
         self.hidden_act = getattr(config, "hidden_act", "silu")
         eps = getattr(config, "rms_norm_eps", 1e-6)
@@ -1117,14 +1118,21 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         q = q.squeeze(0)
         k = k.squeeze(0)
         k_cache, v_cache = kv_cache
+        kv_scale_cache = attn_metadata.get("kv_scale_cache")
+        if kv_scale_cache is not None:
+            k_scale_cache, v_scale_cache = kv_scale_cache[self.layer_idx]
+        else:
+            k_scale_cache, v_scale_cache = (None, None)
+
         from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
         from vllm.kernels.triton.paged_attention import paged_attention_v1
-
+        
         kv_cache_dtype = inf_config.kv_type if inf_config else attn_metadata.get("kv_cache_dtype", self.kv_cache_dtype)
         k_scale = inf_config.k_scale if inf_config else attn_metadata.get("k_scale", self._k_scale_float)
         v_scale = inf_config.v_scale if inf_config else attn_metadata.get("v_scale", self._v_scale_float)
-
-        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], kv_cache_dtype, k_scale, v_scale)
+        
+        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], kv_cache_dtype, k_scale, v_scale,
+                          k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
         block_tables = attn_metadata["block_tables"]
         seq_lens = attn_metadata["seq_lens"]
         is_prefill = attn_metadata.get("is_prefill", False)
@@ -1173,6 +1181,8 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 kv_cache_dtype,
                 k_scale,
                 v_scale,
+                k_scale_ptrs=k_scale_cache,
+                v_scale_ptrs=v_scale_cache,
                 num_kv_heads=nkv,
             )
 
@@ -1268,7 +1278,7 @@ class Qwen2Model(nn.Module):
             else:
                 self.layers.append(
                     Qwen3_5FullAttentionLayer(
-                        self.config, quant_config, f"model.layers.{i}"
+                        self.config, quant_config, f"model.layers.{i}", layer_idx=i
                     )
                 )
         self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
@@ -1291,7 +1301,7 @@ class Qwen2MoEModel(nn.Module):
                 )
             else:
                 self.layers.append(
-                    Qwen3_5FullAttentionLayer(self.config, quant_config, f"model.layers.{i}", use_moe=True)
+                    Qwen3_5FullAttentionLayer(self.config, quant_config, f"model.layers.{i}", layer_idx=i, use_moe=True)
                 )
         self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
 

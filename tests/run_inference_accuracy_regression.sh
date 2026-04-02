@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
-export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-1}"
+# KV defaults are now handled per-model inside this script.
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
@@ -52,16 +52,16 @@ fi
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
 echo "[1/3] TinyLlama"
-"${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
+FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
 
 echo "[2/3] Qwen3.5-9B AWQ"
-"${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
+FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
 if [[ "$SKIP_35B" == "1" ]]; then
   echo "[3/3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
 else
   echo "[3/3] Qwen3.5-35B AWQ (FP8-stable profile)"
-  FASTINFERENCE_KV_FP8=1 \
+  FASTINFERENCE_KV_TYPE=turbo_int4 \
   FASTINFERENCE_QWEN35_MOE_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
     uv run python tests/tools/quality_bar_spotcheck.py \
@@ -82,7 +82,7 @@ fi
 echo ""
 echo "=== Tier-A (verify_semantic_integrity, prefill-only) ==="
 echo "[A1] TinyLlama — Lite vs HF same tree"
-uv run python tests/verify_semantic_integrity.py \
+FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_TINYLLAMA" \
   --preset tinyllama \
   --hf-same-as-lite \
@@ -91,7 +91,7 @@ uv run python tests/verify_semantic_integrity.py \
   --apply-chat-template off
 
 echo "[A2] Qwen3.5-9B AWQ vs FP16 HF (HF may load on CPU when paths differ)"
-uv run python tests/verify_semantic_integrity.py \
+FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
   --hf-model "$HF_QWEN35_9B_FP16" \
@@ -104,7 +104,7 @@ elif [[ ! -d "$HF_QWEN35_35B_FP16" ]]; then
   echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (skipped: missing HF baseline dir '$HF_QWEN35_35B_FP16')"
 else
   echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (prefill-only, FP8-stable profile)"
-  FASTINFERENCE_KV_FP8=1 \
+  FASTINFERENCE_KV_TYPE=turbo_int4 \
   FASTINFERENCE_QWEN35_MOE_FP8=1 \
   FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
     uv run python tests/verify_semantic_integrity.py \

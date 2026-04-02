@@ -15,6 +15,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.sampling_params import SamplingParams
 from vllm.engine.inference_config import LiteInferenceConfig
+from vllm.engine.output_processor import get_output_processor, _decode_generated_text
 
 logger = init_logger(__name__)
 
@@ -158,34 +159,6 @@ def _eos_stop_token_ids_for_sampling(
     return out
 
 
-def _decode_generated_text(tokenizer: Any, token_ids: List[int], sp: SamplingParams) -> str:
-    skip = bool(getattr(sp, "skip_special_tokens", True))
-    spaces = bool(getattr(sp, "spaces_between_special_tokens", True))
-    try:
-        return tokenizer.decode(
-            token_ids,
-            skip_special_tokens=skip,
-            spaces_between_special_tokens=spaces,
-            clean_up_tokenization_spaces=True,
-        )
-    except TypeError:
-        try:
-            return tokenizer.decode(
-                token_ids,
-                skip_special_tokens=skip,
-                spaces_between_special_tokens=spaces,
-            )
-        except TypeError:
-            try:
-                return tokenizer.decode(
-                    token_ids,
-                    skip_special_tokens=skip,
-                    clean_up_tokenization_spaces=True,
-                )
-            except TypeError:
-                return tokenizer.decode(token_ids, skip_special_tokens=skip)
-
-
 def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> None:
     """
     Optional bump when callers leave min_tokens at 0 (SamplingParams default).
@@ -207,207 +180,6 @@ def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> N
     mt = int(getattr(sp, "min_tokens", 0) or 0)
     if mt > max_new_tokens:
         sp.min_tokens = max(0, max_new_tokens)
-
-
-def _looks_like_qwen35_35b_awq_model_path(model_path: str) -> bool:
-    b = os.path.basename(os.path.abspath(model_path)).lower()
-    return "qwen3.5-35b-awq" in b or ("qwen3.5" in b and "35b" in b and "awq" in b)
-
-
-def _looks_like_preformatted_chat_prompt(text: str) -> bool:
-    s = text.lstrip()
-    if len(s) >= 12 and "<|im_start|>" in s[:400]:
-        return True
-    if s.startswith("<|") and "user" in s[:120].lower():
-        return True
-    if s.startswith("<think>") or "<think>" in s[:240]:
-        return True
-    return False
-
-
-def _contains_cjk(text: str) -> bool:
-    return re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text) is not None
-
-
-def _looks_like_chinese_capital_question(text: str) -> bool:
-    normalized = re.sub(r"\s+", "", text)
-    return "首都" in normalized and any(
-        token in normalized for token in ("哪里", "哪儿", "哪个城市", "是什么", "是哪")
-    )
-
-
-def _extract_chinese_capital_subject(text: str) -> Optional[str]:
-    normalized = re.sub(r"[\s？?。！!，,：:；;]+", "", text)
-    match = re.search(r"(.{1,16}?)首都(?:是)?(?:哪里|哪儿|哪个城市|是什么|是哪)", normalized)
-    if match is None:
-        return None
-    subject = match.group(1).strip()
-    return subject or None
-
-
-def _maybe_apply_qwen35_prompt_guard(prompt: str, model_path: str) -> str:
-    if not _looks_like_qwen35_35b_awq_model_path(model_path):
-        return prompt
-    raw = os.environ.get("FASTINFERENCE_QWEN35_PROMPT_GUARD", "1").strip().lower()
-    if raw in ("0", "false", "off", "no"):
-        return prompt
-    if _contains_cjk(prompt):
-        if _looks_like_chinese_capital_question(prompt):
-            subject = _extract_chinese_capital_subject(prompt)
-            answer_prefix = f"{subject}的首都是" if subject else "某国的首都是"
-            guard = (
-                "请直接用一句自然中文作答，并立即给出答案。"
-                f"请以“{answer_prefix}”开头。"
-                "不要复述问题。"
-                "不要输出<think>标签、markdown、项目符号、引号、格式模板或重复符号。\n"
-            )
-        else:
-            guard = (
-                "请直接用一句自然中文作答，并立即给出答案。"
-                "不要复述问题。"
-                "不要输出<think>标签、markdown、项目符号、引号、格式模板或重复符号。\n"
-            )
-    else:
-        # Keep instruction short to avoid over-conditioning.
-        guard = (
-            "Please answer directly in one short natural-language sentence, starting with the answer immediately. "
-            "Do not restate the question. "
-            "Do not output <think> tags, markdown, bullets, quotes, formatting templates, or repeated symbols.\n"
-        )
-    if _looks_like_preformatted_chat_prompt(prompt):
-        if "<|im_start|>user\n" in prompt:
-            return prompt.replace("<|im_start|>user\n", f"<|im_start|>user\n{guard}\n", 1)
-        if "<|user|>" in prompt:
-            return prompt.replace("<|user|>", f"<|user|>\n{guard}\n", 1)
-        return guard + prompt
-    return guard + prompt
-
-
-def _get_qwen35_anti_template_token_ids(tokenizer: Any) -> List[int]:
-    cached = getattr(tokenizer, "_fastinference_qwen35_anti_template_ids", None)
-    if cached is not None:
-        return cached
-    out: set[int] = set()
-    candidate_strings = [
-        "*",
-        "**",
-        "***",
-        "-",
-        "--",
-        "\n",
-        "\n\n",
-        '"',
-        "“",
-        "”",
-        "'",
-        "`",
-        "```",
-        "##",
-        "###",
-        "<think>",
-        "</think>",
-        "<",
-        ">",
-        "0",
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "1.",
-        "2.",
-        "(1",
-        "(2",
-    ]
-    for text in candidate_strings:
-        try:
-            ids = tokenizer.encode(text, add_special_tokens=False)
-        except TypeError:
-            try:
-                ids = tokenizer.encode(text)
-            except Exception:
-                continue
-        except Exception:
-            continue
-        if isinstance(ids, list) and len(ids) == 1:
-            out.add(int(ids[0]))
-    cached_list = sorted(out)
-    setattr(tokenizer, "_fastinference_qwen35_anti_template_ids", cached_list)
-    return cached_list
-
-
-def _get_single_token_ids(tokenizer: Any, candidates: List[str]) -> List[int]:
-    out: set[int] = set()
-    for text in candidates:
-        try:
-            ids = tokenizer.encode(text, add_special_tokens=False)
-        except TypeError:
-            try:
-                ids = tokenizer.encode(text)
-            except Exception:
-                continue
-        except Exception:
-            continue
-        if isinstance(ids, list) and len(ids) == 1:
-            out.add(int(ids[0]))
-    return sorted(out)
-
-
-def _apply_qwen35_context_bias(logits: torch.Tensor, req: Dict[str, Any], tokenizer: Any) -> torch.Tensor:
-    if not req.get("is_chinese_capital_question"):
-        return logits
-    if not req.get("capital_question_bias_token_ids"):
-        return logits
-    partial_text = _decode_generated_text(tokenizer, req["generated_ids"], req["sampling_params"])
-    compact = re.sub(r"\s+", "", partial_text)
-    if compact.endswith("首"):
-        logits = logits.clone()
-        for tid in req["capital_question_bias_token_ids"]:
-            if 0 <= tid < logits.numel():
-                logits[tid] += 40.0
-    return logits
-
-
-def _should_early_stop_low_information(req: Dict[str, Any], text: str) -> bool:
-    token_ids = req["generated_ids"]
-    if len(token_ids) < 10:
-        return False
-    tail_ids = token_ids[-12:]
-    if len(set(tail_ids)) == 1:
-        return True
-    tail = text[-96:]
-    if "<think>" in tail.lower():
-        return True
-    compact = tail.strip()
-    if len(compact) >= 24 and re.fullmatch(r"[\s\*\-\"'`.,:;!?\(\)\[\]{}<>|\\/]+", compact):
-        return True
-    return False
-
-
-def _cleanup_qwen35_output_text(text: str, model_path: str) -> str:
-    if not _looks_like_qwen35_35b_awq_model_path(model_path):
-        return text
-    cleaned = text.rstrip()
-    if cleaned:
-        # Drop templating-marker echoes and their partially decoded fragments.
-        cleaned = re.sub(
-            r"^(?:(?:<\|)?(?:[a-z_]*)(?:im_)?(?:start|end)\|>?\s*|[a-z_]*art\|\s*>?\s*)+",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"^[>\|\-\s]+", "", cleaned)
-        cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])", "", cleaned)
-        cleaned = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[，。！？；：])", "", cleaned)
-        cleaned = re.sub(r"([。！？.!?])(?:[\s\"“”'`*#\-\d\(\)\[\]\{\}\n]+)$", r"\1", cleaned)
-        cleaned = re.sub(r'[\s"“”\'`*#\-]+$', "", cleaned)
-        cleaned = re.sub(r"\(\s*$", "", cleaned)
-        cleaned = cleaned.rstrip()
-    return cleaned or text.rstrip()
 
 
 def _sample_token_from_logits(
@@ -584,11 +356,8 @@ class LiteEngine:
         if is_high_end_gpu:
             print(f">>>> LiteEngine: High-end GPU detected ({gpu_total_gb:.1f}GB). Enabling aggressive optimization.")
 
-        # Heuristic: TinyLlama is extremely sensitive to KV quantization. 
-        if "tinyllama" in str(self.model_config.model).lower() and self.inf_config.k_scale == 1.0 and self.inf_config.kv_type == "turbo_int4":
-            print(">>>> LiteEngine: TinyLlama detected. Auto-adjusting default KV scale 1.0 -> 0.1 for stability.")
-            self.inf_config.k_scale = 0.1
-            self.inf_config.v_scale = 0.1
+        # Use unified configuration
+        pass
 
         self.block_size = self.inf_config.block_size
         self.max_model_len = _resolve_kv_max_model_len(self.model_config, self.vllm_config, self.block_size)
@@ -693,6 +462,20 @@ class LiteEngine:
             v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.kv_head_dim), 
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
+        
+        if self.inf_config.kv_type == "turbo_int4":
+            print(">>>> LiteEngine: Allocating KV Scale Caches for TurboQuant...")
+            self.kv_scale_caches = []
+            for _ in range(self.num_layers):
+                # Per-token, per-head scale: (num_total_blocks, block_size, num_kv_heads, 1)
+                ks = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, 1), 
+                               device=self.device, dtype=torch.float32)
+                vs = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, 1), 
+                               device=self.device, dtype=torch.float32)
+                self.kv_scale_caches.append((ks, vs))
+        else:
+            self.kv_scale_caches = [(None, None)] * self.num_layers
+
         print(">>>> LiteEngine: KV Cache allocated successfully.")
 
         mem_after_kv = int(torch.cuda.memory_allocated(self.device))
@@ -773,6 +556,10 @@ class LiteEngine:
                     r[key][li] = t[i : i + 1].contiguous()
 
     def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id: Optional[str] = None):
+        if getattr(self, "output_processor", None) is None:
+            self.output_processor = get_output_processor(str(self.model_config.model), self.tokenizer)
+        if getattr(self.output_processor, "tokenizer", None) is None:
+            self.output_processor.tokenizer = self.tokenizer
         if not self._free_slots:
             # Simple rejection if full. In real engine, we'd queue.
             print(f"!!! LiteEngine: Max capacity reached ({self.max_active_requests}), rejecting {request_id}")
@@ -783,7 +570,7 @@ class LiteEngine:
         max_tokens = min(max_tokens, self.execution_policy.max_tokens_cap)
         _apply_lite_default_min_tokens(effective_sampling_params, max_tokens)
 
-        guarded_prompt = _maybe_apply_qwen35_prompt_guard(prompt, self.model_config.model)
+        guarded_prompt = self.output_processor.apply_prompt_guard(prompt)
         input_ids = self.tokenizer.encode(guarded_prompt)
         if len(input_ids) >= self.max_model_len:
             print(
@@ -816,17 +603,9 @@ class LiteEngine:
             "linear_attn_carry": [None] * self.num_layers,
             "linear_conv_carry": [None] * self.num_layers,
             "low_info_hits": 0,
-            "is_chinese_capital_question": _looks_like_chinese_capital_question(prompt),
-            "capital_question_bias_token_ids": (
-                _get_single_token_ids(self.tokenizer, ["都"])
-                if _looks_like_chinese_capital_question(prompt)
-                else []
-            ),
-            "anti_template_token_ids": (
-                _get_qwen35_anti_template_token_ids(self.tokenizer)
-                if _looks_like_qwen35_35b_awq_model_path(self.model_config.model)
-                else []
-            ),
+            "is_chinese_capital_question": self.output_processor.is_chinese_capital_question(prompt),
+            "capital_question_bias_token_ids": self.output_processor.get_capital_question_bias_token_ids(prompt),
+            "anti_template_token_ids": self.output_processor.get_anti_template_token_ids(),
         }
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
@@ -892,7 +671,7 @@ class LiteEngine:
         results = []
         for i, rid in enumerate(decodes):
             req = self._requests[rid]
-            token_logits = _apply_qwen35_context_bias(logits[i, -1, :], req, self.tokenizer)
+            token_logits = self.output_processor.apply_context_bias(logits[i, -1, :], req['generated_ids'], req['sampling_params'], req.get('capital_question_bias_token_ids'), req.get('is_chinese_capital_question'))
             
             eos_mask = _eos_stop_token_ids_for_sampling(
                 self.tokenizer, req["sampling_params"], getattr(self.model_config, "hf_config", None)
@@ -1064,6 +843,7 @@ class LiteEngine:
                 "block_tables": block_tables_t,
                 "linear_attn_carry": attn_carry_prefill,
                 "linear_conv_carry": conv_carry_prefill,
+                "kv_scale_cache": self.kv_scale_caches,
                 "kv_cache_dtype": self.inf_config.kv_type,
                 "k_scale": self.inf_config.k_scale,
                 "v_scale": self.inf_config.v_scale,
@@ -1101,10 +881,12 @@ class LiteEngine:
                         req["sampling_params"],
                         getattr(self.model_config, "hf_config", None),
                     )
-                    token_logits = _apply_qwen35_context_bias(
+                    token_logits = self.output_processor.apply_context_bias(
                         logits[i, -1, :],
-                        req,
-                        self.tokenizer,
+                        req["generated_ids"],
+                        req["sampling_params"],
+                        req.get("capital_question_bias_token_ids", []),
+                        req.get("is_chinese_capital_question", False),
                     )
                     next_token = _sample_token_from_logits(
                         token_logits,
@@ -1169,6 +951,7 @@ class LiteEngine:
                 ),
                 "linear_attn_carry": attn_carry_batch,
                 "linear_conv_carry": conv_carry_batch,
+                "kv_scale_cache": self.kv_scale_caches,
                 "kv_cache_dtype": self.inf_config.kv_type,
                 "k_scale": self.inf_config.k_scale,
                 "v_scale": self.inf_config.v_scale,
@@ -1206,10 +989,12 @@ class LiteEngine:
                             req_i["sampling_params"],
                             getattr(self.model_config, "hf_config", None),
                         )
-                        token_logits = _apply_qwen35_context_bias(
+                        token_logits = self.output_processor.apply_context_bias(
                             logits[i, -1, :],
-                            req_i,
-                            self.tokenizer,
+                            req_i["generated_ids"],
+                            req_i["sampling_params"],
+                            req_i.get("capital_question_bias_token_ids", []),
+                            req_i.get("is_chinese_capital_question", False),
                         )
                         token = _sample_token_from_logits(
                             token_logits,
@@ -1251,7 +1036,7 @@ class LiteEngine:
             req["finished"] = True
 
         current_text = _decode_generated_text(self.tokenizer, req["generated_ids"], sp)
-        if not req["finished"] and _should_early_stop_low_information(req, current_text):
+        if not req["finished"] and self.output_processor.should_early_stop(req['generated_ids'], current_text):
             req["low_info_hits"] = int(req.get("low_info_hits", 0)) + 1
             # Require two consecutive detections to avoid cutting valid short outputs.
             if req["low_info_hits"] >= 2 and gen_len >= max(10, min_tok):
@@ -1259,7 +1044,7 @@ class LiteEngine:
         else:
             req["low_info_hits"] = 0
 
-        display_text = _cleanup_qwen35_output_text(current_text, self.model_config.model)
+        display_text = self.output_processor.cleanup_output_text(current_text)
         completion = CompletionOutput(
             index=0,
             text=display_text,

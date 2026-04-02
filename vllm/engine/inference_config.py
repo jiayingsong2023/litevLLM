@@ -5,11 +5,6 @@ from typing import Optional
 
 @dataclass
 class LiteInferenceConfig:
-    # KV Cache Configuration
-    kv_type: str  # 'turbo_int4', 'fp8', 'fp16'
-    k_scale: float
-    v_scale: float
-    
     # Model Optimization Configuration
     # 0: No fusion
     # 1: Basic fusion (AB Gemm)
@@ -24,12 +19,22 @@ class LiteInferenceConfig:
     # Qwen-specific stability
     use_prompt_guard: bool
 
+    # KV Cache Configuration
+    kv_type: str = "auto"
+    k_scale: float = 1.0
+    v_scale: float = 1.0
+
     @classmethod
     def from_env(cls) -> "LiteInferenceConfig":
-        # Resolve KV Type (Defaulting to fp8 for balanced stability and memory)
+        # Resolve KV Type (Checking legacy FP8 toggle first)
         kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
+        kv_fp8_env = os.environ.get("FASTINFERENCE_KV_FP8", "0")
+        
         if kv_type == "auto":
-            kv_type = "fp8"
+            if kv_fp8_env == "1":
+                kv_type = "fp8"
+            else:
+                kv_type = "turbo_int4"
         
         # Resolve Fusion Level (Consolidating QWEN35_FUSED_*)
         # Default to level 2 (Aggressive) if not set

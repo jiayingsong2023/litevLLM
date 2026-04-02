@@ -18,9 +18,10 @@ def get_rotary_embedding(config: LiteConfig):
                     base=config.rope_theta, is_neox_style=True)
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LiteConfig, quant_config, prefix=""):
+    def __init__(self, config: LiteConfig, quant_config, prefix="", layer_idx=0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.input_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
         self.self_attn = nn.Module()
         self.self_attn.num_heads = config.num_attention_heads
@@ -66,7 +67,16 @@ class LlamaDecoderLayer(nn.Module):
             v_scale = inf_config.v_scale if inf_config else (attn_metadata.get("v_scale", 1.0) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "v_scale", 1.0))
 
             k_cache, v_cache = kv_cache
-            reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), k_cache, v_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale)
+            kv_scale_cache = attn_metadata.get("kv_scale_cache")
+            if kv_scale_cache is not None:
+                k_scale_cache, v_scale_cache = kv_scale_cache[self.layer_idx]
+            else:
+                k_scale_cache, v_scale_cache = (None, None)
+
+            reshape_and_cache(k.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), 
+                              v.reshape(-1, self.self_attn.num_kv_heads, self.self_attn.head_dim).contiguous(), 
+                              k_cache, v_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale,
+                              k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
             
             attn_in = torch.empty((bs * seq, self.self_attn.num_heads, self.self_attn.head_dim), device=q.device, dtype=q.dtype)
             block_tables = attn_metadata.get("block_tables", None) if isinstance(attn_metadata, dict) else getattr(attn_metadata, "block_tables", None)
@@ -87,6 +97,8 @@ class LlamaDecoderLayer(nn.Module):
                 bs, seq, is_prefill, seq_lens, block_tables, q.device
             )
             
+            # For paged_attention, we need per-block scale pointers if using row-scales
+            # In LiteEngine, we can pass the scale caches directly as they match KV layout.
             paged_attention_v1(
                 attn_in,
                 q.reshape(bs * seq, self.self_attn.num_heads, self.self_attn.head_dim).contiguous(),
@@ -102,6 +114,8 @@ class LlamaDecoderLayer(nn.Module):
                 kv_cache_dtype,
                 k_scale,
                 v_scale,
+                k_scale_ptrs=k_scale_cache, # Passing full tensor; kernel uses block_idx/stride
+                v_scale_ptrs=v_scale_cache,
                 num_kv_heads=self.self_attn.num_kv_heads,
             )
             out = attn_in.view(bs, seq, -1)
@@ -123,8 +137,8 @@ class LlamaModel(nn.Module):
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
         # Standard: model.embed_tokens, model.layers.0.xxx, model.norm
         # If prefix is 'model', name of layer 0's q_proj will be 'layers.0.q_proj' within this module
-        # but in LlamaForCausalLM it will be 'model.layers.0.q_proj'
-        self.layers = nn.ModuleList([LlamaDecoderLayer(self.config, quant_config, f"layers.{i}") for i in range(self.config.num_hidden_layers)])
+        # so parameters are model.embed_tokens, model.layers.0.xxx
+        self.layers = nn.ModuleList([LlamaDecoderLayer(self.config, quant_config, f"layers.{i}", layer_idx=i) for i in range(self.config.num_hidden_layers)])
         self.norm = RMSNorm(self.config.hidden_size, eps=_get_eps(self.config))
     def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
         if input_ids.dtype == torch.long: x = self.embed_tokens(input_ids)
