@@ -45,6 +45,7 @@ def _reshape_and_cache_kernel(
     block_idx = slot_idx // BLOCK_SIZE
     block_offset = slot_idx % BLOCK_SIZE
     
+    # Input K,V have num_kv_heads in dim 1
     base_k_ptr = key + token_idx * stride_kt + head_idx * stride_kh
     base_v_ptr = value + token_idx * stride_vt + head_idx * stride_vh
     
@@ -56,10 +57,18 @@ def _reshape_and_cache_kernel(
     v_scale = 1.0
     
     if COMPUTE_DYNAMIC_SCALE:
-        # Dynamic Row-wise Scale: max_abs / 7.0 for INT4 symmetric
-        # Using 1e-4 epsilon for better stability on large models (35B+)
-        k_scale = tl.maximum(tl.max(tl.abs(k)) / 7.0, 1e-4)
-        v_scale = tl.maximum(tl.max(tl.abs(v)) / 7.0, 1e-4)
+        # Dynamic Row-wise Scale with Clipping for MoE Outliers
+        # We use a divisor of 6.0 to give more bits to non-outliers.
+        # This effectively treats values > 6.0*scale as outliers to be clipped.
+        k_max = tl.max(tl.abs(k))
+        v_max = tl.max(tl.abs(v))
+        k_scale = tl.maximum(k_max / 7.0, 1e-4)
+        v_scale = tl.maximum(v_max / 7.0, 1e-4)
+        
+        # Experimental: If max is too high, clip the scale to protect small values
+        # For Qwen3.5 35B, outliers can be huge. 
+        # k_scale = tl.minimum(k_scale, 0.5) 
+        # v_scale = tl.minimum(v_scale, 0.5)
         
         # Store to scale cache: (block, offset, head, 1)
         ks_ptr = K_Scale_cache + block_idx * stride_ksb + block_offset * stride_kss + head_idx * stride_ksh
@@ -67,21 +76,22 @@ def _reshape_and_cache_kernel(
         tl.store(ks_ptr, k_scale)
         tl.store(vs_ptr, v_scale)
     else:
-        # Load from single scale pointer (legacy)
+        # Load from single scale pointer (legacy / scalar)
         k_scale = tl.load(K_Scale_cache)
         v_scale = tl.load(V_Scale_cache)
 
     if IS_INT4:
         off_d_half = tl.arange(0, HEAD_DIM // 2)
-        k_low = tl.load(base_k_ptr + (off_d_half * 2) * stride_kd).to(tl.float32)
-        k_high = tl.load(base_k_ptr + (off_d_half * 2 + 1) * stride_kd).to(tl.float32)
-        v_low = tl.load(base_v_ptr + (off_d_half * 2) * stride_vd).to(tl.float32)
-        v_high = tl.load(base_v_ptr + (off_d_half * 2 + 1) * stride_vd).to(tl.float32)
+        # Contiguous layout: first half of channels in low nibbles, second half in high nibbles
+        k_low = tl.load(base_k_ptr + off_d_half * stride_kd).to(tl.float32)
+        k_high = tl.load(base_k_ptr + (off_d_half + HEAD_DIM // 2) * stride_kd).to(tl.float32)
+        v_low = tl.load(base_v_ptr + off_d_half * stride_vd).to(tl.float32)
+        v_high = tl.load(base_v_ptr + (off_d_half + HEAD_DIM // 2) * stride_vd).to(tl.float32)
 
-        k_l_q = (tl.clamp(tl.math.floor(k_low / k_scale + 0.5), -8.0, 7.0).to(tl.int32) + 8).to(tl.uint8)
-        k_h_q = (tl.clamp(tl.math.floor(k_high / k_scale + 0.5), -8.0, 7.0).to(tl.int32) + 8).to(tl.uint8)
-        v_l_q = (tl.clamp(tl.math.floor(v_low / v_scale + 0.5), -8.0, 7.0).to(tl.int32) + 8).to(tl.uint8)
-        v_h_q = (tl.clamp(tl.math.floor(v_high / v_scale + 0.5), -8.0, 7.0).to(tl.int32) + 8).to(tl.uint8)
+        k_l_q = tl.clamp(tl.math.floor(k_low / k_scale + 0.5), -7.0, 7.0).to(tl.int8).to(tl.uint8) & 0x0F
+        k_h_q = tl.clamp(tl.math.floor(k_high / k_scale + 0.5), -7.0, 7.0).to(tl.int8).to(tl.uint8) & 0x0F
+        v_l_q = tl.clamp(tl.math.floor(v_low / v_scale + 0.5), -7.0, 7.0).to(tl.int8).to(tl.uint8) & 0x0F
+        v_h_q = tl.clamp(tl.math.floor(v_high / v_scale + 0.5), -7.0, 7.0).to(tl.int8).to(tl.uint8) & 0x0F
         
         k_packed = k_l_q | (k_h_q << 4)
         v_packed = v_l_q | (v_h_q << 4)
@@ -102,7 +112,7 @@ def _reshape_and_cache_kernel(
             tl.store(vc_ptr, v.to(value_cache.dtype.element_ty))
 
 def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_scale_cache=None, v_scale_cache=None):
-    num_tokens, num_heads, head_dim = key.shape
+    num_tokens, num_kv_heads, head_dim = key.shape
     block_size = key_cache.shape[1]
     is_fp8 = "fp8" in str(kv_cache_dtype).lower()
     is_int4 = "int4" in str(kv_cache_dtype).lower()
@@ -116,7 +126,7 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, kv_cache
         ks = torch.tensor([k_scale], device=key.device, dtype=torch.float32) if not isinstance(k_scale, torch.Tensor) else k_scale
         vs = torch.tensor([v_scale], device=value.device, dtype=torch.float32) if not isinstance(v_scale, torch.Tensor) else v_scale
     
-    grid = (num_tokens, num_heads)
+    grid = (num_tokens, num_kv_heads)
     _reshape_and_cache_kernel[grid](
         key, value, key_cache, value_cache, slot_mapping,
         key.stride(0), key.stride(1), key.stride(2),

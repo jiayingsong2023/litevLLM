@@ -1142,7 +1142,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         kv_start_t = attn_metadata.get("kv_start_indices")
         kv_chunk_start = int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
 
-        use_direct_prefill = seq > 1 and is_prefill and kv_chunk_start == 0
+        # TurboQuant INT4 requires paged_attention for dequantization; skip direct prefill path
+        is_int4 = "int4" in str(kv_cache_dtype).lower()
+        use_direct_prefill = seq > 1 and is_prefill and kv_chunk_start == 0 and not is_int4
         use_sdpa_prefill = use_direct_prefill and _env_qwen35_sdpa_prefill_enabled()
         if use_direct_prefill and not use_sdpa_prefill:
             # HF-parity: same as transformers eager_attention_forward + causal (not Triton paged softmax).
@@ -1166,6 +1168,22 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
                 bs, seq, is_prefill, seq_lens, block_tables, q.device
             )
+
+            # Kernel expects (batch_size, max_blocks) with stride_bt_seq.
+            # For flattened prefill (n_tokens, max_blocks), we MUST use stride 0
+            # for the logical "batch" dimension if we want it to treat each token
+            # as a separate sequence correctly.
+            class MockTensor:
+                def __init__(self, t):
+                    self.t = t
+                    self.shape = t.shape
+                def stride(self, dim=None):
+                    if dim is None: return self.t.stride()
+                    if dim == 0: return 0
+                    return self.t.stride(dim)
+                def __getattr__(self, name):
+                    return getattr(self.t, name)
+
             paged_attention_v1(
                 attn_in,
                 q.contiguous(),
@@ -1173,7 +1191,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 v_cache,
                 nh,
                 hd**-0.5,
-                block_tables_ext,
+                MockTensor(block_tables_ext),
                 seq_lens_ext,
                 k_cache.shape[1],
                 max_ctx,

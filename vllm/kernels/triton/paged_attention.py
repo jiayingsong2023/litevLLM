@@ -39,8 +39,9 @@ def _paged_attention_kernel(
 
     if IS_INT4:
         offs_d_half = tl.arange(0, BLOCK_D // 2)
-        q_low = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + (offs_d_half * 2) * stride_q_dim).to(tl.float32)
-        q_high = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + (offs_d_half * 2 + 1) * stride_q_dim).to(tl.float32)
+        # Contiguous layout: first half of channels in low nibbles, second half in high nibbles
+        q_low = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + offs_d_half * stride_q_dim).to(tl.float32)
+        q_high = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + (offs_d_half + BLOCK_D // 2) * stride_q_dim).to(tl.float32)
     else:
         off_q = seq_idx * stride_q_seq + head_idx * stride_q_head + tl.arange(0, BLOCK_D) * stride_q_dim
         q = tl.load(Q_ptr + off_q).to(tl.float32)
@@ -71,26 +72,29 @@ def _paged_attention_kernel(
         if HAS_ROW_SCALE:
             k_scale = tl.load(ks_base_ptr + offs_n * stride_ks_token + kv_head_idx * stride_ks_head, mask=block_mask, other=1.0)
             v_scale = tl.load(vs_base_ptr + offs_n * stride_vs_token + kv_head_idx * stride_vs_head, mask=block_mask, other=1.0)
+            k_scale = k_scale[:, None]
+            v_scale = v_scale[:, None]
 
         if IS_INT4:
             offs_d_half_2d = tl.arange(0, BLOCK_D // 2)[None, :]
             off_kv = offs_n[:, None] * stride_k_token + kv_head_idx * stride_k_head + offs_d_half_2d * stride_k_dim
-            k_packed = tl.load(k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv, mask=block_mask[:, None], other=0).to(tl.uint8)
-            k_l = ((k_packed & 0x0F).to(tl.float32) - 8.0) * k_scale[:, None]
-            k_h = (((k_packed >> 4) & 0x0F).to(tl.float32) - 8.0) * k_scale[:, None]
+            k_packed = tl.load(k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv, mask=block_mask[:, None], other=0).to(tl.int32)
+            # Manual sign-extension for 4-bit signed
+            k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
+            k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
             qk = tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
         else:
             offs_d_2d = tl.arange(0, BLOCK_D)[None, :]
             off_kv = offs_n[:, None] * stride_k_token + kv_head_idx * stride_k_head + offs_d_2d * stride_k_dim
             k = tl.load(k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
-            if IS_FP8: k = (k.to(tl.float32) * k_scale[:, None])
+            if IS_FP8: k = (k.to(tl.float32) * k_scale)
             qk = tl.sum(q[None, :] * k, axis=1) * scale
 
         qk = tl.where(block_mask, qk, -float('inf'))
         m_curr = tl.max(qk, axis=0); m_new = tl.maximum(m_i, m_curr)
         
-        # Softmax stabilization
-        delta_m = (m_i - m_new).to(tl.float32)
+        # Guard against -inf - (-inf) to avoid NaN
+        delta_m = tl.where(m_i == -float('inf'), 0.0, m_i - m_new)
         alpha = tl.exp(delta_m).to(tl.float32)
         
         p = tl.exp((qk - m_new).to(tl.float32)).to(tl.float32)
@@ -102,14 +106,15 @@ def _paged_attention_kernel(
         l_new = tl.maximum(l_new, 1e-20)
         
         if IS_INT4:
-            v_packed = tl.load(v_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv, mask=block_mask[:, None], other=0).to(tl.uint8)
-            v_l = ((v_packed & 0x0F).to(tl.float32) - 8.0) * v_scale[:, None]
-            v_h = (((v_packed >> 4) & 0x0F).to(tl.float32) - 8.0) * v_scale[:, None]
+            v_packed = tl.load(v_base_ptr.to(tl.pointer_type(tl.uint8)) + offs_n[:, None] * stride_v_token + kv_head_idx * stride_v_head + offs_d_half_2d * stride_v_dim, mask=block_mask[:, None], other=0).to(tl.int32)
+            # Manual sign-extension for 4-bit signed
+            v_l = ((v_packed << 28) >> 28).to(tl.float32) * v_scale
+            v_h = ((v_packed << 24) >> 28).to(tl.float32) * v_scale
             acc_low = acc_low * alpha + tl.sum(p[:, None] * v_l, axis=0)
             acc_high = acc_high * alpha + tl.sum(p[:, None] * v_h, axis=0)
         else:
-            v = tl.load(v_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
-            if IS_FP8: v = (v.to(tl.float32) * v_scale[:, None])
+            v = tl.load(v_base_ptr + offs_n[:, None] * stride_v_token + kv_head_idx * stride_v_head + offs_d_2d * stride_v_dim, mask=block_mask[:, None], other=0.0)
+            if IS_FP8: v = (v.to(tl.float32) * v_scale)
             acc_full = acc_full * alpha + tl.sum(p[:, None] * v, axis=0)
         
         l_i = l_new; m_i = m_new
@@ -117,16 +122,16 @@ def _paged_attention_kernel(
     off_out_base = seq_idx * stride_out_seq + head_idx * stride_out_head
     inv_l_i = 1.0 / tl.maximum(l_i, 1e-20)
     if IS_INT4:
-        # Standard Online Softmax normalization
-        res_low = (acc_low * inv_l_i).to(Out_ptr.dtype.element_ty)
-        res_high = (acc_high * inv_l_i).to(Out_ptr.dtype.element_ty)
+        # Standard Online Softmax normalization in float32
+        res_low = (acc_low * inv_l_i)
+        res_high = (acc_high * inv_l_i)
         off_d_half = tl.arange(0, BLOCK_D // 2)
-        tl.store(Out_ptr + off_out_base + (off_d_half * 2) * stride_out_dim, res_low)
-        tl.store(Out_ptr + off_out_base + (off_d_half * 2 + 1) * stride_out_dim, res_high)
+        tl.store(Out_ptr + off_out_base + off_d_half * stride_out_dim, res_low.to(Out_ptr.dtype.element_ty))
+        tl.store(Out_ptr + off_out_base + (off_d_half + BLOCK_D // 2) * stride_out_dim, res_high.to(Out_ptr.dtype.element_ty))
     else:
-        out = (acc_full * inv_l_i).to(Out_ptr.dtype.element_ty)
+        out = (acc_full * inv_l_i)
         off_d = tl.arange(0, BLOCK_D)
-        tl.store(Out_ptr + off_out_base + off_d * stride_out_dim, out)
+        tl.store(Out_ptr + off_out_base + off_d * stride_out_dim, out.to(Out_ptr.dtype.element_ty))
 
 def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, k_scale_ptrs=None, v_scale_ptrs=None, **kwargs):
     num_seqs, _num_heads_check, head_size = query.shape

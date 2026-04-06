@@ -126,14 +126,20 @@ def _fused_paged_prefill_attn_kernel(
         
         m_ij = tl.max(qk, axis=1)
         m_next = tl.maximum(m_i, m_ij)
-        alpha = tl.exp((m_i - m_next).to(tl.float32)).to(tl.float32)
+        
+        # Guard against -inf - (-inf) to avoid NaN
+        delta_m = tl.where(m_i == NEG_INF, 0.0, m_i - m_next)
+        alpha = tl.exp(delta_m).to(tl.float32)
+        
         p = tl.exp((qk - m_next[:, None]).to(tl.float32)).to(tl.float32)
         p = tl.where(mask, p, 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v_block.to(tl.float16))
         m_i = m_next
-
-    acc = acc / (l_i[:, None] + 1e-6)
+    
+    # Standard Online Softmax cleanup
+    l_i = tl.maximum(l_i, 1e-20)
+    acc = acc / l_i[:, None]
     tl.store(Out + off_m[:, None] * stride_ob + cur_head_idx * stride_oh + off_d[None, :], acc.to(Out.dtype.element_ty))
 
 def fused_prefill_attention(
