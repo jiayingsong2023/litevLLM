@@ -50,6 +50,10 @@ if [[ "$SKIP_35B" != "1" ]]; then
   require_model_dir "$MODEL_QWEN35_35B_AWQ" "Qwen3.5-35B-AWQ"
 fi
 
+# Model Optimization Defaults for MoE (35B+)
+export FASTINFERENCE_QWEN35_MOE_FP8=1
+export FASTINFERENCE_QWEN35_MOE_OFFLOAD=1
+
 echo "=== Tier-B (quality_bar_spotcheck) ==="
 echo "[1/3] TinyLlama"
 FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
@@ -62,8 +66,6 @@ if [[ "$SKIP_35B" == "1" ]]; then
 else
   echo "[3/3] Qwen3.5-35B AWQ (FP8-stable profile)"
   FASTINFERENCE_KV_TYPE=fp8 \
-  FASTINFERENCE_QWEN35_MOE_FP8=1 \
-  FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
     uv run python tests/tools/quality_bar_spotcheck.py \
       --model "$MODEL_QWEN35_35B_AWQ" \
       --quant awq \
@@ -90,7 +92,7 @@ FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
   --prefill-only \
   --apply-chat-template off
 
-echo "[A2] Qwen3.5-9B AWQ vs FP16 HF (HF may load on CPU when paths differ)"
+echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
 FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
@@ -104,9 +106,7 @@ elif [[ ! -d "$HF_QWEN35_35B_FP16" ]]; then
   echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (skipped: missing HF baseline dir '$HF_QWEN35_35B_FP16')"
 else
   echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (prefill-only, FP8-stable profile)"
-  FASTINFERENCE_KV_TYPE=turbo_int4 \
-  FASTINFERENCE_QWEN35_MOE_FP8=1 \
-  FASTINFERENCE_QWEN35_MOE_OFFLOAD=1 \
+  FASTINFERENCE_KV_TYPE=fp8 \
     uv run python tests/verify_semantic_integrity.py \
       --model "$MODEL_QWEN35_35B_AWQ" \
       --preset qwen35_35b_moe_awq \
