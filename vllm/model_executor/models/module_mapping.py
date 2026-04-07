@@ -17,28 +17,8 @@ class LiteModelMapping:
         "lm_head": ["output", "lm_head"]
     }
 
-    # DeepSeek Mapping (MLA)
-    _DEEPSEEK_MAPPING = {
-        "self_attn.qkv_proj": ["attn_q_a_proj", "attn_q_b_proj", "attn_kv_a_proj", "attn_kv_b_proj"],
-        "mlp": ["feed_forward", "mlp"], # MoE specific
-    }
-
-    # GLM Mapping
-    _GLM_MAPPING = {
-        "self_attn.qkv_proj": ["query_key_value"],
-        "self_attn.o_proj": ["dense"],
-        "mlp.gate_up_proj": ["dense_h_to_4h"],
-        "mlp.down_proj": ["dense_4h_to_h"],
-    }
-
     @staticmethod
     def get_mapping(arch: str) -> Dict[str, List[str]]:
-        if "Qwen" in arch or "Llama" in arch:
-            return LiteModelMapping._LLAMA_MAPPING
-        if "Deepseek" in arch:
-            return {**LiteModelMapping._LLAMA_MAPPING, **LiteModelMapping._DEEPSEEK_MAPPING}
-        if "Glm" in arch:
-            return {**LiteModelMapping._LLAMA_MAPPING, **LiteModelMapping._GLM_MAPPING}
         return LiteModelMapping._LLAMA_MAPPING
 
     @staticmethod

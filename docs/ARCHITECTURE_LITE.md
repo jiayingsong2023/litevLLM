@@ -11,7 +11,7 @@ FastInference 是对 vLLM 的一种“外科手术式”重构，目标是建立
 ## 2. 精简版加载器 (Lite ModelLoader)
 针对 Safetensors 和 AWQ 架构，我们优化了加载逻辑：
 - **深层后缀匹配**: 自动识别 `layers.{i}.{proj}.{attr}` 模式，完美支持 Qwen/Llama 系列的非标准权重 Key。
-- **配置强制修正**: 自动补全 DeepSeek/Qwen3.5 系列的关键元数据（如 `head_dim`, `kv_lora_rank` 等）。
+- **配置强制修正**: 自动补全 Qwen3.5 系列的关键元数据（如 `head_dim` 等）。
 - **[DEPRECATED]**: 已彻底移除对 GGUF 及其相关 3D 专家解压逻辑的支持，以换取极简的代码维护性。
 
 ## 3. 高性能注意力体系 (High-Performance Attention)
