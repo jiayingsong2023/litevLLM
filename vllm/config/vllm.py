@@ -19,3 +19,6 @@ class VllmConfig:
         self.scheduler_config = scheduler_config
         self.load_config = load_config
         self.quant_config = quant_config
+        self.runtime_config = None
+        self.model_capabilities = None
+        self.runtime_policy_mode = "auto"

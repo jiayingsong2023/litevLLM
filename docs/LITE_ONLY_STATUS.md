@@ -14,7 +14,20 @@ The only official runtime path is:
 - Offline sync: `vllm.entrypoints.llm.LLM` -> `vllm.engine.lite_engine.LiteEngine`
 - Async/server path: `vllm.engine.async_llm.AsyncLLM` -> `vllm.engine.lite_engine.LiteEngine`
 
-This means offline and async generation now share the same engine core, request lifecycle, KV allocation logic, scheduling, and output processing hooks.
+This means offline and async generation share the same lite runtime core, but that core is now internally decomposed into:
+
+- `vllm/serving/config_builder.py`
+- `vllm/adapters/*`
+- `vllm/engine/step_scheduler.py`
+- `vllm/engine/request_scheduler.py`
+- `vllm/engine/prefill_executor.py`
+- `vllm/engine/decode_executor.py`
+- `vllm/engine/sampling_driver.py`
+- `vllm/engine/output_pipeline.py`
+- `vllm/engine/runtime_observer.py`
+- `vllm/engine/errors.py`
+
+`LiteEngine` remains the orchestrator, but it is no longer the sole owner of request state, async loop management, sampling logic, output assembly, or prefill/decode execution.
 
 ## What Was Removed
 - `Qwen3.5-35B` was removed from default docs, regression, and benchmark entrypoints.
@@ -38,19 +51,22 @@ Legacy `FASTINFERENCE_QWEN35_MOE_*` names are still accepted as compatibility al
 - Some upstream-style modules still exist for reuse, but they are not the official lite-only execution path.
 
 ## Regression Status
-Validated after the refactor:
+Validated after the current refactor set:
 
 - `bash tests/run_regression_suite.sh`
-- `bash tests/run_inference_accuracy_regression.sh`
+- `SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`
+- `uv run pytest tests/test_async_runtime_contracts.py -q`
+- `uv run pytest tests/test_step_scheduler.py -q`
+- `uv run pytest tests/test_runtime_observer.py -q`
 
-Both passed on the current lite-only support surface.
+All passed on the current lite-only support surface.
 
 ---
 
-# Gemma 4 26B A4B Onboarding Checklist
+# Adapter / Policy Onboarding Checklist
 
 ## Adapter Interfaces
-Add a model adapter module, for example `vllm/model_executor/adapters/gemma4_26b_a4b.py`, with responsibilities:
+Add a model adapter module under `vllm/adapters/`, for example `vllm/adapters/gemma4.py`, with responsibilities:
 
 - expose head counts, KV head counts, head dim, layer count, and max model length
 - declare whether the model uses dense attention, hybrid attention, or MoE routing
@@ -86,4 +102,4 @@ Before claiming support, add:
 - benchmark entry only after correctness passes
 
 ## Design Rule
-Gemma support should be implemented by adding adapter, loader, and policy modules. It should not reintroduce model-name-based conditionals inside `LiteEngine`, `output_processor.py`, or generic loader hot paths.
+New model support should be implemented by adding adapter, loader, and policy modules. It should not reintroduce model-name-based conditionals inside `LiteEngine`, `step_scheduler.py`, executor modules, or generic loader hot paths.

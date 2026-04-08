@@ -3,19 +3,33 @@ import asyncio
 import time
 import os
 import re
-from collections import Counter
 import torch
 import torch.nn as nn
 import copy
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
+from vllm.adapters import get_model_adapter
 from vllm.config import VllmConfig
+from vllm.engine.decode_executor import DecodeExecutor
+from vllm.engine.errors import (
+    BackgroundLoopError,
+    ExecutionStepError,
+    RequestRejectedError,
+)
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
+from vllm.engine.output_pipeline import OutputPipeline
+from vllm.engine.prefill_executor import PrefillExecutor
+from vllm.engine.request_scheduler import RequestScheduler
+from vllm.engine.runtime_observer import NullRuntimeObserver
+from vllm.engine.runtime_config import RuntimeConfig
+from vllm.engine.runtime_planner import RuntimePlanner
+from vllm.engine.sampling_driver import SamplingDriver
+from vllm.engine.step_scheduler import StepScheduler
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
-from vllm.outputs import RequestOutput, CompletionOutput
+from vllm.outputs import RequestOutput
+from vllm.policies import build_generation_policies
 from vllm.sampling_params import SamplingParams
 from vllm.engine.inference_config import LiteInferenceConfig
-from vllm.engine.output_processor import get_output_processor, _decode_generated_text
 
 logger = init_logger(__name__)
 
@@ -115,50 +129,6 @@ def _resolve_kv_max_active_requests(
         out = min(out, max(1, int(env)))
     return max(1, out)
 
-
-def _hf_config_eos_token_ids(hf_config: Optional[Any]) -> List[int]:
-    """`config.json` / `text_config` may list eos_token_id(s) that differ from tokenizer.eos_token_id."""
-    if hf_config is None:
-        return []
-    eos = getattr(hf_config, "eos_token_id", None)
-    if eos is None:
-        return []
-    if isinstance(eos, (list, tuple)):
-        return [int(x) for x in eos]
-    return [int(eos)]
-
-
-def _eos_stop_token_ids_for_sampling(
-    tokenizer: Any,
-    sp: SamplingParams,
-    hf_config: Optional[Any] = None,
-) -> List[int]:
-    """
-    Merge tokenizer EOS, HF config EOS (e.g. Qwen3.5 GGUF: text_config vs tokenizer), and
-    user stop_token_ids so we stop / mask consistently with how the checkpoint was trained.
-    """
-    out: List[int] = []
-    seen: set[int] = set()
-
-    def _add(tid: int) -> None:
-        if tid not in seen:
-            seen.add(tid)
-            out.append(tid)
-
-    eos = getattr(tokenizer, "eos_token_id", None)
-    if eos is not None:
-        if isinstance(eos, (list, tuple)):
-            for x in eos:
-                _add(int(x))
-        else:
-            _add(int(eos))
-    for tid in _hf_config_eos_token_ids(hf_config):
-        _add(tid)
-    for tid in getattr(sp, "stop_token_ids", None) or ():
-        _add(int(tid))
-    return out
-
-
 def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> None:
     """
     Optional bump when callers leave min_tokens at 0 (SamplingParams default).
@@ -181,103 +151,16 @@ def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> N
     if mt > max_new_tokens:
         sp.min_tokens = max(0, max_new_tokens)
 
-
-def _sample_token_from_logits(
-    logits_1d: torch.Tensor,
-    sp: SamplingParams,
-    generated_ids: List[int],
-    generator: Optional[torch.Generator],
-    eos_token_ids_to_mask: Optional[List[int]] = None,
-    anti_template_token_ids: Optional[List[int]] = None,
-) -> int:
-    """
-    Greedy argmax when temperature <= 0; otherwise temperature scaling, optional
-    repetition_penalty, top-k / top-p filtering, then multinomial sampling.
-    """
-    logits = logits_1d.float().clone()
-    rp = float(getattr(sp, "repetition_penalty", 1.0) or 1.0)
-    if rp > 1.0 and generated_ids:
-        for tid in set(int(t) for t in generated_ids):
-            if 0 <= tid < logits.numel():
-                if logits[tid] > 0:
-                    logits[tid] /= rp
-                else:
-                    logits[tid] *= rp
-
-    fp = float(getattr(sp, "frequency_penalty", 0.0) or 0.0)
-    if abs(fp) > 1e-12 and generated_ids:
-        for tid, cnt in Counter(int(t) for t in generated_ids).items():
-            if 0 <= tid < logits.numel():
-                logits[tid] -= fp * float(cnt)
-
-    pp = float(getattr(sp, "presence_penalty", 0.0) or 0.0)
-    if abs(pp) > 1e-12 and generated_ids:
-        for tid in set(int(t) for t in generated_ids):
-            if 0 <= tid < logits.numel():
-                logits[tid] -= pp
-
-    if not getattr(sp, "ignore_eos", False) and eos_token_ids_to_mask:
-        mt = int(getattr(sp, "min_tokens", 0) or 0)
-        if len(generated_ids) < mt:
-            for tid in eos_token_ids_to_mask:
-                if 0 <= tid < logits.numel():
-                    logits[tid] = float("-inf")
-    elif getattr(sp, "ignore_eos", False) and eos_token_ids_to_mask:
-        for tid in eos_token_ids_to_mask:
-            if 0 <= tid < logits.numel():
-                logits[tid] = float("-inf")
-
-    if anti_template_token_ids and len(generated_ids) < 12:
-        for tid in anti_template_token_ids:
-            if 0 <= tid < logits.numel():
-                logits[tid] -= 60.0
-
-    temp = float(getattr(sp, "temperature", 0.0) or 0.0)
-    if temp <= 1e-6:
-        return int(torch.argmax(logits).item())
-
-    logits = logits / max(temp, 1e-6)
-
-    top_k = int(getattr(sp, "top_k", -1) or -1)
-    if 0 < top_k < logits.numel():
-        k = min(top_k, logits.numel())
-        _, top_idx = torch.topk(logits, k)
-        keep = torch.zeros_like(logits, dtype=torch.bool)
-        keep[top_idx] = True
-        logits = logits.masked_fill(~keep, float("-inf"))
-
-    top_p = float(getattr(sp, "top_p", 1.0) or 1.0)
-    if top_p < 1.0 - 1e-6:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumprobs = torch.cumsum(sorted_probs, dim=-1)
-        sorted_remove = cumprobs > top_p
-        sorted_remove[1:] = sorted_remove[:-1].clone()
-        sorted_remove[0] = False
-        if sorted_remove.all():
-            sorted_remove[:] = True
-            sorted_remove[0] = False
-        removed_idx = sorted_indices[sorted_remove]
-        logits = logits.clone()
-        logits[removed_idx] = float("-inf")
-
-    probs = torch.softmax(logits, dim=-1)
-    psum = probs.sum()
-    if not torch.isfinite(psum) or psum <= 0:
-        return int(torch.argmax(logits_1d.float()).item())
-    if generator is not None:
-        return int(torch.multinomial(probs, 1, generator=generator).item())
-    return int(torch.multinomial(probs, 1).item())
-
-
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = torch.device("cuda:0")
-        requested_policy_mode = str(
-            getattr(vllm_config, "runtime_policy_mode", "auto")
-        ).lower()
+        self.runtime_config = (
+            getattr(vllm_config, "runtime_config", None)
+            or RuntimeConfig.from_vllm_config(vllm_config)
+        )
+        requested_policy_mode = self.runtime_config.policy_mode
         
         # 1. Load Model
         print(f">>> LiteEngine: Loading {self.model_config.model}...")
@@ -289,120 +172,52 @@ class LiteEngine:
             quant_config=getattr(vllm_config, "quant_config", None),
             policy_mode=requested_policy_mode,  # type: ignore[arg-type]
         )
-        
-        # 2. Extract REAL dimensions from loaded model
-        try:
-            # Prefer actual model attributes (set by loader)
-            inner_model = getattr(self.model, "model", self.model)
-            first_layer = None
-            if hasattr(inner_model, "layers") and len(inner_model.layers) > 0:
-                first_layer = inner_model.layers[0]
-            
-            if first_layer:
-                # Standard attributes we set in llama.py / qwen3_5.py
-                self.num_attention_heads = getattr(first_layer, "num_heads", 0)
-                self.num_kv_heads = getattr(first_layer, "num_kv_heads", 0)
-                self.head_size = getattr(first_layer, "head_dim", 0)
-                
-                # If not found, try nested self_attn
-                if self.num_attention_heads == 0 and hasattr(first_layer, "self_attn"):
-                    self.num_attention_heads = getattr(first_layer.self_attn, "num_heads", 0)
-                    self.num_kv_heads = getattr(first_layer.self_attn, "num_kv_heads", 0)
-                    self.head_size = getattr(first_layer.self_attn, "head_dim", 0)
-
-            from vllm.model_executor.models.qwen3_5 import (
-                Qwen3_5ForConditionalGeneration,
-                Qwen3_5MoeForConditionalGeneration,
-            )
-            is_qwen35 = isinstance(
-                self.model,
-                (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration),
-            )
-
-            # Fallback to config if model inspection failed, or force config for Qwen3.5 hybrid layers.
-            if self.num_attention_heads == 0 or self.head_size == 0 or is_qwen35:
-                self.num_kv_heads = self.model_config.get_num_kv_heads(None)
-                self.head_size = self.model_config.get_head_size()
-                hc = self.model_config.hf_config
-                self.num_attention_heads = getattr(
-                    hc, "num_attention_heads", self.num_kv_heads
-                )
-                hd = getattr(hc, "head_dim", None) or (
-                    hc.get("head_dim") if isinstance(hc, dict) else None
-                )
-                if hd:
-                    self.head_size = int(hd)
-            
-            # FORCE ALIGNMENT TO 8 FOR HARDWARE STABILITY
-            if self.head_size % 8 != 0:
-                old_hs = self.head_size
-                self.head_size = (self.head_size + 7) // 8 * 8
-                print(f">>> LiteEngine: Hard-aligning head_size {old_hs} -> {self.head_size} for stability")
-            
-            print(f">>> LiteEngine: Verified Dimensions: {self.num_attention_heads} Q-heads, {self.num_kv_heads} KV-heads, {self.head_size} head_dim")
-        except Exception as e:
-            print(f">>> LiteEngine: Dimension detection failed ({e}), using defaults")
-            self.num_kv_heads = self.model_config.get_num_kv_heads(None)
-            self.head_size = self.model_config.get_head_size()
-            self.num_attention_heads = self.num_kv_heads
-
-        self.num_layers = self.model_config.get_num_layers(None)
+        self.adapter = get_model_adapter(self.model, self.model_config)
+        self.model_capabilities = self.adapter.detect(self.model, self.model_config)
+        self.vllm_config.model_capabilities = self.model_capabilities
+        self.num_attention_heads = self.model_capabilities.num_attention_heads
+        self.num_kv_heads = self.model_capabilities.num_kv_heads
+        self.head_size = self.model_capabilities.head_dim
+        self.num_layers = self.model_capabilities.num_layers
+        print(
+            f">>> LiteEngine: Verified Dimensions: {self.num_attention_heads} Q-heads, "
+            f"{self.num_kv_heads} KV-heads, {self.head_size} head_dim"
+        )
         
         # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
-        self.inf_config = LiteInferenceConfig.from_env()
+        self.inf_config = LiteInferenceConfig(
+            kv_type=self.runtime_config.kv_cache_dtype,
+            k_scale=self.runtime_config.k_scale,
+            v_scale=self.runtime_config.v_scale,
+            fusion_level=self.runtime_config.fusion_level,
+            block_size=self.runtime_config.block_size,
+            max_model_len=self.runtime_config.kv_max_model_len,
+            max_active_requests=self.runtime_config.kv_max_active_requests,
+            use_prompt_guard=self.runtime_config.use_prompt_guard,
+        )
 
+        planner = RuntimePlanner(self.runtime_config, self.model_capabilities)
+        execution_plan = planner.build_execution_plan(
+            self.execution_policy.max_active_requests
+        )
+        kv_plan = planner.build_kv_cache_plan(execution_plan)
         gpu_total_gb = get_total_gpu_memory_gb()
-        is_high_end_gpu = gpu_total_gb > 24.0
+        is_high_end_gpu = execution_plan.is_high_end_gpu
         if is_high_end_gpu:
             print(f">>>> LiteEngine: High-end GPU detected ({gpu_total_gb:.1f}GB). Enabling aggressive optimization.")
 
-        # Use unified configuration
-        pass
-
-        self.block_size = self.inf_config.block_size
-        self.max_model_len = _resolve_kv_max_model_len(self.model_config, self.vllm_config, self.block_size)
-        if self.inf_config.max_model_len:
-            self.max_model_len = _align_kv_ctx_len(min(self.max_model_len, self.inf_config.max_model_len), self.block_size)
-
-        self.max_active_requests = _resolve_kv_max_active_requests(
-            self.execution_policy.max_active_requests,
-            self.vllm_config,
-        )
-        # Bumping default concurrency for 32GB+ cards
-        if is_high_end_gpu and self.max_active_requests < 16 and os.environ.get("FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS") is None:
-            print(">>>> LiteEngine: Bumping max_active_requests 4 -> 16 for high-end GPU.")
-            self.max_active_requests = 16
-
-        if self.inf_config.max_active_requests != 4:
-             self.max_active_requests = self.inf_config.max_active_requests
-
-        self.num_blocks_per_seq = self.max_model_len // self.block_size
-        self.num_total_blocks = self.max_active_requests * self.num_blocks_per_seq
-
-        sched_token_budget = getattr(
-            self.vllm_config.scheduler_config, "max_num_batched_tokens", None
-        )
-        # High-end GPU can handle more tokens per step
-        default_budget = 8192 if is_high_end_gpu else 4096
-        self._step_token_budget = max(1, int(sched_token_budget)) if sched_token_budget is not None else default_budget
-
-        # Prefill chunk size optimization
-        env_chunk = os.environ.get("FASTINFERENCE_LITE_PREFILL_CHUNK", "").strip()
-        if env_chunk:
-            env_chunk_int = int(env_chunk)
-            self._prefill_chunk_size = env_chunk_int if env_chunk_int > 0 else self.max_model_len
-        else:
-            from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
-            if isinstance(self.model, (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)):
-                self._prefill_chunk_size = 2048 if is_high_end_gpu else 1024
-            else:
-                self._prefill_chunk_size = 1024 if is_high_end_gpu else 512
-
-        self._decode_priority_enabled = _env_truthy("FASTINFERENCE_LITE_DECODE_PRIORITY") or os.environ.get("FASTINFERENCE_LITE_DECODE_PRIORITY", "").strip() == ""
-        self._prefill_reserved_tokens = max(0, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS", "0")))
-        self._prefill_reserve_backlog = max(1, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG", "2")))
-        self._prefill_catchup_ratio = min(1.0, max(0.0, float(os.environ.get("FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO", "0.25"))))
-        self._prefill_microbatch_size = min(4, max(1, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_MICROBATCH", "2"))))
+        self.block_size = execution_plan.block_size
+        self.max_model_len = execution_plan.max_model_len
+        self.max_active_requests = execution_plan.max_active_requests
+        self.num_blocks_per_seq = execution_plan.num_blocks_per_seq
+        self.num_total_blocks = execution_plan.num_total_blocks
+        self._step_token_budget = execution_plan.step_token_budget
+        self._prefill_chunk_size = execution_plan.prefill_chunk_size
+        self._decode_priority_enabled = execution_plan.decode_priority_enabled
+        self._prefill_reserved_tokens = execution_plan.prefill_reserved_tokens
+        self._prefill_reserve_backlog = execution_plan.prefill_reserve_backlog
+        self._prefill_catchup_ratio = execution_plan.prefill_catchup_ratio
+        self._prefill_microbatch_size = execution_plan.prefill_microbatch_size
 
         print(
             ">>>> LiteEngine: Step scheduler "
@@ -412,44 +227,31 @@ class LiteEngine:
             f"prefill_catchup_ratio={self._prefill_catchup_ratio:.2f}, "
             f"prefill_microbatch={self._prefill_microbatch_size})"
         )
-        
-        # Ensure MoE models fallback to FP8 if TurboQuant is selected, due to extreme activation outliers
-        from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
-        if self.inf_config.kv_type == "turbo_int4" and hasattr(self, 'model') and isinstance(self.model, Qwen3_5MoeForConditionalGeneration):
-            print(">>>> [Warning] TurboQuant INT4 KV cache does not support the massive activation outliers found in MoE networks. Automatically falling back to FP8.")
-            self.inf_config.kv_type = "fp8"
 
         # Resolve KV Metadata from config
-        if self.inf_config.kv_type == "turbo_int4":
+        if kv_plan.kv_dtype == torch.uint8:
+            self.inf_config.kv_type = "turbo_int4"
             print(">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]")
-            self.kv_dtype = torch.uint8
-            self.kv_head_dim = self.head_size // 2
+            self.kv_dtype = kv_plan.kv_dtype
+            self.kv_head_dim = kv_plan.kv_head_dim
             print(f">>>> LiteEngine: Using KV scales: K={self.inf_config.k_scale}, V={self.inf_config.v_scale}")
-        elif self.inf_config.kv_type == "fp8":
+        elif kv_plan.kv_dtype == torch.float8_e4m3fn:
+            self.inf_config.kv_type = "fp8"
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
-            self.kv_dtype = torch.float8_e4m3fn
-            self.kv_head_dim = self.head_size
+            self.kv_dtype = kv_plan.kv_dtype
+            self.kv_head_dim = kv_plan.kv_head_dim
         else:
+            self.inf_config.kv_type = "fp16"
             print(">>>> LiteEngine: KV Cache using full precision (BF16/FP16) [ACCURATE]")
-            from vllm.model_executor.models.qwen3_5 import (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)
-            if isinstance(self.model, (Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)):
+            if self.model_capabilities.preferred_kv_dtype == "bfloat16":
                 print(">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5)")
-                self.kv_dtype = torch.bfloat16
+                self.kv_dtype = kv_plan.kv_dtype
             else:
                 print(">>>> LiteEngine: KV Cache dtype float16")
-                self.kv_dtype = torch.float16
-            self.kv_head_dim = self.head_size
+                self.kv_dtype = kv_plan.kv_dtype
+            self.kv_head_dim = kv_plan.kv_head_dim
             
-        elem_nbytes = _dtype_nbytes(self.kv_dtype)
-        kv_theory_bytes = (
-            self.num_layers
-            * 2
-            * self.num_total_blocks
-            * self.block_size
-            * self.num_kv_heads
-            * self.kv_head_dim
-            * elem_nbytes
-        )
+        kv_theory_bytes = kv_plan.theory_bytes
         print(
             f">>>> LiteEngine: Allocating KV Cache on {self.device} "
             f"({self.max_active_requests} seq slots, {self.max_model_len} tokens/seq cap, "
@@ -469,7 +271,7 @@ class LiteEngine:
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         
-        if self.inf_config.kv_type == "turbo_int4":
+        if kv_plan.needs_scale_cache:
             print(">>>> LiteEngine: Allocating KV Scale Caches for TurboQuant...")
             self.kv_scale_caches = []
             for _ in range(self.num_layers):
@@ -504,11 +306,20 @@ class LiteEngine:
             )
 
         # slot_mapping maps batch tokens to physical indices
-        self._requests: Dict[str, Dict[str, Any]] = {}
-        self._running_ids: List[str] = []
-        self._free_slots = list(range(self.max_active_requests))
-        self._request_slots: Dict[str, int] = {} # Map req_id -> slot_idx
-        self._request_streams: Dict[str, asyncio.Queue] = {}
+        self.scheduler = RequestScheduler(self.max_active_requests)
+        self.policies = None
+        self.sampling_driver = None
+        self.output_pipeline = None
+        self.observer = getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
+        self.step_scheduler = StepScheduler(
+            step_token_budget=self._step_token_budget,
+            decode_priority_enabled=self._decode_priority_enabled,
+            prefill_chunk_size=self._prefill_chunk_size,
+            prefill_reserved_tokens=self._prefill_reserved_tokens,
+            prefill_reserve_backlog=self._prefill_reserve_backlog,
+            prefill_catchup_ratio=self._prefill_catchup_ratio,
+            prefill_microbatch_size=self._prefill_microbatch_size,
+        )
         
         # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
         # These will be reused to avoid Python object creation in every decode step.
@@ -522,11 +333,40 @@ class LiteEngine:
         for s in range(self.max_active_requests):
             start_block = s * self.num_blocks_per_seq
             self._fast_block_tables[s] = torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32, device=self.device)
+        self.prefill_executor = PrefillExecutor(
+            model=self.model,
+            device=self.device,
+            num_layers=self.num_layers,
+            num_blocks_per_seq=self.num_blocks_per_seq,
+            max_model_len=self.max_model_len,
+            kv_caches=self.kv_caches,
+            kv_scale_caches=self.kv_scale_caches,
+            inf_config=self.inf_config,
+            stack_per_layer_carries=self._stack_per_layer_carries,
+            split_per_layer_carries=self._split_per_layer_carries,
+        )
+        self.decode_executor = DecodeExecutor(
+            model=self.model,
+            device=self.device,
+            num_layers=self.num_layers,
+            num_blocks_per_seq=self.num_blocks_per_seq,
+            max_model_len=self.max_model_len,
+            kv_caches=self.kv_caches,
+            kv_scale_caches=self.kv_scale_caches,
+            inf_config=self.inf_config,
+            fast_input_ids=self._fast_input_ids,
+            fast_positions=self._fast_positions,
+            fast_slot_mapping=self._fast_slot_mapping,
+            fast_seq_lens=self._fast_seq_lens,
+            fast_block_tables=self._fast_block_tables,
+            stack_per_layer_carries=self._stack_per_layer_carries,
+            split_per_layer_carries=self._split_per_layer_carries,
+        )
 
     @property
     def active_request_count(self) -> int:
         """Number of in-flight requests (for debugging / test harness guards)."""
-        return len(self._running_ids)
+        return self.scheduler.active_request_count
 
     @staticmethod
     def _stack_per_layer_carries(
@@ -562,30 +402,39 @@ class LiteEngine:
                     r[key][li] = t[i : i + 1].contiguous()
 
     def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id: Optional[str] = None):
-        if getattr(self, "output_processor", None) is None:
-            self.output_processor = get_output_processor(str(self.model_config.model), self.tokenizer)
-        if getattr(self.output_processor, "tokenizer", None) is None:
-            self.output_processor.tokenizer = self.tokenizer
-        if not self._free_slots:
+        if self.policies is None:
+            self.policies = build_generation_policies(
+                str(self.model_config.model), self.tokenizer, self.adapter
+            )
+            self.sampling_driver = SamplingDriver(
+                self.tokenizer,
+                getattr(self.model_config, "hf_config", None),
+                self.policies,
+            )
+            self.output_pipeline = OutputPipeline(
+                self.tokenizer, self.policies, self.sampling_driver
+            )
+        if not self.scheduler.has_capacity():
             # Simple rejection if full. In real engine, we'd queue.
-            print(f"!!! LiteEngine: Max capacity reached ({self.max_active_requests}), rejecting {request_id}")
-            return
+            reason = f"max capacity reached ({self.max_active_requests})"
+            self.observer.on_request_rejected(request_id, reason)
+            raise RequestRejectedError(reason)
 
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
         max_tokens = min(max_tokens, self.execution_policy.max_tokens_cap)
         _apply_lite_default_min_tokens(effective_sampling_params, max_tokens)
 
-        guarded_prompt = self.output_processor.apply_prompt_guard(prompt)
+        guarded_prompt = self.policies.normalize_prompt(prompt)
         input_ids = self.tokenizer.encode(guarded_prompt)
         if len(input_ids) >= self.max_model_len:
-            print(
-                f"!!! LiteEngine: rejecting {request_id} because prompt tokens "
-                f"({len(input_ids)}) exceed/equal max_model_len ({self.max_model_len}); "
-                "leave at least one decode token slot."
+            reason = (
+                f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
+                f"({self.max_model_len}); leave at least one decode token slot."
             )
-            return
-        slot_idx = self._free_slots.pop(0)
+            self.observer.on_request_rejected(request_id, reason)
+            raise RequestRejectedError(reason)
+        slot_idx = self.scheduler.allocate_slot()
         
         rng: Optional[torch.Generator] = None
         seed = getattr(effective_sampling_params, "seed", None)
@@ -593,7 +442,7 @@ class LiteEngine:
             rng = torch.Generator(device=self.device)
             rng.manual_seed(int(seed))
 
-        self._requests[request_id] = {
+        request_state = {
             "input_ids": input_ids,
             "generated_ids": [],
             "sampling_params": effective_sampling_params,
@@ -609,84 +458,43 @@ class LiteEngine:
             "linear_attn_carry": [None] * self.num_layers,
             "linear_conv_carry": [None] * self.num_layers,
             "low_info_hits": 0,
-            "is_chinese_capital_question": self.output_processor.is_chinese_capital_question(prompt),
-            "capital_question_bias_token_ids": self.output_processor.get_capital_question_bias_token_ids(prompt),
-            "anti_template_token_ids": self.output_processor.get_anti_template_token_ids(),
+            "is_chinese_capital_question": self.policies.is_chinese_capital_question(prompt),
+            "capital_question_bias_token_ids": self.policies.capital_question_bias_token_ids(prompt),
+            "anti_template_token_ids": self.policies.anti_template_token_ids(),
         }
-        self._request_slots[request_id] = slot_idx
-        self._running_ids.append(request_id)
-        self._request_streams[request_id] = asyncio.Queue()
+        self.scheduler.add_request(request_id, request_state)
+        self.observer.on_request_added(request_id, request_state)
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:
-        queue = self._request_streams[request_id]
-        while True:
-            output = await queue.get()
+        async for output in self.scheduler.get_request_stream(request_id):
             yield output
-            if output.finished: break
+
+    def abort_request(self, request_id: str) -> None:
+        try:
+            req = self.scheduler.get_request(request_id)
+        except KeyError:
+            return
+        output = self.output_pipeline.build_abort_output(request_id, req)
+        self.scheduler.publish_output(request_id, output)
+        self.scheduler.abort_request(request_id)
+        self.observer.on_request_aborted(request_id)
+
+    def handle_background_error(self, exc: BaseException) -> None:
+        request_ids = self.scheduler.request_ids()
+        self.observer.on_background_error(exc, request_ids)
+        for request_id in request_ids:
+            self.scheduler.publish_exception(
+                request_id, exc if isinstance(exc, BackgroundLoopError) else BackgroundLoopError(str(exc))
+            )
+            self.scheduler.free_request(request_id)
 
     @torch.inference_mode()
     def _decode_step_sync(self, decodes: List[str]) -> List[RequestOutput]:
-        bs = len(decodes)
-        # Use sliced pre-allocated tensors
-        input_ids = self._fast_input_ids[:bs]
-        positions = self._fast_positions[:bs]
-        slot_mapping = self._fast_slot_mapping[:bs]
-        seq_lens = self._fast_seq_lens[:bs]
-        
-        # Populate pre-allocated tensors (minimal Python loops)
-        req_dicts = []
-        lora_mapping = []
-        for i, rid in enumerate(decodes):
-            req = self._requests[rid]
-            req_dicts.append(req)
-            input_ids[i, 0] = req["generated_ids"][-1]
-            positions[i, 0] = req["seq_len"]
-            slot_mapping[i] = req["slot_idx"] * self.max_model_len + req["seq_len"]
-            seq_lens[i] = req["seq_len"] + 1
-            lora_mapping.append(req.get("lora_id"))
-
-        # Block tables are static, we just need to slice and gather
-        # self._fast_block_tables has shape (max_active_requests, num_blocks_per_seq)
-        # We need to select the rows corresponding to slot_indices.
-        # This is fast using torch.index_select or advanced indexing.
-        slots_t = torch.tensor([req["slot_idx"] for req in req_dicts], device=self.device)
-        block_tables = self._fast_block_tables.index_select(0, slots_t)
-
-        attn_carry_batch = self._stack_per_layer_carries(req_dicts, self.num_layers, "linear_attn_carry")
-        conv_carry_batch = self._stack_per_layer_carries(req_dicts, self.num_layers, "linear_conv_carry")
-
-        attn_metadata = {
-            "slot_mapping": slot_mapping,
-            "seq_lens": seq_lens,
-            "block_tables": block_tables,
-            "is_prefill": False,
-            "kv_start_indices": positions.squeeze(1).to(torch.int32),
-            "linear_attn_carry": attn_carry_batch,
-            "linear_conv_carry": conv_carry_batch,
-            "kv_cache_dtype": self.inf_config.kv_type,
-            "k_scale": self.inf_config.k_scale,
-            "v_scale": self.inf_config.v_scale,
-            "config": self.inf_config,
-        }
-
-        logits = self.model(input_ids, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
-        
-        self._split_per_layer_carries(attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry")
-        self._split_per_layer_carries(attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry")
-
+        logits, _ = self.decode_executor.execute_sync_fast(decodes, self.scheduler)
         results = []
         for i, rid in enumerate(decodes):
-            req = self._requests[rid]
-            token_logits = self.output_processor.apply_context_bias(logits[i, -1, :], req['generated_ids'], req['sampling_params'], req.get('capital_question_bias_token_ids'), req.get('is_chinese_capital_question'))
-            
-            eos_mask = _eos_stop_token_ids_for_sampling(
-                self.tokenizer, req["sampling_params"], getattr(self.model_config, "hf_config", None)
-            )
-            
-            token = _sample_token_from_logits(
-                token_logits, req["sampling_params"], req["generated_ids"], req.get("rng"),
-                eos_token_ids_to_mask=eos_mask, anti_template_token_ids=req.get("anti_template_token_ids")
-            )
+            req = self.scheduler.get_request(rid)
+            token = self.sampling_driver.sample_next_token(logits[i, -1, :], req)
             
             req["generated_ids"].append(token)
             req["seq_len"] += 1
@@ -695,371 +503,104 @@ class LiteEngine:
         return results
 
     def _free_request(self, rid: str):
-        if rid in self._requests:
-            slot = self._requests[rid]["slot_idx"]
-            self._free_slots.append(slot)
-            # Optional: Clear KV cache for this slot? Not strictly necessary if we track seq_len correctly.
-            del self._requests[rid]
-        if rid in self._request_slots: del self._request_slots[rid]
-        if rid in self._running_ids: self._running_ids.remove(rid)
+        self.scheduler.free_request(rid)
 
     @torch.inference_mode()
     def step(self) -> List[RequestOutput]:
-        if not self._running_ids: return []
-        
-        # 1. Schedule: Separate Prefills and Decodes
-        prefills = []
-        decodes = []
-        for rid in self._running_ids:
-            if self._requests[rid]["is_prefill"]: prefills.append(rid)
-            else: decodes.append(rid)
-        
-        # SYNC DECODE FAST PATH: When only decodes are present, bypass all Async/Object creation.
-        if decodes and not prefills:
-            return self._decode_step_sync(decodes)
+        if self.scheduler.active_request_count == 0: return []
+
+        step_plan = self.step_scheduler.build_plan(self.scheduler)
+        self.observer.on_step_started(step_plan)
+
+        if (
+            step_plan.decodes is not None
+            and step_plan.decodes.use_fast_path
+            and step_plan.prefills is None
+        ):
+            return self._decode_step_sync(step_plan.decodes.request_ids)
 
         results = []
-        chunk_size = self._prefill_chunk_size
 
-        # 2. Execute
-        # STRATEGY:
-        # - Decode-priority mode (default): decode first; reserve prefill budget only when
-        #   prefill backlog builds up (or when there is no decode).
-        # - Fallback mixed mode: run one prefill chunk + decode micro-batch in each step.
-        step_token_budget = max(1, int(self._step_token_budget))
-        if self._decode_priority_enabled:
-            prefill_token_budget = 0
-            if prefills and not decodes:
-                prefill_token_budget = min(chunk_size, step_token_budget)
-            elif prefills and len(prefills) >= self._prefill_reserve_backlog:
-                reserve_tokens = max(
-                    self._prefill_reserved_tokens,
-                    int(step_token_budget * self._prefill_catchup_ratio),
-                )
-                prefill_token_budget = min(
-                    step_token_budget,
-                    max(1, reserve_tokens),
-                )
-            decode_limit = min(len(decodes), max(0, step_token_budget - prefill_token_budget))
-        else:
-            if prefills:
-                reserve_tokens = max(1, self._prefill_reserved_tokens or 1)
-                decode_limit = max(
-                    0, min(len(decodes), step_token_budget - reserve_tokens)
-                )
-            else:
-                decode_limit = min(len(decodes), step_token_budget)
-            prefill_token_budget = max(0, step_token_budget - decode_limit)
-        decodes_to_run = decodes[:decode_limit]
-
-        if prefills and prefill_token_budget > 0:
-            # Prefill micro-batch: select requests with the same processed_len so
-            # full-attention path can use a consistent kv_chunk_start.
-            base_processed_len = self._requests[prefills[0]]["seq_len"]
-            candidate_prefills = [
-                rid
-                for rid in prefills
-                if self._requests[rid]["seq_len"] == base_processed_len
-            ]
-            prefill_batch_size = min(self._prefill_microbatch_size, len(candidate_prefills))
-            prefills_to_run = candidate_prefills[:prefill_batch_size]
-
-            # Budget applies to total prefill tokens in this step.
-            # chunk_len * batch_size <= prefill_token_budget.
-            min_remaining = min(
-                len(self._requests[rid]["input_ids"]) - self._requests[rid]["seq_len"]
-                for rid in prefills_to_run
-            )
-            per_req_budget = max(1, prefill_token_budget // max(1, prefill_batch_size))
-            this_chunk_len = min(min_remaining, chunk_size, per_req_budget)
-            if this_chunk_len <= 0:
-                this_chunk_len = 1
-
-            curr_input_rows = []
-            position_rows = []
-            slot_mapping_rows = []
-            block_tables = []
-            seq_lens_prefill = []
-            kv_start_indices = []
-            req_dicts_prefill = [self._requests[rid] for rid in prefills_to_run]
-            is_last_chunk_flags = []
-
-            for rid in prefills_to_run:
-                req = self._requests[rid]
-                slot_idx = req["slot_idx"]
-                all_input_ids = req["input_ids"]
-                processed_len = req["seq_len"]
-                remaining_len = len(all_input_ids) - processed_len
-                is_last_chunk = processed_len + this_chunk_len >= len(all_input_ids)
-                is_last_chunk_flags.append(is_last_chunk)
-
-                curr_chunk_ids = all_input_ids[
-                    processed_len : processed_len + this_chunk_len
-                ]
-                curr_input_rows.append(curr_chunk_ids)
-                position_rows.append(
-                    torch.arange(
-                        processed_len,
-                        processed_len + this_chunk_len,
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                )
-                slot_mapping_rows.append(
-                    slot_idx * self.max_model_len
-                    + torch.arange(
-                        processed_len,
-                        processed_len + this_chunk_len,
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                )
-                start_block = slot_idx * self.num_blocks_per_seq
-                block_tables.append(
-                    torch.arange(
-                        start_block,
-                        start_block + self.num_blocks_per_seq,
-                        device=self.device,
-                        dtype=torch.int32,
-                    )
-                )
-                seq_lens_prefill.append(processed_len + this_chunk_len)
-                kv_start_indices.append(processed_len)
-
-            curr_input = torch.tensor(curr_input_rows, device=self.device)
-            positions = torch.stack(position_rows, dim=0).to(self.device)
-            slot_mapping = torch.cat(slot_mapping_rows, dim=0).to(self.device)
-            block_tables_t = torch.stack(block_tables).to(self.device)
-            attn_carry_prefill = self._stack_per_layer_carries(
-                req_dicts_prefill, self.num_layers, "linear_attn_carry"
-            )
-            conv_carry_prefill = self._stack_per_layer_carries(
-                req_dicts_prefill, self.num_layers, "linear_conv_carry"
-            )
-
-            attn_metadata = {
-                "slot_mapping": slot_mapping,
-                "seq_lens": torch.tensor(
-                    seq_lens_prefill, device=self.device, dtype=torch.int32
-                ),
-                "is_prefill": True,
-                "kv_start_indices": torch.tensor(
-                    kv_start_indices, device=self.device, dtype=torch.int32
-                ),
-                "block_tables": block_tables_t,
-                "linear_attn_carry": attn_carry_prefill,
-                "linear_conv_carry": conv_carry_prefill,
-                "kv_scale_cache": self.kv_scale_caches,
-                "kv_cache_dtype": self.inf_config.kv_type,
-                "k_scale": self.inf_config.k_scale,
-                "v_scale": self.inf_config.v_scale,
-                "config": self.inf_config,
-            }
-
+        if step_plan.prefills is not None:
             try:
-                lora_mapping = [self._requests[rid].get("lora_id") for rid in prefills_to_run]
-                logits = self.model(
-                    curr_input,
-                    positions,
-                    self.kv_caches,
-                    attn_metadata,
-                    lora_mapping=lora_mapping,
-                )
-                self._split_per_layer_carries(
-                    attn_metadata["linear_attn_carry"],
-                    req_dicts_prefill,
-                    "linear_attn_carry",
-                )
-                self._split_per_layer_carries(
-                    attn_metadata["linear_conv_carry"],
-                    req_dicts_prefill,
-                    "linear_conv_carry",
+                logits, req_dicts_prefill, is_last_chunk_flags = self.prefill_executor.execute(
+                    step_plan.prefills.request_ids,
+                    self.scheduler,
+                    step_plan.prefills.chunk_len,
                 )
 
-                for i, rid in enumerate(prefills_to_run):
-                    req = self._requests[rid]
-                    req["seq_len"] += this_chunk_len
+                for i, rid in enumerate(step_plan.prefills.request_ids):
+                    req = self.scheduler.get_request(rid)
+                    req["seq_len"] += step_plan.prefills.chunk_len
                     if not is_last_chunk_flags[i]:
                         continue
-                    # First generated token: respect SamplingParams (temperature, top_p, etc.)
-                    eos_mask = _eos_stop_token_ids_for_sampling(
-                        self.tokenizer,
-                        req["sampling_params"],
-                        getattr(self.model_config, "hf_config", None),
-                    )
-                    token_logits = self.output_processor.apply_context_bias(
-                        logits[i, -1, :],
-                        req["generated_ids"],
-                        req["sampling_params"],
-                        req.get("capital_question_bias_token_ids", []),
-                        req.get("is_chinese_capital_question", False),
-                    )
-                    next_token = _sample_token_from_logits(
-                        token_logits,
-                        req["sampling_params"],
-                        req["generated_ids"],
-                        req.get("rng"),
-                        eos_token_ids_to_mask=eos_mask,
-                        anti_template_token_ids=req.get("anti_template_token_ids"),
+                    next_token = self.sampling_driver.sample_next_token(
+                        logits[i, -1, :], req
                     )
                     req["generated_ids"].append(next_token)
                     req["is_prefill"] = False
                     self._process_completion(rid, next_token, results)
+                self.observer.on_prefill_executed(step_plan.prefills, len(results))
             except Exception as e:
-                print(f"!!! LiteEngine Error (Chunked Prefill): {e}"); import traceback; traceback.print_exc()
-                for rid in prefills_to_run:
+                error = ExecutionStepError(f"prefill failed: {e}")
+                logger.exception("LiteEngine prefill execution error: %s", error)
+                for rid in step_plan.prefills.request_ids:
                     self._free_request(rid)
+                raise error
 
-        if decodes_to_run:
-            # Batch decode micro-step under the per-step token budget.
-            input_tokens = []
-            slot_indices = []
-            seq_lens = []
-            pos_indices = []
-            
-            for rid in decodes_to_run:
-                req = self._requests[rid]
-                last_token = req["generated_ids"][-1]
-                input_tokens.append([last_token])
-                slot_indices.append(req["slot_idx"])
-                
-                current_len = req["seq_len"]
-                seq_lens.append(current_len + 1) # Including new token
-                pos_indices.append(current_len)
-                
-            curr_input = torch.tensor(input_tokens, device=self.device) # (B, 1)
-            positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1) # (B, 1)
-            
-            # Generate block tables for batch
-            batch_block_tables = []
-            for S in slot_indices:
-                start_block = S * self.num_blocks_per_seq
-                batch_block_tables.append(torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32))
-            block_tables = torch.stack(batch_block_tables).to(self.device)
-
-            # slot_mapping maps batch tokens to physical indices
-            slot_mapping = torch.tensor([s * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)], device=self.device, dtype=torch.long)
-
-            req_dicts = [self._requests[rid] for rid in decodes_to_run]
-            attn_carry_batch = self._stack_per_layer_carries(
-                req_dicts, self.num_layers, "linear_attn_carry"
-            )
-            conv_carry_batch = self._stack_per_layer_carries(
-                req_dicts, self.num_layers, "linear_conv_carry"
-            )
-            attn_metadata = {
-                "slot_mapping": slot_mapping,
-                "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
-                "block_tables": block_tables,
-                "is_prefill": False,
-                "kv_start_indices": torch.tensor(
-                    pos_indices, device=self.device, dtype=torch.int32
-                ),
-                "linear_attn_carry": attn_carry_batch,
-                "linear_conv_carry": conv_carry_batch,
-                "kv_scale_cache": self.kv_scale_caches,
-                "kv_cache_dtype": self.inf_config.kv_type,
-                "k_scale": self.inf_config.k_scale,
-                "v_scale": self.inf_config.v_scale,
-                "config": self.inf_config,
-            }
-
+        if step_plan.decodes is not None:
             try:
-                lora_mapping = [self._requests[rid].get("lora_id") for rid in decodes_to_run]
-                logits = self.model(curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping)
-                self._split_per_layer_carries(
-                    attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
-                )
-                self._split_per_layer_carries(
-                    attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
+                logits, req_dicts = self.decode_executor.execute_batch(
+                    step_plan.decodes.request_ids, self.scheduler
                 )
                 # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
                 # OPTIMIZATION: If all requests are greedy (temp=0), we can argmax in one go.
-                is_all_greedy = all(self._requests[rid]["sampling_params"].temperature == 0 for rid in decodes_to_run)
+                is_all_greedy = all(
+                    self.scheduler.get_request(rid)["sampling_params"].temperature == 0
+                    for rid in step_plan.decodes.request_ids
+                )
                 
                 if is_all_greedy:
                     # Parallel Argmax
                     next_tokens = torch.argmax(logits[:, -1, :], dim=-1).cpu().tolist()
-                    for i, rid in enumerate(decodes_to_run):
-                        req_i = self._requests[rid]
+                    for i, rid in enumerate(step_plan.decodes.request_ids):
+                        req_i = self.scheduler.get_request(rid)
                         token = next_tokens[i]
                         req_i["generated_ids"].append(token)
                         req_i["seq_len"] += 1
                         self._process_completion(rid, token, results)
                 else:
                     # Standard fallback for mixed sampling params
-                    for i, rid in enumerate(decodes_to_run):
-                        req_i = self._requests[rid]
-                        eos_mask = _eos_stop_token_ids_for_sampling(
-                            self.tokenizer,
-                            req_i["sampling_params"],
-                            getattr(self.model_config, "hf_config", None),
-                        )
-                        token_logits = self.output_processor.apply_context_bias(
-                            logits[i, -1, :],
-                            req_i["generated_ids"],
-                            req_i["sampling_params"],
-                            req_i.get("capital_question_bias_token_ids", []),
-                            req_i.get("is_chinese_capital_question", False),
-                        )
-                        token = _sample_token_from_logits(
-                            token_logits,
-                            req_i["sampling_params"],
-                            req_i["generated_ids"],
-                            req_i.get("rng"),
-                            eos_token_ids_to_mask=eos_mask,
-                            anti_template_token_ids=req_i.get("anti_template_token_ids"),
+                    for i, rid in enumerate(step_plan.decodes.request_ids):
+                        req_i = self.scheduler.get_request(rid)
+                        token = self.sampling_driver.sample_next_token(
+                            logits[i, -1, :], req_i
                         )
                         req_i["generated_ids"].append(token)
                         req_i["seq_len"] += 1
                         self._process_completion(rid, token, results)
+                self.observer.on_decode_executed(step_plan.decodes, len(results))
                     
             except Exception as e:
-                print(f"!!! LiteEngine Error (Decode): {e}"); import traceback; traceback.print_exc()
-                # Fail all involved? Or try to isolate? For Lite, just fail.
-                for rid in decodes_to_run: self._free_request(rid)
+                error = ExecutionStepError(f"decode failed: {e}")
+                logger.exception("LiteEngine decode execution error: %s", error)
+                for rid in step_plan.decodes.request_ids:
+                    self._free_request(rid)
+                raise error
 
         return results
 
     def _process_completion(self, rid, next_token, results):
-        req = self._requests[rid]
-        sp = req["sampling_params"]
-        eos_ids = _eos_stop_token_ids_for_sampling(
-            self.tokenizer,
-            sp,
-            getattr(self.model_config, "hf_config", None),
-        )
-        max_tok = int(sp.max_tokens or 16)
-        gen_len = len(req["generated_ids"])
-        min_tok = int(getattr(sp, "min_tokens", 0) or 0)
-
-        if getattr(sp, "ignore_eos", False):
-            if gen_len >= max_tok:
-                req["finished"] = True
-        elif next_token in eos_ids and gen_len >= min_tok:
-            req["finished"] = True
-        elif gen_len >= max_tok:
-            req["finished"] = True
-
-        current_text = _decode_generated_text(self.tokenizer, req["generated_ids"], sp)
-        if not req["finished"] and self.output_processor.should_early_stop(req['generated_ids'], current_text):
-            req["low_info_hits"] = int(req.get("low_info_hits", 0)) + 1
-            # Require two consecutive detections to avoid cutting valid short outputs.
-            if req["low_info_hits"] >= 2 and gen_len >= max(10, min_tok):
-                req["finished"] = True
-        else:
-            req["low_info_hits"] = 0
-
-        display_text = self.output_processor.cleanup_output_text(current_text)
-        completion = CompletionOutput(
-            index=0,
-            text=display_text,
-            token_ids=req["generated_ids"],
-            cumulative_logprob=0.0,
-        )
-        out = RequestOutput(request_id=rid, prompt=req["prompt"], prompt_token_ids=req["input_ids"], outputs=[completion], finished=req["finished"])
-        self._request_streams[rid].put_nowait(out)
+        req = self.scheduler.get_request(rid)
+        out = self.output_pipeline.finalize_step(rid, req, next_token)
+        self.scheduler.publish_output(rid, out)
         results.append(out)
         
         if req["finished"]:
+            finish_reason = "completed"
+            if next_token in self.sampling_driver.completion_eos_ids(req):
+                finish_reason = "eos"
+            elif len(req["generated_ids"]) >= int(req["sampling_params"].max_tokens or 16):
+                finish_reason = "max_tokens"
+            self.observer.on_request_finished(rid, finish_reason)
             self._free_request(rid)

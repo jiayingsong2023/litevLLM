@@ -5,6 +5,7 @@ from .load import LoadConfig
 from .cache import CacheConfig
 from .scheduler import SchedulerConfig
 from .attention import AttentionConfig
+from vllm.engine.runtime_config import RuntimeConfig
 
 __all__ = [
     "VllmConfig",
@@ -13,4 +14,5 @@ __all__ = [
     "CacheConfig",
     "SchedulerConfig",
     "AttentionConfig",
+    "RuntimeConfig",
 ]

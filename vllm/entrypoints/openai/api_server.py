@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
-import asyncio
 import json
 import time
 import os
-import gguf
-from typing import AsyncGenerator, Dict, List, Optional, Union
-from fastapi import FastAPI, Request, HTTPException
+from typing import AsyncGenerator, Optional
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 from vllm.engine.async_llm import AsyncLLM
 from vllm.sampling_params import SamplingParams
 from vllm.logger import init_logger
+from vllm.serving.config_builder import build_vllm_config
 
 logger = init_logger(__name__)
 app = FastAPI()
@@ -80,114 +79,7 @@ def main():
     args = parser.parse_args()
 
     global engine
-    from vllm.config import VllmConfig
-
-    def _as_int_value(value):
-        if isinstance(value, list):
-            if not value:
-                return 1
-            return max(1, int(max(value)))
-        return int(value)
-
-    def build_hf_like_config_from_gguf(model_path: str):
-        gguf_files = [f for f in os.listdir(model_path) if f.endswith(".gguf")]
-        if not gguf_files:
-            return None
-        reader = gguf.GGUFReader(os.path.join(model_path, gguf_files[0]))
-        architecture = str(reader.get_field("general.architecture").contents())
-
-        def read_field_int(field_name: str, default: int) -> int:
-            field = reader.get_field(field_name)
-            if field is None:
-                return default
-            return _as_int_value(field.contents())
-
-        def read_field_raw(field_name: str, default):
-            field = reader.get_field(field_name)
-            if field is None:
-                return default
-            return field.contents()
-
-        class GGUFConfigFallback:
-            pass
-
-        cfg = GGUFConfigFallback()
-        cfg.hidden_size = read_field_int(f"{architecture}.embedding_length", 4096)
-        cfg.num_hidden_layers = read_field_int(f"{architecture}.block_count", 32)
-        cfg.num_attention_heads = read_field_int(
-            f"{architecture}.attention.head_count", 32
-        )
-        cfg.num_key_value_heads = read_field_int(
-            f"{architecture}.attention.head_count_kv",
-            cfg.num_attention_heads,
-        )
-        cfg.intermediate_size = read_field_int(f"{architecture}.feed_forward_length", 11008)
-        cfg.max_position_embeddings = read_field_int(f"{architecture}.context_length", 32768)
-        cfg.vocab_size = read_field_int(f"{architecture}.vocab_size", 32000)
-        cfg.rms_norm_eps = 1e-6
-        if architecture == "kimi-linear":
-            cfg.architectures = ["KimiLinearForCausalLM"]
-            kv_pattern = read_field_raw(f"{architecture}.attention.head_count_kv", [])
-            if isinstance(kv_pattern, list):
-                full_layers = [idx for idx, value in enumerate(kv_pattern) if int(value) > 0]
-            else:
-                full_layers = []
-            cfg.linear_attn_config = {
-                "full_attn_layers": full_layers,
-                "kda_layers": [
-                    idx for idx in range(cfg.num_hidden_layers) if idx not in set(full_layers)
-                ],
-            }
-            cfg.first_k_dense_replace = read_field_int(
-                f"{architecture}.leading_dense_block_count", 1
-            )
-            cfg.num_experts = read_field_int(f"{architecture}.expert_count", 0)
-            cfg.num_experts_per_token = read_field_int(
-                f"{architecture}.expert_used_count", 1
-            )
-            cfg.num_shared_experts = read_field_int(
-                f"{architecture}.expert_shared_count", 0
-            )
-            cfg.moe_intermediate_size = read_field_int(
-                f"{architecture}.expert_feed_forward_length", cfg.intermediate_size
-            )
-            cfg.qk_nope_head_dim = 128
-            cfg.qk_rope_head_dim = 64
-            cfg.v_head_dim = 128
-            cfg.kv_lora_rank = read_field_int(f"{architecture}.attention.kv_lora_rank", 512)
-        else:
-            cfg.architectures = ["LlamaForCausalLM"]
-        return cfg
-    
-    # Simple Mock Config for LitevLLM loading
-    class FakeLiteConfig:
-        def __init__(self, model_path, policy_mode: str):
-            from transformers import AutoConfig
-            import torch
-            try:
-                hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            except:
-                fallback_cfg = build_hf_like_config_from_gguf(model_path)
-                if fallback_cfg is not None:
-                    hf_cfg = fallback_cfg
-                else:
-                    class Simple: pass
-                    hf_cfg = Simple()
-            
-            self.model_config = type('obj', (object,), {
-                'hf_config': hf_cfg, 'dtype': torch.float16,
-                'max_model_len': 2048, 'model': model_path,
-                'get_num_kv_heads': lambda x: getattr(hf_cfg, "num_key_value_heads", 1),
-                'get_head_size': lambda: 128,
-                'get_num_layers': lambda x: getattr(hf_cfg, "num_hidden_layers", 12),
-            })
-            if any(f.endswith(".gguf") for f in os.listdir(model_path)):
-                from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-                self.quant_config = GGUFConfig()
-            else: self.quant_config = None
-            self.runtime_policy_mode = policy_mode
-
-    v_config = FakeLiteConfig(args.model, args.policy_mode)
+    v_config = build_vllm_config(args.model, policy_mode=args.policy_mode)
     engine = AsyncLLM(v_config)
     
     logger.info(f"FastInference API Server starting on http://{args.host}:{args.port}")

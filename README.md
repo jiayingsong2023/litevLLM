@@ -19,10 +19,32 @@
 
 ## 🌟 核心特性
 - **lite-only 主线**: 运行时以 `vllm/engine/lite_engine.py` 为核心，优先收敛单卡执行链路。
-- **配置收敛目标**: 推理与 kernel 行为将逐步收敛到统一 typed config，而不是继续扩散模型专项环境变量。
+- **统一构建链**: offline 与 OpenAI server 现在统一通过 `vllm/serving/config_builder.py` 构建 `VllmConfig + RuntimeConfig`，不再维护服务端旁路配置对象。
+- **分层执行架构**: `LiteEngine` 负责 orchestration，`StepScheduler` 做 step 级调度，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` / `OutputPipeline` 做采样与输出拼装。
+- **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，避免继续在 engine 主路径中扩散模型名特判。
+- **配置收敛目标**: 运行时主要配置已收敛到 `RuntimeConfig`，但部分历史环境变量兼容路径仍保留。
 - **纯净计算路径**: 主线优先维护 **Safetensors + AWQ**，实验性路径会逐步隔离。
 - **混合加速 Prefill**: 预填充阶段利用硬件原生 SDPA，解码阶段全量回归手写高性能 **Triton PagedAttention**。
 - **自动化元数据展开**: 统一的 `expand_metadata_for_paged_attention` 逻辑，完美支持全模型 Chunked Prefill。
+
+## 🧱 当前主路径
+当前官方执行链路为：
+
+```text
+LLM / AsyncLLM / OpenAI API Server
+  -> config_builder
+  -> LiteEngine
+  -> StepScheduler
+  -> RequestScheduler
+  -> PrefillExecutor / DecodeExecutor
+  -> SamplingDriver
+  -> OutputPipeline
+```
+
+运行时观测与错误语义已开始收口到：
+
+- `vllm/engine/runtime_observer.py`
+- `vllm/engine/errors.py`
 
 ## 🛠️ 配置指南 (LiteInferenceConfig)
 通过环境变量控制 `LiteInferenceConfig` 行为，实现性能与精度的平衡：
@@ -45,7 +67,10 @@ uv sync
 
 ### 1. 运行回归测试 (验证精度)
 ```bash
-# 自动验证当前正式支持模型的对齐情况
+# 快速 lite 回归（结构 smoke + 单测）
+uv run bash tests/run_regression_suite.sh
+
+# 推理精度/质量回归
 uv run bash tests/run_inference_accuracy_regression.sh
 ```
 
