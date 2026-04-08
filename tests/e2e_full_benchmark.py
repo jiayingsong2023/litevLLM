@@ -66,25 +66,6 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
     ),
-    "qwen35_35b_awq": ModelSpec(
-        key="qwen35_35b_awq",
-        model_path="models/Qwen3.5-35B-AWQ",
-        display_name="Qwen3.5-35B (AWQ INT4)",
-        quant="awq",
-        concurrent_reqs=1,
-        prompt_tokens_target=128,
-        max_new_tokens=12,
-        gpu_memory_utilization=0.90,
-        max_model_len=2048,
-        max_run_seconds=240,
-        stable_env={
-            "FASTINFERENCE_KV_TYPE": "turbo_int4",
-            "FASTINFERENCE_QWEN35_MOE_FP8": "1",
-            "FASTINFERENCE_QWEN35_MOE_OFFLOAD": "1",
-            "FASTINFERENCE_FUSION_LEVEL": "2",
-            "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
-        },
-    ),
 }
 
 # ROCm/HIP: large BS × long prefill + AWQ Triton + FP8 KV often triggers hipErrorLaunchFailure
@@ -485,8 +466,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         type=str,
-        default="tinyllama,qwen35_9b_awq,qwen35_35b_awq",
-        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,qwen35_35b_awq",
+        default="tinyllama,qwen35_9b_awq",
+        help="Comma-separated model keys: tinyllama,qwen35_9b_awq",
     )
     parser.add_argument(
         "--json-out",
@@ -567,7 +548,7 @@ async def main() -> None:
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
-    print("Targets: TinyLlama + Qwen3.5 9B/35B AWQ")
+    print("Targets: TinyLlama + Qwen3.5-9B AWQ")
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}

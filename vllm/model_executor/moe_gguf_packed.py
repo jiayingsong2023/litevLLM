@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoE expert weights: GGUF packed uint8 rows + slice dequant (avoid full-blob gguf.dequantize at load)."""
+"""Shared MoE expert GGUF packed-row helpers."""
 from __future__ import annotations
 
 import os
@@ -9,13 +9,21 @@ import torch
 _SUPPORTED_MOE_GGUF_TYPES = frozenset({2, 12, 14})  # Q4_0, Q4_K, Q6_K (same as GGUFWeight)
 
 
-def qwen35_moe_packed_gguf_enabled() -> bool:
-    return os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0").strip().lower() in (
+def moe_packed_gguf_enabled() -> bool:
+    raw = os.environ.get("FASTINFERENCE_MOE_PACKED_GGUF")
+    if raw is None:
+        raw = os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0")
+    return raw.strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def qwen35_moe_packed_gguf_enabled() -> bool:
+    """Legacy alias for older Qwen3.5-specific call sites."""
+    return moe_packed_gguf_enabled()
 
 
 def gguf_quant_type_supported_for_moe_packed(qtype: int) -> bool:

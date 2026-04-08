@@ -3,14 +3,12 @@
 # Inference accuracy regression for:
 #   - TinyLlama-1.1B-Chat-v1.0
 #   - Qwen3.5-9B-AWQ
-#   - Qwen3.5-35B-AWQ
 #
 # Run from repo root. Requires local models/ paths and a working CUDA/ROCm device.
 #
 # Usage:
 #   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_accuracy_regression.sh  # force bf16/fp16 KV (more VRAM)
 #   SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh   # B-tier only (faster)
-#   SKIP_35B=1 bash tests/run_inference_accuracy_regression.sh       # skip 35B checks
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_accuracy_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
 #
@@ -22,12 +20,8 @@ export PYTHONPATH="${PYTHONPATH:-.}"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
-MODEL_QWEN35_35B_AWQ="${MODEL_QWEN35_35B_AWQ:-models/Qwen3.5-35B-AWQ}"
 
 HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
-HF_QWEN35_35B_FP16="${HF_QWEN35_35B_FP16:-models/Qwen3.5-35B-FP16}"
-
-SKIP_35B="${SKIP_35B:-0}"
 RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 
@@ -36,7 +30,7 @@ require_model_dir() {
   local label="$2"
   if [[ ! -d "$model_dir" ]]; then
     echo "[ERROR] Missing model directory for ${label}: ${model_dir}"
-    echo "        You can override with env var or skip 35B via SKIP_35B=1."
+    echo "        You can override the path with an env var."
     exit 1
   fi
 }
@@ -46,35 +40,13 @@ SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
 
 require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
 require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
-if [[ "$SKIP_35B" != "1" ]]; then
-  require_model_dir "$MODEL_QWEN35_35B_AWQ" "Qwen3.5-35B-AWQ"
-fi
-
-# Model Optimization Defaults for MoE (35B+)
-export FASTINFERENCE_QWEN35_MOE_FP8=1
-export FASTINFERENCE_QWEN35_MOE_OFFLOAD=1
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
-echo "[1/3] TinyLlama"
+echo "[1/2] TinyLlama"
 FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
 
-echo "[2/3] Qwen3.5-9B AWQ"
+echo "[2/2] Qwen3.5-9B AWQ"
 FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
-
-if [[ "$SKIP_35B" == "1" ]]; then
-  echo "[3/3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
-else
-  echo "[3/3] Qwen3.5-35B AWQ (FP8-stable profile)"
-  FASTINFERENCE_KV_TYPE=fp8 \
-    uv run python tests/tools/quality_bar_spotcheck.py \
-      --model "$MODEL_QWEN35_35B_AWQ" \
-      --quant awq \
-      --prompt-subset minimal \
-      --max-new-tokens 16 \
-      --temperature 0 \
-      --chat-template auto \
-      --frugal
-fi
 
 if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then
   echo "SKIP_A_TIER=1 — done after Tier-B."
@@ -99,21 +71,6 @@ FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.p
   --hf-model "$HF_QWEN35_9B_FP16" \
   --prefill-only \
   --apply-chat-template off
-
-if [[ "$SKIP_35B" == "1" ]]; then
-  echo "[A3] Qwen3.5-35B AWQ (skipped by SKIP_35B=1)"
-elif [[ ! -d "$HF_QWEN35_35B_FP16" ]]; then
-  echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (skipped: missing HF baseline dir '$HF_QWEN35_35B_FP16')"
-else
-  echo "[A3] Qwen3.5-35B AWQ vs FP16 HF (prefill-only, FP8-stable profile)"
-  FASTINFERENCE_KV_TYPE=fp8 \
-    uv run python tests/verify_semantic_integrity.py \
-      --model "$MODEL_QWEN35_35B_AWQ" \
-      --preset qwen35_35b_moe_awq \
-      --hf-model "$HF_QWEN35_35B_FP16" \
-      --prefill-only \
-      --apply-chat-template off
-fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
   echo ""
@@ -143,9 +100,6 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   echo ""
   echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
   PERF_MODELS="tinyllama,qwen35_9b_awq"
-  if [[ "$SKIP_35B" != "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},qwen35_35b_awq"
-  fi
   PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
   echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
   uv run python tests/e2e_full_benchmark.py \

@@ -13,10 +13,10 @@ from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
     fp8_scale_shape_2d,
+    moe_fp8_enabled,
+    moe_offload_enabled,
     moe_expert_lru_size,
     moe_fp8_dequant_to_linear_weight,
-    qwen35_moe_fp8_enabled,
-    qwen35_moe_offload_enabled,
 )
 
 
@@ -383,9 +383,9 @@ class Qwen3_5MoeTopKRouterLite(nn.Module):
 class Qwen3_5MoeExpertsLite(nn.Module):
     """Aligned with HF ``Qwen3_5MoeExperts`` (loop over hit experts).
 
-    Optional GGUF packed uint8 (FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1): load-time RSS avoids full-blob dequant.
-    Optional FP8 block weights (FASTINFERENCE_QWEN35_MOE_FP8=1) halve expert weight bytes (incompatible with packed).
-    Optional CPU offload + GPU LRU (FASTINFERENCE_QWEN35_MOE_OFFLOAD=1) lowers GPU residency.
+    Optional GGUF packed uint8 (FASTINFERENCE_MOE_PACKED_GGUF=1): load-time RSS avoids full-blob dequant.
+    Optional FP8 block weights (FASTINFERENCE_MOE_FP8=1) halve expert weight bytes (incompatible with packed).
+    Optional CPU offload + GPU LRU (FASTINFERENCE_MOE_OFFLOAD=1) lowers GPU residency.
     """
 
     def __init__(self, config: LiteConfig):
@@ -397,11 +397,11 @@ class Qwen3_5MoeExpertsLite(nn.Module):
         
         self.fp8_moe = bool(
             f8 is not None
-            and qwen35_moe_fp8_enabled()
+            and moe_fp8_enabled()
             and dims_ok_for_moe_fp8(self.hidden_dim, self.intermediate_dim)
         )
         self.moe_cpu_offload = bool(
-            self.fp8_moe and qwen35_moe_offload_enabled()
+            self.fp8_moe and moe_offload_enabled()
         )
         self.lru_size = moe_expert_lru_size()
         self._lru_gpu: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = (

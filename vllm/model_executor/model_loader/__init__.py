@@ -22,8 +22,8 @@ from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
     fp8_block_quantize_2d,
     moe_fp8_block_size,
-    qwen35_moe_fp8_enabled,
-    qwen35_moe_offload_enabled,
+    moe_fp8_enabled,
+    moe_offload_enabled,
 )
 
 def _reorder_v_heads_ggml_to_hf(
@@ -670,15 +670,15 @@ def _checkpoint_has_language_model_layers(sd_keys: List[str]) -> bool:
     return any(k.startswith("model.language_model.layers.") for k in sd_keys)
 
 
-def _fill_qwen35_moe_experts_fp8_from_accum(
+def _fill_moe_experts_fp8_from_accum(
     model: nn.Module, expert_accum: Dict[str, torch.Tensor]
 ) -> int:
     """
-    Fill Qwen3.5 MoE expert FP8 CPU buffers from safetensors packed tensors.
+    Fill MoE expert FP8 CPU buffers from safetensors packed tensors.
     """
     if not expert_accum:
         return 0
-    if not (qwen35_moe_fp8_enabled() and qwen35_moe_offload_enabled()):
+    if not (moe_fp8_enabled() and moe_offload_enabled()):
         return 0
     f8 = getattr(torch, "float8_e4m3fn", None)
     if f8 is None:
@@ -796,43 +796,15 @@ def _param_copy_key_allowed(
     )
 
 
-def _looks_like_qwen35_35b_awq_model_path(model_path: str) -> bool:
-    base = os.path.basename(os.path.abspath(model_path)).lower()
-    return "qwen3.5-35b-awq" in base or ("qwen3.5" in base and "35b" in base and "awq" in base)
-
-
 def _looks_like_qwen35_9b_awq_model_path(model_path: str) -> bool:
     base = os.path.basename(os.path.abspath(model_path)).lower()
     return "qwen3.5-9b-awq" in base or ("qwen3.5" in base and "9b" in base and "awq" in base)
 
 
 def _qwen35_awq_profile_hint_from_model_path(model_path: str) -> str:
-    if _looks_like_qwen35_35b_awq_model_path(model_path):
-        return "qwen35_35b_awq"
     if _looks_like_qwen35_9b_awq_model_path(model_path):
         return "qwen35_9b_awq"
     return ""
-
-
-_QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES = (
-    ".linear_attn.in_proj_qkv",
-    ".linear_attn.out_proj",
-    ".self_attn.q_proj",
-    ".self_attn.k_proj",
-    ".self_attn.v_proj",
-    ".self_attn.o_proj",
-    ".shared_expert.gate_proj",
-    ".shared_expert.up_proj",
-    ".shared_expert.down_proj",
-)
-_QWEN35_35B_RELAXED_HIGH_FIDELITY_SUFFIXES = (
-    ".linear_attn.in_proj_qkv",
-    ".linear_attn.out_proj",
-    ".self_attn.q_proj",
-    ".self_attn.k_proj",
-    ".self_attn.v_proj",
-    ".self_attn.o_proj",
-)
 
 
 def _awq_policy_matrix_mode() -> str:
@@ -840,25 +812,6 @@ def _awq_policy_matrix_mode() -> str:
     if raw not in ("safe", "balanced", "throughput", "strict"):
         return "balanced"
     return raw
-
-
-def _should_force_high_fidelity_awq_for_qwen35_35b(module_name: str) -> bool:
-    mode = os.environ.get("FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE", "").strip().lower()
-    if mode == "":
-        matrix = _awq_policy_matrix_mode()
-        if matrix == "strict":
-            mode = "all"
-        elif matrix == "throughput":
-            mode = "relaxed"
-        else:
-            mode = "balanced"
-    if mode in ("off", "0", "false", "no"):
-        return False
-    if mode in ("all", "full"):
-        return ".experts." not in module_name
-    if mode in ("relaxed", "fast"):
-        return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_RELAXED_HIGH_FIDELITY_SUFFIXES)
-    return any(module_name.endswith(suffix) for suffix in _QWEN35_35B_BALANCED_HIGH_FIDELITY_SUFFIXES)
 
 
 def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dtype = torch.float16):
@@ -888,7 +841,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
     loaded_params = set()
     # Sharded checkpoints split qweight / scales / qzeros across files; merge before dequant.
     awq_accum: Dict[str, Dict[str, torch.Tensor]] = {}
-    collect_moe_expert = qwen35_moe_fp8_enabled() and qwen35_moe_offload_enabled()
+    collect_moe_expert = moe_fp8_enabled() and moe_offload_enabled()
     expert_accum: Dict[str, torch.Tensor] = {}
     for f in sf_files:
         print(f"    Processing {f}...")
@@ -995,10 +948,6 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
         try:
             # Force preserve quant for all AWQ models to avoid CPU OOM
             m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)
-            if _looks_like_qwen35_35b_awq_model_path(model_path):
-                m.force_high_fidelity_awq = _should_force_high_fidelity_awq_for_qwen35_35b(
-                    m_name
-                )
             
             # Tensors are already on GPU from immediate transfer above
             m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)
@@ -1032,7 +981,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                 f"keys={list(comps.keys())} (need both qweight and scales)"
             )
 
-    _fill_qwen35_moe_experts_fp8_from_accum(model, expert_accum)
+    _fill_moe_experts_fp8_from_accum(model, expert_accum)
     if collect_moe_expert:
         del expert_accum
         gc.collect()

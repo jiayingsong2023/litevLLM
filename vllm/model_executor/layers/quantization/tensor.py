@@ -209,15 +209,12 @@ def _env_awq_fused_scope(profile_hint: str) -> str:
             return scope
     # Profile-aware default matrix (no override):
     # - qwen35_9b_awq: safe=attention_only, balanced|throughput=all, strict=off
-    # - qwen35_35b_awq: safe/balanced=off, throughput=attention_only, strict=off
     if profile_hint == "qwen35_9b_awq":
         default_scope = (
             "all" if matrix in ("balanced", "throughput")
             else "off" if matrix == "strict"
             else "attention_only"
         )
-    elif profile_hint == "qwen35_35b_awq":
-        default_scope = "attention_only" if matrix == "throughput" else "off"
     else:
         default_scope = "all" if matrix in ("balanced", "throughput") else "attention_only"
     scope = os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE", default_scope).strip().lower()

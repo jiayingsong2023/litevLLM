@@ -905,25 +905,30 @@ def main() -> int:
         f"presence_penalty={args.presence_penalty} "
         f"hints={{gguf_moe={hints.get('is_moe')!s}, model_type={hints.get('model_type')!r}}}\n"
     )
-    if os.environ.get("FASTINFERENCE_QWEN35_MOE_FP8", "0").strip().lower() in (
+    _moe_fp8_env = os.environ.get("FASTINFERENCE_MOE_FP8", os.environ.get("FASTINFERENCE_QWEN35_MOE_FP8", "0"))
+    if _moe_fp8_env.strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     ):
         sys.stderr.write(
-            "[Note] FASTINFERENCE_QWEN35_MOE_FP8=1 trades MoE weight precision for memory; "
+            "[Note] FASTINFERENCE_MOE_FP8=1 trades MoE weight precision for memory; "
             "if completions look repetitive or incoherent, unset it or use --temperature 0 for a greedy sanity check.\n"
         )
-    if os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0").strip().lower() in (
+    _moe_packed_env = os.environ.get(
+        "FASTINFERENCE_MOE_PACKED_GGUF",
+        os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0"),
+    )
+    if _moe_packed_env.strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     ):
         sys.stderr.write(
-            "[Note] FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 lowers MoE GGUF load-time host RSS; "
-            "do not combine with FASTINFERENCE_QWEN35_MOE_FP8=1.\n"
+            "[Note] FASTINFERENCE_MOE_PACKED_GGUF=1 lowers MoE GGUF load-time host RSS; "
+            "do not combine with FASTINFERENCE_MOE_FP8=1.\n"
         )
     if hints.get("model_type") == "deepseek_v2" and args.quant == "gguf":
         # Default-on for Tier-B readability; override with FASTINFERENCE_*=0 if needed.

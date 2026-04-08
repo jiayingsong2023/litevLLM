@@ -26,7 +26,7 @@ If the process crashes immediately during `torch.zeros` allocation or model load
 ### Weights loading OOM
 - **Cause**: The model is too large for your GPU VRAM.
 - **Solution**: Use GGUF or AWQ quantization. FastInference is highly optimized for **Self-Healing Loading**, which dequantizes weights block-by-block to minimize peak memory.
-- **Qwen3.5 MoE GGUF (host RSS peak)**: Setting `FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1` keeps routed expert tensors (`ffn_*_exps`) as packed GGUF bytes during load instead of a full-blob `gguf.dequantize`, which lowers **CPU** peak RSS. This is incompatible with `FASTINFERENCE_QWEN35_MOE_FP8=1` (unset one of them).
+- **MoE GGUF (host RSS peak)**: Setting `FASTINFERENCE_MOE_PACKED_GGUF=1` keeps routed expert tensors (`ffn_*_exps`) as packed GGUF bytes during load instead of a full-blob `gguf.dequantize`, which lowers **CPU** peak RSS. This is incompatible with `FASTINFERENCE_MOE_FP8=1` (unset one of them). Legacy `FASTINFERENCE_QWEN35_MOE_*` names are still accepted for compatibility.
 
 ### KV Cache OOM
 - **Cause**: Too many concurrent requests or very long context.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5 MoE FP8 block quant/dequant and env flags (shared by loader + model)."""
+"""Shared MoE FP8 block quant/dequant helpers and runtime flags."""
 from __future__ import annotations
 
 import os
@@ -12,22 +12,33 @@ def moe_fp8_block_size() -> int:
     return _MOE_FP8_BLOCK
 
 
+def _env_truthy(*names: str) -> bool:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        if raw.strip().lower() in ("1", "true", "yes", "on"):
+            return True
+        return False
+    return False
+
+
+def moe_fp8_enabled() -> bool:
+    return _env_truthy("FASTINFERENCE_MOE_FP8", "FASTINFERENCE_QWEN35_MOE_FP8")
+
+
+def moe_offload_enabled() -> bool:
+    return _env_truthy("FASTINFERENCE_MOE_OFFLOAD", "FASTINFERENCE_QWEN35_MOE_OFFLOAD")
+
+
 def qwen35_moe_fp8_enabled() -> bool:
-    return os.environ.get("FASTINFERENCE_QWEN35_MOE_FP8", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """Legacy alias for older Qwen3.5-specific call sites."""
+    return moe_fp8_enabled()
 
 
 def qwen35_moe_offload_enabled() -> bool:
-    return os.environ.get("FASTINFERENCE_QWEN35_MOE_OFFLOAD", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """Legacy alias for older Qwen3.5-specific call sites."""
+    return moe_offload_enabled()
 
 
 def moe_expert_lru_size() -> int:

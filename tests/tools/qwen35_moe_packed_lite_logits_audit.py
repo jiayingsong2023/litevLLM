@@ -8,10 +8,10 @@ MoE GGUF packed path: audits for Lite logits vs dense load and for raw weight pa
 Compare Lite prefill logits when loading the same GGUF with packed MoE vs dense MoE experts.
 Use two processes (dense load often needs more host RAM).
 
-  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=1 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
+  FASTINFERENCE_MOE_PACKED_GGUF=1 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
     --model models/Qwen3.5-35B-MoE-GGUF --out /tmp/lite_packed.pt
 
-  FASTINFERENCE_QWEN35_MOE_PACKED_GGUF=0 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
+  FASTINFERENCE_MOE_PACKED_GGUF=0 uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py dump \\
     --model models/Qwen3.5-35B-MoE-GGUF --out /tmp/lite_dense.pt --frugal
 
   uv run python tests/tools/qwen35_moe_packed_lite_logits_audit.py diff /tmp/lite_packed.pt /tmp/lite_dense.pt
@@ -189,7 +189,10 @@ def _dump_logits(model_dir: str, prompt: str, out_path: str, *, frugal: bool, gp
         raise RuntimeError(f"Expected logits [B,T,V], got {tuple(last.shape)}")
     logits_last = last[0, -1, :].clone()
 
-    packed = os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0").strip().lower() in (
+    packed = os.environ.get(
+        "FASTINFERENCE_MOE_PACKED_GGUF",
+        os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0"),
+    ).strip().lower() in (
         "1",
         "true",
         "yes",
