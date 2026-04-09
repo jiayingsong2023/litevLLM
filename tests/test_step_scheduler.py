@@ -15,6 +15,14 @@ def _scheduler_with_requests(requests: list[dict]) -> RequestScheduler:
             "input_ids": request.get("input_ids", [1, 2, 3, 4]),
             "generated_ids": request.get("generated_ids", [10]),
             "sampling_params": request.get("sampling_params"),
+            "service_class": request.get("service_class", "latency"),
+            "lora_id": request.get("lora_id"),
+            "is_multimodal": request.get("is_multimodal", False),
+            "multi_modal_data": (
+                {"image": [{"image": "file:///tmp/demo.png"}]}
+                if request.get("is_multimodal", False)
+                else None
+            ),
         }
         scheduler.add_request(f"r{i}", state)
     return scheduler
@@ -28,7 +36,7 @@ def test_step_scheduler_decode_fast_path_when_only_decodes() -> None:
         ]
     )
     step_scheduler = StepScheduler(
-        step_token_budget=16,
+        step_token_budget=2,
         decode_priority_enabled=True,
         prefill_chunk_size=8,
         prefill_reserved_tokens=0,
@@ -251,6 +259,566 @@ def test_step_scheduler_aging_can_override_short_prompt_preference(monkeypatch) 
     assert plan.admissions.request_ids == ["old-long"]
 
 
+def test_step_scheduler_limits_multimodal_admissions_per_step() -> None:
+    scheduler = RequestScheduler(max_active_requests=3)
+    scheduler.enqueue_request(
+        "mm0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "is_multimodal": True},
+    )
+    scheduler.enqueue_request(
+        "mm1",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "is_multimodal": True},
+    )
+    scheduler.enqueue_request(
+        "txt0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "is_multimodal": False},
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_admit_per_step=3,
+        max_admit_multimodal_per_step=1,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.admissions is not None
+    admitted = set(plan.admissions.request_ids)
+    assert "txt0" in admitted
+    assert len([rid for rid in admitted if rid.startswith("mm")]) == 1
+    assert plan.admitted_multimodal_requests == 1
+
+
+def test_step_scheduler_limits_multimodal_prefill_batch() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": False},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=1,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    selected = set(plan.prefills.request_ids)
+    assert len([rid for rid in selected if rid in {"r0", "r1"}]) == 1
+    assert plan.prefill_multimodal_requests == 1
+
+
+def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=1,
+        multimodal_prefix_cache_relax_threshold=0.2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_prefill_limit_relax_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.prefill_multimodal_requests == 2
+    assert plan.effective_prefill_multimodal_request_limit == 2
+    assert plan.prefill_multimodal_limit_relaxed is True
+    assert plan.prefill_multimodal_limit_tightened is False
+    assert plan.prefill_multimodal_limit_triggered is True
+
+
+def test_step_scheduler_tightens_multimodal_prefill_limit_on_high_prefix_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": False},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=2,
+        multimodal_prefix_cache_relax_threshold=0.2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_prefill_limit_tighten_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.prefill_multimodal_requests == 1
+    assert plan.effective_prefill_multimodal_request_limit == 1
+    assert plan.prefill_multimodal_limit_relaxed is False
+    assert plan.prefill_multimodal_limit_tightened is True
+    assert plan.prefill_multimodal_limit_triggered is True
+
+
+def test_step_scheduler_limits_multimodal_lora_admissions_per_step() -> None:
+    scheduler = RequestScheduler(max_active_requests=4)
+    scheduler.enqueue_request(
+        "mm_lora0",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "is_multimodal": True,
+            "lora_id": "adapter-a",
+        },
+    )
+    scheduler.enqueue_request(
+        "mm_lora1",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "is_multimodal": True,
+            "lora_id": "adapter-b",
+        },
+    )
+    scheduler.enqueue_request(
+        "mm_only",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "is_multimodal": True},
+    )
+    scheduler.enqueue_request(
+        "txt_only",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "is_multimodal": False},
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=4,
+        max_admit_per_step=4,
+        max_admit_multimodal_per_step=2,
+        max_admit_multimodal_lora_per_step=1,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.admissions is not None
+    admitted = set(plan.admissions.request_ids)
+    assert "txt_only" in admitted
+    assert "mm_only" in admitted
+    assert len([rid for rid in admitted if rid.startswith("mm_lora")]) == 1
+    assert plan.admitted_multimodal_requests == 2
+    assert plan.admitted_multimodal_lora_requests == 1
+
+
+def test_step_scheduler_limits_multimodal_lora_prefill_batch() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": None,
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=3,
+        max_prefill_multimodal_lora_requests_per_batch=1,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    selected = set(plan.prefills.request_ids)
+    assert "r2" in selected
+    assert len([rid for rid in selected if rid in {"r0", "r1"}]) == 1
+    assert plan.prefill_multimodal_requests == 2
+    assert plan.prefill_multimodal_lora_requests == 1
+
+
+def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_low_prefix_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": None,
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=3,
+        max_prefill_multimodal_lora_requests_per_batch=1,
+        multimodal_prefix_cache_relax_threshold=0.2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_lora_prefill_limit_relax_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.prefill_multimodal_lora_requests == 2
+    assert plan.effective_prefill_multimodal_lora_request_limit == 2
+    assert plan.prefill_multimodal_lora_limit_relaxed is True
+    assert plan.prefill_multimodal_lora_limit_tightened is False
+    assert plan.prefill_multimodal_lora_limit_triggered is False
+
+
+def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_high_prefix_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": None,
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=3,
+        max_prefill_multimodal_lora_requests_per_batch=2,
+        multimodal_prefix_cache_relax_threshold=0.2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_lora_prefill_limit_tighten_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.prefill_multimodal_lora_requests == 1
+    assert plan.effective_prefill_multimodal_lora_request_limit == 1
+    assert plan.prefill_multimodal_lora_limit_relaxed is False
+    assert plan.prefill_multimodal_lora_limit_tightened is True
+    assert plan.prefill_multimodal_lora_limit_triggered is True
+
+
+def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_fairness_gap() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=2,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_prefill_multimodal_requests_per_batch=4,
+        max_prefill_multimodal_lora_requests_per_batch=1,
+        multimodal_prefix_cache_relax_threshold=0.0,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_lora_fairness_relax_threshold=0.2,
+        multimodal_lora_prefill_limit_relax_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.5}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.effective_prefill_multimodal_lora_request_limit == 2
+    assert plan.prefill_multimodal_lora_limit_relaxed is True
+    assert plan.prefill_multimodal_lora_limit_relaxed_by_fairness is True
+    assert plan.prefill_multimodal_lora_max_fairness_gap >= 0.2
+
+
+def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_locality_under_high_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+                "lora_id": None,
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=12,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=3,
+        max_prefill_multimodal_requests_per_batch=3,
+        max_prefill_multimodal_lora_requests_per_batch=2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_lora_locality_tighten_threshold=0.2,
+        multimodal_lora_prefill_limit_tighten_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.effective_prefill_multimodal_lora_request_limit == 1
+    assert plan.prefill_multimodal_lora_limit_tightened is True
+    assert plan.prefill_multimodal_lora_limit_tightened_by_locality is True
+    assert plan.prefill_multimodal_lora_max_fairness_gap <= 0.2
+
+
+def test_step_scheduler_relaxes_multimodal_lora_decode_limit_on_fairness_gap() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-b"},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=2,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_decode_multimodal_requests_per_batch=4,
+        max_decode_multimodal_lora_requests_per_batch=1,
+        multimodal_lora_fairness_relax_threshold=0.2,
+        multimodal_lora_prefill_limit_relax_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.5}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.decodes is not None
+    assert plan.effective_decode_multimodal_lora_request_limit == 2
+    assert plan.decode_multimodal_lora_limit_relaxed is True
+    assert plan.decode_multimodal_lora_limit_relaxed_by_fairness is True
+    assert plan.decode_multimodal_lora_max_fairness_gap >= 0.2
+
+
+def test_step_scheduler_tightens_multimodal_lora_decode_limit_on_locality_under_high_hit_rate() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-b"},
+            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": None},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=4,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_decode_multimodal_requests_per_batch=3,
+        max_decode_multimodal_lora_requests_per_batch=2,
+        multimodal_prefix_cache_tighten_threshold=0.8,
+        multimodal_lora_locality_tighten_threshold=0.2,
+        multimodal_lora_prefill_limit_tighten_delta=1,
+    )
+    step_scheduler.update_runtime_feedback(
+        {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.decodes is not None
+    assert plan.effective_decode_multimodal_lora_request_limit == 1
+    assert plan.decode_multimodal_lora_limit_tightened is True
+    assert plan.decode_multimodal_lora_limit_tightened_by_locality is True
+    assert plan.decode_multimodal_lora_max_fairness_gap <= 0.2
+
+
+def test_step_scheduler_tracks_multimodal_queue_wait_metrics(monkeypatch) -> None:
+    scheduler = RequestScheduler(max_active_requests=2)
+    scheduler.enqueue_request(
+        "mm0",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "queued_at": 4.0,
+            "is_multimodal": True,
+            "multi_modal_data": {"image": [{"image": "file:///tmp/a.png"}]},
+        },
+    )
+    scheduler.enqueue_request(
+        "txt0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "queued_at": 6.0},
+    )
+    monkeypatch.setattr(time, "perf_counter", lambda: 10.0)
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.queued_multimodal_requests == 1
+    assert plan.queued_multimodal_avg_wait_s == 6.0
+    assert plan.queued_multimodal_max_wait_s == 6.0
+    assert plan.queued_multimodal_p95_wait_s == 6.0
+
+
 def test_step_scheduler_starvation_protects_prefill_after_decode_streak() -> None:
     scheduler = _scheduler_with_requests(
         [
@@ -430,6 +998,279 @@ def test_step_scheduler_decode_uses_weighted_service_class_fairness() -> None:
     assert set(plan1.decodes.request_ids) == {"latency-0", "background-0"}
     assert set(plan2.decodes.request_ids) == {"latency-0", "background-1"}
     assert plan1.decode_service_classes == {"latency": 1, "background": 1}
+
+
+def test_step_scheduler_reports_lora_adapter_counts() -> None:
+    scheduler = RequestScheduler(max_active_requests=3)
+    scheduler.add_request(
+        "prefill-a",
+        {
+            "slot_idx": 0,
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2, 3, 4],
+            "generated_ids": [],
+            "lora_id": "adapter-a",
+        },
+    )
+    scheduler.add_request(
+        "decode-b",
+        {
+            "slot_idx": 1,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "lora_id": "adapter-b",
+        },
+    )
+    scheduler.enqueue_request(
+        "queued-a",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "service_class": "latency",
+            "lora_id": "adapter-a",
+        },
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=2,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=1,
+        max_admit_per_step=1,
+    )
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.admitted_lora_adapters == {"adapter-a": 1}
+    assert plan.prefill_lora_adapters == {"adapter-a": 1}
+    assert plan.decode_lora_adapters == {"adapter-b": 1}
+    assert plan.queued_lora_adapters == {"adapter-a": 1}
+
+
+def test_step_scheduler_limits_admit_lora_adapters_per_step_and_rotates() -> None:
+    scheduler = RequestScheduler(max_active_requests=3)
+    scheduler.enqueue_request(
+        "adapter-a-0",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "lora_id": "adapter-a",
+        },
+    )
+    scheduler.enqueue_request(
+        "adapter-b-0",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "lora_id": "adapter-b",
+        },
+    )
+    scheduler.enqueue_request(
+        "adapter-c-0",
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "lora_id": "adapter-c",
+        },
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_admit_per_step=2,
+        max_admit_lora_adapters_per_step=1,
+    )
+
+    plan1 = step_scheduler.build_plan(scheduler)
+    plan2 = step_scheduler.build_plan(scheduler)
+
+    assert plan1.admissions is not None
+    assert plan2.admissions is not None
+    assert len(plan1.admitted_lora_adapters or {}) == 1
+    assert len(plan2.admitted_lora_adapters or {}) == 1
+    assert plan1.admissions.request_ids != plan2.admissions.request_ids
+
+
+def test_step_scheduler_relaxes_admit_lora_limit_on_fairness_gap() -> None:
+    scheduler = RequestScheduler(max_active_requests=4)
+    scheduler.enqueue_request(
+        "adapter-a-0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1], "lora_id": "adapter-a"},
+    )
+    scheduler.enqueue_request(
+        "adapter-b-0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "lora_id": "adapter-b"},
+    )
+    scheduler.enqueue_request(
+        "adapter-c-0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "lora_id": "adapter-c"},
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_admit_per_step=2,
+        max_admit_lora_adapters_per_step=1,
+        lora_fairness_relax_threshold=0.3,
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.admissions is not None
+    assert plan.effective_admit_lora_adapter_limit == 2
+    assert len(plan.admitted_lora_adapters or {}) == 2
+    assert plan.admitted_max_lora_fairness_gap > 0.0
+
+
+def test_step_scheduler_limits_prefill_lora_adapters_per_batch() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4, 5, 6],
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4, 5, 6],
+                "lora_id": "adapter-b",
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=1.0,
+        prefill_microbatch_size=2,
+        max_prefill_lora_adapters_per_batch=1,
+    )
+
+    plan1 = step_scheduler.build_plan(scheduler)
+    plan2 = step_scheduler.build_plan(scheduler)
+
+    assert plan1.prefills is not None
+    assert plan2.prefills is not None
+    assert len(plan1.prefill_lora_adapters or {}) == 1
+    assert len(plan2.prefill_lora_adapters or {}) == 1
+    assert plan1.prefills.request_ids != plan2.prefills.request_ids
+
+
+def test_step_scheduler_tightens_prefill_lora_limit_when_locality_is_good() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4, 5, 6],
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4, 5, 6],
+                "lora_id": "adapter-b",
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=1.0,
+        prefill_microbatch_size=2,
+        max_prefill_lora_adapters_per_batch=2,
+        lora_locality_tighten_threshold=0.01,
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert plan.effective_prefill_lora_adapter_limit == 1
+    assert len(plan.prefill_lora_adapters or {}) == 1
+    assert len(plan.prefills.request_ids) == 1
+
+
+def test_step_scheduler_limits_decode_lora_adapters_per_batch() -> None:
+    scheduler = RequestScheduler(max_active_requests=4)
+    scheduler.add_request(
+        "decode-a",
+        {
+            "slot_idx": 0,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "lora_id": "adapter-a",
+        },
+    )
+    scheduler.add_request(
+        "decode-b",
+        {
+            "slot_idx": 1,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "lora_id": "adapter-b",
+        },
+    )
+    scheduler.add_request(
+        "decode-c",
+        {
+            "slot_idx": 2,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "lora_id": "adapter-c",
+        },
+    )
+
+    step_scheduler = StepScheduler(
+        step_token_budget=3,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=1,
+        max_decode_lora_adapters_per_batch=2,
+    )
+
+    plan1 = step_scheduler.build_plan(scheduler)
+    plan2 = step_scheduler.build_plan(scheduler)
+
+    assert plan1.decodes is not None
+    assert plan2.decodes is not None
+    assert len(plan1.decode_lora_adapters or {}) == 2
+    assert len(plan2.decode_lora_adapters or {}) == 2
+    assert set(plan1.decodes.request_ids) != set(plan2.decodes.request_ids)
 
 
 def test_step_scheduler_reports_aged_admissions() -> None:

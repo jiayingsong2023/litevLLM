@@ -20,6 +20,12 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             self.reset_calls.append(clear_prefix_cache)
 
+        def register_lora_adapter(self, *, lora_name: str, lora_path: str | None = None, lora_int_id: int | None = None):
+            return {"lora_name": lora_name, "lora_path": lora_path, "lora_int_id": lora_int_id}
+
+        def unregister_lora_adapter(self, lora_name: str) -> bool:
+            return lora_name == "demo"
+
     class FakeDriver:
         def __init__(self, engine) -> None:
             self.engine = engine
@@ -42,6 +48,12 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
     assert llm.stats() == {"scheduler": {"active_request_count": 1}}
     llm.reset_stats(clear_prefix_cache=True)
     assert llm.engine.reset_calls == [True]
+    assert llm.register_lora_adapter(lora_name="demo", lora_path="/tmp/demo", lora_int_id=7) == {
+        "lora_name": "demo",
+        "lora_path": "/tmp/demo",
+        "lora_int_id": 7,
+    }
+    assert llm.unregister_lora_adapter("demo") is True
 
 
 def test_llm_stats_delegates_to_engine() -> None:
@@ -57,11 +69,23 @@ def test_llm_stats_delegates_to_engine() -> None:
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             self.reset_calls.append(clear_prefix_cache)
 
+        def register_lora_adapter(self, *, lora_name: str, lora_path: str | None = None, lora_int_id: int | None = None):
+            return {"lora_name": lora_name, "lora_path": lora_path, "lora_int_id": lora_int_id}
+
+        def unregister_lora_adapter(self, lora_name: str) -> bool:
+            return lora_name == "demo"
+
     llm.engine = FakeEngine()
 
     assert llm.stats() == {"backend": {"backend_type": "fake"}}
     llm.reset_stats(clear_prefix_cache=True)
     assert llm.engine.reset_calls == [True]
+    assert llm.register_lora_adapter(lora_name="demo", lora_path="/tmp/demo", lora_int_id=7) == {
+        "lora_name": "demo",
+        "lora_path": "/tmp/demo",
+        "lora_int_id": 7,
+    }
+    assert llm.unregister_lora_adapter("demo") is True
 
 
 def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
@@ -92,6 +116,77 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "model": "demo-model",
+        "summary": {
+            "prefix_cache": {
+                "hit_rate": 0.0,
+                "avg_saved_prefill_tokens_per_request": 0.0,
+            },
+                "preemption": {
+                    "preempted_steps": 0,
+                    "preempted_prefill_requests": 0,
+                    "preempted_multimodal_prefill_requests": 0,
+                    "protected_multimodal_prefix_steps": 0,
+                    "protected_multimodal_prefix_prefill_requests": 0,
+                },
+            "fairness": {
+                "p95_queue_wait_s": 0.0,
+                "max_queue_wait_s": 0.0,
+                "fairness_guardrail_triggered_steps": 0,
+            },
+            "lora": {
+                "registered_adapters": 0,
+                "active_adapters": 0,
+                "total_routed_requests": 0,
+                "prefill_locality_rate": 0.0,
+                "decode_locality_rate": 0.0,
+                "admit_relaxed_steps": 0,
+                "admit_tightened_steps": 0,
+                "prefill_relaxed_steps": 0,
+                "prefill_tightened_steps": 0,
+                "decode_relaxed_steps": 0,
+                "decode_tightened_steps": 0,
+            },
+                "multimodal": {
+                    "requests": 0,
+                    "images": 0,
+                    "multimodal_lora_requests": 0,
+                    "queued_requests": 0,
+                "admitted_requests": 0,
+                "prefill_requests": 0,
+                "prefill_multimodal_lora_requests": 0,
+                "decode_requests": 0,
+                "p95_queue_wait_s": 0.0,
+                "prefix_cache_hits": 0,
+                    "prefix_cache_misses": 0,
+                    "prefix_cache_saved_prefill_tokens": 0,
+                    "prefix_cache_hit_rate": 0.0,
+                    "mixed_multimodal_lora_prefill_ratio": 0.0,
+                    "avg_effective_prefill_multimodal_limit": 0.0,
+                    "prefill_multimodal_limit_relaxed_steps": 0,
+                    "prefill_multimodal_limit_tightened_steps": 0,
+                    "prefill_multimodal_limit_triggered_steps": 0,
+                    "avg_effective_admit_multimodal_lora_limit": 0.0,
+                    "avg_effective_prefill_multimodal_lora_limit": 0.0,
+                    "avg_effective_decode_multimodal_lora_limit": 0.0,
+                    "admit_multimodal_lora_limit_triggered_steps": 0,
+                    "prefill_multimodal_lora_limit_relaxed_steps": 0,
+                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                    "prefill_multimodal_lora_limit_tightened_steps": 0,
+                    "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "prefill_multimodal_lora_limit_triggered_steps": 0,
+                    "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
+                    "decode_multimodal_lora_limit_relaxed_steps": 0,
+                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                    "decode_multimodal_lora_limit_tightened_steps": 0,
+                    "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "decode_multimodal_lora_limit_triggered_steps": 0,
+                    "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
+                "prepared_requests": 0,
+                "prepared_images": 0,
+                "embeddings_computed": 0,
+                "avg_embedding_feature_dim": 0.0,
+            },
+        },
         "stats": {
             "scheduler": {"active_request_count": 2},
             "observer": {"step_count": 3},
@@ -129,10 +224,171 @@ def test_runtime_stats_reset_endpoint_resets_engine_stats() -> None:
     assert fake_engine.reset_calls == [True]
     assert response.json() == {
         "model": "demo-model",
+        "summary": {
+            "prefix_cache": {
+                "hit_rate": 0.0,
+                "avg_saved_prefill_tokens_per_request": 0.0,
+            },
+                "preemption": {
+                    "preempted_steps": 0,
+                    "preempted_prefill_requests": 0,
+                    "preempted_multimodal_prefill_requests": 0,
+                    "protected_multimodal_prefix_steps": 0,
+                    "protected_multimodal_prefix_prefill_requests": 0,
+                },
+            "fairness": {
+                "p95_queue_wait_s": 0.0,
+                "max_queue_wait_s": 0.0,
+                "fairness_guardrail_triggered_steps": 0,
+            },
+            "lora": {
+                "registered_adapters": 0,
+                "active_adapters": 0,
+                "total_routed_requests": 0,
+                "prefill_locality_rate": 0.0,
+                "decode_locality_rate": 0.0,
+                "admit_relaxed_steps": 0,
+                "admit_tightened_steps": 0,
+                "prefill_relaxed_steps": 0,
+                "prefill_tightened_steps": 0,
+                "decode_relaxed_steps": 0,
+                "decode_tightened_steps": 0,
+            },
+                "multimodal": {
+                    "requests": 0,
+                    "images": 0,
+                    "multimodal_lora_requests": 0,
+                    "queued_requests": 0,
+                "admitted_requests": 0,
+                "prefill_requests": 0,
+                "prefill_multimodal_lora_requests": 0,
+                "decode_requests": 0,
+                "p95_queue_wait_s": 0.0,
+                "prefix_cache_hits": 0,
+                    "prefix_cache_misses": 0,
+                    "prefix_cache_saved_prefill_tokens": 0,
+                    "prefix_cache_hit_rate": 0.0,
+                    "mixed_multimodal_lora_prefill_ratio": 0.0,
+                    "avg_effective_prefill_multimodal_limit": 0.0,
+                    "prefill_multimodal_limit_relaxed_steps": 0,
+                    "prefill_multimodal_limit_tightened_steps": 0,
+                    "prefill_multimodal_limit_triggered_steps": 0,
+                    "avg_effective_admit_multimodal_lora_limit": 0.0,
+                    "avg_effective_prefill_multimodal_lora_limit": 0.0,
+                    "avg_effective_decode_multimodal_lora_limit": 0.0,
+                    "admit_multimodal_lora_limit_triggered_steps": 0,
+                    "prefill_multimodal_lora_limit_relaxed_steps": 0,
+                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                    "prefill_multimodal_lora_limit_tightened_steps": 0,
+                    "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "prefill_multimodal_lora_limit_triggered_steps": 0,
+                    "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
+                    "decode_multimodal_lora_limit_relaxed_steps": 0,
+                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                    "decode_multimodal_lora_limit_tightened_steps": 0,
+                    "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "decode_multimodal_lora_limit_triggered_steps": 0,
+                    "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
+                "prepared_requests": 0,
+                "prepared_images": 0,
+                "embeddings_computed": 0,
+                "avg_embedding_feature_dim": 0.0,
+            },
+        },
         "stats": {
             "scheduler": {"active_request_count": 0},
             "observer": {"step_count": 0},
         },
+    }
+
+
+def test_runtime_stats_summary_includes_multimodal_snapshot() -> None:
+    summary = api_server._summarize_runtime_stats(
+        {
+            "observer": {
+                "multimodal": {
+                    "requests": 2,
+                    "images": 2,
+                    "multimodal_lora_requests": 1,
+                    "queued_requests": 1,
+                    "admitted_requests": 2,
+                    "prefill_requests": 2,
+                    "prefill_multimodal_lora_requests": 1,
+                    "decode_requests": 1,
+                    "p95_queue_wait_s": 0.4,
+                    "mixed_multimodal_lora_prefill_ratio": 0.5,
+                    "avg_effective_prefill_multimodal_limit": 2.0,
+                    "prefill_multimodal_limit_relaxed_steps": 1,
+                    "prefill_multimodal_limit_tightened_steps": 0,
+                    "prefill_multimodal_limit_triggered_steps": 1,
+                    "avg_effective_admit_multimodal_lora_limit": 1.0,
+                    "avg_effective_prefill_multimodal_lora_limit": 1.0,
+                    "avg_effective_decode_multimodal_lora_limit": 1.5,
+                    "admit_multimodal_lora_limit_triggered_steps": 2,
+                    "prefill_multimodal_lora_limit_relaxed_steps": 1,
+                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 1,
+                    "prefill_multimodal_lora_limit_tightened_steps": 0,
+                    "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "prefill_multimodal_lora_limit_triggered_steps": 1,
+                    "avg_prefill_multimodal_lora_max_fairness_gap": 0.25,
+                    "decode_multimodal_lora_limit_relaxed_steps": 1,
+                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 1,
+                    "decode_multimodal_lora_limit_tightened_steps": 0,
+                    "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                    "decode_multimodal_lora_limit_triggered_steps": 1,
+                    "avg_decode_multimodal_lora_max_fairness_gap": 0.2,
+                }
+            },
+            "backend": {
+                "multimodal": {
+                    "prepared_requests": 2,
+                    "prepared_images": 2,
+                    "embeddings_computed": 2,
+                    "avg_embedding_feature_dim": 32.0,
+                }
+            },
+        }
+    )
+
+    assert summary["multimodal"] == {
+        "requests": 2,
+        "images": 2,
+        "multimodal_lora_requests": 1,
+        "queued_requests": 1,
+        "admitted_requests": 2,
+        "prefill_requests": 2,
+        "prefill_multimodal_lora_requests": 1,
+        "decode_requests": 1,
+        "p95_queue_wait_s": 0.4,
+        "prefix_cache_hits": 0,
+        "prefix_cache_misses": 0,
+        "prefix_cache_saved_prefill_tokens": 0,
+        "prefix_cache_hit_rate": 0.0,
+        "mixed_multimodal_lora_prefill_ratio": 0.5,
+        "avg_effective_prefill_multimodal_limit": 2.0,
+        "prefill_multimodal_limit_relaxed_steps": 1,
+        "prefill_multimodal_limit_tightened_steps": 0,
+        "prefill_multimodal_limit_triggered_steps": 1,
+        "avg_effective_admit_multimodal_lora_limit": 1.0,
+        "avg_effective_prefill_multimodal_lora_limit": 1.0,
+        "avg_effective_decode_multimodal_lora_limit": 1.5,
+        "admit_multimodal_lora_limit_triggered_steps": 2,
+        "prefill_multimodal_lora_limit_relaxed_steps": 1,
+        "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 1,
+        "prefill_multimodal_lora_limit_tightened_steps": 0,
+        "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+        "prefill_multimodal_lora_limit_triggered_steps": 1,
+        "avg_prefill_multimodal_lora_max_fairness_gap": 0.25,
+        "decode_multimodal_lora_limit_relaxed_steps": 1,
+        "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 1,
+        "decode_multimodal_lora_limit_tightened_steps": 0,
+        "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+        "decode_multimodal_lora_limit_triggered_steps": 1,
+        "avg_decode_multimodal_lora_max_fairness_gap": 0.2,
+        "prepared_requests": 2,
+        "prepared_images": 2,
+        "embeddings_computed": 2,
+        "avg_embedding_feature_dim": 32.0,
     }
 
 

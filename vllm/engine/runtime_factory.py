@@ -8,6 +8,7 @@ from vllm.engine.backend.lite_single_gpu import LiteSingleGpuBackend
 from vllm.engine.decode_executor import DecodeExecutor
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
+from vllm.engine.multimodal_processor import LiteMultiModalProcessor
 from vllm.engine.prefill_executor import PrefillExecutor
 from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.step_scheduler import StepScheduler
@@ -81,10 +82,15 @@ class LiteRuntimeFactory:
             stack_per_layer_carries=engine._stack_per_layer_carries,
             split_per_layer_carries=engine._split_per_layer_carries,
         )
+        multimodal_processor = LiteMultiModalProcessor(
+            model=engine.model,
+            device=engine.device,
+        )
         prefill_executor = PrefillExecutor(
             model=engine.model,
             input_batch_builder=input_batch_builder,
             kv_caches=engine.kv_caches,
+            multimodal_processor=multimodal_processor,
         )
         decode_executor = DecodeExecutor(
             model=engine.model,
@@ -129,6 +135,101 @@ class LiteRuntimeFactory:
             fairness_guardrail_service_classes=_parse_service_class_list_env(
                 "FASTINFERENCE_FAIRNESS_GUARDRAIL_SERVICE_CLASSES"
             ),
+            max_admit_lora_adapters_per_step=int(
+                os.environ.get("FASTINFERENCE_MAX_ADMIT_LORA_ADAPTERS_PER_STEP", "0")
+            ),
+            max_prefill_lora_adapters_per_batch=int(
+                os.environ.get("FASTINFERENCE_MAX_PREFILL_LORA_ADAPTERS_PER_BATCH", "0")
+            ),
+            max_decode_lora_adapters_per_batch=int(
+                os.environ.get("FASTINFERENCE_MAX_DECODE_LORA_ADAPTERS_PER_BATCH", "0")
+            ),
+            lora_fairness_relax_threshold=float(
+                os.environ.get("FASTINFERENCE_LORA_FAIRNESS_RELAX_THRESHOLD", "0.0")
+            ),
+            lora_locality_tighten_threshold=float(
+                os.environ.get("FASTINFERENCE_LORA_LOCALITY_TIGHTEN_THRESHOLD", "0.0")
+            ),
+            lora_limit_relax_delta=int(
+                os.environ.get("FASTINFERENCE_LORA_LIMIT_RELAX_DELTA", "1")
+            ),
+            lora_limit_tighten_delta=int(
+                os.environ.get("FASTINFERENCE_LORA_LIMIT_TIGHTEN_DELTA", "1")
+            ),
+            max_admit_multimodal_per_step=int(
+                os.environ.get("FASTINFERENCE_MAX_ADMIT_MULTIMODAL_PER_STEP", "0")
+            ),
+            max_prefill_multimodal_requests_per_batch=int(
+                os.environ.get(
+                    "FASTINFERENCE_MAX_PREFILL_MULTIMODAL_REQUESTS_PER_BATCH", "0"
+                )
+            ),
+            max_decode_multimodal_requests_per_batch=int(
+                os.environ.get(
+                    "FASTINFERENCE_MAX_DECODE_MULTIMODAL_REQUESTS_PER_BATCH", "0"
+                )
+            ),
+            max_admit_multimodal_lora_per_step=int(
+                os.environ.get(
+                    "FASTINFERENCE_MAX_ADMIT_MULTIMODAL_LORA_PER_STEP", "0"
+                )
+            ),
+            max_prefill_multimodal_lora_requests_per_batch=int(
+                os.environ.get(
+                    "FASTINFERENCE_MAX_PREFILL_MULTIMODAL_LORA_REQUESTS_PER_BATCH",
+                    "0",
+                )
+            ),
+            max_decode_multimodal_lora_requests_per_batch=int(
+                os.environ.get(
+                    "FASTINFERENCE_MAX_DECODE_MULTIMODAL_LORA_REQUESTS_PER_BATCH",
+                    "0",
+                )
+            ),
+            multimodal_prefix_cache_relax_threshold=float(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_RELAX_THRESHOLD", "0.0"
+                )
+            ),
+            multimodal_prefix_cache_tighten_threshold=float(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_TIGHTEN_THRESHOLD", "0.0"
+                )
+            ),
+            multimodal_prefill_limit_relax_delta=int(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_PREFILL_LIMIT_RELAX_DELTA", "1"
+                )
+            ),
+            multimodal_prefill_limit_tighten_delta=int(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_PREFILL_LIMIT_TIGHTEN_DELTA", "1"
+                )
+            ),
+            multimodal_lora_prefill_limit_relax_delta=int(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_LORA_PREFILL_LIMIT_RELAX_DELTA",
+                    "1",
+                )
+            ),
+            multimodal_lora_prefill_limit_tighten_delta=int(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_LORA_PREFILL_LIMIT_TIGHTEN_DELTA",
+                    "1",
+                )
+            ),
+            multimodal_lora_fairness_relax_threshold=float(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_LORA_FAIRNESS_RELAX_THRESHOLD",
+                    "0.0",
+                )
+            ),
+            multimodal_lora_locality_tighten_threshold=float(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_LORA_LOCALITY_TIGHTEN_THRESHOLD",
+                    "0.0",
+                )
+            ),
         )
         execution_backend = LiteSingleGpuBackend(
             scheduler=engine.scheduler,
@@ -138,6 +239,7 @@ class LiteRuntimeFactory:
             sampling_driver=engine.sampling_driver,
             output_coordinator=engine.output_pipeline,
             kv_block_manager=kv_block_manager,
+            lora_registry=engine.lora_registry,
             max_prefix_cache_entries=int(
                 os.environ.get("FASTINFERENCE_PREFIX_CACHE_MAX_ENTRIES", "8")
             ),
@@ -156,6 +258,24 @@ class LiteRuntimeFactory:
             preemptible_service_classes=_parse_service_class_list_env(
                 "FASTINFERENCE_PREEMPTIBLE_SERVICE_CLASSES"
             ),
+            preempt_multimodal_prefills=(
+                os.environ.get("FASTINFERENCE_PREEMPT_MULTIMODAL_PREFILLS", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            ),
+            preempt_multimodal_max_queue_wait_s=float(
+                os.environ.get(
+                    "FASTINFERENCE_PREEMPT_MULTIMODAL_MAX_QUEUE_WAIT_S", "0.0"
+                )
+            ),
+            multimodal_prefix_cache_protect_threshold=float(
+                os.environ.get(
+                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_PROTECT_THRESHOLD",
+                    os.environ.get(
+                        "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_TIGHTEN_THRESHOLD",
+                        "0.0",
+                    ),
+                )
+            ),
         )
         runtime_controller = RuntimeController(
             scheduler=engine.scheduler,
@@ -163,10 +283,12 @@ class LiteRuntimeFactory:
             observer=engine.observer,
             backend=execution_backend,
             queue_timeout_s=engine._queue_timeout_s,
+            lora_registry=engine.lora_registry,
         )
         return {
             "kv_block_manager": kv_block_manager,
             "input_batch_builder": input_batch_builder,
+            "multimodal_processor": multimodal_processor,
             "prefill_executor": prefill_executor,
             "decode_executor": decode_executor,
             "step_scheduler": step_scheduler,
