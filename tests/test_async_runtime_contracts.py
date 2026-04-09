@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from vllm.engine import async_llm as async_llm_module
+from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.engine.async_driver import AsyncDriver
@@ -94,6 +95,7 @@ def test_request_scheduler_rejects_expired_queued_requests() -> None:
 
     assert len(expired) == 1
     assert expired[0][0] == "r1"
+    assert expired[0][2]["queued_at"] == 1.0
     assert scheduler.queued_ids == ["r2"]
 
 
@@ -131,8 +133,15 @@ async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPat
             self.tokenizer = None
             self.streams: dict[str, asyncio.Queue] = {}
 
-        def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id=None) -> None:
-            del prompt, sampling_params, lora_id
+        def add_request(
+            self,
+            request_id: str,
+            prompt: str,
+            sampling_params: SamplingParams,
+            lora_id=None,
+            lora_request=None,
+        ) -> None:
+            del prompt, sampling_params, lora_id, lora_request
             self.streams[request_id] = asyncio.Queue()
 
         async def get_request_stream(self, request_id: str):
@@ -176,3 +185,66 @@ async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPat
     assert output.request_id == "req-1"
     assert output.finished is True
     assert llm.driver.notified == 1
+
+
+@pytest.mark.asyncio
+async def test_async_llm_generate_passes_lora_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeEngine:
+        def __init__(self, _vllm_config) -> None:
+            self.tokenizer = None
+            self.calls = []
+            self.streams: dict[str, asyncio.Queue] = {}
+
+        def add_request(
+            self,
+            request_id: str,
+            prompt: str,
+            sampling_params: SamplingParams,
+            lora_id=None,
+            lora_request=None,
+        ) -> None:
+            self.calls.append((request_id, prompt, sampling_params, lora_id, lora_request))
+            queue = asyncio.Queue()
+            queue.put_nowait(_request_output(request_id, finished=True))
+            self.streams[request_id] = queue
+
+        async def get_request_stream(self, request_id: str):
+            queue = self.streams[request_id]
+            while True:
+                output = await queue.get()
+                yield output
+                if output.finished:
+                    break
+
+    class FakeDriver:
+        def __init__(self, engine) -> None:
+            self.engine = engine
+
+        def notify_new_work(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    class DummyConfig:
+        class ModelConfig:
+            model = "dummy"
+
+        model_config = ModelConfig()
+
+    monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
+    monkeypatch.setattr(async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object())
+
+    llm = async_llm_module.AsyncLLM(DummyConfig())
+    agen = llm.generate(
+        "hi",
+        SamplingParams(max_tokens=4),
+        "req-1",
+        lora_request=LoRARequest(lora_name="adapter-a", lora_int_id=3, lora_path="/tmp/a"),
+    )
+    output = await agen.__anext__()
+
+    assert output.request_id == "req-1"
+    assert llm.engine.calls[0][3] == "adapter-a"
+    assert isinstance(llm.engine.calls[0][4], LoRARequest)

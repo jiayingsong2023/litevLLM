@@ -14,6 +14,7 @@ from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
+from vllm.engine.lora_runtime import LoRARuntimeRegistry
 from vllm.engine.output_pipeline import OutputPipeline
 from vllm.engine.prefill_executor import PrefillExecutor
 from vllm.engine.request_scheduler import RequestScheduler
@@ -284,6 +285,7 @@ class LiteEngine:
 
         # slot_mapping maps batch tokens to physical indices
         self.scheduler = RequestScheduler(self.max_active_requests)
+        self.lora_registry = LoRARuntimeRegistry()
         self.policies = None
         self.sampling_driver = None
         self.output_pipeline = None
@@ -352,7 +354,36 @@ class LiteEngine:
                 else:
                     r[key][li] = t[i : i + 1].contiguous()
 
-    def add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams, lora_id: Optional[str] = None):
+    def register_lora_adapter(
+        self,
+        *,
+        lora_name: str,
+        lora_path: str | None = None,
+        lora_int_id: int | None = None,
+    ) -> dict[str, Any]:
+        request = self.lora_registry.register_adapter(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            lora_int_id=lora_int_id,
+        )
+        return {
+            "lora_name": request.lora_name,
+            "lora_int_id": request.lora_int_id,
+            "lora_path": request.lora_path,
+        }
+
+    def unregister_lora_adapter(self, lora_name: str) -> bool:
+        return self.lora_registry.unregister_adapter(lora_name)
+
+    def add_request(
+        self,
+        request_id: str,
+        prompt: str,
+        sampling_params: SamplingParams,
+        lora_id: Optional[str] = None,
+        lora_request: Optional[Any] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+    ):
         if self.policies is None:
             self.policies = build_generation_policies(
                 str(self.model_config.model), self.tokenizer, self.adapter
@@ -384,12 +415,20 @@ class LiteEngine:
             raise RequestRejectedError(reason)
 
         try:
+            resolved_lora = self.lora_registry.resolve_adapter(
+                lora_id=lora_id,
+                lora_request=lora_request,
+            )
             request_state = self.request_builder.build(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
-                lora_id=lora_id,
+                lora_id=resolved_lora.lora_name if resolved_lora is not None else None,
+                lora_int_id=resolved_lora.lora_int_id if resolved_lora is not None else None,
+                lora_path=resolved_lora.lora_path if resolved_lora is not None else None,
+                multi_modal_data=multi_modal_data,
             )
+            self.multimodal_processor.prepare_request(request_state)
         except ValueError as exc:
             reason = (
                 str(exc)
@@ -398,6 +437,7 @@ class LiteEngine:
             raise RequestRejectedError(reason)
         self.execution_backend.maybe_apply_prefix_cache(request_state)
         self.scheduler.enqueue_request(request_id, request_state)
+        self.lora_registry.on_request_added(request_state.get("lora_id"))
         self.observer.on_request_added(request_id, request_state)
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:

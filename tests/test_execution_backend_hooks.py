@@ -49,6 +49,9 @@ def test_lite_single_gpu_backend_hook_defaults_are_noop() -> None:
         "preemption_min_decodes": 1,
         "preemption_max_queue_wait_s": 0.0,
         "preemptible_service_classes": [],
+        "preempt_multimodal_prefills": False,
+        "preempt_multimodal_max_queue_wait_s": 0.0,
+        "multimodal_prefix_cache_protect_threshold": 0.0,
         "prefix_cache_materialized_hits": 0,
         "prefix_cache_materialized_exact_hits": 0,
         "prefix_cache_materialized_partial_hits": 0,
@@ -67,6 +70,7 @@ def test_lite_single_gpu_backend_hook_defaults_are_noop() -> None:
             "avg_candidates_per_lookup": 0.0,
             "avg_comparisons_per_lookup": 0.0,
         },
+        "multimodal": {},
     }
 
 
@@ -76,6 +80,7 @@ class _FakeObserver:
         self.finished = []
         self.prefix_cache_events = []
         self.preemption_events = []
+        self.multimodal_preemption_guards = []
 
     def on_prefix_cache_event(
         self,
@@ -85,7 +90,9 @@ class _FakeObserver:
         exact: bool,
         prefix_len: int,
         saved_prefill_tokens: int,
+        is_multimodal: bool = False,
     ) -> None:
+        del is_multimodal
         self.prefix_cache_events.append(
             (request_id, hit, exact, prefix_len, saved_prefill_tokens)
         )
@@ -95,8 +102,21 @@ class _FakeObserver:
         *,
         preempted_prefill_requests: int,
         queued_backlog: int,
+        multimodal_prefill_requests: int = 0,
     ) -> None:
-        self.preemption_events.append((preempted_prefill_requests, queued_backlog))
+        self.preemption_events.append(
+            (preempted_prefill_requests, queued_backlog, multimodal_prefill_requests)
+        )
+
+    def on_multimodal_preemption_guard(
+        self,
+        *,
+        protected_prefill_requests: int,
+        prefix_cache_hit_rate: float,
+    ) -> None:
+        self.multimodal_preemption_guards.append(
+            (protected_prefill_requests, prefix_cache_hit_rate)
+        )
 
     def on_first_token(self, request_id: str, ttft_s: float) -> None:
         self.first_tokens.append((request_id, ttft_s))
@@ -396,6 +416,118 @@ def test_lite_single_gpu_backend_materializes_longest_prefix_without_token() -> 
     assert backend.stats()["prefix_cache_materialized_saved_prefill_tokens"] == 3
 
 
+def test_lite_single_gpu_backend_multimodal_prefix_cache_does_not_cross_image_namespace() -> None:
+    scheduler = _FakeScheduler()
+    observer = _FakeObserver()
+    backend = _backend(
+        scheduler=scheduler,
+        observer=observer,
+        sampling_driver=None,
+        output_coordinator=None,
+        kv_caches=[(torch.zeros((4, 2, 1, 1)), torch.zeros((4, 2, 1, 1)))],
+        kv_scale_caches=[(None, None)],
+        block_size=2,
+        num_blocks_per_seq=2,
+        max_prefix_cache_entries=2,
+    )
+
+    source_req = {
+        "request_id": "src-mm",
+        "input_ids": [11, 12, 13],
+        "slot_idx": 0,
+        "seq_len": 3,
+        "generated_ids": [],
+        "sampling_params": type("SP", (), {"max_tokens": 4})(),
+        "finished": False,
+        "admitted_at": 0.0,
+        "first_token_at": None,
+        "multi_modal_data": {"image": [{"image": "file:///tmp/cat-a.png"}]},
+        "is_multimodal": True,
+    }
+    backend._store_prefix_cache_entry("src-mm", source_req, torch.tensor([0.1, 0.9]))
+
+    other_image_req = {
+        "request_id": "dst-mm",
+        "input_ids": [11, 12, 13],
+        "slot_idx": None,
+        "seq_len": 0,
+        "is_prefill": True,
+        "generated_ids": [],
+        "sampling_params": type("SP", (), {"max_tokens": 4})(),
+        "finished": False,
+        "admitted_at": 1.0,
+        "first_token_at": None,
+        "multi_modal_data": {"image": [{"image": "file:///tmp/cat-b.png"}]},
+        "is_multimodal": True,
+    }
+
+    assert backend.maybe_apply_prefix_cache(other_image_req) is None
+    assert "_prefix_cache_entry" not in other_image_req
+    assert observer.prefix_cache_events == [("dst-mm", False, False, 0, 0)]
+
+
+def test_lite_single_gpu_backend_multimodal_prefix_cache_hits_for_same_image_namespace() -> None:
+    scheduler = _FakeScheduler()
+    observer = _FakeObserver()
+    backend = _backend(
+        scheduler=scheduler,
+        observer=observer,
+        sampling_driver=_FakeSamplingDriver(),
+        output_coordinator=_FakeOutputCoordinator(),
+        kv_caches=[(torch.zeros((4, 2, 1, 1)), torch.zeros((4, 2, 1, 1)))],
+        kv_scale_caches=[(None, None)],
+        block_size=2,
+        num_blocks_per_seq=2,
+        max_prefix_cache_entries=2,
+    )
+
+    source_req = {
+        "request_id": "src-mm",
+        "input_ids": [11, 12, 13],
+        "slot_idx": 0,
+        "seq_len": 3,
+        "generated_ids": [],
+        "sampling_params": type("SP", (), {"max_tokens": 4})(),
+        "finished": False,
+        "admitted_at": 0.0,
+        "first_token_at": None,
+        "multi_modal_data": {"image": [{"image": "file:///tmp/cat-a.png"}]},
+        "is_multimodal": True,
+    }
+    backend.kv_block_manager.kv_caches[0][0][0:2].copy_(
+        torch.tensor([[[[1.0]], [[2.0]]], [[[3.0]], [[4.0]]]])
+    )
+    backend.kv_block_manager.kv_caches[0][1][0:2].copy_(
+        torch.tensor([[[[5.0]], [[6.0]]], [[[7.0]], [[8.0]]]])
+    )
+    backend._store_prefix_cache_entry("src-mm", source_req, torch.tensor([0.1, 0.9]))
+
+    same_image_req = {
+        "request_id": "dst-mm",
+        "input_ids": [11, 12, 13],
+        "slot_idx": None,
+        "seq_len": 0,
+        "is_prefill": True,
+        "generated_ids": [],
+        "sampling_params": type("SP", (), {"max_tokens": 4})(),
+        "finished": False,
+        "admitted_at": 1.0,
+        "first_token_at": None,
+        "multi_modal_data": {"image": [{"image": "file:///tmp/cat-a.png"}]},
+        "is_multimodal": True,
+    }
+    scheduler.requests["dst-mm"] = same_image_req
+
+    assert backend.maybe_apply_prefix_cache(same_image_req) is None
+    assert "_prefix_cache_entry" in same_image_req
+    same_image_req["slot_idx"] = 1
+    backend.maybe_apply_prefix_cache(same_image_req)
+
+    assert same_image_req["seq_len"] == 3
+    assert same_image_req["generated_ids"] == [1]
+    assert observer.prefix_cache_events == [("dst-mm", True, True, 3, 3)]
+
+
 def test_lite_single_gpu_backend_reports_prefix_cache_miss() -> None:
     scheduler = _FakeScheduler()
     observer = _FakeObserver()
@@ -645,7 +777,7 @@ def test_lite_single_gpu_backend_soft_preempts_prefill_under_backlog() -> None:
     assert out.prefills is None
     assert out.decodes == step_plan.decodes
     assert out.admissions == step_plan.admissions
-    assert observer.preemption_events == [(1, 2)]
+    assert observer.preemption_events == [(1, 2, 0)]
 
 
 def test_lite_single_gpu_backend_does_not_preempt_without_backlog() -> None:
@@ -734,6 +866,135 @@ def test_lite_single_gpu_backend_respects_prefill_starvation_protection() -> Non
 
     assert out is step_plan
     assert observer.preemption_events == []
+
+
+def test_lite_single_gpu_backend_protects_multimodal_prefill_by_default() -> None:
+    observer = _FakeObserver()
+    backend = _backend(
+        scheduler=object(),
+        observer=observer,
+        sampling_driver=None,
+        output_coordinator=None,
+        block_size=2,
+        num_blocks_per_seq=1,
+    )
+
+    class _Sched:
+        queued_request_count = 3
+
+        @staticmethod
+        def get_request(request_id: str):
+            if request_id == "mm1":
+                return {
+                    "is_multimodal": True,
+                    "multi_modal_data": {"image": [{"image": "file:///tmp/cat.png"}]},
+                }
+            return {"is_multimodal": False}
+
+    step_plan = StepPlan(
+        admissions=None,
+        prefills=PrefillPlan(request_ids=["mm1"], chunk_len=2, token_budget=2),
+        decodes=DecodePlan(request_ids=["d1"], token_budget=1, use_fast_path=False),
+        step_token_budget=8,
+        queued_before=3,
+        running_before=2,
+        queued_multimodal_p95_wait_s=0.0,
+    )
+
+    out = backend.maybe_preempt(step_plan, _Sched())
+
+    assert out is step_plan
+    assert observer.preemption_events == []
+
+
+def test_lite_single_gpu_backend_can_preempt_multimodal_prefill_under_pressure() -> None:
+    observer = _FakeObserver()
+    backend = _backend(
+        scheduler=object(),
+        observer=observer,
+        sampling_driver=None,
+        output_coordinator=None,
+        block_size=2,
+        num_blocks_per_seq=1,
+        preempt_multimodal_prefills=True,
+        preempt_multimodal_max_queue_wait_s=0.5,
+    )
+
+    class _Sched:
+        queued_request_count = 3
+
+        @staticmethod
+        def get_request(request_id: str):
+            if request_id == "mm1":
+                return {
+                    "is_multimodal": True,
+                    "multi_modal_data": {"image": [{"image": "file:///tmp/cat.png"}]},
+                }
+            return {"is_multimodal": False}
+
+    step_plan = StepPlan(
+        admissions=None,
+        prefills=PrefillPlan(request_ids=["mm1"], chunk_len=2, token_budget=2),
+        decodes=DecodePlan(request_ids=["d1"], token_budget=1, use_fast_path=False),
+        step_token_budget=8,
+        queued_before=3,
+        running_before=2,
+        prefill_multimodal_requests=1,
+        queued_multimodal_requests=2,
+        queued_multimodal_p95_wait_s=1.0,
+    )
+
+    out = backend.maybe_preempt(step_plan, _Sched())
+
+    assert out is not step_plan
+    assert out.prefills is None
+    assert observer.preemption_events == [(1, 3, 1)]
+
+
+def test_lite_single_gpu_backend_protects_multimodal_prefix_prefill_on_high_hit_rate() -> None:
+    observer = _FakeObserver()
+    backend = _backend(
+        scheduler=object(),
+        observer=observer,
+        sampling_driver=None,
+        output_coordinator=None,
+        block_size=2,
+        num_blocks_per_seq=1,
+        preempt_multimodal_prefills=True,
+        preempt_multimodal_max_queue_wait_s=0.5,
+        multimodal_prefix_cache_protect_threshold=0.8,
+    )
+
+    class _Sched:
+        queued_request_count = 3
+
+        @staticmethod
+        def get_request(request_id: str):
+            if request_id == "mm1":
+                return {
+                    "is_multimodal": True,
+                    "multi_modal_data": {"image": [{"image": "file:///tmp/cat.png"}]},
+                }
+            return {"is_multimodal": False}
+
+    step_plan = StepPlan(
+        admissions=None,
+        prefills=PrefillPlan(request_ids=["mm1"], chunk_len=2, token_budget=2),
+        decodes=DecodePlan(request_ids=["d1"], token_budget=1, use_fast_path=False),
+        step_token_budget=8,
+        queued_before=3,
+        running_before=2,
+        multimodal_prefix_cache_hit_rate=0.95,
+        prefill_multimodal_requests=1,
+        queued_multimodal_requests=2,
+        queued_multimodal_p95_wait_s=1.0,
+    )
+
+    out = backend.maybe_preempt(step_plan, _Sched())
+
+    assert out is step_plan
+    assert observer.preemption_events == []
+    assert observer.multimodal_preemption_guards == [(1, 0.95)]
 
 
 def test_structured_output_choice_masks_sampling_and_finishes() -> None:

@@ -21,12 +21,14 @@ class RuntimeController:
         observer: Any,
         backend: Any,
         queue_timeout_s: float,
+        lora_registry: Any | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.step_scheduler = step_scheduler
         self.observer = observer
         self.backend = backend
         self.queue_timeout_s = queue_timeout_s
+        self.lora_registry = lora_registry
         self._stats_reset_at_unix_s = time.time()
         self._stats_reset_at_monotonic_s = time.perf_counter()
 
@@ -40,6 +42,11 @@ class RuntimeController:
 
         if self.scheduler.active_request_count == 0:
             return []
+
+        if hasattr(self.step_scheduler, "update_runtime_feedback") and hasattr(
+            self.observer, "stats"
+        ):
+            self.step_scheduler.update_runtime_feedback(self.observer.stats())
 
         step_plan = self.step_scheduler.build_plan(self.scheduler)
         step_plan = self.backend.maybe_preempt(step_plan, self.scheduler)
@@ -67,7 +74,9 @@ class RuntimeController:
             now=now,
             max_queue_wait_s=self.queue_timeout_s,
         )
-        for request_id, reason in expired:
+        for request_id, reason, request in expired:
+            if self.lora_registry is not None:
+                self.lora_registry.on_request_removed(request.get("lora_id"))
             self.observer.on_request_rejected(request_id, reason)
             self.scheduler.publish_exception(
                 request_id,
@@ -110,6 +119,7 @@ class RuntimeController:
             },
             "observer": observer_stats,
             "backend": dict(self.backend.stats()),
+            "lora": dict(self.lora_registry.stats()) if self.lora_registry is not None else {},
         }
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:

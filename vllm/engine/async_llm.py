@@ -34,10 +34,18 @@ class AsyncLLM(EngineClient):
         sampling_params: SamplingParams,
         request_id: str,
         lora_request: Optional[Any] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
-        self.engine.add_request(request_id, prompt, sampling_params, lora_id=lora_id)
+        self.engine.add_request(
+            request_id,
+            prompt,
+            sampling_params,
+            lora_id=lora_id,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+        )
         self.driver.notify_new_work()
         
         # Stream results back to API
@@ -51,6 +59,22 @@ class AsyncLLM(EngineClient):
 
     def stats(self) -> dict[str, Any]:
         return self.engine.stats()
+
+    def register_lora_adapter(
+        self,
+        *,
+        lora_name: str,
+        lora_path: str | None = None,
+        lora_int_id: int | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_lora_adapter(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            lora_int_id=lora_int_id,
+        )
+
+    def unregister_lora_adapter(self, lora_name: str) -> bool:
+        return self.engine.unregister_lora_adapter(lora_name)
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
         self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)

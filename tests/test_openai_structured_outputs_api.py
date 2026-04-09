@@ -29,12 +29,13 @@ class _FakeEngine:
     async def get_model_config(self):
         return type("ModelConfig", (), {"model": "demo-model"})()
 
-    async def generate(self, prompt, sampling_params, request_id):
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
         self.calls.append(
             {
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "request_id": request_id,
+                "kwargs": kwargs,
             }
         )
         yield _FakeOutput()
@@ -98,12 +99,13 @@ class _BehaviorEngine:
     async def get_model_config(self):
         return type("ModelConfig", (), {"model": "demo-model"})()
 
-    async def generate(self, prompt, sampling_params, request_id):
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
         self.calls.append(
             {
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "request_id": request_id,
+                "kwargs": kwargs,
             }
         )
         request = {
@@ -164,6 +166,101 @@ class _BehaviorEngine:
         raise AssertionError("unsupported structured outputs test case")
 
 
+class _MultimodalBehaviorEngine:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def get_model_config(self):
+        return type("ModelConfig", (), {"model": "demo-model"})()
+
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
+        del sampling_params
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "request_id": request_id,
+                "kwargs": kwargs,
+            }
+        )
+        multi_modal_data = kwargs.get("multi_modal_data")
+        if multi_modal_data:
+            image_url = multi_modal_data["image"][0]["image"]
+            text = f"image-aware:{prompt}:{image_url.rsplit('/', 1)[-1]}"
+        else:
+            text = f"text-only:{prompt}"
+        yield _FakeOutput(text=text, finished=True)
+
+
+class _MultimodalStructuredBehaviorEngine:
+    def __init__(self) -> None:
+        self.calls = []
+        self.tokenizer = _hf_tokenizer()
+        self.sampling_driver = SamplingDriver(self.tokenizer, None, _Policies())
+        self.output_pipeline = OutputPipeline(self.tokenizer, _Policies(), self.sampling_driver)
+
+    async def get_model_config(self):
+        return type("ModelConfig", (), {"model": "demo-model"})()
+
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "sampling_params": sampling_params,
+                "request_id": request_id,
+                "kwargs": kwargs,
+            }
+        )
+        request = {
+            "request_id": request_id,
+            "prompt": prompt,
+            "input_ids": [15],
+            "generated_ids": [],
+            "sampling_params": sampling_params,
+            "finished": False,
+            "low_info_hits": 0,
+            "multi_modal_data": kwargs.get("multi_modal_data"),
+            "structured_output_constraint": build_structured_output_constraint(
+                self.tokenizer,
+                sampling_params,
+            ),
+        }
+        for logits in self._logits_sequence_for(sampling_params, kwargs.get("multi_modal_data")):
+            token = self.sampling_driver.sample_next_token(logits, request)
+            request["generated_ids"].append(token)
+            out = self.output_pipeline.finalize_step(request_id, request, token)
+            yield out
+            if out.finished:
+                return
+
+    def _logits_sequence_for(self, sampling_params, multi_modal_data):
+        params = sampling_params.structured_outputs
+        size = self.tokenizer.vocab_size
+        has_image = bool((multi_modal_data or {}).get("image"))
+        if params is None:
+            logits = torch.full((size,), 0.0)
+            logits[12 if has_image else 15] = 9.0
+            return [logits]
+        if params.choice is not None:
+            logits = torch.full((size,), 0.0)
+            logits[4 if has_image else 5] = 9.0
+            return [logits]
+        if params.json_object or params.json is not None:
+            logits = torch.full((size,), 0.0)
+            logits[14] = 9.0
+            return [logits]
+        if params.regex is not None:
+            logits = torch.full((size,), 0.0)
+            logits[4 if has_image else 5] = 9.0
+            return [logits]
+        if params.grammar is not None:
+            logits1 = torch.full((size,), 0.0)
+            logits1[12] = 9.0
+            logits2 = torch.full((size,), 0.0)
+            logits2[0] = 9.0
+            return [logits1, logits2]
+        raise AssertionError("unsupported multimodal structured outputs test case")
+
+
 class _ToyTokenizer:
     eos_token_id = 99
 
@@ -203,12 +300,13 @@ class _FallbackBehaviorEngine:
     async def get_model_config(self):
         return type("ModelConfig", (), {"model": "demo-model"})()
 
-    async def generate(self, prompt, sampling_params, request_id):
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
         self.calls.append(
             {
                 "prompt": prompt,
                 "sampling_params": sampling_params,
                 "request_id": request_id,
+                "kwargs": kwargs,
             }
         )
         request = {
@@ -470,6 +568,210 @@ def test_chat_completion_streaming_preserves_structured_outputs_mapping() -> Non
     params = fake_engine.calls[0]["sampling_params"]
     assert params.structured_outputs is not None
     assert params.structured_outputs.regex == "^(?:A|B)$"
+
+
+def test_chat_completion_maps_single_image_url_to_multi_modal_data() -> None:
+    _, fake_engine = _post_chat(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert fake_engine.calls[0]["prompt"] == "Describe this image"
+    assert fake_engine.calls[0]["kwargs"]["multi_modal_data"] == {
+        "image": [{"image": "https://example.com/cat.png"}]
+    }
+
+
+def test_chat_completion_rejects_unsupported_multimodal_block() -> None:
+    fake_engine = _FakeEngine()
+    prev_engine = api_server.engine
+    api_server.engine = fake_engine
+    try:
+        client = TestClient(api_server.app)
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image"},
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": "https://example.com/demo.mp4"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+    finally:
+        api_server.engine = prev_engine
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "unsupported message content type: video_url"
+
+
+def test_chat_completion_non_streaming_multimodal_response_changes_with_image() -> None:
+    engine = _MultimodalBehaviorEngine()
+    text_only = _post_chat_with_engine(
+        {
+            "model": "demo-model",
+            "messages": [{"role": "user", "content": "Describe this image"}],
+        },
+        engine,
+    )
+    with_image = _post_chat_with_engine(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+        },
+        engine,
+    )
+
+    assert text_only["choices"][0]["message"]["content"] == "text-only:Describe this image"
+    assert with_image["choices"][0]["message"]["content"] == (
+        "image-aware:Describe this image:cat.png"
+    )
+
+
+def test_chat_completion_streaming_multimodal_response_changes_with_image() -> None:
+    events, content = _post_chat_stream_with_engine(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+            "stream": True,
+        },
+        _MultimodalBehaviorEngine(),
+    )
+
+    assert content == "image-aware:Describe this image:cat.png"
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completion_maps_multimodal_and_structured_outputs_together() -> None:
+    _, fake_engine = _post_chat(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+            "structured_outputs": {"choice": ["AB", "AC"]},
+        }
+    )
+
+    params = fake_engine.calls[0]["sampling_params"]
+    assert params.structured_outputs is not None
+    assert params.structured_outputs.choice == ["AB", "AC"]
+    assert fake_engine.calls[0]["kwargs"]["multi_modal_data"] == {
+        "image": [{"image": "https://example.com/cat.png"}]
+    }
+
+
+def test_chat_completion_multimodal_choice_response_satisfies_constraint() -> None:
+    response = _post_chat_with_engine(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+            "structured_outputs": {"choice": ["AB", "AC"]},
+        },
+        _MultimodalStructuredBehaviorEngine(),
+    )
+
+    assert response["choices"][0]["message"]["content"] in {"AB", "AC"}
+    assert response["choices"][0]["message"]["content"] == "AB"
+
+
+def test_chat_completion_streaming_multimodal_json_schema_matches_schema() -> None:
+    events, content = _post_chat_stream_with_engine(
+        {
+            "model": "demo-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/cat.png"},
+                        },
+                    ],
+                }
+            ],
+            "stream": True,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"A": {"type": "number"}},
+                        "required": ["A"],
+                    },
+                },
+            },
+        },
+        _MultimodalStructuredBehaviorEngine(),
+    )
+
+    assert pyjson.loads(content) == {"A": 1}
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_chat_completion_choice_response_content_satisfies_constraint() -> None:

@@ -118,8 +118,8 @@ class RequestScheduler:
         *,
         now: float,
         max_queue_wait_s: float,
-    ) -> list[tuple[str, str]]:
-        expired: list[tuple[str, str]] = []
+    ) -> list[tuple[str, str, EngineRequest]]:
+        expired: list[tuple[str, str, EngineRequest]] = []
         if max_queue_wait_s <= 0:
             return expired
         for request_id in list(self._queued_ids):
@@ -131,12 +131,15 @@ class RequestScheduler:
             if queue_wait < max_queue_wait_s:
                 continue
             self._queued_ids.remove(request_id)
-            self._requests.pop(request_id, None)
+            removed_request = self._requests.pop(request_id, None)
             self._request_slots.pop(request_id, None)
+            if removed_request is None:
+                continue
             expired.append(
                 (
                     request_id,
                     f"queue timeout after {queue_wait:.3f}s (limit={max_queue_wait_s:.3f}s)",
+                    removed_request,
                 )
             )
         return expired
@@ -167,7 +170,7 @@ class RequestScheduler:
         if queue is not None:
             queue.put_nowait(exc)
 
-    def free_request(self, request_id: str) -> None:
+    def free_request(self, request_id: str) -> EngineRequest | None:
         request = self._requests.pop(request_id, None)
         if request is not None:
             slot_idx = request.get("slot_idx")
@@ -178,6 +181,7 @@ class RequestScheduler:
             self._running_ids.remove(request_id)
         if request_id in self._queued_ids:
             self._queued_ids.remove(request_id)
+        return request
 
     def abort_request(self, request_id: str) -> None:
         self.free_request(request_id)

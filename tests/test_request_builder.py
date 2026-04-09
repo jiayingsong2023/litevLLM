@@ -141,6 +141,58 @@ def test_request_builder_attaches_json_object_structured_output_constraint() -> 
     assert request["structured_output_constraint"] is not None
 
 
+def test_request_builder_marks_multimodal_lora_request() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_Tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=2,
+        max_model_len=16,
+        max_tokens_cap=8,
+    )
+
+    request = builder.build(
+        request_id="r1",
+        prompt="prompt",
+        sampling_params=SamplingParams(max_tokens=4),
+        lora_id="adapter-a",
+        lora_int_id=7,
+        lora_path="/tmp/adapter-a",
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert request["lora_id"] == "adapter-a"
+    assert request["lora_int_id"] == 7
+    assert request["lora_path"] == "/tmp/adapter-a"
+    assert request["is_multimodal"] is True
+    assert request["is_multimodal_lora"] is True
+
+
+def test_request_builder_attaches_structured_output_constraint_for_multimodal_request() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_hf_tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+    )
+
+    request = builder.build(
+        request_id="req-mm-structured",
+        prompt="describe image",
+        sampling_params=SamplingParams(
+            max_tokens=4,
+            structured_outputs=StructuredOutputsParams(choice=["AB", "AC"]),
+        ),
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert request["is_multimodal"] is True
+    assert request["is_multimodal_lora"] is False
+    assert request["structured_output_constraint"] is not None
+
+
 def test_request_builder_rejects_unsupported_structured_output_type() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_Tokenizer(),

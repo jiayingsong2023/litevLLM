@@ -42,10 +42,12 @@ class DecodeExecutor:
             fast_seq_lens=self._fast_seq_lens,
             fast_block_tables=self._fast_block_tables,
         )
-        lora_mapping = [req.get("lora_id") for req in req_dicts]
-
         logits = self.model(
-            input_ids, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping
+            input_ids,
+            positions,
+            self.kv_caches,
+            attn_metadata,
+            lora_mapping=attn_metadata.get("lora_mapping"),
         )
         self.input_batch_builder.split_per_layer_carries(attn_metadata, req_dicts)
         return logits, req_dicts
@@ -58,9 +60,12 @@ class DecodeExecutor:
         curr_input, positions, attn_metadata, req_dicts = self.input_batch_builder.build_decode_batch(
             request_ids, scheduler
         )
-        lora_mapping = [req.get("lora_id") for req in req_dicts]
         logits = self.model(
-            curr_input, positions, self.kv_caches, attn_metadata, lora_mapping=lora_mapping
+            curr_input,
+            positions,
+            self.kv_caches,
+            attn_metadata,
+            lora_mapping=attn_metadata.get("lora_mapping"),
         )
         self.input_batch_builder.split_per_layer_carries(attn_metadata, req_dicts)
         return logits, req_dicts

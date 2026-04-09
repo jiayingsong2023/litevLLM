@@ -38,6 +38,9 @@ class LiteRequestBuilder:
         prompt: str,
         sampling_params: SamplingParams,
         lora_id: Optional[str] = None,
+        lora_int_id: Optional[int] = None,
+        lora_path: Optional[str] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
@@ -74,6 +77,8 @@ class LiteRequestBuilder:
             input_ids=input_ids,
             sampling_params=effective_sampling_params,
             lora_id=lora_id,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
             rng=rng,
             linear_attn_carry=[None] * self.num_layers,
             linear_conv_carry=[None] * self.num_layers,
@@ -81,6 +86,9 @@ class LiteRequestBuilder:
             capital_question_bias_token_ids=self.policies.capital_question_bias_token_ids(prompt),
             anti_template_token_ids=self.policies.anti_template_token_ids(),
             service_class=str(getattr(effective_sampling_params, "service_class", "latency") or "latency"),
+            multi_modal_data=copy.deepcopy(multi_modal_data),
+            is_multimodal=bool((multi_modal_data or {}).get("image")),
+            is_multimodal_lora=bool(lora_id) and bool((multi_modal_data or {}).get("image")),
         ).to_engine_request()
         request_state["structured_output_constraint"] = build_structured_output_constraint(
             self.tokenizer,

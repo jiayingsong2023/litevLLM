@@ -126,6 +126,27 @@ class _FakeBackend:
         self.reset_call = clear_prefix_cache
 
 
+class _FakeLoRARegistry:
+    def stats(self) -> dict[str, object]:
+        return {
+            "registered_adapters": 1,
+            "active_adapters": 1,
+            "active_requests": 1,
+            "total_routed_requests": 2,
+            "adapters": {
+                "demo": {
+                    "lora_int_id": 7,
+                    "lora_path": "/tmp/demo",
+                    "active_requests": 1,
+                    "total_requests": 2,
+                }
+            },
+        }
+
+    def on_request_removed(self, _lora_name: str | None) -> None:
+        return None
+
+
 def test_runtime_controller_admits_then_uses_decode_fast_path(monkeypatch) -> None:
     scheduler = _FakeScheduler()
     observer = _FakeObserver()
@@ -193,6 +214,7 @@ def test_runtime_controller_stats_snapshot() -> None:
         observer=observer,
         backend=backend,
         queue_timeout_s=15.0,
+        lora_registry=_FakeLoRARegistry(),
     )
 
     stats = controller.stats()
@@ -214,6 +236,20 @@ def test_runtime_controller_stats_snapshot() -> None:
     assert stats["backend"] == {
         "backend_type": "fake",
         "prefix_cache": {"entries": 0, "capacity": 0},
+    }
+    assert stats["lora"] == {
+        "registered_adapters": 1,
+        "active_adapters": 1,
+        "active_requests": 1,
+        "total_routed_requests": 2,
+        "adapters": {
+            "demo": {
+                "lora_int_id": 7,
+                "lora_path": "/tmp/demo",
+                "active_requests": 1,
+                "total_requests": 2,
+            }
+        },
     }
 
 

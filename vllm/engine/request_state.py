@@ -17,6 +17,8 @@ class RequestState:
     input_ids: list[int]
     sampling_params: SamplingParams
     lora_id: Optional[str] = None
+    lora_int_id: Optional[int] = None
+    lora_path: Optional[str] = None
     rng: Optional[torch.Generator] = None
     generated_ids: list[int] = field(default_factory=list)
     finished: bool = False
@@ -31,6 +33,9 @@ class RequestState:
     anti_template_token_ids: list[int] = field(default_factory=list)
     structured_output_constraint: Any = None
     service_class: str = "latency"
+    multi_modal_data: Any = None
+    is_multimodal: bool = False
+    is_multimodal_lora: bool = False
 
     def to_engine_request(self) -> dict[str, Any]:
         return {
@@ -45,6 +50,8 @@ class RequestState:
             "seq_len": self.seq_len,
             "is_prefill": self.is_prefill,
             "lora_id": self.lora_id,
+            "lora_int_id": self.lora_int_id,
+            "lora_path": self.lora_path,
             "rng": self.rng,
             "linear_attn_carry": self.linear_attn_carry,
             "linear_conv_carry": self.linear_conv_carry,
@@ -54,4 +61,7 @@ class RequestState:
             "anti_template_token_ids": self.anti_template_token_ids,
             "structured_output_constraint": self.structured_output_constraint,
             "service_class": self.service_class,
+            "multi_modal_data": self.multi_modal_data,
+            "is_multimodal": self.is_multimodal,
+            "is_multimodal_lora": self.is_multimodal_lora,
         }

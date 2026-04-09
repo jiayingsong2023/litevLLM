@@ -66,6 +66,9 @@ def test_input_batch_builder_build_prefill() -> None:
     assert attn_metadata["slot_mapping"].tolist() == [1, 2]
     assert attn_metadata["block_tables"].tolist() == [[0, 1]]
     assert attn_metadata["seq_lens"].tolist() == [3]
+    assert attn_metadata["lora_mapping"] == [None]
+    assert attn_metadata["lora_adapter_count"] == 0
+    assert attn_metadata["mixed_lora_batch"] is False
     assert req_dicts[0]["slot_idx"] == 0
     assert last_flags == [False]
 
@@ -101,4 +104,118 @@ def test_input_batch_builder_build_decode_batch() -> None:
     assert attn_metadata["slot_mapping"].tolist() == [3]
     assert attn_metadata["block_tables"].tolist() == [[0, 1]]
     assert attn_metadata["seq_lens"].tolist() == [4]
+    assert attn_metadata["lora_mapping"] == [None]
+    assert attn_metadata["lora_adapter_count"] == 0
+    assert attn_metadata["mixed_lora_batch"] is False
     assert req_dicts[0]["seq_len"] == 3
+
+
+def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
+    scheduler = RequestScheduler(max_active_requests=2)
+    scheduler.add_request(
+        "r1",
+        {
+            "slot_idx": 0,
+            "is_prefill": False,
+            "seq_len": 3,
+            "input_ids": [11, 12, 13, 14],
+            "generated_ids": [42],
+            "linear_attn_carry": [None],
+            "linear_conv_carry": [None],
+            "lora_id": "adapter-a",
+        },
+    )
+    scheduler.add_request(
+        "r2",
+        {
+            "slot_idx": 1,
+            "is_prefill": False,
+            "seq_len": 3,
+            "input_ids": [11, 12, 13, 14],
+            "generated_ids": [43],
+            "linear_attn_carry": [None],
+            "linear_conv_carry": [None],
+            "lora_id": "adapter-b",
+        },
+    )
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=KVBlockManager(
+            kv_caches=[],
+            kv_scale_caches=[],
+            num_blocks_per_seq=2,
+            block_size=2,
+        ),
+        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    _, _, attn_metadata, _ = builder.build_decode_batch(["r1", "r2"], scheduler)
+
+    assert attn_metadata["lora_mapping"] == ["adapter-a", "adapter-b"]
+    assert attn_metadata["lora_adapter_count"] == 2
+    assert attn_metadata["mixed_lora_batch"] is True
+
+
+def test_input_batch_builder_tracks_multimodal_lora_prefill_contract() -> None:
+    scheduler = RequestScheduler(max_active_requests=2)
+    scheduler.add_request(
+        "r1",
+        {
+            "slot_idx": 0,
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [11, 12, 13],
+            "generated_ids": [],
+            "linear_attn_carry": [None],
+            "linear_conv_carry": [None],
+            "lora_id": "adapter-a",
+            "multi_modal_data": {"image": [{"image": "file:///tmp/cat.png"}]},
+            "is_multimodal": True,
+            "is_multimodal_lora": True,
+        },
+    )
+    scheduler.add_request(
+        "r2",
+        {
+            "slot_idx": 1,
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [21, 22, 23],
+            "generated_ids": [],
+            "linear_attn_carry": [None],
+            "linear_conv_carry": [None],
+            "lora_id": None,
+            "multi_modal_data": None,
+            "is_multimodal": False,
+            "is_multimodal_lora": False,
+        },
+    )
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=KVBlockManager(
+            kv_caches=[],
+            kv_scale_caches=[],
+            num_blocks_per_seq=2,
+            block_size=2,
+        ),
+        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    _, _, attn_metadata, _, _ = builder.build_prefill(["r1", "r2"], scheduler, 2)
+
+    assert attn_metadata["lora_mapping"] == ["adapter-a", None]
+    assert attn_metadata["lora_adapter_count"] == 1
+    assert attn_metadata["mixed_lora_batch"] is False
+    assert attn_metadata["multimodal_request_count"] == 1
+    assert attn_metadata["has_multimodal_requests"] is True
+    assert attn_metadata["mixed_multimodal_batch"] is True
+    assert attn_metadata["multimodal_lora_request_count"] == 1
+    assert attn_metadata["has_multimodal_lora_requests"] is True

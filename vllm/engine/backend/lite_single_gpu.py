@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from typing import Any
@@ -29,6 +31,7 @@ class LiteSingleGpuBackend:
         sampling_driver: Any | None,
         output_coordinator: Any | None,
         kv_block_manager: Any,
+        lora_registry: Any | None = None,
         max_prefix_cache_entries: int = 8,
         min_prefix_cache_partial_hit_tokens: int = 1,
         preemption_mode: str = "defer_prefill",
@@ -36,6 +39,9 @@ class LiteSingleGpuBackend:
         preemption_min_decodes: int = 1,
         preemption_max_queue_wait_s: float = 0.0,
         preemptible_service_classes: set[str] | None = None,
+        preempt_multimodal_prefills: bool = False,
+        preempt_multimodal_max_queue_wait_s: float = 0.0,
+        multimodal_prefix_cache_protect_threshold: float = 0.0,
     ) -> None:
         self.scheduler = scheduler
         self.observer = observer
@@ -44,6 +50,7 @@ class LiteSingleGpuBackend:
         self.sampling_driver = sampling_driver
         self.output_coordinator = output_coordinator
         self.kv_block_manager = kv_block_manager
+        self.lora_registry = lora_registry
         self.block_size = self.kv_block_manager.block_size
         self.num_blocks_per_seq = self.kv_block_manager.num_blocks_per_seq
         self.prefix_cache = PrefixCache(max_entries=max_prefix_cache_entries)
@@ -63,17 +70,25 @@ class LiteSingleGpuBackend:
             for service_class in (preemptible_service_classes or set())
             if str(service_class).strip()
         }
+        self.preempt_multimodal_prefills = bool(preempt_multimodal_prefills)
+        self.preempt_multimodal_max_queue_wait_s = max(
+            0.0, float(preempt_multimodal_max_queue_wait_s)
+        )
+        self.multimodal_prefix_cache_protect_threshold = max(
+            0.0, float(multimodal_prefix_cache_protect_threshold)
+        )
 
     def maybe_apply_prefix_cache(self, request_state) -> None:
-        cache_key = tuple(int(tok) for tok in request_state.get("input_ids", []))
+        cache_key = self._prefix_cache_key(request_state)
         if not cache_key:
             return None
 
         entry = request_state.get("_prefix_cache_entry")
         prefix_len = int(request_state.get("_prefix_cache_hit_len") or 0)
         if entry is None:
-            entry, prefix_len = self.prefix_cache.get_longest_prefix(cache_key)
-            exact_hit = prefix_len == len(cache_key)
+            entry, cache_prefix_len = self.prefix_cache.get_longest_prefix(cache_key)
+            prefix_len = self._request_prefix_len_from_cache_prefix(cache_prefix_len)
+            exact_hit = prefix_len == len(request_state.get("input_ids", []))
             if (
                 entry is None
                 or prefix_len <= 0
@@ -121,11 +136,20 @@ class LiteSingleGpuBackend:
             and getattr(scheduler, "queued_request_count", 0) >= self.preemption_min_backlog
             and len(step_plan.decodes.request_ids) >= self.preemption_min_decodes
             and not self._queue_wait_blocks_preemption(step_plan)
+            and self._multimodal_prefills_are_preemptible(step_plan, scheduler)
             and self._prefills_are_preemptible(step_plan, scheduler)
         ):
+            preempted_multimodal = 0
+            if hasattr(scheduler, "get_request"):
+                preempted_multimodal = sum(
+                    1
+                    for rid in step_plan.prefills.request_ids
+                    if self._is_multimodal_request(scheduler.get_request(rid))
+                )
             self.observer.on_preemption_event(
                 preempted_prefill_requests=len(step_plan.prefills.request_ids),
                 queued_backlog=int(getattr(scheduler, "queued_request_count", 0)),
+                multimodal_prefill_requests=preempted_multimodal,
             )
             return StepPlan(
                 admissions=step_plan.admissions,
@@ -137,12 +161,19 @@ class LiteSingleGpuBackend:
                 prefill_starvation_protected=step_plan.prefill_starvation_protected,
                 aged_admission_count=step_plan.aged_admission_count,
                 admitted_service_classes=step_plan.admitted_service_classes,
+                admitted_multimodal_requests=step_plan.admitted_multimodal_requests,
                 prefill_service_classes=step_plan.prefill_service_classes,
+                prefill_multimodal_requests=step_plan.prefill_multimodal_requests,
                 decode_service_classes=step_plan.decode_service_classes,
+                decode_multimodal_requests=step_plan.decode_multimodal_requests,
                 queued_service_classes=step_plan.queued_service_classes,
+                queued_multimodal_requests=step_plan.queued_multimodal_requests,
                 queued_avg_wait_s=step_plan.queued_avg_wait_s,
                 queued_max_wait_s=step_plan.queued_max_wait_s,
                 queued_p95_wait_s=step_plan.queued_p95_wait_s,
+                queued_multimodal_avg_wait_s=step_plan.queued_multimodal_avg_wait_s,
+                queued_multimodal_max_wait_s=step_plan.queued_multimodal_max_wait_s,
+                queued_multimodal_p95_wait_s=step_plan.queued_multimodal_p95_wait_s,
                 queued_service_class_avg_wait_s=step_plan.queued_service_class_avg_wait_s,
                 queued_service_class_max_wait_s=step_plan.queued_service_class_max_wait_s,
                 queued_service_class_p95_wait_s=step_plan.queued_service_class_p95_wait_s,
@@ -233,6 +264,7 @@ class LiteSingleGpuBackend:
 
     def stats(self) -> dict[str, object]:
         materialized_hits = self.prefix_cache_materialized_hits
+        multimodal_processor = getattr(self.prefill_executor, "multimodal_processor", None)
         return {
             "backend_type": "lite_single_gpu",
             "block_size": self.block_size,
@@ -244,6 +276,11 @@ class LiteSingleGpuBackend:
             "preemption_min_decodes": self.preemption_min_decodes,
             "preemption_max_queue_wait_s": self.preemption_max_queue_wait_s,
             "preemptible_service_classes": sorted(self.preemptible_service_classes),
+            "preempt_multimodal_prefills": self.preempt_multimodal_prefills,
+            "preempt_multimodal_max_queue_wait_s": self.preempt_multimodal_max_queue_wait_s,
+            "multimodal_prefix_cache_protect_threshold": (
+                self.multimodal_prefix_cache_protect_threshold
+            ),
             "prefix_cache_materialized_hits": materialized_hits,
             "prefix_cache_materialized_exact_hits": self.prefix_cache_materialized_exact_hits,
             "prefix_cache_materialized_partial_hits": self.prefix_cache_materialized_partial_hits,
@@ -256,6 +293,11 @@ class LiteSingleGpuBackend:
                 else 0.0
             ),
             "prefix_cache": self.prefix_cache.stats(),
+            "multimodal": (
+                dict(multimodal_processor.stats())
+                if multimodal_processor is not None and hasattr(multimodal_processor, "stats")
+                else {}
+            ),
         }
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
@@ -263,6 +305,9 @@ class LiteSingleGpuBackend:
         self.prefix_cache_materialized_exact_hits = 0
         self.prefix_cache_materialized_partial_hits = 0
         self.prefix_cache_materialized_saved_prefill_tokens = 0
+        multimodal_processor = getattr(self.prefill_executor, "multimodal_processor", None)
+        if multimodal_processor is not None and hasattr(multimodal_processor, "reset_stats"):
+            multimodal_processor.reset_stats()
         if clear_prefix_cache:
             self.prefix_cache.clear()
 
@@ -292,7 +337,9 @@ class LiteSingleGpuBackend:
             self._free_request(request_id)
 
     def _free_request(self, request_id: str) -> None:
-        self.scheduler.free_request(request_id)
+        request = self.scheduler.free_request(request_id)
+        if request is not None and self.lora_registry is not None:
+            self.lora_registry.on_request_removed(request.get("lora_id"))
 
     def _ensure_runtime_ready(self) -> None:
         if self.sampling_driver is None or self.output_coordinator is None:
@@ -317,6 +364,7 @@ class LiteSingleGpuBackend:
             exact=exact,
             prefix_len=prefix_len,
             saved_prefill_tokens=saved_prefill_tokens,
+            is_multimodal=self._is_multimodal_request(request_state),
         )
 
     def _queue_wait_blocks_preemption(self, step_plan: StepPlan) -> bool:
@@ -334,6 +382,51 @@ class LiteSingleGpuBackend:
             for rid in step_plan.prefills.request_ids
         )
 
+    def _multimodal_prefills_are_preemptible(
+        self,
+        step_plan: StepPlan,
+        scheduler: Any,
+    ) -> bool:
+        if step_plan.prefills is None:
+            return True
+        if not hasattr(scheduler, "get_request"):
+            return True
+        has_multimodal_prefill = any(
+            self._is_multimodal_request(scheduler.get_request(rid))
+            for rid in step_plan.prefills.request_ids
+        )
+        if not has_multimodal_prefill:
+            return True
+        if self._protect_multimodal_prefix_prefills(step_plan):
+            self.observer.on_multimodal_preemption_guard(
+                protected_prefill_requests=len(step_plan.prefills.request_ids),
+                prefix_cache_hit_rate=float(
+                    getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0
+                ),
+            )
+            return False
+        if self.preempt_multimodal_prefills:
+            if self.preempt_multimodal_max_queue_wait_s <= 0:
+                return True
+            return (
+                float(getattr(step_plan, "queued_multimodal_p95_wait_s", 0.0) or 0.0)
+                >= self.preempt_multimodal_max_queue_wait_s
+            )
+        return False
+
+    def _protect_multimodal_prefix_prefills(self, step_plan: StepPlan) -> bool:
+        threshold = self.multimodal_prefix_cache_protect_threshold
+        if threshold <= 0:
+            return False
+        return float(getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0) >= threshold
+
+    @staticmethod
+    def _is_multimodal_request(request: dict[str, Any]) -> bool:
+        return bool(
+            request.get("is_multimodal")
+            or (request.get("multi_modal_data") or {}).get("image")
+        )
+
     def _store_prefix_cache_entry(
         self,
         request_id: str,
@@ -346,7 +439,7 @@ class LiteSingleGpuBackend:
         if prompt_len <= 0 or slot_idx is None:
             return
 
-        key = tuple(int(tok) for tok in request_state.get("input_ids", []))
+        key = self._prefix_cache_key(request_state)
         if not key:
             return
 
@@ -391,3 +484,31 @@ class LiteSingleGpuBackend:
         request_state["generated_ids"].append(next_token)
         results: list[RequestOutput] = []
         self._process_completion(request_id, next_token, results)
+
+    def _prefix_cache_key(self, request_state: dict[str, Any]) -> tuple[int, ...]:
+        input_ids = tuple(int(tok) for tok in request_state.get("input_ids", []))
+        if not input_ids:
+            return ()
+        namespace = self._prefix_cache_namespace(request_state)
+        return (namespace, *input_ids)
+
+    def _prefix_cache_namespace(self, request_state: dict[str, Any]) -> int:
+        mm_data = request_state.get("multi_modal_data") or {}
+        images = mm_data.get("image") or []
+        if not images:
+            return -1
+        image_urls = [
+            str(item.get("image") or "")
+            for item in images
+            if isinstance(item, dict) and str(item.get("image") or "")
+        ]
+        if not image_urls:
+            return -1
+        digest = hashlib.sha1(
+            json.dumps(image_urls, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).digest()
+        return -int.from_bytes(digest[:8], byteorder="big", signed=False) - 2
+
+    @staticmethod
+    def _request_prefix_len_from_cache_prefix(cache_prefix_len: int) -> int:
+        return max(0, int(cache_prefix_len) - 1)

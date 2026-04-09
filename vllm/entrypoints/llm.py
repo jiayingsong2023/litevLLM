@@ -77,3 +77,19 @@ class LLM:
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
         self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
+
+    def register_lora_adapter(
+        self,
+        *,
+        lora_name: str,
+        lora_path: str | None = None,
+        lora_int_id: int | None = None,
+    ) -> dict[str, object]:
+        return self.engine.register_lora_adapter(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            lora_int_id=lora_int_id,
+        )
+
+    def unregister_lora_adapter(self, lora_name: str) -> bool:
+        return self.engine.unregister_lora_adapter(lora_name)
