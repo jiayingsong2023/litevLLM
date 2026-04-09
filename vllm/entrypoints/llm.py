@@ -71,3 +71,9 @@ class LLM:
 
     def shutdown(self) -> None:
         clear_gguf_cache()
+
+    def stats(self) -> dict[str, object]:
+        return self.engine.stats()
+
+    def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+        self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)

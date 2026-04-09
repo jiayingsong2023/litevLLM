@@ -48,6 +48,14 @@ class OutputPipeline:
         elif gen_len >= max_tok:
             request["finished"] = True
 
+        structured_output_constraint = request.get("structured_output_constraint")
+        if structured_output_constraint is not None:
+            accepted = structured_output_constraint.on_token(request, next_token)
+            if not accepted:
+                request["finished"] = True
+            elif structured_output_constraint.should_finish(request):
+                request["finished"] = True
+
         current_text = _decode_generated_text(
             self.tokenizer, request["generated_ids"], sampling_params
         )

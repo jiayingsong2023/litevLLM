@@ -55,6 +55,48 @@ async def test_request_scheduler_stream_raises_published_exception() -> None:
             pass
 
 
+def test_request_scheduler_enqueue_and_admit_releases_queue() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.add_request("r1", {"slot_idx": 0, "is_prefill": True})
+    scheduler.enqueue_request("r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2]})
+
+    assert scheduler.active_request_count == 2
+    assert scheduler.running_request_count == 1
+    assert scheduler.queued_request_count == 1
+    assert scheduler.queued_ids == ["r2"]
+
+    scheduler.free_request("r1")
+    admitted = scheduler.admit_queued_requests()
+
+    assert admitted == ["r2"]
+    assert scheduler.running_ids == ["r2"]
+    assert scheduler.queued_request_count == 0
+    assert scheduler.get_request("r2")["slot_idx"] == 0
+
+
+def test_request_scheduler_abort_removes_queued_request() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.enqueue_request("r1", {"is_prefill": True})
+
+    assert scheduler.queued_ids == ["r1"]
+    scheduler.abort_request("r1")
+
+    assert scheduler.active_request_count == 0
+    assert scheduler.queued_request_count == 0
+
+
+def test_request_scheduler_rejects_expired_queued_requests() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.enqueue_request("r1", {"is_prefill": True, "queued_at": 1.0})
+    scheduler.enqueue_request("r2", {"is_prefill": True, "queued_at": 9.5})
+
+    expired = scheduler.reject_expired_queued_requests(now=10.0, max_queue_wait_s=5.0)
+
+    assert len(expired) == 1
+    assert expired[0][0] == "r1"
+    assert scheduler.queued_ids == ["r2"]
+
+
 @pytest.mark.asyncio
 async def test_async_driver_propagates_background_error_to_engine() -> None:
     class FakeEngine:

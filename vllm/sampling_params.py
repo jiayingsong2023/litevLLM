@@ -11,6 +11,18 @@ class StructuredOutputsParams:
     json_object: bool = False
     choice: Optional[List[str]] = None
 
+    def all_constraints_none(self) -> bool:
+        return not any(
+            (
+                self.json is not None,
+                self.regex is not None,
+                self.grammar is not None,
+                self.structural_tag is not None,
+                self.json_object,
+                self.choice is not None,
+            )
+        )
+
 class RequestOutputKind:
     DELTA = "delta"
     FINAL_ONLY = "final_only"
@@ -41,6 +53,7 @@ class SamplingParams:
     structured_outputs: Optional[StructuredOutputsParams] = None
     detokenize: bool = True
     output_kind: str = RequestOutputKind.FINAL_ONLY
+    service_class: str = "latency"
 
 
 @dataclass

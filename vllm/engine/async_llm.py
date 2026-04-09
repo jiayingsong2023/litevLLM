@@ -49,5 +49,11 @@ class AsyncLLM(EngineClient):
         for rid in request_ids:
             self.engine.abort_request(rid)
 
+    def stats(self) -> dict[str, Any]:
+        return self.engine.stats()
+
+    def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+        self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
+
     def shutdown(self):
         self.driver.shutdown()

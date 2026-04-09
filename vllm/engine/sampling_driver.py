@@ -68,6 +68,9 @@ class SamplingDriver:
         eos_mask = eos_stop_token_ids_for_sampling(
             self.tokenizer, request["sampling_params"], self.hf_config
         )
+        structured_output_constraint = request.get("structured_output_constraint")
+        if structured_output_constraint is not None:
+            token_logits = structured_output_constraint.apply(token_logits, request)
         return self._sample_token_from_logits(
             token_logits,
             request["sampling_params"],

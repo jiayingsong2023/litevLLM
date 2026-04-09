@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import asyncio
+import copy
 import json
 import math
 import os
@@ -182,6 +183,275 @@ def _restore_env(old_env: Dict[str, Optional[str]]) -> None:
             os.environ[key] = value
 
 
+def _collect_runtime_stats(
+    llm: AsyncLLM,
+    *,
+    phase: str,
+) -> Dict[str, object]:
+    snapshot = copy.deepcopy(llm.stats())
+    derived_metrics = _derive_runtime_metrics(snapshot)
+    return {
+        "phase": phase,
+        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "stats": snapshot,
+        "derived_metrics": derived_metrics,
+    }
+
+
+def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
+    observer = snapshot.get("observer", {})
+    backend = snapshot.get("backend", {})
+    if not isinstance(observer, dict) or not isinstance(backend, dict):
+        return {}
+
+    observer_prefix = observer.get("prefix_cache", {})
+    backend_prefix = backend.get("prefix_cache", {})
+    observer_preemption = observer.get("preemption", {})
+    observer_fairness = observer.get("fairness", {})
+    if not isinstance(observer_prefix, dict):
+        observer_prefix = {}
+    if not isinstance(backend_prefix, dict):
+        backend_prefix = {}
+    if not isinstance(observer_preemption, dict):
+        observer_preemption = {}
+    if not isinstance(observer_fairness, dict):
+        observer_fairness = {}
+
+    request_count = float(observer_prefix.get("events", 0) or 0)
+    step_count = float(observer.get("step_count", 0) or 0)
+    admitted_requests = float(observer.get("admitted_requests", 0) or 0)
+    materialized_hits = float(backend.get("prefix_cache_materialized_hits", 0) or 0)
+    materialized_saved = float(
+        backend.get("prefix_cache_materialized_saved_prefill_tokens", 0) or 0
+    )
+    lookup_comparisons = float(backend_prefix.get("lookup_comparisons", 0) or 0)
+    lookup_candidates_total = float(backend_prefix.get("lookup_candidates_total", 0) or 0)
+    preempted_steps = float(observer_preemption.get("preempted_steps", 0) or 0)
+    preempted_prefills = float(
+        observer_preemption.get("preempted_prefill_requests", 0) or 0
+    )
+    starvation_protected_steps = float(
+        observer_fairness.get("starvation_protected_steps", 0) or 0
+    )
+    fairness_guardrail_steps = float(
+        observer_fairness.get("fairness_guardrail_triggered_steps", 0) or 0
+    )
+    per_class_p95_wait = observer_fairness.get("per_class_p95_queue_wait_s", {})
+    if not isinstance(per_class_p95_wait, dict):
+        per_class_p95_wait = {}
+
+    return {
+        "prefix_cache": {
+            "request_count": request_count,
+            "lookup_hit_rate": float(backend_prefix.get("hit_rate", 0.0) or 0.0),
+            "materialized_hit_rate": (
+                materialized_hits / request_count if request_count else 0.0
+            ),
+            "saved_prefill_tokens_per_request": (
+                materialized_saved / request_count if request_count else 0.0
+            ),
+            "saved_prefill_tokens_per_materialized_hit": (
+                materialized_saved / materialized_hits if materialized_hits else 0.0
+            ),
+            "lookup_cost_per_request": (
+                lookup_comparisons / request_count if request_count else 0.0
+            ),
+            "lookup_candidates_per_request": (
+                lookup_candidates_total / request_count if request_count else 0.0
+            ),
+        },
+        "preemption": {
+            "step_count": step_count,
+            "preempted_steps": preempted_steps,
+            "preempted_prefill_requests": preempted_prefills,
+            "preempted_step_rate": (
+                preempted_steps / step_count if step_count else 0.0
+            ),
+            "preempted_prefill_requests_per_step": (
+                preempted_prefills / step_count if step_count else 0.0
+            ),
+        },
+        "fairness": {
+            "step_count": step_count,
+            "admitted_requests": admitted_requests,
+            "starvation_protected_steps": starvation_protected_steps,
+            "fairness_guardrail_triggered_steps": fairness_guardrail_steps,
+            "starvation_protected_step_rate": (
+                starvation_protected_steps / step_count if step_count else 0.0
+            ),
+            "fairness_guardrail_triggered_step_rate": (
+                fairness_guardrail_steps / step_count if step_count else 0.0
+            ),
+            "avg_admitted_queue_wait_s": float(
+                observer_fairness.get("avg_admitted_queue_wait_s", 0.0) or 0.0
+            ),
+            "p95_queue_wait_s": float(
+                observer_fairness.get("p95_queue_wait_s", 0.0) or 0.0
+            ),
+            "max_queue_wait_s": float(
+                observer_fairness.get("max_queue_wait_s", 0.0) or 0.0
+            ),
+            "per_class_p95_queue_wait_s": {
+                str(key): float(value or 0.0)
+                for key, value in per_class_p95_wait.items()
+            },
+        },
+    }
+
+
+def _derive_runtime_phase_diffs(
+    phases: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    warmup = phases.get("warmup", {})
+    benchmark = phases.get("benchmark", {})
+    if not isinstance(warmup, dict) or not isinstance(benchmark, dict):
+        return {}
+
+    warmup_metrics = warmup.get("derived_metrics", {})
+    benchmark_metrics = benchmark.get("derived_metrics", {})
+    if not isinstance(warmup_metrics, dict) or not isinstance(benchmark_metrics, dict):
+        return {}
+
+    warmup_prefix = warmup_metrics.get("prefix_cache", {})
+    benchmark_prefix = benchmark_metrics.get("prefix_cache", {})
+    warmup_preemption = warmup_metrics.get("preemption", {})
+    benchmark_preemption = benchmark_metrics.get("preemption", {})
+    warmup_fairness = warmup_metrics.get("fairness", {})
+    benchmark_fairness = benchmark_metrics.get("fairness", {})
+    if not isinstance(warmup_prefix, dict) or not isinstance(benchmark_prefix, dict):
+        warmup_prefix, benchmark_prefix = {}, {}
+    if not isinstance(warmup_preemption, dict) or not isinstance(benchmark_preemption, dict):
+        warmup_preemption, benchmark_preemption = {}, {}
+    if not isinstance(warmup_fairness, dict) or not isinstance(benchmark_fairness, dict):
+        warmup_fairness, benchmark_fairness = {}, {}
+
+    prefix_keys = (
+        "request_count",
+        "lookup_hit_rate",
+        "materialized_hit_rate",
+        "saved_prefill_tokens_per_request",
+        "saved_prefill_tokens_per_materialized_hit",
+        "lookup_cost_per_request",
+        "lookup_candidates_per_request",
+    )
+    prefix_delta = {}
+    for key in prefix_keys:
+        prefix_delta[key] = float(benchmark_prefix.get(key, 0.0) or 0.0) - float(
+            warmup_prefix.get(key, 0.0) or 0.0
+        )
+
+    preemption_keys = (
+        "step_count",
+        "preempted_steps",
+        "preempted_prefill_requests",
+        "preempted_step_rate",
+        "preempted_prefill_requests_per_step",
+    )
+    preemption_delta = {}
+    for key in preemption_keys:
+        preemption_delta[key] = float(benchmark_preemption.get(key, 0.0) or 0.0) - float(
+            warmup_preemption.get(key, 0.0) or 0.0
+        )
+
+    fairness_scalar_keys = (
+        "step_count",
+        "admitted_requests",
+        "starvation_protected_steps",
+        "fairness_guardrail_triggered_steps",
+        "starvation_protected_step_rate",
+        "fairness_guardrail_triggered_step_rate",
+        "avg_admitted_queue_wait_s",
+        "p95_queue_wait_s",
+        "max_queue_wait_s",
+    )
+    fairness_delta = {}
+    for key in fairness_scalar_keys:
+        fairness_delta[key] = float(benchmark_fairness.get(key, 0.0) or 0.0) - float(
+            warmup_fairness.get(key, 0.0) or 0.0
+        )
+    warmup_fairness_p95 = warmup_fairness.get("per_class_p95_queue_wait_s", {})
+    benchmark_fairness_p95 = benchmark_fairness.get("per_class_p95_queue_wait_s", {})
+    if not isinstance(warmup_fairness_p95, dict):
+        warmup_fairness_p95 = {}
+    if not isinstance(benchmark_fairness_p95, dict):
+        benchmark_fairness_p95 = {}
+    per_class_keys = sorted(set(warmup_fairness_p95) | set(benchmark_fairness_p95))
+    fairness_delta["per_class_p95_queue_wait_s"] = {
+        str(key): float(benchmark_fairness_p95.get(key, 0.0) or 0.0)
+        - float(warmup_fairness_p95.get(key, 0.0) or 0.0)
+        for key in per_class_keys
+    }
+
+    return {
+        "baseline_phase": "warmup",
+        "target_phase": "benchmark",
+        "prefix_cache": {
+            "warmup": dict(warmup_prefix),
+            "benchmark": dict(benchmark_prefix),
+            "benchmark_delta": prefix_delta,
+        },
+        "preemption": {
+            "warmup": dict(warmup_preemption),
+            "benchmark": dict(benchmark_preemption),
+            "benchmark_delta": preemption_delta,
+        },
+        "fairness": {
+            "warmup": dict(warmup_fairness),
+            "benchmark": dict(benchmark_fairness),
+            "benchmark_delta": fairness_delta,
+        },
+    }
+
+
+def _format_runtime_phase_diff_summary(
+    phase_diffs: Dict[str, object],
+) -> list[str]:
+    if not isinstance(phase_diffs, dict):
+        return []
+
+    lines: list[str] = []
+    prefix_cache = phase_diffs.get("prefix_cache", {})
+    if isinstance(prefix_cache, dict):
+        prefix_delta = prefix_cache.get("benchmark_delta", {})
+        if isinstance(prefix_delta, dict):
+            lines.append(
+                "  RUNTIME(prefix): "
+                f"mat_hit_rate_delta={float(prefix_delta.get('materialized_hit_rate', 0.0) or 0.0):+.3f}, "
+                f"saved_prefill_tok_per_req_delta={float(prefix_delta.get('saved_prefill_tokens_per_request', 0.0) or 0.0):+.3f}, "
+                f"lookup_cost_per_req_delta={float(prefix_delta.get('lookup_cost_per_request', 0.0) or 0.0):+.3f}"
+            )
+
+    preemption = phase_diffs.get("preemption", {})
+    if isinstance(preemption, dict):
+        preemption_delta = preemption.get("benchmark_delta", {})
+        if isinstance(preemption_delta, dict):
+            lines.append(
+                "  RUNTIME(preempt): "
+                f"step_rate_delta={float(preemption_delta.get('preempted_step_rate', 0.0) or 0.0):+.3f}, "
+                f"prefills_per_step_delta={float(preemption_delta.get('preempted_prefill_requests_per_step', 0.0) or 0.0):+.3f}"
+            )
+
+    fairness = phase_diffs.get("fairness", {})
+    if isinstance(fairness, dict):
+        fairness_delta = fairness.get("benchmark_delta", {})
+        if isinstance(fairness_delta, dict):
+            lines.append(
+                "  RUNTIME(fair): "
+                f"guardrail_rate_delta={float(fairness_delta.get('fairness_guardrail_triggered_step_rate', 0.0) or 0.0):+.3f}, "
+                f"starvation_rate_delta={float(fairness_delta.get('starvation_protected_step_rate', 0.0) or 0.0):+.3f}, "
+                f"p95_queue_wait_delta={float(fairness_delta.get('p95_queue_wait_s', 0.0) or 0.0):+.3f}s"
+            )
+            per_class = fairness_delta.get("per_class_p95_queue_wait_s", {})
+            if isinstance(per_class, dict) and per_class:
+                formatted = ", ".join(
+                    f"{key}={float(value or 0.0):+.3f}s"
+                    for key, value in sorted(per_class.items())
+                )
+                lines.append(f"  RUNTIME(fair,p95_by_class): {formatted}")
+
+    return lines
+
+
 def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
     attempts = float(stats.get("awq_fused_attempt", 0))
     success = float(stats.get("awq_fused_success", 0))
@@ -301,6 +571,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
 
     old_env = _apply_temp_env(spec.stable_env)
     llm: Optional[AsyncLLM] = None
+    runtime_stats_by_phase: Dict[str, Dict[str, object]] = {}
     try:
         if spec.quant == "awq":
             from vllm.model_executor.layers.quantization.tensor import (
@@ -322,6 +593,8 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
         print("  [Warmup] Running one short request...")
         async for _ in llm.generate("Hello", SamplingParams(max_tokens=8, temperature=0.0), f"{spec.key}_warmup"):
             pass
+        runtime_stats_by_phase["warmup"] = _collect_runtime_stats(llm, phase="warmup")
+        llm.reset_stats(clear_prefix_cache=False)
 
         print("  [Run] Launching concurrent benchmark requests...")
         wall_start = time.perf_counter()
@@ -354,6 +627,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             if awq_stats:
                 print(f"  AWQ_STATS(timeout): {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
             awq_metrics = _derive_awq_metrics(awq_stats) if awq_stats else {}
+            benchmark_stats = _collect_runtime_stats(llm, phase="benchmark")
             return {
                 "skipped": 0.0,
                 "timed_out": 1.0,
@@ -374,8 +648,22 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
                 "decode_tps_p95": float("nan"),
                 "awq_runtime_stats": awq_stats,
                 "awq_metrics": awq_metrics,
+                "runtime_stats": {
+                    **runtime_stats_by_phase,
+                    "benchmark": benchmark_stats,
+                    "phase_diffs": _derive_runtime_phase_diffs(
+                        {
+                            **runtime_stats_by_phase,
+                            "benchmark": benchmark_stats,
+                        }
+                    ),
+                },
             }
         wall_end = time.perf_counter()
+        runtime_stats_by_phase["benchmark"] = _collect_runtime_stats(llm, phase="benchmark")
+        runtime_stats_by_phase["phase_diffs"] = _derive_runtime_phase_diffs(
+            runtime_stats_by_phase
+        )
 
         wall_sec = max(1e-6, wall_end - wall_start)
         total_tokens = int(sum(r["tokens"] for r in request_results))
@@ -422,6 +710,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
             "awq_runtime_stats": awq_stats,
             "awq_metrics": awq_metrics,
+            "runtime_stats": runtime_stats_by_phase,
         }
 
         print(
@@ -439,6 +728,10 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
                 "requests those durations overlap, so this is not wall batch decode TPS. "
                 "Prefer tokens/s (aggregate_tps) or decode_tps_p50 for A/B vs kernel work."
             )
+        for line in _format_runtime_phase_diff_summary(
+            runtime_stats_by_phase.get("phase_diffs", {})
+        ):
+            print(line)
         if awq_stats:
             print(f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
         return result
@@ -474,6 +767,15 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional path to save JSON benchmark summary.",
+    )
+    parser.add_argument(
+        "--runtime-stats-out",
+        type=str,
+        default="",
+        help=(
+            "Optional path to save runtime stats snapshots only. If unset and --json-out "
+            "is provided, runtime stats are included in the main summary JSON."
+        ),
     )
     parser.add_argument(
         "--aggressive",
@@ -552,8 +854,12 @@ async def main() -> None:
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}
+    runtime_stats_summary: Dict[str, Dict[str, object]] = {}
     for spec in specs:
         summary[spec.key] = await run_benchmark(spec)
+        runtime_stats_summary[spec.key] = dict(
+            summary[spec.key].get("runtime_stats", {})
+        )
 
     print("\n" + "-" * 72)
     print("PERF SUMMARY")
@@ -582,11 +888,22 @@ async def main() -> None:
         payload = {
             "models": model_keys,
             "summary": summary,
+            "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
         print(f"\nJSON summary written to: {args.json_out}")
+
+    if args.runtime_stats_out:
+        payload = {
+            "models": model_keys,
+            "runtime_stats": runtime_stats_summary,
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(args.runtime_stats_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        print(f"Runtime stats written to: {args.runtime_stats_out}")
 
 
 if __name__ == "__main__":

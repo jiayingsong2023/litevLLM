@@ -10,20 +10,20 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 from vllm.adapters import get_model_adapter
 from vllm.config import VllmConfig
 from vllm.engine.decode_executor import DecodeExecutor
-from vllm.engine.errors import (
-    BackgroundLoopError,
-    ExecutionStepError,
-    RequestRejectedError,
-)
+from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
+from vllm.engine.input_batch_builder import InputBatchBuilder
+from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.output_pipeline import OutputPipeline
 from vllm.engine.prefill_executor import PrefillExecutor
 from vllm.engine.request_scheduler import RequestScheduler
+from vllm.engine.request_state import RequestState
+from vllm.engine.request_builder import LiteRequestBuilder
+from vllm.engine.runtime_factory import LiteRuntimeFactory
 from vllm.engine.runtime_observer import NullRuntimeObserver
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_planner import RuntimePlanner
 from vllm.engine.sampling_driver import SamplingDriver
-from vllm.engine.step_scheduler import StepScheduler
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput
@@ -37,7 +37,6 @@ logger = init_logger(__name__)
 def _env_truthy(name: str) -> bool:
     v = os.environ.get(name, "").strip().lower()
     return v in ("1", "true", "yes", "on")
-
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     f8 = getattr(torch, "float8_e4m3fn", None)
@@ -128,28 +127,6 @@ def _resolve_kv_max_active_requests(
     if env:
         out = min(out, max(1, int(env)))
     return max(1, out)
-
-def _apply_lite_default_min_tokens(sp: SamplingParams, max_new_tokens: int) -> None:
-    """
-    Optional bump when callers leave min_tokens at 0 (SamplingParams default).
-    Default is off (same as explicit min_tokens=0: immediate EOS allowed).
-    Set FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS=1 (or higher) to reduce
-    first-token EOS on chat-style models (e.g. Qwen3.5 + GGUF).
-    """
-    if int(getattr(sp, "min_tokens", 0) or 0) != 0:
-        return
-    raw = os.environ.get("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "0")
-    if isinstance(raw, str):
-        raw = raw.strip()
-    if raw == "" or str(raw).lower() in ("0", "false", "off", "no"):
-        return
-    try:
-        sp.min_tokens = max(0, int(raw))
-    except ValueError:
-        sp.min_tokens = 1
-    mt = int(getattr(sp, "min_tokens", 0) or 0)
-    if mt > max_new_tokens:
-        sp.min_tokens = max(0, max_new_tokens)
 
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
@@ -310,15 +287,10 @@ class LiteEngine:
         self.policies = None
         self.sampling_driver = None
         self.output_pipeline = None
+        self.request_builder = None
         self.observer = getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
-        self.step_scheduler = StepScheduler(
-            step_token_budget=self._step_token_budget,
-            decode_priority_enabled=self._decode_priority_enabled,
-            prefill_chunk_size=self._prefill_chunk_size,
-            prefill_reserved_tokens=self._prefill_reserved_tokens,
-            prefill_reserve_backlog=self._prefill_reserve_backlog,
-            prefill_catchup_ratio=self._prefill_catchup_ratio,
-            prefill_microbatch_size=self._prefill_microbatch_size,
+        self._queue_timeout_s = float(
+            os.environ.get("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS", "30.0")
         )
         
         # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
@@ -333,35 +305,14 @@ class LiteEngine:
         for s in range(self.max_active_requests):
             start_block = s * self.num_blocks_per_seq
             self._fast_block_tables[s] = torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32, device=self.device)
-        self.prefill_executor = PrefillExecutor(
-            model=self.model,
-            device=self.device,
-            num_layers=self.num_layers,
-            num_blocks_per_seq=self.num_blocks_per_seq,
-            max_model_len=self.max_model_len,
-            kv_caches=self.kv_caches,
-            kv_scale_caches=self.kv_scale_caches,
-            inf_config=self.inf_config,
-            stack_per_layer_carries=self._stack_per_layer_carries,
-            split_per_layer_carries=self._split_per_layer_carries,
-        )
-        self.decode_executor = DecodeExecutor(
-            model=self.model,
-            device=self.device,
-            num_layers=self.num_layers,
-            num_blocks_per_seq=self.num_blocks_per_seq,
-            max_model_len=self.max_model_len,
-            kv_caches=self.kv_caches,
-            kv_scale_caches=self.kv_scale_caches,
-            inf_config=self.inf_config,
-            fast_input_ids=self._fast_input_ids,
-            fast_positions=self._fast_positions,
-            fast_slot_mapping=self._fast_slot_mapping,
-            fast_seq_lens=self._fast_seq_lens,
-            fast_block_tables=self._fast_block_tables,
-            stack_per_layer_carries=self._stack_per_layer_carries,
-            split_per_layer_carries=self._split_per_layer_carries,
-        )
+        runtime_components = LiteRuntimeFactory.build(self)
+        self.kv_block_manager = runtime_components["kv_block_manager"]
+        self.input_batch_builder = runtime_components["input_batch_builder"]
+        self.prefill_executor = runtime_components["prefill_executor"]
+        self.decode_executor = runtime_components["decode_executor"]
+        self.step_scheduler = runtime_components["step_scheduler"]
+        self.execution_backend = runtime_components["execution_backend"]
+        self.runtime_controller = runtime_components["runtime_controller"]
 
     @property
     def active_request_count(self) -> int:
@@ -414,55 +365,39 @@ class LiteEngine:
             self.output_pipeline = OutputPipeline(
                 self.tokenizer, self.policies, self.sampling_driver
             )
-        if not self.scheduler.has_capacity():
-            # Simple rejection if full. In real engine, we'd queue.
-            reason = f"max capacity reached ({self.max_active_requests})"
-            self.observer.on_request_rejected(request_id, reason)
-            raise RequestRejectedError(reason)
-
-        effective_sampling_params = copy.deepcopy(sampling_params)
-        max_tokens = effective_sampling_params.max_tokens or 16
-        max_tokens = min(max_tokens, self.execution_policy.max_tokens_cap)
-        _apply_lite_default_min_tokens(effective_sampling_params, max_tokens)
-
-        guarded_prompt = self.policies.normalize_prompt(prompt)
-        input_ids = self.tokenizer.encode(guarded_prompt)
-        if len(input_ids) >= self.max_model_len:
+            self.request_builder = LiteRequestBuilder(
+                tokenizer=self.tokenizer,
+                policies=self.policies,
+                device=self.device,
+                num_layers=self.num_layers,
+                max_model_len=self.max_model_len,
+                max_tokens_cap=self.execution_policy.max_tokens_cap,
+            )
+            self.execution_backend.sampling_driver = self.sampling_driver
+            self.execution_backend.output_coordinator = self.output_pipeline
+        if not self.scheduler.has_queue_capacity():
             reason = (
-                f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
-                f"({self.max_model_len}); leave at least one decode token slot."
+                "request queue full "
+                f"(running={self.scheduler.running_request_count}, queued={self.scheduler.queued_request_count})"
             )
             self.observer.on_request_rejected(request_id, reason)
             raise RequestRejectedError(reason)
-        slot_idx = self.scheduler.allocate_slot()
-        
-        rng: Optional[torch.Generator] = None
-        seed = getattr(effective_sampling_params, "seed", None)
-        if seed is not None:
-            rng = torch.Generator(device=self.device)
-            rng.manual_seed(int(seed))
 
-        request_state = {
-            "input_ids": input_ids,
-            "generated_ids": [],
-            "sampling_params": effective_sampling_params,
-            "finished": False,
-            "prompt": prompt,
-            "guarded_prompt": guarded_prompt,
-            "slot_idx": slot_idx,
-            "seq_len": 0,  # Current length in KV cache
-            "is_prefill": True,
-            "lora_id": lora_id,
-            "rng": rng,
-            # Qwen3.5 linear-attn: recurrent delta-net state + causal conv tail (per layer).
-            "linear_attn_carry": [None] * self.num_layers,
-            "linear_conv_carry": [None] * self.num_layers,
-            "low_info_hits": 0,
-            "is_chinese_capital_question": self.policies.is_chinese_capital_question(prompt),
-            "capital_question_bias_token_ids": self.policies.capital_question_bias_token_ids(prompt),
-            "anti_template_token_ids": self.policies.anti_template_token_ids(),
-        }
-        self.scheduler.add_request(request_id, request_state)
+        try:
+            request_state = self.request_builder.build(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=sampling_params,
+                lora_id=lora_id,
+            )
+        except ValueError as exc:
+            reason = (
+                str(exc)
+            )
+            self.observer.on_request_rejected(request_id, reason)
+            raise RequestRejectedError(reason)
+        self.execution_backend.maybe_apply_prefix_cache(request_state)
+        self.scheduler.enqueue_request(request_id, request_state)
         self.observer.on_request_added(request_id, request_state)
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:
@@ -489,118 +424,11 @@ class LiteEngine:
             self.scheduler.free_request(request_id)
 
     @torch.inference_mode()
-    def _decode_step_sync(self, decodes: List[str]) -> List[RequestOutput]:
-        logits, _ = self.decode_executor.execute_sync_fast(decodes, self.scheduler)
-        results = []
-        for i, rid in enumerate(decodes):
-            req = self.scheduler.get_request(rid)
-            token = self.sampling_driver.sample_next_token(logits[i, -1, :], req)
-            
-            req["generated_ids"].append(token)
-            req["seq_len"] += 1
-            self._process_completion(rid, token, results)
-            
-        return results
-
-    def _free_request(self, rid: str):
-        self.scheduler.free_request(rid)
-
-    @torch.inference_mode()
     def step(self) -> List[RequestOutput]:
-        if self.scheduler.active_request_count == 0: return []
+        return self.runtime_controller.step()
 
-        step_plan = self.step_scheduler.build_plan(self.scheduler)
-        self.observer.on_step_started(step_plan)
+    def stats(self) -> Dict[str, Any]:
+        return self.runtime_controller.stats()
 
-        if (
-            step_plan.decodes is not None
-            and step_plan.decodes.use_fast_path
-            and step_plan.prefills is None
-        ):
-            return self._decode_step_sync(step_plan.decodes.request_ids)
-
-        results = []
-
-        if step_plan.prefills is not None:
-            try:
-                logits, req_dicts_prefill, is_last_chunk_flags = self.prefill_executor.execute(
-                    step_plan.prefills.request_ids,
-                    self.scheduler,
-                    step_plan.prefills.chunk_len,
-                )
-
-                for i, rid in enumerate(step_plan.prefills.request_ids):
-                    req = self.scheduler.get_request(rid)
-                    req["seq_len"] += step_plan.prefills.chunk_len
-                    if not is_last_chunk_flags[i]:
-                        continue
-                    next_token = self.sampling_driver.sample_next_token(
-                        logits[i, -1, :], req
-                    )
-                    req["generated_ids"].append(next_token)
-                    req["is_prefill"] = False
-                    self._process_completion(rid, next_token, results)
-                self.observer.on_prefill_executed(step_plan.prefills, len(results))
-            except Exception as e:
-                error = ExecutionStepError(f"prefill failed: {e}")
-                logger.exception("LiteEngine prefill execution error: %s", error)
-                for rid in step_plan.prefills.request_ids:
-                    self._free_request(rid)
-                raise error
-
-        if step_plan.decodes is not None:
-            try:
-                logits, req_dicts = self.decode_executor.execute_batch(
-                    step_plan.decodes.request_ids, self.scheduler
-                )
-                # logits: (B, 1, Vocab) — per-request sampling (may differ per SamplingParams)
-                # OPTIMIZATION: If all requests are greedy (temp=0), we can argmax in one go.
-                is_all_greedy = all(
-                    self.scheduler.get_request(rid)["sampling_params"].temperature == 0
-                    for rid in step_plan.decodes.request_ids
-                )
-                
-                if is_all_greedy:
-                    # Parallel Argmax
-                    next_tokens = torch.argmax(logits[:, -1, :], dim=-1).cpu().tolist()
-                    for i, rid in enumerate(step_plan.decodes.request_ids):
-                        req_i = self.scheduler.get_request(rid)
-                        token = next_tokens[i]
-                        req_i["generated_ids"].append(token)
-                        req_i["seq_len"] += 1
-                        self._process_completion(rid, token, results)
-                else:
-                    # Standard fallback for mixed sampling params
-                    for i, rid in enumerate(step_plan.decodes.request_ids):
-                        req_i = self.scheduler.get_request(rid)
-                        token = self.sampling_driver.sample_next_token(
-                            logits[i, -1, :], req_i
-                        )
-                        req_i["generated_ids"].append(token)
-                        req_i["seq_len"] += 1
-                        self._process_completion(rid, token, results)
-                self.observer.on_decode_executed(step_plan.decodes, len(results))
-                    
-            except Exception as e:
-                error = ExecutionStepError(f"decode failed: {e}")
-                logger.exception("LiteEngine decode execution error: %s", error)
-                for rid in step_plan.decodes.request_ids:
-                    self._free_request(rid)
-                raise error
-
-        return results
-
-    def _process_completion(self, rid, next_token, results):
-        req = self.scheduler.get_request(rid)
-        out = self.output_pipeline.finalize_step(rid, req, next_token)
-        self.scheduler.publish_output(rid, out)
-        results.append(out)
-        
-        if req["finished"]:
-            finish_reason = "completed"
-            if next_token in self.sampling_driver.completion_eos_ids(req):
-                finish_reason = "eos"
-            elif len(req["generated_ids"]) >= int(req["sampling_params"].max_tokens or 16):
-                finish_reason = "max_tokens"
-            self.observer.on_request_finished(rid, finish_reason)
-            self._free_request(rid)
+    def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+        self.runtime_controller.reset_stats(clear_prefix_cache=clear_prefix_cache)
