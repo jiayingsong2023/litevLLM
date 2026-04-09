@@ -5,12 +5,15 @@ import copy
 import json
 import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from statistics import median
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+from PIL import Image
 
 from vllm import SamplingParams
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
@@ -30,6 +33,12 @@ class ModelSpec:
     max_model_len: int
     max_run_seconds: int
     stable_env: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class BenchmarkRequestSpec:
+    prompt: str
+    multi_modal_data: dict[str, Any] | None = None
 
 
 # KV cache: FP8 KV (FASTINFERENCE_KV_FP8=1) to save VRAM; aligned with accuracy suite defaults.
@@ -155,6 +164,55 @@ def _build_prompt(tokenizer, target_tokens: int) -> str:
     return prompt_text
 
 
+def _write_benchmark_image(image_path: Path, *, request_index: int, image_index: int, size: int) -> None:
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    color = (
+        (64 + request_index * 23 + image_index * 11) % 256,
+        (32 + request_index * 47 + image_index * 19) % 256,
+        (128 + request_index * 13 + image_index * 29) % 256,
+    )
+    Image.new("RGB", (size, size), color=color).save(image_path)
+
+
+def _build_benchmark_requests(
+    *,
+    prompt: str,
+    request_count: int,
+    workload: str,
+    image_root: Path | None = None,
+    multimodal_images_per_request: int = 1,
+    multimodal_image_size: int = 8,
+) -> list[BenchmarkRequestSpec]:
+    requests: list[BenchmarkRequestSpec] = []
+    for request_index in range(request_count):
+        request_prompt = f"{prompt}\n[benchmark_request_id={request_index}]"
+        multi_modal_data: dict[str, Any] | None = None
+        if workload != "text":
+            if image_root is None:
+                raise ValueError("image_root is required for multimodal workloads")
+            image_count = (
+                1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+            )
+            image_blocks: list[dict[str, str]] = []
+            for image_index in range(image_count):
+                image_path = image_root / f"req_{request_index:03d}_img_{image_index:02d}.png"
+                _write_benchmark_image(
+                    image_path,
+                    request_index=request_index,
+                    image_index=image_index,
+                    size=max(2, int(multimodal_image_size)),
+                )
+                image_blocks.append({"image": f"file://{image_path}"})
+            multi_modal_data = {"image": image_blocks}
+        requests.append(
+            BenchmarkRequestSpec(
+                prompt=request_prompt,
+                multi_modal_data=multi_modal_data,
+            )
+        )
+    return requests
+
+
 def _p95(values: List[float]) -> float:
     if not values:
         return 0.0
@@ -201,6 +259,7 @@ def _collect_runtime_stats(
 def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     observer = snapshot.get("observer", {})
     backend = snapshot.get("backend", {})
+    lora_runtime = snapshot.get("lora", {})
     if not isinstance(observer, dict) or not isinstance(backend, dict):
         return {}
 
@@ -208,6 +267,9 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     backend_prefix = backend.get("prefix_cache", {})
     observer_preemption = observer.get("preemption", {})
     observer_fairness = observer.get("fairness", {})
+    observer_lora = observer.get("lora", {})
+    observer_multimodal = observer.get("multimodal", {})
+    backend_multimodal = backend.get("multimodal", {})
     if not isinstance(observer_prefix, dict):
         observer_prefix = {}
     if not isinstance(backend_prefix, dict):
@@ -216,6 +278,14 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
         observer_preemption = {}
     if not isinstance(observer_fairness, dict):
         observer_fairness = {}
+    if not isinstance(observer_lora, dict):
+        observer_lora = {}
+    if not isinstance(observer_multimodal, dict):
+        observer_multimodal = {}
+    if not isinstance(backend_multimodal, dict):
+        backend_multimodal = {}
+    if not isinstance(lora_runtime, dict):
+        lora_runtime = {}
 
     request_count = float(observer_prefix.get("events", 0) or 0)
     step_count = float(observer.get("step_count", 0) or 0)
@@ -230,6 +300,15 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     preempted_prefills = float(
         observer_preemption.get("preempted_prefill_requests", 0) or 0
     )
+    preempted_multimodal_prefills = float(
+        observer_preemption.get("preempted_multimodal_prefill_requests", 0) or 0
+    )
+    protected_multimodal_prefix_steps = float(
+        observer_preemption.get("protected_multimodal_prefix_steps", 0) or 0
+    )
+    protected_multimodal_prefix_prefills = float(
+        observer_preemption.get("protected_multimodal_prefix_prefill_requests", 0) or 0
+    )
     starvation_protected_steps = float(
         observer_fairness.get("starvation_protected_steps", 0) or 0
     )
@@ -239,6 +318,27 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     per_class_p95_wait = observer_fairness.get("per_class_p95_queue_wait_s", {})
     if not isinstance(per_class_p95_wait, dict):
         per_class_p95_wait = {}
+    lora_adapters = lora_runtime.get("adapters", {})
+    if not isinstance(lora_adapters, dict):
+        lora_adapters = {}
+    lora_prefill_adapters = observer_lora.get("prefill_adapters", {})
+    lora_decode_adapters = observer_lora.get("decode_adapters", {})
+    lora_backlog_adapters = observer_lora.get("backlog_adapters", {})
+    if not isinstance(lora_prefill_adapters, dict):
+        lora_prefill_adapters = {}
+    if not isinstance(lora_decode_adapters, dict):
+        lora_decode_adapters = {}
+    if not isinstance(lora_backlog_adapters, dict):
+        lora_backlog_adapters = {}
+    lora_prefill_steps = float(observer_lora.get("prefill_step_count", 0) or 0)
+    lora_decode_steps = float(observer_lora.get("decode_step_count", 0) or 0)
+    admitted_adapter_share = _normalized_share_map(
+        observer_lora.get("admitted_adapters", {})
+    )
+    backlog_adapter_share = _normalized_share_map(
+        observer_lora.get("backlog_adapters", {})
+    )
+    adapter_fairness_gap = _share_gap_map(admitted_adapter_share, backlog_adapter_share)
 
     return {
         "prefix_cache": {
@@ -264,11 +364,25 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
             "step_count": step_count,
             "preempted_steps": preempted_steps,
             "preempted_prefill_requests": preempted_prefills,
+            "preempted_multimodal_prefill_requests": preempted_multimodal_prefills,
+            "protected_multimodal_prefix_steps": protected_multimodal_prefix_steps,
+            "protected_multimodal_prefix_prefill_requests": (
+                protected_multimodal_prefix_prefills
+            ),
             "preempted_step_rate": (
                 preempted_steps / step_count if step_count else 0.0
             ),
             "preempted_prefill_requests_per_step": (
                 preempted_prefills / step_count if step_count else 0.0
+            ),
+            "preempted_multimodal_prefill_requests_per_step": (
+                preempted_multimodal_prefills / step_count if step_count else 0.0
+            ),
+            "protected_multimodal_prefix_step_rate": (
+                protected_multimodal_prefix_steps / step_count if step_count else 0.0
+            ),
+            "protected_multimodal_prefix_prefill_requests_per_step": (
+                protected_multimodal_prefix_prefills / step_count if step_count else 0.0
             ),
         },
         "fairness": {
@@ -296,6 +410,509 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
                 for key, value in per_class_p95_wait.items()
             },
         },
+        "lora": {
+            "registered_adapters": float(
+                lora_runtime.get("registered_adapters", 0) or 0
+            ),
+            "active_adapters": float(
+                lora_runtime.get("active_adapters", 0) or 0
+            ),
+            "active_requests": float(
+                lora_runtime.get("active_requests", 0) or 0
+            ),
+            "total_routed_requests": float(
+                lora_runtime.get("total_routed_requests", 0) or 0
+            ),
+            "adapter_count_observed": float(len(lora_adapters)),
+            "mixed_lora_prefill_steps": float(
+                observer_lora.get("mixed_lora_prefill_steps", 0) or 0
+            ),
+            "mixed_lora_decode_steps": float(
+                observer_lora.get("mixed_lora_decode_steps", 0) or 0
+            ),
+            "admit_relaxed_steps": float(
+                observer_lora.get("admit_relaxed_steps", 0) or 0
+            ),
+            "admit_tightened_steps": float(
+                observer_lora.get("admit_tightened_steps", 0) or 0
+            ),
+            "prefill_relaxed_steps": float(
+                observer_lora.get("prefill_relaxed_steps", 0) or 0
+            ),
+            "prefill_tightened_steps": float(
+                observer_lora.get("prefill_tightened_steps", 0) or 0
+            ),
+            "decode_relaxed_steps": float(
+                observer_lora.get("decode_relaxed_steps", 0) or 0
+            ),
+            "decode_tightened_steps": float(
+                observer_lora.get("decode_tightened_steps", 0) or 0
+            ),
+            "prefill_step_count": lora_prefill_steps,
+            "decode_step_count": lora_decode_steps,
+            "mixed_lora_prefill_step_rate": (
+                float(observer_lora.get("mixed_lora_prefill_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "mixed_lora_decode_step_rate": (
+                float(observer_lora.get("mixed_lora_decode_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_adapter_count": float(len(lora_prefill_adapters)),
+            "decode_adapter_count": float(len(lora_decode_adapters)),
+            "backlog_adapter_count": float(len(lora_backlog_adapters)),
+            "prefill_locality_rate": (
+                1.0
+                - (
+                    float(observer_lora.get("mixed_lora_prefill_steps", 0) or 0)
+                    / lora_prefill_steps
+                )
+                if lora_prefill_steps
+                else 0.0
+            ),
+            "decode_locality_rate": (
+                1.0
+                - (
+                    float(observer_lora.get("mixed_lora_decode_steps", 0) or 0)
+                    / lora_decode_steps
+                )
+                if lora_decode_steps
+                else 0.0
+            ),
+            "admitted_adapter_share": admitted_adapter_share,
+            "backlog_adapter_share": backlog_adapter_share,
+            "adapter_fairness_gap": adapter_fairness_gap,
+            "max_adapter_fairness_gap": (
+                max((abs(value) for value in adapter_fairness_gap.values()), default=0.0)
+            ),
+            "mean_abs_adapter_fairness_gap": (
+                sum(abs(value) for value in adapter_fairness_gap.values())
+                / max(1, len(adapter_fairness_gap))
+            ),
+            "admit_relaxed_rate": (
+                float(observer_lora.get("admit_relaxed_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "admit_tightened_rate": (
+                float(observer_lora.get("admit_tightened_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_relaxed_rate": (
+                float(observer_lora.get("prefill_relaxed_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_tightened_rate": (
+                float(observer_lora.get("prefill_tightened_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_relaxed_rate": (
+                float(observer_lora.get("decode_relaxed_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_tightened_rate": (
+                float(observer_lora.get("decode_tightened_steps", 0) or 0) / step_count
+                if step_count
+                else 0.0
+            ),
+        },
+        "multimodal": {
+            "request_count": float(observer_multimodal.get("requests", 0) or 0),
+            "image_count": float(observer_multimodal.get("images", 0) or 0),
+            "multimodal_lora_request_count": float(
+                observer_multimodal.get("multimodal_lora_requests", 0) or 0
+            ),
+            "queued_request_count": float(
+                observer_multimodal.get("queued_requests", 0) or 0
+            ),
+            "admitted_request_count": float(
+                observer_multimodal.get("admitted_requests", 0) or 0
+            ),
+            "prefill_request_count": float(
+                observer_multimodal.get("prefill_requests", 0) or 0
+            ),
+            "decode_request_count": float(
+                observer_multimodal.get("decode_requests", 0) or 0
+            ),
+            "p95_queue_wait_s": float(
+                observer_multimodal.get("p95_queue_wait_s", 0.0) or 0.0
+            ),
+            "multimodal_lora_prefill_count": float(
+                observer_multimodal.get("prefill_multimodal_lora_requests", 0) or 0
+            ),
+            "mixed_multimodal_lora_prefill_steps": float(
+                observer_multimodal.get("mixed_multimodal_lora_prefill_steps", 0) or 0
+            ),
+            "avg_effective_prefill_multimodal_limit": float(
+                observer_multimodal.get("avg_effective_prefill_multimodal_limit", 0.0)
+                or 0.0
+            ),
+            "prefill_multimodal_limit_relaxed_steps": float(
+                observer_multimodal.get("prefill_multimodal_limit_relaxed_steps", 0)
+                or 0
+            ),
+            "prefill_multimodal_limit_tightened_steps": float(
+                observer_multimodal.get("prefill_multimodal_limit_tightened_steps", 0)
+                or 0
+            ),
+            "prefill_multimodal_limit_triggered_steps": float(
+                observer_multimodal.get("prefill_multimodal_limit_triggered_steps", 0)
+                or 0
+            ),
+            "prefix_cache_hits": float(
+                observer_multimodal.get("prefix_cache_hits", 0) or 0
+            ),
+            "prefix_cache_misses": float(
+                observer_multimodal.get("prefix_cache_misses", 0) or 0
+            ),
+            "prefix_cache_saved_prefill_tokens": float(
+                observer_multimodal.get("prefix_cache_saved_prefill_tokens", 0) or 0
+            ),
+            "admit_multimodal_lora_limit_triggered_steps": float(
+                observer_multimodal.get(
+                    "admit_multimodal_lora_limit_triggered_steps", 0
+                )
+                or 0
+            ),
+            "prefill_multimodal_lora_limit_triggered_steps": float(
+                observer_multimodal.get(
+                    "prefill_multimodal_lora_limit_triggered_steps", 0
+                )
+                or 0
+            ),
+            "prefill_multimodal_lora_limit_relaxed_steps": float(
+                observer_multimodal.get(
+                    "prefill_multimodal_lora_limit_relaxed_steps", 0
+                )
+                or 0
+            ),
+            "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": float(
+                observer_multimodal.get(
+                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps", 0
+                )
+                or 0
+            ),
+            "prefill_multimodal_lora_limit_tightened_steps": float(
+                observer_multimodal.get(
+                    "prefill_multimodal_lora_limit_tightened_steps", 0
+                )
+                or 0
+            ),
+            "prefill_multimodal_lora_limit_tightened_by_locality_steps": float(
+                observer_multimodal.get(
+                    "prefill_multimodal_lora_limit_tightened_by_locality_steps", 0
+                )
+                or 0
+            ),
+            "preempted_prefill_requests": preempted_multimodal_prefills,
+            "prepared_request_count": float(
+                backend_multimodal.get("prepared_requests", 0) or 0
+            ),
+            "prepared_image_count": float(
+                backend_multimodal.get("prepared_images", 0) or 0
+            ),
+            "prepare_failure_count": float(
+                backend_multimodal.get("prepare_failures", 0) or 0
+            ),
+            "embedding_request_count": float(
+                backend_multimodal.get("embedding_requests", 0) or 0
+            ),
+            "embeddings_computed": float(
+                backend_multimodal.get("embeddings_computed", 0) or 0
+            ),
+            "avg_embedding_feature_dim": float(
+                backend_multimodal.get("avg_embedding_feature_dim", 0.0) or 0.0
+            ),
+            "images_per_request": (
+                float(observer_multimodal.get("images", 0) or 0)
+                / float(observer_multimodal.get("requests", 0) or 1)
+                if float(observer_multimodal.get("requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "prepared_images_per_request": (
+                float(backend_multimodal.get("prepared_images", 0) or 0)
+                / float(backend_multimodal.get("prepared_requests", 0) or 1)
+                if float(backend_multimodal.get("prepared_requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "embedding_compute_rate": (
+                float(backend_multimodal.get("embeddings_computed", 0) or 0)
+                / float(backend_multimodal.get("embedding_requests", 0) or 1)
+                if float(backend_multimodal.get("embedding_requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "preempted_prefill_rate": (
+                preempted_multimodal_prefills
+                / float(observer_multimodal.get("prefill_requests", 0) or 1)
+                if float(observer_multimodal.get("prefill_requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "multimodal_lora_request_rate": (
+                float(observer_multimodal.get("multimodal_lora_requests", 0) or 0)
+                / float(observer_multimodal.get("requests", 0) or 1)
+                if float(observer_multimodal.get("requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "multimodal_lora_prefill_rate": (
+                float(observer_multimodal.get("prefill_multimodal_lora_requests", 0) or 0)
+                / float(observer_multimodal.get("prefill_requests", 0) or 1)
+                if float(observer_multimodal.get("prefill_requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "prefix_cache_hit_rate": float(
+                observer_multimodal.get("prefix_cache_hit_rate", 0.0) or 0.0
+            ),
+            "saved_prefill_tokens_per_request": (
+                float(observer_multimodal.get("prefix_cache_saved_prefill_tokens", 0) or 0)
+                / float(observer_multimodal.get("requests", 0) or 1)
+                if float(observer_multimodal.get("requests", 0) or 0) > 0
+                else 0.0
+            ),
+            "prefill_multimodal_limit_relaxed_rate": (
+                float(
+                    observer_multimodal.get("prefill_multimodal_limit_relaxed_steps", 0)
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_limit_tightened_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_limit_tightened_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_limit_triggered_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_limit_triggered_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "mixed_multimodal_lora_batch_ratio": float(
+                observer_multimodal.get("mixed_multimodal_lora_prefill_ratio", 0.0) or 0.0
+            ),
+            "avg_effective_admit_multimodal_lora_limit": float(
+                observer_multimodal.get(
+                    "avg_effective_admit_multimodal_lora_limit", 0.0
+                )
+                or 0.0
+            ),
+            "avg_effective_prefill_multimodal_lora_limit": float(
+                observer_multimodal.get(
+                    "avg_effective_prefill_multimodal_lora_limit", 0.0
+                )
+                or 0.0
+            ),
+            "avg_effective_decode_multimodal_lora_limit": float(
+                observer_multimodal.get(
+                    "avg_effective_decode_multimodal_lora_limit", 0.0
+                )
+                or 0.0
+            ),
+            "avg_prefill_multimodal_lora_max_fairness_gap": float(
+                observer_multimodal.get(
+                    "avg_prefill_multimodal_lora_max_fairness_gap", 0.0
+                )
+                or 0.0
+            ),
+            "avg_decode_multimodal_lora_max_fairness_gap": float(
+                observer_multimodal.get(
+                    "avg_decode_multimodal_lora_max_fairness_gap", 0.0
+                )
+                or 0.0
+            ),
+            "admit_multimodal_lora_limit_triggered_rate": (
+                float(
+                    observer_multimodal.get(
+                        "admit_multimodal_lora_limit_triggered_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_lora_limit_triggered_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_lora_limit_triggered_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_lora_limit_relaxed_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_lora_limit_relaxed_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_lora_limit_relaxed_by_fairness_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_lora_limit_relaxed_by_fairness_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_lora_limit_tightened_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_lora_limit_tightened_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "prefill_multimodal_lora_limit_tightened_by_locality_rate": (
+                float(
+                    observer_multimodal.get(
+                        "prefill_multimodal_lora_limit_tightened_by_locality_steps",
+                        0,
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_multimodal_lora_limit_triggered_steps": float(
+                observer_multimodal.get(
+                    "decode_multimodal_lora_limit_triggered_steps", 0
+                )
+                or 0
+            ),
+            "decode_multimodal_lora_limit_relaxed_steps": float(
+                observer_multimodal.get(
+                    "decode_multimodal_lora_limit_relaxed_steps", 0
+                )
+                or 0
+            ),
+            "decode_multimodal_lora_limit_relaxed_by_fairness_steps": float(
+                observer_multimodal.get(
+                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps", 0
+                )
+                or 0
+            ),
+            "decode_multimodal_lora_limit_tightened_steps": float(
+                observer_multimodal.get(
+                    "decode_multimodal_lora_limit_tightened_steps", 0
+                )
+                or 0
+            ),
+            "decode_multimodal_lora_limit_tightened_by_locality_steps": float(
+                observer_multimodal.get(
+                    "decode_multimodal_lora_limit_tightened_by_locality_steps", 0
+                )
+                or 0
+            ),
+            "decode_multimodal_lora_limit_triggered_rate": (
+                float(
+                    observer_multimodal.get(
+                        "decode_multimodal_lora_limit_triggered_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_multimodal_lora_limit_relaxed_rate": (
+                float(
+                    observer_multimodal.get(
+                        "decode_multimodal_lora_limit_relaxed_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_multimodal_lora_limit_relaxed_by_fairness_rate": (
+                float(
+                    observer_multimodal.get(
+                        "decode_multimodal_lora_limit_relaxed_by_fairness_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_multimodal_lora_limit_tightened_rate": (
+                float(
+                    observer_multimodal.get(
+                        "decode_multimodal_lora_limit_tightened_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+            "decode_multimodal_lora_limit_tightened_by_locality_rate": (
+                float(
+                    observer_multimodal.get(
+                        "decode_multimodal_lora_limit_tightened_by_locality_steps", 0
+                    )
+                    or 0
+                )
+                / step_count
+                if step_count
+                else 0.0
+            ),
+        },
+    }
+
+
+def _normalized_share_map(values: object) -> dict[str, float]:
+    if not isinstance(values, dict):
+        return {}
+    normalized = {str(key): float(value or 0.0) for key, value in values.items()}
+    total = sum(normalized.values())
+    if total <= 0:
+        return {key: 0.0 for key in normalized}
+    return {key: value / total for key, value in normalized.items()}
+
+
+def _share_gap_map(
+    target_share: dict[str, float],
+    baseline_share: dict[str, float],
+) -> dict[str, float]:
+    keys = sorted(set(target_share) | set(baseline_share))
+    return {
+        key: float(target_share.get(key, 0.0) or 0.0)
+        - float(baseline_share.get(key, 0.0) or 0.0)
+        for key in keys
     }
 
 
@@ -318,12 +935,20 @@ def _derive_runtime_phase_diffs(
     benchmark_preemption = benchmark_metrics.get("preemption", {})
     warmup_fairness = warmup_metrics.get("fairness", {})
     benchmark_fairness = benchmark_metrics.get("fairness", {})
+    warmup_lora = warmup_metrics.get("lora", {})
+    benchmark_lora = benchmark_metrics.get("lora", {})
+    warmup_multimodal = warmup_metrics.get("multimodal", {})
+    benchmark_multimodal = benchmark_metrics.get("multimodal", {})
     if not isinstance(warmup_prefix, dict) or not isinstance(benchmark_prefix, dict):
         warmup_prefix, benchmark_prefix = {}, {}
     if not isinstance(warmup_preemption, dict) or not isinstance(benchmark_preemption, dict):
         warmup_preemption, benchmark_preemption = {}, {}
     if not isinstance(warmup_fairness, dict) or not isinstance(benchmark_fairness, dict):
         warmup_fairness, benchmark_fairness = {}, {}
+    if not isinstance(warmup_lora, dict) or not isinstance(benchmark_lora, dict):
+        warmup_lora, benchmark_lora = {}, {}
+    if not isinstance(warmup_multimodal, dict) or not isinstance(benchmark_multimodal, dict):
+        warmup_multimodal, benchmark_multimodal = {}, {}
 
     prefix_keys = (
         "request_count",
@@ -344,8 +969,14 @@ def _derive_runtime_phase_diffs(
         "step_count",
         "preempted_steps",
         "preempted_prefill_requests",
+        "preempted_multimodal_prefill_requests",
+        "protected_multimodal_prefix_steps",
+        "protected_multimodal_prefix_prefill_requests",
         "preempted_step_rate",
         "preempted_prefill_requests_per_step",
+        "preempted_multimodal_prefill_requests_per_step",
+        "protected_multimodal_prefix_step_rate",
+        "protected_multimodal_prefix_prefill_requests_per_step",
     )
     preemption_delta = {}
     for key in preemption_keys:
@@ -382,6 +1013,127 @@ def _derive_runtime_phase_diffs(
         for key in per_class_keys
     }
 
+    lora_keys = (
+        "registered_adapters",
+        "active_adapters",
+        "active_requests",
+        "total_routed_requests",
+        "adapter_count_observed",
+        "mixed_lora_prefill_steps",
+        "mixed_lora_decode_steps",
+        "admit_relaxed_steps",
+        "admit_tightened_steps",
+        "prefill_relaxed_steps",
+        "prefill_tightened_steps",
+        "decode_relaxed_steps",
+        "decode_tightened_steps",
+        "prefill_step_count",
+        "decode_step_count",
+        "mixed_lora_prefill_step_rate",
+        "mixed_lora_decode_step_rate",
+        "prefill_adapter_count",
+        "decode_adapter_count",
+        "backlog_adapter_count",
+        "prefill_locality_rate",
+        "decode_locality_rate",
+        "max_adapter_fairness_gap",
+        "mean_abs_adapter_fairness_gap",
+        "admit_relaxed_rate",
+        "admit_tightened_rate",
+        "prefill_relaxed_rate",
+        "prefill_tightened_rate",
+        "decode_relaxed_rate",
+        "decode_tightened_rate",
+    )
+    lora_delta = {}
+    for key in lora_keys:
+        lora_delta[key] = float(benchmark_lora.get(key, 0.0) or 0.0) - float(
+            warmup_lora.get(key, 0.0) or 0.0
+        )
+    warmup_adapter_fairness = warmup_lora.get("adapter_fairness_gap", {})
+    benchmark_adapter_fairness = benchmark_lora.get("adapter_fairness_gap", {})
+    if not isinstance(warmup_adapter_fairness, dict):
+        warmup_adapter_fairness = {}
+    if not isinstance(benchmark_adapter_fairness, dict):
+        benchmark_adapter_fairness = {}
+    fairness_keys = sorted(set(warmup_adapter_fairness) | set(benchmark_adapter_fairness))
+    lora_delta["adapter_fairness_gap"] = {
+        str(key): float(benchmark_adapter_fairness.get(key, 0.0) or 0.0)
+        - float(warmup_adapter_fairness.get(key, 0.0) or 0.0)
+        for key in fairness_keys
+    }
+
+    multimodal_keys = (
+        "request_count",
+        "multimodal_lora_request_count",
+        "image_count",
+        "queued_request_count",
+        "admitted_request_count",
+        "prefill_request_count",
+        "multimodal_lora_prefill_count",
+        "decode_request_count",
+        "p95_queue_wait_s",
+        "mixed_multimodal_lora_prefill_steps",
+        "avg_effective_prefill_multimodal_limit",
+        "prefill_multimodal_limit_relaxed_steps",
+        "prefill_multimodal_limit_tightened_steps",
+        "prefill_multimodal_limit_triggered_steps",
+        "prefix_cache_hits",
+        "prefix_cache_misses",
+        "prefix_cache_saved_prefill_tokens",
+        "admit_multimodal_lora_limit_triggered_steps",
+        "prefill_multimodal_lora_limit_triggered_steps",
+        "preempted_prefill_requests",
+        "prepared_request_count",
+        "prepared_image_count",
+        "prepare_failure_count",
+        "embedding_request_count",
+        "embeddings_computed",
+        "avg_embedding_feature_dim",
+        "images_per_request",
+        "prepared_images_per_request",
+        "embedding_compute_rate",
+        "preempted_prefill_rate",
+        "multimodal_lora_request_rate",
+        "multimodal_lora_prefill_rate",
+        "prefix_cache_hit_rate",
+        "saved_prefill_tokens_per_request",
+        "prefill_multimodal_limit_relaxed_rate",
+        "prefill_multimodal_limit_tightened_rate",
+        "prefill_multimodal_limit_triggered_rate",
+        "mixed_multimodal_lora_batch_ratio",
+        "avg_effective_admit_multimodal_lora_limit",
+        "avg_effective_prefill_multimodal_lora_limit",
+        "avg_effective_decode_multimodal_lora_limit",
+        "avg_prefill_multimodal_lora_max_fairness_gap",
+        "avg_decode_multimodal_lora_max_fairness_gap",
+        "admit_multimodal_lora_limit_triggered_rate",
+        "prefill_multimodal_lora_limit_triggered_rate",
+        "prefill_multimodal_lora_limit_relaxed_steps",
+        "prefill_multimodal_lora_limit_tightened_steps",
+        "prefill_multimodal_lora_limit_relaxed_rate",
+        "prefill_multimodal_lora_limit_tightened_rate",
+        "prefill_multimodal_lora_limit_relaxed_by_fairness_steps",
+        "prefill_multimodal_lora_limit_tightened_by_locality_steps",
+        "prefill_multimodal_lora_limit_relaxed_by_fairness_rate",
+        "prefill_multimodal_lora_limit_tightened_by_locality_rate",
+        "decode_multimodal_lora_limit_triggered_steps",
+        "decode_multimodal_lora_limit_relaxed_steps",
+        "decode_multimodal_lora_limit_tightened_steps",
+        "decode_multimodal_lora_limit_relaxed_by_fairness_steps",
+        "decode_multimodal_lora_limit_tightened_by_locality_steps",
+        "decode_multimodal_lora_limit_triggered_rate",
+        "decode_multimodal_lora_limit_relaxed_rate",
+        "decode_multimodal_lora_limit_tightened_rate",
+        "decode_multimodal_lora_limit_relaxed_by_fairness_rate",
+        "decode_multimodal_lora_limit_tightened_by_locality_rate",
+    )
+    multimodal_delta = {}
+    for key in multimodal_keys:
+        multimodal_delta[key] = float(benchmark_multimodal.get(key, 0.0) or 0.0) - float(
+            warmup_multimodal.get(key, 0.0) or 0.0
+        )
+
     return {
         "baseline_phase": "warmup",
         "target_phase": "benchmark",
@@ -399,6 +1151,16 @@ def _derive_runtime_phase_diffs(
             "warmup": dict(warmup_fairness),
             "benchmark": dict(benchmark_fairness),
             "benchmark_delta": fairness_delta,
+        },
+        "lora": {
+            "warmup": dict(warmup_lora),
+            "benchmark": dict(benchmark_lora),
+            "benchmark_delta": lora_delta,
+        },
+        "multimodal": {
+            "warmup": dict(warmup_multimodal),
+            "benchmark": dict(benchmark_multimodal),
+            "benchmark_delta": multimodal_delta,
         },
     }
 
@@ -428,7 +1190,9 @@ def _format_runtime_phase_diff_summary(
             lines.append(
                 "  RUNTIME(preempt): "
                 f"step_rate_delta={float(preemption_delta.get('preempted_step_rate', 0.0) or 0.0):+.3f}, "
-                f"prefills_per_step_delta={float(preemption_delta.get('preempted_prefill_requests_per_step', 0.0) or 0.0):+.3f}"
+                f"prefills_per_step_delta={float(preemption_delta.get('preempted_prefill_requests_per_step', 0.0) or 0.0):+.3f}, "
+                f"mm_prefills_per_step_delta={float(preemption_delta.get('preempted_multimodal_prefill_requests_per_step', 0.0) or 0.0):+.3f}, "
+                f"mm_prefix_protect_rate_delta={float(preemption_delta.get('protected_multimodal_prefix_step_rate', 0.0) or 0.0):+.3f}"
             )
 
     fairness = phase_diffs.get("fairness", {})
@@ -449,6 +1213,146 @@ def _format_runtime_phase_diff_summary(
                 )
                 lines.append(f"  RUNTIME(fair,p95_by_class): {formatted}")
 
+    lora = phase_diffs.get("lora", {})
+    if isinstance(lora, dict):
+        lora_delta = lora.get("benchmark_delta", {})
+        if isinstance(lora_delta, dict):
+            lines.append(
+                "  RUNTIME(lora): "
+                f"mixed_prefill_rate_delta={float(lora_delta.get('mixed_lora_prefill_step_rate', 0.0) or 0.0):+.3f}, "
+                f"mixed_decode_rate_delta={float(lora_delta.get('mixed_lora_decode_step_rate', 0.0) or 0.0):+.3f}, "
+                f"routed_req_delta={float(lora_delta.get('total_routed_requests', 0.0) or 0.0):+.3f}"
+            )
+            lines.append(
+                "  RUNTIME(lora,adapters): "
+                f"prefill_delta={float(lora_delta.get('prefill_adapter_count', 0.0) or 0.0):+.3f}, "
+                f"decode_delta={float(lora_delta.get('decode_adapter_count', 0.0) or 0.0):+.3f}, "
+                f"backlog_delta={float(lora_delta.get('backlog_adapter_count', 0.0) or 0.0):+.3f}"
+            )
+            lines.append(
+                "  RUNTIME(lora,fair): "
+                f"prefill_locality_delta={float(lora_delta.get('prefill_locality_rate', 0.0) or 0.0):+.3f}, "
+                f"decode_locality_delta={float(lora_delta.get('decode_locality_rate', 0.0) or 0.0):+.3f}, "
+                f"max_fair_gap_delta={float(lora_delta.get('max_adapter_fairness_gap', 0.0) or 0.0):+.3f}"
+            )
+            lines.append(
+                "  RUNTIME(lora,adaptive): "
+                f"admit_relaxed_rate_delta={float(lora_delta.get('admit_relaxed_rate', 0.0) or 0.0):+.3f}, "
+                f"prefill_tightened_rate_delta={float(lora_delta.get('prefill_tightened_rate', 0.0) or 0.0):+.3f}, "
+                f"decode_relaxed_rate_delta={float(lora_delta.get('decode_relaxed_rate', 0.0) or 0.0):+.3f}"
+            )
+            per_adapter = lora_delta.get("adapter_fairness_gap", {})
+            if isinstance(per_adapter, dict) and per_adapter:
+                formatted = ", ".join(
+                    f"{key}={float(value or 0.0):+.3f}"
+                    for key, value in sorted(per_adapter.items())
+                )
+                lines.append(f"  RUNTIME(lora,fair_by_adapter): {formatted}")
+
+    multimodal = phase_diffs.get("multimodal", {})
+    if isinstance(multimodal, dict):
+        multimodal_delta = multimodal.get("benchmark_delta", {})
+        if isinstance(multimodal_delta, dict):
+            lines.append(
+                "  RUNTIME(multimodal): "
+                f"req_delta={float(multimodal_delta.get('request_count', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_req_delta={float(multimodal_delta.get('multimodal_lora_request_count', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_prefill_delta={float(multimodal_delta.get('multimodal_lora_prefill_count', 0.0) or 0.0):+.3f}, "
+                f"queued_delta={float(multimodal_delta.get('queued_request_count', 0.0) or 0.0):+.3f}, "
+                f"p95_wait_delta={float(multimodal_delta.get('p95_queue_wait_s', 0.0) or 0.0):+.3f}s, "
+                f"img_per_req_delta={float(multimodal_delta.get('images_per_request', 0.0) or 0.0):+.3f}, "
+                f"embed_rate_delta={float(multimodal_delta.get('embedding_compute_rate', 0.0) or 0.0):+.3f}, "
+                f"prefix_hit_rate_delta={float(multimodal_delta.get('prefix_cache_hit_rate', 0.0) or 0.0):+.3f}, "
+                f"saved_prefill_tok_per_req_delta={float(multimodal_delta.get('saved_prefill_tokens_per_request', 0.0) or 0.0):+.3f}, "
+                f"mm_prefill_limit_delta={float(multimodal_delta.get('avg_effective_prefill_multimodal_limit', 0.0) or 0.0):+.3f}, "
+                f"mm_prefill_relaxed_rate_delta={float(multimodal_delta.get('prefill_multimodal_limit_relaxed_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_prefill_tightened_rate_delta={float(multimodal_delta.get('prefill_multimodal_limit_tightened_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_preempt_rate_delta={float(multimodal_delta.get('preempted_prefill_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_batch_ratio_delta={float(multimodal_delta.get('mixed_multimodal_lora_batch_ratio', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_admit_limit_delta={float(multimodal_delta.get('avg_effective_admit_multimodal_lora_limit', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_prefill_limit_delta={float(multimodal_delta.get('avg_effective_prefill_multimodal_lora_limit', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_limit_delta={float(multimodal_delta.get('avg_effective_decode_multimodal_lora_limit', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_gap_delta={float(multimodal_delta.get('avg_prefill_multimodal_lora_max_fairness_gap', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_gap_delta={float(multimodal_delta.get('avg_decode_multimodal_lora_max_fairness_gap', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_admit_trigger_rate_delta={float(multimodal_delta.get('admit_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_prefill_trigger_rate_delta={float(multimodal_delta.get('prefill_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_trigger_rate_delta={float(multimodal_delta.get('decode_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_prefill_relaxed_rate_delta={float(multimodal_delta.get('prefill_multimodal_lora_limit_relaxed_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_prefill_tightened_rate_delta={float(multimodal_delta.get('prefill_multimodal_lora_limit_tightened_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_fair_relax_rate_delta={float(multimodal_delta.get('prefill_multimodal_lora_limit_relaxed_by_fairness_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_local_tighten_rate_delta={float(multimodal_delta.get('prefill_multimodal_lora_limit_tightened_by_locality_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_relaxed_rate_delta={float(multimodal_delta.get('decode_multimodal_lora_limit_relaxed_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_tightened_rate_delta={float(multimodal_delta.get('decode_multimodal_lora_limit_tightened_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_fair_relax_rate_delta={float(multimodal_delta.get('decode_multimodal_lora_limit_relaxed_by_fairness_rate', 0.0) or 0.0):+.3f}, "
+                f"mm_lora_decode_local_tighten_rate_delta={float(multimodal_delta.get('decode_multimodal_lora_limit_tightened_by_locality_rate', 0.0) or 0.0):+.3f}"
+            )
+
+    return lines
+
+
+def _format_runtime_snapshot_summary(snapshot: Dict[str, object]) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return []
+    derived = snapshot.get("derived_metrics", {})
+    if not isinstance(derived, dict):
+        return []
+    lines: list[str] = []
+    lora = derived.get("lora", {})
+    multimodal = derived.get("multimodal", {})
+    if isinstance(lora, dict):
+        lines.append(
+            "  RUNTIME(lora,current): "
+            f"prefill_locality={float(lora.get('prefill_locality_rate', 0.0) or 0.0):.3f}, "
+            f"decode_locality={float(lora.get('decode_locality_rate', 0.0) or 0.0):.3f}, "
+            f"max_fair_gap={float(lora.get('max_adapter_fairness_gap', 0.0) or 0.0):.3f}"
+        )
+        lines.append(
+            "  RUNTIME(lora,current_adaptive): "
+            f"admit_relaxed_rate={float(lora.get('admit_relaxed_rate', 0.0) or 0.0):.3f}, "
+            f"prefill_tightened_rate={float(lora.get('prefill_tightened_rate', 0.0) or 0.0):.3f}, "
+            f"decode_relaxed_rate={float(lora.get('decode_relaxed_rate', 0.0) or 0.0):.3f}"
+        )
+        per_adapter = lora.get("adapter_fairness_gap", {})
+        if isinstance(per_adapter, dict) and per_adapter:
+            formatted = ", ".join(
+                f"{key}={float(value or 0.0):+.3f}"
+                for key, value in sorted(per_adapter.items())
+            )
+            lines.append(f"  RUNTIME(lora,current_by_adapter): {formatted}")
+    if isinstance(multimodal, dict):
+        lines.append(
+            "  RUNTIME(multimodal,current): "
+            f"requests={float(multimodal.get('request_count', 0.0) or 0.0):.3f}, "
+            f"mm_lora_requests={float(multimodal.get('multimodal_lora_request_count', 0.0) or 0.0):.3f}, "
+            f"mm_lora_prefills={float(multimodal.get('multimodal_lora_prefill_count', 0.0) or 0.0):.3f}, "
+            f"queued={float(multimodal.get('queued_request_count', 0.0) or 0.0):.3f}, "
+            f"p95_wait={float(multimodal.get('p95_queue_wait_s', 0.0) or 0.0):.3f}s, "
+            f"images_per_request={float(multimodal.get('images_per_request', 0.0) or 0.0):.3f}, "
+            f"embed_rate={float(multimodal.get('embedding_compute_rate', 0.0) or 0.0):.3f}, "
+            f"prefix_hit_rate={float(multimodal.get('prefix_cache_hit_rate', 0.0) or 0.0):.3f}, "
+            f"saved_prefill_tok_per_req={float(multimodal.get('saved_prefill_tokens_per_request', 0.0) or 0.0):.3f}, "
+            f"mm_prefill_limit={float(multimodal.get('avg_effective_prefill_multimodal_limit', 0.0) or 0.0):.3f}, "
+            f"mm_prefill_relaxed_rate={float(multimodal.get('prefill_multimodal_limit_relaxed_rate', 0.0) or 0.0):.3f}, "
+            f"mm_prefill_tightened_rate={float(multimodal.get('prefill_multimodal_limit_tightened_rate', 0.0) or 0.0):.3f}, "
+            f"preempt_rate={float(multimodal.get('preempted_prefill_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_batch_ratio={float(multimodal.get('mixed_multimodal_lora_batch_ratio', 0.0) or 0.0):.3f}, "
+            f"mm_lora_admit_limit={float(multimodal.get('avg_effective_admit_multimodal_lora_limit', 0.0) or 0.0):.3f}, "
+            f"mm_lora_prefill_limit={float(multimodal.get('avg_effective_prefill_multimodal_lora_limit', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_limit={float(multimodal.get('avg_effective_decode_multimodal_lora_limit', 0.0) or 0.0):.3f}, "
+            f"mm_lora_gap={float(multimodal.get('avg_prefill_multimodal_lora_max_fairness_gap', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_gap={float(multimodal.get('avg_decode_multimodal_lora_max_fairness_gap', 0.0) or 0.0):.3f}, "
+            f"mm_lora_admit_trigger_rate={float(multimodal.get('admit_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_prefill_trigger_rate={float(multimodal.get('prefill_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_trigger_rate={float(multimodal.get('decode_multimodal_lora_limit_triggered_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_prefill_relaxed_rate={float(multimodal.get('prefill_multimodal_lora_limit_relaxed_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_prefill_tightened_rate={float(multimodal.get('prefill_multimodal_lora_limit_tightened_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_fair_relax_rate={float(multimodal.get('prefill_multimodal_lora_limit_relaxed_by_fairness_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_local_tighten_rate={float(multimodal.get('prefill_multimodal_lora_limit_tightened_by_locality_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_relaxed_rate={float(multimodal.get('decode_multimodal_lora_limit_relaxed_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_tightened_rate={float(multimodal.get('decode_multimodal_lora_limit_tightened_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_fair_relax_rate={float(multimodal.get('decode_multimodal_lora_limit_relaxed_by_fairness_rate', 0.0) or 0.0):.3f}, "
+            f"mm_lora_decode_local_tighten_rate={float(multimodal.get('decode_multimodal_lora_limit_tightened_by_locality_rate', 0.0) or 0.0):.3f}"
+        )
     return lines
 
 
@@ -519,11 +1423,17 @@ async def _run_single_request(
     request_id: str,
     prompt: str,
     sampling_params: SamplingParams,
+    multi_modal_data: dict[str, Any] | None = None,
 ) -> Dict[str, float]:
     start = time.perf_counter()
     first_token_at: Optional[float] = None
     generated_tokens = 0
-    async for output in llm.generate(prompt, sampling_params, request_id):
+    async for output in llm.generate(
+        prompt,
+        sampling_params,
+        request_id,
+        multi_modal_data=multi_modal_data,
+    ):
         if output.outputs:
             generated_tokens = len(output.outputs[0].token_ids)
             if first_token_at is None and generated_tokens > 0:
@@ -548,14 +1458,20 @@ async def _run_single_request(
     }
 
 
-async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
+async def run_benchmark(
+    spec: ModelSpec,
+    *,
+    workload: str = "text",
+    multimodal_images_per_request: int = 2,
+    multimodal_image_size: int = 8,
+) -> Dict[str, float]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
     print(f"PATH: {spec.model_path}")
     print(
         "SETUP: "
         f"concurrency={spec.concurrent_reqs}, prompt_tokens~{spec.prompt_tokens_target}, "
-        f"max_new_tokens={spec.max_new_tokens}, quant={spec.quant}"
+        f"max_new_tokens={spec.max_new_tokens}, quant={spec.quant}, workload={workload}"
     )
     if torch.cuda.is_available():
         total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -572,6 +1488,7 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
     old_env = _apply_temp_env(spec.stable_env)
     llm: Optional[AsyncLLM] = None
     runtime_stats_by_phase: Dict[str, Dict[str, object]] = {}
+    image_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     try:
         if spec.quant == "awq":
             from vllm.model_executor.layers.quantization.tensor import (
@@ -582,6 +1499,21 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             reset_awq_runtime_stats()
         v_cfg = _build_vllm_config(spec)
         llm = AsyncLLM.from_vllm_config(v_cfg)
+        if workload != "text" and not bool(
+            getattr(llm.engine.multimodal_processor, "supports_multimodal", False)
+        ):
+            print("  [Skip] Model does not support multimodal benchmark workload.")
+            return {
+                "skipped": 1.0,
+                "skip_reason": "multimodal_unsupported",
+                "workload": {
+                    "kind": workload,
+                    "multimodal_images_per_request": (
+                        1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                    ),
+                    "multimodal_image_size": max(2, int(multimodal_image_size)),
+                },
+            }
         sampling_params = SamplingParams(max_tokens=spec.max_new_tokens, temperature=0.0)
         # Reserve decode room so prefill does not consume the full KV capacity.
         prompt_budget = min(
@@ -589,9 +1521,32 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             max(8, int(spec.max_model_len) - int(spec.max_new_tokens) - 1),
         )
         prompt = _build_prompt(llm.engine.tokenizer, prompt_budget)
+        request_specs: list[BenchmarkRequestSpec]
+        if workload == "text":
+            request_specs = _build_benchmark_requests(
+                prompt=prompt,
+                request_count=spec.concurrent_reqs,
+                workload=workload,
+            )
+        else:
+            image_tmpdir = tempfile.TemporaryDirectory(prefix="fastinference_mm_bench_")
+            request_specs = _build_benchmark_requests(
+                prompt=prompt,
+                request_count=spec.concurrent_reqs,
+                workload=workload,
+                image_root=Path(image_tmpdir.name),
+                multimodal_images_per_request=multimodal_images_per_request,
+                multimodal_image_size=multimodal_image_size,
+            )
 
         print("  [Warmup] Running one short request...")
-        async for _ in llm.generate("Hello", SamplingParams(max_tokens=8, temperature=0.0), f"{spec.key}_warmup"):
+        warmup_request = request_specs[0]
+        async for _ in llm.generate(
+            warmup_request.prompt,
+            SamplingParams(max_tokens=8, temperature=0.0),
+            f"{spec.key}_warmup",
+            multi_modal_data=warmup_request.multi_modal_data,
+        ):
             pass
         runtime_stats_by_phase["warmup"] = _collect_runtime_stats(llm, phase="warmup")
         llm.reset_stats(clear_prefix_cache=False)
@@ -602,8 +1557,9 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             _run_single_request(
                 llm=llm,
                 request_id=f"{spec.key}_{idx}_{int(time.time())}",
-                prompt=prompt,
+                prompt=request_specs[idx].prompt,
                 sampling_params=sampling_params,
+                multi_modal_data=request_specs[idx].multi_modal_data,
             )
             for idx in range(spec.concurrent_reqs)
         ]
@@ -648,6 +1604,13 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
                 "decode_tps_p95": float("nan"),
                 "awq_runtime_stats": awq_stats,
                 "awq_metrics": awq_metrics,
+                "workload": {
+                    "kind": workload,
+                    "multimodal_images_per_request": (
+                        1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                    ),
+                    "multimodal_image_size": max(2, int(multimodal_image_size)),
+                },
                 "runtime_stats": {
                     **runtime_stats_by_phase,
                     "benchmark": benchmark_stats,
@@ -710,6 +1673,13 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
             "awq_runtime_stats": awq_stats,
             "awq_metrics": awq_metrics,
+            "workload": {
+                "kind": workload,
+                "multimodal_images_per_request": (
+                    1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                ),
+                "multimodal_image_size": max(2, int(multimodal_image_size)),
+            },
             "runtime_stats": runtime_stats_by_phase,
         }
 
@@ -732,12 +1702,18 @@ async def run_benchmark(spec: ModelSpec) -> Dict[str, float]:
             runtime_stats_by_phase.get("phase_diffs", {})
         ):
             print(line)
+        for line in _format_runtime_snapshot_summary(
+            runtime_stats_by_phase.get("benchmark", {})
+        ):
+            print(line)
         if awq_stats:
             print(f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
         return result
     finally:
         if llm is not None:
             llm.shutdown()
+        if image_tmpdir is not None:
+            image_tmpdir.cleanup()
         try:
             from vllm.model_executor.layers.quantization.tensor import clear_global_weight_cache
 
@@ -785,6 +1761,27 @@ def _parse_args() -> argparse.Namespace:
             "safer profile to avoid HIP launch failures; this flag or FASTINFERENCE_E2E_AGGRESSIVE=1 "
             "restores aggressive settings (needs ample VRAM)."
         ),
+    )
+    parser.add_argument(
+        "--workload",
+        type=str,
+        default="text",
+        choices=("text", "multimodal_single", "multimodal_multi"),
+        help="Benchmark workload type. multimodal_* generates real image_url requests.",
+    )
+    parser.add_argument(
+        "--multimodal-images-per-request",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Number of images per request for multimodal_multi workload.",
+    )
+    parser.add_argument(
+        "--multimodal-image-size",
+        type=int,
+        default=8,
+        metavar="PX",
+        help="Edge size in pixels for generated benchmark images.",
     )
     parser.add_argument(
         "--tinyllama-concurrent",
@@ -856,7 +1853,12 @@ async def main() -> None:
     summary: Dict[str, Dict[str, float]] = {}
     runtime_stats_summary: Dict[str, Dict[str, object]] = {}
     for spec in specs:
-        summary[spec.key] = await run_benchmark(spec)
+        summary[spec.key] = await run_benchmark(
+            spec,
+            workload=args.workload,
+            multimodal_images_per_request=args.multimodal_images_per_request,
+            multimodal_image_size=args.multimodal_image_size,
+        )
         runtime_stats_summary[spec.key] = dict(
             summary[spec.key].get("runtime_stats", {})
         )
@@ -881,12 +1883,18 @@ async def main() -> None:
             f"ttft_p50={r['ttft_p50_ms']:.1f}ms | ttft_p95={r['ttft_p95_ms']:.1f}ms | "
             f"e2e_p50={r['e2e_p50_ms']:.1f}ms | e2e_p95={r['e2e_p95_ms']:.1f}ms | "
             f"decode_tps_agg={r['decode_tps_aggregate']:.2f} | "
-            f"decode_tps_p50={r['decode_tps_p50']:.2f}"
+            f"decode_tps_p50={r['decode_tps_p50']:.2f} | "
+            f"workload={r.get('workload', {}).get('kind', args.workload)}"
         )
 
     if args.json_out:
         payload = {
             "models": model_keys,
+            "workload": {
+                "kind": args.workload,
+                "multimodal_images_per_request": args.multimodal_images_per_request,
+                "multimodal_image_size": args.multimodal_image_size,
+            },
             "summary": summary,
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -898,6 +1906,11 @@ async def main() -> None:
     if args.runtime_stats_out:
         payload = {
             "models": model_keys,
+            "workload": {
+                "kind": args.workload,
+                "multimodal_images_per_request": args.multimodal_images_per_request,
+                "multimodal_image_size": args.multimodal_image_size,
+            },
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
