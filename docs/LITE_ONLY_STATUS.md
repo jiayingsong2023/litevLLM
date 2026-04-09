@@ -1,5 +1,17 @@
 # Lite-Only Architecture Status
 
+## Delivery Snapshot
+As of 2026-04-09, within the current Lite runtime scope:
+
+- `P0` delivered
+- `P1` delivered
+- `P2` delivered
+- Explicit deferred item: `speculative decoding`
+
+For an external-facing DONE/KNOWN_GAPS list, see:
+
+- `docs/DELIVERY_STATUS.md`
+
 ## Current Project Position
 FastInference is now a `lite-only` single-GPU inference project. The repository no longer treats `Qwen3.5-35B` as an officially supported model. The maintained support surface is the lite runtime path plus the current regression targets:
 
