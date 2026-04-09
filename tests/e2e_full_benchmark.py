@@ -225,6 +225,12 @@ def _finite_values(values: List[float]) -> List[float]:
     return [v for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
 
 
+def _fmt_float(value: float, fmt: str) -> str:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return format(float(value), fmt)
+    return "n/a"
+
+
 def _apply_temp_env(env_map: Dict[str, str]) -> Dict[str, Optional[str]]:
     old_env: Dict[str, Optional[str]] = {}
     for key, value in env_map.items():
@@ -1443,6 +1449,10 @@ async def _run_single_request(
     e2e_ms = (end - start) * 1000.0
     decode_tokens = max(0, generated_tokens - 1)
     decode_ms = e2e_ms - ttft_ms if math.isfinite(ttft_ms) else float("nan")
+    # Sub-millisecond decode windows are often dominated by scheduling/buffering noise
+    # in long-prefill benchmarks and can produce misleadingly large decode TPS.
+    if math.isfinite(decode_ms) and decode_ms < 1.0:
+        decode_ms = float("nan")
     decode_tps = (
         (float(decode_tokens) * 1000.0 / decode_ms)
         if decode_tokens > 0 and math.isfinite(decode_ms) and decode_ms > 0.0
@@ -1636,11 +1646,11 @@ async def run_benchmark(
         decode_ms_list = _finite_values([r["decode_ms"] for r in request_results])
         decode_tps_list = _finite_values([r["decode_tps"] for r in request_results])
         decode_tokens_total = float(sum(r["decode_tokens"] for r in request_results))
-        # Sum of per-request decode_ms overlaps in time when concurrent_reqs>1, so this
-        # denominator is not wall-clock decode duration — use aggregate_tps or decode_tps_p50.
+        # Use wall-clock benchmark duration to avoid overlap artifacts from summing
+        # per-request decode windows under concurrency.
         decode_tps_aggregate = (
-            decode_tokens_total / (sum(decode_ms_list) / 1000.0)
-            if decode_tokens_total > 0.0 and decode_ms_list and sum(decode_ms_list) > 0.0
+            decode_tokens_total / wall_sec
+            if decode_tokens_total > 0.0 and wall_sec > 0.0
             else 0.0
         )
         awq_stats = {}
@@ -1685,17 +1695,17 @@ async def run_benchmark(
 
         print(
             "  RESULT: "
-            f"tokens/s={result['aggregate_tps']:.2f}, "
-            f"TTFT p50/p95={result['ttft_p50_ms']:.1f}/{result['ttft_p95_ms']:.1f} ms, "
-            f"E2E p50/p95={result['e2e_p50_ms']:.1f}/{result['e2e_p95_ms']:.1f} ms, "
-            f"Decode p50/p95={result['decode_p50_ms']:.1f}/{result['decode_p95_ms']:.1f} ms, "
-            f"Decode TPS(agg)={result['decode_tps_aggregate']:.2f}, "
-            f"Decode TPS p50={result['decode_tps_p50']:.2f}"
+            f"tokens/s={_fmt_float(result['aggregate_tps'], '.2f')}, "
+            f"TTFT p50/p95={_fmt_float(result['ttft_p50_ms'], '.1f')}/{_fmt_float(result['ttft_p95_ms'], '.1f')} ms, "
+            f"E2E p50/p95={_fmt_float(result['e2e_p50_ms'], '.1f')}/{_fmt_float(result['e2e_p95_ms'], '.1f')} ms, "
+            f"Decode p50/p95={_fmt_float(result['decode_p50_ms'], '.1f')}/{_fmt_float(result['decode_p95_ms'], '.1f')} ms, "
+            f"Decode TPS(agg)={_fmt_float(result['decode_tps_aggregate'], '.2f')}, "
+            f"Decode TPS p50={_fmt_float(result['decode_tps_p50'], '.2f')}"
         )
         if spec.concurrent_reqs > 1:
             print(
-                "  [Note] Decode TPS(agg)=total_decode_tokens/sum(decode_ms); with concurrent "
-                "requests those durations overlap, so this is not wall batch decode TPS. "
+                "  [Note] Decode TPS(agg)=decode_tokens_total/wall_time. Per-request decode TPS "
+                "can still be noisy when prefill dominates and decode windows are very short. "
                 "Prefer tokens/s (aggregate_tps) or decode_tps_p50 for A/B vs kernel work."
             )
         for line in _format_runtime_phase_diff_summary(
@@ -1866,8 +1876,8 @@ async def main() -> None:
     print("\n" + "-" * 72)
     print("PERF SUMMARY")
     print(
-        "(decode_tps = aggregate formula; with concurrent_reqs>1 it is not wall batch TPS — "
-        "see decode_tps_p50 or aggregate_tps)"
+        "(decode_tps_agg = decode_tokens_total / wall_time; decode_tps_p50 may be n/a "
+        "when decode window is too short)"
     )
     print("-" * 72)
     for key in model_keys:
@@ -1879,11 +1889,11 @@ async def main() -> None:
             print(f"{key:16} | timeout")
             continue
         print(
-            f"{key:16} | tps={r['aggregate_tps']:.2f} | "
-            f"ttft_p50={r['ttft_p50_ms']:.1f}ms | ttft_p95={r['ttft_p95_ms']:.1f}ms | "
-            f"e2e_p50={r['e2e_p50_ms']:.1f}ms | e2e_p95={r['e2e_p95_ms']:.1f}ms | "
-            f"decode_tps_agg={r['decode_tps_aggregate']:.2f} | "
-            f"decode_tps_p50={r['decode_tps_p50']:.2f} | "
+            f"{key:16} | tps={_fmt_float(r['aggregate_tps'], '.2f')} | "
+            f"ttft_p50={_fmt_float(r['ttft_p50_ms'], '.1f')}ms | ttft_p95={_fmt_float(r['ttft_p95_ms'], '.1f')}ms | "
+            f"e2e_p50={_fmt_float(r['e2e_p50_ms'], '.1f')}ms | e2e_p95={_fmt_float(r['e2e_p95_ms'], '.1f')}ms | "
+            f"decode_tps_agg={_fmt_float(r['decode_tps_aggregate'], '.2f')} | "
+            f"decode_tps_p50={_fmt_float(r['decode_tps_p50'], '.2f')} | "
             f"workload={r.get('workload', {}).get('kind', args.workload)}"
         )
 

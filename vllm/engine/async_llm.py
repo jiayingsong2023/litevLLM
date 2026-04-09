@@ -38,14 +38,27 @@ class AsyncLLM(EngineClient):
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
-        self.engine.add_request(
-            request_id,
-            prompt,
-            sampling_params,
-            lora_id=lora_id,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-        )
+        try:
+            self.engine.add_request(
+                request_id,
+                prompt,
+                sampling_params,
+                lora_id=lora_id,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+            )
+        except TypeError as exc:
+            # Backward compatibility for engines/test doubles that don't yet accept
+            # the multi_modal_data keyword argument.
+            if "multi_modal_data" not in str(exc):
+                raise
+            self.engine.add_request(
+                request_id,
+                prompt,
+                sampling_params,
+                lora_id=lora_id,
+                lora_request=lora_request,
+            )
         self.driver.notify_new_work()
         
         # Stream results back to API

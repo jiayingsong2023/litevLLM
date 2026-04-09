@@ -310,6 +310,7 @@ class LiteEngine:
         runtime_components = LiteRuntimeFactory.build(self)
         self.kv_block_manager = runtime_components["kv_block_manager"]
         self.input_batch_builder = runtime_components["input_batch_builder"]
+        self.multimodal_processor = runtime_components["multimodal_processor"]
         self.prefill_executor = runtime_components["prefill_executor"]
         self.decode_executor = runtime_components["decode_executor"]
         self.step_scheduler = runtime_components["step_scheduler"]
