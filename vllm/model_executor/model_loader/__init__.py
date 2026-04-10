@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
     fp8_block_quantize_2d,
@@ -1107,37 +1108,17 @@ def _maybe_init_quant_config_from_hf(vllm_config: VllmConfig) -> None:
 
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
-    if cfg.hf_config is None: cfg.hf_config = PretrainedConfig()
+    if cfg.hf_config is None:
+        cfg.hf_config = PretrainedConfig()
     path = os.path.join(cfg.model, "config.json")
     if os.path.exists(path):
         with open(path, "r") as f:
             data = json.load(f)
-            # Hugging Face deprecates `torch_dtype` on configs in favor of `dtype`; avoid noisy warnings.
-            if "dtype" not in data and "torch_dtype" in data:
-                data["dtype"] = data["torch_dtype"]
-            for k, v in data.items():
-                if k != "text_config":
-                    if k == "torch_dtype":
-                        continue
-                    setattr(cfg.hf_config, k, v)
-            if "text_config" in data: 
-                for k, v in data["text_config"].items(): setattr(cfg.hf_config, k, v)
-            cfg.hf_config.layer_types = data.get("text_config", {}).get("layer_types", [])
+            cfg.hf_config = build_fallback_hf_config(data)
     elif _looks_like_hf_repo_id(cfg.model):
         try:
             hf_auto_cfg = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
-            data = hf_auto_cfg.to_dict()
-            if "dtype" not in data and "torch_dtype" in data:
-                data["dtype"] = data["torch_dtype"]
-            for k, v in data.items():
-                if k == "torch_dtype":
-                    continue
-                if k != "text_config":
-                    setattr(cfg.hf_config, k, v)
-            if "text_config" in data and isinstance(data["text_config"], dict):
-                for k, v in data["text_config"].items():
-                    setattr(cfg.hf_config, k, v)
-                cfg.hf_config.layer_types = data["text_config"].get("layer_types", [])
+            cfg.hf_config = build_fallback_hf_config(hf_auto_cfg.to_dict())
         except Exception as e:
             print(f">>> [Warning] AutoConfig.from_pretrained failed for {cfg.model}: {e}")
     _maybe_init_quant_config_from_hf(vllm_config)

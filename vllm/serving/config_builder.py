@@ -7,6 +7,7 @@ from transformers import AutoConfig
 
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.engine.runtime_config import RuntimeConfig
+from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
 
 
 def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
@@ -57,14 +58,7 @@ def load_hf_config(model_path: str) -> Any:
         config_path = os.path.join(model_path, "config.json")
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        class Simple:
-            pass
-
-        hf_config = Simple()
-        hf_config.__dict__.update(data.get("text_config", data))
-        hf_config.architectures = data.get("architectures", [])
-        return hf_config
+        return build_fallback_hf_config(data)
 
 
 def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
