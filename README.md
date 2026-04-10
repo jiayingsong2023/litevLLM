@@ -71,7 +71,7 @@ uv sync
 uv run bash tests/run_regression_suite.sh
 
 # 推理精度/质量回归
-uv run bash tests/run_inference_accuracy_regression.sh
+uv run bash tests/run_inference_correctness_regression.sh
 ```
 
 ### 2. 启动 OpenAI API 服务

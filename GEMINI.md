@@ -29,7 +29,7 @@
 ## Development Guidelines
 *   **No C++**: Never add code that requires a C++ compiler.
 *   **Config First**: Access all runtime settings via `attn_metadata["config"]`. Never use `os.environ` in model layers.
-*   **Validation**: Always run `tests/run_inference_accuracy_regression.sh` after changes.
+*   **Validation**: Always run `tests/run_inference_correctness_regression.sh` after changes.
 *   **Model Implementation**: Use `LiteLinear` and `expand_metadata_for_paged_attention` (from `lite_engine`) for all new model architectures.
 
 ## Environment & Script Workflow (uv-first)
@@ -39,5 +39,5 @@ Always use `uv run` for consistent dependency resolution.
 uv sync
 
 # Run accuracy regression
-uv run bash tests/run_inference_accuracy_regression.sh
+uv run bash tests/run_inference_correctness_regression.sh
 ```

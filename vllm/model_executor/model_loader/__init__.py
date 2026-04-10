@@ -10,6 +10,7 @@ import json
 import re
 import gc
 from transformers import AutoTokenizer, AutoConfig, PretrainedConfig
+from huggingface_hub import snapshot_download
 from vllm.config import VllmConfig, ModelConfig
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.layers.lite_linear import LiteLinear
@@ -17,6 +18,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.tensor import (
     dequantize_awq_pytorch,
     dequantize_symmetric_packed_int4_pytorch,
+)
+from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
 )
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
@@ -814,11 +819,30 @@ def _awq_policy_matrix_mode() -> str:
     return raw
 
 
+def _looks_like_hf_repo_id(model_ref: str) -> bool:
+    return isinstance(model_ref, str) and ("/" in model_ref) and (not os.path.isabs(model_ref))
+
+
+def _resolve_model_dir_for_weights(model_path: str) -> str:
+    if os.path.isdir(model_path):
+        return model_path
+    if not _looks_like_hf_repo_id(model_path):
+        return model_path
+    try:
+        return snapshot_download(
+            repo_id=model_path,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to download model repo {model_path!r}: {e}") from e
+
+
 def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dtype = torch.float16):
     from safetensors.torch import load_file
-    sf_files = sorted([f for f in os.listdir(model_path) if f.endswith(".safetensors")])
+    local_model_dir = _resolve_model_dir_for_weights(model_path)
+    sf_files = sorted([f for f in os.listdir(local_model_dir) if f.endswith(".safetensors")])
     if not sf_files: return
-    print(f">>> Loading Safetensors from {model_path} (Casting to {target_dtype} on-the-fly)...")
+    print(f">>> Loading Safetensors from {local_model_dir} (Casting to {target_dtype} on-the-fly)...")
     loaded_count = 0
     attr_map = {
         "qweight": ["weight_packed", "qweight", "weight"],
@@ -845,7 +869,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
     expert_accum: Dict[str, torch.Tensor] = {}
     for f in sf_files:
         print(f"    Processing {f}...")
-        sd = load_file(os.path.join(model_path, f), device="cpu")
+        sd = load_file(os.path.join(local_model_dir, f), device="cpu")
         if collect_moe_expert:
             for k, v in sd.items():
                 if ".mlp.experts." in k and any(
@@ -1057,6 +1081,30 @@ def get_tokenizer(model: Union[str, Any], **kwargs: Any):
                 def decode(self, ids, **kwargs): return " [Dummy Output] "
             return Dummy()
 
+
+def _maybe_init_quant_config_from_hf(vllm_config: VllmConfig) -> None:
+    if getattr(vllm_config, "quant_config", None) is not None:
+        return
+    model_cfg = vllm_config.model_config
+    hf_cfg = getattr(model_cfg, "hf_config", None)
+    if hf_cfg is None:
+        return
+    quant_cfg = getattr(hf_cfg, "quantization_config", None)
+    if quant_cfg is None:
+        text_cfg = getattr(hf_cfg, "text_config", None)
+        if text_cfg is not None:
+            quant_cfg = getattr(text_cfg, "quantization_config", None)
+    if quant_cfg is None:
+        quant_cfg = getattr(hf_cfg, "compression_config", None)
+    if not isinstance(quant_cfg, dict):
+        return
+
+    quant_method = str(quant_cfg.get("quant_method", "")).lower()
+    if quant_method == "awq":
+        vllm_config.quant_config = AWQConfig.from_config(quant_cfg)
+    elif quant_method == "compressed-tensors":
+        vllm_config.quant_config = CompressedTensorsConfig.from_config(quant_cfg)
+
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
     if cfg.hf_config is None: cfg.hf_config = PretrainedConfig()
@@ -1075,6 +1123,24 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
             if "text_config" in data: 
                 for k, v in data["text_config"].items(): setattr(cfg.hf_config, k, v)
             cfg.hf_config.layer_types = data.get("text_config", {}).get("layer_types", [])
+    elif _looks_like_hf_repo_id(cfg.model):
+        try:
+            hf_auto_cfg = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
+            data = hf_auto_cfg.to_dict()
+            if "dtype" not in data and "torch_dtype" in data:
+                data["dtype"] = data["torch_dtype"]
+            for k, v in data.items():
+                if k == "torch_dtype":
+                    continue
+                if k != "text_config":
+                    setattr(cfg.hf_config, k, v)
+            if "text_config" in data and isinstance(data["text_config"], dict):
+                for k, v in data["text_config"].items():
+                    setattr(cfg.hf_config, k, v)
+                cfg.hf_config.layer_types = data["text_config"].get("layer_types", [])
+        except Exception as e:
+            print(f">>> [Warning] AutoConfig.from_pretrained failed for {cfg.model}: {e}")
+    _maybe_init_quant_config_from_hf(vllm_config)
     if getattr(cfg.hf_config, "model_type", "") == "deepseek_v2":
         setattr(cfg.hf_config, "num_key_value_heads", getattr(cfg.hf_config, "num_attention_heads", 40))
         setattr(cfg.hf_config, "head_dim", 128)

@@ -128,7 +128,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     try:
         from .fp8 import Fp8Config
         method_to_config["fp8"] = Fp8Config
-    except ImportError: pass
+    except Exception: pass
 
     try:
         from .fp_quant import FPQuantConfig

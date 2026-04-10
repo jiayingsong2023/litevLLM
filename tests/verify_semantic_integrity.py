@@ -155,6 +155,12 @@ PRESETS = {
         "max_new_tokens": 10,
         "quant": "awq",
     },
+    # Gemma4 31B Q4 (text-only bring-up; typically compressed-tensors/AWQ-style int4)
+    "gemma4_31b_q4": {
+        "prompt": "The capital of France is",
+        "max_new_tokens": 10,
+        "quant": "awq",
+    },
     # DeepSeek V2 Lite GGUF
     "deepseek_v2_lite_gguf": {
         "prompt": "The capital of France is",

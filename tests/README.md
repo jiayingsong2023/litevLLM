@@ -9,13 +9,13 @@
 在仓库根目录、本地已放置对应 `models/...` 且 GPU 驱动正常时：
 
 ```bash
-bash tests/run_inference_accuracy_regression.sh
+bash tests/run_inference_correctness_regression.sh
 ```
 
 （默认 `FASTINFERENCE_KV_FP8=1` 以省显存；需要 bf16/fp16 KV 对拍时可设 `FASTINFERENCE_KV_FP8=0`。）
 
-仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`  
-附带性能诊断（prefill/decode + AWQ fallback 计数）：`RUN_PERF_DIAG=1 bash tests/run_inference_accuracy_regression.sh`
+仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh`  
+附带性能诊断（prefill/decode + AWQ fallback 计数）：`RUN_PERF_DIAG=1 bash tests/run_inference_correctness_regression.sh`
 
 默认模型路径可通过环境变量覆盖：
 

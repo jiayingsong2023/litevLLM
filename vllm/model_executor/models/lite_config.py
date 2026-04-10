@@ -2,6 +2,13 @@
 import torch
 from typing import Any, Dict, Optional
 
+
+def _normalize_layer_types(raw: Any) -> Optional[list[str]]:
+    if isinstance(raw, list):
+        return [str(x).lower() for x in raw]
+    return None
+
+
 class LiteConfig:
     """
     Standardized configuration adapter for LitevLLM.
@@ -22,6 +29,7 @@ class LiteConfig:
         if _hd is None:
             _hd = self.hidden_size // max(1, self.num_attention_heads)
         self.head_dim = int(_hd)
+        self.global_head_dim = int(getattr(hf_config, "global_head_dim", self.head_dim))
         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", 32)
         self.vocab_size = getattr(hf_config, "vocab_size", 32000)
         
@@ -54,7 +62,12 @@ class LiteConfig:
         self.linear_key_head_dim = getattr(hf_config, "linear_key_head_dim", 128)
         self.linear_value_head_dim = getattr(hf_config, "linear_value_head_dim", 128)
         self.linear_conv_kernel_dim = getattr(hf_config, "linear_conv_kernel_dim", 4)
-        self.hidden_act = getattr(hf_config, "hidden_act", "silu")
+        self.hidden_act = getattr(
+            hf_config,
+            "hidden_act",
+            getattr(hf_config, "hidden_activation", "silu"),
+        )
+        self.hidden_activation = getattr(hf_config, "hidden_activation", self.hidden_act)
 
         # Qwen3.5 MoE text (e.g. Qwen3_5MoeTextConfig / qwen3_5_moe_text)
         self.model_type = getattr(hf_config, "model_type", "") or ""
@@ -65,8 +78,22 @@ class LiteConfig:
             getattr(hf_config, "shared_expert_intermediate_size", 0) or 0
         )
         _lt = getattr(hf_config, "layer_types", None)
-        self.layer_types: Optional[list] = _lt if isinstance(_lt, list) else None
+        self.layer_types: Optional[list[str]] = _normalize_layer_types(_lt)
         self.full_attention_interval = int(getattr(hf_config, "full_attention_interval", 4) or 4)
+        self.num_global_key_value_heads = int(
+            getattr(hf_config, "num_global_key_value_heads", self.num_key_value_heads)
+            or self.num_key_value_heads
+        )
+        self.attention_k_eq_v = bool(getattr(hf_config, "attention_k_eq_v", False))
+
+        # Gemma4-style hybrid attention knobs (text-only path for now).
+        self.sliding_window = getattr(hf_config, "sliding_window", None)
+        self.hybrid_attention_enabled = bool(self.layer_types)
+        self.attn_logit_softcapping = getattr(hf_config, "attn_logit_softcapping", None)
+        self.final_logit_softcapping = getattr(hf_config, "final_logit_softcapping", None)
+        self.query_pre_attn_scalar = getattr(hf_config, "query_pre_attn_scalar", None)
+        self.use_qk_norm = bool(getattr(hf_config, "use_qk_norm", False))
+        self.tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", False))
 
     @classmethod
     def from_model_config(cls, model_config: Any) -> "LiteConfig":

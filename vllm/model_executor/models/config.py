@@ -32,6 +32,30 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
         hf_config = model_config.hf_config
         hf_config.is_causal = not hf_config.use_bidirectional_attention
 
+
+class Gemma4ForConditionalGenerationConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is not None:
+            for k, v in vars(text_config).items():
+                if k.startswith("_"):
+                    continue
+                if (not hasattr(hf_config, k)) or getattr(hf_config, k) is None:
+                    setattr(hf_config, k, v)
+        hf_config.is_causal = True
+        if getattr(hf_config, "num_key_value_heads", None) is None:
+            hf_config.num_key_value_heads = getattr(
+                hf_config, "num_attention_heads", 1
+            )
+        if getattr(hf_config, "head_dim", None) is None:
+            hidden = int(getattr(hf_config, "hidden_size", 1))
+            n_heads = max(1, int(getattr(hf_config, "num_attention_heads", 1)))
+            hf_config.head_dim = hidden // n_heads
+        if not getattr(hf_config, "architectures", None):
+            hf_config.architectures = ["Gemma4ForConditionalGeneration"]
+
 class GteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -544,6 +568,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GteNewModel": GteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
+    "Gemma4ForConditionalGeneration": Gemma4ForConditionalGenerationConfig,
+    "Gemma4ForCausalLM": Gemma4ForConditionalGenerationConfig,
     "LlamaBidirectionalForSequenceClassification": LlamaBidirectionalConfig,
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,
     "NomicBertModel": NomicBertModelConfig,

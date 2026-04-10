@@ -12,11 +12,38 @@ class _ModelRegistry:
             "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
             "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
             "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForConditionalGeneration"),
+            "Gemma4ForConditionalGeneration": ("gemma4", "Gemma4ForConditionalGeneration"),
+            "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
         }
+
+    def _infer_architectures_from_model_config(self, model_config: Any) -> list[str]:
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            return []
+
+        candidates: list[str] = []
+        model_type = getattr(hf_config, "model_type", None)
+        if isinstance(model_type, str) and model_type:
+            candidates.append(model_type.lower())
+
+        text_cfg = getattr(hf_config, "text_config", None)
+        text_model_type = getattr(text_cfg, "model_type", None)
+        if isinstance(text_model_type, str) and text_model_type:
+            candidates.append(text_model_type.lower())
+
+        if any(c.startswith("gemma4") for c in candidates):
+            return ["Gemma4ForConditionalGeneration"]
+        if "qwen3_5_moe_text" in candidates:
+            return ["Qwen3_5MoeForConditionalGeneration"]
+        if "qwen3_5_text" in candidates or "qwen3_5" in candidates:
+            return ["Qwen3_5ForConditionalGeneration"]
+        return []
 
     def resolve_model_cls(self, architectures: list, model_config: Any) -> Tuple[Type[nn.Module], str]:
         if architectures is None:
             architectures = []
+        if len(architectures) == 0:
+            architectures = self._infer_architectures_from_model_config(model_config)
         for arch in architectures:
             if arch in self.models:
                 mod_name, cls_name = self.models[arch]

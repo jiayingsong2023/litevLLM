@@ -78,7 +78,7 @@ LLM / AsyncLLM / OpenAI API Server
 当前架构重构后已验证：
 
 - `bash tests/run_regression_suite.sh`
-- `SKIP_A_TIER=1 bash tests/run_inference_accuracy_regression.sh`
+- `SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh`
 - `uv run pytest tests/test_async_runtime_contracts.py -q`
 - `uv run pytest tests/test_step_scheduler.py -q`
 - `uv run pytest tests/test_runtime_observer.py -q`

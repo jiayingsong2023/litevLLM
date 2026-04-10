@@ -76,6 +76,24 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
     ),
+    "gemma4_31b_q4": ModelSpec(
+        key="gemma4_31b_q4",
+        model_path=os.environ.get("MODEL_GEMMA4_31B_Q4", "models/Gemma-4-31B-Q4"),
+        display_name="Gemma4-31B (Q4)",
+        quant="compressed-tensors",
+        concurrent_reqs=1,
+        prompt_tokens_target=1024,
+        max_new_tokens=24,
+        gpu_memory_utilization=0.90,
+        max_model_len=512,
+        max_run_seconds=1200,
+        stable_env={
+            "FASTINFERENCE_KV_TYPE": "turbo_int4",
+            "FASTINFERENCE_FUSION_LEVEL": "2",
+            "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
+            "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+        },
+    ),
 }
 
 # ROCm/HIP: large BS × long prefill + AWQ Triton + FP8 KV often triggers hipErrorLaunchFailure
@@ -89,6 +107,10 @@ def _is_rocm() -> bool:
     return bool(getattr(torch.version, "hip", None))
 
 
+def _is_hf_repo_id(model_ref: str) -> bool:
+    return "/" in model_ref and not model_ref.startswith("/")
+
+
 def _is_e2e_aggressive(args: argparse.Namespace) -> bool:
     if getattr(args, "aggressive", False):
         return True
@@ -100,7 +122,7 @@ def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSp
     """Downgrade batch/prompt on AMD ROCm unless aggressive mode is enabled."""
     if aggressive or not _is_rocm():
         return spec
-    if spec.key not in ("tinyllama", "qwen35_9b_awq"):
+    if spec.key not in ("tinyllama", "qwen35_9b_awq", "gemma4_31b_q4"):
         return spec
     new_conc = min(spec.concurrent_reqs, _ROCM_E2E_SAFE_CONCURRENT)
     new_prompt = min(spec.prompt_tokens_target, _ROCM_E2E_SAFE_PROMPT_TOKENS)
@@ -114,7 +136,7 @@ def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSp
     )
 
 
-def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
+def _read_q4_group_size_and_bits(model_path: str) -> tuple[int, int]:
     config_path = os.path.join(model_path, "config.json")
     group_size, bits = 128, 4
     try:
@@ -122,7 +144,7 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
             return group_size, bits
         with open(config_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        qc = raw.get("quantization_config") or {}
+        qc = raw.get("quantization_config") or raw.get("compression_config") or {}
         groups = qc.get("config_groups")
         if isinstance(groups, dict):
             for g in groups.values():
@@ -140,7 +162,7 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
         if qc.get("bits") is not None:
             bits = int(qc["bits"])
     except Exception as exc:
-        print(f"  [Warn] Failed to parse AWQ config ({config_path}): {exc}")
+        print(f"  [Warn] Failed to parse Q4 config ({config_path}): {exc}")
     return group_size, bits
 
 
@@ -1419,8 +1441,17 @@ def _build_vllm_config(spec: ModelSpec) -> VllmConfig:
     if spec.quant == "awq":
         from vllm.model_executor.layers.quantization.awq import AWQConfig
 
-        group_size, bits = _read_awq_group_size_and_bits(spec.model_path)
+        group_size, bits = _read_q4_group_size_and_bits(spec.model_path)
         v_cfg.quant_config = AWQConfig(weight_bits=bits, group_size=group_size)
+    elif spec.quant == "compressed-tensors":
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        group_size, bits = _read_q4_group_size_and_bits(spec.model_path)
+        v_cfg.quant_config = CompressedTensorsConfig(
+            weight_bits=bits, group_size=group_size
+        )
     return v_cfg
 
 
@@ -1491,7 +1522,7 @@ async def run_benchmark(
         )
     print(f"{'=' * 72}")
 
-    if not os.path.isdir(spec.model_path):
+    if not os.path.isdir(spec.model_path) and not _is_hf_repo_id(spec.model_path):
         print("  [Skip] Model directory not found.")
         return {"skipped": 1.0}
 
@@ -1500,7 +1531,7 @@ async def run_benchmark(
     runtime_stats_by_phase: Dict[str, Dict[str, object]] = {}
     image_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     try:
-        if spec.quant == "awq":
+        if spec.quant in ("awq", "compressed-tensors"):
             from vllm.model_executor.layers.quantization.tensor import (
                 get_awq_runtime_stats,
                 reset_awq_runtime_stats,
@@ -1580,7 +1611,7 @@ async def run_benchmark(
             )
         except asyncio.TimeoutError:
             awq_stats: Dict = {}
-            if spec.quant == "awq":
+            if spec.quant in ("awq", "compressed-tensors"):
                 from vllm.model_executor.layers.quantization.tensor import (
                     get_awq_runtime_stats,
                 )
@@ -1655,7 +1686,7 @@ async def run_benchmark(
         )
         awq_stats = {}
         awq_metrics: Dict[str, float] = {}
-        if spec.quant == "awq":
+        if spec.quant in ("awq", "compressed-tensors"):
             from vllm.model_executor.layers.quantization.tensor import (
                 get_awq_runtime_stats,
             )
@@ -1740,13 +1771,13 @@ async def run_benchmark(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="End-to-end performance benchmark for TinyLlama / Qwen3.5 AWQ models."
+        description="End-to-end performance benchmark for TinyLlama / Qwen3.5 AWQ / Gemma4 Q4 models."
     )
     parser.add_argument(
         "--models",
         type=str,
         default="tinyllama,qwen35_9b_awq",
-        help="Comma-separated model keys: tinyllama,qwen35_9b_awq",
+        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,gemma4_31b_q4",
     )
     parser.add_argument(
         "--json-out",
@@ -1813,6 +1844,16 @@ def _parse_args() -> argparse.Namespace:
             "Default from MODEL_SPECS is 8 (with ~4096-token prefill; 48GB+ VRAM typical)."
         ),
     )
+    parser.add_argument(
+        "--gemma31b-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override concurrent request count (batch width) for gemma4_31b_q4 only. "
+            "Default from MODEL_SPECS is 2."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1853,11 +1894,20 @@ async def main() -> None:
                 concurrent_reqs=n,
                 max_run_seconds=max(spec.max_run_seconds, 60 * n),
             )
+        if key == "gemma4_31b_q4" and args.gemma31b_concurrent is not None:
+            n = int(args.gemma31b_concurrent)
+            if n < 1 or n > 16:
+                raise ValueError("--gemma31b-concurrent must be between 1 and 16")
+            spec = replace(
+                spec,
+                concurrent_reqs=n,
+                max_run_seconds=max(spec.max_run_seconds, 120 * n),
+            )
         specs.append(spec)
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
-    print("Targets: TinyLlama + Qwen3.5-9B AWQ")
+    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B Q4")
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}
