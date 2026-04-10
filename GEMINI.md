@@ -6,7 +6,7 @@
 **Key Philosophy:**
 *   **Pure Python & Triton:** Zero C++ or CUDA C dependencies. All kernels are Triton-native.
 *   **Unified Configuration:** Centralized control via `LiteInferenceConfig`, eliminating scattered environment variables.
-*   **Path Convergence:** Exclusively focuses on **Safetensors + AWQ + TurboQuant** (GGUF support has been completely removed).
+*   **Path Convergence:** Mainline work focuses on **Safetensors + AWQ + TurboQuant**, with Gemma4 compressed-tensors Q4 support now wired into the lite path and regression suite.
 *   **High-Throughput Focus:** Optimized for batch sizes 8/16 and ultra-long context (up to 128k) using parallel sampling and aggressive KV pool strategies.
 
 ## Key Files & Directories
@@ -16,7 +16,7 @@
 *   **`vllm/kernels/triton/`**: Contains optimized kernels for **TurboQuant INT4**, FP8 KV, and Fused AWQ.
 
 ## Major Milestones (March 2026 - Post-Simplification)
-*   **Phase 1 & 2 Success**: ✅ Consolidated 10+ environment variables into `LiteInferenceConfig`. ✅ Completely stripped GGUF loader and kernels.
+*   **Phase 1 & 2 Success**: ✅ Consolidated major runtime behavior into the lite config/runtime path. ✅ Regression and benchmark coverage now include Gemma4 31B Q4 on the lite path.
 *   **TurboQuant INT4 KV Cache**: ✅ Fixed accumulation logic and quantization offsets, achieving stable inference even on 1.1B models.
 *   **Parallel Sampling**: ✅ Implemented vectorized greedy sampling, removing Python-loop bottlenecks for high concurrency.
 *   **Semantic Audit**: ✅ 1:1 CosSim alignment with HuggingFace for BF16/FP8 paths (Tier-A verified).
@@ -38,6 +38,6 @@ Always use `uv run` for consistent dependency resolution.
 # Sync environment
 uv sync
 
-# Run accuracy regression
+# Run correctness regression
 uv run bash tests/run_inference_correctness_regression.sh
 ```

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "short_hi",
+    "prompt": "Hi,"
+  },
+  {
+    "id": "short_capital",
+    "prompt": "Paris is"
+  },
+  {
+    "id": "short_python",
+    "prompt": "Write one line of Python that prints hello."
+  }
+]

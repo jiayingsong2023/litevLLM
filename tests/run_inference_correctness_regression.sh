@@ -3,9 +3,13 @@
 # Inference correctness regression for:
 #   - TinyLlama-1.1B-Chat-v1.0
 #   - Qwen3.5-9B-AWQ
-#   - Gemma4-31B-Q4 (optional, text-only path)
+#   - Gemma4-31B-it-AWQ-4bit (optional, text-only path)
 #
 # Run from repo root. Requires local models/ paths and a working CUDA/ROCm device.
+#
+# Policy:
+#   - models <= 14B: A-strict + B
+#   - models > 14B:  A-lite + B
 #
 # Usage:
 #   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_correctness_regression.sh  # force bf16/fp16 KV (more VRAM)
@@ -22,7 +26,7 @@ export PYTHONPATH="${PYTHONPATH:-.}"
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-}"
-GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_spotcheck_prompts_minimal.json}"
+GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
 
 HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
 HF_GEMMA4_31B="${HF_GEMMA4_31B:-}"
@@ -30,6 +34,7 @@ RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"
+RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 
 require_model_dir() {
   local model_dir="$1"
@@ -122,6 +127,13 @@ SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
   --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
 GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
   --max-new-tokens 48 --temperature 0 --chat-template auto --frugal)
+GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
+  --max-new-tokens 32
+  --temperature 0
+  --gpu-memory-utilization 0.90
+  --max-model-len 512
+  --min-output-chars 8
+  --max-num-batched-tokens 1024)
 
 require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
 require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
@@ -164,7 +176,7 @@ if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then
 fi
 
 echo ""
-echo "=== Tier-A (verify_semantic_integrity, prefill-only) ==="
+echo "=== Tier-A-strict (<=14B, HF parity) ==="
 echo "[A1] TinyLlama — Lite vs HF same tree"
 FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_TINYLLAMA" \
@@ -183,7 +195,7 @@ FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.p
   --apply-chat-template off
 
 if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_TIER}" == "1" ]]; then
-  echo "[A3] Gemma4-31B Q4 vs HF (prefill-only)"
+  echo "[A3-strict] Gemma4-31B Q4 vs HF (prefill-only, opt-in)"
   GEMMA_HF_ARGS=("--hf-same-as-lite")
   if [[ -n "$HF_GEMMA4_31B" ]]; then
     GEMMA_HF_ARGS=("--hf-model" "$HF_GEMMA4_31B")
@@ -198,6 +210,16 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_TIER}" == "1" ]]; then
     --prefill-only \
     --apply-chat-template off \
     "${GEMMA_HF_ARGS[@]}"
+fi
+
+if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
+  echo ""
+  echo "=== Tier-A-lite (>14B, key-point audit) ==="
+  echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
+  FASTINFERENCE_KV_TYPE=turbo_int4 \
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
+  FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
+  "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
 fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
@@ -222,7 +244,7 @@ if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
 fi
 
 echo ""
-echo "=== All requested accuracy regression steps completed OK ==="
+echo "=== All requested correctness regression steps completed OK ==="
 
 if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   echo ""

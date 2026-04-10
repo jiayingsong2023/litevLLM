@@ -4,14 +4,20 @@
 
 ---
 
-## 1. 两档验收目标（B / A）
+## 1. 三档验收目标（B / A-lite / A-strict）
 
 | 档位 | 目标 | 典型手段 |
 |------|------|----------|
 | **B. 观感合理** | 续写通顺、不离题、少乱码；**不要求**与 HF logits 一致 | 人工抽检、固定 prompt、`tests/tools/quality_bar_spotcheck.py` 启发式（仅粗筛） |
-| **A. 严格对齐** | 与 HF 在数值与 greedy token 上尽量一致 | Prefill logits **CosSim** / **MaxErr**、`tests/verify_semantic_integrity.py` |
+| **A-lite. 关键点审计** | 在资源受限场景下验证主链路可用、无明显结构错误、text-only 路径可完成生成 | 轻量审计、固定 2 到 3 个 prompt、首 token / 结束条件 / 文本完整性检查（例如 `tests/tools/gemma4_single_prompt_smoke.py`） |
+| **A-strict. 严格对齐** | 与 HF 在数值与 greedy token 上尽量一致 | Prefill logits **CosSim** / **MaxErr**、`tests/verify_semantic_integrity.py` |
 
-产品可主要采用 **B**；内核、量化与加载器回归用 **A**。
+默认策略：
+
+- **参数量 <= 14B**：走 **A-strict + B**
+- **参数量 > 14B**：走 **A-lite + B**
+
+产品可主要采用 **B**；内核、量化与加载器回归优先用 **A-strict**；大模型在本机资源不足时退化到 **A-lite**。
 
 **观感档**建议同时满足：可读性（少 ``）、连贯性（无灾难性重复）、与 prompt 大致相关；贪婪首 token 不离谱。**不能**用「降低标准」掩盖整段乱码或 CosSim 长期≈0 且不可读——属实现或权重问题。
 
@@ -91,7 +97,7 @@ PYTHONPATH=. uv run python tests/tools/quality_bar_spotcheck.py \
 - **DeepSeek-V2-Lite-GGUF**：权重目录常无 `config.json`；`quality_bar_spotcheck` 会像 tokenizer 一样从同级 `DeepSeek-V2-Lite-Chat` 读取 `model_type` / MoE 字段，以便 Tier-B 默认采样与贪婪下的惩罚与 MoE GGUF 一致。加载器在 `rope_scaling.type=yarn` 时会把 `rope_type` 与 `factor` 同步进 `rope_parameters`，供 `DeepseekV2RotaryEmbedding` 走 YaRN。**MLA 的 `blk.*.attn_q` / `blk.*.attn_kv_b` 在反量化时必须向 `_dequantize_gguf_for_load` 传入 LiteLinear 的 `target_shape=(out,in)`**：否则 `gguf.dequantize` 已给出的正确布局会被「按 GGUF 元数据 reshape」成转置，导致 `q_proj`/`kv_b` 权重与 HF 几乎正交，推理不可读。可选数值稳定：`FASTINFERENCE_GGUF_DEQUANT_FP32=1`（反量化）、`FASTINFERENCE_DEEPSEEK_ATTN_FP32=1`（QK 注意力 FP32，见 `deepseek_v2`）。默认中间反量化对 `deepseek_v2` 为 float16；需要更低峰值内存时可设 `FASTINFERENCE_GGUF_DEQUANT_FP8=1`。Q4 GGUF 与 HF bf16 的 logits 仍可能明显漂移；B 档以观感与 `quality_bar_spotcheck` 为准，**不**以 HF logits 一致为完成条件。
 - **`FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1`**：强制在 **Q4 GGUF 权重** 上跑 B 档（不切换到同级 `DeepSeek-V2-Lite-Chat` bf16）。脚本会自动收紧 `top_p` / `top_k` 与重复类惩罚，减轻尾部噪声；**观感仍常明显差于 bf16**，不宜作为交付验收标准，仅适合 GGUF 路径冒烟或调参。产品级 B 档验收请**不要**设置该变量，沿用默认的 sibling bf16。
 
-### 5.2 A 档（Lite vs HF）
+### 5.2 A-strict（Lite vs HF）
 
 ```bash
 export MODEL="${MODEL:-models/Qwen3.5-9B-FP16}"
@@ -136,7 +142,21 @@ PYTHONPATH=. uv run python tests/verify_layer0_submodule_alignment.py \
   --model "$MODEL" --hf-model "$MODEL" --quant none --include-embed
 ```
 
-### 5.3 GGUF 权重审计
+### 5.3 A-lite（关键点审计，适用于 >14B）
+
+```bash
+PYTHONPATH=. uv run python tests/tools/gemma4_single_prompt_smoke.py \
+  --model models/gemma-4-31B-it-AWQ-4bit \
+  --prompt "Summarize what a binary search tree is in one short paragraph." \
+  --max-new-tokens 32 --temperature 0 --max-model-len 512
+```
+
+- `A-lite` **不是**完整 HF 数值对拍。
+- 目标是验证：模型能加载、text-only 主路径能结束生成、固定 prompt 集具备首 token、正常结束、输出非空且无明显退化。
+- 对 `Gemma4-31B-it-AWQ-4bit` 这类 >14B 模型，`tests/run_inference_correctness_regression.sh` 默认执行 **A-lite + B**；`A-strict` 仍保留为专项、手动开启路径（见 `RUN_GEMMA4_A_TIER=1`）。
+- Gemma4 默认 correctness prompt 集为 `tests/tools/fixtures/gemma4_correctness_prompts_default.json`；边界题与长尾退化调试 prompt 集为 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`。
+
+### 5.4 GGUF 权重审计
 
 ```bash
 PYTHONPATH=. uv run python tests/tools/qwen35_gguf_alignment_audit.py \
@@ -146,13 +166,44 @@ PYTHONPATH=. uv run python tests/tools/qwen35_gguf_alignment_audit.py \
 
 **AWQ**（与 FP16 对比时注意 HF 是否完整加载 packed 权重）：`verify_layer0_submodule_alignment.py --quant awq`，见 `docs/usage/troubleshooting.md`。
 
-### 5.4 单点漂移定位
+### 5.5 单点漂移定位
 
 | 主题 | 命令 |
 |------|------|
 | Conv+SiLU 中间量 | `tests/tools/qwen35_gated_delta_conv_alignment.py --hf-dir "$MODEL"` |
 | Chunk vs FLA | `tests/tools/qwen35_chunk_gated_delta_alignment.py` |
 | 引擎 | `FASTINFERENCE_LITE_PREFILL_CHUNK`、`vllm/engine/lite_engine.py` |
+
+Gemma4 long decode 漂移诊断：
+
+```bash
+PYTHONPATH=. uv run python tests/tools/gemma4_layer_drift_diagnostic.py \
+  --model models/gemma-4-31B-it-AWQ-4bit \
+  --prompt-id short_hi \
+  --checkpoints 16,24,32 \
+  --max-new-tokens 48
+```
+
+- 默认使用 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`
+- 默认报告 `local` / `full` 两类层在目标 token 的 `cos_to_t1` 与 `cos_to_prev` 摘要
+- 用于诊断 Gemma4 超短 prompt 下的长尾 greedy 发散，不作为默认 correctness gate
+
+Gemma4 已知现象（`short_hi`, `max_new_tokens=48`, greedy, `turbo_int4` KV）：
+
+- 典型退化尾段为：正常问候后进入 `thought` / HTML 片段 / 重复问候混杂的长尾输出。
+- 目前诊断结果更像 **超短 prompt 下的长尾 greedy 发散**，而不是单一结构层错误。
+- 一次基线 trace（`16/24/32` token）中，`local` / `full` 两类层都能观察到漂移，但没有出现“只有 full 崩”或“只有 local 崩”的断点：
+  - `token=16`
+    - `local`: `cos_to_t1 mean=0.744307`, `min=0.173046`
+    - `full`: `cos_to_t1 mean=0.792090`, `min=0.318696`
+  - `token=24`
+    - `local`: `cos_to_t1 mean=0.747189`, `cos_to_prev mean=0.875650`
+    - `full`: `cos_to_t1 mean=0.794872`, `cos_to_prev mean=0.912941`
+  - `token=32`
+    - `local`: `cos_to_t1 mean=0.786903`, `cos_to_prev mean=0.796169`
+    - `full`: `cos_to_t1 mean=0.788480`, `cos_to_prev mean=0.822480`
+- 当前解读：`local` 层最小值更低，局部漂移略早，但整体上 `local/full` 是一起漂，不支持“full/sliding 混合结构存在单点实现 bug”的强结论。
+- 因此默认 correctness 采用 Gemma 专用 prompt 集，不让 `short_hi` 这类边界题阻塞整条回归；`short_hi` 保留在 edge prompt 集里，专门用于长尾退化诊断。
 
 ---
 

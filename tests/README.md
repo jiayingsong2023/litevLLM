@@ -4,7 +4,7 @@
 
 更完整的档位说明见 **[`docs/INFERENCE_ACCURACY.md`](../docs/INFERENCE_ACCURACY.md)**。
 
-## 默认推理准确度回归（TinyLlama + Qwen3.5 9B AWQ）
+## 默认推理准确度回归（TinyLlama + Qwen3.5 9B AWQ + Gemma4 31B Q4）
 
 在仓库根目录、本地已放置对应 `models/...` 且 GPU 驱动正常时：
 
@@ -17,11 +17,33 @@ bash tests/run_inference_correctness_regression.sh
 仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh`  
 附带性能诊断（prefill/decode + AWQ fallback 计数）：`RUN_PERF_DIAG=1 bash tests/run_inference_correctness_regression.sh`
 
+默认策略：
+
+- `<=14B` 模型：`A-strict + B`
+- `>14B` 模型：`A-lite + B`
+
+当前脚本中：
+
+- `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ` 走 `A-strict + B`
+- `Gemma4-31B-it-AWQ-4bit` 走 `A-lite + B`
+- 如需对 Gemma 手动开启严格 HF prefill 对拍，可设 `RUN_GEMMA4_A_TIER=1`
+
 默认模型路径可通过环境变量覆盖：
 
 - `MODEL_TINYLLAMA`
 - `MODEL_QWEN35_9B_AWQ`
+- `MODEL_GEMMA4_31B_Q4`
 - `HF_QWEN35_9B_FP16`
+
+Gemma4 默认优先探测本地目录：
+`models/gemma-4-31B-it-AWQ-4bit`、`models/Gemma-4-31B-Q4`、`models/Gemma-4-31B-AWQ`、`models/Gemma-4-31B-AWQ-4bit`。
+仅在这些目录都不存在时，才回退到 `cyankiwi/gemma-4-31B-it-AWQ-4bit`。
+
+Gemma4 默认 correctness prompt 集：
+`tests/tools/fixtures/gemma4_correctness_prompts_default.json`
+
+Gemma4 边界题 / 长尾退化调试 prompt 集：
+`tests/tools/fixtures/gemma4_edge_prompts_debug.json`
 
 ## 一键 pytest（默认，不加载整模）
 
@@ -36,10 +58,12 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 | 场景 | 入口 |
 |------|------|
 | B 档观感（Qwen / DeepSeek / GLM 等） | `uv run python tests/tools/quality_bar_spotcheck.py`（见文档 §5） |
-| A 档 logits（HF vs Lite） | `tests/verify_semantic_integrity.py`、`tests/verify_layer0_submodule_alignment.py`、`tests/verify_layerwise_alignment.py` |
+| A-strict（HF vs Lite） | `tests/verify_semantic_integrity.py`、`tests/verify_layer0_submodule_alignment.py`、`tests/verify_layerwise_alignment.py` |
+| A-lite（关键点审计） | `tests/tools/gemma4_single_prompt_smoke.py`（固定 2 到 3 个 prompt，检查首 token / 正常结束 / 文本完整性） |
+| Gemma4 long decode 诊断 | `tests/tools/gemma4_layer_drift_diagnostic.py`（默认 `short_hi`，输出 local/full 层在 16/24/32 token 的 drift 摘要） |
 | DeepSeek 末位 logits / 逐层 hidden | `tests/tools/compare_hf_lite_deepseek_logits.py`（A 档宜 **同一 safetensors 目录**；GGUF 对 HF bf16 不做 CosSim≥0.99 要求）、`compare_hf_lite_deepseek_layer_hiddens.py` |
 | Qwen GGUF 张量审计 | `tests/tools/qwen35_gguf_alignment_audit.py` |
-| 性能回归（TinyLlama + Qwen3.5 9B AWQ） | `uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq --json-out .tmp_perf_regression_awq.json` |
+| 性能回归（TinyLlama + Qwen3.5 9B AWQ + Gemma4 31B Q4） | `uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq,gemma4_31b_q4 --json-out .tmp_perf_regression_awq.json` |
 | AWQ fused GEMM 微基准（可选） | `uv run python tests/bench_awq_fused_gemm_ab.py` |
 | LLM.generate 冒烟（与 e2e 模型列表对齐） | `uv run python tests/test_offline_api.py` |
 

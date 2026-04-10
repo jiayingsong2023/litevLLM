@@ -1,0 +1,22 @@
+[
+  {
+    "id": "gemma_en_capital",
+    "prompt": "What is the capital of France, and name one famous landmark there in one short sentence."
+  },
+  {
+    "id": "gemma_en_bst",
+    "prompt": "Explain what a binary search tree is in one short paragraph."
+  },
+  {
+    "id": "gemma_zh_capital",
+    "prompt": "法国的首都是哪里？请用一句话回答。"
+  },
+  {
+    "id": "gemma_zh_gd",
+    "prompt": "用两三句话解释什么是梯度下降。"
+  },
+  {
+    "id": "gemma_chat_intro",
+    "prompt": "Please introduce yourself briefly and offer two ways you can help with coding tasks."
+  }
+]

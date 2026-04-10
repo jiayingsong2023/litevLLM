@@ -78,7 +78,9 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
     ),
     "gemma4_31b_q4": ModelSpec(
         key="gemma4_31b_q4",
-        model_path=os.environ.get("MODEL_GEMMA4_31B_Q4", "models/Gemma-4-31B-Q4"),
+        model_path=os.environ.get(
+            "MODEL_GEMMA4_31B_Q4", "models/gemma-4-31B-it-AWQ-4bit"
+        ),
         display_name="Gemma4-31B (Q4)",
         quant="compressed-tensors",
         concurrent_reqs=1,
@@ -1907,7 +1909,7 @@ async def main() -> None:
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
-    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B Q4")
+    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit")
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}
