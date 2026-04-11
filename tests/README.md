@@ -82,6 +82,7 @@ Gemma4 诊断基线文件：
 
 - `tests/tools/fixtures/gemma4_a_strict_baseline.json`（CosSim + argmax）
 - `tests/tools/fixtures/gemma4_layer_drift_baseline_short_hi.json`（token 16/24/32 层漂移摘要）
+- 一键复检入口：`bash tests/run_gemma4_diagnostics_warn_only.sh`（可附加 pytest 参数，例如 `-k parse_helpers`）
 
 ## 模型覆盖矩阵（本地需有 `models/...` 目录）
 
