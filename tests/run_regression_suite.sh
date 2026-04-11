@@ -11,6 +11,7 @@ uv run pytest \
   tests/test_logits_dump_stats.py \
   tests/lite_smoke_test.py \
   tests/test_gemma4_strict_audit_smoke.py \
+  tests/test_model_registry_gemma4.py \
   tests/test_gemma4_reference_loader.py \
   tests/test_run_inference_correctness_regression.py \
   -v --tb=short "$@"

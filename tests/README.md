@@ -65,12 +65,14 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 - `tests/test_logits_dump_stats.py`
 - `tests/lite_smoke_test.py`
 - `tests/test_gemma4_strict_audit_smoke.py`
+- `tests/test_model_registry_gemma4.py`
 - `tests/test_gemma4_reference_loader.py`
 - `tests/test_run_inference_correctness_regression.py`
 
 其中 Gemma4 相关默认覆盖三类轻量保护：
 
 - `test_gemma4_strict_audit_smoke.py`：校验 `tests/tools/gemma4_prefill_strict_audit.py` 的参数解析、失败快返、命令与环境变量拼装
+- `test_model_registry_gemma4.py`：校验 `vllm/model_executor/models/registry.py` 在 `architectures=[]` 时对 Gemma4 的推断与解析（避免 `Unsupported architectures: []` 回归）
 - `test_gemma4_reference_loader.py`：校验 `tests/verify_semantic_integrity.py` 中 Gemma4 reference loader 的关键映射与赋值逻辑（`weight_packed/scale/shape`、vision/audio 忽略、零赋值失败）
 - `test_run_inference_correctness_regression.py`：校验 `RUN_GEMMA4_A_STRICT=1` 时，`tests/run_inference_correctness_regression.sh` 会实际触发 Gemma4 A-strict 入口
 
