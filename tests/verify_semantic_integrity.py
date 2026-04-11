@@ -288,6 +288,47 @@ def _set_module_attr_by_name(root: torch.nn.Module, full_name: str, value: Any) 
         setattr(obj, leaf, value)
 
 
+def _assign_gemma4_reference_weights(
+    model: torch.nn.Module,
+    hf_path: str,
+    target_device: torch.device,
+    *,
+    safe_open_fn: Any,
+) -> int:
+    assigned = 0
+    shards = sorted(str(p) for p in Path(hf_path).glob("*.safetensors"))
+    for shard_path in shards:
+        with safe_open_fn(shard_path, framework="pt", device="cpu") as f:
+            for hf_key in f.keys():
+                target = _gemma4_map_ref_key(hf_key)
+                if target is None:
+                    continue
+                tensor = f.get_tensor(hf_key)
+                if target.endswith(".weight_shape"):
+                    module_name = target[: -len(".weight_shape")]
+                    module = model.get_submodule(module_name)
+                    module.weight_shape = tuple(int(x) for x in tensor.view(-1).tolist())
+                    assigned += 1
+                    continue
+                try:
+                    current = model.get_parameter(target)
+                except Exception:
+                    continue
+                if target.endswith((".qweight", ".scales", ".qzeros")):
+                    tensor = tensor.to(device=target_device, dtype=tensor.dtype)
+                else:
+                    tensor = tensor.to(device=target_device, dtype=current.dtype)
+                _set_module_attr_by_name(
+                    model,
+                    target,
+                    torch.nn.Parameter(tensor.contiguous(), requires_grad=False),
+                )
+                assigned += 1
+    if assigned == 0:
+        raise RuntimeError(f"Gemma4 reference loader assigned no weights from {hf_path}")
+    return assigned
+
+
 class _Gemma4ReferenceWrapper(torch.nn.Module):
     def __init__(self, inner: torch.nn.Module):
         super().__init__()
@@ -383,37 +424,12 @@ def _load_gemma4_reference_model(hf_path: str, dtype: torch.dtype, hf_device: st
     target_device = torch.device("cuda" if hf_device == "cuda" else "cpu")
     model = Gemma4ForConditionalGeneration(v_cfg).to(device=target_device, dtype=dtype).eval()
 
-    assigned = 0
-    shards = sorted(str(p) for p in Path(hf_path).glob("*.safetensors"))
-    for shard_path in shards:
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for hf_key in f.keys():
-                target = _gemma4_map_ref_key(hf_key)
-                if target is None:
-                    continue
-                tensor = f.get_tensor(hf_key)
-                if target.endswith(".weight_shape"):
-                    module_name = target[: -len(".weight_shape")]
-                    module = model.get_submodule(module_name)
-                    module.weight_shape = tuple(int(x) for x in tensor.view(-1).tolist())
-                    assigned += 1
-                    continue
-                try:
-                    current = model.get_parameter(target)
-                except Exception:
-                    continue
-                if target.endswith((".qweight", ".scales", ".qzeros")):
-                    tensor = tensor.to(device=target_device, dtype=tensor.dtype)
-                else:
-                    tensor = tensor.to(device=target_device, dtype=current.dtype)
-                _set_module_attr_by_name(
-                    model,
-                    target,
-                    torch.nn.Parameter(tensor.contiguous(), requires_grad=False),
-                )
-                assigned += 1
-    if assigned == 0:
-        raise RuntimeError(f"Gemma4 reference loader assigned no weights from {hf_path}")
+    _assign_gemma4_reference_weights(
+        model,
+        hf_path,
+        target_device,
+        safe_open_fn=safe_open,
+    )
     return _Gemma4ReferenceWrapper(model)
 
 
