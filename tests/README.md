@@ -26,7 +26,15 @@ bash tests/run_inference_correctness_regression.sh
 
 - `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ` 走 `A-strict + B`
 - `Gemma4-31B-it-AWQ-4bit` 走 `A-lite + B`
-- 如需对 Gemma 手动开启严格 HF prefill 对拍，可设 `RUN_GEMMA4_A_TIER=1`
+- 如需对 Gemma 手动开启严格 HF prefill 对拍，可设 `RUN_GEMMA4_A_TIER=1` 或 `RUN_GEMMA4_A_STRICT=1`
+
+Gemma4 `A-strict` 的执行方式与小模型不同：
+
+- 默认入口：`tests/tools/gemma4_prefill_strict_audit.py`
+- 默认使用 `--hf-device cuda`
+- 采用 **sequential GPU reference**，不是 Lite 与 HF 同时驻留 GPU
+- 具体顺序是：先抓 Lite prefill logits，再释放 LiteEngine GPU 占用，再在同一张 GPU 上加载 Gemma4 reference 做一次 `prefill-only` 对拍
+- 因此，Gemma4 `A-strict` 适合作为手动专项审计，不适合作为 >14B 默认回归项
 
 默认模型路径可通过环境变量覆盖：
 
@@ -59,6 +67,7 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 |------|------|
 | B 档观感（Qwen / DeepSeek / GLM 等） | `uv run python tests/tools/quality_bar_spotcheck.py`（见文档 §5） |
 | A-strict（HF vs Lite） | `tests/verify_semantic_integrity.py`、`tests/verify_layer0_submodule_alignment.py`、`tests/verify_layerwise_alignment.py` |
+| Gemma4 A-strict（prefill-only, sequential GPU reference） | `tests/tools/gemma4_prefill_strict_audit.py` |
 | A-lite（关键点审计） | `tests/tools/gemma4_single_prompt_smoke.py`（固定 2 到 3 个 prompt，检查首 token / 正常结束 / 文本完整性） |
 | Gemma4 long decode 诊断 | `tests/tools/gemma4_layer_drift_diagnostic.py`（默认 `short_hi`，输出 local/full 层在 16/24/32 token 的 drift 摘要） |
 | DeepSeek 末位 logits / 逐层 hidden | `tests/tools/compare_hf_lite_deepseek_logits.py`（A 档宜 **同一 safetensors 目录**；GGUF 对 HF bf16 不做 CosSim≥0.99 要求）、`compare_hf_lite_deepseek_layer_hiddens.py` |

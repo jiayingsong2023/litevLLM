@@ -34,6 +34,7 @@ RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"
+RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-${RUN_GEMMA4_A_TIER}}"
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 
 require_model_dir() {
@@ -134,6 +135,11 @@ GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
   --max-model-len 512
   --min-output-chars 8
   --max-num-batched-tokens 1024)
+GEMMA4_A_STRICT_AUDIT=(uv run python tests/tools/gemma4_prefill_strict_audit.py
+  --hf-device cuda
+  --max-model-len 256
+  --gpu-memory-utilization 0.80
+  --max-num-batched-tokens 512)
 
 require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
 require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
@@ -194,22 +200,13 @@ FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.p
   --prefill-only \
   --apply-chat-template off
 
-if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_TIER}" == "1" ]]; then
-  echo "[A3-strict] Gemma4-31B Q4 vs HF (prefill-only, opt-in)"
-  GEMMA_HF_ARGS=("--hf-same-as-lite")
+if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_STRICT}" == "1" ]]; then
+  echo "[A3-strict] Gemma4-31B Q4 prefill-only strict audit (manual)"
+  GEMMA_HF_ARGS=()
   if [[ -n "$HF_GEMMA4_31B" ]]; then
-    GEMMA_HF_ARGS=("--hf-model" "$HF_GEMMA4_31B")
+    GEMMA_HF_ARGS=(--hf-model "$HF_GEMMA4_31B")
   fi
-  # Gemma4-31B needs a much smaller KV pool than the generic high-end default.
-  FASTINFERENCE_KV_TYPE=turbo_int4 \
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-  FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-  uv run python tests/verify_semantic_integrity.py \
-    --model "$MODEL_GEMMA4_31B_Q4" \
-    --preset gemma4_31b_q4 \
-    --prefill-only \
-    --apply-chat-template off \
-    "${GEMMA_HF_ARGS[@]}"
+  "${GEMMA4_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_31B_Q4" "${GEMMA_HF_ARGS[@]}"
 fi
 
 if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then

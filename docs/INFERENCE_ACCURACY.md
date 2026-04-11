@@ -19,6 +19,12 @@
 
 产品可主要采用 **B**；内核、量化与加载器回归优先用 **A-strict**；大模型在本机资源不足时退化到 **A-lite**。
 
+补充说明：
+
+- 对 `Gemma4-31B-it-AWQ-4bit` 这类 31B 级模型，专项 `A-strict` 采用 **sequential GPU reference**，而不是 Lite 与 HF 同时驻留 GPU。
+- 具体做法是：先运行 Lite prefill 并抓取 last-token logits；随后释放 LiteEngine 的 GPU 占用，再在同一张 GPU 上加载 Gemma4 reference，做一次 `prefill-only` 对拍。
+- 因此，Gemma4 `A-strict` 的通过标准仍然是严格的 prefill 数值对齐，但执行方式是顺序式的，而不是双驻留并行式的。
+
 **观感档**建议同时满足：可读性（少 ``）、连贯性（无灾难性重复）、与 prompt 大致相关；贪婪首 token 不离谱。**不能**用「降低标准」掩盖整段乱码或 CosSim 长期≈0 且不可读——属实现或权重问题。
 
 **何时「降低标准」仍不够**：首 token 即异常、整段乱码；Lite 与 HF `generate` 反差极大；Prefill 与合理参考几乎正交且输出不可读。
@@ -154,6 +160,7 @@ PYTHONPATH=. uv run python tests/tools/gemma4_single_prompt_smoke.py \
 - `A-lite` **不是**完整 HF 数值对拍。
 - 目标是验证：模型能加载、text-only 主路径能结束生成、固定 prompt 集具备首 token、正常结束、输出非空且无明显退化。
 - 对 `Gemma4-31B-it-AWQ-4bit` 这类 >14B 模型，`tests/run_inference_correctness_regression.sh` 默认执行 **A-lite + B**；`A-strict` 仍保留为专项、手动开启路径（见 `RUN_GEMMA4_A_TIER=1`）。
+- Gemma4 专项 `A-strict` 入口为 `tests/tools/gemma4_prefill_strict_audit.py`。默认使用 `--hf-device cuda`，走 **sequential GPU reference**：先抓 Lite prefill logits，再释放 Lite GPU 占用，再加载 Gemma4 reference 到 GPU 做一次 `prefill-only` 对拍。
 - Gemma4 默认 correctness prompt 集为 `tests/tools/fixtures/gemma4_correctness_prompts_default.json`；边界题与长尾退化调试 prompt 集为 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`。
 
 ### 5.4 GGUF 权重审计

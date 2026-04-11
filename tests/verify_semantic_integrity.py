@@ -45,6 +45,9 @@ import argparse
 import math
 import os
 import sys
+import gc
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, List, Optional
 
 # Prefill-only audit: HF reference logits must align within this cosine floor (aligned vocab slice).
@@ -238,6 +241,182 @@ def _resolve_hf_torch_dtype(config_path_dir: str) -> torch.dtype:
     return torch.float16
 
 
+def _read_model_config_json(model_path: str) -> dict[str, Any]:
+    cfg_path = Path(model_path) / "config.json"
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _looks_like_gemma4_model_path(model_path: str) -> bool:
+    try:
+        raw = _read_model_config_json(model_path)
+    except Exception:
+        return False
+    model_type = str(raw.get("model_type", "") or "").lower()
+    text_model_type = str(((raw.get("text_config") or {}).get("model_type", "")) or "").lower()
+    return model_type == "gemma4" or text_model_type.startswith("gemma4")
+
+
+def _gemma4_map_ref_key(hf_key: str) -> Optional[str]:
+    if hf_key.startswith("model.embed_vision.") or hf_key.startswith("model.audio_"):
+        return None
+    if hf_key.startswith("model.language_model."):
+        name = "model." + hf_key[len("model.language_model.") :]
+    else:
+        name = hf_key
+    if name.endswith(".weight_packed"):
+        return name[: -len(".weight_packed")] + ".qweight"
+    if name.endswith(".weight_scale"):
+        return name[: -len(".weight_scale")] + ".scales"
+    if name.endswith(".weight_shape"):
+        return name
+    return name
+
+
+def _set_module_attr_by_name(root: torch.nn.Module, full_name: str, value: Any) -> None:
+    parts = full_name.split(".")
+    obj: Any = root
+    for part in parts[:-1]:
+        if part.isdigit():
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part)
+    leaf = parts[-1]
+    if leaf.isdigit():
+        obj[int(leaf)] = value
+    else:
+        setattr(obj, leaf, value)
+
+
+class _Gemma4ReferenceWrapper(torch.nn.Module):
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.inner = inner.eval()
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        del attention_mask
+        bsz, seqlen = input_ids.shape
+        positions = (
+            torch.arange(seqlen, device=input_ids.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(bsz, seqlen)
+        )
+        if input_ids.device.type == "cuda":
+            block_size = 16
+            max_model_len = max(256, ((seqlen + block_size - 1) // block_size) * block_size)
+            num_blocks = max(1, max_model_len // block_size)
+            num_layers = len(self.inner.model.layers)
+            cfg = self.inner.model.config
+            num_kv_heads = max(
+                int(getattr(cfg, "num_key_value_heads", 1)),
+                int(getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", 1))),
+            )
+            kv_head_dim = max(
+                int(getattr(cfg, "head_dim", 1)),
+                int(getattr(cfg, "global_head_dim", getattr(cfg, "head_dim", 1))),
+            )
+            kv_caches = []
+            kv_scale_caches = []
+            for _ in range(num_layers):
+                k = torch.zeros(
+                    (num_blocks, block_size, num_kv_heads, kv_head_dim),
+                    device=input_ids.device,
+                    dtype=torch.uint8,
+                )
+                v = torch.zeros_like(k)
+                kv_caches.append((k, v))
+                ks = torch.zeros(
+                    (num_blocks, block_size, num_kv_heads, 1),
+                    device=input_ids.device,
+                    dtype=torch.float32,
+                )
+                vs = torch.zeros_like(ks)
+                kv_scale_caches.append((ks, vs))
+            meta = {
+                "slot_mapping": torch.arange(seqlen, device=input_ids.device, dtype=torch.long),
+                "seq_lens": torch.tensor([seqlen], device=input_ids.device, dtype=torch.int32),
+                "is_prefill": True,
+                "kv_start_indices": torch.tensor([0], device=input_ids.device, dtype=torch.int32),
+                "block_tables": torch.arange(num_blocks, device=input_ids.device, dtype=torch.int32).unsqueeze(0),
+                "linear_attn_carry": [None] * num_layers,
+                "linear_conv_carry": [None] * num_layers,
+                "kv_scale_cache": kv_scale_caches,
+                "kv_cache_dtype": "turbo_int4",
+                "k_scale": 1.0,
+                "v_scale": 1.0,
+                "config": SimpleNamespace(kv_type="turbo_int4", k_scale=1.0, v_scale=1.0),
+            }
+        else:
+            kv_caches = [None] * len(self.inner.model.layers)
+            meta = {}
+        logits = self.inner(
+            input_ids=input_ids,
+            positions=positions,
+            kv_caches=kv_caches,
+            attn_metadata=meta,
+        )
+        return SimpleNamespace(logits=logits)
+
+
+def _load_gemma4_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str) -> torch.nn.Module:
+    from safetensors import safe_open
+
+    from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.models.gemma4 import Gemma4ForConditionalGeneration
+    from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
+
+    raw = _read_model_config_json(hf_path)
+    hf_config = build_fallback_hf_config(raw)
+    quant_cfg = getattr(hf_config, "quantization_config", None)
+    q_cfg = AWQConfig.from_config(quant_cfg) if isinstance(quant_cfg, dict) else None
+
+    m_cfg = ModelConfig(model=hf_path, tokenizer=hf_path)
+    m_cfg.hf_config = hf_config
+    v_cfg = VllmConfig(
+        m_cfg,
+        CacheConfig(block_size=16, gpu_memory_utilization=0.1, swap_space=0),
+        SchedulerConfig(max_num_batched_tokens=16, max_num_seqs=1, max_model_len=16),
+        LoadConfig(),
+        quant_config=q_cfg,
+    )
+    target_device = torch.device("cuda" if hf_device == "cuda" else "cpu")
+    model = Gemma4ForConditionalGeneration(v_cfg).to(device=target_device, dtype=dtype).eval()
+
+    assigned = 0
+    shards = sorted(str(p) for p in Path(hf_path).glob("*.safetensors"))
+    for shard_path in shards:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for hf_key in f.keys():
+                target = _gemma4_map_ref_key(hf_key)
+                if target is None:
+                    continue
+                tensor = f.get_tensor(hf_key)
+                if target.endswith(".weight_shape"):
+                    module_name = target[: -len(".weight_shape")]
+                    module = model.get_submodule(module_name)
+                    module.weight_shape = tuple(int(x) for x in tensor.view(-1).tolist())
+                    assigned += 1
+                    continue
+                try:
+                    current = model.get_parameter(target)
+                except Exception:
+                    continue
+                if target.endswith((".qweight", ".scales", ".qzeros")):
+                    tensor = tensor.to(device=target_device, dtype=tensor.dtype)
+                else:
+                    tensor = tensor.to(device=target_device, dtype=current.dtype)
+                _set_module_attr_by_name(
+                    model,
+                    target,
+                    torch.nn.Parameter(tensor.contiguous(), requires_grad=False),
+                )
+                assigned += 1
+    if assigned == 0:
+        raise RuntimeError(f"Gemma4 reference loader assigned no weights from {hf_path}")
+    return _Gemma4ReferenceWrapper(model)
+
+
 def _looks_like_preformatted_chat(text: str) -> bool:
     s = text.lstrip()
     if len(s) >= 12 and "<|im_start|>" in s[:400]:
@@ -331,6 +510,9 @@ def _load_hf_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str):
     Load HF reference; supports dense CausalLM and Qwen3.5 multimodal checkpoints.
     Use hf_device='cpu' when Lite already occupies GPU VRAM to avoid OOM / illegal memory access.
     """
+    if _looks_like_gemma4_model_path(hf_path):
+        return _load_gemma4_reference_model(hf_path, dtype, hf_device)
+
     hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
     common = dict(
         pretrained_model_name_or_path=hf_path,
@@ -384,6 +566,9 @@ def run_alignment_test(
     quant_type="none",
     prompt="The capital of France is",
     max_new_tokens=10,
+    max_model_len: int = 2048,
+    max_num_batched_tokens: int = 2048,
+    gpu_memory_utilization: float = 0.9,
     no_hf=False,
     hf_model_path=None,
     hf_device="auto",
@@ -437,8 +622,12 @@ def run_alignment_test(
     
     # 1. Initialize LitevLLM Engine
     m_cfg = ModelConfig(model=model_path, tokenizer=model_path)
-    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=0.9, swap_space=4)
-    s_cfg = SchedulerConfig(max_num_batched_tokens=2048, max_num_seqs=32, max_model_len=2048)
+    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=4)
+    s_cfg = SchedulerConfig(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=32,
+        max_model_len=max_model_len,
+    )
     l_cfg = LoadConfig()
     
     q_cfg = None
@@ -597,6 +786,15 @@ def run_alignment_test(
                 print(f"  [Warning] Lite prefill logits: {n_bad} non-finite values (check AWQ group_size / weights).")
 
             print(f"  [2b] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}...")
+            if (
+                hf_device == "cuda"
+                and prefill_only
+                and _looks_like_gemma4_model_path(hf_load_path)
+            ):
+                print("  [Info] Releasing LiteEngine GPU state before Gemma4 CUDA reference load.")
+                del engine
+                gc.collect()
+                torch.cuda.empty_cache()
             try:
                 hf_model = _load_hf_reference_model(hf_load_path, dtype, hf_device)
             except Exception as e:
@@ -790,6 +988,24 @@ if __name__ == "__main__":
         default=None,
         help="Override max_new_tokens for generation audit.",
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=int(os.environ.get("FASTINFERENCE_VERIFY_MAX_MODEL_LEN", "2048")),
+        help="Override Lite scheduler max_model_len for the audit.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=int(os.environ.get("FASTINFERENCE_VERIFY_MAX_BATCHED_TOKENS", "2048")),
+        help="Override Lite scheduler max_num_batched_tokens for the audit.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=float(os.environ.get("FASTINFERENCE_VERIFY_GPU_MEM_UTIL", "0.9")),
+        help="Override Lite cache gpu_memory_utilization for the audit.",
+    )
     parser.add_argument("--no-hf", action="store_true")
     parser.add_argument(
         "--hf-model",
@@ -904,7 +1120,9 @@ if __name__ == "__main__":
     print(
         f"[Config] preset={args.preset}, quant={effective_quant}, "
         f"max_new_tokens={effective_max_new_tokens}, hf_device={hf_device}, "
-        f"apply_chat_template={args.apply_chat_template}, prefill_only={args.prefill_only}"
+        f"apply_chat_template={args.apply_chat_template}, prefill_only={args.prefill_only}, "
+        f"max_model_len={args.max_model_len}, max_num_batched_tokens={args.max_num_batched_tokens}, "
+        f"gpu_mem_util={args.gpu_memory_utilization}"
     )
     if effective_hf_model_path and not args.no_hf:
         same = os.path.abspath(effective_hf_model_path) == os.path.abspath(args.model)
@@ -918,6 +1136,9 @@ if __name__ == "__main__":
         effective_quant,
         prompt=effective_prompt,
         max_new_tokens=effective_max_new_tokens,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         no_hf=args.no_hf,
         hf_model_path=effective_hf_model_path,
         hf_device=hf_device,
