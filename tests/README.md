@@ -59,7 +59,18 @@ Gemma4 边界题 / 长尾退化调试 prompt 集：
 cd /path/to/FastInference && bash tests/run_regression_suite.sh
 ```
 
-等价于对下列文件的 `pytest`：`test_qwen35_*`、`test_moe_gguf_packed`、`test_quality_bar_spotcheck_heuristics`、`test_logits_dump_stats`、`test_lora_registry_smoke`、`test_multimodal_registry_smoke`、`lite_smoke_test`。
+当前默认集合包含：
+
+- `tests/test_quality_bar_spotcheck_heuristics.py`
+- `tests/test_logits_dump_stats.py`
+- `tests/lite_smoke_test.py`
+- `tests/test_gemma4_strict_audit_smoke.py`
+- `tests/test_run_inference_correctness_regression.py`
+
+其中 Gemma4 相关默认覆盖两类轻量保护：
+
+- `test_gemma4_strict_audit_smoke.py`：校验 `tests/tools/gemma4_prefill_strict_audit.py` 的参数解析、失败快返、命令与环境变量拼装
+- `test_run_inference_correctness_regression.py`：校验 `RUN_GEMMA4_A_STRICT=1` 时，`tests/run_inference_correctness_regression.sh` 会实际触发 Gemma4 A-strict 入口
 
 ## 模型覆盖矩阵（本地需有 `models/...` 目录）
 
