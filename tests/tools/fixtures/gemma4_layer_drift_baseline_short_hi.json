@@ -1,0 +1,62 @@
+{
+  "model": "models/gemma-4-31B-it-AWQ-4bit",
+  "prompt_id": "short_hi",
+  "checkpoints": [1, 16, 24, 32],
+  "max_new_tokens": 32,
+  "token_to_step": {
+    "1": 2,
+    "16": 17,
+    "24": 25,
+    "32": 33
+  },
+  "metrics": {
+    "16": {
+      "local": {
+        "cos_to_t1_mean": 0.726229,
+        "cos_to_t1_min": 0.139810,
+        "cos_to_prev_mean": 0.726229,
+        "cos_to_prev_min": 0.139810
+      },
+      "full": {
+        "cos_to_t1_mean": 0.719264,
+        "cos_to_t1_min": 0.065373,
+        "cos_to_prev_mean": 0.719264,
+        "cos_to_prev_min": 0.065373
+      }
+    },
+    "24": {
+      "local": {
+        "cos_to_t1_mean": 0.747082,
+        "cos_to_t1_min": 0.166733,
+        "cos_to_prev_mean": 0.817752,
+        "cos_to_prev_min": 0.201784
+      },
+      "full": {
+        "cos_to_t1_mean": 0.777167,
+        "cos_to_t1_min": 0.358014,
+        "cos_to_prev_mean": 0.837632,
+        "cos_to_prev_min": 0.446408
+      }
+    },
+    "32": {
+      "local": {
+        "cos_to_t1_mean": 0.733025,
+        "cos_to_t1_min": 0.155076,
+        "cos_to_prev_mean": 0.814279,
+        "cos_to_prev_min": 0.214832
+      },
+      "full": {
+        "cos_to_t1_mean": 0.747627,
+        "cos_to_t1_min": 0.286143,
+        "cos_to_prev_mean": 0.852596,
+        "cos_to_prev_min": 0.537703
+      }
+    }
+  },
+  "warn_tolerance": {
+    "mean_abs_diff": 0.08,
+    "min_abs_diff": 0.10,
+    "token_to_step_abs": 3
+  },
+  "collected_at": "2026-04-11"
+}

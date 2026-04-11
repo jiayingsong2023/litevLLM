@@ -162,6 +162,7 @@ PYTHONPATH=. uv run python tests/tools/gemma4_single_prompt_smoke.py \
 - 对 `Gemma4-31B-it-AWQ-4bit` 这类 >14B 模型，`tests/run_inference_correctness_regression.sh` 默认执行 **A-lite + B**；`A-strict` 仍保留为专项、手动开启路径（见 `RUN_GEMMA4_A_TIER=1`）。
 - Gemma4 专项 `A-strict` 入口为 `tests/tools/gemma4_prefill_strict_audit.py`。默认使用 `--hf-device cuda`，走 **sequential GPU reference**：先抓 Lite prefill logits，再释放 Lite GPU 占用，再加载 Gemma4 reference 到 GPU 做一次 `prefill-only` 对拍。
 - Gemma4 默认 correctness prompt 集为 `tests/tools/fixtures/gemma4_correctness_prompts_default.json`；边界题与长尾退化调试 prompt 集为 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`。
+- Gemma4 `A-strict` 基线（CosSim + argmax）固定在 `tests/tools/fixtures/gemma4_a_strict_baseline.json`。可用 `RUN_GEMMA4_DIAGNOSTIC=1 uv run pytest tests/test_gemma4_diagnostics_warn_only.py -q` 做基线对比；该入口**仅告警不 gate**。
 
 ### 5.4 GGUF 权重审计
 
@@ -194,21 +195,22 @@ PYTHONPATH=. uv run python tests/tools/gemma4_layer_drift_diagnostic.py \
 - 默认使用 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`
 - 默认报告 `local` / `full` 两类层在目标 token 的 `cos_to_t1` 与 `cos_to_prev` 摘要
 - 用于诊断 Gemma4 超短 prompt 下的长尾 greedy 发散，不作为默认 correctness gate
+- Gemma4 drift 基线固定在 `tests/tools/fixtures/gemma4_layer_drift_baseline_short_hi.json`，通过 `tests/test_gemma4_diagnostics_warn_only.py` 比较（偏离时仅 warning）
 
-Gemma4 已知现象（`short_hi`, `max_new_tokens=48`, greedy, `turbo_int4` KV）：
+Gemma4 已知现象（`short_hi`, greedy, `turbo_int4` KV）：
 
 - 典型退化尾段为：正常问候后进入 `thought` / HTML 片段 / 重复问候混杂的长尾输出。
 - 目前诊断结果更像 **超短 prompt 下的长尾 greedy 发散**，而不是单一结构层错误。
-- 一次基线 trace（`16/24/32` token）中，`local` / `full` 两类层都能观察到漂移，但没有出现“只有 full 崩”或“只有 local 崩”的断点：
+- 一次基线 trace（`max_new_tokens=32`, `16/24/32` token）中，`local` / `full` 两类层都能观察到漂移，但没有出现“只有 full 崩”或“只有 local 崩”的断点：
   - `token=16`
-    - `local`: `cos_to_t1 mean=0.744307`, `min=0.173046`
-    - `full`: `cos_to_t1 mean=0.792090`, `min=0.318696`
+    - `local`: `cos_to_t1 mean=0.726229`, `min=0.139810`
+    - `full`: `cos_to_t1 mean=0.719264`, `min=0.065373`
   - `token=24`
-    - `local`: `cos_to_t1 mean=0.747189`, `cos_to_prev mean=0.875650`
-    - `full`: `cos_to_t1 mean=0.794872`, `cos_to_prev mean=0.912941`
+    - `local`: `cos_to_t1 mean=0.747082`, `cos_to_prev mean=0.817752`
+    - `full`: `cos_to_t1 mean=0.777167`, `cos_to_prev mean=0.837632`
   - `token=32`
-    - `local`: `cos_to_t1 mean=0.786903`, `cos_to_prev mean=0.796169`
-    - `full`: `cos_to_t1 mean=0.788480`, `cos_to_prev mean=0.822480`
+    - `local`: `cos_to_t1 mean=0.733025`, `cos_to_prev mean=0.814279`
+    - `full`: `cos_to_t1 mean=0.747627`, `cos_to_prev mean=0.852596`
 - 当前解读：`local` 层最小值更低，局部漂移略早，但整体上 `local/full` 是一起漂，不支持“full/sliding 混合结构存在单点实现 bug”的强结论。
 - 因此默认 correctness 采用 Gemma 专用 prompt 集，不让 `short_hi` 这类边界题阻塞整条回归；`short_hi` 保留在 edge prompt 集里，专门用于长尾退化诊断。
 

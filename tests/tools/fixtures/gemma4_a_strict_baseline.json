@@ -1,0 +1,14 @@
+{
+  "model": "models/gemma-4-31B-it-AWQ-4bit",
+  "quant": "awq",
+  "prompt_id": "en_capital",
+  "hf_device": "cuda",
+  "max_model_len": 256,
+  "max_num_batched_tokens": 512,
+  "cos_sim": 0.999983,
+  "max_err": 0.0,
+  "hf_argmax": 537,
+  "lite_engine_argmax": 537,
+  "lite_logits_argmax": 537,
+  "collected_at": "2026-04-11"
+}
