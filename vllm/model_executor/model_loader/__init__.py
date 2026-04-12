@@ -3,7 +3,7 @@ import os
 from math import prod
 import torch
 import torch.nn as nn
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 import gguf
 import json
@@ -864,10 +864,12 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
             lite_modules[n] = mod
     params_dict = dict(model.named_parameters())
     loaded_params = set()
+    loaded_module_attrs: Set[str] = set()
     # Sharded checkpoints split qweight / scales / qzeros across files; merge before dequant.
     awq_accum: Dict[str, Dict[str, torch.Tensor]] = {}
     collect_moe_expert = moe_fp8_enabled() and moe_offload_enabled()
     expert_accum: Dict[str, torch.Tensor] = {}
+    seen_language_model_layers = False
     for f in sf_files:
         print(f"    Processing {f}...")
         sd = load_file(os.path.join(local_model_dir, f), device="cpu")
@@ -878,25 +880,71 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                 ):
                     expert_accum[k] = v
         sd_keys = list(sd.keys())
-        use_lm_layers = _checkpoint_has_language_model_layers(sd_keys)
+        if _checkpoint_has_language_model_layers(sd_keys):
+            seen_language_model_layers = True
+        # Keep language-model prefix matching sticky across shards.
+        # Multimodal checkpoints can have tail shards that only contain
+        # vision tensors; falling back to loose "layers.{i}" matching there
+        # can incorrectly overwrite already-loaded text-layer params.
+        use_lm_layers = seen_language_model_layers
         for m_name, m in lite_modules.items():
             idx_match = re.search(r"layers\.(\d+)\.", m_name)
             idx = idx_match.group(1) if idx_match else None
             proj = m_name.split(".")[-1]
             for internal, srcs in attr_map.items():
+                module_internal_key = f"{m_name}.{internal}"
+                if module_internal_key in loaded_module_attrs:
+                    continue
                 found_v = None
                 for s in srcs:
+                    alt_suffixes = [s]
+                    if s == "weight_packed":
+                        alt_suffixes.append("packed")
+                    elif s == "weight_scale":
+                        alt_suffixes.append("scale")
+                    elif s == "weight_shape":
+                        alt_suffixes.append("shape")
+                    elif s == "weight_zero":
+                        alt_suffixes.append("zero")
                     for k in sd_keys:
+                        if k not in sd:
+                            continue
                         if idx is not None and f"layers.{idx}." in k:
                             if not _safetensors_key_matches_main_model_layer(
                                 k, idx, use_lm_layers
                             ):
                                 continue
-                            if k.endswith(f".{proj}.{s}") or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}.{s}"): found_v = sd[k]; break
+                            matched = False
+                            for suffix in alt_suffixes:
+                                if (
+                                    k.endswith(f".{proj}.{suffix}")
+                                    or k.endswith(f".{proj}_{suffix}")
+                                    or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}.{suffix}")
+                                    or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}_{suffix}")
+                                ):
+                                    matched = True
+                                    break
+                            if matched:
+                                found_v = sd[k]
+                                break
                             if "linear_attn" in k and k.endswith(f".{s}") and proj in k:
                                 if not any(x in k for x in ["packed", "scale", "zero"]): found_v = sd[k]; break
                         elif idx is None and "layers." not in k:
-                            if k.endswith(f".{proj}.{s}") or k == f"{m_name}.{s}" or k.endswith(f".{m_name}.{s}"): found_v = sd[k]; break
+                            matched = False
+                            for suffix in alt_suffixes:
+                                if (
+                                    k.endswith(f".{proj}.{suffix}")
+                                    or k.endswith(f".{proj}_{suffix}")
+                                    or k == f"{m_name}.{suffix}"
+                                    or k.endswith(f".{m_name}.{suffix}")
+                                    or k == f"{m_name}_{suffix}"
+                                    or k.endswith(f".{m_name}_{suffix}")
+                                ):
+                                    matched = True
+                                    break
+                            if matched:
+                                found_v = sd[k]
+                                break
                         if found_v is not None: break
                     if found_v is not None: break
                 if found_v is None:
@@ -906,6 +954,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                     m.to("cuda")
                     m.bias = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
                     loaded_count += 1
+                    loaded_module_attrs.add(module_internal_key)
                     del sd[k]; torch.cuda.empty_cache()
                 elif internal == "qweight" and found_v.dtype in [torch.float16, torch.bfloat16]:
                     m.to("cuda")
@@ -913,23 +962,35 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                     m.weight = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
                     loaded_count += 1
                     loaded_params.add(m_name + ".weight")
+                    loaded_module_attrs.add(module_internal_key)
                     del sd[k]; torch.cuda.empty_cache()
                 elif internal in ("qweight", "scales", "qzeros", "weight_shape"):
                     m.to("cuda")
                     if hasattr(m, internal): setattr(m, internal, None)
                     if m_name not in awq_accum:
                         awq_accum[m_name] = {}
+                    if internal in awq_accum[m_name]:
+                        continue
                     awq_accum[m_name][internal] = found_v.to(device="cuda")
+                    loaded_module_attrs.add(module_internal_key)
                     del sd[k]; torch.cuda.empty_cache()
         for p_name, p in params_dict.items():
             if p_name in loaded_params:
                 continue
             target = p_name[6:] if p_name.startswith("model.") else p_name
+            target_aliases = {target}
+            if ".mlp.router." in target:
+                target_aliases.add(target.replace(".mlp.router.", ".router."))
+            if ".mlp.experts." in target:
+                target_aliases.add(target.replace(".mlp.experts.", ".experts."))
             copied = False
             for k in list(sd.keys()):
-                if not _param_copy_key_allowed(k, target, use_lm_layers):
+                if not any(
+                    _param_copy_key_allowed(k, cand, use_lm_layers)
+                    for cand in target_aliases
+                ):
                     continue
-                if k == target or k.endswith("." + target):
+                if any(k == cand or k.endswith("." + cand) for cand in target_aliases):
                     parts = p_name.split(".")
                     obj = model
                     try:
@@ -963,13 +1024,15 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
             continue
         qw = comps["qweight"]
         sc = comps["scales"]
-        K = qw.shape[1] * 8
-        if sc.shape[1] <= 0 or K % sc.shape[1] != 0:
+        packed_cols = qw.shape[-1]
+        K = packed_cols * 8
+        scale_groups = sc.shape[-1] if sc.ndim >= 2 else 0
+        if scale_groups <= 0 or K % scale_groups != 0:
             print(
                 f">>> AWQ skip {m_name}: bad scales shape {tuple(sc.shape)} for packed in_features {K}"
             )
             continue
-        G = K // sc.shape[1]
+        G = K // scale_groups
         try:
             # Force preserve quant for all AWQ models to avoid CPU OOM
             m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)

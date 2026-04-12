@@ -44,11 +44,12 @@ import time
 import argparse
 import math
 import os
+import re
 import sys
 import gc
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Prefill-only audit: HF reference logits must align within this cosine floor (aligned vocab slice).
 # Same-precision Lite vs HF (e.g. both FP16).
@@ -164,6 +165,11 @@ PRESETS = {
         "max_new_tokens": 10,
         "quant": "awq",
     },
+    "gemma4_26b_a4b": {
+        "prompt": "The capital of France is",
+        "max_new_tokens": 10,
+        "quant": "awq",
+    },
     # DeepSeek V2 Lite GGUF
     "deepseek_v2_lite_gguf": {
         "prompt": "The capital of France is",
@@ -264,12 +270,30 @@ def _gemma4_map_ref_key(hf_key: str) -> Optional[str]:
         name = "model." + hf_key[len("model.language_model.") :]
     else:
         name = hf_key
+    # Gemma4 MoE checkpoints keep router/experts at layer root, while Lite model nests
+    # them under decoder_layer.mlp.{router,experts}.
+    m_exp = re.match(r"^model\.layers\.(\d+)\.experts\.(.+)$", name)
+    if m_exp is not None:
+        name = f"model.layers.{m_exp.group(1)}.mlp.experts.{m_exp.group(2)}"
+    m_router = re.match(r"^model\.layers\.(\d+)\.router\.(.+)$", name)
+    if m_router is not None:
+        name = f"model.layers.{m_router.group(1)}.mlp.router.{m_router.group(2)}"
     if name.endswith(".weight_packed"):
         return name[: -len(".weight_packed")] + ".qweight"
     if name.endswith(".weight_scale"):
         return name[: -len(".weight_scale")] + ".scales"
     if name.endswith(".weight_shape"):
         return name
+    if name.endswith(".router.per_expert_scale"):
+        return name
+    if name.endswith("_packed"):
+        return name[: -len("_packed")] + ".qweight"
+    if name.endswith("_scale"):
+        return name[: -len("_scale")] + ".scales"
+    if name.endswith("_zero"):
+        return name[: -len("_zero")] + ".qzeros"
+    if name.endswith("_shape"):
+        return name[: -len("_shape")] + ".weight_shape"
     return name
 
 
@@ -286,6 +310,34 @@ def _set_module_attr_by_name(root: torch.nn.Module, full_name: str, value: Any) 
         obj[int(leaf)] = value
     else:
         setattr(obj, leaf, value)
+
+
+def _resolve_gemma4_target_with_shared_mlp_fallback(
+    model: torch.nn.Module, target: str
+) -> Optional[str]:
+    candidates = [target]
+    m = re.match(
+        r"^(model\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj)(\..+)$",
+        target,
+    )
+    if m is not None:
+        candidates.append(
+            f"{m.group(1)}.shared_mlp.{m.group(2)}{m.group(3)}"
+        )
+    m_shared = re.match(
+        r"^(model\.layers\.\d+\.mlp)\.shared_mlp\.(gate_proj|up_proj|down_proj)(\..+)$",
+        target,
+    )
+    if m_shared is not None:
+        candidates.append(f"{m_shared.group(1)}.{m_shared.group(2)}{m_shared.group(3)}")
+
+    for cand in candidates:
+        try:
+            model.get_parameter(cand)
+            return cand
+        except Exception:
+            continue
+    return None
 
 
 def _assign_gemma4_reference_weights(
@@ -306,21 +358,42 @@ def _assign_gemma4_reference_weights(
                 tensor = f.get_tensor(hf_key)
                 if target.endswith(".weight_shape"):
                     module_name = target[: -len(".weight_shape")]
-                    module = model.get_submodule(module_name)
+                    resolved_module_name = module_name
+                    try:
+                        model.get_submodule(module_name)
+                    except Exception:
+                        resolved_module_name = module_name
+                    m2 = re.match(
+                        r"^(model\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj)$",
+                        module_name,
+                    )
+                    if m2 is not None:
+                        alt = f"{m2.group(1)}.shared_mlp.{m2.group(2)}"
+                        try:
+                            model.get_submodule(alt)
+                            resolved_module_name = alt
+                        except Exception:
+                            resolved_module_name = module_name
+                    try:
+                        module = model.get_submodule(resolved_module_name)
+                    except Exception:
+                        continue
                     module.weight_shape = tuple(int(x) for x in tensor.view(-1).tolist())
                     assigned += 1
                     continue
-                try:
-                    current = model.get_parameter(target)
-                except Exception:
+                resolved_target = _resolve_gemma4_target_with_shared_mlp_fallback(
+                    model, target
+                )
+                if resolved_target is None:
                     continue
+                current = model.get_parameter(resolved_target)
                 if target.endswith((".qweight", ".scales", ".qzeros")):
                     tensor = tensor.to(device=target_device, dtype=tensor.dtype)
                 else:
                     tensor = tensor.to(device=target_device, dtype=current.dtype)
                 _set_module_attr_by_name(
                     model,
-                    target,
+                    resolved_target,
                     torch.nn.Parameter(tensor.contiguous(), requires_grad=False),
                 )
                 assigned += 1
@@ -521,6 +594,79 @@ def compare_logits_aligned(lite_logits: torch.Tensor, ref_logits: torch.Tensor):
     max_err = (a - b).abs().max().item()
     return cos_sim, max_err
 
+
+def _extract_tensor_from_layer_output(output: Any) -> Optional[torch.Tensor]:
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, (tuple, list)):
+        for item in output:
+            if isinstance(item, torch.Tensor):
+                return item
+    return None
+
+
+def _get_gemma4_layers_for_hooks(model: torch.nn.Module) -> list[torch.nn.Module]:
+    root: Any = model
+    if hasattr(root, "inner"):
+        root = root.inner
+    if hasattr(root, "model") and hasattr(root.model, "layers"):
+        return list(root.model.layers)
+    if hasattr(root, "layers"):
+        return list(root.layers)
+    return []
+
+
+def _register_last_token_layer_hooks(
+    layers: list[torch.nn.Module],
+    sink: Dict[int, torch.Tensor],
+) -> list[Any]:
+    handles: list[Any] = []
+    for idx, layer in enumerate(layers):
+        def _hook(_module: torch.nn.Module, _inputs: Any, output: Any, i: int = idx) -> None:
+            t = _extract_tensor_from_layer_output(output)
+            if t is None or t.ndim < 3:
+                return
+            sink[i] = t[:, -1, :].detach().float().cpu()
+
+        handles.append(layer.register_forward_hook(_hook))
+    return handles
+
+
+def _print_first_drift_layer(
+    lite_layer_last_token: Dict[int, torch.Tensor],
+    hf_layer_last_token: Dict[int, torch.Tensor],
+    cos_threshold: float,
+) -> None:
+    shared_layers = sorted(set(lite_layer_last_token.keys()) & set(hf_layer_last_token.keys()))
+    if not shared_layers:
+        print("  [LayerDrift] no shared layer captures; skipping.")
+        return
+
+    first_drift: Optional[int] = None
+    first_drift_cos: Optional[float] = None
+    for li in shared_layers:
+        cos_sim, _ = compare_logits_aligned(
+            lite_layer_last_token[li],
+            hf_layer_last_token[li],
+        )
+        if not math.isfinite(cos_sim):
+            continue
+        if cos_sim < cos_threshold:
+            first_drift = li
+            first_drift_cos = cos_sim
+            break
+
+    if first_drift is None:
+        print(
+            f"  [LayerDrift] compared={len(shared_layers)} first_drift_layer=None "
+            f"(all cos>={cos_threshold:.4f})"
+        )
+    else:
+        print(
+            f"  [LayerDrift] compared={len(shared_layers)} first_drift_layer={first_drift} "
+            f"cos={first_drift_cos:.6f} threshold={cos_threshold:.4f}"
+        )
+
 def _load_hf_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str):
     """
     Load HF reference; supports dense CausalLM and Qwen3.5 multimodal checkpoints.
@@ -595,6 +741,8 @@ def run_alignment_test(
     prefill_only: bool = False,
     awq_force_fused: bool = False,
     awq_disable_fused: bool = False,
+    report_first_drift_layer: bool = False,
+    drift_cos_threshold: float = 0.995,
 ):
     print(f"\n" + "="*60)
     print(f"AUDITING: {os.path.basename(model_path)} (Quant: {quant_type})")
@@ -758,6 +906,8 @@ def run_alignment_test(
         prefill_cos_sim: Optional[float] = None
         prefill_lite_argmax: Optional[int] = None
         prefill_hf_argmax: Optional[int] = None
+        lite_layer_last_token: Dict[int, torch.Tensor] = {}
+        hf_layer_last_token: Dict[int, torch.Tensor] = {}
 
         input_ids_tokens = tokenizer.encode(prompt, return_tensors="pt")
         print(f"  Input Tokens: {input_ids_tokens[0].tolist()}")
@@ -778,8 +928,14 @@ def run_alignment_test(
         if not no_hf and hf_model_path is not None:
             captured_logits = []
             original_forward = engine.model.forward
+            lite_handles: list[Any] = []
+            if report_first_drift_layer and _looks_like_gemma4_model_path(model_path):
+                lite_layers = _get_gemma4_layers_for_hooks(engine.model)
+                lite_handles = _register_last_token_layer_hooks(lite_layers, lite_layer_last_token)
 
             def audit_forward(*args, **kwargs):
+                if lite_handles:
+                    lite_layer_last_token.clear()
                 res = original_forward(*args, **kwargs)
                 captured_logits.append(res.detach().cpu())
                 return res
@@ -794,6 +950,8 @@ def run_alignment_test(
             )
             lite_prefill_token = audit_ro.outputs[0].token_ids[-1]
             engine.model.forward = original_forward
+            for h in lite_handles:
+                h.remove()
             # Last forward in chunked prefill is the final prompt chunk (not the first).
             lite_prefill_logits_cpu = captured_logits[-1][:, -1, :].float().cpu()
             lite_argmax_from_logits = int(torch.argmax(lite_prefill_logits_cpu, dim=-1).item())
@@ -822,6 +980,11 @@ def run_alignment_test(
                 hf_eval_device = next(hf_model.parameters()).device
                 input_ids_hf = input_ids_tokens.to(hf_eval_device)
                 attn_mask = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+                hf_handles: list[Any] = []
+                if report_first_drift_layer and _looks_like_gemma4_model_path(hf_load_path):
+                    hf_layers = _get_gemma4_layers_for_hooks(hf_model)
+                    hf_handles = _register_last_token_layer_hooks(hf_layers, hf_layer_last_token)
+                    hf_layer_last_token.clear()
                 with torch.inference_mode():
                     hf_outputs = hf_model(input_ids_hf, attention_mask=attn_mask)
                     if hasattr(hf_outputs, "logits") and hf_outputs.logits is not None:
@@ -831,6 +994,8 @@ def run_alignment_test(
                     else:
                         raise RuntimeError("HF model output has no usable logits for audit.")
                     hf_token = torch.argmax(hf_logits, dim=-1).item()
+                for h in hf_handles:
+                    h.remove()
                 hf_logits_cmp = hf_logits.float().cpu()
                 vl, vr = lite_prefill_logits_cpu.shape[-1], hf_logits_cmp.shape[-1]
                 if vl != vr:
@@ -849,6 +1014,11 @@ def run_alignment_test(
             hf_eval_device = next(hf_model.parameters()).device
             input_ids_hf = input_ids_tokens.to(hf_eval_device)
             attn_mask = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+            hf_handles: list[Any] = []
+            if report_first_drift_layer and _looks_like_gemma4_model_path(hf_load_path):
+                hf_layers = _get_gemma4_layers_for_hooks(hf_model)
+                hf_handles = _register_last_token_layer_hooks(hf_layers, hf_layer_last_token)
+                hf_layer_last_token.clear()
             with torch.inference_mode():
                 hf_outputs = hf_model(input_ids_hf, attention_mask=attn_mask)
                 if hasattr(hf_outputs, "logits") and hf_outputs.logits is not None:
@@ -858,11 +1028,19 @@ def run_alignment_test(
                 else:
                     raise RuntimeError("HF model output has no usable logits for audit.")
                 hf_token = torch.argmax(hf_logits, dim=-1).item()
+            for h in hf_handles:
+                h.remove()
 
             captured_logits = []
             original_forward = engine.model.forward
+            lite_handles: list[Any] = []
+            if report_first_drift_layer and _looks_like_gemma4_model_path(model_path):
+                lite_layers = _get_gemma4_layers_for_hooks(engine.model)
+                lite_handles = _register_last_token_layer_hooks(lite_layers, lite_layer_last_token)
 
             def audit_forward(*args, **kwargs):
+                if lite_handles:
+                    lite_layer_last_token.clear()
                 res = original_forward(*args, **kwargs)
                 captured_logits.append(res.detach().cpu())
                 return res
@@ -877,6 +1055,8 @@ def run_alignment_test(
             )
             lite_token = audit_ro2.outputs[0].token_ids[-1]
             engine.model.forward = original_forward
+            for h in lite_handles:
+                h.remove()
             lite_logits = captured_logits[-1][:, -1, :].float().cpu()
             lite_argmax_from_logits2 = int(torch.argmax(lite_logits, dim=-1).item())
             hf_logits_cmp = hf_logits.float().cpu()
@@ -894,6 +1074,17 @@ def run_alignment_test(
             prefill_hf_argmax = hf_token
 
         if prefill_only:
+            if (
+                report_first_drift_layer
+                and hf_model is not None
+                and lite_layer_last_token
+                and hf_layer_last_token
+            ):
+                _print_first_drift_layer(
+                    lite_layer_last_token,
+                    hf_layer_last_token,
+                    cos_threshold=drift_cos_threshold,
+                )
             if hf_model is not None and prefill_cos_sim is not None:
                 cos_floor = prefill_cosine_floor_for_hf_compare(
                     model_path, hf_model_path, quant_type
@@ -1094,6 +1285,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Force-disable AWQ fused GEMM path for A/B regression checks.",
     )
+    parser.add_argument(
+        "--report-first-drift-layer",
+        action="store_true",
+        help=(
+            "Prefill-only diagnostic: for Gemma4, compare Lite/HF last-token hidden states per layer "
+            "and print the first layer whose cosine drops below --drift-cos-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--drift-cos-threshold",
+        type=float,
+        default=0.995,
+        help="Cosine threshold used by --report-first-drift-layer.",
+    )
     args = parser.parse_args()
 
     if args.hf_same_as_lite and args.no_hf:
@@ -1137,6 +1342,7 @@ if __name__ == "__main__":
         f"[Config] preset={args.preset}, quant={effective_quant}, "
         f"max_new_tokens={effective_max_new_tokens}, hf_device={hf_device}, "
         f"apply_chat_template={args.apply_chat_template}, prefill_only={args.prefill_only}, "
+        f"report_first_drift_layer={args.report_first_drift_layer}, "
         f"max_model_len={args.max_model_len}, max_num_batched_tokens={args.max_num_batched_tokens}, "
         f"gpu_mem_util={args.gpu_memory_utilization}"
     )
@@ -1165,6 +1371,8 @@ if __name__ == "__main__":
         prefill_only=args.prefill_only,
         awq_force_fused=args.awq_force_fused,
         awq_disable_fused=args.awq_disable_fused,
+        report_first_drift_layer=args.report_first_drift_layer,
+        drift_cos_threshold=args.drift_cos_threshold,
     )
     if not success:
         exit(1)

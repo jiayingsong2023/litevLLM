@@ -26,16 +26,21 @@ export PYTHONPATH="${PYTHONPATH:-.}"
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-}"
+MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-}"
 GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
 
 HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
 HF_GEMMA4_31B="${HF_GEMMA4_31B:-}"
+HF_GEMMA4_26B="${HF_GEMMA4_26B:-}"
 RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
+RUN_GEMMA4_26B="${RUN_GEMMA4_26B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"
 RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-${RUN_GEMMA4_A_TIER}}"
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
+RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-0}"
+RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
 
 require_model_dir() {
   local model_dir="$1"
@@ -124,6 +129,41 @@ resolve_gemma4_model_ref() {
   return 0
 }
 
+resolve_gemma4_26b_model_ref() {
+  local candidates=(
+    "models/gemma-4-26B-A4B-it-AWQ-4bit"
+    "models/Gemma-4-26B-A4B-it-AWQ-4bit"
+    "models/gemma-4-26b-a4b-it-awq-4bit"
+    "models/Gemma-4-26B-A4B"
+  )
+  local candidate
+  if [[ -n "${MODEL_GEMMA4_26B_A4B}" ]]; then
+    if [[ -d "${MODEL_GEMMA4_26B_A4B}" ]]; then
+      printf '%s\n' "${MODEL_GEMMA4_26B_A4B}"
+      return 0
+    fi
+    if is_hf_repo_id "${MODEL_GEMMA4_26B_A4B}"; then
+      for candidate in "${candidates[@]}"; do
+        if [[ -d "${candidate}" ]]; then
+          echo "[Info] Using local Gemma4 26B model dir instead of repo id override: ${candidate}" >&2
+          printf '%s\n' "${candidate}"
+          return 0
+        fi
+      done
+    fi
+    printf '%s\n' "${MODEL_GEMMA4_26B_A4B}"
+    return 0
+  fi
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  printf '%s\n' "google/gemma-4-26B-A4B-it"
+  return 0
+}
+
 SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
   --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
 GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
@@ -140,10 +180,17 @@ GEMMA4_A_STRICT_AUDIT=(uv run python tests/tools/gemma4_prefill_strict_audit.py
   --max-model-len 256
   --gpu-memory-utilization 0.80
   --max-num-batched-tokens 512)
+GEMMA4_26B_A_STRICT_AUDIT=(uv run python tests/tools/gemma4_prefill_strict_audit.py
+  --preset gemma4_26b_a4b
+  --hf-device cuda
+  --max-model-len 256
+  --gpu-memory-utilization 0.80
+  --max-num-batched-tokens 512)
 
 require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
 require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
 MODEL_GEMMA4_31B_Q4="$(resolve_gemma4_model_ref)"
+MODEL_GEMMA4_26B_A4B="$(resolve_gemma4_26b_model_ref)"
 warn_if_repo_id_proxy_is_unsupported "$MODEL_GEMMA4_31B_Q4"
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
@@ -173,6 +220,25 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
     "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
   else
     echo "[Warn] Gemma4 model dir not found, skipping: $MODEL_GEMMA4_31B_Q4"
+  fi
+fi
+
+GEMMA4_26B_AVAILABLE=0
+if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
+  if [[ -d "$MODEL_GEMMA4_26B_A4B" ]] || is_hf_repo_id "$MODEL_GEMMA4_26B_A4B"; then
+    GEMMA4_26B_AVAILABLE=1
+    echo "[Gemma4-26B] Q4/A4B (text-only)"
+    require_model_ref "$MODEL_GEMMA4_26B_A4B" "Gemma4-26B-A4B"
+    GEMMA4_26B_PROMPT_ARGS=(--prompt-subset minimal)
+    if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
+      GEMMA4_26B_PROMPT_ARGS=(--prompts-file "$GEMMA4_PROMPTS_FILE")
+    fi
+    FASTINFERENCE_KV_TYPE=fp16 \
+    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
+    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
+    "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
+  else
+    echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
   fi
 fi
 
@@ -209,6 +275,15 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_STRICT}" == "1" ]]; then
   "${GEMMA4_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_31B_Q4" "${GEMMA_HF_ARGS[@]}"
 fi
 
+if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
+  echo "[A3-strict-26B] Gemma4-26B A4B prefill-only strict audit (manual)"
+  GEMMA26_HF_ARGS=()
+  if [[ -n "$HF_GEMMA4_26B" ]]; then
+    GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
+  fi
+  "${GEMMA4_26B_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_26B_A4B" "${GEMMA26_HF_ARGS[@]}"
+fi
+
 if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
   echo ""
   echo "=== Tier-A-lite (>14B, key-point audit) ==="
@@ -217,6 +292,14 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
   FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
   FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
   "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+fi
+
+if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
+  echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
+  FASTINFERENCE_KV_TYPE=fp16 \
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
+  FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
+  "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
 fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
@@ -249,6 +332,9 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   PERF_MODELS="tinyllama,qwen35_9b_awq"
   if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
     PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
+  fi
+  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b_q4"
   fi
   PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
   echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"

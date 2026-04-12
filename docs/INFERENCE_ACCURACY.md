@@ -100,8 +100,24 @@ PYTHONPATH=. uv run python tests/tools/quality_bar_spotcheck.py \
 - 可选：`bash tests/tools/run_inference_quality_suite.sh`。
 - **`temperature == 0`**：贪婪 argmax，与 A 档 greedy 一致；默认脚本可能为采样，需显式指定。
 - 常用参数：`--prompt-subset minimal|full`、`--prompts-file`（覆盖子集）、`--json`、`--no-heuristics-fail`（启发式告警仍 **exit 0**）。启发式 **PASS/WARN 不等于语义合格**，需人工扫输出。
+- **Gemma4-26B A4B hard gate（默认开启）**：当 `--model` 命中 `gemma-4-26b` 且 `a4b` 时，`quality_bar_spotcheck.py` 会启用模型专用严格规则，用于把「可跑通但不可读」输出判为失败。规则分两层：
+  - 文本结构硬规则：`fragmented_short_run_salad`、`gemma4_26b_*token_soup*`、`gemma4_26b_mixed_token_garble` 等（拦截短词循环、混脚本胶水词、乱码碎片）。
+  - 固定 prompt 语义锚点：仅对 `tests/tools/fixtures/gemma4_correctness_prompts_default.json` 里的 `gemma_*` prompt id 生效（例如 `gemma_en_capital` 需出现 `paris/巴黎`，`gemma_en_bst` 需出现 `tree + (node|left|right|binary)`）。
+  - 注意：该 hard gate 是 **Gemma4-26B 定向门禁**，不是通用语义评分器；其目标是“当前乱码必失败”，而不是跨模型统一打分。
 - **DeepSeek-V2-Lite-GGUF**：权重目录常无 `config.json`；`quality_bar_spotcheck` 会像 tokenizer 一样从同级 `DeepSeek-V2-Lite-Chat` 读取 `model_type` / MoE 字段，以便 Tier-B 默认采样与贪婪下的惩罚与 MoE GGUF 一致。加载器在 `rope_scaling.type=yarn` 时会把 `rope_type` 与 `factor` 同步进 `rope_parameters`，供 `DeepseekV2RotaryEmbedding` 走 YaRN。**MLA 的 `blk.*.attn_q` / `blk.*.attn_kv_b` 在反量化时必须向 `_dequantize_gguf_for_load` 传入 LiteLinear 的 `target_shape=(out,in)`**：否则 `gguf.dequantize` 已给出的正确布局会被「按 GGUF 元数据 reshape」成转置，导致 `q_proj`/`kv_b` 权重与 HF 几乎正交，推理不可读。可选数值稳定：`FASTINFERENCE_GGUF_DEQUANT_FP32=1`（反量化）、`FASTINFERENCE_DEEPSEEK_ATTN_FP32=1`（QK 注意力 FP32，见 `deepseek_v2`）。默认中间反量化对 `deepseek_v2` 为 float16；需要更低峰值内存时可设 `FASTINFERENCE_GGUF_DEQUANT_FP8=1`。Q4 GGUF 与 HF bf16 的 logits 仍可能明显漂移；B 档以观感与 `quality_bar_spotcheck` 为准，**不**以 HF logits 一致为完成条件。
 - **`FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY=1`**：强制在 **Q4 GGUF 权重** 上跑 B 档（不切换到同级 `DeepSeek-V2-Lite-Chat` bf16）。脚本会自动收紧 `top_p` / `top_k` 与重复类惩罚，减轻尾部噪声；**观感仍常明显差于 bf16**，不宜作为交付验收标准，仅适合 GGUF 路径冒烟或调参。产品级 B 档验收请**不要**设置该变量，沿用默认的 sibling bf16。
+
+Gemma4-26B hard gate 复检命令（当前行为应对乱码返回非 0）：
+
+```bash
+FASTINFERENCE_KV_TYPE=fp16 FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 FASTINFERENCE_KV_MAX_MODEL_LEN=1024 \
+PYTHONPATH=. uv run python tests/tools/quality_bar_spotcheck.py \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit \
+  --quant awq \
+  --prompts-file tests/tools/fixtures/gemma4_correctness_prompts_default.json \
+  --max-new-tokens 64 --temperature 0 --top-p 0.95 --top-k -1 \
+  --gpu-memory-utilization 0.55 --max-model-len 1024
+```
 
 ### 5.2 A-strict（Lite vs HF）
 

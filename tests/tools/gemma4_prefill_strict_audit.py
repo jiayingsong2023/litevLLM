@@ -54,6 +54,12 @@ def _build_parser() -> argparse.ArgumentParser:
     default_model = _default_model_path()
     p.add_argument("--model", type=str, default=default_model, required=default_model is None)
     p.add_argument("--hf-model", type=str, default=None)
+    p.add_argument(
+        "--preset",
+        type=str,
+        default="gemma4_31b_q4",
+        choices=("gemma4_31b_q4", "gemma4_26b_a4b"),
+    )
     p.add_argument("--hf-device", type=str, default="cuda", choices=("cpu", "cuda"))
     p.add_argument(
         "--prompt-id",
@@ -72,6 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-batched-tokens", type=int, default=512)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     p.add_argument("--kv-type", type=str, default="turbo_int4")
+    p.add_argument(
+        "--drift-cos-threshold",
+        type=float,
+        default=0.995,
+        help="Cosine threshold for first-drift-layer reporting.",
+    )
     p.add_argument(
         "--quant",
         type=str,
@@ -106,7 +118,7 @@ def main() -> int:
         "--model",
         model_path,
         "--preset",
-        "gemma4_31b_q4",
+        args.preset,
         "--quant",
         args.quant,
         "--prompt",
@@ -124,6 +136,9 @@ def main() -> int:
         "--prefill-only",
         "--apply-chat-template",
         "off",
+        "--report-first-drift-layer",
+        "--drift-cos-threshold",
+        str(args.drift_cos_threshold),
     ]
 
     env = os.environ.copy()

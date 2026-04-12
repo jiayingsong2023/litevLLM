@@ -125,6 +125,94 @@ def test_coherence_fails_on_low_token_diversity(qb: Any) -> None:
     assert detail["coherence"]["pass"] is False
 
 
+def test_substance_fails_on_mixed_script_fragmentation(qb: Any) -> None:
+    text = (
+        "Helloمرحباهाँです한국어 mixed tokens for test and more symbols "
+        "مرحباhelloहिन्दीかな한글abc"
+    )
+    ids = list(range(64))
+    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    assert severe
+    assert detail["substance"]["pass"] is False
+    assert any("mixed_script_fragmentation" in m for m in msgs)
+
+
+def test_substance_ok_for_single_script_with_small_english_mix(qb: Any) -> None:
+    text = "法国的首都是巴黎。这是一个简短回答，with only a tiny English suffix."
+    ids = list(range(40))
+    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    assert detail["substance"]["pass"] is True
+    assert not any("mixed_script_fragmentation" in m for m in msgs)
+
+
+def test_substance_fails_on_fragmented_short_run_salad(qb: Any) -> None:
+    text = (
+        "de ownاًగా तरह negeri- ANSed%， Aj own ownاً%、-감이- APPEND own astonishingor-- "
+        "阿-APPEND way̸-( worldるur- Ã arrange own debans de de de Americana autos much←Ann #-}"
+    )
+    ids = list(range(48))
+    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    assert severe
+    assert detail["substance"]["pass"] is False
+    assert any("fragmented_short_run_salad" in m for m in msgs)
+
+
+def test_substance_hard_rule_not_triggered_for_normal_prose(qb: Any) -> None:
+    text = (
+        "A binary search tree is a data structure where each node has a key, and keys in the left "
+        "subtree are smaller while keys in the right subtree are larger."
+    )
+    ids = list(range(48))
+    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    assert detail["substance"]["pass"] is True
+    assert not any("fragmented_short_run_salad" in m for m in msgs)
+
+
+def test_gemma4_26b_structural_garble_fails_under_strict_profile(qb: Any) -> None:
+    text = (
+        "maybe than deANSWERS a de muchA-- amazing ownAns-APPEND own-- deNine own much own own "
+        "much de- de-ANNAne로Milk arrangements-Annot-accent army arrangement anxious de-로-Dairy "
+        "de own deAAsync,"
+    )
+    ids = list(range(64))
+    severe, detail, msgs = qb.analyze_tier_b(
+        text,
+        ids,
+        _FakeTok(),
+        check_substance=True,
+        strict_profile="gemma4_26b",
+    )
+    assert severe
+    assert detail["substance"]["pass"] is False
+    assert any(
+        "gemma4_26b_structural_garble" in m
+        or "gemma4_26b_lexical_collapse" in m
+        or "gemma4_26b_token_soup_loop" in m
+        or "gemma4_26b_token_soup_top2" in m
+        or "gemma4_26b_token_soup_heavy" in m
+        or "gemma4_26b_repeat_glue" in m
+        or "gemma4_26b_mixed_token_garble" in m
+        for m in msgs
+    )
+
+
+def test_gemma4_26b_strict_profile_keeps_normal_text_pass(qb: Any) -> None:
+    text = (
+        "Gradient descent is an optimization method that updates parameters by moving in the "
+        "direction opposite to the gradient, so the loss decreases over iterations."
+    )
+    ids = list(range(40))
+    severe, detail, msgs = qb.analyze_tier_b(
+        text,
+        ids,
+        _FakeTok(),
+        check_substance=True,
+        strict_profile="gemma4_26b",
+    )
+    assert detail["substance"]["pass"] is True
+    assert not any("gemma4_26b_structural_garble" in m for m in msgs)
+
+
 def test_model_config_hints_deepseek_moe_from_n_routed_experts(qb: Any) -> None:
     """DeepSeek V2 GGUF config uses n_routed_experts (not num_experts) — must enable MoE Tier-B defaults."""
     with tempfile.TemporaryDirectory() as d:
@@ -133,3 +221,15 @@ def test_model_config_hints_deepseek_moe_from_n_routed_experts(qb: Any) -> None:
         h = qb._model_config_hints(d)
     assert h["model_type"] == "deepseek_v2"
     assert h["is_moe"] is True
+
+
+def test_gemma4_26b_prompt_anchor_rules_fail_on_garble(qb: Any) -> None:
+    bad = "de autos own de- arrangement own de"
+    notes = qb._gemma4_26b_prompt_anchor_issues("gemma_en_capital", bad)
+    assert any("gemma4_26b_prompt_anchor_miss" in n for n in notes)
+
+
+def test_gemma4_26b_prompt_anchor_rules_pass_on_readable(qb: Any) -> None:
+    ok = "The capital of France is Paris."
+    notes = qb._gemma4_26b_prompt_anchor_issues("gemma_en_capital", ok)
+    assert notes == []

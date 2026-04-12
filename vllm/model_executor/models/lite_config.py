@@ -72,11 +72,19 @@ class LiteConfig:
         # Qwen3.5 MoE text (e.g. Qwen3_5MoeTextConfig / qwen3_5_moe_text)
         self.model_type = getattr(hf_config, "model_type", "") or ""
         self.num_experts = int(getattr(hf_config, "num_experts", 0) or 0)
-        self.num_experts_per_tok = int(getattr(hf_config, "num_experts_per_tok", 0) or 0)
+        self.num_experts_per_tok = int(
+            getattr(
+                hf_config,
+                "num_experts_per_tok",
+                getattr(hf_config, "top_k_experts", 0),
+            )
+            or 0
+        )
         self.moe_intermediate_size = int(getattr(hf_config, "moe_intermediate_size", 0) or 0)
         self.shared_expert_intermediate_size = int(
             getattr(hf_config, "shared_expert_intermediate_size", 0) or 0
         )
+        self.num_shared_experts = int(getattr(hf_config, "num_shared_experts", 0) or 0)
         _lt = getattr(hf_config, "layer_types", None)
         self.layer_types: Optional[list[str]] = _normalize_layer_types(_lt)
         self.full_attention_interval = int(getattr(hf_config, "full_attention_interval", 4) or 4)

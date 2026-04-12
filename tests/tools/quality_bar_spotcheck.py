@@ -59,6 +59,33 @@ _MANY_TOKENS_FOR_SUBSTANCE = 8
 _MIN_BODY_CHARS_FOR_LETTER_RATIO = 16
 _MIN_LETTERISH_RATIO = 0.15
 _MAX_DIGIT_RATIO_SEVERE = 0.68
+_MIN_LETTERS_FOR_SCRIPT_FRAGMENT_CHECK = 18
+_MIN_SCRIPT_BUCKETS_FOR_FRAGMENT_SEVERE = 3
+_MAX_DOMINANT_SCRIPT_RATIO_FOR_FRAGMENT_SEVERE = 0.80
+_MIN_CORE_CHARS_FOR_FRAGMENTED_SHORT_RUN_SALAD = 40
+_MIN_RUN_COUNT_FOR_FRAGMENTED_SHORT_RUN_SALAD = 12
+_MIN_SHORT_RUN_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD = 0.50
+_MIN_PUNCT_SYMBOL_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD = 0.12
+_MIN_TOKENS_FOR_GEMMA4_26B_STRUCTURE_CHECK = 12
+_MAX_CLEAN_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE = 0.35
+_MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE = 0.45
+_MIN_WORDS_FOR_GEMMA4_26B_LEXICAL_COLLAPSE = 12
+_MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE = 0.60
+_MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE = 0.18
+_MAX_UNIQUE_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE = 0.60
+_MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP = 0.45
+_MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP = 0.18
+_MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP = 0.18
+_MIN_TOP2_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP = 0.36
+_MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_TOP2 = 0.40
+_MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_HEAVY = 0.34
+_MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_HEAVY = 0.50
+_MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE = 0.22
+_MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE = 0.25
+_MAX_UNIQUE_WORD_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE = 0.72
+_MIN_MIXED_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE = 0.20
+_MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE = 0.30
+_MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE = 0.45
 
 
 def _lite_engine_step_budget(engine: LiteEngine, prompt_token_len: int, max_new_tokens: int) -> int:
@@ -313,6 +340,37 @@ def _looks_like_code_fragment(text: str) -> bool:
     return any(n in s for n in needles)
 
 
+def _script_bucket(ch: str) -> str:
+    """Coarse Unicode script buckets for text-fragmentation detection."""
+    if not _is_letterish(ch):
+        return "non_letter"
+    o = ord(ch)
+    if (
+        0x4E00 <= o <= 0x9FFF
+        or 0x3400 <= o <= 0x4DBF
+        or 0x20000 <= o <= 0x2A6DF
+    ):
+        return "cjk"
+    name = unicodedata.name(ch, "")
+    if "LATIN" in name:
+        return "latin"
+    if "CYRILLIC" in name:
+        return "cyrillic"
+    if "ARABIC" in name:
+        return "arabic"
+    if "DEVANAGARI" in name:
+        return "devanagari"
+    if "HANGUL" in name:
+        return "hangul"
+    if "HIRAGANA" in name:
+        return "hiragana"
+    if "KATAKANA" in name:
+        return "katakana"
+    if "THAI" in name:
+        return "thai"
+    return "other_letter"
+
+
 def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
     """Human-readability signals not covered by replacement/control/repeat checks."""
     notes: List[str] = []
@@ -349,6 +407,216 @@ def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
     elif ratio_letter < _MIN_LETTERISH_RATIO and len(core) >= 24:
         notes.append(f"low_letterish_ratio({ratio_letter:.2f} on len={len(core)})")
 
+    letter_buckets: Counter[str] = Counter()
+    for ch in core:
+        b = _script_bucket(ch)
+        if b != "non_letter":
+            letter_buckets[b] += 1
+    total_letters = sum(letter_buckets.values())
+    if total_letters >= _MIN_LETTERS_FOR_SCRIPT_FRAGMENT_CHECK:
+        script_buckets = [
+            k for k, v in letter_buckets.items() if v > 0 and k != "other_letter"
+        ]
+        if len(script_buckets) >= _MIN_SCRIPT_BUCKETS_FOR_FRAGMENT_SEVERE:
+            dominant = max(letter_buckets.values()) / total_letters
+            if dominant <= _MAX_DOMINANT_SCRIPT_RATIO_FOR_FRAGMENT_SEVERE:
+                notes.append(
+                    "mixed_script_fragmentation("
+                    f"buckets={sorted(script_buckets)} dominant={dominant:.2f})"
+                )
+
+    # Hard rule: fragmented short-run word salad (typical Gemma4-26B failure mode).
+    # Pattern: many tiny letter runs split by punctuation/symbol glue ("de- own- ..."),
+    # not natural prose and not code.
+    if len(core) >= _MIN_CORE_CHARS_FOR_FRAGMENTED_SHORT_RUN_SALAD:
+        runs: List[int] = []
+        run_len = 0
+        run_bucket: Optional[str] = None
+        punct_sym = 0
+        for ch in core:
+            cat0 = unicodedata.category(ch)[0]
+            if cat0 in ("P", "S"):
+                punct_sym += 1
+            if _is_letterish(ch):
+                b = _script_bucket(ch)
+                if run_len == 0:
+                    run_len = 1
+                    run_bucket = b
+                elif b == run_bucket:
+                    run_len += 1
+                else:
+                    runs.append(run_len)
+                    run_len = 1
+                    run_bucket = b
+            else:
+                if run_len > 0:
+                    runs.append(run_len)
+                    run_len = 0
+                    run_bucket = None
+        if run_len > 0:
+            runs.append(run_len)
+
+        if len(runs) >= _MIN_RUN_COUNT_FOR_FRAGMENTED_SHORT_RUN_SALAD:
+            short_ratio = sum(1 for x in runs if x <= 3) / len(runs)
+            punct_ratio = punct_sym / len(core)
+            if (
+                short_ratio >= _MIN_SHORT_RUN_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD
+                and punct_ratio >= _MIN_PUNCT_SYMBOL_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD
+            ):
+                notes.append(
+                    "fragmented_short_run_salad("
+                    f"runs={len(runs)} short_ratio={short_ratio:.2f} punct_ratio={punct_ratio:.2f})"
+                )
+
+    return notes
+
+
+def _looks_like_gemma4_26b_a4b_model(model_path: str) -> bool:
+    b = os.path.basename(os.path.abspath(model_path)).lower()
+    return "gemma-4-26b" in b and "a4b" in b
+
+
+def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
+    """Gemma4-26B-specific hard rule for garbled token-salad decode."""
+    notes: List[str] = []
+    tokens = [t for t in text.split() if t]
+    if len(tokens) < _MIN_TOKENS_FOR_GEMMA4_26B_STRUCTURE_CHECK:
+        return notes
+
+    considered = 0
+    weird = 0
+    clean = 0
+    mixed_token_count = 0
+    strip_chars = " \t\r\n`'\".,!?;:()[]{}<>"
+
+    for tok in tokens:
+        core = tok.strip(strip_chars)
+        if not core:
+            continue
+        considered += 1
+        letterish = sum(1 for ch in core if _is_letterish(ch))
+        punct_sym = sum(1 for ch in core if unicodedata.category(ch)[0] in ("P", "S"))
+        core_len = len(core)
+
+        if letterish <= 0:
+            weird += 1
+            continue
+
+        letter_ratio = letterish / max(core_len, 1)
+        punct_ratio = punct_sym / max(core_len, 1)
+        script_buckets = {_script_bucket(ch) for ch in core if _is_letterish(ch)}
+        if len(script_buckets) >= 2:
+            mixed_token_count += 1
+
+        token_weird = (
+            punct_ratio >= 0.20
+            or letter_ratio < 0.55
+            or len(script_buckets) >= 2
+        )
+        if token_weird:
+            weird += 1
+
+        token_clean = (
+            punct_sym == 0
+            and letter_ratio >= 0.80
+            and len(script_buckets) <= 1
+        )
+        if token_clean:
+            clean += 1
+
+    if considered < _MIN_TOKENS_FOR_GEMMA4_26B_STRUCTURE_CHECK:
+        return notes
+
+    weird_ratio = weird / considered
+    clean_ratio = clean / considered
+    mixed_token_ratio = mixed_token_count / considered
+    if (
+        weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE
+        and clean_ratio <= _MAX_CLEAN_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE
+    ):
+        notes.append(
+            "gemma4_26b_structural_garble("
+            f"tokens={considered} weird_ratio={weird_ratio:.2f} clean_ratio={clean_ratio:.2f})"
+        )
+
+    # Catch "looks tokenized but unreadable" outputs with heavy short-word repetition
+    # (e.g. de/own/much loops).
+    words: List[str] = []
+    for tok in tokens:
+        core = tok.strip(strip_chars)
+        if not core:
+            continue
+        normalized = "".join(
+            ch.lower() for ch in core if _is_letterish(ch) or ch.isdigit()
+        )
+        if len(normalized) >= 2:
+            words.append(normalized)
+    if len(words) >= _MIN_WORDS_FOR_GEMMA4_26B_LEXICAL_COLLAPSE:
+        short_ratio = sum(1 for w in words if len(w) <= 4) / len(words)
+        c_words = Counter(words)
+        uniq_ratio = len(c_words) / len(words)
+        top_counts = sorted(c_words.values(), reverse=True)
+        top_ratio = top_counts[0] / len(words)
+        top2_ratio = (top_counts[0] + (top_counts[1] if len(top_counts) > 1 else 0)) / len(words)
+        if (
+            short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE
+            and top_ratio >= _MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE
+            and uniq_ratio <= _MAX_UNIQUE_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE
+        ):
+            notes.append(
+                "gemma4_26b_lexical_collapse("
+                f"words={len(words)} short_ratio={short_ratio:.2f} "
+                f"top_ratio={top_ratio:.2f} unique_ratio={uniq_ratio:.2f})"
+            )
+        elif (
+            short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP
+            and top_ratio >= _MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP
+            and weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP
+        ):
+            notes.append(
+                "gemma4_26b_token_soup_loop("
+                f"words={len(words)} short_ratio={short_ratio:.2f} "
+                f"top_ratio={top_ratio:.2f} weird_ratio={weird_ratio:.2f})"
+            )
+        elif (
+            short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_TOP2
+            and top2_ratio >= _MIN_TOP2_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP
+            and weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP
+        ):
+            notes.append(
+                "gemma4_26b_token_soup_top2("
+                f"words={len(words)} short_ratio={short_ratio:.2f} "
+                f"top2_ratio={top2_ratio:.2f} weird_ratio={weird_ratio:.2f})"
+            )
+        elif (
+            short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_HEAVY
+            and weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_TOKEN_SOUP_HEAVY
+        ):
+            notes.append(
+                "gemma4_26b_token_soup_heavy("
+                f"words={len(words)} short_ratio={short_ratio:.2f} "
+                f"weird_ratio={weird_ratio:.2f})"
+            )
+        elif (
+            top_ratio >= _MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE
+            and weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE
+            and uniq_ratio <= _MAX_UNIQUE_WORD_RATIO_FOR_GEMMA4_26B_REPEAT_GLUE
+        ):
+            notes.append(
+                "gemma4_26b_repeat_glue("
+                f"words={len(words)} top_ratio={top_ratio:.2f} "
+                f"weird_ratio={weird_ratio:.2f} unique_ratio={uniq_ratio:.2f})"
+            )
+        elif (
+            mixed_token_ratio >= _MIN_MIXED_TOKEN_RATIO_FOR_GEMMA4_26B_GARBLE
+            and weird_ratio >= _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE
+            and short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE
+        ):
+            notes.append(
+                "gemma4_26b_mixed_token_garble("
+                f"words={len(words)} mixed_token_ratio={mixed_token_ratio:.2f} "
+                f"weird_ratio={weird_ratio:.2f} short_ratio={short_ratio:.2f})"
+            )
     return notes
 
 
@@ -401,6 +669,7 @@ def analyze_tier_b(
     tokenizer: Any,
     *,
     check_substance: bool = True,
+    strict_profile: str = "default",
 ) -> Tuple[bool, Dict[str, Any], List[str]]:
     """
     Map outputs to INFERENCE_ACCURACY.md tier-B dimensions:
@@ -500,6 +769,12 @@ def analyze_tier_b(
             detail["substance"]["notes"].append(note)
             flat.append(note)
             severe = True
+        if strict_profile == "gemma4_26b":
+            for note in _gemma4_26b_hard_quality_issues(text):
+                detail["substance"]["pass"] = False
+                detail["substance"]["notes"].append(note)
+                flat.append(note)
+                severe = True
 
     detail["tier_b_alignment"] = {
         "readability_ok": detail["readability"]["pass"],
@@ -617,6 +892,40 @@ def _apply_chat_template_to_prompts(
             wrapped = text
         out.append((pid, wrapped))
     return out
+
+
+def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> List[str]:
+    """Prompt-specific minimal semantic anchors for Gemma4-26B Tier-B fixed suite."""
+    pid = (prompt_id or "").strip().lower()
+    s = (text or "").strip()
+    s_l = s.lower()
+    if not pid.startswith("gemma_"):
+        return []
+
+    def _has_any(needles: List[str]) -> bool:
+        return any(n in s_l for n in needles)
+
+    if pid == "gemma_en_capital":
+        if "paris" not in s_l:
+            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_en_capital, need=paris)"]
+    elif pid == "gemma_zh_capital":
+        if "巴黎" not in s and "paris" not in s_l:
+            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_zh_capital, need=巴黎|paris)"]
+    elif pid == "gemma_en_bst":
+        has_tree = "tree" in s_l
+        has_shape = any(k in s_l for k in ("node", "left", "right", "binary"))
+        if not (has_tree and has_shape):
+            return [
+                "gemma4_26b_prompt_anchor_miss("
+                "pid=gemma_en_bst, need=tree+(node|left|right|binary))"
+            ]
+    elif pid == "gemma_zh_gd":
+        if not _has_any(["梯度", "gradient", "loss", "学习率"]):
+            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_zh_gd, need=梯度|gradient|loss|学习率)"]
+    elif pid == "gemma_chat_intro":
+        if not _has_any(["hello", "hi", "assist", "help", "你好", "您好"]):
+            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_chat_intro, need=greeting/help)"]
+    return []
 
 
 def main() -> int:
@@ -959,6 +1268,7 @@ def main() -> int:
     engine.tokenizer = tokenizer
 
     prompts = _apply_chat_template_to_prompts(args.chat_template, tokenizer, prompts)
+    strict_profile = "gemma4_26b" if _looks_like_gemma4_26b_a4b_model(args.model) else "default"
 
     any_severe = False
     summary_rows: List[dict] = []
@@ -1004,7 +1314,16 @@ def main() -> int:
             token_ids,
             tokenizer,
             check_substance=not args.skip_substance_heuristics,
+            strict_profile=strict_profile,
         )
+        if strict_profile == "gemma4_26b":
+            for note in _gemma4_26b_prompt_anchor_issues(pid, text):
+                detail["substance"]["pass"] = False
+                detail["substance"]["notes"].append(note)
+                msgs.append(note)
+                severe = True
+            if "tier_b_alignment" in detail:
+                detail["tier_b_alignment"]["substance_ok"] = detail["substance"]["pass"]
 
         row = {
             "id": pid,

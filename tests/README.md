@@ -53,6 +53,14 @@ Gemma4 默认 correctness prompt 集：
 Gemma4 边界题 / 长尾退化调试 prompt 集：
 `tests/tools/fixtures/gemma4_edge_prompts_debug.json`
 
+Gemma4-26B A4B（`models/gemma-4-26B-A4B-it-AWQ-4bit`）的 Tier-B 说明：
+
+- `tests/tools/quality_bar_spotcheck.py` 对该模型自动启用 `gemma4_26b` hard gate（模型专用）。
+- hard gate 包含两类检查：
+  - 结构可读性硬规则：拦截 token-soup、短词循环、混脚本胶水词等典型乱码。
+  - 固定 prompt 语义锚点：对 `gemma4_correctness_prompts_default.json` 的 `gemma_*` prompt id 校验最小语义锚（如 `capital -> paris/巴黎`、`bst -> tree+node/left/right/binary`）。
+- 该机制目标是避免 Tier-B 启发式假阳性（“看似通过但文本不可读”）；它是 Gemma4-26B 定向门禁，不是通用语义评分器。
+
 ## 一键 pytest（默认，不加载整模）
 
 ```bash

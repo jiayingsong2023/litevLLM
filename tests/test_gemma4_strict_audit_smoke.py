@@ -125,6 +125,9 @@ def test_main_builds_verify_command_and_env(
         "--prefill-only",
         "--apply-chat-template",
         "off",
+        "--report-first-drift-layer",
+        "--drift-cos-threshold",
+        "0.995",
     ]
     assert calls["env"]["FASTINFERENCE_KV_TYPE"] == "turbo_int4"
     assert calls["env"]["FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS"] == "1"

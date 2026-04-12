@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 import torch
 import torch.nn as nn
@@ -8,6 +9,11 @@ import torch.nn.functional as F
 
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
+from vllm.model_executor.layers.quantization.tensor import (
+    dequantize_awq_pytorch,
+    dequantize_symmetric_packed_int4_pytorch,
+)
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from .lite_config import LiteConfig
@@ -23,6 +29,10 @@ def _meta_get(meta: Any, key: str, default: Any = None) -> Any:
     if isinstance(meta, dict):
         return meta.get(key, default)
     return getattr(meta, key, default)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _repeat_kv_for_gqa(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -45,13 +55,17 @@ def _causal_attention_ref(
     k_full = _repeat_kv_for_gqa(k, n_rep)
     v_full = _repeat_kv_for_gqa(v, n_rep)
     scores = torch.matmul(q, k_full.transpose(2, 3)) * scale
-    s = q.shape[2]
-    causal = torch.triu(torch.ones(s, s, device=q.device, dtype=torch.bool), diagonal=1)
-    scores = scores.masked_fill(causal, float("-inf"))
+    q_len = int(q.shape[2])
+    kv_len = int(k_full.shape[2])
+    # Support both square (q_len == kv_len) and chunked prefill (q_len < kv_len).
+    # For chunked prefill, q is assumed to be the tail segment of the kv timeline.
+    q_pos = torch.arange(q_len, device=q.device, dtype=torch.long) + (kv_len - q_len)
+    k_pos = torch.arange(kv_len, device=q.device, dtype=torch.long)
+    causal = k_pos[None, :] > q_pos[:, None]
+    scores = scores.masked_fill(causal[None, None, :, :], float("-inf"))
     if local_window is not None and local_window > 0:
-        idx = torch.arange(s, device=q.device)
-        dist = idx[None, :] - idx[:, None]
-        local_mask = dist >= local_window
+        dist = q_pos[:, None] - k_pos[None, :]
+        local_mask = dist >= int(local_window)
         scores = scores.masked_fill(local_mask[None, None, :, :], float("-inf"))
     if softcap is not None and softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
@@ -87,14 +101,17 @@ def _gather_recent_kv(
     batch_idx: int,
     num_kv_heads: int,
     head_dim: int,
-    local_window: int,
+    local_window: Optional[int],
     kv_cache_dtype: str,
     kv_scale_cache: Optional[tuple[Any, Any]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     k_cache, v_cache = kv_cache
     block_size = int(k_cache.shape[1])
     seq_len = int(seq_lens[batch_idx].item())
-    start = max(0, seq_len - local_window)
+    if local_window is None or int(local_window) <= 0:
+        start = 0
+    else:
+        start = max(0, seq_len - int(local_window))
     k_rows = []
     v_rows = []
     k_scale_cache = kv_scale_cache[0] if kv_scale_cache is not None else None
@@ -120,6 +137,39 @@ def _gather_recent_kv(
     k = torch.stack(k_rows, dim=0).unsqueeze(0)
     v = torch.stack(v_rows, dim=0).unsqueeze(0)
     return k, v
+
+
+def _should_use_full_decode_reference(kv_cache_dtype: str) -> bool:
+    kvt = str(kv_cache_dtype).lower()
+    # Stability-first path for Gemma4 decode alignment:
+    # when KV is full precision, use the same reference attention math as no-cache path.
+    return ("int4" not in kvt) and ("fp8" not in kvt)
+
+
+def _write_full_precision_kv_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    flat_k = k.reshape(-1, num_kv_heads, head_dim).contiguous()
+    flat_v = v.reshape(-1, num_kv_heads, head_dim).contiguous()
+    valid = slot_mapping >= 0
+    if not bool(valid.any()):
+        return
+    slots = slot_mapping[valid].to(torch.long)
+    block_size = int(k_cache.shape[1])
+    block_idx = torch.div(slots, block_size, rounding_mode="floor")
+    block_off = torch.remainder(slots, block_size)
+    k_cache[block_idx, block_off, :num_kv_heads, :head_dim] = flat_k[valid].to(
+        dtype=k_cache.dtype
+    )
+    v_cache[block_idx, block_off, :num_kv_heads, :head_dim] = flat_v[valid].to(
+        dtype=v_cache.dtype
+    )
 
 
 def _layer_type_for_idx(config: LiteConfig, layer_idx: int) -> str:
@@ -229,6 +279,8 @@ class Gemma4Attention(nn.Module):
             if self.is_sliding
             else getattr(config, "num_global_key_value_heads", config.num_key_value_heads)
         )
+        # HF Gemma4TextAttention uses q/k RMSNorm and sets attention scaling to 1.0.
+        # Keeping it aligned avoids over-damping logits (especially in MoE variants).
         self.scale = 1.0
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -332,29 +384,40 @@ class Gemma4Attention(nn.Module):
             else:
                 k_scale_cache, v_scale_cache = (None, None)
 
-            reshape_and_cache(
-                k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                k_cache,
-                v_cache,
-                slot_mapping,
-                kv_cache_dtype,
-                k_scale,
-                v_scale,
-                k_scale_cache=k_scale_cache,
-                v_scale_cache=v_scale_cache,
-            )
+            if _should_use_full_decode_reference(str(kv_cache_dtype)):
+                _write_full_precision_kv_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )
+            else:
+                reshape_and_cache(
+                    k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
+                    v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
+                    k_cache,
+                    v_cache,
+                    slot_mapping,
+                    kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                    k_scale_cache=k_scale_cache,
+                    v_scale_cache=v_scale_cache,
+                )
 
             is_prefill = bool(_meta_get(attn_metadata, "is_prefill", False))
             if is_local and is_prefill and seqlen > 1:
                 out = _causal_attention_ref(
-                    q.transpose(1, 2),
-                    k.transpose(1, 2),
-                    v.transpose(1, 2),
+                    q.transpose(1, 2).float(),
+                    k.transpose(1, 2).float(),
+                    v.transpose(1, 2).float(),
                     self.scale,
                     local_window=local_window,
                     softcap=softcap,
-                ).view(bsz, seqlen, -1)
+                ).to(q.dtype).view(bsz, seqlen, -1)
             elif is_local and not is_prefill:
                 block_tables = _meta_get(attn_metadata, "block_tables", None)
                 seq_lens = _meta_get(attn_metadata, "seq_lens", None)
@@ -365,6 +428,7 @@ class Gemma4Attention(nn.Module):
                 )
                 outs = []
                 for bi in range(bsz):
+                    ctx_window = int(local_window or 0)
                     k_ctx, v_ctx = _gather_recent_kv(
                         kv_cache=kv_cache,
                         block_tables=block_tables,
@@ -372,19 +436,19 @@ class Gemma4Attention(nn.Module):
                         batch_idx=bi,
                         num_kv_heads=self.num_kv_heads,
                         head_dim=self.head_dim,
-                        local_window=int(local_window or 0),
+                        local_window=ctx_window,
                         kv_cache_dtype=str(kv_dtype_name),
                         kv_scale_cache=(k_scale_cache, v_scale_cache),
                     )
-                    q_i = q[bi : bi + 1].transpose(1, 2)
+                    q_i = q[bi : bi + 1].transpose(1, 2).float()
                     out_i = _causal_attention_ref(
                         q_i,
-                        k_ctx.transpose(1, 2).to(q.dtype),
-                        v_ctx.transpose(1, 2).to(q.dtype),
+                        k_ctx.transpose(1, 2).float(),
+                        v_ctx.transpose(1, 2).float(),
                         self.scale,
                         local_window=None,
                         softcap=softcap,
-                    ).view(1, seqlen, -1)
+                    ).to(q.dtype).view(1, seqlen, -1)
                     outs.append(out_i)
                 out = torch.cat(outs, dim=0)
             else:
@@ -398,6 +462,33 @@ class Gemma4Attention(nn.Module):
                 )
                 block_tables = _meta_get(attn_metadata, "block_tables", None)
                 seq_lens = _meta_get(attn_metadata, "seq_lens", None)
+                use_full_ref = _should_use_full_decode_reference(str(kv_cache_dtype))
+                if use_full_ref and block_tables is not None and seq_lens is not None:
+                    outs = []
+                    for bi in range(bsz):
+                        k_ctx, v_ctx = _gather_recent_kv(
+                            kv_cache=kv_cache,
+                            block_tables=block_tables,
+                            seq_lens=seq_lens,
+                            batch_idx=bi,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim=self.head_dim,
+                            local_window=None,
+                            kv_cache_dtype=str(kv_cache_dtype),
+                            kv_scale_cache=(k_scale_cache, v_scale_cache),
+                        )
+                        q_i = q[bi : bi + 1].transpose(1, 2).float()
+                        out_i = _causal_attention_ref(
+                            q_i,
+                            k_ctx.transpose(1, 2).float(),
+                            v_ctx.transpose(1, 2).float(),
+                            self.scale,
+                            local_window=None,
+                            softcap=softcap,
+                        ).to(q.dtype).view(1, seqlen, -1)
+                        outs.append(out_i)
+                    out = torch.cat(outs, dim=0)
+                    return self.o_proj(out, lora_mapping)
                 seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
                     bsz, seqlen, is_prefill, seq_lens, block_tables, q.device
                 )
@@ -477,16 +568,489 @@ class Gemma4MLP(nn.Module):
         return self.down_proj(act * up, lora_mapping)
 
 
+def _is_gemma4_moe_enabled(config: LiteConfig) -> bool:
+    return bool(
+        int(getattr(config, "num_experts", 0) or 0) > 0
+        and int(getattr(config, "num_experts_per_tok", 0) or 0) > 0
+        and int(getattr(config, "moe_intermediate_size", 0) or 0) > 0
+    )
+
+
+def _is_gemma4_moe_layer(config: LiteConfig, layer_idx: int) -> bool:
+    if not _is_gemma4_moe_enabled(config):
+        return False
+    if hasattr(config, "is_moe_layer"):
+        try:
+            return bool(config.is_moe_layer(layer_idx))
+        except Exception:
+            pass
+    return True
+
+
+def _is_gemma4_26b_a4b_like(config: LiteConfig) -> bool:
+    return bool(
+        int(getattr(config, "hidden_size", 0) or 0) == 2816
+        and int(getattr(config, "num_hidden_layers", 0) or 0) == 30
+        and int(getattr(config, "num_experts", 0) or 0) >= 64
+        and int(getattr(config, "moe_intermediate_size", 0) or 0) > 0
+    )
+
+
+def _residual_add_fp32(residual: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+    return (residual.float() + update.float()).to(residual.dtype)
+
+
+def _reshape_hidden_to_2d(
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    bsz, seqlen, hidden_dim = hidden_states.shape
+    return hidden_states.reshape(bsz * seqlen, hidden_dim), (bsz, seqlen, hidden_dim)
+
+
+def _restore_hidden_from_2d(
+    hidden_states_2d: torch.Tensor,
+    shape: tuple[int, int, int],
+) -> torch.Tensor:
+    bsz, seqlen, hidden_dim = shape
+    return hidden_states_2d.reshape(bsz, seqlen, hidden_dim)
+
+
+class Gemma4TopKRouterLite(nn.Module):
+    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str):
+        super().__init__()
+        self.num_experts = int(config.num_experts)
+        self.top_k = int(config.num_experts_per_tok)
+        self.hidden_size = int(config.hidden_size)
+        self.eps = float(_get_eps(config))
+        self.scalar_root_size = float(max(1, self.hidden_size)) ** -0.5
+        self.proj = LiteLinear(
+            config.hidden_size,
+            self.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.router.proj",
+        )
+        # Optional router scaling tensors used by Gemma4-26B A4B checkpoints.
+        self.scale = nn.Parameter(torch.empty(0), requires_grad=False)
+        self.per_expert_scale = nn.Parameter(torch.empty(0), requires_grad=False)
+
+    def forward(
+        self,
+        hidden_states_2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Match HF Gemma4 router math:
+        # x = RMSNorm(with_scale=False)(x) * scale * (hidden_size ** -0.5)
+        x_fp32 = hidden_states_2d.to(torch.float32)
+        variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x = (x_fp32 * torch.rsqrt(variance + self.eps)).to(hidden_states_2d.dtype)
+        if self.scale.numel() > 1:
+            x = x * self.scale.to(device=x.device, dtype=x.dtype)
+        x = x * self.scalar_root_size
+        router_logits = self.proj(x)
+        routing_weights = F.softmax(router_logits.float(), dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights,
+            k=self.top_k,
+            dim=-1,
+        )
+        routing_weights = routing_weights / routing_weights.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-8)
+        if self.per_expert_scale.numel() > 1:
+            per_exp = self.per_expert_scale.to(
+                device=routing_weights.device,
+                dtype=routing_weights.dtype,
+            )
+            routing_weights = routing_weights * per_exp[selected_experts]
+        return (
+            router_logits,
+            routing_weights.to(hidden_states_2d.dtype),
+            selected_experts,
+        )
+
+
+def _materialize_litelinear_dense_weight_awqaware(
+    layer: LiteLinear,
+    *,
+    out_features: int,
+    in_features: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    dense_weight = getattr(layer, "weight", None)
+    if isinstance(dense_weight, torch.Tensor) and dense_weight.numel() > 1:
+        dense_weight = dense_weight[:out_features, :in_features].contiguous()
+        return dense_weight.to(device=device, dtype=dtype)
+
+    qweight = getattr(layer, "qweight", None)
+    scales = getattr(layer, "scales", None)
+    qzeros = getattr(layer, "qzeros", None)
+    group_size = int(getattr(layer, "group_size", 128))
+    if qweight is None or not isinstance(qweight, torch.Tensor) or qweight.numel() <= 1:
+        raise RuntimeError(
+            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' has neither dense nor packed weights."
+        )
+    if scales is None or not isinstance(scales, torch.Tensor) or scales.numel() <= 1:
+        raise RuntimeError(
+            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' is missing AWQ scales."
+        )
+
+    if isinstance(qzeros, torch.Tensor) and qzeros.numel() > 1:
+        dense_weight = dequantize_awq_pytorch(
+            qweight.to(device=device, dtype=torch.int32),
+            scales.to(device=device),
+            qzeros.to(device=device, dtype=torch.int32),
+            group_size=group_size,
+        )
+    else:
+        dense_weight = dequantize_symmetric_packed_int4_pytorch(
+            qweight.to(device=device, dtype=torch.int32),
+            scales.to(device=device),
+            group_size=group_size,
+        )
+
+    if dense_weight.shape[0] < out_features or dense_weight.shape[1] < in_features:
+        raise RuntimeError(
+            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' dequantized weight too small: "
+            f"got {tuple(dense_weight.shape)}, need ({out_features}, {in_features})"
+        )
+    return dense_weight[:out_features, :in_features].contiguous().to(device=device, dtype=dtype)
+
+
+class Gemma4MoeExpertsLite(nn.Module):
+    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str):
+        super().__init__()
+        self.hidden_dim = int(config.hidden_size)
+        self.intermediate_dim = int(config.moe_intermediate_size)
+        self.num_experts = int(config.num_experts)
+        self.top_k = int(config.num_experts_per_tok)
+        self.hidden_act = str(
+            getattr(config, "hidden_activation", getattr(config, "hidden_act", "silu"))
+        ).lower()
+        self.gate_up_proj = LiteLinear(
+            self.hidden_dim,
+            self.num_experts * (2 * self.intermediate_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts.gate_up_proj",
+        )
+        self.down_proj = LiteLinear(
+            self.intermediate_dim,
+            self.num_experts * self.hidden_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts.down_proj",
+        )
+        self._cached_device: Optional[torch.device] = None
+        self._cached_dtype: Optional[torch.dtype] = None
+        self._cached_w1: Optional[torch.Tensor] = None
+        self._cached_w2: Optional[torch.Tensor] = None
+
+    def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
+        if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
+            return F.gelu(gate, approximate="tanh")
+        return F.silu(gate)
+
+    def _has_awq_packed_expert_major(self) -> bool:
+        qweight_gu = getattr(self.gate_up_proj, "qweight", None)
+        scales_gu = getattr(self.gate_up_proj, "scales", None)
+        qweight_d = getattr(self.down_proj, "qweight", None)
+        scales_d = getattr(self.down_proj, "scales", None)
+        return (
+            isinstance(qweight_gu, torch.Tensor)
+            and isinstance(scales_gu, torch.Tensor)
+            and qweight_gu.ndim == 3
+            and scales_gu.ndim == 3
+            and isinstance(qweight_d, torch.Tensor)
+            and isinstance(scales_d, torch.Tensor)
+            and qweight_d.ndim == 3
+            and scales_d.ndim == 3
+        )
+
+    def _materialize_one_expert_awq(
+        self,
+        expert_id: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qweight_gu = self.gate_up_proj.qweight
+        scales_gu = self.gate_up_proj.scales
+        qweight_d = self.down_proj.qweight
+        scales_d = self.down_proj.scales
+
+        gsz_gu = max(1, int((qweight_gu.shape[2] * 8) // max(1, scales_gu.shape[2])))
+        gsz_d = max(1, int((qweight_d.shape[2] * 8) // max(1, scales_d.shape[2])))
+        w1e = dequantize_symmetric_packed_int4_pytorch(
+            qweight_gu[expert_id].to(device=device, dtype=torch.int32),
+            scales_gu[expert_id].to(device=device),
+            group_size=gsz_gu,
+        )
+        w2e = dequantize_symmetric_packed_int4_pytorch(
+            qweight_d[expert_id].to(device=device, dtype=torch.int32),
+            scales_d[expert_id].to(device=device),
+            group_size=gsz_d,
+        )
+        w1 = w1e[: 2 * self.intermediate_dim, : self.hidden_dim].contiguous().to(
+            device=device, dtype=dtype
+        )
+        w2 = w2e[: self.hidden_dim, : self.intermediate_dim].contiguous().to(
+            device=device, dtype=dtype
+        )
+        return w1, w2
+
+    def _forward_awq_streaming(
+        self,
+        hidden_states_2d: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if topk_weights is None or topk_ids is None:
+            if router_logits is None:
+                raise RuntimeError("router_logits or top-k routing inputs are required.")
+            topk_weights, topk_ids = torch.topk(
+                router_logits,
+                k=self.top_k,
+                dim=-1,
+            )
+            topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(
+                hidden_states_2d.dtype
+            )
+        compute_dtype = torch.float32
+        out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
+
+        unique_experts = torch.unique(topk_ids).tolist()
+        for expert_id in unique_experts:
+            assignment_mask = topk_ids == int(expert_id)
+            if not bool(assignment_mask.any()):
+                continue
+            token_idx, choice_idx = torch.nonzero(assignment_mask, as_tuple=True)
+            if token_idx.numel() == 0:
+                continue
+            x_sel = hidden_states_2d.index_select(0, token_idx).to(compute_dtype)
+            coeff = topk_weights[token_idx, choice_idx].unsqueeze(-1).to(compute_dtype)
+            w1e, w2e = self._materialize_one_expert_awq(
+                int(expert_id),
+                hidden_states_2d.device,
+                compute_dtype,
+            )
+            gu = F.linear(x_sel, w1e)
+            g, u = torch.chunk(gu, 2, dim=-1)
+            h = self._apply_gate_activation(g) * u
+            y = F.linear(h, w2e) * coeff
+            out.index_add_(0, token_idx, y)
+        return out.to(hidden_states_2d.dtype)
+
+    def _materialize_expert_weights(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._cached_w1 is not None
+            and self._cached_w2 is not None
+            and self._cached_device == device
+            and self._cached_dtype == dtype
+        ):
+            return self._cached_w1, self._cached_w2
+
+        qweight_gu = getattr(self.gate_up_proj, "qweight", None)
+        scales_gu = getattr(self.gate_up_proj, "scales", None)
+        qweight_d = getattr(self.down_proj, "qweight", None)
+        scales_d = getattr(self.down_proj, "scales", None)
+
+        # Gemma4-26B-A4B checkpoint path: expert-major packed tensors
+        # gate_up_proj_packed: [E, 2I, H/8], gate_up_proj_scale: [E, 2I, H/group]
+        # down_proj_packed: [E, H, I/8], down_proj_scale: [E, H, I/group]
+        if (
+            isinstance(qweight_gu, torch.Tensor)
+            and isinstance(scales_gu, torch.Tensor)
+            and qweight_gu.ndim == 3
+            and scales_gu.ndim == 3
+            and isinstance(qweight_d, torch.Tensor)
+            and isinstance(scales_d, torch.Tensor)
+            and qweight_d.ndim == 3
+            and scales_d.ndim == 3
+        ):
+            w1_parts = []
+            w2_parts = []
+            gsz_gu = max(1, int((qweight_gu.shape[2] * 8) // max(1, scales_gu.shape[2])))
+            gsz_d = max(1, int((qweight_d.shape[2] * 8) // max(1, scales_d.shape[2])))
+            for e in range(self.num_experts):
+                w1e = dequantize_symmetric_packed_int4_pytorch(
+                    qweight_gu[e].to(device=device, dtype=torch.int32),
+                    scales_gu[e].to(device=device),
+                    group_size=gsz_gu,
+                )
+                w2e = dequantize_symmetric_packed_int4_pytorch(
+                    qweight_d[e].to(device=device, dtype=torch.int32),
+                    scales_d[e].to(device=device),
+                    group_size=gsz_d,
+                )
+                w1_parts.append(
+                    w1e[: 2 * self.intermediate_dim, : self.hidden_dim].to(device=device, dtype=dtype)
+                )
+                w2_parts.append(
+                    w2e[: self.hidden_dim, : self.intermediate_dim].to(device=device, dtype=dtype)
+                )
+            w1 = torch.stack(w1_parts, dim=0).contiguous()
+            w2 = torch.stack(w2_parts, dim=0).contiguous()
+        else:
+            gate_up_dense = _materialize_litelinear_dense_weight_awqaware(
+                self.gate_up_proj,
+                out_features=self.num_experts * (2 * self.intermediate_dim),
+                in_features=self.hidden_dim,
+                device=device,
+                dtype=dtype,
+            )
+            down_dense = _materialize_litelinear_dense_weight_awqaware(
+                self.down_proj,
+                out_features=self.num_experts * self.hidden_dim,
+                in_features=self.intermediate_dim,
+                device=device,
+                dtype=dtype,
+            )
+            w1 = gate_up_dense.view(
+                self.num_experts,
+                2 * self.intermediate_dim,
+                self.hidden_dim,
+            ).contiguous()
+            w2 = down_dense.view(
+                self.num_experts,
+                self.hidden_dim,
+                self.intermediate_dim,
+            ).contiguous()
+
+        self._cached_device = device
+        self._cached_dtype = dtype
+        self._cached_w1 = w1
+        self._cached_w2 = w2
+        return w1, w2
+
+    def forward(
+        self,
+        hidden_states_2d: torch.Tensor,
+        router_logits: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._has_awq_packed_expert_major():
+            return self._forward_awq_streaming(
+                hidden_states_2d,
+                router_logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+        if topk_weights is not None and topk_ids is not None:
+            router_logits = None
+            # Build sparse logits proxy for fused_moe path: fill selected experts
+            # with log-weights and keep others very negative.
+            n_tok = int(hidden_states_2d.shape[0])
+            if router_logits is None:
+                router_logits = torch.full(
+                    (n_tok, self.num_experts),
+                    -1e9,
+                    device=hidden_states_2d.device,
+                    dtype=hidden_states_2d.dtype,
+                )
+            router_logits.scatter_(1, topk_ids, topk_weights.clamp_min(1e-20).log())
+        if router_logits is None:
+            raise RuntimeError("router_logits is required when top-k routing is not provided.")
+        w1, w2 = self._materialize_expert_weights(
+            hidden_states_2d.device,
+            hidden_states_2d.dtype,
+        )
+        return fused_moe(
+            hidden_states_2d,
+            w1,
+            w2,
+            router_logits,
+            topk=self.top_k,
+            renormalize=True,
+        )
+
+
+class Gemma4SparseMoeBlock(nn.Module):
+    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str):
+        super().__init__()
+        self.router = Gemma4TopKRouterLite(config, quant_config, prefix)
+        self.experts = Gemma4MoeExpertsLite(config, quant_config, prefix)
+        self.shared_mlp = Gemma4MLP(config, quant_config, prefix)
+
+    def forward_branches(
+        self,
+        hidden_states_dense: torch.Tensor,
+        hidden_states_sparse: torch.Tensor,
+        hidden_states_router: Optional[torch.Tensor] = None,
+        lora_mapping: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_2d, shape = _reshape_hidden_to_2d(hidden_states_sparse)
+        router_src = hidden_states_router if hidden_states_router is not None else hidden_states_sparse
+        router_2d, _ = _reshape_hidden_to_2d(router_src)
+        router_logits, routing_weights, selected_experts = self.router(router_2d)
+        sparse_out_2d = self.experts(
+            hidden_states_2d,
+            router_logits,
+            topk_weights=routing_weights,
+            topk_ids=selected_experts,
+        )
+        sparse_out = _restore_hidden_from_2d(sparse_out_2d, shape)
+        dense_out = self.shared_mlp(hidden_states_dense, lora_mapping)
+        return dense_out, sparse_out
+
+    def forward(self, hidden_states: torch.Tensor, lora_mapping: Any = None) -> torch.Tensor:
+        dense_out, sparse_out = self.forward_branches(
+            hidden_states,
+            hidden_states,
+            hidden_states_router=hidden_states,
+            lora_mapping=lora_mapping,
+        )
+        return dense_out + sparse_out
+
+
 class Gemma4DecoderLayer(nn.Module):
     def __init__(self, config: LiteConfig, quant_config: Any, prefix: str, layer_idx: int):
         super().__init__()
+        self.layer_idx = int(layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
         self.self_attn = Gemma4Attention(config, quant_config, prefix, layer_idx)
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
+        self.pre_feedforward_layernorm_2: Optional[RMSNorm] = None
+        self.post_feedforward_layernorm_1: Optional[RMSNorm] = None
+        self.post_feedforward_layernorm_2: Optional[RMSNorm] = None
         self.layer_scalar = nn.Parameter(torch.tensor(1.0), requires_grad=False)
-        self.mlp = Gemma4MLP(config, quant_config, prefix)
+        self._fp32_residual_guard_enabled = bool(
+            _is_gemma4_26b_a4b_like(config)
+            and _env_truthy("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD")
+        )
+        # Backward compatible priority:
+        # 1) explicit range start env
+        # 2) legacy single-layer env
+        # 3) default start layer 8
+        guard_start_raw = os.environ.get("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START")
+        if guard_start_raw is None:
+            guard_start_raw = os.environ.get(
+                "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_LAYER", "8"
+            )
+        self._fp32_residual_guard_start = int(guard_start_raw)
+        # Default span=3 to cover [first_drift_layer, first_drift_layer+2].
+        self._fp32_residual_guard_span = max(
+            1,
+            int(os.environ.get("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN", "3")),
+        )
+        self.use_moe = _is_gemma4_moe_layer(config, layer_idx)
+        if self.use_moe:
+            # Gemma4-26B-A4B checkpoints expose dual pre-FFN norms and dual
+            # branch post-FFN norms at layer root.
+            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=_get_eps(config))
+            self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=_get_eps(config))
+            self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=_get_eps(config))
+            self.mlp = Gemma4SparseMoeBlock(config, quant_config, prefix)
+        else:
+            self.mlp = Gemma4MLP(config, quant_config, prefix)
 
     def forward(
         self,
@@ -500,13 +1064,54 @@ class Gemma4DecoderLayer(nn.Module):
         h = self.input_layernorm(x)
         h = self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping)
         h = self.post_attention_layernorm(h)
-        x = residual + h
+        guard_hit = (
+            self._fp32_residual_guard_enabled
+            and self._fp32_residual_guard_start
+            <= self.layer_idx
+            < (self._fp32_residual_guard_start + self._fp32_residual_guard_span)
+        )
+        if guard_hit:
+            x = _residual_add_fp32(residual, h)
+        else:
+            x = residual + h
 
         residual = x
-        h = self.pre_feedforward_layernorm(x)
-        h = self.mlp(h, lora_mapping)
+        h_dense = self.pre_feedforward_layernorm(x)
+        if self.use_moe and isinstance(self.mlp, Gemma4SparseMoeBlock):
+            # Match HF Gemma4 MoE flow:
+            # - dense MLP branch consumes pre_feedforward_layernorm(residual)
+            # - router consumes raw residual (before pre-FF norms)
+            # - sparse experts consume pre_feedforward_layernorm_2(residual)
+            dense_out = self.mlp.shared_mlp(h_dense, lora_mapping=lora_mapping)
+            if self.post_feedforward_layernorm_1 is not None:
+                dense_out = self.post_feedforward_layernorm_1(dense_out)
+
+            router_in_2d, router_shape = _reshape_hidden_to_2d(residual)
+            router_logits, routing_weights, selected_experts = self.mlp.router(
+                router_in_2d
+            )
+            if self.pre_feedforward_layernorm_2 is not None:
+                sparse_in = self.pre_feedforward_layernorm_2(residual)
+            else:
+                sparse_in = residual
+            sparse_in_2d, _ = _reshape_hidden_to_2d(sparse_in)
+            sparse_out_2d = self.mlp.experts(
+                sparse_in_2d,
+                router_logits,
+                topk_weights=routing_weights,
+                topk_ids=selected_experts,
+            )
+            sparse_out = _restore_hidden_from_2d(sparse_out_2d, router_shape)
+            if self.post_feedforward_layernorm_2 is not None:
+                sparse_out = self.post_feedforward_layernorm_2(sparse_out)
+            h = dense_out + sparse_out
+        else:
+            h = self.mlp(h_dense, lora_mapping)
         h = self.post_feedforward_layernorm(h)
-        x = residual + h
+        if guard_hit:
+            x = _residual_add_fp32(residual, h)
+        else:
+            x = residual + h
         return x * self.layer_scalar
 
 

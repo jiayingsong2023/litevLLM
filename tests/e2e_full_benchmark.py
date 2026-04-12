@@ -96,6 +96,26 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
         },
     ),
+    "gemma4_26b_a4b": ModelSpec(
+        key="gemma4_26b_a4b",
+        model_path=os.environ.get(
+            "MODEL_GEMMA4_26B_A4B", "models/gemma-4-26B-A4B-it-AWQ-4bit"
+        ),
+        display_name="Gemma4-26B A4B (Q4 MoE)",
+        quant="compressed-tensors",
+        concurrent_reqs=1,
+        prompt_tokens_target=1024,
+        max_new_tokens=24,
+        gpu_memory_utilization=0.90,
+        max_model_len=512,
+        max_run_seconds=1200,
+        stable_env={
+            "FASTINFERENCE_KV_TYPE": "turbo_int4",
+            "FASTINFERENCE_FUSION_LEVEL": "2",
+            "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
+            "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+        },
+    ),
 }
 
 # ROCm/HIP: large BS × long prefill + AWQ Triton + FP8 KV often triggers hipErrorLaunchFailure
@@ -124,7 +144,7 @@ def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSp
     """Downgrade batch/prompt on AMD ROCm unless aggressive mode is enabled."""
     if aggressive or not _is_rocm():
         return spec
-    if spec.key not in ("tinyllama", "qwen35_9b_awq", "gemma4_31b_q4"):
+    if spec.key not in ("tinyllama", "qwen35_9b_awq", "gemma4_31b_q4", "gemma4_26b_a4b"):
         return spec
     new_conc = min(spec.concurrent_reqs, _ROCM_E2E_SAFE_CONCURRENT)
     new_prompt = min(spec.prompt_tokens_target, _ROCM_E2E_SAFE_PROMPT_TOKENS)
@@ -1779,7 +1799,7 @@ def _parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default="tinyllama,qwen35_9b_awq",
-        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,gemma4_31b_q4",
+        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,gemma4_31b_q4,gemma4_26b_a4b",
     )
     parser.add_argument(
         "--json-out",
@@ -1856,6 +1876,16 @@ def _parse_args() -> argparse.Namespace:
             "Default from MODEL_SPECS is 2."
         ),
     )
+    parser.add_argument(
+        "--gemma26b-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override concurrent request count (batch width) for gemma4_26b_a4b only. "
+            "Default from MODEL_SPECS is 1."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1905,11 +1935,20 @@ async def main() -> None:
                 concurrent_reqs=n,
                 max_run_seconds=max(spec.max_run_seconds, 120 * n),
             )
+        if key == "gemma4_26b_a4b" and args.gemma26b_concurrent is not None:
+            n = int(args.gemma26b_concurrent)
+            if n < 1 or n > 16:
+                raise ValueError("--gemma26b-concurrent must be between 1 and 16")
+            spec = replace(
+                spec,
+                concurrent_reqs=n,
+                max_run_seconds=max(spec.max_run_seconds, 120 * n),
+            )
         specs.append(spec)
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
-    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit")
+    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit + Gemma4-26B-A4B-it-AWQ-4bit")
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}
