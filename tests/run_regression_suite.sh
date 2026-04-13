@@ -8,7 +8,9 @@ cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 uv run pytest \
   tests/test_kv_default_policy.py \
+  tests/test_perf_grid_search.py \
   tests/test_step_scheduler_single_request_fast_path.py \
+  tests/test_gemma4_kv_helpers.py \
   tests/test_quality_bar_spotcheck_heuristics.py \
   tests/test_logits_dump_stats.py \
   tests/lite_smoke_test.py \

@@ -39,10 +39,12 @@ def _paged_attention_kernel(
 
     if IS_INT4:
         offs_d_half = tl.arange(0, BLOCK_D // 2)
+        offs_d_half_2d = offs_d_half[None, :]
         # Contiguous layout: first half of channels in low nibbles, second half in high nibbles
         q_low = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + offs_d_half * stride_q_dim).to(tl.float32)
         q_high = tl.load(Q_ptr + seq_idx * stride_q_seq + head_idx * stride_q_head + (offs_d_half + BLOCK_D // 2) * stride_q_dim).to(tl.float32)
     else:
+        offs_d_2d = tl.arange(0, BLOCK_D)[None, :]
         off_q = seq_idx * stride_q_seq + head_idx * stride_q_head + tl.arange(0, BLOCK_D) * stride_q_dim
         q = tl.load(Q_ptr + off_q).to(tl.float32)
 
@@ -76,7 +78,6 @@ def _paged_attention_kernel(
             v_scale = v_scale[:, None]
 
         if IS_INT4:
-            offs_d_half_2d = tl.arange(0, BLOCK_D // 2)[None, :]
             off_kv = offs_n[:, None] * stride_k_token + kv_head_idx * stride_k_head + offs_d_half_2d * stride_k_dim
             k_packed = tl.load(k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv, mask=block_mask[:, None], other=0).to(tl.int32)
             # Manual sign-extension for 4-bit signed
@@ -84,7 +85,6 @@ def _paged_attention_kernel(
             k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
             qk = tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
         else:
-            offs_d_2d = tl.arange(0, BLOCK_D)[None, :]
             off_kv = offs_n[:, None] * stride_k_token + kv_head_idx * stride_k_head + offs_d_2d * stride_k_dim
             k = tl.load(k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
             if IS_FP8: k = (k.to(tl.float32) * k_scale)

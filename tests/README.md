@@ -112,6 +112,7 @@ Gemma4 诊断基线文件：
 | 性能回归（TinyLlama + Qwen3.5 9B AWQ + Gemma4 31B Q4） | `uv run python tests/e2e_full_benchmark.py --models tinyllama,qwen35_9b_awq,gemma4_31b_q4 --json-out .tmp_perf_regression_awq.json` |
 | AWQ fused GEMM 微基准（可选） | `uv run python tests/bench_awq_fused_gemm_ab.py` |
 | LLM.generate 冒烟（与 e2e 模型列表对齐） | `uv run python tests/test_offline_api.py` |
+| 参数网格自动调优（批量跑 + 自动选优 + 归档） | `uv run python tests/tools/perf_grid_search.py --model-key gemma4_26b_a4b --phase full --run-correctness-on-best --correctness-skip-a-tier` |
 
 ## 整模验证注意事项
 

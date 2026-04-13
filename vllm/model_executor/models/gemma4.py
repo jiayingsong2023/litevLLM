@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from typing import Any, Optional
 import torch
 import torch.nn as nn
@@ -94,6 +95,28 @@ def _decode_int4_row(
     return out
 
 
+def _decode_int4_rows(
+    packed_rows: torch.Tensor,
+    scales: Optional[torch.Tensor],
+    head_dim: int,
+) -> torch.Tensor:
+    # packed_rows: [T, num_kv_heads, head_dim/2] uint8/int32
+    packed_i32 = packed_rows.to(torch.int32)
+    low = ((packed_i32 << 28) >> 28).to(torch.float32)
+    high = ((packed_i32 << 24) >> 28).to(torch.float32)
+    out = torch.empty(
+        (packed_rows.shape[0], packed_rows.shape[1], head_dim),
+        device=packed_rows.device,
+        dtype=torch.float32,
+    )
+    half = head_dim // 2
+    out[:, :, :half] = low
+    out[:, :, half:] = high
+    if scales is not None:
+        out = out * scales.to(torch.float32).unsqueeze(-1)
+    return out
+
+
 def _gather_recent_kv(
     kv_cache: Any,
     block_tables: torch.Tensor,
@@ -112,30 +135,40 @@ def _gather_recent_kv(
         start = 0
     else:
         start = max(0, seq_len - int(local_window))
-    k_rows = []
-    v_rows = []
     k_scale_cache = kv_scale_cache[0] if kv_scale_cache is not None else None
     v_scale_cache = kv_scale_cache[1] if kv_scale_cache is not None else None
     is_int4 = "int4" in str(kv_cache_dtype).lower()
+    token_positions = torch.arange(start, seq_len, device=block_tables.device, dtype=torch.long)
+    bt_row = block_tables[batch_idx]
+    block_indices = bt_row[token_positions // block_size]
+    block_offsets = torch.remainder(token_positions, block_size)
 
-    for token_idx in range(start, seq_len):
-        block_idx = int(block_tables[batch_idx, token_idx // block_size].item())
-        block_offset = token_idx % block_size
-        if is_int4:
-            k_row = _decode_int4_row(
-                k_cache, k_scale_cache, block_idx, block_offset, num_kv_heads, head_dim
-            )
-            v_row = _decode_int4_row(
-                v_cache, v_scale_cache, block_idx, block_offset, num_kv_heads, head_dim
-            )
-        else:
-            k_row = k_cache[block_idx, block_offset, :num_kv_heads, :head_dim].to(torch.float32)
-            v_row = v_cache[block_idx, block_offset, :num_kv_heads, :head_dim].to(torch.float32)
-        k_rows.append(k_row)
-        v_rows.append(v_row)
-
-    k = torch.stack(k_rows, dim=0).unsqueeze(0)
-    v = torch.stack(v_rows, dim=0).unsqueeze(0)
+    if is_int4:
+        k_packed = k_cache[block_indices, block_offsets, :num_kv_heads, : head_dim // 2]
+        v_packed = v_cache[block_indices, block_offsets, :num_kv_heads, : head_dim // 2]
+        k_scales = (
+            k_scale_cache[block_indices, block_offsets, :num_kv_heads, 0]
+            if k_scale_cache is not None
+            else None
+        )
+        v_scales = (
+            v_scale_cache[block_indices, block_offsets, :num_kv_heads, 0]
+            if v_scale_cache is not None
+            else None
+        )
+        k = _decode_int4_rows(k_packed, k_scales, head_dim).unsqueeze(0)
+        v = _decode_int4_rows(v_packed, v_scales, head_dim).unsqueeze(0)
+    else:
+        k = (
+            k_cache[block_indices, block_offsets, :num_kv_heads, :head_dim]
+            .to(torch.float32)
+            .unsqueeze(0)
+        )
+        v = (
+            v_cache[block_indices, block_offsets, :num_kv_heads, :head_dim]
+            .to(torch.float32)
+            .unsqueeze(0)
+        )
     return k, v
 
 
@@ -746,6 +779,12 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._cached_dtype: Optional[torch.dtype] = None
         self._cached_w1: Optional[torch.Tensor] = None
         self._cached_w2: Optional[torch.Tensor] = None
+        self._expert_weight_cache: "OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._expert_cache_device: Optional[torch.device] = None
+        self._expert_cache_dtype: Optional[torch.dtype] = None
+        self._max_expert_cache = max(
+            0, int(os.environ.get("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE", "8"))
+        )
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
         if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
@@ -774,6 +813,23 @@ class Gemma4MoeExpertsLite(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._max_expert_cache > 0
+            and self._expert_cache_device == device
+            and self._expert_cache_dtype == dtype
+        ):
+            cached = self._expert_weight_cache.get(expert_id)
+            if cached is not None:
+                self._expert_weight_cache.move_to_end(expert_id)
+                return cached
+        if (
+            self._expert_cache_device != device
+            or self._expert_cache_dtype != dtype
+        ):
+            self._expert_weight_cache.clear()
+            self._expert_cache_device = device
+            self._expert_cache_dtype = dtype
+
         qweight_gu = self.gate_up_proj.qweight
         scales_gu = self.gate_up_proj.scales
         qweight_d = self.down_proj.qweight
@@ -797,6 +853,11 @@ class Gemma4MoeExpertsLite(nn.Module):
         w2 = w2e[: self.hidden_dim, : self.intermediate_dim].contiguous().to(
             device=device, dtype=dtype
         )
+        if self._max_expert_cache > 0:
+            self._expert_weight_cache[expert_id] = (w1, w2)
+            self._expert_weight_cache.move_to_end(expert_id)
+            while len(self._expert_weight_cache) > self._max_expert_cache:
+                self._expert_weight_cache.popitem(last=False)
         return w1, w2
 
     def _forward_awq_streaming(
