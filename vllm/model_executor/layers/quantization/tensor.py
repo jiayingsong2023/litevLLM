@@ -568,6 +568,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
             try:
                 from vllm.kernels.triton.awq_fused_gemm import packed_int4_symmetric_fused_gemm_safe
 
+                _awq_stat_inc("awq_fused_attempt")
                 out, used_fused, _ = packed_int4_symmetric_fused_gemm_safe(
                     x.reshape(-1, x.shape[-1]).contiguous(),
                     self.qweight,
@@ -576,6 +577,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     bias=bias,
                 )
                 if used_fused:
+                    _awq_stat_inc("awq_fused_success")
                     return out.view(*x.shape[:-1], out.shape[-1])
             except Exception:
                 pass
@@ -588,6 +590,10 @@ class PackedInt4Weight(QuantizedLinearWeight):
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
             self._cached_fused_decision = False
             return _dense_fallback()
+
+        if _env_awq_fused_gemm_force():
+            self._cached_fused_decision = True
+            return self.matmul(x, bias)
 
         policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
         use_fused = False

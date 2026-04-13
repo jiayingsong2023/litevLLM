@@ -41,6 +41,16 @@ class BenchmarkRequestSpec:
     multi_modal_data: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class WarmupConfig:
+    prefill_rounds: int = 1
+    decode_rounds: int = 1
+    decode_tokens: int = 8
+    burst_rounds: int = 0
+    burst_concurrency: int = 0
+    burst_decode_tokens: int = 8
+
+
 # KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
 MODEL_SPECS: Dict[str, ModelSpec] = {
     "tinyllama": ModelSpec(
@@ -138,6 +148,68 @@ def _is_e2e_aggressive(args: argparse.Namespace) -> bool:
         return True
     raw = os.environ.get("FASTINFERENCE_E2E_AGGRESSIVE", "").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _clamp_non_negative_int(value: int, *, minimum: int = 0) -> int:
+    return max(minimum, int(value))
+
+
+def _read_int_with_default(raw: str | None, default: int) -> int:
+    if raw is None or raw.strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _resolve_warmup_config(args: argparse.Namespace) -> WarmupConfig:
+    prefill_rounds = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_PREFILL_ROUNDS"),
+            args.warmup_prefill_rounds,
+        )
+    )
+    decode_rounds = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_DECODE_ROUNDS"),
+            args.warmup_decode_rounds,
+        )
+    )
+    decode_tokens = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_DECODE_TOKENS"),
+            args.warmup_decode_tokens,
+        ),
+        minimum=1,
+    )
+    burst_rounds = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_ROUNDS"),
+            args.warmup_burst_rounds,
+        )
+    )
+    burst_concurrency = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_CONCURRENCY"),
+            args.warmup_burst_concurrency,
+        )
+    )
+    burst_decode_tokens = _clamp_non_negative_int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_DECODE_TOKENS"),
+            args.warmup_burst_decode_tokens,
+        ),
+        minimum=1,
+    )
+    return WarmupConfig(
+        prefill_rounds=prefill_rounds,
+        decode_rounds=decode_rounds,
+        decode_tokens=decode_tokens,
+        burst_rounds=burst_rounds,
+        burst_concurrency=burst_concurrency,
+        burst_decode_tokens=burst_decode_tokens,
+    )
 
 
 def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSpec:
@@ -1521,13 +1593,103 @@ async def _run_single_request(
     }
 
 
+async def _run_warmup_stage_request(
+    llm: AsyncLLM,
+    *,
+    prompt: str,
+    request_id: str,
+    max_tokens: int,
+    multi_modal_data: dict[str, Any] | None,
+) -> float:
+    start = time.perf_counter()
+    async for _ in llm.generate(
+        prompt,
+        SamplingParams(max_tokens=max(1, int(max_tokens)), temperature=0.0),
+        request_id,
+        multi_modal_data=multi_modal_data,
+    ):
+        pass
+    return (time.perf_counter() - start) * 1000.0
+
+
+async def _run_benchmark_warmup(
+    llm: AsyncLLM,
+    *,
+    spec: ModelSpec,
+    request_specs: list[BenchmarkRequestSpec],
+    warmup_config: WarmupConfig,
+) -> list[dict[str, float | str]]:
+    warmup_request = request_specs[0]
+    warmup_trace: list[dict[str, float | str]] = []
+    step = 0
+    if warmup_config.prefill_rounds > 0:
+        print(f"  [Warmup] Prefill compile rounds: {warmup_config.prefill_rounds}x")
+    for _ in range(warmup_config.prefill_rounds):
+        elapsed_ms = await _run_warmup_stage_request(
+            llm,
+            prompt=warmup_request.prompt,
+            request_id=f"{spec.key}_warmup_prefill_{step}",
+            max_tokens=1,
+            multi_modal_data=warmup_request.multi_modal_data,
+        )
+        warmup_trace.append({"stage": "prefill", "step": float(step), "elapsed_ms": elapsed_ms})
+        step += 1
+
+    if warmup_config.decode_rounds > 0:
+        print(
+            "  [Warmup] Decode compile rounds: "
+            f"{warmup_config.decode_rounds}x (max_tokens={warmup_config.decode_tokens})"
+        )
+    for _ in range(warmup_config.decode_rounds):
+        elapsed_ms = await _run_warmup_stage_request(
+            llm,
+            prompt=warmup_request.prompt,
+            request_id=f"{spec.key}_warmup_decode_{step}",
+            max_tokens=warmup_config.decode_tokens,
+            multi_modal_data=warmup_request.multi_modal_data,
+        )
+        warmup_trace.append({"stage": "decode", "step": float(step), "elapsed_ms": elapsed_ms})
+        step += 1
+
+    burst_concurrency = min(
+        int(spec.concurrent_reqs),
+        max(0, int(warmup_config.burst_concurrency)),
+        len(request_specs),
+    )
+    if warmup_config.burst_rounds > 0 and burst_concurrency > 1:
+        print(
+            "  [Warmup] Burst jitter rounds: "
+            f"{warmup_config.burst_rounds}x (concurrency={burst_concurrency}, "
+            f"max_tokens={warmup_config.burst_decode_tokens})"
+        )
+    for round_idx in range(warmup_config.burst_rounds):
+        start = time.perf_counter()
+        tasks = [
+            _run_warmup_stage_request(
+                llm,
+                prompt=request_specs[idx].prompt,
+                request_id=f"{spec.key}_warmup_burst_{round_idx}_{idx}_{step}",
+                max_tokens=warmup_config.burst_decode_tokens,
+                multi_modal_data=request_specs[idx].multi_modal_data,
+            )
+            for idx in range(burst_concurrency)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            warmup_trace.append({"stage": "burst", "step": float(step), "elapsed_ms": elapsed_ms})
+            step += 1
+    return warmup_trace
+
+
 async def run_benchmark(
     spec: ModelSpec,
     *,
     workload: str = "text",
     multimodal_images_per_request: int = 2,
     multimodal_image_size: int = 8,
-) -> Dict[str, float]:
+    warmup_config: WarmupConfig | None = None,
+) -> Dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
     print(f"PATH: {spec.model_path}")
@@ -1551,6 +1713,7 @@ async def run_benchmark(
     old_env = _apply_temp_env(spec.stable_env)
     llm: Optional[AsyncLLM] = None
     runtime_stats_by_phase: Dict[str, Dict[str, object]] = {}
+    warmup_trace: list[dict[str, float | str]] = []
     image_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     try:
         if spec.quant in ("awq", "compressed-tensors"):
@@ -1602,15 +1765,13 @@ async def run_benchmark(
                 multimodal_image_size=multimodal_image_size,
             )
 
-        print("  [Warmup] Running one short request...")
-        warmup_request = request_specs[0]
-        async for _ in llm.generate(
-            warmup_request.prompt,
-            SamplingParams(max_tokens=8, temperature=0.0),
-            f"{spec.key}_warmup",
-            multi_modal_data=warmup_request.multi_modal_data,
-        ):
-            pass
+        resolved_warmup = warmup_config or WarmupConfig()
+        warmup_trace = await _run_benchmark_warmup(
+            llm,
+            spec=spec,
+            request_specs=request_specs,
+            warmup_config=resolved_warmup,
+        )
         runtime_stats_by_phase["warmup"] = _collect_runtime_stats(llm, phase="warmup")
         llm.reset_stats(clear_prefix_cache=False)
 
@@ -1684,6 +1845,7 @@ async def run_benchmark(
                         }
                     ),
                 },
+                "warmup_trace": warmup_trace,
             }
         wall_end = time.perf_counter()
         runtime_stats_by_phase["benchmark"] = _collect_runtime_stats(llm, phase="benchmark")
@@ -1744,6 +1906,7 @@ async def run_benchmark(
                 "multimodal_image_size": max(2, int(multimodal_image_size)),
             },
             "runtime_stats": runtime_stats_by_phase,
+            "warmup_trace": warmup_trace,
         }
 
         print(
@@ -1886,12 +2049,76 @@ def _parse_args() -> argparse.Namespace:
             "Default from MODEL_SPECS is 1."
         ),
     )
+    parser.add_argument(
+        "--gemma26b-prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override prompt token target for gemma4_26b_a4b.",
+    )
+    parser.add_argument(
+        "--gemma26b-max-new-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max_new_tokens for gemma4_26b_a4b.",
+    )
+    parser.add_argument(
+        "--gemma26b-max-model-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max_model_len for gemma4_26b_a4b.",
+    )
+    parser.add_argument(
+        "--warmup-prefill-rounds",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Warmup prefill rounds before benchmark (default: 1).",
+    )
+    parser.add_argument(
+        "--warmup-decode-rounds",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Warmup decode rounds before benchmark (default: 1).",
+    )
+    parser.add_argument(
+        "--warmup-decode-tokens",
+        type=int,
+        default=8,
+        metavar="N",
+        help="max_tokens used by each warmup decode round (default: 8).",
+    )
+    parser.add_argument(
+        "--warmup-burst-rounds",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Optional concurrent warmup rounds for first-request jitter control.",
+    )
+    parser.add_argument(
+        "--warmup-burst-concurrency",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Concurrency used in warmup burst rounds (0 disables burst warmup).",
+    )
+    parser.add_argument(
+        "--warmup-burst-decode-tokens",
+        type=int,
+        default=8,
+        metavar="N",
+        help="max_tokens used by each request in burst warmup rounds.",
+    )
     return parser.parse_args()
 
 
 async def main() -> None:
     args = _parse_args()
     aggressive = _is_e2e_aggressive(args)
+    warmup_config = _resolve_warmup_config(args)
     if _is_rocm() and not aggressive:
         print(
             "[ROCm] Using conservative E2E defaults "
@@ -1944,11 +2171,32 @@ async def main() -> None:
                 concurrent_reqs=n,
                 max_run_seconds=max(spec.max_run_seconds, 120 * n),
             )
+        if key == "gemma4_26b_a4b" and args.gemma26b_prompt_tokens is not None:
+            n = int(args.gemma26b_prompt_tokens)
+            if n < 8:
+                raise ValueError("--gemma26b-prompt-tokens must be >= 8")
+            spec = replace(spec, prompt_tokens_target=n)
+        if key == "gemma4_26b_a4b" and args.gemma26b_max_new_tokens is not None:
+            n = int(args.gemma26b_max_new_tokens)
+            if n < 1:
+                raise ValueError("--gemma26b-max-new-tokens must be >= 1")
+            spec = replace(spec, max_new_tokens=n)
+        if key == "gemma4_26b_a4b" and args.gemma26b_max_model_len is not None:
+            n = int(args.gemma26b_max_model_len)
+            if n < 64:
+                raise ValueError("--gemma26b-max-model-len must be >= 64")
+            spec = replace(spec, max_model_len=n)
         specs.append(spec)
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
     print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit + Gemma4-26B-A4B-it-AWQ-4bit")
+    print(
+        "Warmup: "
+        f"prefill={warmup_config.prefill_rounds}, "
+        f"decode={warmup_config.decode_rounds}x{warmup_config.decode_tokens}, "
+        f"burst={warmup_config.burst_rounds}x{warmup_config.burst_concurrency}"
+    )
     print("=" * 72)
 
     summary: Dict[str, Dict[str, float]] = {}
@@ -1959,6 +2207,7 @@ async def main() -> None:
             workload=args.workload,
             multimodal_images_per_request=args.multimodal_images_per_request,
             multimodal_image_size=args.multimodal_image_size,
+            warmup_config=warmup_config,
         )
         runtime_stats_summary[spec.key] = dict(
             summary[spec.key].get("runtime_stats", {})
@@ -1996,6 +2245,14 @@ async def main() -> None:
                 "multimodal_images_per_request": args.multimodal_images_per_request,
                 "multimodal_image_size": args.multimodal_image_size,
             },
+            "warmup": {
+                "prefill_rounds": warmup_config.prefill_rounds,
+                "decode_rounds": warmup_config.decode_rounds,
+                "decode_tokens": warmup_config.decode_tokens,
+                "burst_rounds": warmup_config.burst_rounds,
+                "burst_concurrency": warmup_config.burst_concurrency,
+                "burst_decode_tokens": warmup_config.burst_decode_tokens,
+            },
             "summary": summary,
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2011,6 +2268,14 @@ async def main() -> None:
                 "kind": args.workload,
                 "multimodal_images_per_request": args.multimodal_images_per_request,
                 "multimodal_image_size": args.multimodal_image_size,
+            },
+            "warmup": {
+                "prefill_rounds": warmup_config.prefill_rounds,
+                "decode_rounds": warmup_config.decode_rounds,
+                "decode_tokens": warmup_config.decode_tokens,
+                "burst_rounds": warmup_config.burst_rounds,
+                "burst_concurrency": warmup_config.burst_concurrency,
+                "burst_decode_tokens": warmup_config.burst_decode_tokens,
             },
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

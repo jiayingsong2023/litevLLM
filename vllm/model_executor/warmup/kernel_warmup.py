@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,19 +18,84 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r, fallback to %d", name, raw, default)
+        return max(minimum, int(default))
+
+
+def _run_first_request_warmup(worker: "Worker") -> None:
+    runner: Any = worker.model_runner
+    steps = _env_int("FASTINFERENCE_WARMUP_FIRST_REQUEST_STEPS", 0, minimum=0)
+    if steps <= 0:
+        return
+    if not hasattr(runner, "_dummy_run"):
+        logger.warning("First-request warmup skipped: model_runner has no _dummy_run")
+        return
+
+    max_tokens = int(getattr(runner.scheduler_config, "max_num_batched_tokens", 128))
+    prefill_tokens = _env_int(
+        "FASTINFERENCE_WARMUP_PREFILL_TOKENS",
+        min(max_tokens, 1024),
+        minimum=1,
+    )
+    decode_tokens = _env_int(
+        "FASTINFERENCE_WARMUP_DECODE_TOKENS",
+        min(max_tokens, 16),
+        minimum=1,
+    )
+    prefill_tokens = min(prefill_tokens, max_tokens)
+    decode_tokens = min(decode_tokens, max_tokens)
+    warmup_sync = _env_truthy("FASTINFERENCE_WARMUP_SYNC", default=True)
+
+    logger.info(
+        "Running first-request warmup: steps=%d prefill_tokens=%d decode_tokens=%d",
+        steps,
+        prefill_tokens,
+        decode_tokens,
+    )
+    for idx in range(steps):
+        # Step 0: prefill-shape compile; later steps: decode-ish short path compile.
+        num_tokens = prefill_tokens if idx == 0 else decode_tokens
+        runner._dummy_run(
+            num_tokens,
+            skip_attn=False,
+            skip_eplb=True,
+            is_profile=True,
+        )
+
+    if warmup_sync:
+        torch.cuda.synchronize()
+
+
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
-        envs.VLLM_USE_DEEP_GEMM
+        bool(getattr(envs, "VLLM_USE_DEEP_GEMM", False))
         and is_deep_gemm_supported()
-        and envs.VLLM_DEEP_GEMM_WARMUP != "skip"
+        and str(getattr(envs, "VLLM_DEEP_GEMM_WARMUP", "skip")).lower() != "skip"
     )
     if do_deep_gemm_warmup:
         try:
             from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
-        except ModuleNotFoundError:
+        except Exception as exc:
             logger.warning(
-                "Deep GEMM warmup skipped (missing optional modules)."
+                "Deep GEMM warmup skipped: %s: %s",
+                type(exc).__name__,
+                exc,
             )
         else:
             model = worker.get_model()
@@ -71,6 +137,9 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    _run_first_request_warmup(worker)
+
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     from vllm.utils.flashinfer import autotune

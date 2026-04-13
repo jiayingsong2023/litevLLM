@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, Optional
 
 import torch
@@ -33,6 +34,13 @@ def _read_bits_group_size(cfg: Dict[str, Any]) -> tuple[int, int]:
                     group_size = _as_int(w.get("group_size"), group_size)
                 break
     return weight_bits, group_size
+
+
+def _compressed_tensors_high_fidelity_enabled() -> bool:
+    # Throughput-first default for pack-quantized checkpoints:
+    # keep fused int4 path enabled unless explicitly forced to strict mode.
+    raw = os.environ.get("FASTINFERENCE_COMPRESSED_TENSORS_HIGH_FIDELITY", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class CompressedTensorsConfig(QuantizationConfig):
@@ -68,6 +76,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 f"'{getattr(layer, 'prefix', '<unknown>')}'"
             )
         gs = int(getattr(layer, "group_size", self.group_size))
+        high_fidelity = _compressed_tensors_high_fidelity_enabled()
         if qzeros is not None and isinstance(qzeros, torch.Tensor) and qzeros.numel() > 1:
             return AWQWeight(
                 qweight,
@@ -75,8 +84,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 qzeros,
                 gs,
                 prefix=getattr(layer, "prefix", ""),
-                # Compressed-tensors checkpoints often need strict reference path first.
-                high_fidelity=True,
+                high_fidelity=high_fidelity,
                 profile_hint=str(getattr(layer, "awq_profile_hint", "")),
             )
         return PackedInt4Weight(
@@ -85,7 +93,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             gs,
             original_shape=weight_shape,
             prefix=getattr(layer, "prefix", ""),
-            high_fidelity=True,
+            high_fidelity=high_fidelity,
             profile_hint=str(getattr(layer, "awq_profile_hint", "")),
         )
 

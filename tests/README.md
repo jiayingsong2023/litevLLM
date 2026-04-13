@@ -73,6 +73,7 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 
 - `tests/test_kv_default_policy.py`
 - `tests/test_quality_bar_spotcheck_heuristics.py`
+- `tests/test_e2e_warmup_config.py`
 - `tests/test_logits_dump_stats.py`
 - `tests/lite_smoke_test.py`
 - `tests/test_gemma4_strict_audit_smoke.py`
@@ -113,6 +114,15 @@ Gemma4 诊断基线文件：
 | AWQ fused GEMM 微基准（可选） | `uv run python tests/bench_awq_fused_gemm_ab.py` |
 | LLM.generate 冒烟（与 e2e 模型列表对齐） | `uv run python tests/test_offline_api.py` |
 | 参数网格自动调优（批量跑 + 自动选优 + 归档） | `uv run python tests/tools/perf_grid_search.py --model-key gemma4_26b_a4b --phase full --run-correctness-on-best --correctness-skip-a-tier` |
+
+Day5 warmup / 首请求抖动治理（E2E）可通过下列参数或同名环境变量控制：
+
+- `--warmup-prefill-rounds`
+- `--warmup-decode-rounds`
+- `--warmup-decode-tokens`
+- `--warmup-burst-rounds`
+- `--warmup-burst-concurrency`
+- `--warmup-burst-decode-tokens`
 
 ## 整模验证注意事项
 

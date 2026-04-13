@@ -35,6 +35,12 @@ class GridConfig:
     fusion_level: int = 2
     kv_max_active_requests: int | None = None
     kv_max_model_len: int | None = None
+    warmup_prefill_rounds: int = 1
+    warmup_decode_rounds: int = 1
+    warmup_decode_tokens: int = 8
+    warmup_burst_rounds: int = 0
+    warmup_burst_concurrency: int = 0
+    warmup_burst_decode_tokens: int = 8
 
 
 def _default_baseline_config() -> GridConfig:
@@ -114,6 +120,24 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--top-k-fine-seed", type=int, default=2)
     p.add_argument(
+        "--gemma26b-prompt-tokens",
+        type=int,
+        default=128,
+        help="Long-decode tuning: prompt token target for gemma4_26b_a4b.",
+    )
+    p.add_argument(
+        "--gemma26b-max-new-tokens",
+        type=int,
+        default=160,
+        help="Long-decode tuning: max_new_tokens for gemma4_26b_a4b.",
+    )
+    p.add_argument(
+        "--gemma26b-max-model-len",
+        type=int,
+        default=512,
+        help="Long-decode tuning: max_model_len for gemma4_26b_a4b.",
+    )
+    p.add_argument(
         "--ttft-degrade-limit",
         type=float,
         default=0.08,
@@ -182,6 +206,9 @@ def _run_one(
     model_key: str,
     cfg: GridConfig,
     dry_run: bool,
+    gemma26b_prompt_tokens: int,
+    gemma26b_max_new_tokens: int,
+    gemma26b_max_model_len: int,
 ) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     out_json = run_dir / "e2e_summary.json"
@@ -205,6 +232,16 @@ def _run_one(
     env["FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG"] = str(cfg.prefill_reserve_backlog)
     env["FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO"] = str(cfg.prefill_catchup_ratio)
     env["FASTINFERENCE_LITE_DECODE_PRIORITY"] = str(cfg.decode_priority)
+    env["FASTINFERENCE_BENCH_WARMUP_PREFILL_ROUNDS"] = str(cfg.warmup_prefill_rounds)
+    env["FASTINFERENCE_BENCH_WARMUP_DECODE_ROUNDS"] = str(cfg.warmup_decode_rounds)
+    env["FASTINFERENCE_BENCH_WARMUP_DECODE_TOKENS"] = str(cfg.warmup_decode_tokens)
+    env["FASTINFERENCE_BENCH_WARMUP_BURST_ROUNDS"] = str(cfg.warmup_burst_rounds)
+    env["FASTINFERENCE_BENCH_WARMUP_BURST_CONCURRENCY"] = str(
+        cfg.warmup_burst_concurrency
+    )
+    env["FASTINFERENCE_BENCH_WARMUP_BURST_DECODE_TOKENS"] = str(
+        cfg.warmup_burst_decode_tokens
+    )
 
     cmd = [
         sys.executable,
@@ -213,7 +250,30 @@ def _run_one(
         model_key,
         "--json-out",
         str(out_json),
+        "--warmup-prefill-rounds",
+        str(cfg.warmup_prefill_rounds),
+        "--warmup-decode-rounds",
+        str(cfg.warmup_decode_rounds),
+        "--warmup-decode-tokens",
+        str(cfg.warmup_decode_tokens),
+        "--warmup-burst-rounds",
+        str(cfg.warmup_burst_rounds),
+        "--warmup-burst-concurrency",
+        str(cfg.warmup_burst_concurrency),
+        "--warmup-burst-decode-tokens",
+        str(cfg.warmup_burst_decode_tokens),
     ]
+    if model_key == "gemma4_26b_a4b":
+        cmd.extend(
+            [
+                "--gemma26b-prompt-tokens",
+                str(gemma26b_prompt_tokens),
+                "--gemma26b-max-new-tokens",
+                str(gemma26b_max_new_tokens),
+                "--gemma26b-max-model-len",
+                str(gemma26b_max_model_len),
+            ]
+        )
     t0 = time.perf_counter()
     if dry_run:
         stdout_log.write_text("DRY_RUN\n" + " ".join(cmd), encoding="utf-8")
@@ -339,6 +399,9 @@ def main() -> int:
             model_key=args.model_key,
             cfg=cfg,
             dry_run=args.dry_run,
+            gemma26b_prompt_tokens=args.gemma26b_prompt_tokens,
+            gemma26b_max_new_tokens=args.gemma26b_max_new_tokens,
+            gemma26b_max_model_len=args.gemma26b_max_model_len,
         )
         all_rows.append(row)
 
@@ -363,6 +426,9 @@ def main() -> int:
                 model_key=args.model_key,
                 cfg=cfg,
                 dry_run=args.dry_run,
+                gemma26b_prompt_tokens=args.gemma26b_prompt_tokens,
+                gemma26b_max_new_tokens=args.gemma26b_max_new_tokens,
+                gemma26b_max_model_len=args.gemma26b_max_model_len,
             )
             if args.dry_run:
                 row["status"] = "dry_run"
@@ -387,6 +453,11 @@ def main() -> int:
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model_key": args.model_key,
         "phase": args.phase,
+        "long_decode_profile": {
+            "gemma26b_prompt_tokens": args.gemma26b_prompt_tokens,
+            "gemma26b_max_new_tokens": args.gemma26b_max_new_tokens,
+            "gemma26b_max_model_len": args.gemma26b_max_model_len,
+        },
         "ttft_degrade_limit": args.ttft_degrade_limit,
         "baseline": baseline_row,
         "rows": all_rows,
