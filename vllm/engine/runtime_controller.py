@@ -49,7 +49,11 @@ class RuntimeController:
             self.step_scheduler.update_runtime_feedback(self.observer.stats())
 
         step_plan = self.step_scheduler.build_plan(self.scheduler)
-        step_plan = self.backend.maybe_preempt(step_plan, self.scheduler)
+        if not (
+            self.scheduler.running_request_count == 1
+            and self.scheduler.queued_request_count == 0
+        ):
+            step_plan = self.backend.maybe_preempt(step_plan, self.scheduler)
         self._admit_requests(step_plan, now)
 
         if self.scheduler.running_request_count == 0:

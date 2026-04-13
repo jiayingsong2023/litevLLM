@@ -171,6 +171,16 @@ class StepScheduler:
             self._multimodal_prefix_cache_hit_rate_feedback = 0.0
 
     def build_plan(self, scheduler) -> StepPlan:
+        fast_plan = self._build_single_request_fast_path(scheduler)
+        if fast_plan is not None:
+            self._update_prefill_deferrals(
+                [rid for rid in fast_plan.prefills.request_ids] if fast_plan.prefills else [],
+                [rid for rid in fast_plan.decodes.request_ids] if fast_plan.decodes else [],
+                fast_plan.prefills,
+            )
+            self._update_decode_streak(fast_plan)
+            return fast_plan
+
         queued_metrics = self._compute_queued_metrics(scheduler)
         (
             admissions,
@@ -359,6 +369,51 @@ class StepScheduler:
         self._update_prefill_deferrals(prefills, decodes, prefill_plan)
         self._update_decode_streak(plan)
         return plan
+
+    def _build_single_request_fast_path(self, scheduler) -> StepPlan | None:
+        """Fast scheduler path for the common single-running-request case.
+
+        This avoids fairness/admission bookkeeping when no queue exists and there is
+        exactly one active running request. Numerical behavior is unchanged.
+        """
+        if scheduler.queued_request_count != 0 or scheduler.running_request_count != 1:
+            return None
+
+        rid = scheduler.running_ids[0]
+        req = scheduler.get_request(rid)
+        running_before = 1
+        queued_before = 0
+
+        if bool(req.get("is_prefill", False)):
+            remaining = max(1, int(len(req["input_ids"]) - int(req["seq_len"])))
+            chunk_len = min(remaining, self.prefill_chunk_size, self.step_token_budget)
+            prefill = PrefillPlan(
+                request_ids=[rid],
+                chunk_len=max(1, int(chunk_len)),
+                token_budget=self.step_token_budget,
+            )
+            return StepPlan(
+                admissions=None,
+                prefills=prefill,
+                decodes=None,
+                step_token_budget=self.step_token_budget,
+                queued_before=queued_before,
+                running_before=running_before,
+            )
+
+        decode = DecodePlan(
+            request_ids=[rid],
+            token_budget=1,
+            use_fast_path=True,
+        )
+        return StepPlan(
+            admissions=None,
+            prefills=None,
+            decodes=decode,
+            step_token_budget=self.step_token_budget,
+            queued_before=queued_before,
+            running_before=running_before,
+        )
 
     def _build_admission_plan(
         self,
