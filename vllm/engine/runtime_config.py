@@ -38,7 +38,9 @@ class RuntimeConfig:
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
 
-        kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "auto").strip().lower()
+        # Default to TurboQuant INT4 unless explicitly overridden.
+        # Keep legacy FASTINFERENCE_KV_FP8 only when user sets KV_TYPE=auto.
+        kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "turbo_int4").strip().lower()
         if kv_type == "auto":
             kv_type = "fp8" if os.environ.get("FASTINFERENCE_KV_FP8", "0") == "1" else "turbo_int4"
 

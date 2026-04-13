@@ -26,8 +26,9 @@ class LiteInferenceConfig:
 
     @classmethod
     def from_env(cls) -> "LiteInferenceConfig":
-        # Resolve KV Type (Checking legacy FP8 toggle first)
-        kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
+        # Resolve KV Type.
+        # Default is TurboQuant INT4; legacy FASTINFERENCE_KV_FP8 applies only in auto mode.
+        kv_type = os.environ.get("FASTINFERENCE_KV_TYPE", "turbo_int4")
         kv_fp8_env = os.environ.get("FASTINFERENCE_KV_FP8", "0")
         
         if kv_type == "auto":

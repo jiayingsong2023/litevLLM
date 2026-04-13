@@ -280,7 +280,7 @@ class LiteEngine:
         if gpu_total_gb > 0 and total_gb > 0.85 * gpu_total_gb:
             print(
                 "     [Warn] Total allocated is high vs GPU size; reduce FASTINFERENCE_KV_MAX_MODEL_LEN "
-                "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_FP8=1, or --frugal scheduling."
+                "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_TYPE=fp8, or --frugal scheduling."
             )
 
         # slot_mapping maps batch tokens to physical indices

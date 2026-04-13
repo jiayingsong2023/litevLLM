@@ -1,0 +1,16 @@
+{
+  "model": "models/gemma-4-26B-A4B-it-AWQ-4bit",
+  "quant": "awq",
+  "preset": "gemma4_26b_a4b",
+  "prompt_id": "en_capital",
+  "hf_device": "cuda",
+  "kv_type": "turbo_int4",
+  "max_model_len": 256,
+  "max_num_batched_tokens": 512,
+  "cos_sim": 0.999987,
+  "max_err": 0.0,
+  "hf_argmax": 506,
+  "lite_engine_argmax": 506,
+  "lite_logits_argmax": 506,
+  "collected_at": "2026-04-13"
+}

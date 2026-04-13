@@ -397,7 +397,7 @@ def main() -> None:
         action="append",
         default=[],
         metavar="KEY=VAL",
-        help="Extra env (repeatable), e.g. FASTINFERENCE_KV_FP8=1",
+        help="Extra env (repeatable), e.g. FASTINFERENCE_KV_TYPE=turbo_int4",
     )
     args = parser.parse_args()
 
@@ -413,7 +413,7 @@ def main() -> None:
             k, v = item.split("=", 1)
             os.environ[k.strip()] = v.strip()
 
-    os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
+    os.environ.setdefault("FASTINFERENCE_KV_TYPE", "turbo_int4")
 
     from vllm.model_executor.layers.quantization.awq import AWQConfig
 

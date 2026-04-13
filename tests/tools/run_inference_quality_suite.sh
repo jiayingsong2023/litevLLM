@@ -14,13 +14,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
-export FASTINFERENCE_KV_FP8="${FASTINFERENCE_KV_FP8:-1}"
+export FASTINFERENCE_KV_TYPE="${FASTINFERENCE_KV_TYPE:-turbo_int4}"
 
 MODEL="${MODEL:-models/Qwen3.5-9B-FP16}"
 QUANT="${1:-none}"
 
 echo "=== Inference quality suite (B-tier greedy) ==="
-echo "  MODEL=$MODEL  QUANT=$QUANT  FASTINFERENCE_KV_FP8=$FASTINFERENCE_KV_FP8"
+echo "  MODEL=$MODEL  QUANT=$QUANT  FASTINFERENCE_KV_TYPE=$FASTINFERENCE_KV_TYPE"
   echo "  See docs/INFERENCE_ACCURACY.md §5 for per-layer / GGUF commands."
 echo ""
 

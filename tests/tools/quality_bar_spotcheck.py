@@ -27,7 +27,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
+# Keep spot-check default aligned with runtime default policy.
+os.environ.setdefault("FASTINFERENCE_KV_TYPE", "turbo_int4")
 
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig  # noqa: E402
 from vllm.engine.lite_engine import LiteEngine  # noqa: E402

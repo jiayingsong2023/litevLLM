@@ -41,7 +41,7 @@ class BenchmarkRequestSpec:
     multi_modal_data: dict[str, Any] | None = None
 
 
-# KV cache: FP8 KV (FASTINFERENCE_KV_FP8=1) to save VRAM; aligned with accuracy suite defaults.
+# KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
 MODEL_SPECS: Dict[str, ModelSpec] = {
     "tinyllama": ModelSpec(
         key="tinyllama",
@@ -55,7 +55,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.92,
         max_model_len=4096,
         max_run_seconds=600,
-        stable_env={"FASTINFERENCE_KV_TYPE": "fp8"},
+        stable_env={"FASTINFERENCE_KV_TYPE": "turbo_int4"},
     ),
     "qwen35_9b_awq": ModelSpec(
         key="qwen35_9b_awq",

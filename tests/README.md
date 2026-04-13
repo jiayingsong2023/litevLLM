@@ -12,7 +12,7 @@
 bash tests/run_inference_correctness_regression.sh
 ```
 
-（默认 `FASTINFERENCE_KV_FP8=1` 以省显存；需要 bf16/fp16 KV 对拍时可设 `FASTINFERENCE_KV_FP8=0`。）
+（默认 `FASTINFERENCE_KV_TYPE=turbo_int4`；如需切换可显式设置 `FASTINFERENCE_KV_TYPE=fp16|fp8|turbo_int4`。）
 
 仅跑 B 档（更快）：`SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh`  
 附带性能诊断（prefill/decode + AWQ fallback 计数）：`RUN_PERF_DIAG=1 bash tests/run_inference_correctness_regression.sh`
@@ -25,16 +25,18 @@ bash tests/run_inference_correctness_regression.sh
 当前脚本中：
 
 - `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ` 走 `A-strict + B`
-- `Gemma4-31B-it-AWQ-4bit` 走 `A-lite + B`
-- 如需对 Gemma 手动开启严格 HF prefill 对拍，可设 `RUN_GEMMA4_A_TIER=1` 或 `RUN_GEMMA4_A_STRICT=1`
+- `Gemma4-31B-it-AWQ-4bit` 默认走 `A-lite + B`（可手动加 `A-strict`）
+- `Gemma4-26B-A4B-it-AWQ-4bit` 默认走 `A-strict + A-lite + B`（text-only）
+- 如需对 Gemma4-31B 手动开启严格 HF prefill 对拍，可设 `RUN_GEMMA4_A_TIER=1` 或 `RUN_GEMMA4_A_STRICT=1`
 
-Gemma4 `A-strict` 的执行方式与小模型不同：
+Gemma4 `A-strict`（31B/26B）的执行方式与小模型不同：
 
 - 默认入口：`tests/tools/gemma4_prefill_strict_audit.py`
 - 默认使用 `--hf-device cuda`
 - 采用 **sequential GPU reference**，不是 Lite 与 HF 同时驻留 GPU
 - 具体顺序是：先抓 Lite prefill logits，再释放 LiteEngine GPU 占用，再在同一张 GPU 上加载 Gemma4 reference 做一次 `prefill-only` 对拍
-- 因此，Gemma4 `A-strict` 适合作为手动专项审计，不适合作为 >14B 默认回归项
+- 对 31B：默认仍建议 `A-lite + B`，`A-strict` 作为手动专项审计
+- 对 26B-A4B：默认开启 `A-strict`（sequential GPU reference）
 
 默认模型路径可通过环境变量覆盖：
 
@@ -69,10 +71,12 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 
 当前默认集合包含：
 
+- `tests/test_kv_default_policy.py`
 - `tests/test_quality_bar_spotcheck_heuristics.py`
 - `tests/test_logits_dump_stats.py`
 - `tests/lite_smoke_test.py`
 - `tests/test_gemma4_strict_audit_smoke.py`
+- `tests/test_gemma4_26b_strict_warn_only.py`
 - `tests/test_model_registry_gemma4.py`
 - `tests/test_gemma4_reference_loader.py`
 - `tests/test_gemma4_diagnostics_warn_only.py`
@@ -89,8 +93,10 @@ cd /path/to/FastInference && bash tests/run_regression_suite.sh
 Gemma4 诊断基线文件：
 
 - `tests/tools/fixtures/gemma4_a_strict_baseline.json`（CosSim + argmax）
+- `tests/tools/fixtures/gemma4_26b_a_strict_baseline.json`（26B A-strict CosSim + argmax）
 - `tests/tools/fixtures/gemma4_layer_drift_baseline_short_hi.json`（token 16/24/32 层漂移摘要）
 - 一键复检入口：`bash tests/run_gemma4_diagnostics_warn_only.sh`（可附加 pytest 参数，例如 `-k parse_helpers`）
+- Gemma4-26B 一键 strict 复检入口：`bash tests/run_gemma4_26b_diagnostics_warn_only.sh`
 
 ## 模型覆盖矩阵（本地需有 `models/...` 目录）
 

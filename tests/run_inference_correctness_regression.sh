@@ -10,9 +10,10 @@
 # Policy:
 #   - models <= 14B: A-strict + B
 #   - models > 14B:  A-lite + B
+#   - exception: Gemma4-26B-A4B defaults to A-strict + A-lite + B
 #
 # Usage:
-#   FASTINFERENCE_KV_FP8=0 bash tests/run_inference_correctness_regression.sh  # force bf16/fp16 KV (more VRAM)
+#   FASTINFERENCE_KV_TYPE=fp16 bash tests/run_inference_correctness_regression.sh  # force fp16 KV globally
 #   SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh   # B-tier only (faster)
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
@@ -39,7 +40,7 @@ RUN_GEMMA4_26B="${RUN_GEMMA4_26B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"
 RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-${RUN_GEMMA4_A_TIER}}"
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
-RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-0}"
+RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
 
 require_model_dir() {
@@ -233,7 +234,7 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
       GEMMA4_26B_PROMPT_ARGS=(--prompts-file "$GEMMA4_PROMPTS_FILE")
     fi
-    FASTINFERENCE_KV_TYPE=fp16 \
+    FASTINFERENCE_KV_TYPE=turbo_int4 \
     FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
     FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
     "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
@@ -296,7 +297,7 @@ fi
 
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
   echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
-  FASTINFERENCE_KV_TYPE=fp16 \
+  FASTINFERENCE_KV_TYPE=turbo_int4 \
   FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
   FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
   "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"

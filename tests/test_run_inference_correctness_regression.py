@@ -40,6 +40,7 @@ def test_run_inference_correctness_regression_invokes_gemma4_a_strict(tmp_path: 
     env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
     env["MODEL_GEMMA4_31B_Q4"] = str(gemma_dir)
     env["RUN_GEMMA4_31B"] = "1"
+    env["RUN_GEMMA4_26B"] = "0"
     env["RUN_GEMMA4_A_STRICT"] = "1"
     env["RUN_GEMMA4_A_LITE"] = "0"
     env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
@@ -64,7 +65,7 @@ def test_run_inference_correctness_regression_invokes_gemma4_a_strict(tmp_path: 
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
 
 
-def test_run_inference_correctness_regression_uses_fp16_kv_for_gemma4_26b(
+def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
     tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -119,5 +120,5 @@ def test_run_inference_correctness_regression_uses_fp16_kv_for_gemma4_26b(
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
     assert str(gemma26_dir) in calls
-    # Gemma4-26B defaults to fp16 KV for stability-first correctness regression.
-    assert "KV=fp16" in calls
+    # Gemma4-26B defaults to turbo_int4 KV in correctness regression.
+    assert "KV=turbo_int4" in calls

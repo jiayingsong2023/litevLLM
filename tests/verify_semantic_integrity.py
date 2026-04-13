@@ -762,8 +762,10 @@ def run_alignment_test(
     # HF baseline dtype; refined when hf_load_path is known (see below).
     dtype = torch.float16
 
-    # Default FP8 KV to save VRAM; set FASTINFERENCE_KV_FP8=0 before launch for bf16/fp16 KV audits.
-    os.environ.setdefault("FASTINFERENCE_KV_FP8", "1")
+    # Default to TurboQuant INT4 KV unless caller explicitly requests otherwise.
+    # Keep legacy FASTINFERENCE_KV_FP8 behavior only when KV_TYPE is explicitly "auto".
+    if "FASTINFERENCE_KV_TYPE" not in os.environ and "FASTINFERENCE_KV_FP8" not in os.environ:
+        os.environ["FASTINFERENCE_KV_TYPE"] = "turbo_int4"
     if quant_type == "awq":
         if awq_disable_fused:
             os.environ["FASTINFERENCE_AWQ_FUSED_GEMM"] = "0"
