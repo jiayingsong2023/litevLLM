@@ -433,13 +433,15 @@ class StepScheduler:
             return None, 0, {}, {}, 0, 0, False, False, False
         now = time.perf_counter()
         queued_ids = scheduler.queued_ids
+        queued_requests = {rid: scheduler.get_request(rid) for rid in queued_ids}
         aged_ids = [
             rid
             for rid in queued_ids
-            if (now - float(scheduler.get_request(rid).get("queued_at") or now))
+            if (now - float(queued_requests[rid].get("queued_at") or now))
             >= self.queue_aging_threshold_s
         ]
-        non_aged_ids = [rid for rid in queued_ids if rid not in set(aged_ids)]
+        aged_set = set(aged_ids)
+        non_aged_ids = [rid for rid in queued_ids if rid not in aged_set]
         admit_limit = min(
             scheduler.queued_request_count,
             scheduler.available_slots,
@@ -454,10 +456,11 @@ class StepScheduler:
             quotas=self.admission_service_class_quotas,
         )
         if len(request_ids) < admit_limit:
+            selected_set = set(request_ids)
             request_ids.extend(
                 self._select_weighted_requests(
                     scheduler=scheduler,
-                    request_ids=[rid for rid in non_aged_ids if rid not in set(request_ids)],
+                    request_ids=[rid for rid in non_aged_ids if rid not in selected_set],
                     limit=admit_limit - len(request_ids),
                     cursor_attr="_admission_service_cursor",
                     prefer_short_prompts=True,
@@ -510,7 +513,7 @@ class StepScheduler:
                 relaxed,
                 tightened,
             )
-        aged_admission_count = sum(1 for rid in request_ids if rid in set(aged_ids))
+        aged_admission_count = sum(1 for rid in request_ids if rid in aged_set)
         return (
             AdmissionPlan(request_ids=request_ids),
             aged_admission_count,
@@ -1302,21 +1305,32 @@ class StepScheduler:
         if limit <= 0 or not request_ids:
             return []
         groups: dict[str, list[str]] = {}
+        request_meta: dict[str, tuple[str, int, float]] = {}
         for rid in request_ids:
-            service_class = str(scheduler.get_request(rid).get("service_class") or "latency")
+            request = scheduler.get_request(rid)
+            service_class = str(request.get("service_class") or "latency")
+            request_meta[rid] = (
+                service_class,
+                len(request.get("input_ids", [])),
+                float(request.get("queued_at") or 0.0),
+            )
             groups.setdefault(service_class, []).append(rid)
         for service_class, grouped_ids in groups.items():
             groups[service_class] = sorted(
                 grouped_ids,
                 key=lambda rid: (
-                    len(scheduler.get_request(rid).get("input_ids", []))
-                    if prefer_short_prompts
-                    else 0,
-                    -float(scheduler.get_request(rid).get("queued_at") or 0.0),
+                    request_meta[rid][1] if prefer_short_prompts else 0,
+                    -request_meta[rid][2],
                     rid,
                 ),
             )
-        service_classes = self._service_classes_for_ids(scheduler, request_ids)
+        service_classes = sorted(
+            groups,
+            key=lambda service_class: (
+                self._service_class_priority(service_class),
+                service_class,
+            ),
+        )
         if not service_classes:
             return []
         selected: list[str] = []
@@ -1340,7 +1354,8 @@ class StepScheduler:
             if not picked:
                 continue
             selected.extend(picked)
-            groups[service_class] = [rid for rid in groups[service_class] if rid not in set(picked)]
+            picked_set = set(picked)
+            groups[service_class] = [rid for rid in groups[service_class] if rid not in picked_set]
         while len(selected) < limit:
             progressed = False
             for service_class in rotated_classes:
@@ -1358,7 +1373,8 @@ class StepScheduler:
                 if not picked:
                     continue
                 selected.extend(picked)
-                groups[service_class] = [rid for rid in groups[service_class] if rid not in set(picked)]
+                picked_set = set(picked)
+                groups[service_class] = [rid for rid in groups[service_class] if rid not in picked_set]
                 progressed = True
                 if len(selected) >= limit:
                     break
