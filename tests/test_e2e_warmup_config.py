@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from tests import e2e_full_benchmark as bench
 
 
 def _args() -> argparse.Namespace:
     return argparse.Namespace(
+        warmup_preset="default",
         warmup_prefill_rounds=1,
         warmup_decode_rounds=2,
         warmup_decode_tokens=8,
@@ -59,3 +61,29 @@ def test_resolve_warmup_config_invalid_env_falls_back(monkeypatch) -> None:
     assert cfg.prefill_rounds == 1
     assert cfg.decode_rounds == 2
     assert cfg.decode_tokens == 8
+
+
+def test_resolve_warmup_config_off_preset(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_BENCH_WARMUP_PRESET", "off")
+    cfg = bench._resolve_warmup_config(_args())
+    assert cfg.prefill_rounds == 0
+    assert cfg.decode_rounds == 0
+    assert cfg.burst_rounds == 0
+
+
+def test_resolve_warmup_config_cold_preset(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_BENCH_WARMUP_PRESET", "cold")
+    cfg = bench._resolve_warmup_config(_args())
+    assert cfg.prefill_rounds == 2
+    assert cfg.decode_rounds == 2
+    assert cfg.decode_tokens == 16
+    assert cfg.burst_rounds == 1
+    assert cfg.burst_concurrency == 2
+
+
+def test_resolve_compile_cache_env(tmp_path: Path) -> None:
+    args = argparse.Namespace(compile_cache_dir=str(tmp_path / "compile_cache"), compile_cache_clear=False)
+    env_map, meta = bench._resolve_compile_cache_env(args)
+    assert meta["enabled"] is True
+    assert "TRITON_CACHE_DIR" in env_map
+    assert "TORCHINDUCTOR_CACHE_DIR" in env_map
