@@ -70,7 +70,19 @@ def _select_fused_gemm_blocks(
     mlp_down_decode_small_m = n == 5376 and k == 21504 and m <= 2
     block_k = 64
     deep_k_narrow_out = k >= 16384 and n <= 6144
-    if m <= 4:
+    if m == 1:
+        # M=1 decode: route to the GEMV specialization inside the kernel. A
+        # BLOCK_M of 16 would waste 15/16 MFMA lanes on replicated rows; the
+        # GEMV branch needs BLOCK_M==1 to be picked up (constexpr DCE of the
+        # MMA path). Wider N tiles keep the reduction dominated by memory.
+        block_m = 1
+        if mlp_down_decode_small_m:
+            block_n = 128
+        elif n <= 8192 or k >= 16384:
+            block_n = 256
+        else:
+            block_n = 128
+    elif m <= 4:
         block_m = 16
         # Decode-heavy Gemma4 shapes prefer wider N tiles, but very wide output
         # projections (e.g. global q / gate-up) still favor 128.
@@ -202,20 +214,28 @@ def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
     Whether to launch Triton autotune for fused GEMM.
 
     FASTINFERENCE_AWQ_FUSED_AUTOTUNE:
-      - "1"/"true"/"on": always autotune
+      - "1"/"true"/"on": always autotune (except M==1; see below)
       - "0"/"false"/"off": never autotune
       - unset or "auto": shape-aware default
 
     The "auto" mode skips autotune on Gemma4-like production shapes where our
     curated heuristics are consistently faster and avoid warmup overhead.
+
+    M==1 is **never** autotuned: ``_PACKED_FUSED_AUTOTUNE_CONFIGS`` only lists
+    ``BLOCK_M >= 16``, so autotune would always pick an MMA tile that skips the
+    ``BLOCK_M == 1`` GEMV fast path inside the heuristic/split-k kernels. Even
+    when operators force ``FASTINFERENCE_AWQ_FUSED_AUTOTUNE=1``, single-row
+    decode must stay on the deterministic heuristic launcher.
     """
+    mm, nn, kk = int(m), int(n), int(k)
+    if mm == 1:
+        return False
     raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
         return True
     # auto
-    mm, nn, kk = int(m), int(n), int(k)
     # Gemma4-31B decode dominant projections (m in {1,2,4}) benefit a lot from
     # autotuned tiles after the scale-index correctness fix; heuristic kernels
     # are kept for medium-M wide-output shapes to avoid unnecessary tuning cost.
@@ -342,10 +362,16 @@ def _awq_native_tiled_gemm_split_k(
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
 
-        if USE_BF16_DOT:
-            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        # Same M=1 GEMV rationale as ``_packed_int4_symmetric_tiled_gemm_split_k``:
+        # MFMA tiles with BLOCK_M>1 waste lanes when M==1 at runtime.
+        if BLOCK_M == 1:
+            prod = a.to(tl.float32) * b
+            accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+            if USE_BF16_DOT:
+                accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+            else:
+                accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
@@ -431,11 +457,15 @@ def _awq_native_tiled_gemm_heuristic(
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
 
-        # 4. Multiply-Accumulate (bf16 dot avoids extra cast when activations are bf16)
-        if USE_BF16_DOT:
-            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        # 4. Multiply-Accumulate: M=1 GEMV path matches packed-int4 kernels.
+        if BLOCK_M == 1:
+            prod = a.to(tl.float32) * b
+            accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+            if USE_BF16_DOT:
+                accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+            else:
+                accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         # Advance pointers
         a_ptrs += BLOCK_K * stride_ak
@@ -508,10 +538,25 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         )
 
         b = (b_unpacked.to(tl.float32) - 8.0) * scales.to(tl.float32)
-        if USE_BF16_DOT:
-            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        # ---- M=1 GEMV specialization -----------------------------------
+        # Decode batches with M=1 produce a [1, BLOCK_K] activation tile. The
+        # generic MMA path forces BLOCK_M>=16 (MFMA lane requirement), which
+        # wastes 15/16 SIMD lanes on replicated inputs. When BLOCK_M==1 we
+        # broadcast multiply-add along the N axis in fp32 to keep every lane
+        # productive without sacrificing accuracy.
+        #
+        #   a : [1,        BLOCK_K]  (activation row)
+        #   b : [BLOCK_N,  BLOCK_K]  (dequantized weights, fp32)
+        # a * b broadcasts to [BLOCK_N, BLOCK_K]; tl.sum over K yields [BLOCK_N].
+        # ----------------------------------------------------------------
+        if BLOCK_M == 1:
+            prod = a.to(tl.float32) * b
+            accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+            if USE_BF16_DOT:
+                accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+            else:
+                accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
@@ -592,11 +637,18 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
 
         # (q - 8) * scale
         b = (b_unpacked.to(tl.float32) - 8.0) * scales.to(tl.float32)
-        
-        if USE_BF16_DOT:
-            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+
+        # See split-k kernel above for the M=1 GEMV rationale: broadcast-FMA
+        # along N with fp32 accumulation keeps SIMD lanes fully utilized when
+        # MFMA's 16-row tile would otherwise waste 15/16 lanes.
+        if BLOCK_M == 1:
+            prod = a.to(tl.float32) * b
+            accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+            if USE_BF16_DOT:
+                accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+            else:
+                accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
@@ -668,10 +720,15 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
         )
 
         b = (b_unpacked.to(tl.float32) - 8.0) * scales.to(tl.float32)
-        if BF16_DOT:
-            accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+        # See split-k kernel for M=1 GEMV rationale.
+        if BLOCK_M == 1:
+            prod = a.to(tl.float32) * b
+            accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
+            if BF16_DOT:
+                accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
+            else:
+                accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
@@ -802,7 +859,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         if split_k > 1:
             c.zero_()
 
-    if _env_fused_gemm_autotune(M, N, K) and split_k == 1:
+    if _env_fused_gemm_autotune(M, N, K) and split_k == 1 and M > 1:
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
         try:
             _awq_native_tiled_gemm_autotuned[grid](
@@ -955,7 +1012,10 @@ def packed_int4_symmetric_fused_gemm(
         group_size=int(group_size),
     )
 
-    if profile_blocks is not None and split_k == 1:
+    # Persistent JSON profiles are tuned for prefill / medium-M; M=1 decode
+    # must use ``_select_fused_gemm_blocks`` so BLOCK_M==1 and the GEMV branch
+    # inside the heuristic kernel are guaranteed.
+    if profile_blocks is not None and split_k == 1 and m > 1:
         block_m, block_n, block_k, num_warps, num_stages = profile_blocks
         grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
         _packed_int4_symmetric_tiled_gemm_heuristic[grid](
@@ -987,7 +1047,7 @@ def packed_int4_symmetric_fused_gemm(
         )
         return c
 
-    if _env_fused_gemm_autotune(m, n, k) and split_k == 1:
+    if _env_fused_gemm_autotune(m, n, k) and split_k == 1 and m > 1:
         grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
         try:
             _packed_int4_symmetric_tiled_gemm_autotuned[grid](
