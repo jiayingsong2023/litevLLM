@@ -645,12 +645,21 @@ def _local_prefill_attention_sdpa(
 
 
 def _should_use_full_decode_reference(kv_cache_dtype: str) -> bool:
+    # Step 3 rewire: the Triton paged-attention kernel now supports Gemma-style
+    # logit soft-capping natively, so full-precision (fp16/bf16) KV no longer
+    # needs to fall back to the eager pytorch reference path on the decode hot
+    # loop. We still honour two escape hatches:
+    #   FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN=1
+    #     Emergency rollback: force ref-path for every dtype (numerical debugging).
+    #   FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN=1
+    #     Preserve the pre-Step-3 behaviour where fp16/bf16 KV forces ref-path
+    #     while int4/fp8 still takes the Triton kernel. Useful during rollout.
     if _env_truthy("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN"):
         return True
-    kvt = str(kv_cache_dtype).lower()
-    # Stability-first path for Gemma4 decode alignment:
-    # when KV is full precision, use the same reference attention math as no-cache path.
-    return ("int4" not in kvt) and ("fp8" not in kvt)
+    if _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN"):
+        kvt = str(kv_cache_dtype).lower()
+        return ("int4" not in kvt) and ("fp8" not in kvt)
+    return False
 
 
 def _is_packed_or_quantized_kv_cache(kv_cache_dtype: str) -> bool:
@@ -1072,9 +1081,12 @@ class Gemma4Attention(nn.Module):
                         else _meta_get(attn_metadata, "kv_cache_dtype", "auto")
                     )
                     ctx_window = int(local_window or 0)
+                    # Step 3 rewire: the Triton paged-attention kernel now
+                    # applies Gemma-style softcap internally (scale -> softcap
+                    # -> -inf mask -> online softmax), so we no longer need to
+                    # route softcap>0 through the eager pytorch ref path here.
                     use_triton_local_decode = (
                         _env_truthy_default_on("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON")
-                        and (softcap is None or float(softcap) <= 0.0)
                         and block_tables is not None
                         and seq_lens is not None
                         and seqlen == 1
@@ -1151,6 +1163,11 @@ class Gemma4Attention(nn.Module):
                             num_kv_heads=self.num_kv_heads,
                             attn_scope="local",
                             layer_type=self.layer_type,
+                            softcap=(
+                                float(softcap)
+                                if softcap is not None and float(softcap) > 0.0
+                                else None
+                            ),
                         )
                         out = attn_out.view(bsz, seqlen, -1)
                     else:
@@ -1264,6 +1281,11 @@ class Gemma4Attention(nn.Module):
                         num_kv_heads=self.num_kv_heads,
                         attn_scope="global",
                         layer_type=self.layer_type,
+                        softcap=(
+                            float(softcap)
+                            if softcap is not None and float(softcap) > 0.0
+                            else None
+                        ),
                     )
                     out = attn_out.view(bsz, seqlen, -1)
         else:
@@ -1285,6 +1307,7 @@ class Gemma4MLP(nn.Module):
         self.hidden_act = str(
             getattr(config, "hidden_activation", getattr(config, "hidden_act", "silu"))
         ).lower()
+        self.intermediate_size = int(config.intermediate_size)
         self.gate_proj = LiteLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -1307,13 +1330,47 @@ class Gemma4MLP(nn.Module):
             prefix=f"{prefix}.mlp.down_proj",
         )
 
+    def _apply_activation(self, gate: torch.Tensor) -> torch.Tensor:
+        # Keep activation dispatch isolated so the fused and unfused branches
+        # share one implementation.
+        if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
+            return F.gelu(gate, approximate="tanh")
+        return F.silu(gate)
+
     def forward(self, x: torch.Tensor, lora_mapping: Any = None) -> torch.Tensor:
+        # Step 4 pair fusion: concat gate_proj and up_proj into a single
+        # quantized GEMM, halving the per-layer kernel launches for AWQ/int4
+        # weights.
+        #
+        # LoRA-activity detection is delegated to the helper because the
+        # input_batch_builder always hands us a list like ``[None, None]``
+        # for non-LoRA requests (see vllm/engine/input_batch_builder.py).
+        # The outer env gate only toggles the optimization wholesale.
+        #
+        # The helper returns None when structural guards trip (mismatched
+        # shapes, high-fidelity flag, active LoRA, etc.) and the caller
+        # falls back to the two-matmul path below.
+        if _env_truthy_default_on("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"):
+            from vllm.model_executor.models._fused_awq_pair import (
+                try_fused_awq_pair_matmul,
+            )
+
+            gu = try_fused_awq_pair_matmul(
+                x,
+                self.gate_proj,
+                self.up_proj,
+                self,
+                "mlp_gate_up",
+                lora_mapping=lora_mapping,
+            )
+            if gu is not None:
+                gate, up = torch.split(gu, self.intermediate_size, dim=-1)
+                act = self._apply_activation(gate)
+                return self.down_proj(act * up, lora_mapping)
+
         gate = self.gate_proj(x, lora_mapping)
         up = self.up_proj(x, lora_mapping)
-        if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
-            act = F.gelu(gate, approximate="tanh")
-        else:
-            act = F.silu(gate)
+        act = self._apply_activation(gate)
         return self.down_proj(act * up, lora_mapping)
 
 

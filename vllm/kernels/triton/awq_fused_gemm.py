@@ -241,9 +241,23 @@ def _select_split_k(m: int, n: int, k: int) -> int:
         except ValueError:
             return 1
     mm, nn, kk = int(m), int(n), int(k)
-    # Decode m=1 with deep-K and wide output often benefits from K-splitting.
-    # Keep narrow-output projections on split_k=1 to avoid atomic overhead.
+    # Decode m=1 with deep-K benefits from K-splitting when there is not
+    # enough work along N to saturate CU/SM occupancy.
+    #
+    # Shape families this heuristic covers (decode M=1):
+    #   * Gemma4-31B / Qwen3.5-like gate_up fused pair: K~hidden (<=8k),
+    #     N~2*intermediate (>=16k)   -> split_k=1 (lots of N-parallelism).
+    #   * Gemma4-31B down_proj:     K~21504, N~hidden (~5k-6k) -> split_k=4.
+    #     Narrow-N means few (pid_m, pid_n) tiles, so atomics over SPLIT_K
+    #     are amortized by the extra CU fill.
+    #   * Qwen3.5-9B style wide-N deep-K (K~16k, N>=8k)       -> split_k=4.
+    #
+    # The narrow-N lane uses a moderately higher K threshold (>= 20k) so
+    # shallower-K decodes on Qwen3.5 (K~18944, N~3584) stay on split_k=1
+    # where atomic overhead would otherwise dominate.
     if mm == 1 and kk >= 16384 and nn >= 8192:
+        return 4
+    if mm == 1 and kk >= 20480 and nn >= 4096:
         return 4
     return 1
 

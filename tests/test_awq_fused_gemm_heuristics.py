@@ -47,8 +47,13 @@ def test_env_fused_gemm_autotune_explicit_override(monkeypatch) -> None:
 
 def test_select_split_k_auto_prefers_wide_decode_only(monkeypatch) -> None:
     monkeypatch.delenv("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", raising=False)
+    # Wide-output deep-K (gate_up fused or Qwen3.5 large MLP).
     assert _select_split_k(1, 16384, 21504) == 4
-    assert _select_split_k(1, 5376, 21504) == 1
+    # Gemma4-31B down_proj: narrow N, very deep K -> now split_k=4
+    # (Step 4.3). This case previously fell through to split_k=1, which
+    # starved the GPU when only ~42 N-tiles existed.
+    assert _select_split_k(1, 5376, 21504) == 4
+    # Prefill (M>1) never splits regardless of shape.
     assert _select_split_k(4, 8192, 21504) == 1
 
 

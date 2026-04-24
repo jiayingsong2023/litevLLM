@@ -5,6 +5,14 @@ import torch
 import triton
 import triton.language as tl
 
+# Triton >= 2.2 ships libdevice under extra; tanh lives there for fp32 path.
+# Use a thin alias so the kernel can call libdevice.tanh without namespacing
+# each site, and so we can fall back to tl.math on older backends if needed.
+try:
+    from triton.language.extra import libdevice  # type: ignore
+except Exception:  # pragma: no cover - fallback for older triton
+    from triton.language import math as libdevice  # type: ignore
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -117,10 +125,12 @@ def _paged_attention_kernel(
     K_Scale_Ptrs_ptr, V_Scale_Ptrs_ptr,
     stride_ks_block, stride_ks_token, stride_ks_head,
     stride_vs_block, stride_vs_token, stride_vs_head,
+    softcap_value,
     IS_FP8: tl.constexpr,
     IS_INT4: tl.constexpr,
     IS_CACHED: tl.constexpr,
     HAS_ROW_SCALE: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
     BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -187,6 +197,13 @@ def _paged_attention_kernel(
             if IS_FP8: k = (k.to(tl.float32) * k_scale)
             qk = tl.sum(q[None, :] * k, axis=1) * scale
 
+        # Apply Gemma-style logit soft-capping BEFORE the padding -inf mask.
+        # If softcap were applied after mask, tanh(-inf)=-1 would wreck the
+        # running max. Order: scale -> softcap -> mask -> online softmax.
+        if HAS_SOFTCAP:
+            inv_softcap = 1.0 / softcap_value
+            qk = softcap_value * libdevice.tanh(qk * inv_softcap)
+
         qk = tl.where(block_mask, qk, -float('inf'))
         m_curr = tl.max(qk, axis=0); m_new = tl.maximum(m_i, m_curr)
         
@@ -230,13 +247,25 @@ def _paged_attention_kernel(
         off_d = tl.arange(0, BLOCK_D)
         tl.store(Out_ptr + off_out_base + off_d * stride_out_dim, out.to(Out_ptr.dtype.element_ty))
 
-def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, k_scale_ptrs=None, v_scale_ptrs=None, **kwargs):
+def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype, k_scale=1.0, v_scale=1.0, k_ptrs=None, v_ptrs=None, k_scale_ptrs=None, v_scale_ptrs=None, softcap=None, **kwargs):
     num_seqs, _num_heads_check, head_size = query.shape
     num_kv_heads = kwargs.get("num_kv_heads", num_heads)
     is_fp8 = "fp8" in str(kv_cache_dtype).lower()
     is_int4 = "int4" in str(kv_cache_dtype).lower()
     is_cached = k_ptrs is not None
     has_row_scale = k_scale_ptrs is not None
+    # Gemma-style logit soft-capping: qk' = cap * tanh(qk * scale / cap).
+    # None / <=0 / NaN -> treat as disabled (HAS_SOFTCAP=False) so the kernel
+    # compiles the tanh branch out entirely (zero runtime cost for non-Gemma).
+    if softcap is None:
+        has_softcap = False
+        softcap_val = 0.0
+    else:
+        try:
+            softcap_val = float(softcap)
+        except (TypeError, ValueError):
+            softcap_val = 0.0
+        has_softcap = softcap_val > 0.0 and softcap_val == softcap_val  # NaN-safe
     
     s_k = key_cache.stride(); s_v = value_cache.stride()
     
@@ -272,7 +301,10 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, blo
         k_scale_ptrs if has_row_scale else out, v_scale_ptrs if has_row_scale else out,
         s_ks[0], s_ks[1], s_ks[2],
         s_vs[0], s_vs[1], s_vs[2],
-        IS_FP8=is_fp8, IS_INT4=is_int4, IS_CACHED=is_cached, HAS_ROW_SCALE=has_row_scale, BLOCK_D=head_size, BLOCK_N=block_size,
+        softcap_val,
+        IS_FP8=is_fp8, IS_INT4=is_int4, IS_CACHED=is_cached, HAS_ROW_SCALE=has_row_scale,
+        HAS_SOFTCAP=has_softcap,
+        BLOCK_D=head_size, BLOCK_N=block_size,
         num_warps=num_warps, num_stages=num_stages,
     )
 

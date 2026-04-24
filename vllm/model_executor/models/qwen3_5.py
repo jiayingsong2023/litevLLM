@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 from vllm.model_executor.layers.lite_linear import LiteLinear
-from vllm.model_executor.layers.quantization.tensor import AWQWeight, PackedInt4Weight
 from .lite_config import LiteConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.model_executor.moe_fp8_utils import (
@@ -633,86 +632,16 @@ def _qwen35_try_fused_awq_pair_matmul(
     owner: nn.Module,
     cache_key: str,
 ) -> Optional[torch.Tensor]:
+    """Backward-compatible shim over the model-agnostic helper in
+    ``_fused_awq_pair``. Kept so existing Qwen3.5 callsites do not need
+    touching in this refactor. New callers (Gemma4, future models) should
+    import ``try_fused_awq_pair_matmul`` directly.
     """
-    Single quantized matmul for two LiteLinear layers with identical packed layout
-    (same qweight/scales row shape) and same input/output sizes.
-
-    Supports:
-    - Classic AWQ (qweight + scales + qzeros): stacked AWQWeight.
-    - Symmetric packed int4 (qweight + scales, qzeros None): stacked PackedInt4Weight (Qwen3.5 AWQ).
-
-    Returns tensor (..., 2 * out_dim) or None to fall back to two forwards.
-    """
-    if lin_a.input_size != lin_b.input_size or lin_a.output_size != lin_b.output_size:
-        return None
-    ba = getattr(lin_a, "bias", None)
-    bb = getattr(lin_b, "bias", None)
-    fused_bias: Optional[torch.Tensor] = None
-    if ba is not None and bb is not None:
-        fused_bias = torch.cat([ba.reshape(-1), bb.reshape(-1)], dim=0).contiguous()
-    elif ba is not None or bb is not None:
-        return None
-    if getattr(lin_a, "force_high_fidelity_awq", False) or getattr(
-        lin_b, "force_high_fidelity_awq", False
-    ):
-        return None
-    qwa = getattr(lin_a, "qweight", None)
-    qwb = getattr(lin_b, "qweight", None)
-    if qwa is None or qwb is None or qwa.numel() <= 1 or qwb.numel() <= 1:
-        return None
-    if tuple(qwa.shape) != tuple(qwb.shape):
-        return None
-    if tuple(lin_a.scales.shape) != tuple(lin_b.scales.shape):
-        return None
-    gs = int(getattr(lin_a, "group_size", 128))
-    if int(getattr(lin_b, "group_size", 128)) != gs:
-        return None
-
-    za = getattr(lin_a, "qzeros", None)
-    zb = getattr(lin_b, "qzeros", None)
-    has_awq_zeros = (
-        za is not None
-        and zb is not None
-        and za.numel() > 1
-        and zb.numel() > 1
-        and tuple(za.shape) == tuple(zb.shape)
+    from vllm.model_executor.models._fused_awq_pair import (
+        try_fused_awq_pair_matmul,
     )
-    has_symmetric_packed = (za is None or za.numel() <= 1) and (zb is None or zb.numel() <= 1)
-    if not has_awq_zeros and not has_symmetric_packed:
-        return None
 
-    cache_attr = f"_fused_awq_pair_{cache_key}"
-    fused_w = getattr(owner, cache_attr, None)
-    if fused_w is None:
-        q_cat = torch.cat([lin_a.qweight, lin_b.qweight], dim=0).contiguous()
-        s_cat = torch.cat([lin_a.scales, lin_b.scales], dim=0).contiguous()
-        if has_awq_zeros:
-            fused_w = AWQWeight(
-                q_cat,
-                s_cat,
-                torch.cat([lin_a.qzeros, lin_b.qzeros], dim=0).contiguous(),
-                group_size=gs,
-                prefix=getattr(lin_a, "prefix", "") or "fused_pair",
-                high_fidelity=False,
-                profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
-            )
-        else:
-            fused_w = PackedInt4Weight(
-                q_cat,
-                s_cat,
-                group_size=gs,
-                original_shape=getattr(lin_a, "weight_shape", None),
-                prefix=getattr(lin_a, "prefix", "") or "fused_pair",
-                high_fidelity=False,
-                profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
-            )
-        setattr(owner, cache_attr, fused_w)
-
-    lead_shape = x.shape[:-1]
-    x2 = x.reshape(-1, x.shape[-1])
-    out2 = fused_w.matmul(x2, fused_bias)
-    od = int(lin_a.output_size)
-    return out2.reshape(*lead_shape, 2 * od)
+    return try_fused_awq_pair_matmul(x, lin_a, lin_b, owner, cache_key)
 
 
 def _call_litelinear_stable(layer: LiteLinear, x_f32: torch.Tensor, pre_cap: float = 2048.0) -> torch.Tensor:
