@@ -156,6 +156,7 @@ _HIGH_FIDELITY_PREFIXES = tuple(
 )
 
 _AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
+_AWQ_RUNTIME_PREFIX_STATS: Dict[str, Dict[str, int]] = {}
 
 
 def _awq_stat_inc(key: str, delta: int = 1) -> None:
@@ -164,6 +165,13 @@ def _awq_stat_inc(key: str, delta: int = 1) -> None:
 
 def _awq_stat_set(key: str, value: int) -> None:
     _AWQ_RUNTIME_STATS[key] = int(value)
+
+
+def _awq_prefix_stat_inc(prefix: str, key: str, delta: int = 1) -> None:
+    if not prefix:
+        prefix = "<unknown>"
+    bucket = _AWQ_RUNTIME_PREFIX_STATS.setdefault(prefix, defaultdict(int))  # type: ignore[arg-type]
+    bucket[key] += int(delta)
 
 
 def _env_awq_prefer_fused_default() -> bool:
@@ -210,6 +218,13 @@ def _env_awq_fused_scope(profile_hint: str) -> str:
     # Profile-aware default matrix (no override):
     # - qwen35_9b_awq: safe=attention_only, balanced|throughput=all, strict=off
     if profile_hint == "qwen35_9b_awq":
+        default_scope = (
+            "all" if matrix in ("balanced", "throughput")
+            else "off" if matrix == "strict"
+            else "attention_only"
+        )
+    # - gemma4_31b_q4: throughput-first dense model; keep fused enabled except in strict mode
+    elif profile_hint == "gemma4_31b_q4":
         default_scope = (
             "all" if matrix in ("balanced", "throughput")
             else "off" if matrix == "strict"
@@ -266,6 +281,15 @@ def should_allow_dense_cache(prefix: str, policy: AWQExecutionPolicy) -> bool:
     return True
 
 
+def should_allow_awq_fused(prefix: str, policy: AWQExecutionPolicy) -> tuple[bool, str]:
+    scope = policy.fused_scope
+    if scope == "off":
+        return False, "fused_scope_off"
+    if scope == "attention_only" and (not _is_attention_like_prefix(prefix)):
+        return False, "fused_scope_attention_only_non_attn"
+    return True, "scope_ok"
+
+
 def should_use_awq_fused_path(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -278,6 +302,9 @@ def should_use_awq_fused_path(
     if _env_awq_fused_gemm_force():
         # print(f">>>> DEBUG: Fused path FORCED for {prefix}")
         return True, "force_on"
+    allow_by_scope, scope_reason = should_allow_awq_fused(prefix, policy)
+    if not allow_by_scope:
+        return False, scope_reason
     if not (policy.prefer_fused or _env_awq_fused_gemm_force()):
         return False, "fused_disabled"
     
@@ -295,6 +322,7 @@ def should_use_awq_fused_path(
 
 def reset_awq_runtime_stats() -> None:
     _AWQ_RUNTIME_STATS.clear()
+    _AWQ_RUNTIME_PREFIX_STATS.clear()
     _awq_stat_set("awq_matmul_calls", 0)
     _awq_stat_set("awq_fused_attempt", 0)
     _awq_stat_set("awq_fused_success", 0)
@@ -307,6 +335,21 @@ def reset_awq_runtime_stats() -> None:
 def get_awq_runtime_stats() -> Dict[str, int]:
     out = dict(_AWQ_RUNTIME_STATS)
     out.update(_GLOBAL_WEIGHT_CACHE.get_memory_stats())
+    return out
+
+
+def get_awq_runtime_prefix_stats(limit: int = 20) -> Dict[str, Dict[str, int]]:
+    rows = sorted(
+        _AWQ_RUNTIME_PREFIX_STATS.items(),
+        key=lambda kv: (
+            -int(kv[1].get("matmul_calls", 0)),
+            -int(kv[1].get("fused_success", 0)),
+            kv[0],
+        ),
+    )
+    out: Dict[str, Dict[str, int]] = {}
+    for prefix, stats in rows[: max(0, int(limit))]:
+        out[prefix] = {k: int(v) for k, v in stats.items()}
     return out
 
 
@@ -419,7 +462,7 @@ def dequantize_symmetric_packed_int4_pytorch(
         n_groups = n_cols // group_size
         qs = qs.view(n_rows, n_groups, group_size)
         res = qs * scales.to(torch.float32).unsqueeze(-1)
-        return res.view(n_rows, n_cols)
+        return res.view(n_rows, n_cols).to(torch.float16)
     except Exception as e:
         raise RuntimeError(f"Symmetric packed int4 dequant error: {e}")
 
@@ -490,21 +533,33 @@ class AWQWeight(QuantizedLinearWeight):
         super().__init__(); self.qweight = nn.Parameter(qweight, requires_grad=False); self.scales = nn.Parameter(scales, requires_grad=False); self.qzeros = nn.Parameter(qzeros, requires_grad=False); self.group_size = group_size; self.prefix = prefix; self.high_fidelity = high_fidelity; self.profile_hint = profile_hint
     def matmul(self, x, bias=None):
         _awq_stat_inc("awq_matmul_calls")
+        _awq_prefix_stat_inc(self.prefix, "matmul_calls")
         
         # FAST PATH: Cached Decision
         if hasattr(self, "_cached_fused_decision"):
             if self._cached_fused_decision:
                 try:
                     from vllm.kernels.triton.awq_fused_gemm import awq_fused_gemm_safe
+                    _awq_stat_inc("awq_fused_attempt")
+                    _awq_prefix_stat_inc(self.prefix, "fused_attempt")
                     out, used_fused, reason = awq_fused_gemm_safe(
                         x.reshape(-1, x.shape[-1]).contiguous(),
                         self.qweight, self.scales, self.qzeros, int(self.group_size), bias=bias,
                     )
-                    if used_fused: return out.view(*x.shape[:-1], out.shape[-1])
-                except: pass
+                    if used_fused:
+                        _awq_stat_inc("awq_fused_success")
+                        _awq_prefix_stat_inc(self.prefix, "fused_success")
+                        return out.view(*x.shape[:-1], out.shape[-1])
+                    _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
+                    if reason:
+                        _awq_prefix_stat_inc(self.prefix, f"reason:{reason}")
+                except Exception:
+                    _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
             # Fallback to cached dense or dequant
             cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
             if cached_w is not None:
+                _awq_stat_inc("awq_cache_hits")
+                _awq_prefix_stat_inc(self.prefix, "cache_hit")
                 # print(f">>>> DEBUG: Using CACHED DENSE for {self.prefix}")
                 return _apply_linear_with_cached_weight(x, cached_w, bias)
 
@@ -512,13 +567,20 @@ class AWQWeight(QuantizedLinearWeight):
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
             # print(f">>>> DEBUG: High Fidelity Direct Dequant for {self.prefix}")
             self._cached_fused_decision = False
+            _awq_prefix_stat_inc(self.prefix, "high_fidelity_forced")
             return self._slow_matmul_dequant(x, bias)
 
         policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
-        use_fused, _ = should_use_awq_fused_path(
+        use_fused, reason = should_use_awq_fused_path(
             x=x, qweight=self.qweight, scales=self.scales, qzeros=self.qzeros,
             group_size=self.group_size, prefix=self.prefix, policy=policy,
         )
+        if use_fused:
+            _awq_prefix_stat_inc(self.prefix, "decision_fused")
+        else:
+            _awq_prefix_stat_inc(self.prefix, "decision_dense")
+            if reason:
+                _awq_prefix_stat_inc(self.prefix, f"reason:{reason}")
         self._cached_fused_decision = use_fused
         return self.matmul(x, bias) # Re-run with fast path
 
@@ -528,6 +590,8 @@ class AWQWeight(QuantizedLinearWeight):
             dense_weight = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
         except:
             dense_weight = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
+        _awq_stat_inc("awq_dense_builds")
+        _awq_prefix_stat_inc(self.prefix, "dense_build")
         return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
 
 
@@ -544,10 +608,13 @@ class PackedInt4Weight(QuantizedLinearWeight):
 
     def matmul(self, x, bias=None):
         _awq_stat_inc("awq_matmul_calls")
+        _awq_prefix_stat_inc(self.prefix, "matmul_calls")
 
         def _dense_fallback() -> torch.Tensor:
             cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
             if cached_w is not None:
+                _awq_stat_inc("awq_cache_hits")
+                _awq_prefix_stat_inc(self.prefix, "cache_hit")
                 return _apply_linear_with_cached_weight(x, cached_w, bias)
             # Use the local unpack/dequant path for stability with pack-quantized
             # checkpoints that can diverge under external helper backends.
@@ -561,6 +628,10 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     : self.original_shape[0], : self.original_shape[1]
                 ].contiguous()
             _awq_cache_put(self.weight_id, dense_weight)
+            _awq_stat_inc("awq_cache_misses")
+            _awq_stat_inc("awq_dense_builds")
+            _awq_prefix_stat_inc(self.prefix, "cache_miss")
+            _awq_prefix_stat_inc(self.prefix, "dense_build")
             return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
 
         use_fused_cached = getattr(self, "_cached_fused_decision", None)
@@ -569,6 +640,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 from vllm.kernels.triton.awq_fused_gemm import packed_int4_symmetric_fused_gemm_safe
 
                 _awq_stat_inc("awq_fused_attempt")
+                _awq_prefix_stat_inc(self.prefix, "fused_attempt")
                 out, used_fused, _ = packed_int4_symmetric_fused_gemm_safe(
                     x.reshape(-1, x.shape[-1]).contiguous(),
                     self.qweight,
@@ -578,24 +650,35 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 )
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "fused_success")
                     return out.view(*x.shape[:-1], out.shape[-1])
             except Exception:
-                pass
+                _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
             self._cached_fused_decision = False
+            _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
             return _dense_fallback()
 
         if use_fused_cached is False:
+            _awq_prefix_stat_inc(self.prefix, "decision_dense_cached")
             return _dense_fallback()
 
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
             self._cached_fused_decision = False
+            _awq_prefix_stat_inc(self.prefix, "high_fidelity_forced")
             return _dense_fallback()
 
         if _env_awq_fused_gemm_force():
             self._cached_fused_decision = True
+            _awq_prefix_stat_inc(self.prefix, "decision_fused_forced")
             return self.matmul(x, bias)
 
         policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        allow_by_scope, scope_reason = should_allow_awq_fused(self.prefix, policy)
+        if not allow_by_scope:
+            self._cached_fused_decision = False
+            _awq_prefix_stat_inc(self.prefix, "decision_dense")
+            _awq_prefix_stat_inc(self.prefix, f"reason:{scope_reason}")
+            return _dense_fallback()
         use_fused = False
         if policy.prefer_fused or _env_awq_fused_gemm_force():
             try:
@@ -610,7 +693,10 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 print(
                     f">>>> DEBUG: PackedInt4 capability check EXCEPTION for {self.prefix}: {e}"
                 )
+                _awq_prefix_stat_inc(self.prefix, "capability_check_exception")
         self._cached_fused_decision = bool(use_fused)
         if self._cached_fused_decision:
+            _awq_prefix_stat_inc(self.prefix, "decision_fused")
             return self.matmul(x, bias)
+        _awq_prefix_stat_inc(self.prefix, "decision_dense")
         return _dense_fallback()

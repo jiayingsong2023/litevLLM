@@ -407,6 +407,24 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
         super().__init__()
         self.inner = inner.eval()
 
+    @staticmethod
+    def _env_truthy(name: str) -> bool:
+        v = str(os.environ.get(name, "")).strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    @classmethod
+    def _resolve_kv_type_for_gemma4(cls) -> str:
+        requested = str(os.environ.get("FASTINFERENCE_KV_TYPE", "turbo_int4")).strip().lower()
+        if requested in ("int4", "turbo_int4") and (not cls._env_truthy("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV")):
+            # Keep Gemma4 reference path aligned with LiteEngine's accuracy guard.
+            return "fp8"
+        if requested in ("fp8", "float8", "float8_e4m3fn", "e4m3", "e4m3fn"):
+            return "fp8"
+        if requested in ("fp16", "float16", "bf16", "bfloat16"):
+            return "fp16"
+        # Conservative fallback for unknown/auto values.
+        return "fp8"
+
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         del attention_mask
         bsz, seqlen = input_ids.shape
@@ -420,32 +438,33 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
             max_model_len = max(256, ((seqlen + block_size - 1) // block_size) * block_size)
             num_blocks = max(1, max_model_len // block_size)
             num_layers = len(self.inner.model.layers)
-            cfg = self.inner.model.config
-            num_kv_heads = max(
-                int(getattr(cfg, "num_key_value_heads", 1)),
-                int(getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", 1))),
-            )
-            kv_head_dim = max(
-                int(getattr(cfg, "head_dim", 1)),
-                int(getattr(cfg, "global_head_dim", getattr(cfg, "head_dim", 1))),
-            )
+            kv_type = self._resolve_kv_type_for_gemma4()
+            kv_dtype = torch.uint8 if kv_type == "turbo_int4" else torch.float8_e4m3fn
+            k_scale = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
+            v_scale = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
             kv_caches = []
             kv_scale_caches = []
-            for _ in range(num_layers):
+            for li in range(num_layers):
+                attn = self.inner.model.layers[li].self_attn
+                layer_num_kv_heads = int(getattr(attn, "num_kv_heads", 1))
+                layer_kv_head_dim = int(getattr(attn, "head_dim", 1))
                 k = torch.zeros(
-                    (num_blocks, block_size, num_kv_heads, kv_head_dim),
+                    (num_blocks, block_size, layer_num_kv_heads, layer_kv_head_dim),
                     device=input_ids.device,
-                    dtype=torch.uint8,
+                    dtype=kv_dtype,
                 )
                 v = torch.zeros_like(k)
                 kv_caches.append((k, v))
-                ks = torch.zeros(
-                    (num_blocks, block_size, num_kv_heads, 1),
-                    device=input_ids.device,
-                    dtype=torch.float32,
-                )
-                vs = torch.zeros_like(ks)
-                kv_scale_caches.append((ks, vs))
+                if kv_type == "turbo_int4":
+                    ks = torch.zeros(
+                        (num_blocks, block_size, layer_num_kv_heads, 1),
+                        device=input_ids.device,
+                        dtype=torch.float32,
+                    )
+                    vs = torch.zeros_like(ks)
+                    kv_scale_caches.append((ks, vs))
+                else:
+                    kv_scale_caches.append((None, None))
             meta = {
                 "slot_mapping": torch.arange(seqlen, device=input_ids.device, dtype=torch.long),
                 "seq_lens": torch.tensor([seqlen], device=input_ids.device, dtype=torch.int32),
@@ -455,10 +474,10 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
                 "linear_attn_carry": [None] * num_layers,
                 "linear_conv_carry": [None] * num_layers,
                 "kv_scale_cache": kv_scale_caches,
-                "kv_cache_dtype": "turbo_int4",
-                "k_scale": 1.0,
-                "v_scale": 1.0,
-                "config": SimpleNamespace(kv_type="turbo_int4", k_scale=1.0, v_scale=1.0),
+                "kv_cache_dtype": kv_type,
+                "k_scale": k_scale,
+                "v_scale": v_scale,
+                "config": SimpleNamespace(kv_type=kv_type, k_scale=k_scale, v_scale=v_scale),
             }
         else:
             kv_caches = [None] * len(self.inner.model.layers)

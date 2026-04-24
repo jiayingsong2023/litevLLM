@@ -813,6 +813,23 @@ def _qwen35_awq_profile_hint_from_model_path(model_path: str) -> str:
     return ""
 
 
+def _looks_like_gemma4_31b_model_path(model_path: str) -> bool:
+    base = os.path.basename(os.path.abspath(model_path)).lower()
+    return (
+        "gemma-4-31b" in base
+        or ("gemma4" in base and "31b" in base)
+        or ("gemma" in base and "31b" in base and "awq" in base)
+    )
+
+
+def _awq_profile_hint_from_model_path(model_path: str) -> str:
+    if _looks_like_qwen35_9b_awq_model_path(model_path):
+        return "qwen35_9b_awq"
+    if _looks_like_gemma4_31b_model_path(model_path):
+        return "gemma4_31b_q4"
+    return ""
+
+
 def _awq_policy_matrix_mode() -> str:
     raw = os.environ.get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
     if raw not in ("safe", "balanced", "throughput", "strict"):
@@ -1035,7 +1052,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
         G = K // scale_groups
         try:
             # Force preserve quant for all AWQ models to avoid CPU OOM
-            m.awq_profile_hint = _qwen35_awq_profile_hint_from_model_path(model_path)
+            m.awq_profile_hint = _awq_profile_hint_from_model_path(model_path)
             
             # Tensors are already on GPU from immediate transfer above
             m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)

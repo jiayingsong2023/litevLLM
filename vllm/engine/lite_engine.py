@@ -6,6 +6,7 @@ import re
 import torch
 import torch.nn as nn
 import copy
+from dataclasses import replace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 from vllm.adapters import get_model_adapter
 from vllm.config import VllmConfig
@@ -50,6 +51,14 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
     if dtype == torch.float32:
         return 4
     return 2
+
+
+def _bytes_to_gib(value: int | float) -> float:
+    return float(value) / float(1024**3)
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "")
 
 
 def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
@@ -172,6 +181,43 @@ class LiteEngine:
             f">>> LiteEngine: Verified Dimensions: {self.num_attention_heads} Q-heads, "
             f"{self.num_kv_heads} KV-heads, {self.head_size} head_dim"
         )
+        self._layer_kv_specs = self._resolve_layer_kv_specs()
+        model_type_name = type(self.model).__name__.lower()
+        is_gemma4_model = "gemma4" in model_type_name
+        if (
+            is_gemma4_model
+            and str(self.runtime_config.kv_cache_dtype).lower() in ("turbo_int4", "int4")
+            and (not _env_truthy("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV"))
+        ):
+            print(
+                ">>>> LiteEngine: Gemma4 accuracy guard enabled: forcing KV dtype to fp8 "
+                "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
+            )
+            self.runtime_config = replace(self.runtime_config, kv_cache_dtype="fp8")
+        if is_gemma4_model:
+            # Stage-wise fused rollout for Gemma4:
+            # - default: attention_only (accuracy-first, partial fused recovery)
+            # - FASTINFERENCE_GEMMA4_FUSED_STAGE=off|attention_only|all to override
+            # Compatibility: FASTINFERENCE_GEMMA4_ALLOW_FUSED_AWQ=1 implies default_stage=all
+            default_stage = "all"
+            fused_stage = os.environ.get(
+                "FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage
+            ).strip().lower()
+            if fused_stage not in ("off", "attention_only", "all"):
+                fused_stage = default_stage
+            if os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE", "").strip() == "":
+                os.environ["FASTINFERENCE_AWQ_FUSED_SCOPE"] = fused_stage
+            if os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM", "").strip() == "":
+                os.environ["FASTINFERENCE_AWQ_FUSED_GEMM"] = (
+                    "0" if fused_stage == "off" else "1"
+                )
+            if os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_FORCE", "").strip() == "":
+                os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_FORCE"] = "0"
+            print(
+                ">>>> LiteEngine: Gemma4 fused rollout stage="
+                f"{os.environ.get('FASTINFERENCE_AWQ_FUSED_SCOPE', fused_stage)} "
+                "(set FASTINFERENCE_GEMMA4_FUSED_STAGE=off|attention_only|all to override)."
+            )
         
         # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
         self.inf_config = LiteInferenceConfig(
@@ -241,6 +287,8 @@ class LiteEngine:
             self.kv_head_dim = kv_plan.kv_head_dim
             
         kv_theory_bytes = kv_plan.theory_bytes
+        if self._layer_kv_specs is not None:
+            kv_theory_bytes = self._compute_kv_theory_bytes(needs_scale_cache=kv_plan.needs_scale_cache)
         print(
             f">>>> LiteEngine: Allocating KV Cache on {self.device} "
             f"({self.max_active_requests} seq slots, {self.max_model_len} tokens/seq cap, "
@@ -253,21 +301,23 @@ class LiteEngine:
         self.kv_caches = []
         for i in range(self.num_layers):
             print(f"    Allocating layer {i}...")
+            layer_num_kv_heads, layer_kv_head_dim = self._layer_kv_cache_shape_for_layer(i)
             # Shape: (num_total_blocks, block_size, heads, head_size)
-            k = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.kv_head_dim), 
+            k = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, layer_kv_head_dim), 
                           device=self.device, dtype=self.kv_dtype)
-            v = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, self.kv_head_dim), 
+            v = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, layer_kv_head_dim), 
                           device=self.device, dtype=self.kv_dtype)
             self.kv_caches.append((k, v))
         
         if kv_plan.needs_scale_cache:
             print(">>>> LiteEngine: Allocating KV Scale Caches for TurboQuant...")
             self.kv_scale_caches = []
-            for _ in range(self.num_layers):
+            for i in range(self.num_layers):
+                layer_num_kv_heads, _layer_kv_head_dim = self._layer_kv_cache_shape_for_layer(i)
                 # Per-token, per-head scale: (num_total_blocks, block_size, num_kv_heads, 1)
-                ks = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, 1), 
+                ks = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, 1), 
                                device=self.device, dtype=torch.float32)
-                vs = torch.zeros((self.num_total_blocks, self.block_size, self.num_kv_heads, 1), 
+                vs = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, 1), 
                                device=self.device, dtype=torch.float32)
                 self.kv_scale_caches.append((ks, vs))
         else:
@@ -277,10 +327,20 @@ class LiteEngine:
 
         mem_after_kv = int(torch.cuda.memory_allocated(self.device))
         kv_delta_bytes = mem_after_kv - mem_before_kv
-        total_gb = mem_after_kv / (1024**3)
-        weights_gb = mem_before_kv / (1024**3)
-        kv_delta_gb = kv_delta_bytes / (1024**3)
+        total_gb = _bytes_to_gib(mem_after_kv)
+        weights_gb = _bytes_to_gib(mem_before_kv)
+        kv_delta_gb = _bytes_to_gib(kv_delta_bytes)
         gpu_total_gb = get_total_gpu_memory_gb()
+        audit = self._collect_cuda_tensor_memory_audit()
+        params_total_bytes = int(audit["params_total_bytes"])
+        buffers_total_bytes = int(audit["buffers_total_bytes"])
+        awq_cache_bytes = int(audit["awq_cache_bytes"])
+        accounted_before_kv = params_total_bytes + buffers_total_bytes + awq_cache_bytes
+        other_cuda_overhead = max(0, mem_before_kv - accounted_before_kv)
+        kv_data_theory = self._compute_kv_theory_bytes(needs_scale_cache=False)
+        kv_scale_theory = (
+            self._compute_kv_scale_theory_bytes() if kv_plan.needs_scale_cache else 0
+        )
         print(
             ">>>> LiteEngine: GPU memory breakdown (torch.cuda.memory_allocated; "
             "host RSS not included — large GGUF load is often CPU anon-rss):"
@@ -288,6 +348,66 @@ class LiteEngine:
         print(f"     before_KV (weights + overhead): {weights_gb:.3f} GiB")
         print(f"     KV pool (delta alloc):          {kv_delta_gb:.3f} GiB  (theory {kv_theory_bytes / (1024**3):.3f} GiB)")
         print(f"     after_KV total:                 {total_gb:.3f} GiB  /  GPU cap ~{gpu_total_gb:.1f} GiB")
+        print(">>>> LiteEngine: Startup memory audit (CUDA tensors):")
+        print(
+            "     model params:                  "
+            f"{_bytes_to_gib(params_total_bytes):.3f} GiB  ({audit['params_count']} tensors)"
+        )
+        for dtype_name, nbytes in sorted(
+            audit["params_dtype_bytes"].items(),
+            key=lambda kv: -int(kv[1]),
+        ):
+            print(
+                f"       - params[{dtype_name:<10}]         "
+                f"{_bytes_to_gib(int(nbytes)):.3f} GiB"
+            )
+        if audit["params_top"]:
+            print(
+                f"     top params by size (Top-{audit['topn']}):"
+            )
+            for row in audit["params_top"]:
+                print(
+                    "       - "
+                    f"{row['name']} "
+                    f"shape={tuple(row['shape'])} dtype={row['dtype']} "
+                    f"size={_bytes_to_gib(int(row['bytes'])):.3f} GiB"
+                )
+        print(
+            "     model buffers:                 "
+            f"{_bytes_to_gib(buffers_total_bytes):.3f} GiB  ({audit['buffers_count']} tensors)"
+        )
+        for dtype_name, nbytes in sorted(
+            audit["buffers_dtype_bytes"].items(),
+            key=lambda kv: -int(kv[1]),
+        ):
+            print(
+                f"       - buffers[{dtype_name:<9}]        "
+                f"{_bytes_to_gib(int(nbytes)):.3f} GiB"
+            )
+        if audit["buffers_top"]:
+            print(
+                f"     top buffers by size (Top-{audit['topn']}):"
+            )
+            for row in audit["buffers_top"]:
+                print(
+                    "       - "
+                    f"{row['name']} "
+                    f"shape={tuple(row['shape'])} dtype={row['dtype']} "
+                    f"size={_bytes_to_gib(int(row['bytes'])):.3f} GiB"
+                )
+        print(
+            "     AWQ dense cache (global):      "
+            f"{_bytes_to_gib(awq_cache_bytes):.3f} GiB"
+        )
+        print(
+            "     other CUDA overhead (est.):    "
+            f"{_bytes_to_gib(other_cuda_overhead):.3f} GiB"
+        )
+        print(
+            "     KV theory split:               "
+            f"data={_bytes_to_gib(kv_data_theory):.3f} GiB, "
+            f"scales={_bytes_to_gib(kv_scale_theory):.3f} GiB"
+        )
         if gpu_total_gb > 0 and total_gb > 0.85 * gpu_total_gb:
             print(
                 "     [Warn] Total allocated is high vs GPU size; reduce FASTINFERENCE_KV_MAX_MODEL_LEN "
@@ -327,6 +447,179 @@ class LiteEngine:
         self.step_scheduler = runtime_components["step_scheduler"]
         self.execution_backend = runtime_components["execution_backend"]
         self.runtime_controller = runtime_components["runtime_controller"]
+
+    def _collect_cuda_tensor_memory_audit(self) -> dict[str, Any]:
+        """
+        Snapshot CUDA-resident model tensor footprint by dtype.
+        This is startup-only diagnostics, not used in the hot path.
+        """
+        device = self.device
+        raw_topn = os.environ.get("FASTINFERENCE_MEM_AUDIT_TOPN", "20").strip()
+        try:
+            topn = max(0, min(200, int(raw_topn)))
+        except ValueError:
+            topn = 20
+        param_total = 0
+        buffer_total = 0
+        param_count = 0
+        buffer_count = 0
+        param_dtype_bytes: Dict[str, int] = {}
+        buffer_dtype_bytes: Dict[str, int] = {}
+        param_rows: list[dict[str, Any]] = []
+        buffer_rows: list[dict[str, Any]] = []
+
+        for name, p in self.model.named_parameters():
+            if not isinstance(p, torch.Tensor) or p.device != device:
+                continue
+            size = int(p.numel() * p.element_size())
+            param_total += size
+            param_count += 1
+            key = _dtype_name(p.dtype)
+            param_dtype_bytes[key] = param_dtype_bytes.get(key, 0) + size
+            param_rows.append(
+                {
+                    "name": str(name),
+                    "shape": tuple(int(x) for x in p.shape),
+                    "dtype": key,
+                    "bytes": int(size),
+                }
+            )
+
+        for name, b in self.model.named_buffers():
+            if not isinstance(b, torch.Tensor) or b.device != device:
+                continue
+            size = int(b.numel() * b.element_size())
+            buffer_total += size
+            buffer_count += 1
+            key = _dtype_name(b.dtype)
+            buffer_dtype_bytes[key] = buffer_dtype_bytes.get(key, 0) + size
+            buffer_rows.append(
+                {
+                    "name": str(name),
+                    "shape": tuple(int(x) for x in b.shape),
+                    "dtype": key,
+                    "bytes": int(size),
+                }
+            )
+
+        awq_cache_bytes = 0
+        try:
+            from vllm.model_executor.layers.quantization.tensor import get_awq_runtime_stats
+
+            awq_stats = get_awq_runtime_stats()
+            awq_cache_bytes = int(awq_stats.get("cache_bytes", 0) or 0)
+        except Exception:
+            awq_cache_bytes = 0
+
+        return {
+            "params_total_bytes": int(param_total),
+            "buffers_total_bytes": int(buffer_total),
+            "params_count": int(param_count),
+            "buffers_count": int(buffer_count),
+            "params_dtype_bytes": param_dtype_bytes,
+            "buffers_dtype_bytes": buffer_dtype_bytes,
+            "awq_cache_bytes": int(awq_cache_bytes),
+            "topn": int(topn),
+            "params_top": sorted(param_rows, key=lambda x: -int(x["bytes"]))[:topn],
+            "buffers_top": sorted(buffer_rows, key=lambda x: -int(x["bytes"]))[:topn],
+        }
+
+    def _resolve_layer_kv_specs(self) -> Optional[list[tuple[int, int]]]:
+        """
+        Best-effort per-layer KV specs in unpacked domain: (num_kv_heads, head_dim).
+        Falls back to model-capability-wide uniform dimensions when model internals are not inspectable.
+        """
+        try:
+            layers = list(getattr(getattr(self.model, "model", None), "layers", []))
+            if not layers:
+                return None
+            specs: list[tuple[int, int]] = []
+            for layer in layers:
+                attn = getattr(layer, "self_attn", None)
+                if attn is None:
+                    return None
+                nkv = int(getattr(attn, "num_kv_heads"))
+                hdim = int(getattr(attn, "head_dim"))
+                if nkv <= 0 or hdim <= 0:
+                    return None
+                specs.append((nkv, hdim))
+            if len(specs) != int(self.num_layers):
+                return None
+            return specs
+        except Exception:
+            return None
+
+    def _layer_kv_cache_shape_for_layer(self, layer_idx: int) -> tuple[int, int]:
+        if self._layer_kv_specs is None:
+            return int(self.num_kv_heads), int(self.kv_head_dim)
+        nkv, hdim = self._layer_kv_specs[layer_idx]
+        if self.kv_dtype == torch.uint8:
+            return int(nkv), int(hdim // 2)
+        return int(nkv), int(hdim)
+
+    def _compute_kv_theory_bytes(self, *, needs_scale_cache: bool) -> int:
+        if self._layer_kv_specs is None:
+            data = int(
+                self.num_layers
+                * 2
+                * self.num_total_blocks
+                * self.block_size
+                * self.num_kv_heads
+                * self.kv_head_dim
+                * _dtype_nbytes(self.kv_dtype)
+            )
+            if not needs_scale_cache:
+                return data
+            return data + int(
+                self.num_layers
+                * 2
+                * self.num_total_blocks
+                * self.block_size
+                * self.num_kv_heads
+                * _dtype_nbytes(torch.float32)
+            )
+        data = 0
+        scale = 0
+        for i in range(self.num_layers):
+            nkv, cache_hdim = self._layer_kv_cache_shape_for_layer(i)
+            data += (
+                2
+                * self.num_total_blocks
+                * self.block_size
+                * nkv
+                * cache_hdim
+                * _dtype_nbytes(self.kv_dtype)
+            )
+            scale += (
+                2
+                * self.num_total_blocks
+                * self.block_size
+                * nkv
+                * _dtype_nbytes(torch.float32)
+            )
+        return int(data + (scale if needs_scale_cache else 0))
+
+    def _compute_kv_scale_theory_bytes(self) -> int:
+        if self._layer_kv_specs is None:
+            return int(
+                self.num_layers
+                * 2
+                * self.num_total_blocks
+                * self.block_size
+                * self.num_kv_heads
+                * _dtype_nbytes(torch.float32)
+            )
+        total = 0
+        for i in range(self.num_layers):
+            nkv, _cache_hdim = self._layer_kv_cache_shape_for_layer(i)
+            total += (
+                2
+                * self.num_total_blocks
+                * self.block_size
+                * nkv
+                * _dtype_nbytes(torch.float32)
+            )
+        return int(total)
 
     @property
     def active_request_count(self) -> int:
