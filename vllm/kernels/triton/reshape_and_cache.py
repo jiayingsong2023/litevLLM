@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from typing import Dict, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -16,6 +18,56 @@ def _get_fp8_dtype():
     return None
 
 FP8_DTYPE = _get_fp8_dtype()
+
+
+# ---- Step 5: per-(device, dtype, value) scalar scale tensor cache ----
+#
+# reshape_and_cache gets called once per decoder layer per step. When the
+# caller passes Python scalar k_scale / v_scale (the non-dynamic path,
+# which covers bf16/f16 KV writes and fp8 with a fixed calibration scale),
+# naive ``torch.tensor([k_scale], device=...)`` constructs a fresh
+# 1-element CUDA tensor each call, which on ROCm surfaces as a
+# ``hipMemcpyWithStream`` H->D copy that blocks behind the current Triton
+# stream. Profiling Gemma4-31B decode shows this was ~120 syncs / step
+# and ~79% of wall time.
+#
+# We deduplicate the tensor construction using a tiny module-level cache.
+# Keys include the device, dtype and the scalar *value* so fp8 callers
+# with non-unit scales stay bitwise-correct without each layer paying the
+# allocation cost after the first step.
+_SCALE_TENSOR_CACHE: Dict[Tuple[torch.device, torch.dtype, float], torch.Tensor] = {}
+
+
+def _get_scalar_scale_tensor(
+    value: float, device: torch.device, dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Return a cached 1-element tensor on ``device`` holding ``value``.
+
+    The returned tensor is owned by the cache and MUST be treated as
+    read-only by the caller; reshape_and_cache only reads it via
+    ``tl.load``.
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    # Normalize to a plain Python float so the dict key is hashable and
+    # value-stable (NaN is not expected for scale; we do not special-case
+    # it because an upstream NaN scale would itself be a correctness bug).
+    key = (device, dtype, float(value))
+    cached = _SCALE_TENSOR_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor([float(value)], device=device, dtype=dtype)
+        _SCALE_TENSOR_CACHE[key] = cached
+    return cached
+
+
+def _clear_scale_tensor_cache() -> None:
+    """Test-only helper: drop the per-device scalar scale cache.
+
+    Production code never needs to call this; it exists so test fixtures
+    can assert that the cache is being populated lazily and reused across
+    calls instead of reallocated.
+    """
+    _SCALE_TENSOR_CACHE.clear()
 
 @triton.jit
 def _reshape_and_cache_kernel(
@@ -122,9 +174,22 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, kv_cache
     if compute_dynamic:
         ks, vs = k_scale_cache, v_scale_cache
     else:
-        # Fallback to scalar scales passed as tensors for legacy support
-        ks = torch.tensor([k_scale], device=key.device, dtype=torch.float32) if not isinstance(k_scale, torch.Tensor) else k_scale
-        vs = torch.tensor([v_scale], device=value.device, dtype=torch.float32) if not isinstance(v_scale, torch.Tensor) else v_scale
+        # Fallback path: kernel reads a single-element scale tensor via
+        # tl.load(K_Scale_cache) / tl.load(V_Scale_cache). Caller may have
+        # passed either a Python scalar or an already-constructed tensor.
+        #
+        # Tensors are used as-is (preserve legacy semantics for dynamic
+        # calibration scales that upstream wants to pin). Scalars are
+        # resolved via the module cache so the decode hot path stops
+        # issuing a per-layer 4-byte H->D hipMemcpyWithStream.
+        if isinstance(k_scale, torch.Tensor):
+            ks = k_scale
+        else:
+            ks = _get_scalar_scale_tensor(k_scale, key.device)
+        if isinstance(v_scale, torch.Tensor):
+            vs = v_scale
+        else:
+            vs = _get_scalar_scale_tensor(v_scale, value.device)
     
     grid = (num_tokens, num_kv_heads)
     _reshape_and_cache_kernel[grid](
