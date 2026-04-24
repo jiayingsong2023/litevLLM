@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "packed_int4_symmetric": [
+    {"m_min": 1, "m_max": 4, "n": 8192, "k": 5376, "group_size": 32, "block_m": 16, "block_n": 256, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 4, "n": 4096, "k": 5376, "group_size": 32, "block_m": 16, "block_n": 256, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 4, "n": 5376, "k": 8192, "group_size": 32, "block_m": 16, "block_n": 256, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 4, "n": 16384, "k": 5376, "group_size": 32, "block_m": 16, "block_n": 128, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 4, "n": 2048, "k": 5376, "group_size": 32, "block_m": 16, "block_n": 256, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 2, "n": 5376, "k": 16384, "group_size": 32, "block_m": 16, "block_n": 256, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 4, "m_max": 4, "n": 5376, "k": 16384, "group_size": 32, "block_m": 16, "block_n": 128, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 1, "m_max": 4, "n": 21504, "k": 5376, "group_size": 32, "block_m": 16, "block_n": 128, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 8192, "k": 5376, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 4096, "k": 5376, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 5376, "k": 8192, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 16384, "k": 5376, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 2048, "k": 5376, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 5376, "k": 16384, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 21504, "k": 5376, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2},
+    {"m_min": 192, "m_max": 256, "n": 5376, "k": 21504, "group_size": 32, "block_m": 64, "block_n": 64, "block_k": 64, "num_warps": 8, "num_stages": 2}
+  ]
+}

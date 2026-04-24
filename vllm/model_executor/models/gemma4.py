@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import atexit
+import json
 import os
+import time
 from collections import OrderedDict
 from typing import Any, Optional
 import torch
@@ -20,6 +23,107 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from .lite_config import LiteConfig
 
 
+_GEMMA4_PROFILE_ENABLED = os.environ.get("FASTINFERENCE_GEMMA4_LAYER_PROFILE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_GEMMA4_PROFILE_STATS: dict[str, dict[str, float]] = {}
+_GEMMA4_PROFILE_PRINTED = False
+_GEMMA4_ROPE_CACHE_POOL: OrderedDict[
+    tuple[int, int, float, str, float, str, int, str],
+    tuple[torch.Tensor, torch.Tensor],
+] = OrderedDict()
+
+
+def _resolve_gemma4_rope_cache_max_pos(config: LiteConfig) -> int:
+    max_pos = int(getattr(config, "max_position_embeddings", 2048))
+    kv_max_raw = os.environ.get("FASTINFERENCE_KV_MAX_MODEL_LEN", "").strip()
+    if kv_max_raw:
+        try:
+            max_pos = min(max_pos, max(64, int(kv_max_raw)))
+        except ValueError:
+            pass
+    rope_cap_raw = os.environ.get("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS", "").strip()
+    if rope_cap_raw:
+        try:
+            max_pos = min(max_pos, max(64, int(rope_cap_raw)))
+        except ValueError:
+            pass
+    return max(64, int(max_pos))
+
+
+def _resolve_gemma4_rope_cache_pool_limit() -> int:
+    raw = os.environ.get("FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX", "8").strip()
+    try:
+        return max(1, min(128, int(raw)))
+    except ValueError:
+        return 8
+
+
+def _gemma4_profile_sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _gemma4_profile_record(scope: str, elapsed_s: float) -> None:
+    bucket = _GEMMA4_PROFILE_STATS.setdefault(scope, {"time_s": 0.0, "count": 0.0})
+    bucket["time_s"] += float(elapsed_s)
+    bucket["count"] += 1.0
+
+
+class _Gemma4ProfileSpan:
+    def __init__(self, scope: str):
+        self.scope = scope
+        self._start = 0.0
+
+    def __enter__(self) -> "_Gemma4ProfileSpan":
+        if _GEMMA4_PROFILE_ENABLED:
+            _gemma4_profile_sync()
+            self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if _GEMMA4_PROFILE_ENABLED:
+            _gemma4_profile_sync()
+            _gemma4_profile_record(self.scope, time.perf_counter() - self._start)
+
+
+def _gemma4_profile_span(scope: str) -> _Gemma4ProfileSpan:
+    return _Gemma4ProfileSpan(scope)
+
+
+def _dump_gemma4_profile() -> None:
+    global _GEMMA4_PROFILE_PRINTED
+    if (not _GEMMA4_PROFILE_ENABLED) or _GEMMA4_PROFILE_PRINTED or (not _GEMMA4_PROFILE_STATS):
+        return
+    _GEMMA4_PROFILE_PRINTED = True
+    total_s = sum(v["time_s"] for v in _GEMMA4_PROFILE_STATS.values())
+    rows = []
+    for scope, data in sorted(
+        _GEMMA4_PROFILE_STATS.items(),
+        key=lambda item: item[1]["time_s"],
+        reverse=True,
+    ):
+        time_s = float(data["time_s"])
+        count = int(data["count"])
+        rows.append(
+            {
+                "scope": scope,
+                "time_s": time_s,
+                "time_ms": time_s * 1000.0,
+                "share_pct": (time_s / total_s * 100.0) if total_s > 0 else 0.0,
+                "count": count,
+                "avg_ms": (time_s * 1000.0 / count) if count > 0 else 0.0,
+            }
+        )
+    print("[Gemma4LayerProfile] " + json.dumps({"total_s": total_s, "rows": rows}, ensure_ascii=True))
+
+
+atexit.register(_dump_gemma4_profile)
+
+
 def _get_eps(config: LiteConfig) -> float:
     return float(
         getattr(config, "rms_norm_eps", getattr(config, "layer_norm_epsilon", 1e-6))
@@ -32,8 +136,36 @@ def _meta_get(meta: Any, key: str, default: Any = None) -> Any:
     return getattr(meta, key, default)
 
 
+def _meta_set(meta: Any, key: str, value: Any) -> bool:
+    if isinstance(meta, dict):
+        meta[key] = value
+        return True
+    try:
+        setattr(meta, key, value)
+        return True
+    except Exception:
+        return False
+
+
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_truthy_default_on(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
 
 
 def _repeat_kv_for_gqa(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -51,23 +183,40 @@ def _causal_attention_ref(
     scale: float,
     local_window: Optional[int] = None,
     softcap: Optional[float] = None,
+    key_padding_mask: Optional[torch.Tensor] = None,
+    q_positions: Optional[torch.Tensor] = None,
+    k_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     n_rep = q.shape[1] // k.shape[1]
     k_full = _repeat_kv_for_gqa(k, n_rep)
     v_full = _repeat_kv_for_gqa(v, n_rep)
     scores = torch.matmul(q, k_full.transpose(2, 3)) * scale
+    bsz = int(q.shape[0])
     q_len = int(q.shape[2])
     kv_len = int(k_full.shape[2])
     # Support both square (q_len == kv_len) and chunked prefill (q_len < kv_len).
     # For chunked prefill, q is assumed to be the tail segment of the kv timeline.
-    q_pos = torch.arange(q_len, device=q.device, dtype=torch.long) + (kv_len - q_len)
-    k_pos = torch.arange(kv_len, device=q.device, dtype=torch.long)
-    causal = k_pos[None, :] > q_pos[:, None]
-    scores = scores.masked_fill(causal[None, None, :, :], float("-inf"))
+    if q_positions is None:
+        q_pos = (
+            torch.arange(q_len, device=q.device, dtype=torch.long) + (kv_len - q_len)
+        )[None, :].expand(bsz, q_len)
+    else:
+        q_pos = q_positions.to(device=q.device, dtype=torch.long)
+    if k_positions is None:
+        k_pos = torch.arange(kv_len, device=q.device, dtype=torch.long)[None, :].expand(
+            bsz, kv_len
+        )
+    else:
+        k_pos = k_positions.to(device=q.device, dtype=torch.long)
+    causal = k_pos[:, None, :] > q_pos[:, :, None]
+    scores = scores.masked_fill(causal[:, None, :, :], float("-inf"))
+    if key_padding_mask is not None:
+        pad_mask = ~key_padding_mask.to(device=q.device, dtype=torch.bool)
+        scores = scores.masked_fill(pad_mask[:, None, None, :], float("-inf"))
     if local_window is not None and local_window > 0:
-        dist = q_pos[:, None] - k_pos[None, :]
+        dist = q_pos[:, :, None] - k_pos[:, None, :]
         local_mask = dist >= int(local_window)
-        scores = scores.masked_fill(local_mask[None, None, :, :], float("-inf"))
+        scores = scores.masked_fill(local_mask[:, None, :, :], float("-inf"))
     if softcap is not None and softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -172,11 +321,233 @@ def _gather_recent_kv(
     return k, v
 
 
+def _gather_recent_kv_batched(
+    kv_cache: Any,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    head_dim: int,
+    local_window: Optional[int],
+    kv_cache_dtype: str,
+    kv_scale_cache: Optional[tuple[Any, Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    k_cache, v_cache = kv_cache
+    block_size = int(k_cache.shape[1])
+    seq_lens_i64 = seq_lens.to(dtype=torch.long)
+    bsz = int(seq_lens_i64.shape[0])
+    if local_window is None or int(local_window) <= 0:
+        starts = torch.zeros_like(seq_lens_i64)
+    else:
+        starts = torch.clamp(seq_lens_i64 - int(local_window), min=0)
+    ctx_lens = seq_lens_i64 - starts
+    max_ctx = int(torch.max(ctx_lens).item()) if bsz > 0 else 0
+    if max_ctx <= 0:
+        empty = torch.empty(
+            (bsz, 0, num_kv_heads, head_dim),
+            device=block_tables.device,
+            dtype=torch.float32,
+        )
+        return (
+            empty,
+            empty,
+            torch.empty((bsz, 0), device=block_tables.device, dtype=torch.long),
+            torch.empty((bsz, 0), device=block_tables.device, dtype=torch.bool),
+        )
+
+    rel = torch.arange(max_ctx, device=block_tables.device, dtype=torch.long)[None, :]
+    valid = rel < ctx_lens[:, None]
+    token_positions = starts[:, None] + rel
+    safe_token_positions = torch.where(valid, token_positions, torch.zeros_like(token_positions))
+    bt_idx = torch.div(safe_token_positions, block_size, rounding_mode="floor")
+    block_indices = block_tables.gather(1, bt_idx)
+    block_offsets = torch.remainder(safe_token_positions, block_size)
+
+    k_scale_cache = kv_scale_cache[0] if kv_scale_cache is not None else None
+    v_scale_cache = kv_scale_cache[1] if kv_scale_cache is not None else None
+    is_int4 = "int4" in str(kv_cache_dtype).lower()
+    if is_int4:
+        half = head_dim // 2
+        k_packed = k_cache[block_indices, block_offsets, :num_kv_heads, :half]
+        v_packed = v_cache[block_indices, block_offsets, :num_kv_heads, :half]
+        k_scales = (
+            k_scale_cache[block_indices, block_offsets, :num_kv_heads, 0]
+            if k_scale_cache is not None
+            else None
+        )
+        v_scales = (
+            v_scale_cache[block_indices, block_offsets, :num_kv_heads, 0]
+            if v_scale_cache is not None
+            else None
+        )
+        k = _decode_int4_rows(
+            k_packed.reshape(-1, num_kv_heads, half),
+            None if k_scales is None else k_scales.reshape(-1, num_kv_heads),
+            head_dim,
+        ).reshape(bsz, max_ctx, num_kv_heads, head_dim)
+        v = _decode_int4_rows(
+            v_packed.reshape(-1, num_kv_heads, half),
+            None if v_scales is None else v_scales.reshape(-1, num_kv_heads),
+            head_dim,
+        ).reshape(bsz, max_ctx, num_kv_heads, head_dim)
+    else:
+        k = k_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(torch.float32)
+        v = v_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(torch.float32)
+
+    valid4d = valid[:, :, None, None]
+    k = torch.where(valid4d, k, torch.zeros_like(k))
+    v = torch.where(valid4d, v, torch.zeros_like(v))
+    k_positions = torch.where(valid, token_positions, torch.full_like(token_positions, -1))
+    return k, v, k_positions, valid
+
+
+def _build_local_decode_aligned_metadata(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    local_window: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build local-window metadata for paged_attention_v1.
+
+    The window start is aligned to block boundary so decode can run through
+    paged-attention directly from KV cache. This may include up to
+    (block_size - 1) extra left-context tokens.
+    """
+    seq_lens_i64 = seq_lens.to(dtype=torch.long)
+    bsz = int(seq_lens_i64.shape[0])
+    if bsz <= 0:
+        return seq_lens_i64, block_tables.new_zeros((0, 0))
+
+    if int(local_window) > 0:
+        starts = torch.clamp(seq_lens_i64 - int(local_window), min=0)
+    else:
+        starts = torch.zeros_like(seq_lens_i64)
+    start_aligned = torch.div(starts, block_size, rounding_mode="floor") * block_size
+    seq_lens_aligned = seq_lens_i64 - start_aligned
+    num_blocks = torch.div(
+        seq_lens_aligned + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    )
+    max_blocks = int(torch.max(num_blocks).item()) if bsz > 0 else 0
+    block_tables_aligned = block_tables.new_zeros((bsz, max_blocks))
+    for bi in range(bsz):
+        n = int(num_blocks[bi].item())
+        if n <= 0:
+            continue
+        sblk = int(start_aligned[bi].item() // block_size)
+        block_tables_aligned[bi, :n] = block_tables[bi, sblk : sblk + n]
+    return seq_lens_aligned, block_tables_aligned
+
+
+def _get_or_build_local_decode_aligned_metadata(
+    *,
+    attn_metadata: Any,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    local_window: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cache local decode aligned metadata in attn_metadata so all layers in the same
+    decode step can reuse the same tensors.
+    """
+    cache_key = (
+        int(local_window),
+        int(block_size),
+        int(block_tables.data_ptr()),
+        int(seq_lens.data_ptr()),
+        tuple(int(x) for x in block_tables.shape),
+        tuple(int(x) for x in seq_lens.shape),
+        str(block_tables.device),
+        str(seq_lens.device),
+    )
+    cache = _meta_get(attn_metadata, "_gemma4_local_decode_aligned_cache", None)
+    if isinstance(cache, dict) and cache.get("key") == cache_key:
+        seq_cached = cache.get("seq_lens_local")
+        bt_cached = cache.get("block_tables_local")
+        if isinstance(seq_cached, torch.Tensor) and isinstance(bt_cached, torch.Tensor):
+            return seq_cached, bt_cached
+
+    seq_lens_local, block_tables_local = _build_local_decode_aligned_metadata(
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        local_window=local_window,
+        block_size=block_size,
+    )
+    _meta_set(
+        attn_metadata,
+        "_gemma4_local_decode_aligned_cache",
+        {
+            "key": cache_key,
+            "seq_lens_local": seq_lens_local,
+            "block_tables_local": block_tables_local,
+        },
+    )
+    return seq_lens_local, block_tables_local
+
+
+def _local_prefill_attention_sdpa(
+    q: torch.Tensor,
+    k_ctx: torch.Tensor,
+    v_ctx: torch.Tensor,
+    q_positions: torch.Tensor,
+    k_positions: torch.Tensor,
+    k_valid: torch.Tensor,
+    local_window: Optional[int],
+    scale: float,
+) -> torch.Tensor:
+    qh = q.transpose(1, 2).contiguous()
+    kh = k_ctx.transpose(1, 2).contiguous()
+    vh = v_ctx.transpose(1, 2).contiguous()
+    n_rep = qh.shape[1] // max(1, kh.shape[1])
+    if n_rep > 1:
+        kh = _repeat_kv_for_gqa(kh, n_rep)
+        vh = _repeat_kv_for_gqa(vh, n_rep)
+    if kh.dtype != qh.dtype:
+        kh = kh.to(qh.dtype)
+    if vh.dtype != qh.dtype:
+        vh = vh.to(qh.dtype)
+
+    causal = k_positions[:, None, :] > q_positions[:, :, None]
+    invalid = causal | (~k_valid)[:, None, :]
+    if local_window is not None and int(local_window) > 0:
+        dist = q_positions[:, :, None] - k_positions[:, None, :]
+        invalid = invalid | (dist >= int(local_window))
+    attn_bias = torch.zeros(
+        (qh.shape[0], 1, qh.shape[2], kh.shape[2]),
+        device=qh.device,
+        dtype=qh.dtype,
+    )
+    attn_bias = attn_bias.masked_fill(invalid[:, None, :, :], float("-inf"))
+    out = F.scaled_dot_product_attention(
+        qh,
+        kh,
+        vh,
+        attn_mask=attn_bias,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    )
+    return out.transpose(1, 2).contiguous()
+
+
 def _should_use_full_decode_reference(kv_cache_dtype: str) -> bool:
+    if _env_truthy("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN"):
+        return True
     kvt = str(kv_cache_dtype).lower()
     # Stability-first path for Gemma4 decode alignment:
     # when KV is full precision, use the same reference attention math as no-cache path.
     return ("int4" not in kvt) and ("fp8" not in kvt)
+
+
+def _is_packed_or_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+    kvt = str(kv_cache_dtype).lower()
+    return ("int4" in kvt) or ("fp8" in kvt)
+
+
+def _use_legacy_full_precision_kv_write() -> bool:
+    return _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE")
 
 
 def _write_full_precision_kv_cache(
@@ -221,7 +592,8 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = int(head_size)
         self.layer_type = layer_type
-        self.max_position_embeddings = int(config.max_position_embeddings)
+        self.max_position_embeddings_limit = int(config.max_position_embeddings)
+        self.max_position_embeddings = _resolve_gemma4_rope_cache_max_pos(config)
         self.apply_rotary_emb = ApplyRotaryEmb(is_neox_style=True)
 
         rope_params = {}
@@ -235,11 +607,11 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         )
         self.rope_type = str(rope_params.get("rope_type", "default"))
         self.partial_rotary_factor = float(rope_params.get("partial_rotary_factor", 1.0))
-        inv_freq = self._build_inv_freq()
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+        self._inv_freq_cpu = self._build_inv_freq().cpu()
+        self._last_cache_key: Optional[
+            tuple[int, int, float, str, float, str, int, str]
+        ] = None
+        self._last_cache_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     def _build_inv_freq(self) -> torch.Tensor:
         if self.rope_type == "proportional":
@@ -268,13 +640,75 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
             )
         )
 
+    def _ensure_cache_len(self, required_len: int) -> None:
+        if required_len <= self.max_position_embeddings:
+            return
+        new_len = min(int(required_len), int(self.max_position_embeddings_limit))
+        if new_len <= self.max_position_embeddings:
+            return
+        self.max_position_embeddings = int(new_len)
+        self._last_cache_key = None
+        self._last_cache_value = None
+
+    def _cache_pool_key(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[int, int, float, str, float, str, int, str]:
+        return (
+            int(self.max_position_embeddings),
+            int(self.head_size),
+            float(self.base),
+            str(self.rope_type),
+            float(self.partial_rotary_factor),
+            str(device.type),
+            int(device.index) if device.index is not None else -1,
+            str(dtype),
+        )
+
+    def _get_or_build_cache(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = self._cache_pool_key(device=device, dtype=dtype)
+        if self._last_cache_key == key and self._last_cache_value is not None:
+            return self._last_cache_value
+        cached = _GEMMA4_ROPE_CACHE_POOL.get(key)
+        if cached is not None:
+            _GEMMA4_ROPE_CACHE_POOL.move_to_end(key)
+            self._last_cache_key = key
+            self._last_cache_value = cached
+            return cached
+        inv_freq = self._inv_freq_cpu.to(device=device, dtype=torch.float32)
+        t = torch.arange(self.max_position_embeddings, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        cos = freqs.cos().to(dtype=dtype)
+        sin = freqs.sin().to(dtype=dtype)
+        _GEMMA4_ROPE_CACHE_POOL[key] = (cos, sin)
+        self._last_cache_key = key
+        self._last_cache_value = (cos, sin)
+        pool_limit = _resolve_gemma4_rope_cache_pool_limit()
+        while len(_GEMMA4_ROPE_CACHE_POOL) > pool_limit:
+            _GEMMA4_ROPE_CACHE_POOL.popitem(last=False)
+        return cos, sin
+
     def forward(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if positions.device != self.cos_cached.device:
-            positions = positions.to(self.cos_cached.device)
-        cos = self.cos_cached[positions]
-        sin = self.sin_cached[positions]
+        if positions.numel() > 0:
+            required_len = int(positions.max().item()) + 1
+            self._ensure_cache_len(required_len)
+        if positions.device != query.device:
+            positions = positions.to(query.device)
+        cos_cached, sin_cached = self._get_or_build_cache(
+            device=query.device,
+            dtype=query.dtype,
+        )
+        cos = cos_cached[positions]
+        sin = sin_cached[positions]
         return (
             self.apply_rotary_emb.forward_native(query, cos, sin),
             self.apply_rotary_emb.forward_native(key, cos, sin),
@@ -417,149 +851,250 @@ class Gemma4Attention(nn.Module):
             else:
                 k_scale_cache, v_scale_cache = (None, None)
 
-            if _should_use_full_decode_reference(str(kv_cache_dtype)):
-                _write_full_precision_kv_cache(
-                    k,
-                    v,
-                    k_cache,
-                    v_cache,
-                    slot_mapping,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )
+            if (
+                _use_legacy_full_precision_kv_write()
+                and _should_use_full_decode_reference(str(kv_cache_dtype))
+                and (not _is_packed_or_quantized_kv_cache(str(kv_cache_dtype)))
+            ):
+                with _gemma4_profile_span("kv_write_full_precision"):
+                    _write_full_precision_kv_cache(
+                        k,
+                        v,
+                        k_cache,
+                        v_cache,
+                        slot_mapping,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )
             else:
-                reshape_and_cache(
-                    k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                    v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                    k_cache,
-                    v_cache,
-                    slot_mapping,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                    k_scale_cache=k_scale_cache,
-                    v_scale_cache=v_scale_cache,
-                )
+                with _gemma4_profile_span("kv_write_reshape_and_cache"):
+                    reshape_and_cache(
+                        k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
+                        v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
+                        k_cache,
+                        v_cache,
+                        slot_mapping,
+                        kv_cache_dtype,
+                        k_scale,
+                        v_scale,
+                        k_scale_cache=k_scale_cache,
+                        v_scale_cache=v_scale_cache,
+                    )
 
             is_prefill = bool(_meta_get(attn_metadata, "is_prefill", False))
             if is_local and is_prefill and seqlen > 1:
-                out = _causal_attention_ref(
-                    q.transpose(1, 2).float(),
-                    k.transpose(1, 2).float(),
-                    v.transpose(1, 2).float(),
-                    self.scale,
-                    local_window=local_window,
-                    softcap=softcap,
-                ).to(q.dtype).view(bsz, seqlen, -1)
-            elif is_local and not is_prefill:
-                block_tables = _meta_get(attn_metadata, "block_tables", None)
-                seq_lens = _meta_get(attn_metadata, "seq_lens", None)
-                kv_dtype_name = (
-                    inf_config.kv_type
-                    if inf_config is not None
-                    else _meta_get(attn_metadata, "kv_cache_dtype", "auto")
-                )
-                outs = []
-                for bi in range(bsz):
-                    ctx_window = int(local_window or 0)
-                    k_ctx, v_ctx = _gather_recent_kv(
-                        kv_cache=kv_cache,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens,
-                        batch_idx=bi,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim=self.head_dim,
-                        local_window=ctx_window,
-                        kv_cache_dtype=str(kv_dtype_name),
-                        kv_scale_cache=(k_scale_cache, v_scale_cache),
-                    )
-                    q_i = q[bi : bi + 1].transpose(1, 2).float()
-                    out_i = _causal_attention_ref(
-                        q_i,
-                        k_ctx.transpose(1, 2).float(),
-                        v_ctx.transpose(1, 2).float(),
-                        self.scale,
-                        local_window=None,
-                        softcap=softcap,
-                    ).to(q.dtype).view(1, seqlen, -1)
-                    outs.append(out_i)
-                out = torch.cat(outs, dim=0)
-            else:
-                from vllm.engine.lite_engine import expand_metadata_for_paged_attention
-                from vllm.kernels.triton.paged_attention import paged_attention_v1
-
-                attn_out = torch.empty(
-                    (bsz * seqlen, self.num_heads, self.head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
-                )
-                block_tables = _meta_get(attn_metadata, "block_tables", None)
-                seq_lens = _meta_get(attn_metadata, "seq_lens", None)
-                use_full_ref = _should_use_full_decode_reference(str(kv_cache_dtype))
-                if use_full_ref and block_tables is not None and seq_lens is not None:
-                    outs = []
-                    for bi in range(bsz):
-                        k_ctx, v_ctx = _gather_recent_kv(
+                with _gemma4_profile_span("attn_local_prefill"):
+                    block_tables = _meta_get(attn_metadata, "block_tables", None)
+                    seq_lens = _meta_get(attn_metadata, "seq_lens", None)
+                    kv_start_t = _meta_get(attn_metadata, "kv_start_indices", None)
+                    if kv_start_t is None:
+                        q_starts = seq_lens.to(device=q.device, dtype=torch.long) - seqlen
+                    else:
+                        q_starts = kv_start_t.to(device=q.device, dtype=torch.long).reshape(-1)
+                    q_positions = q_starts[:, None] + torch.arange(
+                        seqlen, device=q.device, dtype=torch.long
+                    )[None, :]
+                    with _gemma4_profile_span("kv_read_local_prefill"):
+                        k_ctx, v_ctx, k_positions, k_valid = _gather_recent_kv_batched(
                             kv_cache=kv_cache,
                             block_tables=block_tables,
                             seq_lens=seq_lens,
-                            batch_idx=bi,
                             num_kv_heads=self.num_kv_heads,
                             head_dim=self.head_dim,
-                            local_window=None,
+                            local_window=int(local_window or 0),
                             kv_cache_dtype=str(kv_cache_dtype),
                             kv_scale_cache=(k_scale_cache, v_scale_cache),
                         )
-                        q_i = q[bi : bi + 1].transpose(1, 2).float()
-                        out_i = _causal_attention_ref(
-                            q_i,
+                    if softcap is not None and float(softcap) > 0:
+                        out = _causal_attention_ref(
+                            q.transpose(1, 2).float(),
                             k_ctx.transpose(1, 2).float(),
                             v_ctx.transpose(1, 2).float(),
                             self.scale,
                             local_window=None,
                             softcap=softcap,
-                        ).to(q.dtype).view(1, seqlen, -1)
-                        outs.append(out_i)
-                    out = torch.cat(outs, dim=0)
-                    return self.o_proj(out, lora_mapping)
-                seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                    bsz, seqlen, is_prefill, seq_lens, block_tables, q.device
-                )
-                max_ctx = int(
-                    max(
-                        self.num_heads * self.head_dim,
-                        getattr(self.config, "max_position_embeddings", 4096),
+                            key_padding_mask=k_valid,
+                            q_positions=q_positions,
+                            k_positions=k_positions,
+                        ).to(q.dtype).view(bsz, seqlen, -1)
+                    else:
+                        out = _local_prefill_attention_sdpa(
+                            q,
+                            k_ctx,
+                            v_ctx,
+                            q_positions,
+                            k_positions,
+                            k_valid,
+                            local_window=None,
+                            scale=self.scale,
+                        ).to(q.dtype).view(bsz, seqlen, -1)
+            elif is_local and not is_prefill:
+                with _gemma4_profile_span("attn_local_decode"):
+                    block_tables = _meta_get(attn_metadata, "block_tables", None)
+                    seq_lens = _meta_get(attn_metadata, "seq_lens", None)
+                    kv_dtype_name = (
+                        inf_config.kv_type
+                        if inf_config is not None
+                        else _meta_get(attn_metadata, "kv_cache_dtype", "auto")
                     )
-                )
-                paged_attention_v1(
-                    attn_out,
-                    q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
-                    k_cache,
-                    v_cache,
-                    self.num_heads,
-                    self.scale,
-                    block_tables_ext,
-                    seq_lens_ext,
-                    k_cache.shape[1],
-                    max_ctx,
-                    None,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                    k_scale_ptrs=k_scale_cache,
-                    v_scale_ptrs=v_scale_cache,
-                    num_kv_heads=self.num_kv_heads,
-                )
-                out = attn_out.view(bsz, seqlen, -1)
+                    ctx_window = int(local_window or 0)
+                    use_triton_local_decode = (
+                        _env_truthy_default_on("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON")
+                        and (softcap is None or float(softcap) <= 0.0)
+                        and block_tables is not None
+                        and seq_lens is not None
+                        and seqlen == 1
+                    )
+                    if use_triton_local_decode:
+                        from vllm.kernels.triton.paged_attention import paged_attention_v1
+
+                        attn_out = torch.empty(
+                            (bsz * seqlen, self.num_heads, self.head_dim),
+                            device=q.device,
+                            dtype=q.dtype,
+                        )
+                        with _gemma4_profile_span("kv_read_local_decode"):
+                            seq_lens_local, block_tables_local = _get_or_build_local_decode_aligned_metadata(
+                                attn_metadata=attn_metadata,
+                                block_tables=block_tables,
+                                seq_lens=seq_lens,
+                                local_window=ctx_window,
+                                block_size=int(k_cache.shape[1]),
+                            )
+                        max_ctx_local = (
+                            int(torch.max(seq_lens_local).item())
+                            if int(seq_lens_local.numel()) > 0
+                            else 0
+                        )
+                        paged_attention_v1(
+                            attn_out,
+                            q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                            k_cache,
+                            v_cache,
+                            self.num_heads,
+                            self.scale,
+                            block_tables_local,
+                            seq_lens_local.to(device=q.device, dtype=seq_lens.dtype),
+                            k_cache.shape[1],
+                            max_ctx_local,
+                            None,
+                            kv_dtype_name,
+                            k_scale,
+                            v_scale,
+                            k_scale_ptrs=k_scale_cache,
+                            v_scale_ptrs=v_scale_cache,
+                            num_kv_heads=self.num_kv_heads,
+                            attn_scope="local",
+                            layer_type=self.layer_type,
+                        )
+                        out = attn_out.view(bsz, seqlen, -1)
+                    else:
+                        with _gemma4_profile_span("kv_read_local_decode"):
+                            k_ctx, v_ctx, k_positions, k_valid = _gather_recent_kv_batched(
+                                kv_cache=kv_cache,
+                                block_tables=block_tables,
+                                seq_lens=seq_lens,
+                                num_kv_heads=self.num_kv_heads,
+                                head_dim=self.head_dim,
+                                local_window=ctx_window,
+                                kv_cache_dtype=str(kv_dtype_name),
+                                kv_scale_cache=(k_scale_cache, v_scale_cache),
+                            )
+                        q_positions = (
+                            seq_lens.to(device=q.device, dtype=torch.long)[:, None] - seqlen
+                        ) + torch.arange(seqlen, device=q.device, dtype=torch.long)[None, :]
+                        out = _causal_attention_ref(
+                            q.transpose(1, 2).float(),
+                            k_ctx.transpose(1, 2).float(),
+                            v_ctx.transpose(1, 2).float(),
+                            self.scale,
+                            local_window=None,
+                            softcap=softcap,
+                            key_padding_mask=k_valid,
+                            q_positions=q_positions,
+                            k_positions=k_positions,
+                        ).to(q.dtype).view(bsz, seqlen, -1)
+            else:
+                with _gemma4_profile_span("attn_global"):
+                    from vllm.engine.lite_engine import expand_metadata_for_paged_attention
+                    from vllm.kernels.triton.paged_attention import paged_attention_v1
+
+                    attn_out = torch.empty(
+                        (bsz * seqlen, self.num_heads, self.head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    block_tables = _meta_get(attn_metadata, "block_tables", None)
+                    seq_lens = _meta_get(attn_metadata, "seq_lens", None)
+                    use_full_ref = _should_use_full_decode_reference(str(kv_cache_dtype))
+                    if use_full_ref and block_tables is not None and seq_lens is not None:
+                        outs = []
+                        for bi in range(bsz):
+                            with _gemma4_profile_span("kv_read_global_ref"):
+                                k_ctx, v_ctx = _gather_recent_kv(
+                                    kv_cache=kv_cache,
+                                    block_tables=block_tables,
+                                    seq_lens=seq_lens,
+                                    batch_idx=bi,
+                                    num_kv_heads=self.num_kv_heads,
+                                    head_dim=self.head_dim,
+                                    local_window=None,
+                                    kv_cache_dtype=str(kv_cache_dtype),
+                                    kv_scale_cache=(k_scale_cache, v_scale_cache),
+                                )
+                            q_i = q[bi : bi + 1].transpose(1, 2).float()
+                            out_i = _causal_attention_ref(
+                                q_i,
+                                k_ctx.transpose(1, 2).float(),
+                                v_ctx.transpose(1, 2).float(),
+                                self.scale,
+                                local_window=None,
+                                softcap=softcap,
+                            ).to(q.dtype).view(1, seqlen, -1)
+                            outs.append(out_i)
+                        out = torch.cat(outs, dim=0)
+                        return self.o_proj(out, lora_mapping)
+                    seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
+                        bsz, seqlen, is_prefill, seq_lens, block_tables, q.device
+                    )
+                    max_ctx = int(
+                        max(
+                            self.num_heads * self.head_dim,
+                            getattr(self.config, "max_position_embeddings", 4096),
+                        )
+                    )
+                    paged_attention_v1(
+                        attn_out,
+                        q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                        k_cache,
+                        v_cache,
+                        self.num_heads,
+                        self.scale,
+                        block_tables_ext,
+                        seq_lens_ext,
+                        k_cache.shape[1],
+                        max_ctx,
+                        None,
+                        kv_cache_dtype,
+                        k_scale,
+                        v_scale,
+                        k_scale_ptrs=k_scale_cache,
+                        v_scale_ptrs=v_scale_cache,
+                        num_kv_heads=self.num_kv_heads,
+                        attn_scope="global",
+                        layer_type=self.layer_type,
+                    )
+                    out = attn_out.view(bsz, seqlen, -1)
         else:
-            out = _causal_attention_ref(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                self.scale,
-                local_window=local_window,
-                softcap=softcap,
-            ).view(bsz, seqlen, -1)
+            with _gemma4_profile_span("attn_nocache"):
+                out = _causal_attention_ref(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    self.scale,
+                    local_window=local_window,
+                    softcap=softcap,
+                ).view(bsz, seqlen, -1)
         return self.o_proj(out, lora_mapping)
 
 
@@ -783,7 +1318,8 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._expert_cache_device: Optional[torch.device] = None
         self._expert_cache_dtype: Optional[torch.dtype] = None
         self._max_expert_cache = max(
-            0, int(os.environ.get("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE", "8"))
+            0,
+            _env_int("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE", 8),
         )
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
@@ -808,6 +1344,15 @@ class Gemma4MoeExpertsLite(nn.Module):
         )
 
     def _materialize_one_expert_awq(
+        self,
+        expert_id: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with _gemma4_profile_span("moe_materialize_one_expert_awq"):
+            return self._materialize_one_expert_awq_impl(expert_id, device, dtype)
+
+    def _materialize_one_expert_awq_impl(
         self,
         expert_id: int,
         device: torch.device,
@@ -880,26 +1425,41 @@ class Gemma4MoeExpertsLite(nn.Module):
             )
         compute_dtype = torch.float32
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
+        n_tokens = int(hidden_states_2d.shape[0])
+        flat_topk_ids = topk_ids.reshape(-1).to(torch.long)
+        flat_topk_weights = topk_weights.reshape(-1)
+        flat_token_idx = torch.arange(
+            n_tokens, device=hidden_states_2d.device, dtype=torch.long
+        ).repeat_interleave(self.top_k)
 
-        unique_experts = torch.unique(topk_ids).tolist()
-        for expert_id in unique_experts:
-            assignment_mask = topk_ids == int(expert_id)
-            if not bool(assignment_mask.any()):
+        sorted_expert_ids, sort_idx = torch.sort(flat_topk_ids)
+        sorted_token_idx = flat_token_idx.index_select(0, sort_idx)
+        sorted_weights = flat_topk_weights.index_select(0, sort_idx)
+        unique_experts, counts = torch.unique_consecutive(
+            sorted_expert_ids, return_counts=True
+        )
+
+        start = 0
+        for expert_id_t, count_t in zip(unique_experts, counts):
+            expert_id = int(expert_id_t.item())
+            count = int(count_t.item())
+            if count <= 0:
                 continue
-            token_idx, choice_idx = torch.nonzero(assignment_mask, as_tuple=True)
-            if token_idx.numel() == 0:
-                continue
+            end = start + count
+            token_idx = sorted_token_idx[start:end]
+            coeff = sorted_weights[start:end].unsqueeze(-1).to(compute_dtype)
+            start = end
             x_sel = hidden_states_2d.index_select(0, token_idx).to(compute_dtype)
-            coeff = topk_weights[token_idx, choice_idx].unsqueeze(-1).to(compute_dtype)
             w1e, w2e = self._materialize_one_expert_awq(
-                int(expert_id),
+                expert_id,
                 hidden_states_2d.device,
                 compute_dtype,
             )
-            gu = F.linear(x_sel, w1e)
-            g, u = torch.chunk(gu, 2, dim=-1)
-            h = self._apply_gate_activation(g) * u
-            y = F.linear(h, w2e) * coeff
+            with _gemma4_profile_span("moe_sparse_expert_linear"):
+                gu = F.linear(x_sel, w1e)
+                g, u = torch.chunk(gu, 2, dim=-1)
+                h = self._apply_gate_activation(g) * u
+                y = F.linear(h, w2e) * coeff
             out.index_add_(0, token_idx, y)
         return out.to(hidden_states_2d.dtype)
 
@@ -1123,7 +1683,8 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = x
         h = self.input_layernorm(x)
-        h = self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping)
+        with _gemma4_profile_span("layer_self_attn"):
+            h = self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping)
         h = self.post_attention_layernorm(h)
         guard_hit = (
             self._fp32_residual_guard_enabled
@@ -1143,31 +1704,35 @@ class Gemma4DecoderLayer(nn.Module):
             # - dense MLP branch consumes pre_feedforward_layernorm(residual)
             # - router consumes raw residual (before pre-FF norms)
             # - sparse experts consume pre_feedforward_layernorm_2(residual)
-            dense_out = self.mlp.shared_mlp(h_dense, lora_mapping=lora_mapping)
+            with _gemma4_profile_span("layer_dense_mlp"):
+                dense_out = self.mlp.shared_mlp(h_dense, lora_mapping=lora_mapping)
             if self.post_feedforward_layernorm_1 is not None:
                 dense_out = self.post_feedforward_layernorm_1(dense_out)
 
             router_in_2d, router_shape = _reshape_hidden_to_2d(residual)
-            router_logits, routing_weights, selected_experts = self.mlp.router(
-                router_in_2d
-            )
+            with _gemma4_profile_span("layer_moe_router"):
+                router_logits, routing_weights, selected_experts = self.mlp.router(
+                    router_in_2d
+                )
             if self.pre_feedforward_layernorm_2 is not None:
                 sparse_in = self.pre_feedforward_layernorm_2(residual)
             else:
                 sparse_in = residual
             sparse_in_2d, _ = _reshape_hidden_to_2d(sparse_in)
-            sparse_out_2d = self.mlp.experts(
-                sparse_in_2d,
-                router_logits,
-                topk_weights=routing_weights,
-                topk_ids=selected_experts,
-            )
+            with _gemma4_profile_span("layer_moe_sparse_experts"):
+                sparse_out_2d = self.mlp.experts(
+                    sparse_in_2d,
+                    router_logits,
+                    topk_weights=routing_weights,
+                    topk_ids=selected_experts,
+                )
             sparse_out = _restore_hidden_from_2d(sparse_out_2d, router_shape)
             if self.post_feedforward_layernorm_2 is not None:
                 sparse_out = self.post_feedforward_layernorm_2(sparse_out)
             h = dense_out + sparse_out
         else:
-            h = self.mlp(h_dense, lora_mapping)
+            with _gemma4_profile_span("layer_dense_mlp"):
+                h = self.mlp(h_dense, lora_mapping)
         h = self.post_feedforward_layernorm(h)
         if guard_hit:
             x = _residual_add_fp32(residual, h)

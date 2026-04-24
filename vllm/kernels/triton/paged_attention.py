@@ -1,7 +1,104 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw.strip())
+    except Exception:
+        return int(default)
+
+
+def _env_truthy(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _select_paged_attention_launch_config(
+    *,
+    num_seqs: int,
+    head_size: int,
+    block_size: int,
+    is_int4: bool,
+    is_fp8: bool,
+    attn_scope: str | None = None,
+    layer_type: str | None = None,
+) -> tuple[int, int]:
+    scope = str(attn_scope or "").strip().lower()
+    if not scope:
+        lt = str(layer_type or "").strip().lower()
+        if "sliding" in lt or "local" in lt:
+            scope = "local"
+        elif "full" in lt or "global" in lt:
+            scope = "global"
+
+    # Scope-specific override: let local/global layers use independent launch knobs.
+    # Alias full->global and sliding->local for convenience.
+    if scope in ("full",):
+        scope = "global"
+    if scope in ("sliding",):
+        scope = "local"
+    if scope in ("local", "global"):
+        scoped_warps = _env_int(
+            f"FASTINFERENCE_PAGED_ATTN_NUM_WARPS_{scope.upper()}",
+            -1,
+        )
+        scoped_stages = _env_int(
+            f"FASTINFERENCE_PAGED_ATTN_NUM_STAGES_{scope.upper()}",
+            -1,
+        )
+        if scoped_warps > 0 and scoped_stages > 0:
+            return scoped_warps, scoped_stages
+
+    # C1 single-request preset for consumer GPUs / Ollama-like workloads.
+    # Keep this ahead of generic/manual-tuning heuristics and behind explicit
+    # scope overrides so operators can still force an emergency setting.
+    if _env_truthy("FASTINFERENCE_GEMMA4_C1_PRESET") and int(num_seqs) <= 1:
+        if scope == "global":
+            return 4, 1
+        if scope == "local":
+            return 4, 1
+
+    # Manual override is useful for A/B and emergency rollback without code edit.
+    override_warps = _env_int("FASTINFERENCE_PAGED_ATTN_NUM_WARPS", -1)
+    override_stages = _env_int("FASTINFERENCE_PAGED_ATTN_NUM_STAGES", -1)
+    if override_warps > 0 and override_stages > 0:
+        return override_warps, override_stages
+
+    # Decode-heavy Gemma4-31B path: head_size=256, block_size=16.
+    # Scope-aware bucket:
+    # - global/full attention: low concurrency often benefits from leaner launch (2/2),
+    #   while >=3 concurrency is more stable with 4/2.
+    # - local/sliding attention: use a lighter stage depth at c1 (4/1), and 4/2 otherwise.
+    # Fallback keeps stable default and env override remains available.
+    if head_size >= 256:
+        if scope == "global":
+            if num_seqs <= 2:
+                return 2, 2
+            return 4, 2
+        if scope == "local":
+            if num_seqs <= 1:
+                return 4, 1
+            return 4, 2
+        return 4, 2
+
+    if is_int4 or is_fp8:
+        if num_seqs <= 8:
+            return 4, 2
+        return 2, 2
+
+    if block_size >= 32:
+        return 4, 2
+    return 2, 2
 
 @triton.jit
 def _paged_attention_kernel(
@@ -148,6 +245,16 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, blo
     else:
         s_ks = [0]*4; s_vs = [0]*4
 
+    num_warps, num_stages = _select_paged_attention_launch_config(
+        num_seqs=num_seqs,
+        head_size=head_size,
+        block_size=int(block_size),
+        is_int4=is_int4,
+        is_fp8=is_fp8,
+        attn_scope=kwargs.get("attn_scope"),
+        layer_type=kwargs.get("layer_type"),
+    )
+
     grid = (num_seqs * num_heads,)
     _paged_attention_kernel[grid](
         out, query, key_cache, value_cache, 
@@ -165,7 +272,8 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, blo
         k_scale_ptrs if has_row_scale else out, v_scale_ptrs if has_row_scale else out,
         s_ks[0], s_ks[1], s_ks[2],
         s_vs[0], s_vs[1], s_vs[2],
-        IS_FP8=is_fp8, IS_INT4=is_int4, IS_CACHED=is_cached, HAS_ROW_SCALE=has_row_scale, BLOCK_D=head_size, BLOCK_N=block_size
+        IS_FP8=is_fp8, IS_INT4=is_int4, IS_CACHED=is_cached, HAS_ROW_SCALE=has_row_scale, BLOCK_D=head_size, BLOCK_N=block_size,
+        num_warps=num_warps, num_stages=num_stages,
     )
 
 def paged_attention_v2(*args, **kwargs):

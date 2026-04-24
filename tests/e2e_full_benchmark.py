@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -49,6 +50,34 @@ class WarmupConfig:
     burst_rounds: int = 0
     burst_concurrency: int = 0
     burst_decode_tokens: int = 8
+
+
+_GEMMA31B_SCHEDULER_PROFILES: dict[str, dict[str, str]] = {
+    "baseline": {
+        "FASTINFERENCE_LITE_PREFILL_CHUNK": "256",
+        "FASTINFERENCE_LITE_PREFILL_MICROBATCH": "2",
+        "FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS": "0",
+        "FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG": "2",
+        "FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO": "0.25",
+        "FASTINFERENCE_LITE_DECODE_PRIORITY": "1",
+    },
+    "decode_bias": {
+        "FASTINFERENCE_LITE_PREFILL_CHUNK": "192",
+        "FASTINFERENCE_LITE_PREFILL_MICROBATCH": "1",
+        "FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS": "0",
+        "FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG": "3",
+        "FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO": "0.20",
+        "FASTINFERENCE_LITE_DECODE_PRIORITY": "1",
+    },
+    "catchup_prefill": {
+        "FASTINFERENCE_LITE_PREFILL_CHUNK": "384",
+        "FASTINFERENCE_LITE_PREFILL_MICROBATCH": "2",
+        "FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS": "128",
+        "FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG": "2",
+        "FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO": "0.35",
+        "FASTINFERENCE_LITE_DECODE_PRIORITY": "1",
+    },
+}
 
 
 # KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
@@ -164,41 +193,71 @@ def _read_int_with_default(raw: str | None, default: int) -> int:
 
 
 def _resolve_warmup_config(args: argparse.Namespace) -> WarmupConfig:
+    warmup_preset = str(
+        os.environ.get(
+            "FASTINFERENCE_BENCH_WARMUP_PRESET",
+            getattr(args, "warmup_preset", "default"),
+        )
+    ).strip().lower()
+    if warmup_preset not in ("default", "off", "cold"):
+        warmup_preset = "default"
+    if warmup_preset == "off":
+        preset_prefill = 0
+        preset_decode = 0
+        preset_decode_tokens = 8
+        preset_burst_rounds = 0
+        preset_burst_concurrency = 0
+        preset_burst_decode_tokens = 8
+    elif warmup_preset == "cold":
+        preset_prefill = 2
+        preset_decode = 2
+        preset_decode_tokens = 16
+        preset_burst_rounds = 1
+        preset_burst_concurrency = 2
+        preset_burst_decode_tokens = 8
+    else:
+        preset_prefill = args.warmup_prefill_rounds
+        preset_decode = args.warmup_decode_rounds
+        preset_decode_tokens = args.warmup_decode_tokens
+        preset_burst_rounds = args.warmup_burst_rounds
+        preset_burst_concurrency = args.warmup_burst_concurrency
+        preset_burst_decode_tokens = args.warmup_burst_decode_tokens
+
     prefill_rounds = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_PREFILL_ROUNDS"),
-            args.warmup_prefill_rounds,
+            preset_prefill,
         )
     )
     decode_rounds = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_DECODE_ROUNDS"),
-            args.warmup_decode_rounds,
+            preset_decode,
         )
     )
     decode_tokens = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_DECODE_TOKENS"),
-            args.warmup_decode_tokens,
+            preset_decode_tokens,
         ),
         minimum=1,
     )
     burst_rounds = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_ROUNDS"),
-            args.warmup_burst_rounds,
+            preset_burst_rounds,
         )
     )
     burst_concurrency = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_CONCURRENCY"),
-            args.warmup_burst_concurrency,
+            preset_burst_concurrency,
         )
     )
     burst_decode_tokens = _clamp_non_negative_int(
         _read_int_with_default(
             os.environ.get("FASTINFERENCE_BENCH_WARMUP_BURST_DECODE_TOKENS"),
-            args.warmup_burst_decode_tokens,
+            preset_burst_decode_tokens,
         ),
         minimum=1,
     )
@@ -210,6 +269,144 @@ def _resolve_warmup_config(args: argparse.Namespace) -> WarmupConfig:
         burst_concurrency=burst_concurrency,
         burst_decode_tokens=burst_decode_tokens,
     )
+
+
+def _resolve_compile_cache_env(
+    args: argparse.Namespace,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    raw = str(
+        os.environ.get(
+            "FASTINFERENCE_BENCH_COMPILE_CACHE_DIR",
+            getattr(args, "compile_cache_dir", ""),
+        )
+    ).strip()
+    if raw == "":
+        return {}, {"enabled": False}
+    cache_dir = Path(raw).expanduser().resolve()
+    if bool(getattr(args, "compile_cache_clear", False)) and cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    inductor_dir = (cache_dir / "torchinductor").resolve()
+    inductor_dir.mkdir(parents=True, exist_ok=True)
+    env_map = {
+        "TRITON_CACHE_DIR": str(cache_dir),
+        "TORCHINDUCTOR_CACHE_DIR": str(inductor_dir),
+    }
+    return env_map, {
+        "enabled": True,
+        "cache_dir": str(cache_dir),
+        "torchinductor_cache_dir": str(inductor_dir),
+    }
+
+
+def _cache_dir_stats(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {"exists": False, "files": 0, "bytes": 0}
+    p = Path(path)
+    if not p.exists():
+        return {"exists": False, "files": 0, "bytes": 0}
+    files = 0
+    total_bytes = 0
+    for root, _dirs, names in os.walk(p):
+        root_path = Path(root)
+        for name in names:
+            files += 1
+            try:
+                total_bytes += int((root_path / name).stat().st_size)
+            except OSError:
+                continue
+    return {"exists": True, "files": files, "bytes": total_bytes}
+
+
+def _resolve_gemma31b_bucket_policy(
+    spec: ModelSpec,
+    args: argparse.Namespace,
+) -> tuple[ModelSpec, dict[str, Any]]:
+    enabled_raw = str(
+        os.environ.get(
+            "FASTINFERENCE_GEMMA31B_BUCKET_ENABLE",
+            "1" if bool(getattr(args, "gemma31b_bucket_enable", True)) else "0",
+        )
+    ).strip().lower()
+    enabled = enabled_raw in ("1", "true", "yes", "on")
+    short_profile = str(
+        os.environ.get(
+            "FASTINFERENCE_GEMMA31B_BUCKET_SHORT_PROFILE",
+            getattr(args, "gemma31b_bucket_short_profile", "decode_bias"),
+        )
+    ).strip()
+    short_decode_profile = str(
+        os.environ.get(
+            "FASTINFERENCE_GEMMA31B_BUCKET_SHORT_DECODE_PROFILE",
+            getattr(
+                args,
+                "gemma31b_bucket_short_decode_profile",
+                "catchup_prefill",
+            ),
+        )
+    ).strip()
+    long_profile = str(
+        os.environ.get(
+            "FASTINFERENCE_GEMMA31B_BUCKET_LONG_PROFILE",
+            getattr(args, "gemma31b_bucket_long_profile", "baseline"),
+        )
+    ).strip()
+    cutoff = int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_GEMMA31B_BUCKET_CUTOFF"),
+            int(getattr(args, "gemma31b_bucket_cutoff", 128)),
+        )
+    )
+    decode_cutoff = int(
+        _read_int_with_default(
+            os.environ.get("FASTINFERENCE_GEMMA31B_BUCKET_DECODE_CUTOFF"),
+            int(getattr(args, "gemma31b_bucket_decode_cutoff", 32)),
+        )
+    )
+    profile_override = str(
+        os.environ.get(
+            "FASTINFERENCE_GEMMA31B_SCHED_PROFILE",
+            getattr(args, "gemma31b_schedule_profile", "auto_bucket"),
+        )
+    ).strip()
+    if short_profile not in _GEMMA31B_SCHEDULER_PROFILES:
+        short_profile = "decode_bias"
+    if short_decode_profile not in _GEMMA31B_SCHEDULER_PROFILES:
+        short_decode_profile = "catchup_prefill"
+    if long_profile not in _GEMMA31B_SCHEDULER_PROFILES:
+        long_profile = "baseline"
+    if profile_override not in ("auto_bucket", *tuple(_GEMMA31B_SCHEDULER_PROFILES.keys())):
+        profile_override = "auto_bucket"
+    if profile_override == "auto_bucket":
+        if enabled:
+            if int(spec.prompt_tokens_target) <= int(cutoff):
+                selected_profile = (
+                    short_decode_profile
+                    if int(spec.max_new_tokens) <= int(decode_cutoff)
+                    else short_profile
+                )
+            else:
+                selected_profile = long_profile
+        else:
+            selected_profile = "baseline"
+    else:
+        selected_profile = profile_override
+    merged_env = dict(spec.stable_env)
+    merged_env.update(_GEMMA31B_SCHEDULER_PROFILES[selected_profile])
+    merged_spec = replace(spec, stable_env=merged_env)
+    policy = {
+        "enabled": enabled,
+        "mode": profile_override,
+        "selected_profile": selected_profile,
+        "cutoff_prompt_tokens": int(cutoff),
+        "cutoff_decode_tokens": int(decode_cutoff),
+        "short_profile": short_profile,
+        "short_decode_profile": short_decode_profile,
+        "long_profile": long_profile,
+        "prompt_tokens_target": int(spec.prompt_tokens_target),
+        "max_new_tokens": int(spec.max_new_tokens),
+    }
+    return merged_spec, policy
 
 
 def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSpec:
@@ -1553,11 +1750,15 @@ async def _run_single_request(
     llm: AsyncLLM,
     request_id: str,
     prompt: str,
+    prompt_tokens: int,
     sampling_params: SamplingParams,
     multi_modal_data: dict[str, Any] | None = None,
 ) -> Dict[str, float]:
     start = time.perf_counter()
-    first_token_at: Optional[float] = None
+    token_timestamps: list[float] = []
+    output_event_count = 0
+    progressive_token_events = 0
+    prev_token_count = 0
     generated_tokens = 0
     async for output in llm.generate(
         prompt,
@@ -1565,17 +1766,32 @@ async def _run_single_request(
         request_id,
         multi_modal_data=multi_modal_data,
     ):
-        if output.outputs:
-            generated_tokens = len(output.outputs[0].token_ids)
-            if first_token_at is None and generated_tokens > 0:
-                first_token_at = time.perf_counter()
+        output_event_count += 1
+        if not output.outputs:
+            continue
+        now = time.perf_counter()
+        current_count = len(output.outputs[0].token_ids)
+        generated_tokens = max(generated_tokens, current_count)
+        new_tokens = max(0, current_count - prev_token_count)
+        if new_tokens <= 0 and prev_token_count == 0 and current_count > 0:
+            # Defensive fallback for engines that only emit a final output.
+            new_tokens = current_count
+        if new_tokens > 0:
+            progressive_token_events += 1
+            token_timestamps.extend([now] * new_tokens)
+            prev_token_count = current_count
     end = time.perf_counter()
+    first_token_at = token_timestamps[0] if token_timestamps else None
+    last_token_at = token_timestamps[-1] if token_timestamps else None
     ttft_ms = ((first_token_at - start) * 1000.0) if first_token_at is not None else float("nan")
     e2e_ms = (end - start) * 1000.0
     decode_tokens = max(0, generated_tokens - 1)
-    decode_ms = e2e_ms - ttft_ms if math.isfinite(ttft_ms) else float("nan")
-    # Sub-millisecond decode windows are often dominated by scheduling/buffering noise
-    # in long-prefill benchmarks and can produce misleadingly large decode TPS.
+    decode_ms = (
+        (last_token_at - first_token_at) * 1000.0
+        if first_token_at is not None and last_token_at is not None and len(token_timestamps) >= 2
+        else float("nan")
+    )
+    # Sub-millisecond decode windows are often dominated by scheduling/buffering noise.
     if math.isfinite(decode_ms) and decode_ms < 1.0:
         decode_ms = float("nan")
     decode_tps = (
@@ -1583,13 +1799,26 @@ async def _run_single_request(
         if decode_tokens > 0 and math.isfinite(decode_ms) and decode_ms > 0.0
         else float("nan")
     )
+    prefill_tps = (
+        (float(prompt_tokens) * 1000.0 / ttft_ms)
+        if prompt_tokens > 0 and math.isfinite(ttft_ms) and ttft_ms > 0.0
+        else float("nan")
+    )
     return {
         "tokens": float(generated_tokens),
+        "prompt_tokens": float(prompt_tokens),
         "ttft_ms": ttft_ms,
         "e2e_ms": e2e_ms,
         "decode_tokens": float(decode_tokens),
         "decode_ms": decode_ms,
         "decode_tps": decode_tps,
+        "prefill_tps": prefill_tps,
+        "stream_output_events": float(output_event_count),
+        "stream_progressive_token_events": float(progressive_token_events),
+        "stream_token_events": float(len(token_timestamps)),
+        "stream_progressive_visible": (
+            1.0 if progressive_token_events > 1 and len(token_timestamps) >= 2 else 0.0
+        ),
     }
 
 
@@ -1689,6 +1918,7 @@ async def run_benchmark(
     multimodal_images_per_request: int = 2,
     multimodal_image_size: int = 8,
     warmup_config: WarmupConfig | None = None,
+    fixed_decode_len: bool = True,
 ) -> Dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
@@ -1740,7 +1970,12 @@ async def run_benchmark(
                     "multimodal_image_size": max(2, int(multimodal_image_size)),
                 },
             }
-        sampling_params = SamplingParams(max_tokens=spec.max_new_tokens, temperature=0.0)
+        sampling_params = SamplingParams(
+            max_tokens=spec.max_new_tokens,
+            min_tokens=spec.max_new_tokens if fixed_decode_len else 0,
+            ignore_eos=fixed_decode_len,
+            temperature=0.0,
+        )
         # Reserve decode room so prefill does not consume the full KV capacity.
         prompt_budget = min(
             int(spec.prompt_tokens_target),
@@ -1764,6 +1999,10 @@ async def run_benchmark(
                 multimodal_images_per_request=multimodal_images_per_request,
                 multimodal_image_size=multimodal_image_size,
             )
+        prompt_tokens_by_request = [
+            len(llm.engine.tokenizer.encode(req.prompt))
+            for req in request_specs
+        ]
 
         resolved_warmup = warmup_config or WarmupConfig()
         warmup_trace = await _run_benchmark_warmup(
@@ -1782,6 +2021,7 @@ async def run_benchmark(
                 llm=llm,
                 request_id=f"{spec.key}_{idx}_{int(time.time())}",
                 prompt=request_specs[idx].prompt,
+                prompt_tokens=prompt_tokens_by_request[idx],
                 sampling_params=sampling_params,
                 multi_modal_data=request_specs[idx].multi_modal_data,
             )
@@ -1822,10 +2062,19 @@ async def run_benchmark(
                 "prefill_p95_ms": float("nan"),
                 "decode_p50_ms": float("nan"),
                 "decode_p95_ms": float("nan"),
+                "prompt_tokens_total": 0.0,
+                "prefill_tps_aggregate": 0.0,
+                "prefill_tps_p50": float("nan"),
+                "prefill_tps_p95": float("nan"),
+                "decode_ms_total": 0.0,
                 "decode_tokens_total": 0.0,
                 "decode_tps_aggregate": 0.0,
                 "decode_tps_p50": float("nan"),
                 "decode_tps_p95": float("nan"),
+                "stream_output_events_total": 0.0,
+                "stream_progressive_token_events_total": 0.0,
+                "stream_token_events_total": 0.0,
+                "stream_progressive_visible_ratio": 0.0,
                 "awq_runtime_stats": awq_stats,
                 "awq_metrics": awq_metrics,
                 "workload": {
@@ -1860,12 +2109,23 @@ async def run_benchmark(
         e2e_list = _finite_values([r["e2e_ms"] for r in request_results])
         decode_ms_list = _finite_values([r["decode_ms"] for r in request_results])
         decode_tps_list = _finite_values([r["decode_tps"] for r in request_results])
+        prefill_tps_list = _finite_values([r["prefill_tps"] for r in request_results])
+        progressive_visible_list = [
+            float(r.get("stream_progressive_visible", 0.0) or 0.0)
+            for r in request_results
+        ]
+        prompt_tokens_total = float(sum(r["prompt_tokens"] for r in request_results))
         decode_tokens_total = float(sum(r["decode_tokens"] for r in request_results))
-        # Use wall-clock benchmark duration to avoid overlap artifacts from summing
-        # per-request decode windows under concurrency.
+        prefill_ms_total = float(sum(ttft_list)) if ttft_list else 0.0
+        decode_ms_total = float(sum(decode_ms_list)) if decode_ms_list else 0.0
+        prefill_tps_aggregate = (
+            (prompt_tokens_total * 1000.0 / prefill_ms_total)
+            if prompt_tokens_total > 0.0 and prefill_ms_total > 0.0
+            else 0.0
+        )
         decode_tps_aggregate = (
-            decode_tokens_total / wall_sec
-            if decode_tokens_total > 0.0 and wall_sec > 0.0
+            (decode_tokens_total * 1000.0 / decode_ms_total)
+            if decode_tokens_total > 0.0 and decode_ms_total > 0.0
             else 0.0
         )
         awq_stats = {}
@@ -1892,10 +2152,29 @@ async def run_benchmark(
             "prefill_p95_ms": _p95(ttft_list) if ttft_list else float("nan"),
             "decode_p50_ms": median(decode_ms_list) if decode_ms_list else float("nan"),
             "decode_p95_ms": _p95(decode_ms_list) if decode_ms_list else float("nan"),
+            "prompt_tokens_total": prompt_tokens_total,
+            "prefill_tps_aggregate": prefill_tps_aggregate,
+            "prefill_tps_p50": median(prefill_tps_list) if prefill_tps_list else float("nan"),
+            "prefill_tps_p95": _p95(prefill_tps_list) if prefill_tps_list else float("nan"),
+            "decode_ms_total": decode_ms_total,
             "decode_tokens_total": decode_tokens_total,
             "decode_tps_aggregate": decode_tps_aggregate,
             "decode_tps_p50": median(decode_tps_list) if decode_tps_list else float("nan"),
             "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
+            "stream_output_events_total": float(
+                sum(r.get("stream_output_events", 0.0) for r in request_results)
+            ),
+            "stream_progressive_token_events_total": float(
+                sum(r.get("stream_progressive_token_events", 0.0) for r in request_results)
+            ),
+            "stream_token_events_total": float(
+                sum(r.get("stream_token_events", 0.0) for r in request_results)
+            ),
+            "stream_progressive_visible_ratio": (
+                (sum(progressive_visible_list) / len(progressive_visible_list))
+                if progressive_visible_list
+                else 0.0
+            ),
             "awq_runtime_stats": awq_stats,
             "awq_metrics": awq_metrics,
             "workload": {
@@ -1914,15 +2193,17 @@ async def run_benchmark(
             f"tokens/s={_fmt_float(result['aggregate_tps'], '.2f')}, "
             f"TTFT p50/p95={_fmt_float(result['ttft_p50_ms'], '.1f')}/{_fmt_float(result['ttft_p95_ms'], '.1f')} ms, "
             f"E2E p50/p95={_fmt_float(result['e2e_p50_ms'], '.1f')}/{_fmt_float(result['e2e_p95_ms'], '.1f')} ms, "
+            f"Prefill TPS(agg)={_fmt_float(result['prefill_tps_aggregate'], '.2f')}, "
+            f"Prefill TPS p50={_fmt_float(result['prefill_tps_p50'], '.2f')}, "
             f"Decode p50/p95={_fmt_float(result['decode_p50_ms'], '.1f')}/{_fmt_float(result['decode_p95_ms'], '.1f')} ms, "
             f"Decode TPS(agg)={_fmt_float(result['decode_tps_aggregate'], '.2f')}, "
-            f"Decode TPS p50={_fmt_float(result['decode_tps_p50'], '.2f')}"
+            f"Decode TPS p50={_fmt_float(result['decode_tps_p50'], '.2f')}, "
+            f"stream_visible={_fmt_float(result['stream_progressive_visible_ratio'] * 100.0, '.1f')}%"
         )
         if spec.concurrent_reqs > 1:
             print(
-                "  [Note] Decode TPS(agg)=decode_tokens_total/wall_time. Per-request decode TPS "
-                "can still be noisy when prefill dominates and decode windows are very short. "
-                "Prefer tokens/s (aggregate_tps) or decode_tps_p50 for A/B vs kernel work."
+                "  [Note] Decode TPS(agg)=decode_tokens_total/decode_ms_total. "
+                "Per-request decode TPS can still be noisy when decode windows are short."
             )
         for line in _format_runtime_phase_diff_summary(
             runtime_stats_by_phase.get("phase_diffs", {})
@@ -2040,6 +2321,27 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gemma31b-prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override prompt token target for gemma4_31b_q4.",
+    )
+    parser.add_argument(
+        "--gemma31b-max-new-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max_new_tokens for gemma4_31b_q4.",
+    )
+    parser.add_argument(
+        "--gemma31b-max-model-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max_model_len for gemma4_31b_q4.",
+    )
+    parser.add_argument(
         "--gemma26b-concurrent",
         type=int,
         default=None,
@@ -2078,6 +2380,16 @@ def _parse_args() -> argparse.Namespace:
         help="Warmup prefill rounds before benchmark (default: 1).",
     )
     parser.add_argument(
+        "--warmup-preset",
+        type=str,
+        default="default",
+        choices=("default", "off", "cold"),
+        help=(
+            "Warmup preset. default uses explicit warmup-* args; "
+            "off disables warmup; cold adds stronger compile/jitter warmup."
+        ),
+    )
+    parser.add_argument(
         "--warmup-decode-rounds",
         type=int,
         default=1,
@@ -2112,6 +2424,93 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="max_tokens used by each request in burst warmup rounds.",
     )
+    parser.add_argument(
+        "--compile-cache-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Optional compile cache root (sets TRITON_CACHE_DIR and TORCHINDUCTOR_CACHE_DIR). "
+            "Can also be set via FASTINFERENCE_BENCH_COMPILE_CACHE_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--compile-cache-clear",
+        action="store_true",
+        help="Clear --compile-cache-dir before run (cold-start style measurement).",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-enable",
+        action="store_true",
+        default=True,
+        help="Enable default prompt-bucket scheduling policy for Gemma4-31B.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-disable",
+        action="store_false",
+        dest="gemma31b_bucket_enable",
+        help="Disable prompt-bucket scheduling policy for Gemma4-31B.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-cutoff",
+        type=int,
+        default=128,
+        metavar="N",
+        help="Prompt-token cutoff for Gemma4-31B auto bucket routing.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-decode-cutoff",
+        type=int,
+        default=32,
+        metavar="N",
+        help="Decode-token cutoff used inside the short-prompt bucket for Gemma4-31B.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-short-profile",
+        type=str,
+        default="decode_bias",
+        choices=("baseline", "decode_bias", "catchup_prefill"),
+        help="Scheduler profile for short prompts (<= cutoff) with longer decode lengths.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-short-decode-profile",
+        type=str,
+        default="catchup_prefill",
+        choices=("baseline", "decode_bias", "catchup_prefill"),
+        help="Scheduler profile for short prompts (<= cutoff) with decode <= decode-cutoff.",
+    )
+    parser.add_argument(
+        "--gemma31b-bucket-long-profile",
+        type=str,
+        default="baseline",
+        choices=("baseline", "decode_bias", "catchup_prefill"),
+        help="Scheduler profile for long prompts (> cutoff).",
+    )
+    parser.add_argument(
+        "--gemma31b-schedule-profile",
+        type=str,
+        default="auto_bucket",
+        choices=("auto_bucket", "baseline", "decode_bias", "catchup_prefill"),
+        help=(
+            "Gemma4-31B scheduler profile mode. auto_bucket routes by prompt bucket; "
+            "other values force one profile."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-decode-len",
+        action="store_true",
+        default=True,
+        help=(
+            "Force fixed decode length by setting ignore_eos=True and min_tokens=max_new_tokens "
+            "(default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-eos-stop",
+        action="store_false",
+        dest="fixed_decode_len",
+        help="Disable fixed decode length and allow early stop on EOS.",
+    )
     return parser.parse_args()
 
 
@@ -2119,6 +2518,9 @@ async def main() -> None:
     args = _parse_args()
     aggressive = _is_e2e_aggressive(args)
     warmup_config = _resolve_warmup_config(args)
+    compile_cache_env, compile_cache_meta = _resolve_compile_cache_env(args)
+    compile_cache_before = _cache_dir_stats(compile_cache_meta.get("cache_dir"))
+    compile_cache_after = dict(compile_cache_before)
     if _is_rocm() and not aggressive:
         print(
             "[ROCm] Using conservative E2E defaults "
@@ -2131,6 +2533,7 @@ async def main() -> None:
         )
     model_keys = [k.strip() for k in args.models.split(",") if k.strip()]
     specs: List[ModelSpec] = []
+    resolved_scheduler_policy: Dict[str, Dict[str, Any]] = {}
     for key in model_keys:
         if key not in MODEL_SPECS:
             raise ValueError(f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}")
@@ -2162,6 +2565,24 @@ async def main() -> None:
                 concurrent_reqs=n,
                 max_run_seconds=max(spec.max_run_seconds, 120 * n),
             )
+        if key == "gemma4_31b_q4" and args.gemma31b_prompt_tokens is not None:
+            n = int(args.gemma31b_prompt_tokens)
+            if n < 8:
+                raise ValueError("--gemma31b-prompt-tokens must be >= 8")
+            spec = replace(spec, prompt_tokens_target=n)
+        if key == "gemma4_31b_q4" and args.gemma31b_max_new_tokens is not None:
+            n = int(args.gemma31b_max_new_tokens)
+            if n < 1:
+                raise ValueError("--gemma31b-max-new-tokens must be >= 1")
+            spec = replace(spec, max_new_tokens=n)
+        if key == "gemma4_31b_q4" and args.gemma31b_max_model_len is not None:
+            n = int(args.gemma31b_max_model_len)
+            if n < 64:
+                raise ValueError("--gemma31b-max-model-len must be >= 64")
+            spec = replace(spec, max_model_len=n)
+        if key == "gemma4_31b_q4":
+            spec, policy = _resolve_gemma31b_bucket_policy(spec, args)
+            resolved_scheduler_policy[key] = policy
         if key == "gemma4_26b_a4b" and args.gemma26b_concurrent is not None:
             n = int(args.gemma26b_concurrent)
             if n < 1 or n > 16:
@@ -2193,31 +2614,61 @@ async def main() -> None:
     print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit + Gemma4-26B-A4B-it-AWQ-4bit")
     print(
         "Warmup: "
+        f"preset={args.warmup_preset}, "
         f"prefill={warmup_config.prefill_rounds}, "
         f"decode={warmup_config.decode_rounds}x{warmup_config.decode_tokens}, "
         f"burst={warmup_config.burst_rounds}x{warmup_config.burst_concurrency}"
     )
+    print(
+        "Decode mode: "
+        f"{'fixed_len(ignore_eos,min_tokens=max_new_tokens)' if args.fixed_decode_len else 'allow_eos_stop'}"
+    )
+    if compile_cache_meta.get("enabled"):
+        print(
+            "Compile cache: "
+            f"dir={compile_cache_meta['cache_dir']} "
+            f"(files={compile_cache_before['files']}, bytes={compile_cache_before['bytes']})"
+        )
+    gemma31_policy = resolved_scheduler_policy.get("gemma4_31b_q4")
+    if gemma31_policy is not None:
+        print(
+            "Gemma4-31B scheduler: "
+            f"mode={gemma31_policy['mode']} profile={gemma31_policy['selected_profile']} "
+            f"bucket={'on' if gemma31_policy['enabled'] else 'off'} "
+            f"cutoff={gemma31_policy['cutoff_prompt_tokens']} "
+            f"prompt={gemma31_policy['prompt_tokens_target']}"
+        )
     print("=" * 72)
 
-    summary: Dict[str, Dict[str, float]] = {}
+    summary: Dict[str, Dict[str, Any]] = {}
     runtime_stats_summary: Dict[str, Dict[str, object]] = {}
-    for spec in specs:
-        summary[spec.key] = await run_benchmark(
-            spec,
-            workload=args.workload,
-            multimodal_images_per_request=args.multimodal_images_per_request,
-            multimodal_image_size=args.multimodal_image_size,
-            warmup_config=warmup_config,
-        )
-        runtime_stats_summary[spec.key] = dict(
-            summary[spec.key].get("runtime_stats", {})
-        )
+    global_old_env = _apply_temp_env(compile_cache_env)
+    try:
+        for spec in specs:
+            summary[spec.key] = await run_benchmark(
+                spec,
+                workload=args.workload,
+                multimodal_images_per_request=args.multimodal_images_per_request,
+                multimodal_image_size=args.multimodal_image_size,
+                warmup_config=warmup_config,
+                fixed_decode_len=bool(args.fixed_decode_len),
+            )
+            runtime_stats_summary[spec.key] = dict(
+                summary[spec.key].get("runtime_stats", {})
+            )
+    finally:
+        _restore_env(global_old_env)
+    compile_cache_after = _cache_dir_stats(compile_cache_meta.get("cache_dir"))
+    compile_cache_delta = {
+        "files": int(compile_cache_after["files"]) - int(compile_cache_before["files"]),
+        "bytes": int(compile_cache_after["bytes"]) - int(compile_cache_before["bytes"]),
+    }
 
     print("\n" + "-" * 72)
     print("PERF SUMMARY")
     print(
-        "(decode_tps_agg = decode_tokens_total / wall_time; decode_tps_p50 may be n/a "
-        "when decode window is too short)"
+        "(decode_tps_agg = decode_tokens_total / decode_ms_total; decode_tps_p50 may be n/a "
+        "when token streaming is not progressively visible)"
     )
     print("-" * 72)
     for key in model_keys:
@@ -2231,10 +2682,18 @@ async def main() -> None:
         print(
             f"{key:16} | tps={_fmt_float(r['aggregate_tps'], '.2f')} | "
             f"ttft_p50={_fmt_float(r['ttft_p50_ms'], '.1f')}ms | ttft_p95={_fmt_float(r['ttft_p95_ms'], '.1f')}ms | "
+            f"prefill_tps_agg={_fmt_float(r.get('prefill_tps_aggregate', float('nan')), '.2f')} | "
             f"e2e_p50={_fmt_float(r['e2e_p50_ms'], '.1f')}ms | e2e_p95={_fmt_float(r['e2e_p95_ms'], '.1f')}ms | "
             f"decode_tps_agg={_fmt_float(r['decode_tps_aggregate'], '.2f')} | "
             f"decode_tps_p50={_fmt_float(r['decode_tps_p50'], '.2f')} | "
+            f"stream_visible={_fmt_float(float(r.get('stream_progressive_visible_ratio', 0.0) or 0.0) * 100.0, '.1f')}% | "
             f"workload={r.get('workload', {}).get('kind', args.workload)}"
+        )
+    if compile_cache_meta.get("enabled"):
+        print(
+            "compile_cache      | "
+            f"files={compile_cache_after['files']} (delta={compile_cache_delta['files']:+d}) | "
+            f"bytes={compile_cache_after['bytes']} (delta={compile_cache_delta['bytes']:+d})"
         )
 
     if args.json_out:
@@ -2246,6 +2705,7 @@ async def main() -> None:
                 "multimodal_image_size": args.multimodal_image_size,
             },
             "warmup": {
+                "preset": args.warmup_preset,
                 "prefill_rounds": warmup_config.prefill_rounds,
                 "decode_rounds": warmup_config.decode_rounds,
                 "decode_tokens": warmup_config.decode_tokens,
@@ -2253,6 +2713,16 @@ async def main() -> None:
                 "burst_concurrency": warmup_config.burst_concurrency,
                 "burst_decode_tokens": warmup_config.burst_decode_tokens,
             },
+            "decode_mode": {
+                "fixed_decode_len": bool(args.fixed_decode_len),
+            },
+            "compile_cache": {
+                **compile_cache_meta,
+                "before": compile_cache_before,
+                "after": compile_cache_after,
+                "delta": compile_cache_delta,
+            },
+            "resolved_scheduler_policy": resolved_scheduler_policy,
             "summary": summary,
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2270,6 +2740,7 @@ async def main() -> None:
                 "multimodal_image_size": args.multimodal_image_size,
             },
             "warmup": {
+                "preset": args.warmup_preset,
                 "prefill_rounds": warmup_config.prefill_rounds,
                 "decode_rounds": warmup_config.decode_rounds,
                 "decode_tokens": warmup_config.decode_tokens,
@@ -2277,6 +2748,16 @@ async def main() -> None:
                 "burst_concurrency": warmup_config.burst_concurrency,
                 "burst_decode_tokens": warmup_config.burst_decode_tokens,
             },
+            "decode_mode": {
+                "fixed_decode_len": bool(args.fixed_decode_len),
+            },
+            "compile_cache": {
+                **compile_cache_meta,
+                "before": compile_cache_before,
+                "after": compile_cache_after,
+                "delta": compile_cache_delta,
+            },
+            "resolved_scheduler_policy": resolved_scheduler_policy,
             "runtime_stats": runtime_stats_summary,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }

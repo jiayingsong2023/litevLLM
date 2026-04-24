@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+import json
+from pathlib import Path
 import torch
 import triton
 import triton.language as tl
@@ -60,37 +62,190 @@ def _select_fused_gemm_blocks(
         num_stages = max(1, min(4, num_stages))
         return block_m, block_n, block_k, num_warps, num_stages
 
+    k = int(_k)
+    # Gemma4-31B MLP down_proj decode hot shape:
+    #   n=5376, k=21504, m in {1,2}
+    # This shape is latency-sensitive and generally prefers lower warp/stage pressure
+    # compared with the broader decode defaults.
+    mlp_down_decode_small_m = n == 5376 and k == 21504 and m <= 2
     block_k = 64
+    deep_k_narrow_out = k >= 16384 and n <= 6144
     if m <= 4:
         block_m = 16
-    elif m <= 16:
+        # Decode-heavy Gemma4 shapes prefer wider N tiles, but very wide output
+        # projections (e.g. global q / gate-up) still favor 128.
+        if mlp_down_decode_small_m:
+            block_n = 128
+        elif deep_k_narrow_out and m >= 4:
+            block_n = 128
+        elif n <= 8192 or (m == 1 and k >= 16384):
+            block_n = 256
+        else:
+            block_n = 128
+    elif m <= 32:
         block_m = 32
+        if deep_k_narrow_out:
+            block_n = 128
+        else:
+            block_n = 256 if n >= 4096 else 128
+    elif m <= 192:
+        # Gemma4 prefill-like batches consistently benefit from shorter M tiles
+        # with a wider N tile on packed-int4 fused GEMM.
+        if deep_k_narrow_out:
+            block_m = 64
+            block_n = 64
+        else:
+            block_m = 32
+            block_n = 256 if n >= 4096 else 128
     else:
         block_m = 64
-
-    if m <= 16 and n >= 4096:
-        block_n = 128
-    else:
+        # M=256 prefill-like shapes on Gemma4-31B favor square-ish N tiles.
         block_n = 64
 
-    if m >= 64 and n >= 4096:
-        num_warps = 8
-    elif block_n >= 128:
+    if mlp_down_decode_small_m:
+        # m in {1,2} decode path: reduce occupancy pressure to improve single-request
+        # token latency and stabilize C1 decode TPS.
+        num_warps = 4
+    elif block_n >= 128 or (m >= 64 and n >= 4096):
         num_warps = 8
     else:
         num_warps = 4
-    num_stages = 2
+    num_stages = 1 if mlp_down_decode_small_m else 2
     return block_m, block_n, block_k, num_warps, num_stages
 
 
-def _env_fused_gemm_autotune() -> bool:
-    """Bench candidate tile shapes at first launch per (M,N,K,dot) key; disable to use heuristics only."""
-    return os.environ.get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "1").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+_PERSISTENT_PROFILE_CACHE: dict[str, list[dict[str, int]]] | None = None
+
+
+def _persistent_profile_path() -> Path:
+    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "").strip()
+    if not raw:
+        return Path()
+    return Path(raw).expanduser()
+
+
+def _load_persistent_profile() -> dict[str, list[dict[str, int]]]:
+    global _PERSISTENT_PROFILE_CACHE
+    if _PERSISTENT_PROFILE_CACHE is not None:
+        return _PERSISTENT_PROFILE_CACHE
+    path = _persistent_profile_path()
+    if not str(path) or (not path.is_file()):
+        _PERSISTENT_PROFILE_CACHE = {}
+        return _PERSISTENT_PROFILE_CACHE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        _PERSISTENT_PROFILE_CACHE = {}
+        return _PERSISTENT_PROFILE_CACHE
+    out: dict[str, list[dict[str, int]]] = {}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key == "version":
+                continue
+            if isinstance(value, list):
+                rows: list[dict[str, int]] = []
+                for row in value:
+                    if isinstance(row, dict):
+                        rows.append({str(k): int(v) for k, v in row.items() if isinstance(v, (int, float))})
+                out[str(key)] = rows
+    _PERSISTENT_PROFILE_CACHE = out
+    return _PERSISTENT_PROFILE_CACHE
+
+
+def _match_profile_entry(
+    row: dict[str, int],
+    *,
+    m: int,
+    n: int,
+    k: int,
+    group_size: int,
+) -> bool:
+    m_min = int(row.get("m_min", 1))
+    m_max = int(row.get("m_max", 1 << 30))
+    if m < m_min or m > m_max:
+        return False
+    if "n" in row and int(row["n"]) != n:
+        return False
+    if "k" in row and int(row["k"]) != k:
+        return False
+    if "group_size" in row and int(row["group_size"]) != group_size:
+        return False
+    return True
+
+
+def _lookup_persistent_blocks(
+    kind: str,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    group_size: int,
+) -> tuple[int, int, int, int, int] | None:
+    rows = _load_persistent_profile().get(kind, [])
+    for row in rows:
+        if not _match_profile_entry(row, m=m, n=n, k=k, group_size=group_size):
+            continue
+        keys = ("block_m", "block_n", "block_k", "num_warps", "num_stages")
+        if all(key in row for key in keys):
+            return (
+                int(row["block_m"]),
+                int(row["block_n"]),
+                int(row["block_k"]),
+                int(row["num_warps"]),
+                int(row["num_stages"]),
+            )
+    return None
+
+
+def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
+    """
+    Whether to launch Triton autotune for fused GEMM.
+
+    FASTINFERENCE_AWQ_FUSED_AUTOTUNE:
+      - "1"/"true"/"on": always autotune
+      - "0"/"false"/"off": never autotune
+      - unset or "auto": shape-aware default
+
+    The "auto" mode skips autotune on Gemma4-like production shapes where our
+    curated heuristics are consistently faster and avoid warmup overhead.
+    """
+    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "auto").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # auto
+    mm, nn, kk = int(m), int(n), int(k)
+    # Gemma4-31B decode dominant projections (m in {1,2,4}) benefit a lot from
+    # autotuned tiles after the scale-index correctness fix; heuristic kernels
+    # are kept for medium-M wide-output shapes to avoid unnecessary tuning cost.
+    if mm <= 8 and nn >= 4096 and kk >= 4096:
+        return True
+    if mm <= 192 and nn >= 4096 and kk >= 4096:
+        return False
+    return True
+
+
+def _select_split_k(m: int, n: int, k: int) -> int:
+    """
+    Split-K policy for fused int4 GEMM.
+
+    FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K:
+      - integer >= 1: force value
+      - unset/"auto": shape-aware default
+    """
+    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 1
+    mm, nn, kk = int(m), int(n), int(k)
+    # Decode m=1 with deep-K and wide output often benefits from K-splitting.
+    # Keep narrow-output projections on split_k=1 to avoid atomic overhead.
+    if mm == 1 and kk >= 16384 and nn >= 8192:
+        return 4
+    return 1
 
 
 # Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA; autotune picks best per key.
@@ -101,6 +256,13 @@ _PACKED_FUSED_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    # Gemma4-31B packed-int4 winners on ROCm/gfx11-class workloads.
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
 ]
 
 
@@ -375,7 +537,8 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
 ):
     """
     Optimized Symmetric INT4 GEMM. 
-    Reduces Scale load frequency and uses vectorized unpacking.
+    Uses per-element group index for scales so results remain correct when
+    BLOCK_K spans multiple quant groups (e.g. group_size=32, BLOCK_K=64).
     """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -404,13 +567,14 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
         # Fast 4-bit unpacking using bitwise shifts
         b_unpacked = (b_packed >> ((offs_k[None, :] % 8) * 4)) & 0xF
 
-        # Scale loading: check if we are at a group boundary
-        # For simplicity and performance in Triton, we load once per K-block
-        # but ensure group_idx is calculated correctly for the first element of offs_k.
-        current_k_base = k * BLOCK_K
-        group_idx = current_k_base // group_size
-        s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx * stride_sk)
-        scales = tl.load(s_ptrs, mask=offs_bn[:, None] < N, other=1.0)
+        current_k = k * BLOCK_K + offs_k
+        group_idx = current_k // group_size
+        s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
+        scales = tl.load(
+            s_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=1.0,
+        )
 
         # (q - 8) * scale
         b = (b_unpacked.to(tl.float32) - 8.0) * scales.to(tl.float32)
@@ -611,9 +775,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
     out_bf16 = 1 if use_bf16_output else 0
 
     # Decision for Split-K: Only for extremely narrow M and deep K
-    split_k = 1
-    if M == 1 and K >= 8192:
-        split_k = 4
+    split_k = _select_split_k(M, N, K)
 
     if out is None:
         if split_k > 1:
@@ -626,7 +788,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         if split_k > 1:
             c.zero_()
 
-    if _env_fused_gemm_autotune() and split_k == 1:
+    if _env_fused_gemm_autotune(M, N, K) and split_k == 1:
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
         try:
             _awq_native_tiled_gemm_autotuned[grid](
@@ -759,9 +921,7 @@ def packed_int4_symmetric_fused_gemm(
     bf16_dot = 1 if use_bf16_dot else 0
     out_bf16 = 1 if use_bf16_output else 0
 
-    split_k = 1
-    if m == 1 and k >= 8192:
-        split_k = 4
+    split_k = _select_split_k(m, n, k)
 
     if out is None:
         if split_k > 1:
@@ -773,7 +933,47 @@ def packed_int4_symmetric_fused_gemm(
         if split_k > 1:
             c.zero_()
 
-    if _env_fused_gemm_autotune() and split_k == 1:
+    profile_blocks = _lookup_persistent_blocks(
+        "packed_int4_symmetric",
+        m=m,
+        n=n,
+        k=k,
+        group_size=int(group_size),
+    )
+
+    if profile_blocks is not None and split_k == 1:
+        block_m, block_n, block_k, num_warps, num_stages = profile_blocks
+        grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
+        _packed_int4_symmetric_tiled_gemm_heuristic[grid](
+            a,
+            qweight,
+            scales,
+            c,
+            bias_ptr_arg,
+            m,
+            n,
+            k,
+            group_size,
+            a.stride(0),
+            a.stride(1),
+            qweight.stride(0),
+            qweight.stride(1),
+            scales.stride(0),
+            scales.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            USE_BF16_DOT=use_bf16_dot,
+            USE_BF16_OUTPUT=use_bf16_output,
+            HAS_BIAS=has_bias,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return c
+
+    if _env_fused_gemm_autotune(m, n, k) and split_k == 1:
         grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
         try:
             _packed_int4_symmetric_tiled_gemm_autotuned[grid](
