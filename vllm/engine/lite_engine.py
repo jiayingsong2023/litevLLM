@@ -64,14 +64,22 @@ def expand_metadata_for_paged_attention(
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
     q_device: torch.device,
+    seq_lens_cpu: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Expands seq_lens and block_tables for PagedAttention kernels during prefill.
     Standardizes 'Chunked Prefill' logic across Llama and Qwen architectures.
+
+    When ``seq_lens_cpu`` is provided (a Python list of ints), this function
+    avoids any GPU->CPU sync via ``.item()``; the caller is expected to have
+    already surfaced per-request lengths to the host side.
     """
     if seq > 1 and is_prefill:
         if bs == 1:
-            end_pos = int(seq_lens[0].item())
+            if seq_lens_cpu is not None and len(seq_lens_cpu) >= 1:
+                end_pos = int(seq_lens_cpu[0])
+            else:
+                end_pos = int(seq_lens[0].item())
             start_pos = end_pos - seq
             seq_lens_ext = torch.arange(
                 start_pos + 1, end_pos + 1, device=q_device, dtype=torch.int32
@@ -82,7 +90,10 @@ def expand_metadata_for_paged_attention(
             seq_lens_ext_parts = []
             block_tables_ext_parts = []
             for bi in range(bs):
-                end_pos_b = int(seq_lens[bi].item())
+                if seq_lens_cpu is not None and len(seq_lens_cpu) > bi:
+                    end_pos_b = int(seq_lens_cpu[bi])
+                else:
+                    end_pos_b = int(seq_lens[bi].item())
                 start_pos_b = end_pos_b - seq
                 seq_lens_ext_parts.append(
                     torch.arange(

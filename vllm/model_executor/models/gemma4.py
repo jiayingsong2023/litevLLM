@@ -136,6 +136,50 @@ def _meta_get(meta: Any, key: str, default: Any = None) -> Any:
     return getattr(meta, key, default)
 
 
+def _meta_cpu_seq_lens(meta: Any) -> Optional[list[int]]:
+    """
+    Return the host-side per-sequence length list if the engine-side builder
+    has already surfaced it; otherwise return None.
+
+    Keeps the Gemma4 60-layer decode loop free of `.item()` D->H syncs which
+    profiling showed dominate end-to-end latency (~107ms per sync).
+    """
+    raw = _meta_get(meta, "seq_lens_cpu", None)
+    if isinstance(raw, (list, tuple)) and len(raw) > 0:
+        return [int(v) for v in raw]
+    return None
+
+
+def _meta_cpu_max_seq_len(meta: Any) -> Optional[int]:
+    raw = _meta_get(meta, "max_seq_len_cpu", None)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _resolve_max_position_plus_one_cpu(
+    attn_metadata: Any, positions: torch.Tensor
+) -> Optional[int]:
+    """
+    Best-effort CPU-side upper bound for RoPE cache extension.
+
+    The engine-side builder populates ``max_seq_len_cpu`` per request on both
+    prefill and decode paths. For any call site where this is present we can
+    avoid ``positions.max().item()`` which forces a full device sync on the
+    hot path (one per decoder layer x 60 layers).
+    """
+    cpu_max = _meta_cpu_max_seq_len(attn_metadata)
+    if cpu_max is not None:
+        return int(cpu_max)
+    pos_cpu = _meta_get(attn_metadata, "positions_cpu", None)
+    if isinstance(pos_cpu, (list, tuple)) and len(pos_cpu) > 0:
+        return int(max(int(p) for p in pos_cpu)) + 1
+    return None
+
+
 def _meta_set(meta: Any, key: str, value: Any) -> bool:
     if isinstance(meta, dict):
         meta[key] = value
@@ -276,10 +320,14 @@ def _gather_recent_kv(
     local_window: Optional[int],
     kv_cache_dtype: str,
     kv_scale_cache: Optional[tuple[Any, Any]] = None,
+    seq_len_cpu: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     k_cache, v_cache = kv_cache
     block_size = int(k_cache.shape[1])
-    seq_len = int(seq_lens[batch_idx].item())
+    if seq_len_cpu is not None:
+        seq_len = int(seq_len_cpu)
+    else:
+        seq_len = int(seq_lens[batch_idx].item())
     if local_window is None or int(local_window) <= 0:
         start = 0
     else:
@@ -330,6 +378,8 @@ def _gather_recent_kv_batched(
     local_window: Optional[int],
     kv_cache_dtype: str,
     kv_scale_cache: Optional[tuple[Any, Any]] = None,
+    seq_lens_cpu: Optional[list[int]] = None,
+    max_seq_len_cpu: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     k_cache, v_cache = kv_cache
     block_size = int(k_cache.shape[1])
@@ -340,7 +390,27 @@ def _gather_recent_kv_batched(
     else:
         starts = torch.clamp(seq_lens_i64 - int(local_window), min=0)
     ctx_lens = seq_lens_i64 - starts
-    max_ctx = int(torch.max(ctx_lens).item()) if bsz > 0 else 0
+    # Prefer CPU-side scalar upper bound (injected by the engine-side builder)
+    # to avoid a full device sync on the 60-layer decode loop.
+    if seq_lens_cpu is not None and len(seq_lens_cpu) >= bsz and bsz > 0:
+        if local_window is None or int(local_window) <= 0:
+            max_ctx = int(max(int(v) for v in seq_lens_cpu[:bsz]))
+        else:
+            lw = int(local_window)
+            max_ctx = int(max(min(int(v), lw) for v in seq_lens_cpu[:bsz]))
+    elif max_seq_len_cpu is not None and bsz > 0:
+        if local_window is None or int(local_window) <= 0:
+            max_ctx = int(max_seq_len_cpu)
+        else:
+            max_ctx = min(int(max_seq_len_cpu), int(local_window))
+    elif _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH"):
+        max_ctx = int(torch.max(ctx_lens).item()) if bsz > 0 else 0
+    else:
+        # Conservative upper bound: fall back to cache width instead of a
+        # device sync. Trades a bit of extra gather work for zero sync cost.
+        max_ctx = int(block_tables.shape[1]) * block_size if bsz > 0 else 0
+        if local_window is not None and int(local_window) > 0:
+            max_ctx = min(max_ctx, int(local_window))
     if max_ctx <= 0:
         empty = torch.empty(
             (bsz, 0, num_kv_heads, head_dim),
@@ -405,6 +475,7 @@ def _build_local_decode_aligned_metadata(
     seq_lens: torch.Tensor,
     local_window: int,
     block_size: int,
+    seq_lens_cpu: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build local-window metadata for paged_attention_v1.
@@ -412,6 +483,10 @@ def _build_local_decode_aligned_metadata(
     The window start is aligned to block boundary so decode can run through
     paged-attention directly from KV cache. This may include up to
     (block_size - 1) extra left-context tokens.
+
+    When ``seq_lens_cpu`` is provided the implementation avoids all
+    ``.item()`` calls; the slicing is expressed via ``torch.gather`` so the
+    whole batch of ``block_tables`` rows is assembled in a single kernel.
     """
     seq_lens_i64 = seq_lens.to(dtype=torch.long)
     bsz = int(seq_lens_i64.shape[0])
@@ -429,14 +504,49 @@ def _build_local_decode_aligned_metadata(
         block_size,
         rounding_mode="floor",
     )
-    max_blocks = int(torch.max(num_blocks).item()) if bsz > 0 else 0
-    block_tables_aligned = block_tables.new_zeros((bsz, max_blocks))
-    for bi in range(bsz):
-        n = int(num_blocks[bi].item())
-        if n <= 0:
-            continue
-        sblk = int(start_aligned[bi].item() // block_size)
-        block_tables_aligned[bi, :n] = block_tables[bi, sblk : sblk + n]
+
+    # Host-side scalar max_blocks: prefer CPU path (no D->H sync).
+    # When seq_lens_cpu is absent we fall back to `.item()` to preserve the
+    # tight-shape contract of the legacy API. Callers on the Gemma4 decode
+    # hot path always pass seq_lens_cpu via the engine-side builder, so this
+    # sync never triggers in production; direct callers in tests and ad-hoc
+    # scripts keep their previous shape guarantees.
+    if seq_lens_cpu is not None and len(seq_lens_cpu) >= bsz:
+        lw = int(local_window) if int(local_window) > 0 else 0
+        max_blocks = 0
+        for i in range(bsz):
+            sl = int(seq_lens_cpu[i])
+            if lw > 0:
+                st = max(0, sl - lw)
+            else:
+                st = 0
+            sa = (st // block_size) * block_size
+            nb = (sl - sa + block_size - 1) // block_size
+            if nb > max_blocks:
+                max_blocks = nb
+    else:
+        max_blocks = int(torch.max(num_blocks).item())
+
+    if max_blocks <= 0:
+        return seq_lens_aligned, block_tables.new_zeros((bsz, 0))
+
+    # Vectorized gather replaces the per-sequence Python loop + `.item()`.
+    # sblk[b] = start_aligned[b] // block_size
+    sblk = torch.div(start_aligned, block_size, rounding_mode="floor")
+    # rel[max_blocks] = [0, 1, ..., max_blocks - 1]
+    rel = torch.arange(max_blocks, device=block_tables.device, dtype=sblk.dtype)
+    # col[b, j] = sblk[b] + j, clamped into the source table's column range
+    col = sblk[:, None] + rel[None, :]
+    max_col = int(block_tables.shape[1]) - 1
+    col_clamped = col.clamp(min=0, max=max(0, max_col))
+    block_tables_aligned = torch.gather(
+        block_tables.to(dtype=torch.long), 1, col_clamped
+    ).to(dtype=block_tables.dtype)
+    # Zero out columns that are past this sequence's real block count.
+    valid = rel[None, :] < num_blocks[:, None]
+    block_tables_aligned = torch.where(
+        valid, block_tables_aligned, torch.zeros_like(block_tables_aligned)
+    )
     return seq_lens_aligned, block_tables_aligned
 
 
@@ -469,11 +579,13 @@ def _get_or_build_local_decode_aligned_metadata(
         if isinstance(seq_cached, torch.Tensor) and isinstance(bt_cached, torch.Tensor):
             return seq_cached, bt_cached
 
+    seq_lens_cpu = _meta_cpu_seq_lens(attn_metadata)
     seq_lens_local, block_tables_local = _build_local_decode_aligned_metadata(
         block_tables=block_tables,
         seq_lens=seq_lens,
         local_window=local_window,
         block_size=block_size,
+        seq_lens_cpu=seq_lens_cpu,
     )
     _meta_set(
         attn_metadata,
@@ -696,11 +808,24 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         return cos, sin
 
     def forward(
-        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        max_position_plus_one_cpu: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if positions.numel() > 0:
-            required_len = int(positions.max().item()) + 1
-            self._ensure_cache_len(required_len)
+        # Prefer a caller-provided CPU-side bound to avoid a GPU->CPU
+        # sync (`positions.max().item()`) on every decoder layer.
+        if max_position_plus_one_cpu is not None and int(max_position_plus_one_cpu) > 0:
+            self._ensure_cache_len(int(max_position_plus_one_cpu))
+        elif positions.numel() > 0:
+            if _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH"):
+                required_len = int(positions.max().item()) + 1
+                self._ensure_cache_len(required_len)
+            else:
+                # Ensure the cache covers the configured model limit once; then
+                # growth happens lazily only when a hint explicitly exceeds it.
+                self._ensure_cache_len(int(self.max_position_embeddings))
         if positions.device != query.device:
             positions = positions.to(query.device)
         cos_cached, sin_cached = self._get_or_build_cache(
@@ -818,7 +943,14 @@ class Gemma4Attention(nn.Module):
         q = self._apply_head_norm(self.q_norm, q)
         k = self._apply_head_norm(self.k_norm, k)
         v = self._apply_head_norm_noscale(v, self.v_norm_eps)
-        q, k = self.rotary_emb(positions, q, k)
+        # Surface the max position upper bound from the engine-side builder so
+        # rotary_emb can extend its cache without a per-layer D->H sync.
+        max_pos_plus_one_cpu = _resolve_max_position_plus_one_cpu(
+            attn_metadata, positions
+        )
+        q, k = self.rotary_emb(
+            positions, q, k, max_position_plus_one_cpu=max_pos_plus_one_cpu
+        )
         is_local = self.is_sliding
         local_window = (
             int(getattr(self.config, "sliding_window", 0) or 0) if is_local else None
@@ -904,6 +1036,8 @@ class Gemma4Attention(nn.Module):
                             local_window=int(local_window or 0),
                             kv_cache_dtype=str(kv_cache_dtype),
                             kv_scale_cache=(k_scale_cache, v_scale_cache),
+                            seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                            max_seq_len_cpu=_meta_cpu_max_seq_len(attn_metadata),
                         )
                     if softcap is not None and float(softcap) > 0:
                         out = _causal_attention_ref(
@@ -961,11 +1095,42 @@ class Gemma4Attention(nn.Module):
                                 local_window=ctx_window,
                                 block_size=int(k_cache.shape[1]),
                             )
-                        max_ctx_local = (
-                            int(torch.max(seq_lens_local).item())
-                            if int(seq_lens_local.numel()) > 0
-                            else 0
-                        )
+                        # Upper bound for paged_attention_v1: prefer a cheap
+                        # CPU-side scalar so the 60-layer decode loop never
+                        # triggers a D->H sync here. The bound only needs to
+                        # upper-cover seq_lens_local per batch row.
+                        _slc_cpu = _meta_cpu_seq_lens(attn_metadata)
+                        _max_cpu = _meta_cpu_max_seq_len(attn_metadata)
+                        _block_sz = int(k_cache.shape[1])
+                        if _slc_cpu is not None and len(_slc_cpu) > 0:
+                            if ctx_window > 0:
+                                max_ctx_local = max(
+                                    (min(int(s), ctx_window) + _block_sz - 1)
+                                    for s in _slc_cpu
+                                )
+                            else:
+                                max_ctx_local = max(int(s) for s in _slc_cpu)
+                        elif _max_cpu is not None:
+                            if ctx_window > 0:
+                                max_ctx_local = (
+                                    min(int(_max_cpu), ctx_window) + _block_sz - 1
+                                )
+                            else:
+                                max_ctx_local = int(_max_cpu)
+                        elif _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH"):
+                            max_ctx_local = (
+                                int(torch.max(seq_lens_local).item())
+                                if int(seq_lens_local.numel()) > 0
+                                else 0
+                            )
+                        else:
+                            # Conservative upper bound derived from tensor
+                            # shapes (free) rather than a device-side reduce.
+                            max_ctx_local = (
+                                int(block_tables_local.shape[1]) * _block_sz
+                                if int(seq_lens_local.numel()) > 0
+                                else 0
+                            )
                         paged_attention_v1(
                             attn_out,
                             q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
@@ -999,6 +1164,8 @@ class Gemma4Attention(nn.Module):
                                 local_window=ctx_window,
                                 kv_cache_dtype=str(kv_dtype_name),
                                 kv_scale_cache=(k_scale_cache, v_scale_cache),
+                                seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                                max_seq_len_cpu=_meta_cpu_max_seq_len(attn_metadata),
                             )
                         q_positions = (
                             seq_lens.to(device=q.device, dtype=torch.long)[:, None] - seqlen
@@ -1029,8 +1196,15 @@ class Gemma4Attention(nn.Module):
                     use_full_ref = _should_use_full_decode_reference(str(kv_cache_dtype))
                     if use_full_ref and block_tables is not None and seq_lens is not None:
                         outs = []
+                        _global_seq_lens_cpu = _meta_cpu_seq_lens(attn_metadata)
                         for bi in range(bsz):
                             with _gemma4_profile_span("kv_read_global_ref"):
+                                _slc_hint = None
+                                if (
+                                    _global_seq_lens_cpu is not None
+                                    and bi < len(_global_seq_lens_cpu)
+                                ):
+                                    _slc_hint = int(_global_seq_lens_cpu[bi])
                                 k_ctx, v_ctx = _gather_recent_kv(
                                     kv_cache=kv_cache,
                                     block_tables=block_tables,
@@ -1041,6 +1215,7 @@ class Gemma4Attention(nn.Module):
                                     local_window=None,
                                     kv_cache_dtype=str(kv_cache_dtype),
                                     kv_scale_cache=(k_scale_cache, v_scale_cache),
+                                    seq_len_cpu=_slc_hint,
                                 )
                             q_i = q[bi : bi + 1].transpose(1, 2).float()
                             out_i = _causal_attention_ref(
@@ -1055,7 +1230,13 @@ class Gemma4Attention(nn.Module):
                         out = torch.cat(outs, dim=0)
                         return self.o_proj(out, lora_mapping)
                     seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                        bsz, seqlen, is_prefill, seq_lens, block_tables, q.device
+                        bsz,
+                        seqlen,
+                        is_prefill,
+                        seq_lens,
+                        block_tables,
+                        q.device,
+                        seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
                     )
                     max_ctx = int(
                         max(
