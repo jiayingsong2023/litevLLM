@@ -36,7 +36,10 @@ class AsyncDriver:
 
             try:
                 outputs = self.engine.step()
-                if not outputs and self.engine.active_request_count > 0:
+                # Always yield to event loop between engine steps so streaming
+                # consumers can observe incremental tokens instead of tail-batched
+                # queue draining when the driver keeps stepping in a tight loop.
+                if self.engine.active_request_count > 0:
                     await asyncio.sleep(0)
             except asyncio.CancelledError:
                 raise
