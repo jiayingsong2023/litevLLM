@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import warnings
 from pathlib import Path
@@ -11,6 +10,12 @@ from typing import Any
 
 import pytest
 import torch
+
+from tests.tools._gemma4_diag_utils import (
+    parse_strict_metrics,
+    warn_if_diff,
+    warn_if_token_mismatch,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _BASELINE_PATH = _ROOT / "tests" / "tools" / "fixtures" / "gemma4_26b_a_strict_baseline.json"
@@ -36,41 +41,6 @@ def _resolve_model_path() -> str | None:
         if os.path.isdir(candidate):
             return candidate
     return None
-
-
-def _parse_strict_metrics(text: str) -> dict[str, Any]:
-    cos_re = re.search(r"Prefill Logits -> CosSim:\s*([0-9.]+), MaxErr:\s*([0-9.]+)", text)
-    tok_re = re.search(
-        r"Prefill Token:\s*HF\(argmax\)=(-?\d+)\s*\|\s*Lite\(engine\)=(-?\d+)\s*\|\s*Lite\(argmax logits\)=(-?\d+)",
-        text,
-    )
-    if cos_re is None or tok_re is None:
-        raise ValueError("Could not parse strict audit metrics from output.")
-    return {
-        "cos_sim": float(cos_re.group(1)),
-        "max_err": float(cos_re.group(2)),
-        "hf_argmax": int(tok_re.group(1)),
-        "lite_engine_argmax": int(tok_re.group(2)),
-        "lite_logits_argmax": int(tok_re.group(3)),
-    }
-
-
-def _warn_if_diff(name: str, actual: float, expected: float, tol: float) -> None:
-    delta = abs(actual - expected)
-    if delta > tol:
-        warnings.warn(
-            f"[Gemma4-26BDiagWarn] {name} drifted: actual={actual:.6f} expected={expected:.6f} "
-            f"abs_diff={delta:.6f} tol={tol:.6f}",
-            stacklevel=2,
-        )
-
-
-def _warn_if_token_mismatch(name: str, actual: int, expected: int) -> None:
-    if actual != expected:
-        warnings.warn(
-            f"[Gemma4-26BDiagWarn] {name} changed: actual={actual} expected={expected}",
-            stacklevel=2,
-        )
 
 
 def test_gemma4_26b_strict_baseline_fixture_schema() -> None:
@@ -133,18 +103,20 @@ def test_gemma4_26b_strict_warn_only_against_baseline() -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
-    got = _parse_strict_metrics(proc.stdout)
+    got = parse_strict_metrics(proc.stdout)
 
-    _warn_if_diff("strict.cos_sim", got["cos_sim"], float(base["cos_sim"]), 0.001)
-    _warn_if_diff("strict.max_err", got["max_err"], float(base["max_err"]), 0.05)
-    _warn_if_token_mismatch("strict.hf_argmax", got["hf_argmax"], int(base["hf_argmax"]))
-    _warn_if_token_mismatch(
+    warn_if_diff("strict.cos_sim", got["cos_sim"], float(base["cos_sim"]), 0.001, tag="Gemma4-26BDiagWarn")
+    warn_if_diff("strict.max_err", got["max_err"], float(base["max_err"]), 0.05, tag="Gemma4-26BDiagWarn")
+    warn_if_token_mismatch("strict.hf_argmax", got["hf_argmax"], int(base["hf_argmax"]), tag="Gemma4-26BDiagWarn")
+    warn_if_token_mismatch(
         "strict.lite_engine_argmax",
         got["lite_engine_argmax"],
         int(base["lite_engine_argmax"]),
+        tag="Gemma4-26BDiagWarn",
     )
-    _warn_if_token_mismatch(
+    warn_if_token_mismatch(
         "strict.lite_logits_argmax",
         got["lite_logits_argmax"],
         int(base["lite_logits_argmax"]),
+        tag="Gemma4-26BDiagWarn",
     )

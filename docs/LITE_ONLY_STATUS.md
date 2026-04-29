@@ -17,6 +17,8 @@ FastInference is now a `lite-only` single-GPU inference project. The repository 
 
 - `TinyLlama-1.1B`
 - `Qwen3.5-9B-AWQ`
+- `Gemma4-26B-A4B-it-AWQ-4bit` (MoE, A-strict + A-lite + B)
+- `Gemma4-31B-it-AWQ-4bit` (Dense, A-lite + B)
 
 The project still reuses selected vLLM infrastructure modules, but it no longer aims to preserve a second full runtime path or a `vllm-compatible-lite` product boundary.
 

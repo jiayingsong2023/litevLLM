@@ -308,5 +308,3 @@ def paged_attention_v1(out, query, key_cache, value_cache, num_heads, scale, blo
         num_warps=num_warps, num_stages=num_stages,
     )
 
-def paged_attention_v2(*args, **kwargs):
-    return paged_attention_v1(*args, **kwargs)

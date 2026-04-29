@@ -209,4 +209,3 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping, kv_cache
         COMPUTE_DYNAMIC_SCALE=compute_dynamic,
         FP8_DTYPE=FP8_DTYPE
     )
-def reshape_and_cache_flash(*args, **kwargs): pass

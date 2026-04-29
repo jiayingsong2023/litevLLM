@@ -29,17 +29,18 @@ LLM / AsyncLLM / OpenAI API Server
 
 LitevLLM has been significantly optimized for Gemma4 dense and MoE models:
 
-### 2.1 MoE Single-Launch Architecture (Gemma4 26B/A4B)
-To overcome Python-side dispatch overhead in deep MoE models, we implemented a Single-Launch architecture:
-- **Block Mapping:** Tokens assigned to the same expert are partitioned into fixed-size blocks. A lookup table maps each Triton program block to a specific expert and token offset.
-- **Unified Kernel:** Replaced fragmented sequential expert processing with a single-launch `awq_moe_grouped_gemm` operator. 
-- **Physical Alignment:** Weights are processed in a consistent [E, N, K/8] 3D layout, eliminating layout ambiguities and ensuring high-fidelity AWQ dequantization.
-- **Impact:** Achieved >9x throughput improvement for MoE models, effectively hiding launch latency.
+### 2.1 Operator Fusion & Kernel Specialization
 
-### 2.2 Dense Model Fusion & Caching (Gemma4 31B)
-For high-parameter dense models where memory bandwidth is the primary bottleneck:
-- **Operator Fusion:** Implemented `fused_add_rmsnorm` to combine residual additions with RMSNorm, reducing global memory round-trips per transformer layer.
-- **Persistent Cache:** Added `materialize_cache()` support in `LiteLinear` to selectively pre-dequantize early model layers (e.g., layers 0-4) into FP16. This bypasses AWQ dequantization logic for compute-heavy early stages, prioritizing memory bandwidth utilization on high-end GPUs.
+- **MLP Gate-Up Fusion**: `packed_int4_symmetric_fused_gate_up_m1` fuses gate projection, up projection, and activation (SiLU/GELU) into a single Triton kernel, halving kernel launches for decode.
+- **QKV Fusion**: `packed_int4_symmetric_group32_qkv_m1` fuses Q/K/V projections into a single kernel, sharing activation loads across three projections and saving ~2/3 of activation global memory traffic.
+- **Split-K Decode**: Deep-K narrow-N projections (e.g., Gemma4-31B o_proj N=5376 K=16384) use split-K partial sums with atomic reduce to fill underutilized CUs.
+- **M=1 GEMV Specialization**: All decode GEMM kernels have dedicated M=1 paths using broadcast FMA instead of `tl.dot`, avoiding wasted MFMA lanes on single-token batches.
+
+### 2.2 Persistent & Cached Configurations
+
+- **AWQ Fused Profile Cache**: Persistent JSON-based autotune profiles (`awq_fused_profile.json`) skip first-run autotune overhead for known shapes.
+- **CPU-Side Scalar Injection**: Engine-side `InputBatchBuilder` pre-computes `seq_lens_cpu`, `kv_start_indices_cpu` lists and passes them through `attn_metadata` so the per-layer model loop never triggers `hipMemcpyWithStream` / `.item()` D->H syncs — eliminated ~107ms across 60 layers on Gemma4-31B.
+- **Reshape & Cache Scale Caching**: Scalar KV quantization scales are cached on the Python side via `_SCALE_TENSOR_CACHE` to avoid per-layer H->D memcpy for static scale values.
 
 ## 3. 精简版加载器 (Lite ModelLoader)
 针对 Safetensors 和 AWQ 架构，我们优化了加载逻辑：

@@ -4,7 +4,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import warnings
 from pathlib import Path
@@ -12,6 +11,13 @@ from typing import Any
 
 import pytest
 import torch
+
+from tests.tools._gemma4_diag_utils import (
+    parse_drift_metrics,
+    parse_strict_metrics,
+    warn_if_diff,
+    warn_if_token_mismatch,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _STRICT_BASELINE_PATH = _ROOT / "tests" / "tools" / "fixtures" / "gemma4_a_strict_baseline.json"
@@ -34,86 +40,12 @@ def _resolve_default_gemma_model_path() -> str | None:
     return mod.resolve_default_model_path()
 
 
-def _parse_strict_metrics(text: str) -> dict[str, Any]:
-    cos_re = re.search(r"Prefill Logits -> CosSim:\s*([0-9.]+), MaxErr:\s*([0-9.]+)", text)
-    tok_re = re.search(
-        r"Prefill Token:\s*HF\(argmax\)=(-?\d+)\s*\|\s*Lite\(engine\)=(-?\d+)\s*\|\s*Lite\(argmax logits\)=(-?\d+)",
-        text,
-    )
-    if cos_re is None or tok_re is None:
-        raise ValueError("Could not parse strict audit metrics from output.")
-    return {
-        "cos_sim": float(cos_re.group(1)),
-        "max_err": float(cos_re.group(2)),
-        "hf_argmax": int(tok_re.group(1)),
-        "lite_engine_argmax": int(tok_re.group(2)),
-        "lite_logits_argmax": int(tok_re.group(3)),
-    }
-
-
-def _parse_drift_metrics(text: str) -> dict[str, Any]:
-    token_map: dict[int, int] = {}
-    tm_re = re.search(r"\[Drift\] token_to_step=\{([^}]*)\}", text)
-    if tm_re is not None:
-        for pair in tm_re.group(1).split(","):
-            pair = pair.strip()
-            if not pair:
-                continue
-            k, v = pair.split(":")
-            token_map[int(k.strip())] = int(v.strip())
-
-    metrics: dict[int, dict[str, dict[str, float]]] = {}
-    cur_token: int | None = None
-    token_re = re.compile(r"^\[token=(\d+)\]")
-    line_re = re.compile(
-        r"^\s+(local|full):\s+cos_to_t1 mean=([0-9.]+)\s+min=([0-9.]+)\s+"
-        r"cos_to_prev mean=([0-9.]+)\s+min=([0-9.]+)"
-    )
-    for raw in text.splitlines():
-        line = raw.strip("\n")
-        m_tok = token_re.match(line)
-        if m_tok is not None:
-            cur_token = int(m_tok.group(1))
-            metrics[cur_token] = {}
-            continue
-        m_line = line_re.match(line)
-        if m_line is not None and cur_token is not None:
-            kind = m_line.group(1)
-            metrics[cur_token][kind] = {
-                "cos_to_t1_mean": float(m_line.group(2)),
-                "cos_to_t1_min": float(m_line.group(3)),
-                "cos_to_prev_mean": float(m_line.group(4)),
-                "cos_to_prev_min": float(m_line.group(5)),
-            }
-    if not metrics:
-        raise ValueError("Could not parse drift metrics from output.")
-    return {"token_to_step": token_map, "metrics": metrics}
-
-
-def _warn_if_diff(name: str, actual: float, expected: float, tol: float) -> None:
-    delta = abs(actual - expected)
-    if delta > tol:
-        warnings.warn(
-            f"[Gemma4DiagWarn] {name} drifted: actual={actual:.6f} expected={expected:.6f} "
-            f"abs_diff={delta:.6f} tol={tol:.6f}",
-            stacklevel=2,
-        )
-
-
-def _warn_if_token_mismatch(name: str, actual: int, expected: int) -> None:
-    if actual != expected:
-        warnings.warn(
-            f"[Gemma4DiagWarn] {name} changed: actual={actual} expected={expected}",
-            stacklevel=2,
-        )
-
-
 def test_parse_helpers_cover_sample_formats() -> None:
     strict_text = (
         "Prefill Logits -> CosSim: 0.999983, MaxErr: 0.000000\n"
         "Prefill Token: HF(argmax)=537 | Lite(engine)=537 | Lite(argmax logits)=537\n"
     )
-    strict = _parse_strict_metrics(strict_text)
+    strict = parse_strict_metrics(strict_text)
     assert strict["cos_sim"] == pytest.approx(0.999983)
     assert strict["hf_argmax"] == 537
 
@@ -123,7 +55,7 @@ def test_parse_helpers_cover_sample_formats() -> None:
         "  local: cos_to_t1 mean=0.726229 min=0.139810 cos_to_prev mean=0.726229 min=0.139810\n"
         "  full: cos_to_t1 mean=0.719264 min=0.065373 cos_to_prev mean=0.719264 min=0.065373\n"
     )
-    drift = _parse_drift_metrics(drift_text)
+    drift = parse_drift_metrics(drift_text)
     assert drift["token_to_step"][16] == 17
     assert drift["metrics"][16]["local"]["cos_to_t1_mean"] == pytest.approx(0.726229)
 
@@ -164,19 +96,17 @@ def test_gemma4_diagnostics_warn_only_against_baseline() -> None:
         check=False,
     )
     assert strict_proc.returncode == 0, strict_proc.stdout + "\n" + strict_proc.stderr
-    strict = _parse_strict_metrics(strict_proc.stdout)
+    strict = parse_strict_metrics(strict_proc.stdout)
 
-    _warn_if_diff("strict.cos_sim", strict["cos_sim"], float(strict_base["cos_sim"]), 0.001)
-    _warn_if_diff("strict.max_err", strict["max_err"], float(strict_base["max_err"]), 0.05)
-    _warn_if_token_mismatch(
-        "strict.hf_argmax", strict["hf_argmax"], int(strict_base["hf_argmax"])
-    )
-    _warn_if_token_mismatch(
+    warn_if_diff("strict.cos_sim", strict["cos_sim"], float(strict_base["cos_sim"]), 0.001)
+    warn_if_diff("strict.max_err", strict["max_err"], float(strict_base["max_err"]), 0.05)
+    warn_if_token_mismatch("strict.hf_argmax", strict["hf_argmax"], int(strict_base["hf_argmax"]))
+    warn_if_token_mismatch(
         "strict.lite_engine_argmax",
         strict["lite_engine_argmax"],
         int(strict_base["lite_engine_argmax"]),
     )
-    _warn_if_token_mismatch(
+    warn_if_token_mismatch(
         "strict.lite_logits_argmax",
         strict["lite_logits_argmax"],
         int(strict_base["lite_logits_argmax"]),
@@ -209,7 +139,7 @@ def test_gemma4_diagnostics_warn_only_against_baseline() -> None:
         check=False,
     )
     assert drift_proc.returncode == 0, drift_proc.stdout + "\n" + drift_proc.stderr
-    drift = _parse_drift_metrics(drift_proc.stdout)
+    drift = parse_drift_metrics(drift_proc.stdout)
 
     tol = drift_base["warn_tolerance"]
     step_tol = int(tol["token_to_step_abs"])
@@ -236,25 +166,25 @@ def test_gemma4_diagnostics_warn_only_against_baseline() -> None:
                 )
                 continue
             exp = cp_metrics[kind]
-            _warn_if_diff(
+            warn_if_diff(
                 f"drift[{cp}].{kind}.cos_to_t1_mean",
                 float(got["cos_to_t1_mean"]),
                 float(exp["cos_to_t1_mean"]),
                 mean_tol,
             )
-            _warn_if_diff(
+            warn_if_diff(
                 f"drift[{cp}].{kind}.cos_to_prev_mean",
                 float(got["cos_to_prev_mean"]),
                 float(exp["cos_to_prev_mean"]),
                 mean_tol,
             )
-            _warn_if_diff(
+            warn_if_diff(
                 f"drift[{cp}].{kind}.cos_to_t1_min",
                 float(got["cos_to_t1_min"]),
                 float(exp["cos_to_t1_min"]),
                 min_tol,
             )
-            _warn_if_diff(
+            warn_if_diff(
                 f"drift[{cp}].{kind}.cos_to_prev_min",
                 float(got["cos_to_prev_min"]),
                 float(exp["cos_to_prev_min"]),

@@ -1,4 +1,4 @@
-# AWQ Policy Matrix (9B / 35B)
+# AWQ Policy Matrix (9B / Gemma4)
 
 This project uses `FASTINFERENCE_AWQ_POLICY_MATRIX` to switch AWQ runtime defaults quickly without changing code.
 
@@ -26,14 +26,8 @@ If `FASTINFERENCE_AWQ_FUSED_SCOPE` is unset, profile-aware defaults are:
 | Model Profile | safe | balanced | throughput | strict |
 |---|---|---|---|---|
 | `qwen35_9b_awq` | `attention_only` | `attention_only` | `all` | `off` |
-| `qwen35_35b_awq` | `off` | `off` | `attention_only` | `off` |
+| `gemma4_31b_q4` | `attention_only` | `all` | `all` | `attention_only` |
+| `gemma4_26b_a4b` | `attention_only` | `all` | `all` | `attention_only` |
 | generic AWQ | `attention_only` | `all` | `all` | `attention_only` |
 
-For Qwen3.5 35B AWQ high-fidelity forcing (`force_high_fidelity_awq`):
-
-- `strict` -> `all`
-- `balanced` -> `balanced`
-- `throughput` -> `relaxed`
-- `safe` -> `balanced`
-
-This mapping is used only when `FASTINFERENCE_QWEN35_35B_AWQ_HIGH_FIDELITY_MODE` is not explicitly set.
+Gemma4 fused AWQ rollout is gated by `FASTINFERENCE_GEMMA4_FUSED_STAGE` (`off` / `attention_only` / `all`), which takes precedence over the policy matrix for Gemma4 models.

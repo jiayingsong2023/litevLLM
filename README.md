@@ -10,11 +10,13 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | ✅ [1:1 HF 对齐] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | ✅ [FP8 KV 稳定] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, 512ctx | **2.31** | ✅ [MoE 稳定] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, 512ctx | **0.90** | ✅ [Dense 稳定] |
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
   - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径。
-  - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-31B-it-AWQ-4bit`。
+  - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`。
   - **非目标**: 不再将 `Qwen3.5-35B` 作为正式支持模型推进。
 
 ## 🌟 核心特性
@@ -74,14 +76,12 @@ uv run bash tests/run_regression_suite.sh
 uv run bash tests/run_inference_correctness_regression.sh
 ```
 
-`tests/run_inference_correctness_regression.sh` 默认会自动探测本地 Gemma4 目录，优先顺序为：
-`models/gemma-4-31B-it-AWQ-4bit`、`models/Gemma-4-31B-Q4`、`models/Gemma-4-31B-AWQ`、`models/Gemma-4-31B-AWQ-4bit`。
-仅在本地目录不存在时，才会回退到 Hugging Face repo id `cyankiwi/gemma-4-31B-it-AWQ-4bit`。
+`tests/run_inference_correctness_regression.sh` 覆盖四个回归目标：TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B。Gemma4 模型目录自动探测，优先本地路径，仅在缺失时回退到 HuggingFace repo id。
 
 默认准确度策略为：
 
 - `<=14B`：`A-strict + B`
-- `>14B`：`A-lite + B`
+- `>14B`：`A-lite + B`（Gemma4-26B 例外，默认开启 A-strict + A-lite + B）
 
 ### 2. 启动 OpenAI API 服务
 ```bash
