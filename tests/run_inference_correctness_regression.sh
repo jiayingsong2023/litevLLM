@@ -3,7 +3,8 @@
 # Inference correctness regression for:
 #   - TinyLlama-1.1B-Chat-v1.0
 #   - Qwen3.5-9B-AWQ
-#   - Gemma4-31B-it-AWQ-4bit (optional, text-only path)
+#   - Gemma4-31B-it-AWQ-4bit
+#   - Gemma4-26B-A4B-it-AWQ-4bit
 #
 # Run from repo root. Requires local models/ paths and a working CUDA/ROCm device.
 #
@@ -26,8 +27,9 @@ export PYTHONPATH="${PYTHONPATH:-.}"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
-MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-}"
-MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-}"
+MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-models/gemma-4-31B-it-AWQ-4bit}"
+MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-models/gemma-4-26B-A4B-it-AWQ-4bit}"
+TINYLLAMA_PROMPTS_FILE="${TINYLLAMA_PROMPTS_FILE:-tests/tools/fixtures/tinyllama_correctness_prompts_default.json}"
 GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
 
 HF_QWEN35_9B_FP16="${HF_QWEN35_9B_FP16:-models/Qwen3.5-9B-FP16}"
@@ -42,6 +44,36 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-${RUN_GEMMA4_A_TIER}}"
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
+
+GEMMA4_31B_RECOMMENDED_ENV=(
+  FASTINFERENCE_KV_TYPE=turbo_int4
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
+  FASTINFERENCE_KV_MAX_MODEL_LEN=512
+  FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1
+  FASTINFERENCE_AWQ_DECODE_GEMV=1
+  FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1
+  FASTINFERENCE_AWQ_FUSED_GATE_UP=1
+  FASTINFERENCE_GPU_GREEDY_SAMPLING=1
+  FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY=1
+  FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES=1
+)
+
+GEMMA4_26B_RECOMMENDED_ENV=(
+  FASTINFERENCE_KV_TYPE=turbo_int4
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
+  FASTINFERENCE_KV_MAX_MODEL_LEN=512
+  FASTINFERENCE_AWQ_DECODE_GEMV=1
+  FASTINFERENCE_AWQ_FUSED_GATE_UP=1
+  FASTINFERENCE_GPU_GREEDY_SAMPLING=1
+  FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY=1
+  FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES=1
+)
+
+print_gemma4_profile() {
+  local label="$1"
+  shift
+  echo "  ${label} profile: $*"
+}
 
 require_model_dir() {
   local model_dir="$1"
@@ -196,7 +228,13 @@ warn_if_repo_id_proxy_is_unsupported "$MODEL_GEMMA4_31B_Q4"
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
 echo "[1/2] TinyLlama"
-FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none
+TINYLLAMA_PROMPT_ARGS=(--prompt-subset minimal)
+if [[ -f "$TINYLLAMA_PROMPTS_FILE" ]]; then
+  TINYLLAMA_PROMPT_ARGS=(--prompts-file "$TINYLLAMA_PROMPTS_FILE")
+else
+  echo "[Warn] TINYLLAMA_PROMPTS_FILE not found, fallback to built-in minimal set: $TINYLLAMA_PROMPTS_FILE"
+fi
+FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
 echo "[2/2] Qwen3.5-9B AWQ"
 FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
@@ -215,10 +253,9 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
     else
       echo "[Warn] GEMMA4_PROMPTS_FILE not found, fallback to built-in minimal set: $GEMMA4_PROMPTS_FILE"
     fi
-    FASTINFERENCE_KV_TYPE=turbo_int4 \
-    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-    "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
+    print_gemma4_profile "Gemma4-31B" "${GEMMA4_31B_RECOMMENDED_ENV[*]}"
+    env "${GEMMA4_31B_RECOMMENDED_ENV[@]}" \
+      "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
   else
     echo "[Warn] Gemma4 model dir not found, skipping: $MODEL_GEMMA4_31B_Q4"
   fi
@@ -234,10 +271,9 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
       GEMMA4_26B_PROMPT_ARGS=(--prompts-file "$GEMMA4_PROMPTS_FILE")
     fi
-    FASTINFERENCE_KV_TYPE=turbo_int4 \
-    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-    "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
+    print_gemma4_profile "Gemma4-26B" "${GEMMA4_26B_RECOMMENDED_ENV[*]}"
+    env "${GEMMA4_26B_RECOMMENDED_ENV[@]}" \
+      "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
   else
     echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
   fi
@@ -289,18 +325,16 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
   echo ""
   echo "=== Tier-A-lite (>14B, key-point audit) ==="
   echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
-  FASTINFERENCE_KV_TYPE=turbo_int4 \
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-  FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-  "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+  print_gemma4_profile "Gemma4-31B" "${GEMMA4_31B_RECOMMENDED_ENV[*]}"
+  env "${GEMMA4_31B_RECOMMENDED_ENV[@]}" \
+    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
 fi
 
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
   echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
-  FASTINFERENCE_KV_TYPE=turbo_int4 \
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-  FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-  "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
+  print_gemma4_profile "Gemma4-26B" "${GEMMA4_26B_RECOMMENDED_ENV[*]}"
+  env "${GEMMA4_26B_RECOMMENDED_ENV[@]}" \
+    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
 fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
@@ -335,7 +369,7 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
     PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
   fi
   if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b_q4"
+    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b"
   fi
   PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
   echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"

@@ -230,8 +230,12 @@ class InputBatchBuilder:
             req = scheduler.get_request(rid)
             req_dicts.append(req)
             prev_seq_len = int(req["seq_len"])
-            last_token = req["generated_ids"][-1]
-            input_ids[i, 0] = last_token
+            last_token_tensor = req.get("_last_token_tensor")
+            if isinstance(last_token_tensor, torch.Tensor):
+                input_ids[i, 0].copy_(last_token_tensor.reshape(()))
+            else:
+                last_token = req["generated_ids"][-1]
+                input_ids[i, 0] = last_token
             positions[i, 0] = prev_seq_len
             slot_mapping[i] = req["slot_idx"] * self.max_model_len + prev_seq_len
             seq_lens[i] = prev_seq_len + 1

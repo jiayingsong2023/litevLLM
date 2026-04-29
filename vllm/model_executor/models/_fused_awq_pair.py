@@ -141,11 +141,14 @@ def try_fused_awq_pair_matmul(
                 profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
             )
         else:
+            original_shape = getattr(lin_a, "weight_shape", None)
+            if original_shape is not None:
+                original_shape = (int(original_shape[0]) * 2, int(original_shape[1]))
             fused_w = PackedInt4Weight(
                 q_cat,
                 s_cat,
                 group_size=gs,
-                original_shape=getattr(lin_a, "weight_shape", None),
+                original_shape=original_shape,
                 prefix=getattr(lin_a, "prefix", "") or f"fused_pair:{cache_key}",
                 high_fidelity=False,
                 profile_hint=str(getattr(lin_a, "awq_profile_hint", "") or ""),
@@ -157,3 +160,72 @@ def try_fused_awq_pair_matmul(
     out2 = fused_w.matmul(x2, fused_bias)
     od = int(lin_a.output_size)
     return out2.reshape(*lead_shape, 2 * od)
+
+
+def try_fused_awq_gate_up_activation(
+    x: torch.Tensor,
+    gate_proj: LiteLinear,
+    up_proj: LiteLinear,
+    *,
+    activation: str,
+    lora_mapping: Any = None,
+) -> Optional[torch.Tensor]:
+    """Attempt decode-only fused gate/up GEMV that returns ``act(gate) * up``.
+
+    This is intentionally narrower than ``try_fused_awq_pair_matmul``: it only
+    handles symmetric packed-int4, M=1, no-bias Gemma-style MLP projections.
+    Wider/prefill batches and classic AWQ fall back to existing pair fusion.
+    """
+    if _lora_is_active(lora_mapping):
+        return None
+    if gate_proj.input_size != up_proj.input_size:
+        return None
+    if gate_proj.output_size != up_proj.output_size:
+        return None
+    if getattr(gate_proj, "bias", None) is not None or getattr(up_proj, "bias", None) is not None:
+        return None
+    if getattr(gate_proj, "force_high_fidelity_awq", False) or getattr(
+        up_proj, "force_high_fidelity_awq", False
+    ):
+        return None
+    za = getattr(gate_proj, "qzeros", None)
+    zb = getattr(up_proj, "qzeros", None)
+    has_symmetric_packed = (za is None or za.numel() <= 1) and (
+        zb is None or zb.numel() <= 1
+    )
+    if not has_symmetric_packed:
+        return None
+    qwg = getattr(gate_proj, "qweight", None)
+    qwu = getattr(up_proj, "qweight", None)
+    if qwg is None or qwu is None or qwg.numel() <= 1 or qwu.numel() <= 1:
+        return None
+    if tuple(qwg.shape) != tuple(qwu.shape):
+        return None
+    if tuple(gate_proj.scales.shape) != tuple(up_proj.scales.shape):
+        return None
+    gs = int(getattr(gate_proj, "group_size", 128))
+    if int(getattr(up_proj, "group_size", 128)) != gs:
+        return None
+    lead_shape = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1])
+    if int(x2.shape[0]) != 1:
+        return None
+    try:
+        from vllm.kernels.triton.awq_fused_gemm import (
+            packed_int4_symmetric_fused_gate_up_m1_safe,
+        )
+
+        out2, used, _ = packed_int4_symmetric_fused_gate_up_m1_safe(
+            x2.contiguous(),
+            qwg,
+            qwu,
+            gate_proj.scales,
+            up_proj.scales,
+            gs,
+            activation=activation,
+        )
+        if not used:
+            return None
+        return out2.reshape(*lead_shape, int(gate_proj.output_size))
+    except Exception:
+        return None

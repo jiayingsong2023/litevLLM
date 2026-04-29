@@ -6,6 +6,8 @@ import json
 import math
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -79,6 +81,32 @@ _GEMMA31B_SCHEDULER_PROFILES: dict[str, dict[str, str]] = {
     },
 }
 
+_GEMMA4_31B_RECOMMENDED_ENV: dict[str, str] = {
+    "FASTINFERENCE_KV_TYPE": "turbo_int4",
+    "FASTINFERENCE_FUSION_LEVEL": "2",
+    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
+    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+    "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ": "1",
+    "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
+    "FASTINFERENCE_AWQ_GROUP32_GEMV_ALL": "1",
+    "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
+    "FASTINFERENCE_GPU_GREEDY_SAMPLING": "1",
+    "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY": "1",
+    "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
+}
+
+_GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
+    "FASTINFERENCE_KV_TYPE": "turbo_int4",
+    "FASTINFERENCE_FUSION_LEVEL": "2",
+    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
+    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+    "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
+    "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
+    "FASTINFERENCE_GPU_GREEDY_SAMPLING": "1",
+    "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY": "1",
+    "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
+}
+
 
 # KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
 MODEL_SPECS: Dict[str, ModelSpec] = {
@@ -128,12 +156,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.90,
         max_model_len=512,
         max_run_seconds=1200,
-        stable_env={
-            "FASTINFERENCE_KV_TYPE": "turbo_int4",
-            "FASTINFERENCE_FUSION_LEVEL": "2",
-            "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
-            "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
-        },
+        stable_env=dict(_GEMMA4_31B_RECOMMENDED_ENV),
     ),
     "gemma4_26b_a4b": ModelSpec(
         key="gemma4_26b_a4b",
@@ -148,12 +171,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.90,
         max_model_len=512,
         max_run_seconds=1200,
-        stable_env={
-            "FASTINFERENCE_KV_TYPE": "turbo_int4",
-            "FASTINFERENCE_FUSION_LEVEL": "2",
-            "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
-            "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
-        },
+        stable_env=dict(_GEMMA4_26B_RECOMMENDED_ENV),
     ),
 }
 
@@ -316,6 +334,143 @@ def _cache_dir_stats(path: str | None) -> dict[str, Any]:
             except OSError:
                 continue
     return {"exists": True, "files": files, "bytes": total_bytes}
+
+
+def _should_use_model_process_isolation(
+    args: argparse.Namespace,
+    model_keys: list[str],
+) -> bool:
+    if bool(getattr(args, "model_process_isolation", False)):
+        return True
+    if bool(getattr(args, "no_model_process_isolation", False)):
+        return False
+    if not _is_rocm():
+        return False
+    if len(model_keys) < 2:
+        return False
+    large_gemma = {"gemma4_31b_q4", "gemma4_26b_a4b"}
+    return any(key in large_gemma for key in model_keys)
+
+
+_CLI_OPTS_WITH_VALUES = {
+    "--models",
+    "--json-out",
+    "--runtime-stats-out",
+    "--workload",
+    "--multimodal-images-per-request",
+    "--multimodal-image-size",
+    "--tinyllama-concurrent",
+    "--qwen9b-concurrent",
+    "--gemma31b-concurrent",
+    "--gemma31b-prompt-tokens",
+    "--gemma31b-max-new-tokens",
+    "--gemma31b-max-model-len",
+    "--gemma26b-concurrent",
+    "--gemma26b-prompt-tokens",
+    "--gemma26b-max-new-tokens",
+    "--gemma26b-max-model-len",
+    "--warmup-prefill-rounds",
+    "--warmup-preset",
+    "--warmup-decode-rounds",
+    "--warmup-decode-tokens",
+    "--warmup-burst-rounds",
+    "--warmup-burst-concurrency",
+    "--warmup-burst-decode-tokens",
+    "--compile-cache-dir",
+    "--gemma31b-bucket-cutoff",
+    "--gemma31b-bucket-decode-cutoff",
+    "--gemma31b-bucket-short-profile",
+    "--gemma31b-bucket-short-decode-profile",
+    "--gemma31b-bucket-long-profile",
+    "--gemma31b-schedule-profile",
+}
+
+
+def _build_child_cli_args(single_model_key: str, json_out: str) -> list[str]:
+    child_args: list[str] = []
+    argv = sys.argv[1:]
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token in (
+            "--json-out",
+            "--runtime-stats-out",
+            "--models",
+            "--model-process-isolation",
+            "--no-model-process-isolation",
+        ):
+            if token in _CLI_OPTS_WITH_VALUES and idx + 1 < len(argv):
+                idx += 2
+            else:
+                idx += 1
+            continue
+        if token.startswith("--json-out="):
+            idx += 1
+            continue
+        if token.startswith("--runtime-stats-out="):
+            idx += 1
+            continue
+        if token.startswith("--models="):
+            idx += 1
+            continue
+        child_args.append(token)
+        idx += 1
+    child_args.extend(
+        [
+            "--models",
+            single_model_key,
+            "--json-out",
+            json_out,
+            "--no-model-process-isolation",
+        ]
+    )
+    return child_args
+
+
+def _run_isolated_model_benchmarks(
+    model_keys: list[str],
+    compile_cache_env: dict[str, str],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, object]]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    runtime_stats_summary: Dict[str, Dict[str, object]] = {}
+    base_env = os.environ.copy()
+    base_env.update(compile_cache_env)
+    script_path = Path(__file__).resolve()
+
+    for key in model_keys:
+        with tempfile.NamedTemporaryFile(
+            prefix=f"fastinference_e2e_{key}_",
+            suffix=".json",
+            delete=False,
+        ) as tmp:
+            child_json = tmp.name
+        child_args = _build_child_cli_args(key, child_json)
+        print(f"[Isolated] Launching child benchmark for {key}")
+        proc = subprocess.run(
+            [sys.executable, str(script_path), *child_args],
+            cwd=str(script_path.parents[1]),
+            env=base_env,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Child benchmark failed for {key} with rc={proc.returncode}. "
+                "Run the single-model command to inspect the detailed traceback."
+            )
+        with open(child_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        try:
+            os.unlink(child_json)
+        except OSError:
+            pass
+        child_summary = payload.get("summary", {})
+        child_runtime = payload.get("runtime_stats", {})
+        if key not in child_summary:
+            raise RuntimeError(f"Child benchmark JSON for {key} missing summary entry.")
+        summary[key] = dict(child_summary[key])
+        runtime_stats_summary[key] = dict(child_runtime.get(key, {}))
+    return summary, runtime_stats_summary
 
 
 def _resolve_gemma31b_bucket_policy(
@@ -1928,6 +2083,11 @@ async def run_benchmark(
         f"concurrency={spec.concurrent_reqs}, prompt_tokens~{spec.prompt_tokens_target}, "
         f"max_new_tokens={spec.max_new_tokens}, quant={spec.quant}, workload={workload}"
     )
+    if spec.stable_env:
+        env_summary = ", ".join(
+            f"{key}={value}" for key, value in sorted(spec.stable_env.items())
+        )
+        print(f"STABLE_ENV: {env_summary}")
     if torch.cuda.is_available():
         total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(
@@ -2184,6 +2344,7 @@ async def run_benchmark(
                 ),
                 "multimodal_image_size": max(2, int(multimodal_image_size)),
             },
+            "stable_env": dict(spec.stable_env),
             "runtime_stats": runtime_stats_by_phase,
             "warmup_trace": warmup_trace,
         }
@@ -2511,6 +2672,21 @@ def _parse_args() -> argparse.Namespace:
         dest="fixed_decode_len",
         help="Disable fixed decode length and allow early stop on EOS.",
     )
+    parser.add_argument(
+        "--model-process-isolation",
+        action="store_true",
+        default=False,
+        help=(
+            "Run each requested model in a fresh child process and merge JSON summaries. "
+            "Useful on ROCm when sequential large-model runs OOM due to allocator residue."
+        ),
+    )
+    parser.add_argument(
+        "--no-model-process-isolation",
+        action="store_true",
+        default=False,
+        help="Disable per-model child-process isolation even when auto-isolation would apply.",
+    )
     return parser.parse_args()
 
 
@@ -2642,22 +2818,33 @@ async def main() -> None:
 
     summary: Dict[str, Dict[str, Any]] = {}
     runtime_stats_summary: Dict[str, Dict[str, object]] = {}
-    global_old_env = _apply_temp_env(compile_cache_env)
-    try:
-        for spec in specs:
-            summary[spec.key] = await run_benchmark(
-                spec,
-                workload=args.workload,
-                multimodal_images_per_request=args.multimodal_images_per_request,
-                multimodal_image_size=args.multimodal_image_size,
-                warmup_config=warmup_config,
-                fixed_decode_len=bool(args.fixed_decode_len),
-            )
-            runtime_stats_summary[spec.key] = dict(
-                summary[spec.key].get("runtime_stats", {})
-            )
-    finally:
-        _restore_env(global_old_env)
+    use_isolation = _should_use_model_process_isolation(args, model_keys)
+    if use_isolation:
+        print(
+            "[ROCm] Enabling per-model process isolation for this run to avoid "
+            "sequential large-model OOM/fragmentation."
+        )
+        summary, runtime_stats_summary = _run_isolated_model_benchmarks(
+            model_keys,
+            compile_cache_env,
+        )
+    else:
+        global_old_env = _apply_temp_env(compile_cache_env)
+        try:
+            for spec in specs:
+                summary[spec.key] = await run_benchmark(
+                    spec,
+                    workload=args.workload,
+                    multimodal_images_per_request=args.multimodal_images_per_request,
+                    multimodal_image_size=args.multimodal_image_size,
+                    warmup_config=warmup_config,
+                    fixed_decode_len=bool(args.fixed_decode_len),
+                )
+                runtime_stats_summary[spec.key] = dict(
+                    summary[spec.key].get("runtime_stats", {})
+                )
+        finally:
+            _restore_env(global_old_env)
     compile_cache_after = _cache_dir_stats(compile_cache_meta.get("cache_dir"))
     compile_cache_delta = {
         "files": int(compile_cache_after["files"]) - int(compile_cache_before["files"]),

@@ -57,10 +57,15 @@ class TestAutoHeuristicDecode:
         # Shallow K means SPLIT_K=1 gives full occupancy via large N grid.
         assert _select_split_k(1, 43008, 5376) == 1
 
-    def test_gemma4_down_proj_triggers_split4_narrow_n(self) -> None:
-        # down_proj on Gemma4-31B: deep K, narrow N. This is the case we
-        # added in Step 4.3; previously fell through to split_k=1.
+    def test_gemma4_down_proj_stays_split4_without_decode_gemv(self) -> None:
+        # Generic policy still keeps the deep-K narrow-N decode shape on split_k=4.
         assert _select_split_k(1, 5376, 21504) == 4
+
+    def test_gemma4_down_proj_uses_split1_when_decode_gemv_enabled(self) -> None:
+        # The dedicated M=1 down_proj GEMV path requires split_k=1 so the
+        # grouped GEMV specialization can run.
+        with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_DECODE_GEMV": "1"}):
+            assert _select_split_k(1, 5376, 21504) == 1
 
     def test_qwen35_wide_deep_triggers_split4(self) -> None:
         # Qwen3.5-9B-class wide-output deep-K (pre-existing rule).

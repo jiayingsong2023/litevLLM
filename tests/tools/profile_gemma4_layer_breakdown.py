@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 import os
 import time
@@ -94,6 +95,44 @@ def _has_running_requests(engine: Any) -> bool:
     return int(getattr(engine, "active_request_count", 0)) > 0
 
 
+def _projection_kind(prefix: str) -> str:
+    suffixes = (
+        ("self_attn.q_proj", "attn_q_proj"),
+        ("self_attn.k_proj", "attn_k_proj"),
+        ("self_attn.v_proj", "attn_v_proj"),
+        ("self_attn.o_proj", "attn_o_proj"),
+        ("mlp.gate_proj", "mlp_gate_proj"),
+        ("mlp.up_proj", "mlp_up_proj"),
+        ("mlp.down_proj", "mlp_down_proj"),
+    )
+    for marker, kind in suffixes:
+        if marker in prefix:
+            return kind
+    return "other"
+
+
+def _summarize_awq_projection_prefixes(
+    prefix_stats: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int | float]]:
+    buckets: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))  # type: ignore[arg-type]
+    for prefix, stats in prefix_stats.items():
+        kind = _projection_kind(prefix)
+        bucket = buckets[kind]
+        bucket["prefixes"] += 1
+        for key, value in stats.items():
+            bucket[key] += int(value)
+
+    out: dict[str, dict[str, int | float]] = {}
+    for kind, stats in sorted(buckets.items()):
+        row: dict[str, int | float] = {key: int(value) for key, value in stats.items()}
+        calls = int(stats.get("matmul_calls", 0))
+        fused_success = int(stats.get("fused_success", 0))
+        if calls:
+            row["fused_success_rate"] = round(fused_success / calls, 4)
+        out[kind] = row
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Gemma4 LiteEngine layer profiler")
     parser.add_argument("--model", type=str, default="", help="Model path (default: auto-discover local Gemma4 31B)")
@@ -106,6 +145,18 @@ def main() -> int:
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--kv-type", type=str, default="turbo_int4")
+    parser.add_argument(
+        "--awq-prefix-limit",
+        type=int,
+        default=256,
+        help="Number of per-layer AWQ prefixes to include in the JSON summary.",
+    )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default="",
+        help="Optional path to write the machine-readable summary JSON.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -178,7 +229,7 @@ def main() -> int:
         engine.step()
 
     awq_stats = get_awq_runtime_stats()
-    awq_prefix_stats = get_awq_runtime_prefix_stats(limit=12)
+    awq_prefix_stats = get_awq_runtime_prefix_stats(limit=args.awq_prefix_limit)
     summary = {
         "model": model_path,
         "load_s": round(load_s, 3),
@@ -190,8 +241,16 @@ def main() -> int:
         "decode_step_mean_ms": round(_mean(decode_ms), 3),
         "decode_step_p50_ms": round(_p50(decode_ms), 3),
         "awq_stats": awq_stats,
+        "awq_projection_summary": _summarize_awq_projection_prefixes(awq_prefix_stats),
         "awq_prefix_stats": awq_prefix_stats,
     }
+    if args.json_out:
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print("[Gemma4ProfileSummary] " + json.dumps(summary, ensure_ascii=True, sort_keys=True))
     print(
         "[Gemma4ProfileNote] Internal layer spans are emitted as "

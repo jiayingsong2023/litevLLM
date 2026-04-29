@@ -157,6 +157,12 @@ class _FakeSamplingDriver:
         return []
 
 
+class _FakeSamplingDriverWithEos(_FakeSamplingDriver):
+    def completion_eos_ids(self, request_state) -> list[int]:
+        del request_state
+        return [42]
+
+
 class _FakeOutputCoordinator:
     def finalize_step(self, request_id, request_state, next_token):
         return {
@@ -164,6 +170,41 @@ class _FakeOutputCoordinator:
             "token": next_token,
             "finished": request_state["finished"],
         }
+
+
+class _RaisingSamplingDriver(_FakeSamplingDriver):
+    def sample_next_token(self, logits: torch.Tensor, request_state) -> int:
+        del logits, request_state
+        raise AssertionError("CPU sampling path should not be used")
+
+
+class _FinishOnMaxOutputCoordinator:
+    def finalize_step(self, request_id, request_state, next_token):
+        request_state["finished"] = (
+            len(request_state["generated_ids"])
+            >= int(request_state["sampling_params"].max_tokens)
+        )
+        return {
+            "request_id": request_id,
+            "token": next_token,
+            "token_ids": list(request_state["generated_ids"]),
+            "finished": request_state["finished"],
+        }
+
+
+class _FixedDecodeExecutor:
+    def __init__(self, token_ids: list[int]) -> None:
+        self.token_ids = token_ids
+        self.calls = 0
+
+    def execute_sync_fast(self, request_ids, scheduler):
+        del scheduler
+        vocab = max(self.token_ids) + 2
+        logits = torch.full((len(request_ids), 1, vocab), -1000.0)
+        token = self.token_ids[self.calls]
+        logits[:, 0, token] = 1000.0
+        self.calls += 1
+        return logits, [None for _ in request_ids]
 
 
 def _backend(
@@ -197,6 +238,121 @@ def _backend(
         ),
         **kwargs,
     )
+
+
+def test_decode_step_sync_gpu_greedy_delays_cpu_sampling(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_SAMPLING", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "1")
+    scheduler = _FakeScheduler()
+    observer = _FakeObserver()
+    scheduler.requests["r1"] = {
+        "request_id": "r1",
+        "input_ids": [11],
+        "slot_idx": 0,
+        "seq_len": 1,
+        "generated_ids": [],
+        "sampling_params": type(
+            "SP",
+            (),
+            {
+                "temperature": 0.0,
+                "max_tokens": 2,
+                "repetition_penalty": 1.0,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+            },
+        )(),
+        "finished": False,
+        "admitted_at": 0.0,
+        "first_token_at": None,
+        "anti_template_token_ids": [99],
+    }
+    backend = _backend(
+        scheduler=scheduler,
+        observer=observer,
+        decode_executor=_FixedDecodeExecutor([2, 3]),
+        sampling_driver=_RaisingSamplingDriver(),
+        output_coordinator=_FinishOnMaxOutputCoordinator(),
+    )
+
+    assert backend.decode_step_sync(["r1"]) == []
+    req = scheduler.requests["r1"]
+    assert req["generated_ids"] == []
+    assert isinstance(req["_last_token_tensor"], torch.Tensor)
+    assert int(req["_last_token_tensor"].detach().cpu()) == 2
+    assert req["seq_len"] == 2
+
+    out = backend.decode_step_sync(["r1"])
+    assert out == [
+        {
+            "request_id": "r1",
+            "token": 3,
+            "token_ids": [2, 3],
+            "finished": True,
+        }
+    ]
+    assert scheduler.outputs == [("r1", out[0])]
+    assert scheduler.freed == ["r1"]
+
+
+def test_decode_step_sync_gpu_greedy_disabled_when_eos_exists(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_SAMPLING", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "1")
+    scheduler = _FakeScheduler()
+    observer = _FakeObserver()
+    scheduler.requests["r1"] = {
+        "request_id": "r1",
+        "input_ids": [11],
+        "slot_idx": 0,
+        "seq_len": 1,
+        "generated_ids": [],
+        "sampling_params": type(
+            "SP",
+            (),
+            {
+                "temperature": 0.0,
+                "max_tokens": 2,
+                "repetition_penalty": 1.0,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+                "stop_token_ids": None,
+            },
+        )(),
+        "finished": False,
+        "admitted_at": 0.0,
+        "first_token_at": None,
+        "anti_template_token_ids": [],
+    }
+    backend = _backend(
+        scheduler=scheduler,
+        observer=observer,
+        decode_executor=_FixedDecodeExecutor([2, 3]),
+        sampling_driver=_FakeSamplingDriverWithEos(),
+        output_coordinator=_FinishOnMaxOutputCoordinator(),
+    )
+
+    out1 = backend.decode_step_sync(["r1"])
+    out2 = backend.decode_step_sync(["r1"])
+
+    assert out1 == [
+        {
+            "request_id": "r1",
+            "token": 2,
+            "token_ids": [2],
+            "finished": False,
+        }
+    ]
+    assert "_last_token_tensor" not in scheduler.requests["r1"]
+    assert out2 == [
+        {
+            "request_id": "r1",
+            "token": 3,
+            "token_ids": [2, 3],
+            "finished": True,
+        }
+    ]
 
 
 class _ChoiceTokenizer:

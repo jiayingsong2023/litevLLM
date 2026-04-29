@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from typing import Any
 
@@ -16,6 +17,10 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 
 logger = init_logger(__name__)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class LiteSingleGpuBackend:
@@ -184,6 +189,8 @@ class LiteSingleGpuBackend:
     def decode_step_sync(self, request_ids: list[str]) -> list[RequestOutput]:
         self._ensure_runtime_ready()
         logits, _ = self.decode_executor.execute_sync_fast(request_ids, self.scheduler)
+        if self._can_use_gpu_greedy_decode(request_ids):
+            return self._decode_step_gpu_greedy(request_ids, logits)
         results: list[RequestOutput] = []
         for i, rid in enumerate(request_ids):
             req = self.scheduler.get_request(rid)
@@ -261,6 +268,86 @@ class LiteSingleGpuBackend:
             for rid in step_plan.decodes.request_ids:
                 self._free_request(rid)
             raise error
+
+    def _can_use_gpu_greedy_decode(self, request_ids: list[str]) -> bool:
+        if not _env_truthy("FASTINFERENCE_GPU_GREEDY_SAMPLING"):
+            return False
+        if not request_ids:
+            return False
+        # This fast path intentionally handles the latency benchmark shape first:
+        # greedy, max-token-bounded decode with no per-token CPU policy work.
+        if not _env_truthy("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY"):
+            return False
+        bypass_cpu_policies = _env_truthy(
+            "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES"
+        )
+        ignore_eos = _env_truthy("FASTINFERENCE_GPU_GREEDY_IGNORE_EOS")
+        for rid in request_ids:
+            req = self.scheduler.get_request(rid)
+            sp = req["sampling_params"]
+            if float(getattr(sp, "temperature", 0.0) or 0.0) > 1e-6:
+                return False
+            if abs(float(getattr(sp, "repetition_penalty", 1.0) or 1.0) - 1.0) > 1e-12:
+                return False
+            if abs(float(getattr(sp, "frequency_penalty", 0.0) or 0.0)) > 1e-12:
+                return False
+            if abs(float(getattr(sp, "presence_penalty", 0.0) or 0.0)) > 1e-12:
+                return False
+            if not ignore_eos:
+                stop_token_ids = getattr(sp, "stop_token_ids", None)
+                if stop_token_ids:
+                    return False
+                if self.sampling_driver is not None:
+                    try:
+                        if self.sampling_driver.completion_eos_ids(req):
+                            return False
+                    except Exception:
+                        return False
+            if req.get("structured_output_constraint") is not None:
+                return False
+            if not bypass_cpu_policies:
+                if req.get("anti_template_token_ids"):
+                    return False
+                if req.get("capital_question_bias_token_ids") or req.get("is_chinese_capital_question"):
+                    return False
+        return True
+
+    def _decode_step_gpu_greedy(
+        self,
+        request_ids: list[str],
+        logits: torch.Tensor,
+    ) -> list[RequestOutput]:
+        next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+        results: list[RequestOutput] = []
+        for i, rid in enumerate(request_ids):
+            req = self.scheduler.get_request(rid)
+            token_t = next_tokens[i].detach()
+            req["_last_token_tensor"] = token_t
+            pending = req.setdefault("_pending_token_tensors", [])
+            pending.append(token_t)
+            req["seq_len"] += 1
+
+            now = time.perf_counter()
+            if req.get("first_token_at") is None:
+                req["first_token_at"] = now
+                admitted_at = float(req.get("admitted_at") or now)
+                self.observer.on_first_token(rid, max(0.0, now - admitted_at))
+
+            generated_len = len(req["generated_ids"]) + len(pending)
+            max_tok = int(req["sampling_params"].max_tokens or 16)
+            if generated_len < max_tok:
+                continue
+
+            # One synchronization at request completion replaces one sync per
+            # token. The generated list is restored before finalize_step so
+            # output text and token_ids keep the normal API contract.
+            pending_tokens = torch.stack(pending).to(device="cpu").tolist()
+            req["generated_ids"].extend(int(t) for t in pending_tokens)
+            req["_pending_token_tensors"] = []
+            req.pop("_last_token_tensor", None)
+            last_token = int(pending_tokens[-1]) if pending_tokens else int(req["generated_ids"][-1])
+            self._process_completion(rid, last_token, results)
+        return results
 
     def stats(self) -> dict[str, object]:
         materialized_hits = self.prefix_cache_materialized_hits

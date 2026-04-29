@@ -129,3 +129,43 @@ def test_resolve_gemma31_bucket_policy_long_prompt_uses_baseline(monkeypatch) ->
     updated, policy = bench._resolve_gemma31b_bucket_policy(spec, args)
     assert policy["selected_profile"] == "baseline"
     assert updated.stable_env["FASTINFERENCE_LITE_PREFILL_CHUNK"] == "256"
+
+
+def test_gemma4_model_specs_include_recommended_profiles() -> None:
+    gemma31 = bench.MODEL_SPECS["gemma4_31b_q4"]
+    gemma26 = bench.MODEL_SPECS["gemma4_26b_a4b"]
+
+    assert gemma31.stable_env["FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ"] == "1"
+    assert gemma31.stable_env["FASTINFERENCE_AWQ_DECODE_GEMV"] == "1"
+    assert gemma31.stable_env["FASTINFERENCE_AWQ_GROUP32_GEMV_ALL"] == "1"
+    assert gemma31.stable_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] == "1"
+    assert gemma31.stable_env["FASTINFERENCE_GPU_GREEDY_SAMPLING"] == "1"
+
+    assert gemma26.stable_env["FASTINFERENCE_AWQ_DECODE_GEMV"] == "1"
+    assert gemma26.stable_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] == "1"
+    assert gemma26.stable_env["FASTINFERENCE_GPU_GREEDY_SAMPLING"] == "1"
+    assert "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ" not in gemma26.stable_env
+
+
+def test_should_auto_isolate_multi_gemma_on_rocm(monkeypatch) -> None:
+    monkeypatch.setattr(bench.torch.version, "hip", "6.1", raising=False)
+    args = argparse.Namespace(
+        model_process_isolation=False,
+        no_model_process_isolation=False,
+    )
+    assert bench._should_use_model_process_isolation(
+        args,
+        ["gemma4_26b_a4b", "gemma4_31b_q4"],
+    )
+
+
+def test_should_not_auto_isolate_single_model(monkeypatch) -> None:
+    monkeypatch.setattr(bench.torch.version, "hip", "6.1", raising=False)
+    args = argparse.Namespace(
+        model_process_isolation=False,
+        no_model_process_isolation=False,
+    )
+    assert not bench._should_use_model_process_isolation(
+        args,
+        ["gemma4_31b_q4"],
+    )

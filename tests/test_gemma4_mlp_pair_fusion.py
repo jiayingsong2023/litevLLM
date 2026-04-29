@@ -34,7 +34,10 @@ from vllm.model_executor.layers.quantization.tensor import (
     PackedInt4Weight,
     dequantize_symmetric_packed_int4_pytorch,
 )
-from vllm.model_executor.models._fused_awq_pair import try_fused_awq_pair_matmul
+from vllm.model_executor.models._fused_awq_pair import (
+    try_fused_awq_gate_up_activation,
+    try_fused_awq_pair_matmul,
+)
 from vllm.model_executor.models.gemma4 import Gemma4MLP
 
 
@@ -259,6 +262,68 @@ class TestHelperNumericEquivalence:
         _ = try_fused_awq_pair_matmul(x, a, b, owner, "mlp_gate_up")
         assert getattr(owner, cache_attr) is cached_first
 
+    def test_direct_fused_gate_up_matches_dense_silu(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
+        device = torch.device("cuda")
+        n, k, group_size = 257, 288, 32
+        gate, up, _ = self._build_pair(n, k, group_size, device)
+        x = torch.randn((1, k), device=device, dtype=torch.bfloat16)
+
+        fused = try_fused_awq_gate_up_activation(
+            x,
+            gate,
+            up,
+            activation="silu",
+        )
+        assert fused is not None
+        torch.cuda.synchronize()
+
+        w_gate = dequantize_symmetric_packed_int4_pytorch(
+            gate.qweight.to(torch.int32), gate.scales, group_size=group_size
+        ).to(x.dtype)
+        w_up = dequantize_symmetric_packed_int4_pytorch(
+            up.qweight.to(torch.int32), up.scales, group_size=group_size
+        ).to(x.dtype)
+        ref = F.silu(F.linear(x, w_gate)) * F.linear(x, w_up)
+        cos = F.cosine_similarity(fused.float().reshape(-1), ref.float().reshape(-1), dim=0).item()
+        diff = (fused.float() - ref.float()).abs()
+        rel_mae = (diff.mean() / ref.float().abs().mean().clamp_min(1e-6)).item()
+        assert cos > 0.999, f"cosine similarity {cos} too low"
+        assert rel_mae < 0.02, f"relative mae {rel_mae} too high"
+
+    def test_direct_fused_gate_up_matches_dense_gelu_tanh(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
+        device = torch.device("cuda")
+        n, k, group_size = 193, 256, 32
+        gate, up, _ = self._build_pair(n, k, group_size, device)
+        x = torch.randn((1, k), device=device, dtype=torch.bfloat16)
+
+        fused = try_fused_awq_gate_up_activation(
+            x,
+            gate,
+            up,
+            activation="gelu_pytorch_tanh",
+        )
+        assert fused is not None
+        torch.cuda.synchronize()
+
+        w_gate = dequantize_symmetric_packed_int4_pytorch(
+            gate.qweight.to(torch.int32), gate.scales, group_size=group_size
+        ).to(x.dtype)
+        w_up = dequantize_symmetric_packed_int4_pytorch(
+            up.qweight.to(torch.int32), up.scales, group_size=group_size
+        ).to(x.dtype)
+        ref = F.gelu(F.linear(x, w_gate), approximate="tanh") * F.linear(x, w_up)
+        cos = F.cosine_similarity(fused.float().reshape(-1), ref.float().reshape(-1), dim=0).item()
+        diff = (fused.float() - ref.float()).abs()
+        rel_mae = (diff.mean() / ref.float().abs().mean().clamp_min(1e-6)).item()
+        assert cos > 0.999, f"cosine similarity {cos} too low"
+        assert rel_mae < 0.02, f"relative mae {rel_mae} too high"
+
 
 # ---------------------------------------------------------------------------
 # Gemma4MLP.forward routing.
@@ -348,6 +413,27 @@ class TestGemma4MLPRouting:
             assert args[3] is mlp
             assert args[4] == "mlp_gate_up"
             assert kwargs.get("lora_mapping") is None
+
+    def test_direct_gate_up_helper_has_priority_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mlp = _make_mlp()
+        x = torch.randn((1, 1, 64), dtype=torch.float32)
+        direct = torch.randn((1, 1, 128), dtype=torch.float32)
+        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
+        monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
+
+        with mock.patch(
+            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
+            return_value=direct,
+        ) as direct_helper, mock.patch(
+            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
+            return_value=None,
+        ) as pair_helper:
+            out = mlp(x)
+        assert out.shape == x.shape
+        assert direct_helper.call_count == 1
+        pair_helper.assert_not_called()
 
     def test_fused_branch_numerically_matches_unfused(
         self, monkeypatch: pytest.MonkeyPatch

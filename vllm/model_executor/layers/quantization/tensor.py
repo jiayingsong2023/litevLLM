@@ -105,6 +105,12 @@ def _default_awq_dense_fallback_max_gb() -> float:
         total_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024**3)
     except Exception:
         return 4.0
+    if (
+        total_gb >= 48.0
+        and os.environ.get("FASTINFERENCE_GEMMA4_DENSE_MLP", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ):
+        return 44.0
     if total_gb >= 48.0:
         return 14.0
     if total_gb >= 32.0:
@@ -196,6 +202,49 @@ def _env_awq_matmul_cache_before_fused() -> bool:
     if _env_awq_fused_gemm_force():
         return False
     return _env_truthy("FASTINFERENCE_AWQ_MATMUL_CACHE_BEFORE_FUSED", "0")
+
+
+def _env_gemma4_dense_down_proj() -> bool:
+    return _env_truthy("FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ", "0")
+
+
+def _env_gemma4_dense_mlp() -> bool:
+    return _env_truthy("FASTINFERENCE_GEMMA4_DENSE_MLP", "0")
+
+
+def _is_gemma4_mlp_down_proj(prefix: str, profile_hint: str) -> bool:
+    return profile_hint == "gemma4_31b_q4" and ".mlp.down_proj" in str(prefix)
+
+
+def _is_gemma4_mlp_proj(prefix: str, profile_hint: str) -> bool:
+    return profile_hint == "gemma4_31b_q4" and ".mlp." in str(prefix)
+
+
+def _env_awq_decode_gemv() -> bool:
+    return _env_truthy("FASTINFERENCE_AWQ_DECODE_GEMV", "0")
+
+
+def _should_try_gemma4_down_proj_decode_fused(
+    prefix: str,
+    profile_hint: str,
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    group_size: int,
+) -> bool:
+    if not _env_gemma4_dense_down_proj():
+        return False
+    if not _env_awq_decode_gemv():
+        return False
+    if not _is_gemma4_mlp_down_proj(prefix, profile_hint):
+        return False
+    if int(group_size) != 32:
+        return False
+    if x.dim() < 2:
+        return False
+    m = int(x.reshape(-1, x.shape[-1]).shape[0])
+    k = int(x.shape[-1])
+    n = int(qweight.shape[0])
+    return m == 1 and n == 5376 and k == 21504
 
 
 def _env_awq_cache_scope() -> str:
@@ -633,6 +682,44 @@ class PackedInt4Weight(QuantizedLinearWeight):
             _awq_prefix_stat_inc(self.prefix, "cache_miss")
             _awq_prefix_stat_inc(self.prefix, "dense_build")
             return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
+
+        if _should_try_gemma4_down_proj_decode_fused(
+            self.prefix,
+            self.profile_hint,
+            x,
+            self.qweight,
+            int(self.group_size),
+        ):
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import packed_int4_symmetric_fused_gemm_safe
+
+                _awq_stat_inc("awq_fused_attempt")
+                _awq_prefix_stat_inc(self.prefix, "fused_attempt")
+                out, used_fused, _ = packed_int4_symmetric_fused_gemm_safe(
+                    x.reshape(-1, x.shape[-1]).contiguous(),
+                    self.qweight,
+                    self.scales,
+                    int(self.group_size),
+                    bias=bias,
+                )
+                if used_fused:
+                    _awq_stat_inc("awq_fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "decision_fused_gemma4_down_proj_decode")
+                    return out.view(*x.shape[:-1], out.shape[-1])
+            except Exception:
+                _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
+            _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
+        if (
+            _env_gemma4_dense_mlp()
+            and _is_gemma4_mlp_proj(self.prefix, self.profile_hint)
+        ) or (
+            _env_gemma4_dense_down_proj()
+            and _is_gemma4_mlp_down_proj(self.prefix, self.profile_hint)
+        ):
+            self._cached_fused_decision = False
+            _awq_prefix_stat_inc(self.prefix, "decision_dense_gemma4_mlp")
+            return _dense_fallback()
 
         use_fused_cached = getattr(self, "_cached_fused_decision", None)
         if use_fused_cached is True:

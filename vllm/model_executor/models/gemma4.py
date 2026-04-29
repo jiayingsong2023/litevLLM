@@ -29,12 +29,31 @@ _GEMMA4_PROFILE_ENABLED = os.environ.get("FASTINFERENCE_GEMMA4_LAYER_PROFILE", "
     "yes",
     "on",
 )
+_GEMMA4_ROCTX_PROFILE_ENABLED = os.environ.get("FASTINFERENCE_GEMMA4_ROCTX_PROFILE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _GEMMA4_PROFILE_STATS: dict[str, dict[str, float]] = {}
 _GEMMA4_PROFILE_PRINTED = False
 _GEMMA4_ROPE_CACHE_POOL: OrderedDict[
     tuple[int, int, float, str, float, str, int, str],
     tuple[torch.Tensor, torch.Tensor],
 ] = OrderedDict()
+
+try:
+    from torch.cuda import nvtx as _gemma4_roctx
+
+    _gemma4_range_push = _gemma4_roctx.range_push
+    _gemma4_range_pop = _gemma4_roctx.range_pop
+except Exception:  # pragma: no cover - best-effort profiling hook
+
+    def _gemma4_range_push(name: str) -> None:
+        return None
+
+    def _gemma4_range_pop() -> None:
+        return None
 
 
 def _resolve_gemma4_rope_cache_max_pos(config: LiteConfig) -> int:
@@ -79,6 +98,8 @@ class _Gemma4ProfileSpan:
         self._start = 0.0
 
     def __enter__(self) -> "_Gemma4ProfileSpan":
+        if _GEMMA4_ROCTX_PROFILE_ENABLED:
+            _gemma4_range_push(self.scope)
         if _GEMMA4_PROFILE_ENABLED:
             _gemma4_profile_sync()
             self._start = time.perf_counter()
@@ -88,6 +109,8 @@ class _Gemma4ProfileSpan:
         if _GEMMA4_PROFILE_ENABLED:
             _gemma4_profile_sync()
             _gemma4_profile_record(self.scope, time.perf_counter() - self._start)
+        if _GEMMA4_ROCTX_PROFILE_ENABLED:
+            _gemma4_range_pop()
 
 
 def _gemma4_profile_span(scope: str) -> _Gemma4ProfileSpan:
@@ -942,9 +965,15 @@ class Gemma4Attention(nn.Module):
         attn_metadata: Any,
         lora_mapping: Any = None,
     ) -> torch.Tensor:
-        q = self.q_proj(x, lora_mapping)
-        k = self.k_proj(x, lora_mapping)
-        v = self.v_proj(x, lora_mapping) if self.v_proj is not None else k
+        with _gemma4_profile_span("attn_q_proj"):
+            q = self.q_proj(x, lora_mapping)
+        with _gemma4_profile_span("attn_k_proj"):
+            k = self.k_proj(x, lora_mapping)
+        if self.v_proj is not None:
+            with _gemma4_profile_span("attn_v_proj"):
+                v = self.v_proj(x, lora_mapping)
+        else:
+            v = k
         bsz, seqlen = x.shape[:2]
         q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -1143,32 +1172,33 @@ class Gemma4Attention(nn.Module):
                                 if int(seq_lens_local.numel()) > 0
                                 else 0
                             )
-                        paged_attention_v1(
-                            attn_out,
-                            q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
-                            k_cache,
-                            v_cache,
-                            self.num_heads,
-                            self.scale,
-                            block_tables_local,
-                            seq_lens_local.to(device=q.device, dtype=seq_lens.dtype),
-                            k_cache.shape[1],
-                            max_ctx_local,
-                            None,
-                            kv_dtype_name,
-                            k_scale,
-                            v_scale,
-                            k_scale_ptrs=k_scale_cache,
-                            v_scale_ptrs=v_scale_cache,
-                            num_kv_heads=self.num_kv_heads,
-                            attn_scope="local",
-                            layer_type=self.layer_type,
-                            softcap=(
-                                float(softcap)
-                                if softcap is not None and float(softcap) > 0.0
-                                else None
-                            ),
-                        )
+                        with _gemma4_profile_span("attn_local_decode_kernel"):
+                            paged_attention_v1(
+                                attn_out,
+                                q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                                k_cache,
+                                v_cache,
+                                self.num_heads,
+                                self.scale,
+                                block_tables_local,
+                                seq_lens_local.to(device=q.device, dtype=seq_lens.dtype),
+                                k_cache.shape[1],
+                                max_ctx_local,
+                                None,
+                                kv_dtype_name,
+                                k_scale,
+                                v_scale,
+                                k_scale_ptrs=k_scale_cache,
+                                v_scale_ptrs=v_scale_cache,
+                                num_kv_heads=self.num_kv_heads,
+                                attn_scope="local",
+                                layer_type=self.layer_type,
+                                softcap=(
+                                    float(softcap)
+                                    if softcap is not None and float(softcap) > 0.0
+                                    else None
+                                ),
+                            )
                         out = attn_out.view(bsz, seqlen, -1)
                     else:
                         with _gemma4_profile_span("kv_read_local_decode"):
@@ -1261,32 +1291,33 @@ class Gemma4Attention(nn.Module):
                             getattr(self.config, "max_position_embeddings", 4096),
                         )
                     )
-                    paged_attention_v1(
-                        attn_out,
-                        q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
-                        k_cache,
-                        v_cache,
-                        self.num_heads,
-                        self.scale,
-                        block_tables_ext,
-                        seq_lens_ext,
-                        k_cache.shape[1],
-                        max_ctx,
-                        None,
-                        kv_cache_dtype,
-                        k_scale,
-                        v_scale,
-                        k_scale_ptrs=k_scale_cache,
-                        v_scale_ptrs=v_scale_cache,
-                        num_kv_heads=self.num_kv_heads,
-                        attn_scope="global",
-                        layer_type=self.layer_type,
-                        softcap=(
-                            float(softcap)
-                            if softcap is not None and float(softcap) > 0.0
-                            else None
-                        ),
-                    )
+                    with _gemma4_profile_span("attn_global_kernel"):
+                        paged_attention_v1(
+                            attn_out,
+                            q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                            k_cache,
+                            v_cache,
+                            self.num_heads,
+                            self.scale,
+                            block_tables_ext,
+                            seq_lens_ext,
+                            k_cache.shape[1],
+                            max_ctx,
+                            None,
+                            kv_cache_dtype,
+                            k_scale,
+                            v_scale,
+                            k_scale_ptrs=k_scale_cache,
+                            v_scale_ptrs=v_scale_cache,
+                            num_kv_heads=self.num_kv_heads,
+                            attn_scope="global",
+                            layer_type=self.layer_type,
+                            softcap=(
+                                float(softcap)
+                                if softcap is not None and float(softcap) > 0.0
+                                else None
+                            ),
+                        )
                     out = attn_out.view(bsz, seqlen, -1)
         else:
             with _gemma4_profile_span("attn_nocache"):
@@ -1298,7 +1329,8 @@ class Gemma4Attention(nn.Module):
                     local_window=local_window,
                     softcap=softcap,
                 ).view(bsz, seqlen, -1)
-        return self.o_proj(out, lora_mapping)
+        with _gemma4_profile_span("attn_o_proj"):
+            return self.o_proj(out, lora_mapping)
 
 
 class Gemma4MLP(nn.Module):
@@ -1350,6 +1382,21 @@ class Gemma4MLP(nn.Module):
         # The helper returns None when structural guards trip (mismatched
         # shapes, high-fidelity flag, active LoRA, etc.) and the caller
         # falls back to the two-matmul path below.
+        if _env_truthy("FASTINFERENCE_AWQ_FUSED_GATE_UP"):
+            from vllm.model_executor.models._fused_awq_pair import (
+                try_fused_awq_gate_up_activation,
+            )
+
+            h = try_fused_awq_gate_up_activation(
+                x,
+                self.gate_proj,
+                self.up_proj,
+                activation=self.hidden_act,
+                lora_mapping=lora_mapping,
+            )
+            if h is not None:
+                return self.down_proj(h, lora_mapping)
+
         if _env_truthy_default_on("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"):
             from vllm.model_executor.models._fused_awq_pair import (
                 try_fused_awq_pair_matmul,
