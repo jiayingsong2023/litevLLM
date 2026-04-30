@@ -39,6 +39,10 @@ class RuntimeConfig:
     paged_attn_num_stages_local: int | None = None
     gemma4_c1_preset: bool = False
     tuning_env: dict[str, str] | None = None
+    kv_select_ratio: float = 0.0
+    kv_select_sig_dim: int = 32
+    kv_select_min_blocks: int = 4
+    kv_select_min_context: int = 256
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object) -> "RuntimeConfig":
@@ -143,6 +147,27 @@ class RuntimeConfig:
                 "FASTINFERENCE_PAGED_ATTN_NUM_STAGES_LOCAL"
             ),
             gemma4_c1_preset=_env_truthy("FASTINFERENCE_GEMMA4_C1_PRESET"),
+            kv_select_ratio=min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        os.environ.get("FASTINFERENCE_KV_SELECT_RATIO", "0.0")
+                    ),
+                ),
+            ),
+            kv_select_sig_dim=max(
+                4,
+                min(128, int(os.environ.get("FASTINFERENCE_KV_SIG_DIM", "32"))),
+            ),
+            kv_select_min_blocks=max(
+                1,
+                int(os.environ.get("FASTINFERENCE_KV_SELECT_MIN_BLOCKS", "4")),
+            ),
+            kv_select_min_context=max(
+                64,
+                int(os.environ.get("FASTINFERENCE_KV_SELECT_MIN_CONTEXT", "256")),
+            ),
             tuning_env={
                 key: value
                 for key, value in os.environ.items()
