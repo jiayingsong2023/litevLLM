@@ -88,6 +88,40 @@ Observed CUDA startup breakdown on the audited run:
 
 This confirmed that the dominant steady GPU footprint is not the KV cache. It is mostly model parameters and large BF16 buffers.
 
+## Current E2E Baseline
+
+Latest default benchmark command:
+
+```bash
+uv run python tests/e2e_full_benchmark.py
+```
+
+Measurement date: `2026-04-30`.
+
+Runtime profile:
+
+- ROCm conservative defaults
+- per-model process isolation enabled automatically for Gemma4 26B + 31B
+- `BS=1`
+- `prompt_tokens~384`
+- `max_new_tokens=24`
+- `FASTINFERENCE_KV_MAX_MODEL_LEN=512`
+- Gemma4 accuracy guard forced runtime KV cache to `fp8`
+
+Observed parent-process summary:
+
+| Model key | Aggregate TPS | TTFT p95 | E2E p95 | Prefill TPS agg | Decode TPS agg |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `gemma4_26b_a4b` | `2.30` | `3365.3ms` | `10448.0ms` | `117.08` | `3.25` |
+| `gemma4_31b_q4` | `1.49` | `8741.7ms` | `16121.5ms` | `45.07` | `3.12` |
+
+Interpretation:
+
+- The 26B MoE path has materially better prefill throughput than 31B under this default shape.
+- Decode throughput is close between the two models, around `3.1-3.2` decode tokens/sec.
+- 31B remains TTFT/prefill-bound for this conservative default benchmark.
+- These numbers supersede older README headline Gemma4 TPS claims that were measured under different or less clearly pinned profiles.
+
 ## Confirmed Gains
 
 ### 1. Local decode Triton path

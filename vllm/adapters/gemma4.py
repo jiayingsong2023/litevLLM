@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any
 
-from .base import ModelAdapter, ModelCapabilities
+from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 
 
 def _int_or(value: Any, default: int) -> int:
@@ -11,8 +11,53 @@ def _int_or(value: Any, default: int) -> int:
         return int(default)
 
 
+def _truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class Gemma4Adapter(ModelAdapter):
     model_type = "gemma4"
+
+    def runtime_policy(
+        self,
+        model_config: Any,
+        runtime_config: Any,
+    ) -> RuntimeModelPolicy:
+        tuning_env = dict(getattr(runtime_config, "tuning_env", None) or {})
+        default_stage = "all"
+        fused_stage = str(
+            tuning_env.get("FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage)
+        ).strip().lower()
+        if fused_stage not in ("off", "attention_only", "all"):
+            fused_stage = default_stage
+
+        kv_dtype = str(getattr(runtime_config, "kv_cache_dtype", "")).lower()
+        force_kv_dtype = None
+        if kv_dtype in ("turbo_int4", "int4") and not _truthy(
+            tuning_env.get("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV")
+        ):
+            force_kv_dtype = "fp8"
+
+        return RuntimeModelPolicy(
+            force_kv_cache_dtype=force_kv_dtype,
+            force_kv_cache_dtype_when=("turbo_int4", "int4"),
+            force_kv_cache_dtype_reason=(
+                "Gemma4 accuracy guard enabled: forcing KV dtype to fp8 "
+                "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
+            ),
+            tuning_env_overrides={
+                "FASTINFERENCE_AWQ_FUSED_SCOPE": fused_stage,
+                "FASTINFERENCE_AWQ_FUSED_GEMM": "0"
+                if fused_stage == "off"
+                else "1",
+                "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE": "0",
+            },
+        )
+
+    def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
+        from vllm.model_executor.models.gemma4 import set_gemma4_tuning_config
+
+        set_gemma4_tuning_config(tuning_env, locked=True)
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)
@@ -65,4 +110,3 @@ class Gemma4Adapter(ModelAdapter):
             supports_paged_prefill=True,
             preferred_kv_dtype="bfloat16",
         )
-

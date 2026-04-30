@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.adapters.base import ModelCapabilities
+from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb
 from vllm.engine.runtime_config import RuntimeConfig
 
@@ -52,9 +52,15 @@ class KVCachePlan:
 
 
 class RuntimePlanner:
-    def __init__(self, runtime_config: RuntimeConfig, caps: ModelCapabilities) -> None:
+    def __init__(
+        self,
+        runtime_config: RuntimeConfig,
+        caps: ModelCapabilities,
+        model_policy: RuntimeModelPolicy | None = None,
+    ) -> None:
         self.runtime_config = runtime_config
         self.caps = caps
+        self.model_policy = model_policy or RuntimeModelPolicy()
 
     def build_execution_plan(self, execution_policy_max: int) -> ExecutionPlan:
         gpu_total_gb = get_total_gpu_memory_gb()
@@ -80,8 +86,10 @@ class RuntimePlanner:
 
         if self.runtime_config.prefill_chunk_size > 0:
             prefill_chunk_size = self.runtime_config.prefill_chunk_size
-        elif self.caps.model_type == "qwen3_5":
-            prefill_chunk_size = 2048 if is_high_end_gpu else 1024
+        elif is_high_end_gpu and self.model_policy.prefill_chunk_size_high_end:
+            prefill_chunk_size = self.model_policy.prefill_chunk_size_high_end
+        elif (not is_high_end_gpu) and self.model_policy.prefill_chunk_size_standard:
+            prefill_chunk_size = self.model_policy.prefill_chunk_size_standard
         else:
             prefill_chunk_size = 1024 if is_high_end_gpu else 512
 

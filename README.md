@@ -10,8 +10,13 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | ✅ [1:1 HF 对齐] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | ✅ [FP8 KV 稳定] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, 512ctx | **2.31** | ✅ [MoE 稳定] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, 512ctx | **0.90** | ✅ [Dense 稳定] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.30** | ✅ [MoE 稳定] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.49** | ✅ [Dense 稳定] |
+
+  最新 Gemma4 数值来自 `uv run python tests/e2e_full_benchmark.py` 的无参数默认配置
+  （2026-04-30，ROCm conservative defaults，按模型进程隔离顺序执行 26B/31B）。同次运行中：
+  Gemma4-26B `TTFT p95=3365.3ms`、`prefill_tps_agg=117.08`、`decode_tps_agg=3.25`；
+  Gemma4-31B `TTFT p95=8741.7ms`、`prefill_tps_agg=45.07`、`decode_tps_agg=3.12`。
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
@@ -53,7 +58,7 @@ LLM / AsyncLLM / OpenAI API Server
 
 | 环境变量 | 可选值 | 描述 |
 | :--- | :--- | :--- |
-| `FASTINFERENCE_KV_TYPE` | `fp16`, `fp8`, `turbo_int4` | 控制 KV 缓存精度（默认 `auto`->`fp8`） |
+| `FASTINFERENCE_KV_TYPE` | `fp16`, `fp8`, `turbo_int4` | 控制 KV 缓存精度（默认 `turbo_int4`; `auto` 会按 legacy `FASTINFERENCE_KV_FP8` 解析） |
 | `FASTINFERENCE_FUSION_LEVEL` | `0`, `1`, `2` | `1`: AB 融合; `2`: 全量算子融合 (默认) |
 | `FASTINFERENCE_BLOCK_SIZE` | `16`, `32`, `64` | 物理块大小，长文本建议 `32/64` |
 | `FASTINFERENCE_K_SCALE` | `float` | TurboQuant 专用 K 缩放因子 |
@@ -74,6 +79,9 @@ uv run bash tests/run_regression_suite.sh
 
 # 推理精度/质量回归
 uv run bash tests/run_inference_correctness_regression.sh
+
+# Gemma4 26B/31B 默认性能回归
+uv run python tests/e2e_full_benchmark.py
 ```
 
 `tests/run_inference_correctness_regression.sh` 覆盖四个回归目标：TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B。Gemma4 模型目录自动探测，优先本地路径，仅在缺失时回退到 HuggingFace repo id。

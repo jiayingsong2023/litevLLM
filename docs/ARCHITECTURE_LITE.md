@@ -63,9 +63,16 @@ LitevLLM has been significantly optimized for Gemma4 dense and MoE models:
 - **目标**: 稳定、可测试、可扩展的 lite runtime
 
 ## 7. 核心性能概览 (AMD Radeon 8060S 65GB)
-- **TinyLlama-1.1B**: **542+ TPS**
-- **Gemma4-26B (MoE)**: **2.31 TPS** (Verified stable)
-- **Gemma4-31B (Dense)**: **0.90 TPS** (Memory Bound)
+
+最新 Gemma4 基线来自 2026-04-30 的无参数 `uv run python tests/e2e_full_benchmark.py`，
+即 ROCm conservative defaults、`BS=1`、`prompt~384`、`max_new=24`、`KV cap=512`，并在 ROCm
+上自动启用 per-model process isolation。
+
+| 模型 | Aggregate TPS | TTFT p95 | Prefill TPS agg | Decode TPS agg | 状态 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TinyLlama-1.1B** | **542+** | 历史 fast-path 基线 | - | - | 1:1 HF 对齐 |
+| **Gemma4-26B A4B (MoE)** | **2.30** | **3365.3ms** | **117.08** | **3.25** | Verified stable |
+| **Gemma4-31B (Dense)** | **1.49** | **8741.7ms** | **45.07** | **3.12** | Memory bound, accuracy-gated |
 
 ---
 *本项目完全遵循 pure-Python 哲学，严禁引入任何需要 C++ 编译器的代码。所有算子均通过 Triton JIT 即时编译生成。*

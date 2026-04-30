@@ -336,6 +336,10 @@ def _cache_dir_stats(path: str | None) -> dict[str, Any]:
     return {"exists": True, "files": files, "bytes": total_bytes}
 
 
+def _format_targets(specs: list[ModelSpec]) -> str:
+    return " + ".join(spec.display_name for spec in specs)
+
+
 def _should_use_model_process_isolation(
     args: argparse.Namespace,
     model_keys: list[str],
@@ -2398,13 +2402,16 @@ async def run_benchmark(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="End-to-end performance benchmark for TinyLlama / Qwen3.5 AWQ / Gemma4 Q4 models."
+        description="End-to-end performance benchmark focused on Gemma4 26B/31B models."
     )
     parser.add_argument(
         "--models",
         type=str,
-        default="tinyllama,qwen35_9b_awq",
-        help="Comma-separated model keys: tinyllama,qwen35_9b_awq,gemma4_31b_q4,gemma4_26b_a4b",
+        default="gemma4_26b_a4b,gemma4_31b_q4",
+        help=(
+            "Comma-separated model keys. Default: gemma4_26b_a4b,gemma4_31b_q4. "
+            "Available: tinyllama,qwen35_9b_awq,gemma4_31b_q4,gemma4_26b_a4b"
+        ),
     )
     parser.add_argument(
         "--json-out",
@@ -2787,7 +2794,7 @@ async def main() -> None:
 
     print("=" * 72)
     print("FASTINFERENCE END-TO-END PERFORMANCE REGRESSION")
-    print("Targets: TinyLlama + Qwen3.5-9B AWQ + Gemma4-31B-it-AWQ-4bit + Gemma4-26B-A4B-it-AWQ-4bit")
+    print("Targets: " + _format_targets(specs))
     print(
         "Warmup: "
         f"preset={args.warmup_preset}, "

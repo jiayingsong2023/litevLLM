@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any
 
-from .base import ModelAdapter, ModelCapabilities
+from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -12,6 +12,21 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
 
 class Qwen35Adapter(ModelAdapter):
     model_type = "qwen3_5"
+
+    def runtime_policy(
+        self,
+        model_config: Any,
+        runtime_config: Any,
+    ) -> RuntimeModelPolicy:
+        return RuntimeModelPolicy(
+            prefill_chunk_size_high_end=2048,
+            prefill_chunk_size_standard=1024,
+        )
+
+    def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
+        from vllm.model_executor.models.qwen3_5 import set_qwen35_tuning_config
+
+        set_qwen35_tuning_config(tuning_env, locked=True)
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)

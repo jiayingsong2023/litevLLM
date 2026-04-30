@@ -1,11 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any
 
-from .base import ModelAdapter, ModelCapabilities
+from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 
 
 class LlamaAdapter(ModelAdapter):
     model_type = "llama"
+
+    def runtime_policy(
+        self,
+        model_config: Any,
+        runtime_config: Any,
+    ) -> RuntimeModelPolicy:
+        return RuntimeModelPolicy()
+
+    def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
+        return None
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)

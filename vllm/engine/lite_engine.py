@@ -36,10 +36,6 @@ from vllm.engine.inference_config import LiteInferenceConfig
 logger = init_logger(__name__)
 
 
-def _env_truthy(name: str) -> bool:
-    v = os.environ.get(name, "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     f8 = getattr(torch, "float8_e4m3fn", None)
     if f8 is not None and dtype == f8:
@@ -112,13 +108,11 @@ def expand_metadata_for_paged_attention(
                         dtype=torch.int32,
                     )
                 )
-                block_tables_ext_parts.append(
-                    block_tables[bi : bi + 1].expand(seq, -1)
-                )
+                block_tables_ext_parts.append(block_tables[bi : bi + 1].expand(seq, -1))
             seq_lens_ext = torch.cat(seq_lens_ext_parts, dim=0)
             block_tables_ext = torch.cat(block_tables_ext_parts, dim=0).contiguous()
         return seq_lens_ext, block_tables_ext
-    
+
     return seq_lens, block_tables
 
 
@@ -142,35 +136,47 @@ def _resolve_kv_max_active_requests(
     vllm_config: VllmConfig,
 ) -> int:
     """Match paged KV pool to scheduler concurrency (and optional env)."""
-    sched_seqs = getattr(vllm_config.scheduler_config, "max_num_seqs", execution_policy_max)
+    sched_seqs = getattr(
+        vllm_config.scheduler_config, "max_num_seqs", execution_policy_max
+    )
     out = min(int(execution_policy_max), int(sched_seqs))
     env = os.environ.get("FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS", "").strip()
     if env:
         out = min(out, max(1, int(env)))
     return max(1, out)
 
+
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = torch.device("cuda:0")
-        self.runtime_config = (
-            getattr(vllm_config, "runtime_config", None)
-            or RuntimeConfig.from_vllm_config(vllm_config)
-        )
+        self.runtime_config = getattr(
+            vllm_config, "runtime_config", None
+        ) or RuntimeConfig.from_vllm_config(vllm_config)
         requested_policy_mode = self.runtime_config.policy_mode
-        
+        self.adapter = get_model_adapter(None, self.model_config)
+        self.runtime_policy = self.adapter.runtime_policy(
+            self.model_config,
+            self.runtime_config,
+        )
+        self._install_tuning_configs_for_model(self.runtime_policy)
+
         # 1. Load Model
         print(f">>> LiteEngine: Loading {self.model_config.model}...")
         self.model = get_model(vllm_config=self.vllm_config)
         print(f">>> LiteEngine: Model Type: {type(self.model)}")
-        self.tokenizer = None 
+        self.tokenizer = None
         self.execution_policy = select_loadtime_policy(
             model_config=self.model_config,
             quant_config=getattr(vllm_config, "quant_config", None),
             policy_mode=requested_policy_mode,  # type: ignore[arg-type]
         )
         self.adapter = get_model_adapter(self.model, self.model_config)
+        self.runtime_policy = self.adapter.runtime_policy(
+            self.model_config,
+            self.runtime_config,
+        )
         self.model_capabilities = self.adapter.detect(self.model, self.model_config)
         self.vllm_config.model_capabilities = self.model_capabilities
         self.num_attention_heads = self.model_capabilities.num_attention_heads
@@ -182,43 +188,17 @@ class LiteEngine:
             f"{self.num_kv_heads} KV-heads, {self.head_size} head_dim"
         )
         self._layer_kv_specs = self._resolve_layer_kv_specs()
-        model_type_name = type(self.model).__name__.lower()
-        is_gemma4_model = "gemma4" in model_type_name
-        if (
-            is_gemma4_model
-            and str(self.runtime_config.kv_cache_dtype).lower() in ("turbo_int4", "int4")
-            and (not _env_truthy("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV"))
-        ):
-            print(
-                ">>>> LiteEngine: Gemma4 accuracy guard enabled: forcing KV dtype to fp8 "
-                "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
+        self._apply_runtime_model_policy()
+        if "FASTINFERENCE_AWQ_FUSED_SCOPE" in self._active_tuning_env:
+            fused_stage = self._active_tuning_env.get(
+                "FASTINFERENCE_AWQ_FUSED_SCOPE", "all"
             )
-            self.runtime_config = replace(self.runtime_config, kv_cache_dtype="fp8")
-        if is_gemma4_model:
-            # Stage-wise fused rollout for Gemma4:
-            # - default: attention_only (accuracy-first, partial fused recovery)
-            # - FASTINFERENCE_GEMMA4_FUSED_STAGE=off|attention_only|all to override
-            # Compatibility: FASTINFERENCE_GEMMA4_ALLOW_FUSED_AWQ=1 implies default_stage=all
-            default_stage = "all"
-            fused_stage = os.environ.get(
-                "FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage
-            ).strip().lower()
-            if fused_stage not in ("off", "attention_only", "all"):
-                fused_stage = default_stage
-            if os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE", "").strip() == "":
-                os.environ["FASTINFERENCE_AWQ_FUSED_SCOPE"] = fused_stage
-            if os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM", "").strip() == "":
-                os.environ["FASTINFERENCE_AWQ_FUSED_GEMM"] = (
-                    "0" if fused_stage == "off" else "1"
-                )
-            if os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_FORCE", "").strip() == "":
-                os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_FORCE"] = "0"
             print(
-                ">>>> LiteEngine: Gemma4 fused rollout stage="
-                f"{os.environ.get('FASTINFERENCE_AWQ_FUSED_SCOPE', fused_stage)} "
+                ">>>> LiteEngine: fused rollout stage="
+                f"{fused_stage} "
                 "(set FASTINFERENCE_GEMMA4_FUSED_STAGE=off|attention_only|all to override)."
             )
-        
+
         # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
         self.inf_config = LiteInferenceConfig(
             kv_type=self.runtime_config.kv_cache_dtype,
@@ -229,9 +209,21 @@ class LiteEngine:
             max_model_len=self.runtime_config.kv_max_model_len,
             max_active_requests=self.runtime_config.kv_max_active_requests,
             use_prompt_guard=self.runtime_config.use_prompt_guard,
+            paged_attn_num_warps=self.runtime_config.paged_attn_num_warps,
+            paged_attn_num_stages=self.runtime_config.paged_attn_num_stages,
+            paged_attn_num_warps_global=self.runtime_config.paged_attn_num_warps_global,
+            paged_attn_num_stages_global=self.runtime_config.paged_attn_num_stages_global,
+            paged_attn_num_warps_local=self.runtime_config.paged_attn_num_warps_local,
+            paged_attn_num_stages_local=self.runtime_config.paged_attn_num_stages_local,
+            gemma4_c1_preset=self.runtime_config.gemma4_c1_preset,
+            tuning_env=self._active_tuning_env,
         )
 
-        planner = RuntimePlanner(self.runtime_config, self.model_capabilities)
+        planner = RuntimePlanner(
+            self.runtime_config,
+            self.model_capabilities,
+            self.runtime_policy,
+        )
         execution_plan = planner.build_execution_plan(
             self.execution_policy.max_active_requests
         )
@@ -239,7 +231,9 @@ class LiteEngine:
         gpu_total_gb = get_total_gpu_memory_gb()
         is_high_end_gpu = execution_plan.is_high_end_gpu
         if is_high_end_gpu:
-            print(f">>>> LiteEngine: High-end GPU detected ({gpu_total_gb:.1f}GB). Enabling aggressive optimization.")
+            print(
+                f">>>> LiteEngine: High-end GPU detected ({gpu_total_gb:.1f}GB). Enabling aggressive optimization."
+            )
 
         self.block_size = execution_plan.block_size
         self.max_model_len = execution_plan.max_model_len
@@ -266,10 +260,14 @@ class LiteEngine:
         # Resolve KV Metadata from config
         if kv_plan.kv_dtype == torch.uint8:
             self.inf_config.kv_type = "turbo_int4"
-            print(">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]")
+            print(
+                ">>>> LiteEngine: KV Cache quantized to TurboQuant INT4 (uint8 packed) [NEW]"
+            )
             self.kv_dtype = kv_plan.kv_dtype
             self.kv_head_dim = kv_plan.kv_head_dim
-            print(f">>>> LiteEngine: Using KV scales: K={self.inf_config.k_scale}, V={self.inf_config.v_scale}")
+            print(
+                f">>>> LiteEngine: Using KV scales: K={self.inf_config.k_scale}, V={self.inf_config.v_scale}"
+            )
         elif kv_plan.kv_dtype == torch.float8_e4m3fn:
             self.inf_config.kv_type = "fp8"
             print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
@@ -277,7 +275,9 @@ class LiteEngine:
             self.kv_head_dim = kv_plan.kv_head_dim
         else:
             self.inf_config.kv_type = "fp16"
-            print(">>>> LiteEngine: KV Cache using full precision (BF16/FP16) [ACCURATE]")
+            print(
+                ">>>> LiteEngine: KV Cache using full precision (BF16/FP16) [ACCURATE]"
+            )
             if self.model_capabilities.preferred_kv_dtype == "bfloat16":
                 print(">>>> LiteEngine: KV Cache dtype bfloat16 (Qwen3.5)")
                 self.kv_dtype = kv_plan.kv_dtype
@@ -285,10 +285,12 @@ class LiteEngine:
                 print(">>>> LiteEngine: KV Cache dtype float16")
                 self.kv_dtype = kv_plan.kv_dtype
             self.kv_head_dim = kv_plan.kv_head_dim
-            
+
         kv_theory_bytes = kv_plan.theory_bytes
         if self._layer_kv_specs is not None:
-            kv_theory_bytes = self._compute_kv_theory_bytes(needs_scale_cache=kv_plan.needs_scale_cache)
+            kv_theory_bytes = self._compute_kv_theory_bytes(
+                needs_scale_cache=kv_plan.needs_scale_cache
+            )
         print(
             f">>>> LiteEngine: Allocating KV Cache on {self.device} "
             f"({self.max_active_requests} seq slots, {self.max_model_len} tokens/seq cap, "
@@ -301,24 +303,50 @@ class LiteEngine:
         self.kv_caches = []
         for i in range(self.num_layers):
             print(f"    Allocating layer {i}...")
-            layer_num_kv_heads, layer_kv_head_dim = self._layer_kv_cache_shape_for_layer(i)
+            layer_num_kv_heads, layer_kv_head_dim = (
+                self._layer_kv_cache_shape_for_layer(i)
+            )
             # Shape: (num_total_blocks, block_size, heads, head_size)
-            k = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, layer_kv_head_dim), 
-                          device=self.device, dtype=self.kv_dtype)
-            v = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, layer_kv_head_dim), 
-                          device=self.device, dtype=self.kv_dtype)
+            k = torch.zeros(
+                (
+                    self.num_total_blocks,
+                    self.block_size,
+                    layer_num_kv_heads,
+                    layer_kv_head_dim,
+                ),
+                device=self.device,
+                dtype=self.kv_dtype,
+            )
+            v = torch.zeros(
+                (
+                    self.num_total_blocks,
+                    self.block_size,
+                    layer_num_kv_heads,
+                    layer_kv_head_dim,
+                ),
+                device=self.device,
+                dtype=self.kv_dtype,
+            )
             self.kv_caches.append((k, v))
-        
+
         if kv_plan.needs_scale_cache:
             print(">>>> LiteEngine: Allocating KV Scale Caches for TurboQuant...")
             self.kv_scale_caches = []
             for i in range(self.num_layers):
-                layer_num_kv_heads, _layer_kv_head_dim = self._layer_kv_cache_shape_for_layer(i)
+                layer_num_kv_heads, _layer_kv_head_dim = (
+                    self._layer_kv_cache_shape_for_layer(i)
+                )
                 # Per-token, per-head scale: (num_total_blocks, block_size, num_kv_heads, 1)
-                ks = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, 1), 
-                               device=self.device, dtype=torch.float32)
-                vs = torch.zeros((self.num_total_blocks, self.block_size, layer_num_kv_heads, 1), 
-                               device=self.device, dtype=torch.float32)
+                ks = torch.zeros(
+                    (self.num_total_blocks, self.block_size, layer_num_kv_heads, 1),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                vs = torch.zeros(
+                    (self.num_total_blocks, self.block_size, layer_num_kv_heads, 1),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
                 self.kv_scale_caches.append((ks, vs))
         else:
             self.kv_scale_caches = [(None, None)] * self.num_layers
@@ -346,8 +374,12 @@ class LiteEngine:
             "host RSS not included — large GGUF load is often CPU anon-rss):"
         )
         print(f"     before_KV (weights + overhead): {weights_gb:.3f} GiB")
-        print(f"     KV pool (delta alloc):          {kv_delta_gb:.3f} GiB  (theory {kv_theory_bytes / (1024**3):.3f} GiB)")
-        print(f"     after_KV total:                 {total_gb:.3f} GiB  /  GPU cap ~{gpu_total_gb:.1f} GiB")
+        print(
+            f"     KV pool (delta alloc):          {kv_delta_gb:.3f} GiB  (theory {kv_theory_bytes / (1024**3):.3f} GiB)"
+        )
+        print(
+            f"     after_KV total:                 {total_gb:.3f} GiB  /  GPU cap ~{gpu_total_gb:.1f} GiB"
+        )
         print(">>>> LiteEngine: Startup memory audit (CUDA tensors):")
         print(
             "     model params:                  "
@@ -362,9 +394,7 @@ class LiteEngine:
                 f"{_bytes_to_gib(int(nbytes)):.3f} GiB"
             )
         if audit["params_top"]:
-            print(
-                f"     top params by size (Top-{audit['topn']}):"
-            )
+            print(f"     top params by size (Top-{audit['topn']}):")
             for row in audit["params_top"]:
                 print(
                     "       - "
@@ -385,9 +415,7 @@ class LiteEngine:
                 f"{_bytes_to_gib(int(nbytes)):.3f} GiB"
             )
         if audit["buffers_top"]:
-            print(
-                f"     top buffers by size (Top-{audit['topn']}):"
-            )
+            print(f"     top buffers by size (Top-{audit['topn']}):")
             for row in audit["buffers_top"]:
                 print(
                     "       - "
@@ -421,23 +449,42 @@ class LiteEngine:
         self.sampling_driver = None
         self.output_pipeline = None
         self.request_builder = None
-        self.observer = getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
+        self.observer = (
+            getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
+        )
         self._queue_timeout_s = float(
             os.environ.get("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS", "30.0")
         )
-        
+
         # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
         # These will be reused to avoid Python object creation in every decode step.
-        self._fast_input_ids = torch.empty((self.max_active_requests, 1), dtype=torch.long, device=self.device)
-        self._fast_positions = torch.empty((self.max_active_requests, 1), dtype=torch.long, device=self.device)
-        self._fast_slot_mapping = torch.empty((self.max_active_requests,), dtype=torch.long, device=self.device)
-        self._fast_seq_lens = torch.empty((self.max_active_requests,), dtype=torch.int32, device=self.device)
-        self._fast_block_tables = torch.empty((self.max_active_requests, self.num_blocks_per_seq), dtype=torch.int32, device=self.device)
-        
+        self._fast_input_ids = torch.empty(
+            (self.max_active_requests, 1), dtype=torch.long, device=self.device
+        )
+        self._fast_positions = torch.empty(
+            (self.max_active_requests, 1), dtype=torch.long, device=self.device
+        )
+        self._fast_slot_mapping = torch.empty(
+            (self.max_active_requests,), dtype=torch.long, device=self.device
+        )
+        self._fast_seq_lens = torch.empty(
+            (self.max_active_requests,), dtype=torch.int32, device=self.device
+        )
+        self._fast_block_tables = torch.empty(
+            (self.max_active_requests, self.num_blocks_per_seq),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
         # Static block tables (only depends on slot_idx)
         for s in range(self.max_active_requests):
             start_block = s * self.num_blocks_per_seq
-            self._fast_block_tables[s] = torch.arange(start_block, start_block + self.num_blocks_per_seq, dtype=torch.int32, device=self.device)
+            self._fast_block_tables[s] = torch.arange(
+                start_block,
+                start_block + self.num_blocks_per_seq,
+                dtype=torch.int32,
+                device=self.device,
+            )
         runtime_components = LiteRuntimeFactory.build(self)
         self.kv_block_manager = runtime_components["kv_block_manager"]
         self.input_batch_builder = runtime_components["input_batch_builder"]
@@ -447,6 +494,50 @@ class LiteEngine:
         self.step_scheduler = runtime_components["step_scheduler"]
         self.execution_backend = runtime_components["execution_backend"]
         self.runtime_controller = runtime_components["runtime_controller"]
+
+    def _apply_runtime_model_policy(self) -> None:
+        force_kv_dtype = self.runtime_policy.force_kv_cache_dtype
+        if not force_kv_dtype:
+            return
+        current = str(self.runtime_config.kv_cache_dtype).lower()
+        allowed_current = self.runtime_policy.force_kv_cache_dtype_when
+        if allowed_current and current not in allowed_current:
+            return
+        reason = self.runtime_policy.force_kv_cache_dtype_reason
+        if reason:
+            print(f">>>> LiteEngine: {reason}")
+        self.runtime_config = replace(
+            self.runtime_config,
+            kv_cache_dtype=force_kv_dtype,
+        )
+
+    def _install_tuning_configs_for_model(self, runtime_policy: Any) -> None:
+        tuning_env: dict[str, str] = dict(self.runtime_config.tuning_env or {})
+        for key, value in runtime_policy.tuning_env_overrides.items():
+            tuning_env.setdefault(str(key), str(value))
+
+        self._active_tuning_env = tuning_env
+
+        try:
+            from vllm.kernels.triton.awq_fused_gemm import (
+                set_awq_fused_tuning_config,
+            )
+
+            set_awq_fused_tuning_config(tuning_env, locked=True)
+        except Exception:
+            logger.debug("Unable to install AWQ fused tuning config", exc_info=True)
+        try:
+            from vllm.model_executor.layers.quantization.tensor import (
+                set_awq_tensor_tuning_config,
+            )
+
+            set_awq_tensor_tuning_config(tuning_env, locked=True)
+        except Exception:
+            logger.debug("Unable to install AWQ tensor tuning config", exc_info=True)
+        try:
+            self.adapter.install_tuning_config(tuning_env)
+        except Exception:
+            logger.debug("Unable to install model tuning config", exc_info=True)
 
     def _collect_cuda_tensor_memory_audit(self) -> dict[str, Any]:
         """
@@ -504,7 +595,9 @@ class LiteEngine:
 
         awq_cache_bytes = 0
         try:
-            from vllm.model_executor.layers.quantization.tensor import get_awq_runtime_stats
+            from vllm.model_executor.layers.quantization.tensor import (
+                get_awq_runtime_stats,
+            )
 
             awq_stats = get_awq_runtime_stats()
             awq_cache_bytes = int(awq_stats.get("cache_bytes", 0) or 0)
@@ -729,15 +822,17 @@ class LiteEngine:
                 prompt=prompt,
                 sampling_params=sampling_params,
                 lora_id=resolved_lora.lora_name if resolved_lora is not None else None,
-                lora_int_id=resolved_lora.lora_int_id if resolved_lora is not None else None,
-                lora_path=resolved_lora.lora_path if resolved_lora is not None else None,
+                lora_int_id=resolved_lora.lora_int_id
+                if resolved_lora is not None
+                else None,
+                lora_path=resolved_lora.lora_path
+                if resolved_lora is not None
+                else None,
                 multi_modal_data=multi_modal_data,
             )
             self.multimodal_processor.prepare_request(request_state)
         except ValueError as exc:
-            reason = (
-                str(exc)
-            )
+            reason = str(exc)
             self.observer.on_request_rejected(request_id, reason)
             raise RequestRejectedError(reason)
         self.execution_backend.maybe_apply_prefix_cache(request_state)
@@ -764,7 +859,10 @@ class LiteEngine:
         self.observer.on_background_error(exc, request_ids)
         for request_id in request_ids:
             self.scheduler.publish_exception(
-                request_id, exc if isinstance(exc, BackgroundLoopError) else BackgroundLoopError(str(exc))
+                request_id,
+                exc
+                if isinstance(exc, BackgroundLoopError)
+                else BackgroundLoopError(str(exc)),
             )
             self.scheduler.free_request(request_id)
 

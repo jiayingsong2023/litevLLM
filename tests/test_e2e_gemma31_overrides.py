@@ -8,6 +8,23 @@ from dataclasses import replace
 from tests import e2e_full_benchmark as bench
 
 
+def test_parse_args_defaults_to_gemma4_26b_and_31b(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["e2e_full_benchmark.py"])
+    args = bench._parse_args()
+    assert args.models == "gemma4_26b_a4b,gemma4_31b_q4"
+
+
+def test_format_targets_uses_model_display_names() -> None:
+    specs = [
+        bench.MODEL_SPECS["gemma4_26b_a4b"],
+        bench.MODEL_SPECS["gemma4_31b_q4"],
+    ]
+    assert (
+        bench._format_targets(specs)
+        == "Gemma4-26B A4B (Q4 MoE) + Gemma4-31B (Q4)"
+    )
+
+
 def test_parse_args_accepts_gemma31_shape_overrides(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,

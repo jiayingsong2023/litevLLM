@@ -79,12 +79,19 @@ vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8000
 FastInference comes with specialized benchmarks to demonstrate its Triton-powered speed.
 
 ```bash
+# Default full benchmark: Gemma4 26B A4B + Gemma4 31B Q4
+uv run python tests/e2e_full_benchmark.py
+
 # Measure MoE throughput (Scaling up to BS=32)
 uv run python tests/e2e_moe_batch_scaling.py
 
 # Measure GGUF throughput with LRU Caching
 uv run python tests/e2e_gguf_perf.py
 ```
+
+On AMD Radeon 8060S 65GB with ROCm conservative defaults, the 2026-04-30 Gemma4
+default benchmark measured `gemma4_26b_a4b` at `2.30` aggregate TPS and
+`gemma4_31b_q4` at `1.49` aggregate TPS.
 
 ## Core Backend: Triton Only
 
