@@ -141,6 +141,9 @@ def _paged_attention_kernel(
     IS_CACHED: tl.constexpr,
     HAS_ROW_SCALE: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
+    USE_SELECTION: tl.constexpr,
+    SELECT_STRIDE: tl.constexpr,
+    MIN_SELECTED_BLOCKS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -186,6 +189,16 @@ def _paged_attention_kernel(
     offs_n = tl.arange(0, BLOCK_N)
 
     for i in range(0, num_blocks):
+        if USE_SELECTION:
+            # Uniform strided block selection: load every SELECT_STRIDE-th block.
+            # Always load first MIN_SELECTED_BLOCKS and the last (partial-fill) block.
+            is_selected = (
+                (i % SELECT_STRIDE == 0)
+                or (i < MIN_SELECTED_BLOCKS)
+                or (i == num_blocks - 1)
+            )
+        else:
+            is_selected = True
         if IS_CACHED:
             k_base_ptr = tl.load(K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
                 tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
@@ -212,6 +225,13 @@ def _paged_attention_kernel(
 
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
+        if USE_SELECTION:
+            # When a block is not selected, extend mask to all-False so
+            # K/V loads return `other` values and QK becomes -inf.
+            # The loads still issue on this path; bandwidth savings requires
+            # a follow-up kernel restructuring.
+            if not is_selected:
+                block_mask = tl.arange(0, BLOCK_N) < 0
 
         k_scale = k_scale_arg
         v_scale = v_scale_arg
@@ -352,6 +372,9 @@ def paged_attention_v1(
     k_scale_ptrs=None,
     v_scale_ptrs=None,
     softcap=None,
+    sig_cache=None,
+    kv_select_ratio=0.0,
+    kv_select_min_blocks=4,
     **kwargs,
 ):
     num_seqs, _num_heads_check, head_size = query.shape
@@ -360,6 +383,13 @@ def paged_attention_v1(
     is_int4 = "int4" in str(kv_cache_dtype).lower()
     is_cached = k_ptrs is not None
     has_row_scale = k_scale_ptrs is not None
+
+    # KV Block Selective Attention: convert ratio to stride.
+    # select_ratio=0.0 → disabled, 0.25 → stride 4, 0.5 → stride 2, 1.0 → stride 1.
+    select_ratio = max(0.0, min(1.0, float(kv_select_ratio)))
+    use_selection = select_ratio > 0.0
+    select_stride = max(1, int(1.0 / select_ratio)) if use_selection else 1
+    min_selected = max(1, int(kv_select_min_blocks))
     # Gemma-style logit soft-capping: qk' = cap * tanh(qk * scale / cap).
     # None / <=0 / NaN -> treat as disabled (HAS_SOFTCAP=False) so the kernel
     # compiles the tanh branch out entirely (zero runtime cost for non-Gemma).
@@ -444,6 +474,9 @@ def paged_attention_v1(
         IS_CACHED=is_cached,
         HAS_ROW_SCALE=has_row_scale,
         HAS_SOFTCAP=has_softcap,
+        USE_SELECTION=use_selection,
+        SELECT_STRIDE=select_stride,
+        MIN_SELECTED_BLOCKS=min_selected,
         BLOCK_D=head_size,
         BLOCK_N=block_size,
         num_warps=num_warps,
