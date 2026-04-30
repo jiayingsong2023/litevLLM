@@ -260,6 +260,22 @@ def _meta_set(meta: Any, key: str, value: Any) -> bool:
         return False
 
 
+def _get_sig_for_layer(
+    attn_metadata: Any,
+    layer_idx: int,
+) -> "torch.Tensor | None":
+    """Return the signature cache tensor for a given layer, or None."""
+    _sig_list = _meta_get(attn_metadata, "sig_cache", None)
+    if _sig_list is None:
+        return None
+    if not isinstance(_sig_list, list) or len(_sig_list) <= layer_idx:
+        return None
+    _sig = _sig_list[layer_idx]
+    if _sig.numel() == 0:
+        return None
+    return _sig
+
+
 def _env_truthy(name: str) -> bool:
     return _env_get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -1295,6 +1311,9 @@ class Gemma4Attention(nn.Module):
                                 else 0
                             )
                         with _gemma4_profile_span("attn_local_decode_kernel"):
+                            _sig_local = _get_sig_for_layer(
+                                attn_metadata, self.layer_idx
+                            )
                             paged_attention_v1(
                                 attn_out,
                                 q.reshape(
@@ -1325,6 +1344,9 @@ class Gemma4Attention(nn.Module):
                                     if softcap is not None and float(softcap) > 0.0
                                     else None
                                 ),
+                                sig_cache=_sig_local,
+                                kv_select_ratio=0.0,
+                                kv_select_min_blocks=0,
                             )
                         out = attn_out.view(bsz, seqlen, -1)
                     else:
@@ -1443,6 +1465,19 @@ class Gemma4Attention(nn.Module):
                         )
                     )
                     with _gemma4_profile_span("attn_global_kernel"):
+                        _sig_global = _get_sig_for_layer(
+                            attn_metadata, self.layer_idx
+                        )
+                        _kv_sel_ratio = float(
+                            getattr(inf_config, "kv_select_ratio", 0.0)
+                            if inf_config is not None
+                            else 0.0
+                        )
+                        _kv_sel_min = int(
+                            getattr(inf_config, "kv_select_min_blocks", 4)
+                            if inf_config is not None
+                            else 4
+                        )
                         paged_attention_v1(
                             attn_out,
                             q.reshape(
@@ -1471,6 +1506,9 @@ class Gemma4Attention(nn.Module):
                                 if softcap is not None and float(softcap) > 0.0
                                 else None
                             ),
+                            sig_cache=_sig_global,
+                            kv_select_ratio=_kv_sel_ratio,
+                            kv_select_min_blocks=_kv_sel_min,
                         )
                     out = attn_out.view(bsz, seqlen, -1)
         else:
