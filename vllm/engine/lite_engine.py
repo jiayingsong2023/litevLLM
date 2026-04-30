@@ -357,6 +357,39 @@ class LiteEngine:
 
         print(">>>> LiteEngine: KV Cache allocated successfully.")
 
+        # Allocate signature cache for KV Block Selective Attention.
+        # sig_dim elements per (block, head), fp16.
+        # Zero-initialized; populated lazily as blocks fill.
+        sig_dim = int(getattr(self.inf_config, "kv_select_sig_dim", 32))
+        self.sig_caches: list[torch.Tensor] = []
+        self._sig_temp_buffers: list[torch.Tensor] = []
+        _sig_enabled = self.inf_config.kv_select_ratio > 0.0
+        for i in range(self.num_layers):
+            layer_num_kv_heads, _layer_kv_head_dim = (
+                self._layer_kv_cache_shape_for_layer(i)
+            )
+            if _sig_enabled:
+                sig = torch.zeros(
+                    (self.num_total_blocks, layer_num_kv_heads, sig_dim),
+                    device=self.device,
+                    dtype=torch.float16,
+                )
+                sig_temp = torch.zeros(
+                    (
+                        self.num_total_blocks,
+                        self.block_size,
+                        layer_num_kv_heads,
+                        sig_dim,
+                    ),
+                    device=self.device,
+                    dtype=torch.float16,
+                )
+            else:
+                sig = torch.empty((0,), device=self.device, dtype=torch.float16)
+                sig_temp = torch.empty((0,), device=self.device, dtype=torch.float16)
+            self.sig_caches.append(sig)
+            self._sig_temp_buffers.append(sig_temp)
+
         mem_after_kv = int(torch.cuda.memory_allocated(self.device))
         kv_delta_bytes = mem_after_kv - mem_before_kv
         total_gb = _bytes_to_gib(mem_after_kv)

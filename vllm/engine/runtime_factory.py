@@ -81,6 +81,8 @@ class LiteRuntimeFactory:
             inf_config=engine.inf_config,
             stack_per_layer_carries=engine._stack_per_layer_carries,
             split_per_layer_carries=engine._split_per_layer_carries,
+            sig_caches=getattr(engine, "sig_caches", None),
+            sig_temp_buffers=getattr(engine, "_sig_temp_buffers", None),
         )
         multimodal_processor = LiteMultiModalProcessor(
             model=engine.model,
