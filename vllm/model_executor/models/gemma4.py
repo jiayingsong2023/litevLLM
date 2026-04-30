@@ -1129,6 +1129,29 @@ class Gemma4Attention(nn.Module):
                         v_scale_cache=v_scale_cache,
                     )
 
+            # Finalize block signatures for any blocks that just filled.
+            _sig_cache_list = _meta_get(attn_metadata, "sig_cache", None)
+            _sig_temp_list = _meta_get(attn_metadata, "sig_temp", None)
+            if (
+                _sig_cache_list is not None
+                and _sig_temp_list is not None
+                and len(_sig_cache_list) > self.layer_idx
+                and _sig_cache_list[self.layer_idx].numel() > 0
+            ):
+                _block_sz = int(k_cache.shape[1])
+                _slot = slot_mapping.reshape(-1)
+                _block_ids = _slot // _block_sz
+                _offsets = _slot % _block_sz
+                _filled_mask = _offsets == (_block_sz - 1)
+                if _filled_mask.any():
+                    _filled_blocks = torch.unique(_block_ids[_filled_mask])
+                    from vllm.kernels.triton.kv_sig import kv_sig_finalize
+                    kv_sig_finalize(
+                        _sig_temp_list[self.layer_idx],
+                        _sig_cache_list[self.layer_idx],
+                        _filled_blocks,
+                    )
+
             is_prefill = bool(_meta_get(attn_metadata, "is_prefill", False))
             if is_local and is_prefill and seqlen > 1:
                 with _gemma4_profile_span("attn_local_prefill"):
