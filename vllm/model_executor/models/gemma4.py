@@ -22,14 +22,53 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from .lite_config import LiteConfig
 
+_GEMMA4_TUNING: dict[str, str] = {
+    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_GEMMA4_") or key.startswith("FASTINFERENCE_KV_MAX_")
+}
+_GEMMA4_TUNING_LOCKED = False
 
-_GEMMA4_PROFILE_ENABLED = os.environ.get("FASTINFERENCE_GEMMA4_LAYER_PROFILE", "").strip().lower() in (
+
+def set_gemma4_tuning_config(
+    values: dict[str, object] | None, *, locked: bool = False
+) -> None:
+    """Install Gemma4 tuning flags before model construction."""
+    global _GEMMA4_TUNING
+    global _GEMMA4_TUNING_LOCKED
+    global _GEMMA4_PROFILE_ENABLED
+    global _GEMMA4_ROCTX_PROFILE_ENABLED
+    _GEMMA4_TUNING = {
+        str(key): str(value)
+        for key, value in (values or {}).items()
+        if (
+            str(key).startswith("FASTINFERENCE_GEMMA4_")
+            or str(key).startswith("FASTINFERENCE_KV_MAX_")
+        )
+        and value is not None
+    }
+    _GEMMA4_TUNING_LOCKED = bool(locked)
+    _GEMMA4_PROFILE_ENABLED = _env_truthy("FASTINFERENCE_GEMMA4_LAYER_PROFILE")
+    _GEMMA4_ROCTX_PROFILE_ENABLED = _env_truthy("FASTINFERENCE_GEMMA4_ROCTX_PROFILE")
+
+
+def _env_get(name: str, default: str = "") -> str:
+    if _GEMMA4_TUNING_LOCKED:
+        return _GEMMA4_TUNING.get(name, default)
+    return os.environ.get(name, _GEMMA4_TUNING.get(name, default))
+
+
+
+
+_GEMMA4_PROFILE_ENABLED = _env_get(
+    "FASTINFERENCE_GEMMA4_LAYER_PROFILE", ""
+).strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-_GEMMA4_ROCTX_PROFILE_ENABLED = os.environ.get("FASTINFERENCE_GEMMA4_ROCTX_PROFILE", "").strip().lower() in (
+_GEMMA4_ROCTX_PROFILE_ENABLED = _env_get(
+    "FASTINFERENCE_GEMMA4_ROCTX_PROFILE", ""
+).strip().lower() in (
     "1",
     "true",
     "yes",
@@ -58,13 +97,13 @@ except Exception:  # pragma: no cover - best-effort profiling hook
 
 def _resolve_gemma4_rope_cache_max_pos(config: LiteConfig) -> int:
     max_pos = int(getattr(config, "max_position_embeddings", 2048))
-    kv_max_raw = os.environ.get("FASTINFERENCE_KV_MAX_MODEL_LEN", "").strip()
+    kv_max_raw = _env_get("FASTINFERENCE_KV_MAX_MODEL_LEN", "").strip()
     if kv_max_raw:
         try:
             max_pos = min(max_pos, max(64, int(kv_max_raw)))
         except ValueError:
             pass
-    rope_cap_raw = os.environ.get("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS", "").strip()
+    rope_cap_raw = _env_get("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS", "").strip()
     if rope_cap_raw:
         try:
             max_pos = min(max_pos, max(64, int(rope_cap_raw)))
@@ -74,7 +113,7 @@ def _resolve_gemma4_rope_cache_max_pos(config: LiteConfig) -> int:
 
 
 def _resolve_gemma4_rope_cache_pool_limit() -> int:
-    raw = os.environ.get("FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX", "8").strip()
+    raw = _env_get("FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX", "8").strip()
     try:
         return max(1, min(128, int(raw)))
     except ValueError:
@@ -119,7 +158,11 @@ def _gemma4_profile_span(scope: str) -> _Gemma4ProfileSpan:
 
 def _dump_gemma4_profile() -> None:
     global _GEMMA4_PROFILE_PRINTED
-    if (not _GEMMA4_PROFILE_ENABLED) or _GEMMA4_PROFILE_PRINTED or (not _GEMMA4_PROFILE_STATS):
+    if (
+        (not _GEMMA4_PROFILE_ENABLED)
+        or _GEMMA4_PROFILE_PRINTED
+        or (not _GEMMA4_PROFILE_STATS)
+    ):
         return
     _GEMMA4_PROFILE_PRINTED = True
     total_s = sum(v["time_s"] for v in _GEMMA4_PROFILE_STATS.values())
@@ -141,7 +184,10 @@ def _dump_gemma4_profile() -> None:
                 "avg_ms": (time_s * 1000.0 / count) if count > 0 else 0.0,
             }
         )
-    print("[Gemma4LayerProfile] " + json.dumps({"total_s": total_s, "rows": rows}, ensure_ascii=True))
+    print(
+        "[Gemma4LayerProfile] "
+        + json.dumps({"total_s": total_s, "rows": rows}, ensure_ascii=True)
+    )
 
 
 atexit.register(_dump_gemma4_profile)
@@ -215,20 +261,30 @@ def _meta_set(meta: Any, key: str, value: Any) -> bool:
 
 
 def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+    return _env_get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_truthy_default_on(name: str) -> bool:
-    raw = os.environ.get(name)
+    raw = _env_get(name)
     if raw is None:
         return True
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+    raw = _env_get(name)
     if raw is None or raw.strip() == "":
         return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _env_int_alias(primary_name: str, legacy_name: str, default: int) -> int:
+    raw = _env_get(primary_name, "").strip()
+    if not raw:
+        raw = _env_get(legacy_name, str(default)).strip()
     try:
         return int(raw)
     except ValueError:
@@ -299,10 +355,14 @@ def _decode_int4_row(
     num_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    packed = cache[block_idx, block_offset, :num_kv_heads, : head_dim // 2].to(torch.int32)
+    packed = cache[block_idx, block_offset, :num_kv_heads, : head_dim // 2].to(
+        torch.int32
+    )
     low = ((packed << 28) >> 28).to(torch.float32)
     high = ((packed << 24) >> 28).to(torch.float32)
-    out = torch.empty((num_kv_heads, head_dim), device=cache.device, dtype=torch.float32)
+    out = torch.empty(
+        (num_kv_heads, head_dim), device=cache.device, dtype=torch.float32
+    )
     out[:, : head_dim // 2] = low
     out[:, head_dim // 2 :] = high
     if scale_cache is not None:
@@ -358,7 +418,9 @@ def _gather_recent_kv(
     k_scale_cache = kv_scale_cache[0] if kv_scale_cache is not None else None
     v_scale_cache = kv_scale_cache[1] if kv_scale_cache is not None else None
     is_int4 = "int4" in str(kv_cache_dtype).lower()
-    token_positions = torch.arange(start, seq_len, device=block_tables.device, dtype=torch.long)
+    token_positions = torch.arange(
+        start, seq_len, device=block_tables.device, dtype=torch.long
+    )
     bt_row = block_tables[batch_idx]
     block_indices = bt_row[token_positions // block_size]
     block_offsets = torch.remainder(token_positions, block_size)
@@ -450,7 +512,9 @@ def _gather_recent_kv_batched(
     rel = torch.arange(max_ctx, device=block_tables.device, dtype=torch.long)[None, :]
     valid = rel < ctx_lens[:, None]
     token_positions = starts[:, None] + rel
-    safe_token_positions = torch.where(valid, token_positions, torch.zeros_like(token_positions))
+    safe_token_positions = torch.where(
+        valid, token_positions, torch.zeros_like(token_positions)
+    )
     bt_idx = torch.div(safe_token_positions, block_size, rounding_mode="floor")
     block_indices = block_tables.gather(1, bt_idx)
     block_offsets = torch.remainder(safe_token_positions, block_size)
@@ -483,13 +547,19 @@ def _gather_recent_kv_batched(
             head_dim,
         ).reshape(bsz, max_ctx, num_kv_heads, head_dim)
     else:
-        k = k_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(torch.float32)
-        v = v_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(torch.float32)
+        k = k_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(
+            torch.float32
+        )
+        v = v_cache[block_indices, block_offsets, :num_kv_heads, :head_dim].to(
+            torch.float32
+        )
 
     valid4d = valid[:, :, None, None]
     k = torch.where(valid4d, k, torch.zeros_like(k))
     v = torch.where(valid4d, v, torch.zeros_like(v))
-    k_positions = torch.where(valid, token_positions, torch.full_like(token_positions, -1))
+    k_positions = torch.where(
+        valid, token_positions, torch.full_like(token_positions, -1)
+    )
     return k, v, k_positions, valid
 
 
@@ -750,7 +820,9 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
             rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0))
         )
         self.rope_type = str(rope_params.get("rope_type", "default"))
-        self.partial_rotary_factor = float(rope_params.get("partial_rotary_factor", 1.0))
+        self.partial_rotary_factor = float(
+            rope_params.get("partial_rotary_factor", 1.0)
+        )
         self._inv_freq_cpu = self._build_inv_freq().cpu()
         self._last_cache_key: Optional[
             tuple[int, int, float, str, float, str, int, str]
@@ -827,7 +899,9 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
             self._last_cache_value = cached
             return cached
         inv_freq = self._inv_freq_cpu.to(device=device, dtype=torch.float32)
-        t = torch.arange(self.max_position_embeddings, device=device, dtype=torch.float32)
+        t = torch.arange(
+            self.max_position_embeddings, device=device, dtype=torch.float32
+        )
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos().to(dtype=dtype)
         sin = freqs.sin().to(dtype=dtype)
@@ -883,7 +957,9 @@ def _get_rope(config: LiteConfig, head_size: int, layer_type: str):
 
 
 class Gemma4Attention(nn.Module):
-    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str, layer_idx: int):
+    def __init__(
+        self, config: LiteConfig, quant_config: Any, prefix: str, layer_idx: int
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -901,7 +977,9 @@ class Gemma4Attention(nn.Module):
         self.num_kv_heads = int(
             config.num_key_value_heads
             if self.is_sliding
-            else getattr(config, "num_global_key_value_heads", config.num_key_value_heads)
+            else getattr(
+                config, "num_global_key_value_heads", config.num_key_value_heads
+            )
         )
         # HF Gemma4TextAttention uses q/k RMSNorm and sets attention scaling to 1.0.
         # Keeping it aligned avoids over-damping logits (especially in MoE variants).
@@ -1058,12 +1136,19 @@ class Gemma4Attention(nn.Module):
                     seq_lens = _meta_get(attn_metadata, "seq_lens", None)
                     kv_start_t = _meta_get(attn_metadata, "kv_start_indices", None)
                     if kv_start_t is None:
-                        q_starts = seq_lens.to(device=q.device, dtype=torch.long) - seqlen
+                        q_starts = (
+                            seq_lens.to(device=q.device, dtype=torch.long) - seqlen
+                        )
                     else:
-                        q_starts = kv_start_t.to(device=q.device, dtype=torch.long).reshape(-1)
-                    q_positions = q_starts[:, None] + torch.arange(
-                        seqlen, device=q.device, dtype=torch.long
-                    )[None, :]
+                        q_starts = kv_start_t.to(
+                            device=q.device, dtype=torch.long
+                        ).reshape(-1)
+                    q_positions = (
+                        q_starts[:, None]
+                        + torch.arange(seqlen, device=q.device, dtype=torch.long)[
+                            None, :
+                        ]
+                    )
                     with _gemma4_profile_span("kv_read_local_prefill"):
                         k_ctx, v_ctx, k_positions, k_valid = _gather_recent_kv_batched(
                             kv_cache=kv_cache,
@@ -1078,28 +1163,36 @@ class Gemma4Attention(nn.Module):
                             max_seq_len_cpu=_meta_cpu_max_seq_len(attn_metadata),
                         )
                     if softcap is not None and float(softcap) > 0:
-                        out = _causal_attention_ref(
-                            q.transpose(1, 2).float(),
-                            k_ctx.transpose(1, 2).float(),
-                            v_ctx.transpose(1, 2).float(),
-                            self.scale,
-                            local_window=None,
-                            softcap=softcap,
-                            key_padding_mask=k_valid,
-                            q_positions=q_positions,
-                            k_positions=k_positions,
-                        ).to(q.dtype).view(bsz, seqlen, -1)
+                        out = (
+                            _causal_attention_ref(
+                                q.transpose(1, 2).float(),
+                                k_ctx.transpose(1, 2).float(),
+                                v_ctx.transpose(1, 2).float(),
+                                self.scale,
+                                local_window=None,
+                                softcap=softcap,
+                                key_padding_mask=k_valid,
+                                q_positions=q_positions,
+                                k_positions=k_positions,
+                            )
+                            .to(q.dtype)
+                            .view(bsz, seqlen, -1)
+                        )
                     else:
-                        out = _local_prefill_attention_sdpa(
-                            q,
-                            k_ctx,
-                            v_ctx,
-                            q_positions,
-                            k_positions,
-                            k_valid,
-                            local_window=None,
-                            scale=self.scale,
-                        ).to(q.dtype).view(bsz, seqlen, -1)
+                        out = (
+                            _local_prefill_attention_sdpa(
+                                q,
+                                k_ctx,
+                                v_ctx,
+                                q_positions,
+                                k_positions,
+                                k_valid,
+                                local_window=None,
+                                scale=self.scale,
+                            )
+                            .to(q.dtype)
+                            .view(bsz, seqlen, -1)
+                        )
             elif is_local and not is_prefill:
                 with _gemma4_profile_span("attn_local_decode"):
                     block_tables = _meta_get(attn_metadata, "block_tables", None)
@@ -1115,13 +1208,17 @@ class Gemma4Attention(nn.Module):
                     # -> -inf mask -> online softmax), so we no longer need to
                     # route softcap>0 through the eager pytorch ref path here.
                     use_triton_local_decode = (
-                        _env_truthy_default_on("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON")
+                        _env_truthy_default_on(
+                            "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON"
+                        )
                         and block_tables is not None
                         and seq_lens is not None
                         and seqlen == 1
                     )
                     if use_triton_local_decode:
-                        from vllm.kernels.triton.paged_attention import paged_attention_v1
+                        from vllm.kernels.triton.paged_attention import (
+                            paged_attention_v1,
+                        )
 
                         attn_out = torch.empty(
                             (bsz * seqlen, self.num_heads, self.head_dim),
@@ -1129,12 +1226,14 @@ class Gemma4Attention(nn.Module):
                             dtype=q.dtype,
                         )
                         with _gemma4_profile_span("kv_read_local_decode"):
-                            seq_lens_local, block_tables_local = _get_or_build_local_decode_aligned_metadata(
-                                attn_metadata=attn_metadata,
-                                block_tables=block_tables,
-                                seq_lens=seq_lens,
-                                local_window=ctx_window,
-                                block_size=int(k_cache.shape[1]),
+                            seq_lens_local, block_tables_local = (
+                                _get_or_build_local_decode_aligned_metadata(
+                                    attn_metadata=attn_metadata,
+                                    block_tables=block_tables,
+                                    seq_lens=seq_lens,
+                                    local_window=ctx_window,
+                                    block_size=int(k_cache.shape[1]),
+                                )
                             )
                         # Upper bound for paged_attention_v1: prefer a cheap
                         # CPU-side scalar so the 60-layer decode loop never
@@ -1175,13 +1274,17 @@ class Gemma4Attention(nn.Module):
                         with _gemma4_profile_span("attn_local_decode_kernel"):
                             paged_attention_v1(
                                 attn_out,
-                                q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                                q.reshape(
+                                    bsz * seqlen, self.num_heads, self.head_dim
+                                ).contiguous(),
                                 k_cache,
                                 v_cache,
                                 self.num_heads,
                                 self.scale,
                                 block_tables_local,
-                                seq_lens_local.to(device=q.device, dtype=seq_lens.dtype),
+                                seq_lens_local.to(
+                                    device=q.device, dtype=seq_lens.dtype
+                                ),
                                 k_cache.shape[1],
                                 max_ctx_local,
                                 None,
@@ -1193,6 +1296,7 @@ class Gemma4Attention(nn.Module):
                                 num_kv_heads=self.num_kv_heads,
                                 attn_scope="local",
                                 layer_type=self.layer_type,
+                                config=inf_config,
                                 softcap=(
                                     float(softcap)
                                     if softcap is not None and float(softcap) > 0.0
@@ -1202,35 +1306,48 @@ class Gemma4Attention(nn.Module):
                         out = attn_out.view(bsz, seqlen, -1)
                     else:
                         with _gemma4_profile_span("kv_read_local_decode"):
-                            k_ctx, v_ctx, k_positions, k_valid = _gather_recent_kv_batched(
-                                kv_cache=kv_cache,
-                                block_tables=block_tables,
-                                seq_lens=seq_lens,
-                                num_kv_heads=self.num_kv_heads,
-                                head_dim=self.head_dim,
-                                local_window=ctx_window,
-                                kv_cache_dtype=str(kv_dtype_name),
-                                kv_scale_cache=(k_scale_cache, v_scale_cache),
-                                seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
-                                max_seq_len_cpu=_meta_cpu_max_seq_len(attn_metadata),
+                            k_ctx, v_ctx, k_positions, k_valid = (
+                                _gather_recent_kv_batched(
+                                    kv_cache=kv_cache,
+                                    block_tables=block_tables,
+                                    seq_lens=seq_lens,
+                                    num_kv_heads=self.num_kv_heads,
+                                    head_dim=self.head_dim,
+                                    local_window=ctx_window,
+                                    kv_cache_dtype=str(kv_dtype_name),
+                                    kv_scale_cache=(k_scale_cache, v_scale_cache),
+                                    seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                                    max_seq_len_cpu=_meta_cpu_max_seq_len(
+                                        attn_metadata
+                                    ),
+                                )
                             )
                         q_positions = (
-                            seq_lens.to(device=q.device, dtype=torch.long)[:, None] - seqlen
-                        ) + torch.arange(seqlen, device=q.device, dtype=torch.long)[None, :]
-                        out = _causal_attention_ref(
-                            q.transpose(1, 2).float(),
-                            k_ctx.transpose(1, 2).float(),
-                            v_ctx.transpose(1, 2).float(),
-                            self.scale,
-                            local_window=None,
-                            softcap=softcap,
-                            key_padding_mask=k_valid,
-                            q_positions=q_positions,
-                            k_positions=k_positions,
-                        ).to(q.dtype).view(bsz, seqlen, -1)
+                            seq_lens.to(device=q.device, dtype=torch.long)[:, None]
+                            - seqlen
+                        ) + torch.arange(seqlen, device=q.device, dtype=torch.long)[
+                            None, :
+                        ]
+                        out = (
+                            _causal_attention_ref(
+                                q.transpose(1, 2).float(),
+                                k_ctx.transpose(1, 2).float(),
+                                v_ctx.transpose(1, 2).float(),
+                                self.scale,
+                                local_window=None,
+                                softcap=softcap,
+                                key_padding_mask=k_valid,
+                                q_positions=q_positions,
+                                k_positions=k_positions,
+                            )
+                            .to(q.dtype)
+                            .view(bsz, seqlen, -1)
+                        )
             else:
                 with _gemma4_profile_span("attn_global"):
-                    from vllm.engine.lite_engine import expand_metadata_for_paged_attention
+                    from vllm.engine.lite_engine import (
+                        expand_metadata_for_paged_attention,
+                    )
                     from vllm.kernels.triton.paged_attention import paged_attention_v1
 
                     attn_out = torch.empty(
@@ -1240,16 +1357,21 @@ class Gemma4Attention(nn.Module):
                     )
                     block_tables = _meta_get(attn_metadata, "block_tables", None)
                     seq_lens = _meta_get(attn_metadata, "seq_lens", None)
-                    use_full_ref = _should_use_full_decode_reference(str(kv_cache_dtype))
-                    if use_full_ref and block_tables is not None and seq_lens is not None:
+                    use_full_ref = _should_use_full_decode_reference(
+                        str(kv_cache_dtype)
+                    )
+                    if (
+                        use_full_ref
+                        and block_tables is not None
+                        and seq_lens is not None
+                    ):
                         outs = []
                         _global_seq_lens_cpu = _meta_cpu_seq_lens(attn_metadata)
                         for bi in range(bsz):
                             with _gemma4_profile_span("kv_read_global_ref"):
                                 _slc_hint = None
-                                if (
-                                    _global_seq_lens_cpu is not None
-                                    and bi < len(_global_seq_lens_cpu)
+                                if _global_seq_lens_cpu is not None and bi < len(
+                                    _global_seq_lens_cpu
                                 ):
                                     _slc_hint = int(_global_seq_lens_cpu[bi])
                                 k_ctx, v_ctx = _gather_recent_kv(
@@ -1265,25 +1387,31 @@ class Gemma4Attention(nn.Module):
                                     seq_len_cpu=_slc_hint,
                                 )
                             q_i = q[bi : bi + 1].transpose(1, 2).float()
-                            out_i = _causal_attention_ref(
-                                q_i,
-                                k_ctx.transpose(1, 2).float(),
-                                v_ctx.transpose(1, 2).float(),
-                                self.scale,
-                                local_window=None,
-                                softcap=softcap,
-                            ).to(q.dtype).view(1, seqlen, -1)
+                            out_i = (
+                                _causal_attention_ref(
+                                    q_i,
+                                    k_ctx.transpose(1, 2).float(),
+                                    v_ctx.transpose(1, 2).float(),
+                                    self.scale,
+                                    local_window=None,
+                                    softcap=softcap,
+                                )
+                                .to(q.dtype)
+                                .view(1, seqlen, -1)
+                            )
                             outs.append(out_i)
                         out = torch.cat(outs, dim=0)
                         return self.o_proj(out, lora_mapping)
-                    seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                        bsz,
-                        seqlen,
-                        is_prefill,
-                        seq_lens,
-                        block_tables,
-                        q.device,
-                        seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                    seq_lens_ext, block_tables_ext = (
+                        expand_metadata_for_paged_attention(
+                            bsz,
+                            seqlen,
+                            is_prefill,
+                            seq_lens,
+                            block_tables,
+                            q.device,
+                            seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                        )
                     )
                     max_ctx = int(
                         max(
@@ -1294,7 +1422,9 @@ class Gemma4Attention(nn.Module):
                     with _gemma4_profile_span("attn_global_kernel"):
                         paged_attention_v1(
                             attn_out,
-                            q.reshape(bsz * seqlen, self.num_heads, self.head_dim).contiguous(),
+                            q.reshape(
+                                bsz * seqlen, self.num_heads, self.head_dim
+                            ).contiguous(),
                             k_cache,
                             v_cache,
                             self.num_heads,
@@ -1312,6 +1442,7 @@ class Gemma4Attention(nn.Module):
                             num_kv_heads=self.num_kv_heads,
                             attn_scope="global",
                             layer_type=self.layer_type,
+                            config=inf_config,
                             softcap=(
                                 float(softcap)
                                 if softcap is not None and float(softcap) > 0.0
@@ -1568,7 +1699,11 @@ def _materialize_litelinear_dense_weight_awqaware(
             f"Layer '{getattr(layer, 'prefix', '<unknown>')}' dequantized weight too small: "
             f"got {tuple(dense_weight.shape)}, need ({out_features}, {in_features})"
         )
-    return dense_weight[:out_features, :in_features].contiguous().to(device=device, dtype=dtype)
+    return (
+        dense_weight[:out_features, :in_features]
+        .contiguous()
+        .to(device=device, dtype=dtype)
+    )
 
 
 class Gemma4MoeExpertsLite(nn.Module):
@@ -1652,10 +1787,7 @@ class Gemma4MoeExpertsLite(nn.Module):
             if cached is not None:
                 self._expert_weight_cache.move_to_end(expert_id)
                 return cached
-        if (
-            self._expert_cache_device != device
-            or self._expert_cache_dtype != dtype
-        ):
+        if self._expert_cache_device != device or self._expert_cache_dtype != dtype:
             self._expert_weight_cache.clear()
             self._expert_cache_device = device
             self._expert_cache_dtype = dtype
@@ -1677,11 +1809,15 @@ class Gemma4MoeExpertsLite(nn.Module):
             scales_d[expert_id].to(device=device),
             group_size=gsz_d,
         )
-        w1 = w1e[: 2 * self.intermediate_dim, : self.hidden_dim].contiguous().to(
-            device=device, dtype=dtype
+        w1 = (
+            w1e[: 2 * self.intermediate_dim, : self.hidden_dim]
+            .contiguous()
+            .to(device=device, dtype=dtype)
         )
-        w2 = w2e[: self.hidden_dim, : self.intermediate_dim].contiguous().to(
-            device=device, dtype=dtype
+        w2 = (
+            w2e[: self.hidden_dim, : self.intermediate_dim]
+            .contiguous()
+            .to(device=device, dtype=dtype)
         )
         if self._max_expert_cache > 0:
             self._expert_weight_cache[expert_id] = (w1, w2)
@@ -1699,7 +1835,9 @@ class Gemma4MoeExpertsLite(nn.Module):
     ) -> torch.Tensor:
         if topk_weights is None or topk_ids is None:
             if router_logits is None:
-                raise RuntimeError("router_logits or top-k routing inputs are required.")
+                raise RuntimeError(
+                    "router_logits or top-k routing inputs are required."
+                )
             topk_weights, topk_ids = torch.topk(
                 router_logits,
                 k=self.top_k,
@@ -1781,7 +1919,9 @@ class Gemma4MoeExpertsLite(nn.Module):
         ):
             w1_parts = []
             w2_parts = []
-            gsz_gu = max(1, int((qweight_gu.shape[2] * 8) // max(1, scales_gu.shape[2])))
+            gsz_gu = max(
+                1, int((qweight_gu.shape[2] * 8) // max(1, scales_gu.shape[2]))
+            )
             gsz_d = max(1, int((qweight_d.shape[2] * 8) // max(1, scales_d.shape[2])))
             for e in range(self.num_experts):
                 w1e = dequantize_symmetric_packed_int4_pytorch(
@@ -1795,10 +1935,14 @@ class Gemma4MoeExpertsLite(nn.Module):
                     group_size=gsz_d,
                 )
                 w1_parts.append(
-                    w1e[: 2 * self.intermediate_dim, : self.hidden_dim].to(device=device, dtype=dtype)
+                    w1e[: 2 * self.intermediate_dim, : self.hidden_dim].to(
+                        device=device, dtype=dtype
+                    )
                 )
                 w2_parts.append(
-                    w2e[: self.hidden_dim, : self.intermediate_dim].to(device=device, dtype=dtype)
+                    w2e[: self.hidden_dim, : self.intermediate_dim].to(
+                        device=device, dtype=dtype
+                    )
                 )
             w1 = torch.stack(w1_parts, dim=0).contiguous()
             w2 = torch.stack(w2_parts, dim=0).contiguous()
@@ -1862,7 +2006,9 @@ class Gemma4MoeExpertsLite(nn.Module):
                 )
             router_logits.scatter_(1, topk_ids, topk_weights.clamp_min(1e-20).log())
         if router_logits is None:
-            raise RuntimeError("router_logits is required when top-k routing is not provided.")
+            raise RuntimeError(
+                "router_logits is required when top-k routing is not provided."
+            )
         w1, w2 = self._materialize_expert_weights(
             hidden_states_2d.device,
             hidden_states_2d.dtype,
@@ -1892,7 +2038,11 @@ class Gemma4SparseMoeBlock(nn.Module):
         lora_mapping: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states_2d, shape = _reshape_hidden_to_2d(hidden_states_sparse)
-        router_src = hidden_states_router if hidden_states_router is not None else hidden_states_sparse
+        router_src = (
+            hidden_states_router
+            if hidden_states_router is not None
+            else hidden_states_sparse
+        )
         router_2d, _ = _reshape_hidden_to_2d(router_src)
         router_logits, routing_weights, selected_experts = self.router(router_2d)
         sparse_out_2d = self.experts(
@@ -1905,7 +2055,9 @@ class Gemma4SparseMoeBlock(nn.Module):
         dense_out = self.shared_mlp(hidden_states_dense, lora_mapping)
         return dense_out, sparse_out
 
-    def forward(self, hidden_states: torch.Tensor, lora_mapping: Any = None) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, lora_mapping: Any = None
+    ) -> torch.Tensor:
         dense_out, sparse_out = self.forward_branches(
             hidden_states,
             hidden_states,
@@ -1916,14 +2068,22 @@ class Gemma4SparseMoeBlock(nn.Module):
 
 
 class Gemma4DecoderLayer(nn.Module):
-    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str, layer_idx: int):
+    def __init__(
+        self, config: LiteConfig, quant_config: Any, prefix: str, layer_idx: int
+    ):
         super().__init__()
         self.layer_idx = int(layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
         self.self_attn = Gemma4Attention(config, quant_config, prefix, layer_idx)
-        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=_get_eps(config))
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=_get_eps(config)
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=_get_eps(config)
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=_get_eps(config)
+        )
         self.pre_feedforward_layernorm_2: Optional[RMSNorm] = None
         self.post_feedforward_layernorm_1: Optional[RMSNorm] = None
         self.post_feedforward_layernorm_2: Optional[RMSNorm] = None
@@ -1936,24 +2096,29 @@ class Gemma4DecoderLayer(nn.Module):
         # 1) explicit range start env
         # 2) legacy single-layer env
         # 3) default start layer 8
-        guard_start_raw = os.environ.get("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START")
-        if guard_start_raw is None:
-            guard_start_raw = os.environ.get(
-                "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_LAYER", "8"
-            )
-        self._fp32_residual_guard_start = int(guard_start_raw)
+        self._fp32_residual_guard_start = _env_int_alias(
+            "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START",
+            "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_LAYER",
+            8,
+        )
         # Default span=3 to cover [first_drift_layer, first_drift_layer+2].
         self._fp32_residual_guard_span = max(
             1,
-            int(os.environ.get("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN", "3")),
+            _env_int("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN", 3),
         )
         self.use_moe = _is_gemma4_moe_layer(config, layer_idx)
         if self.use_moe:
             # Gemma4-26B-A4B checkpoints expose dual pre-FFN norms and dual
             # branch post-FFN norms at layer root.
-            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=_get_eps(config))
-            self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=_get_eps(config))
-            self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=_get_eps(config))
+            self.pre_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=_get_eps(config)
+            )
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                config.hidden_size, eps=_get_eps(config)
+            )
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=_get_eps(config)
+            )
             self.mlp = Gemma4SparseMoeBlock(config, quant_config, prefix)
         else:
             self.mlp = Gemma4MLP(config, quant_config, prefix)
@@ -2083,7 +2248,9 @@ class Gemma4ForConditionalGeneration(nn.Module):
     def __init__(self, vllm_config: Any, prefix: str = ""):
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
-        self.model = Gemma4TextModel(hf_config, vllm_config.quant_config, prefix="model")
+        self.model = Gemma4TextModel(
+            hf_config, vllm_config.quant_config, prefix="model"
+        )
         self.lm_head = LiteLinear(
             self.model.config.hidden_size,
             self.model.config.vocab_size,
@@ -2101,9 +2268,13 @@ class Gemma4ForConditionalGeneration(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         _assert_text_only_kwargs(kwargs)
-        hidden = self.model(input_ids, positions, kv_caches, attn_metadata, lora_mapping)
+        hidden = self.model(
+            input_ids, positions, kv_caches, attn_metadata, lora_mapping
+        )
         if getattr(self.model.config, "tie_word_embeddings", False):
-            logits = torch.nn.functional.linear(hidden[:, -1:, :], self.model.embed_tokens.weight)
+            logits = torch.nn.functional.linear(
+                hidden[:, -1:, :], self.model.embed_tokens.weight
+            )
         else:
             logits = self.lm_head(hidden[:, -1:, :], lora_mapping)
         final_softcap = getattr(self.model.config, "final_logit_softcapping", None)

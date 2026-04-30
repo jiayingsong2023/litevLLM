@@ -1,0 +1,14 @@
+[
+  {
+    "id": "tiny_en_capital",
+    "prompt": "What is the capital of France? Answer in one short sentence."
+  },
+  {
+    "id": "tiny_en_bst",
+    "prompt": "Explain what a binary search tree is in one short paragraph."
+  },
+  {
+    "id": "tiny_chat_intro",
+    "prompt": "Please introduce yourself briefly and name one way you can help with coding tasks."
+  }
+]

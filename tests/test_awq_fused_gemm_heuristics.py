@@ -4,6 +4,7 @@ from __future__ import annotations
 from vllm.kernels.triton.awq_fused_gemm import (
     _env_fused_gemm_autotune,
     _select_fused_gemm_blocks,
+    set_awq_fused_tuning_config,
 )
 
 
@@ -29,16 +30,16 @@ def test_select_fused_gemm_blocks_deep_k_narrow_output_decode() -> None:
     assert _select_fused_gemm_blocks(4, 5376, 21504) == (16, 128, 64, 8, 2)
 
 
-def test_env_fused_gemm_autotune_auto_prefers_small_m_decode_autotune(monkeypatch) -> None:
-    monkeypatch.delenv("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", raising=False)
+def test_env_fused_gemm_autotune_auto_prefers_small_m_decode_autotune() -> None:
+    set_awq_fused_tuning_config({})
     assert _env_fused_gemm_autotune(1, 8192, 5376) is False
     assert _env_fused_gemm_autotune(4, 8192, 5376) is True
     assert _env_fused_gemm_autotune(128, 21504, 5376) is False
     assert _env_fused_gemm_autotune(256, 2048, 4096) is True
 
 
-def test_env_fused_gemm_autotune_explicit_override(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "1")
+def test_env_fused_gemm_autotune_explicit_override() -> None:
+    set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "1"})
     assert _env_fused_gemm_autotune(1, 8192, 5376) is False
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "off")
+    set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "off"})
     assert _env_fused_gemm_autotune(256, 2048, 4096) is False

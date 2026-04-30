@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
+
 from vllm.kernels.triton.paged_attention import paged_attention_v1
 
+
 def triton_paged_attention(
-    q, k, v, kv_cache,
-    slot_mapping,
-    seq_lens,
-    block_tables,
-    scale,
-    **kwargs
+    q, k, v, kv_cache, slot_mapping, seq_lens, block_tables, scale, **kwargs
 ):
     """
     LitevLLM Triton Paged Attention Wrapper.
@@ -17,9 +14,12 @@ def triton_paged_attention(
     # 1. Prepare scales (if not provided, check the forward context or layer attributes)
     # Note: In a real vLLM implementation, these would come from the Attention layer.
     # Here we default to 1.0 but expect them in kwargs if quantization is active.
-    k_scale = kwargs.get("k_scale", 1.0)
-    v_scale = kwargs.get("v_scale", 1.0)
-    kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+    config = kwargs.get("config")
+    k_scale = getattr(config, "k_scale", kwargs.get("k_scale", 1.0))
+    v_scale = getattr(config, "v_scale", kwargs.get("v_scale", 1.0))
+    kv_cache_dtype = getattr(
+        config, "kv_type", kwargs.get("kv_cache_dtype", "turbo_int4")
+    )
 
     # 2. Extract Key/Value Cache (Standard vLLM layout)
     # kv_cache[0] is Key, kv_cache[1] is Value
@@ -38,10 +38,21 @@ def triton_paged_attention(
 
     # 4. Invoke Triton Kernel
     paged_attention_v1(
-        out, q, key_cache, value_cache,
-        num_heads, scale, block_tables, seq_lens,
-        block_size, max_seq_len, None, kv_cache_dtype,
-        k_scale=k_scale, v_scale=v_scale
+        out,
+        q,
+        key_cache,
+        value_cache,
+        num_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        None,
+        kv_cache_dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        config=config,
     )
-    
+
     return out

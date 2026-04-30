@@ -1,11 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 import json
 from pathlib import Path
+import os
 import torch
-import triton
-import triton.language as tl
+from vllm.triton_utils import triton, tl
 
+
+
+_AWQ_FUSED_TUNING: dict[str, str] = {
+    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_AWQ_")
+}
+_AWQ_FUSED_TUNING_LOCKED = False
+
+
+def set_awq_fused_tuning_config(
+    values: dict[str, object] | None, *, locked: bool = False
+) -> None:
+    """Install an immutable-ish FASTINFERENCE_AWQ_* config snapshot.
+
+    LiteEngine calls this before model load so fused AWQ kernels do not read
+    process environment variables on the inference hot path. Standalone tools
+    retain import-time env snapshot behavior.
+    """
+    global _AWQ_FUSED_TUNING, _AWQ_FUSED_TUNING_LOCKED, _PERSISTENT_PROFILE_CACHE
+    _AWQ_FUSED_TUNING = {
+        str(key): str(value)
+        for key, value in (values or {}).items()
+        if str(key).startswith("FASTINFERENCE_AWQ_") and value is not None
+    }
+    _AWQ_FUSED_TUNING_LOCKED = bool(locked)
+    _PERSISTENT_PROFILE_CACHE = None
+
+
+def _env_get(name: str, default: str = "") -> str:
+    if _AWQ_FUSED_TUNING_LOCKED:
+        return _AWQ_FUSED_TUNING.get(name, default)
+    return os.environ.get(name, _AWQ_FUSED_TUNING.get(name, default))
 
 def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
@@ -21,7 +51,9 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     if a.dtype != torch.bfloat16:
         return False
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
+    raw = (
+        _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
+    )
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -42,22 +74,22 @@ def _select_fused_gemm_blocks(
     Decode often uses M in {1..32}; fixed BLOCK_M=64 wastes most warps on the M axis.
     Prefill uses larger M where BLOCK_M=64 is appropriate.
     """
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M", "").strip()
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M", "").strip()
     if raw:
         try:
             block_m = max(1, int(raw))
         except ValueError:
             block_m = 64
-        raw_n = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N", "").strip()
-        raw_k = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K", "").strip()
+        raw_n = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N", "").strip()
+        raw_k = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K", "").strip()
         block_n = int(raw_n) if raw_n else 64
         block_k = int(raw_k) if raw_k else 32
         block_n = max(16, block_n)
         block_k = max(8, block_k)
-        raw_w = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS", "").strip()
+        raw_w = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS", "").strip()
         num_warps = int(raw_w) if raw_w else 4
         num_warps = max(1, min(8, num_warps))
-        raw_s = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES", "").strip()
+        raw_s = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES", "").strip()
         num_stages = int(raw_s) if raw_s else 2
         num_stages = max(1, min(4, num_stages))
         return block_m, block_n, block_k, num_warps, num_stages
@@ -130,7 +162,7 @@ _PERSISTENT_PROFILE_CACHE: dict[str, list[dict[str, int]]] | None = None
 
 
 def _persistent_profile_path() -> Path:
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "").strip()
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "").strip()
     if not raw:
         return Path()
     return Path(raw).expanduser()
@@ -158,7 +190,13 @@ def _load_persistent_profile() -> dict[str, list[dict[str, int]]]:
                 rows: list[dict[str, int]] = []
                 for row in value:
                     if isinstance(row, dict):
-                        rows.append({str(k): int(v) for k, v in row.items() if isinstance(v, (int, float))})
+                        rows.append(
+                            {
+                                str(k): int(v)
+                                for k, v in row.items()
+                                if isinstance(v, (int, float))
+                            }
+                        )
                 out[str(key)] = rows
     _PERSISTENT_PROFILE_CACHE = out
     return _PERSISTENT_PROFILE_CACHE
@@ -228,7 +266,7 @@ def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
     mm, nn, kk = int(m), int(n), int(k)
     if mm == 1:
         return False
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "auto").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -252,19 +290,14 @@ def _select_split_k(m: int, n: int, k: int) -> int:
       - integer >= 1: force value
       - unset/"auto": shape-aware default
     """
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", "auto").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", "auto").strip().lower()
     if raw not in ("", "auto"):
         try:
             return max(1, int(raw))
         except ValueError:
             return 1
     mm, nn, kk = int(m), int(n), int(k)
-    if (
-        _env_awq_decode_gemv()
-        and mm == 1
-        and nn == 5376
-        and kk == 21504
-    ):
+    if _env_awq_decode_gemv() and mm == 1 and nn == 5376 and kk == 21504:
         # Gemma4-31B dense MLP down_proj decode hot shape. Route to split_k=1
         # so the M=1 grouped GEMV specialization can run; the generic split-K
         # kernel was previously chosen here to improve occupancy, but that kept
@@ -293,70 +326,102 @@ def _select_split_k(m: int, n: int, k: int) -> int:
 
 
 def _env_awq_decode_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_DECODE_GEMV", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_DECODE_GEMV", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_fused_gate_up() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_FUSED_GATE_UP", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_o_proj_group32_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV", "1").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV", "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_group32_gemv_all() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_GROUP32_GEMV_ALL", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_GROUP32_GEMV_ALL", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_qo_proj_exact_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_QO_PROJ_EXACT_GEMV", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_QO_PROJ_EXACT_GEMV", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_q_proj_exact_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_Q_PROJ_EXACT_GEMV", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_Q_PROJ_EXACT_GEMV", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_o_proj_exact_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_EXACT_GEMV", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_EXACT_GEMV", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _env_awq_o_proj_splitk_gemv() -> bool:
-    raw = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV", "0").strip().lower()
+    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 # Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA; autotune picks best per key.
 _PACKED_FUSED_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2
+    ),
     # Gemma4-31B packed-int4 winners on ROCm/gfx11-class workloads.
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=2
+    ),
 ]
 
 
 @triton.jit
 def _packed_int4_symmetric_grouped_gemv_m1(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
-    N, K, group_size,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    N,
+    K,
+    group_size,
     stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
     stride_cn,
     BLOCK_PACKS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -401,7 +466,9 @@ def _packed_int4_symmetric_grouped_gemv_m1(
         partial = tl.zeros((BLOCK_N, BLOCK_PACKS), dtype=tl.float32)
         for nibble in tl.static_range(0, 8):
             k_idx = pack_idx * 8 + nibble
-            aval = tl.load(a_ptr + k_idx * stride_ak, mask=mask_p & (k_idx < K), other=0.0)
+            aval = tl.load(
+                a_ptr + k_idx * stride_ak, mask=mask_p & (k_idx < K), other=0.0
+            )
             q = (packed >> (nibble * 4)) & 0xF
             partial += aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
         acc += tl.sum(partial, axis=1)
@@ -421,11 +488,18 @@ def _packed_int4_symmetric_grouped_gemv_m1(
 
 @triton.jit
 def _packed_int4_symmetric_group32_gemv_m1(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
-    N, K,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    N,
+    K,
     stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
     stride_cn,
     BLOCK_GROUPS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -466,9 +540,13 @@ def _packed_int4_symmetric_group32_gemv_m1(
             ).to(tl.int32)
             for nibble in tl.static_range(0, 8):
                 k_idx = group_idx * 32 + pack_in_group * 8 + nibble
-                aval = tl.load(a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0)
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0
+                )
                 q = (packed >> (nibble * 4)) & 0xF
-                group_partial += aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
         acc += tl.sum(group_partial, axis=1)
 
     if HAS_BIAS:
@@ -485,10 +563,16 @@ def _packed_int4_symmetric_group32_gemv_m1(
 
 @triton.jit
 def _packed_int4_symmetric_group32_gemv_m1_exact(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
     stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
     stride_cn,
     K_GROUPS: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
@@ -524,7 +608,9 @@ def _packed_int4_symmetric_group32_gemv_m1_exact(
                 k_idx = group_idx * 32 + pack_in_group * 8 + nibble
                 aval = tl.load(a_ptr + k_idx * stride_ak)
                 q = (packed >> (nibble * 4)) & 0xF
-                group_partial += aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
         acc += tl.sum(group_partial, axis=1)
 
     if HAS_BIAS:
@@ -541,10 +627,15 @@ def _packed_int4_symmetric_group32_gemv_m1_exact(
 
 @triton.jit
 def _packed_int4_symmetric_group32_o_proj_splitk_partial_m1(
-    a_ptr, b_ptr, s_ptr, partial_ptr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    partial_ptr,
     stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
     N: tl.constexpr,
     K_GROUPS: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -581,7 +672,9 @@ def _packed_int4_symmetric_group32_o_proj_splitk_partial_m1(
                 k_idx = group_idx * 32 + pack_in_group * 8 + nibble
                 aval = tl.load(a_ptr + k_idx * stride_ak)
                 q = (packed >> (nibble * 4)) & 0xF
-                group_partial += aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
         acc += tl.sum(group_partial, axis=1)
 
     tl.store(partial_ptr + pid_k * N + offs_n, acc)
@@ -589,7 +682,9 @@ def _packed_int4_symmetric_group32_o_proj_splitk_partial_m1(
 
 @triton.jit
 def _packed_int4_symmetric_group32_o_proj_splitk_reduce_m1(
-    partial_ptr, c_ptr, bias_ptr,
+    partial_ptr,
+    c_ptr,
+    bias_ptr,
     stride_cn,
     N: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -614,17 +709,30 @@ def _packed_int4_symmetric_group32_o_proj_splitk_reduce_m1(
 @triton.jit
 def _packed_int4_symmetric_group32_qkv_m1(
     a_ptr,
-    q_ptr, k_ptr, v_ptr,
-    qs_ptr, ks_ptr, vs_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    qs_ptr,
+    ks_ptr,
+    vs_ptr,
     c_ptr,
-    QN: tl.constexpr, KN: tl.constexpr, VN: tl.constexpr, K: tl.constexpr,
+    QN: tl.constexpr,
+    KN: tl.constexpr,
+    VN: tl.constexpr,
+    K: tl.constexpr,
     stride_ak,
-    stride_qn, stride_qk,
-    stride_kn, stride_kk,
-    stride_vn, stride_vk,
-    stride_qsn, stride_qsk,
-    stride_ksn, stride_ksk,
-    stride_vsn, stride_vsk,
+    stride_qn,
+    stride_qk,
+    stride_kn,
+    stride_kk,
+    stride_vn,
+    stride_vk,
+    stride_qsn,
+    stride_qsk,
+    stride_ksn,
+    stride_ksk,
+    stride_vsn,
+    stride_vsk,
     stride_cn,
     BLOCK_GROUPS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -666,7 +774,11 @@ def _packed_int4_symmetric_group32_qkv_m1(
         ).to(tl.float32)
         v_scale = tl.load(
             vs_ptr + local_n[:, None] * stride_vsn + group_idx[None, :] * stride_vsk,
-            mask=mask_t[:, None] & (~is_q[:, None]) & (~is_k[:, None]) & HAS_V & mask_g[None, :],
+            mask=mask_t[:, None]
+            & (~is_q[:, None])
+            & (~is_k[:, None])
+            & HAS_V
+            & mask_g[None, :],
             other=0.0,
         ).to(tl.float32)
         scale = q_scale + k_scale + v_scale
@@ -685,15 +797,23 @@ def _packed_int4_symmetric_group32_qkv_m1(
             ).to(tl.int32)
             v_packed = tl.load(
                 v_ptr + local_n[:, None] * stride_vn + pack_idx[None, :] * stride_vk,
-                mask=mask_t[:, None] & (~is_q[:, None]) & (~is_k[:, None]) & HAS_V & mask_g[None, :],
+                mask=mask_t[:, None]
+                & (~is_q[:, None])
+                & (~is_k[:, None])
+                & HAS_V
+                & mask_g[None, :],
                 other=0,
             ).to(tl.int32)
             packed = q_packed + k_packed + v_packed
             for nibble in tl.static_range(0, 8):
                 k_idx = group_idx * 32 + pack_in_group * 8 + nibble
-                aval = tl.load(a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0)
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0
+                )
                 q = (packed >> (nibble * 4)) & 0xF
-                group_partial += aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
         acc += tl.sum(group_partial, axis=1)
 
     if USE_BF16_OUTPUT:
@@ -705,13 +825,24 @@ def _packed_int4_symmetric_group32_qkv_m1(
 
 @triton.jit
 def _packed_int4_symmetric_fused_gate_up_m1(
-    a_ptr, gate_ptr, up_ptr, gate_s_ptr, up_s_ptr, c_ptr,
-    N, K, group_size,
+    a_ptr,
+    gate_ptr,
+    up_ptr,
+    gate_s_ptr,
+    up_s_ptr,
+    c_ptr,
+    N,
+    K,
+    group_size,
     stride_ak,
-    stride_gn, stride_gk,
-    stride_un, stride_uk,
-    stride_gsn, stride_gsk,
-    stride_usn, stride_usk,
+    stride_gn,
+    stride_gk,
+    stride_un,
+    stride_uk,
+    stride_gsn,
+    stride_gsk,
+    stride_usn,
+    stride_usk,
     stride_cn,
     BLOCK_PACKS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -764,11 +895,19 @@ def _packed_int4_symmetric_fused_gate_up_m1(
         up_partial = tl.zeros((BLOCK_N, BLOCK_PACKS), dtype=tl.float32)
         for nibble in tl.static_range(0, 8):
             k_idx = pack_idx * 8 + nibble
-            aval = tl.load(a_ptr + k_idx * stride_ak, mask=mask_p & (k_idx < K), other=0.0)
+            aval = tl.load(
+                a_ptr + k_idx * stride_ak, mask=mask_p & (k_idx < K), other=0.0
+            )
             gate_q = (gate_packed >> (nibble * 4)) & 0xF
             up_q = (up_packed >> (nibble * 4)) & 0xF
-            gate_partial += aval[None, :].to(tl.float32) * (gate_q.to(tl.float32) - 8.0) * gate_scale
-            up_partial += aval[None, :].to(tl.float32) * (up_q.to(tl.float32) - 8.0) * up_scale
+            gate_partial += (
+                aval[None, :].to(tl.float32)
+                * (gate_q.to(tl.float32) - 8.0)
+                * gate_scale
+            )
+            up_partial += (
+                aval[None, :].to(tl.float32) * (up_q.to(tl.float32) - 8.0) * up_scale
+            )
         gate_acc += tl.sum(gate_partial, axis=1)
         up_acc += tl.sum(up_partial, axis=1)
 
@@ -792,14 +931,29 @@ def _packed_int4_symmetric_fused_gate_up_m1(
 
 @triton.jit
 def _awq_native_tiled_gemm_split_k(
-    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_zn, stride_zk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    z_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_zn,
+    stride_zk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
@@ -811,7 +965,7 @@ def _awq_native_tiled_gemm_split_k(
     """
     pid = tl.program_id(0)
     pid_sk = tl.program_id(1)
-    
+
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
@@ -819,15 +973,19 @@ def _awq_native_tiled_gemm_split_k(
 
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    
+
     # Split K dimension
     iters_per_sk = tl.cdiv(tl.cdiv(K, BLOCK_K), SPLIT_K)
     start_k = pid_sk * iters_per_sk * BLOCK_K
     end_k = min(K, (pid_sk + 1) * iters_per_sk * BLOCK_K)
-    
+
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + (start_k + offs_k[None, :]) * stride_ak)
-    b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + ((start_k + offs_k[None, :]) // 8) * stride_bk)
+    a_ptrs = a_ptr + (
+        offs_am[:, None] * stride_am + (start_k + offs_k[None, :]) * stride_ak
+    )
+    b_ptrs = b_ptr + (
+        offs_bn[:, None] * stride_bn + ((start_k + offs_k[None, :]) // 8) * stride_bk
+    )
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -836,7 +994,7 @@ def _awq_native_tiled_gemm_split_k(
         k_remaining = K - curr_k_base
         mask_k = (offs_k[None, :] < BLOCK_K) & (curr_k_base + offs_k[None, :] < K)
         mask_k = mask_k & (curr_k_base < end_k)
-        
+
         a = tl.load(a_ptrs, mask=mask_k, other=0.0)
         b_packed = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & mask_k, other=0)
         b_unpacked = (b_packed >> ((offs_k[None, :] % 8) * 4)) & 0xF
@@ -844,10 +1002,20 @@ def _awq_native_tiled_gemm_split_k(
         current_k = curr_k_base + offs_k
         group_idx = current_k // group_size
         s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
-        z_ptrs = z_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
-        
-        scales = tl.load(s_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=1.0)
-        z_packed = tl.load(z_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=0)
+        z_ptrs = z_ptr + (
+            offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk
+        )
+
+        scales = tl.load(
+            s_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=1.0,
+        )
+        z_packed = tl.load(
+            z_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=0,
+        )
         zeros = (z_packed >> ((group_idx[None, :] % 8) * 4)) & 0xF
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
@@ -870,33 +1038,52 @@ def _awq_native_tiled_gemm_split_k(
         result = accumulator.to(tl.bfloat16)
     else:
         result = accumulator.to(tl.float16)
-        
+
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    
+
     # Use atomic add if SPLIT_K > 1
     if SPLIT_K > 1:
-        tl.atomic_add(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+        tl.atomic_add(
+            c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        )
     else:
         if HAS_BIAS:
             bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
             accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-            if USE_BF16_OUTPUT: result = accumulator.to(tl.bfloat16)
-            else: result = accumulator.to(tl.float16)
+            if USE_BF16_OUTPUT:
+                result = accumulator.to(tl.bfloat16)
+            else:
+                result = accumulator.to(tl.float16)
         tl.store(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 @triton.jit
 def _awq_native_tiled_gemm_heuristic(
-    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_zn, stride_zk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    z_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_zn,
+    stride_zk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -913,10 +1100,10 @@ def _awq_native_tiled_gemm_heuristic(
 
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    
+
     # Static K-axis offsets
     offs_k = tl.arange(0, BLOCK_K)
-    
+
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + (offs_k[None, :] // 8) * stride_bk)
 
@@ -927,7 +1114,7 @@ def _awq_native_tiled_gemm_heuristic(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         k_remaining = K - k * BLOCK_K
         mask_k = offs_k[None, :] < k_remaining
-        
+
         # 1. Load A
         a = tl.load(a_ptrs, mask=mask_k, other=0.0)
 
@@ -939,10 +1126,20 @@ def _awq_native_tiled_gemm_heuristic(
         current_k = k * BLOCK_K + offs_k
         group_idx = current_k // group_size
         s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
-        z_ptrs = z_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
-        
-        scales = tl.load(s_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=1.0)
-        z_packed = tl.load(z_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=0)
+        z_ptrs = z_ptr + (
+            offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk
+        )
+
+        scales = tl.load(
+            s_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=1.0,
+        )
+        z_packed = tl.load(
+            z_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=0,
+        )
         zeros = (z_packed >> ((group_idx[None, :] % 8) * 4)) & 0xF
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
@@ -977,13 +1174,26 @@ def _awq_native_tiled_gemm_heuristic(
 
 @triton.jit
 def _packed_int4_symmetric_tiled_gemm_split_k(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
@@ -998,14 +1208,18 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
 
     offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-    
+
     iters_per_sk = tl.cdiv(tl.cdiv(K, BLOCK_K), SPLIT_K)
     start_k = pid_sk * iters_per_sk * BLOCK_K
     end_k = min(K, (pid_sk + 1) * iters_per_sk * BLOCK_K)
-    
+
     offs_k = tl.arange(0, BLOCK_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + (start_k + offs_k[None, :]) * stride_ak)
-    b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + ((start_k + offs_k[None, :]) // 8) * stride_bk)
+    a_ptrs = a_ptr + (
+        offs_am[:, None] * stride_am + (start_k + offs_k[None, :]) * stride_ak
+    )
+    b_ptrs = b_ptr + (
+        offs_bn[:, None] * stride_bn + ((start_k + offs_k[None, :]) // 8) * stride_bk
+    )
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, iters_per_sk):
@@ -1055,37 +1269,54 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         result = accumulator.to(tl.bfloat16)
     else:
         result = accumulator.to(tl.float16)
-        
+
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    
+
     if SPLIT_K > 1:
-        tl.atomic_add(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+        tl.atomic_add(
+            c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        )
     else:
         if HAS_BIAS:
             bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
             accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-            if USE_BF16_OUTPUT: result = accumulator.to(tl.bfloat16)
-            else: result = accumulator.to(tl.float16)
+            if USE_BF16_OUTPUT:
+                result = accumulator.to(tl.bfloat16)
+            else:
+                result = accumulator.to(tl.float16)
         tl.store(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
 @triton.jit
 def _packed_int4_symmetric_tiled_gemm_heuristic(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     USE_BF16_DOT: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     """
-    Optimized Symmetric INT4 GEMM. 
+    Optimized Symmetric INT4 GEMM.
     Uses per-element group index for scales so results remain correct when
     BLOCK_K spans multiple quant groups (e.g. group_size=32, BLOCK_K=64).
     """
@@ -1105,14 +1336,14 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
 
     # Heuristic: if BLOCK_K is a multiple of group_size (or vice versa), we can optimize scale loads.
     # Most common: BLOCK_K=64, group_size=128. Scale stays same for 2 iterations.
-    
+
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         k_remaining = K - k * BLOCK_K
         mask_k = offs_k[None, :] < k_remaining
 
         a = tl.load(a_ptrs, mask=mask_k, other=0.0)
         b_packed = tl.load(b_ptrs, mask=(offs_bn[:, None] < N) & mask_k, other=0)
-        
+
         # Fast 4-bit unpacking using bitwise shifts
         b_unpacked = (b_packed >> ((offs_k[None, :] % 8) * 4)) & 0xF
 
@@ -1148,12 +1379,12 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
         accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-    
+
     if USE_BF16_OUTPUT:
         c = accumulator.to(tl.bfloat16)
     else:
         c = accumulator.to(tl.float16)
-        
+
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
@@ -1167,13 +1398,26 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
 )
 @triton.jit
 def _packed_int4_symmetric_tiled_gemm_autotuned(
-    a_ptr, b_ptr, s_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BF16_DOT: tl.constexpr,
     OUT_BF16: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -1245,14 +1489,29 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
 )
 @triton.jit
 def _awq_native_tiled_gemm_autotuned(
-    a_ptr, b_ptr, s_ptr, z_ptr, c_ptr, bias_ptr,
-    M, N, K, group_size,
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sn, stride_sk,
-    stride_zn, stride_zk,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    z_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    group_size,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_zn,
+    stride_zk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BF16_DOT: tl.constexpr,
     OUT_BF16: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -1284,10 +1543,20 @@ def _awq_native_tiled_gemm_autotuned(
         current_k = k * BLOCK_K + offs_k
         group_idx = current_k // group_size
         s_ptrs = s_ptr + (offs_bn[:, None] * stride_sn + group_idx[None, :] * stride_sk)
-        z_ptrs = z_ptr + (offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk)
+        z_ptrs = z_ptr + (
+            offs_bn[:, None] * stride_zn + (group_idx[None, :] // 8) * stride_zk
+        )
 
-        scales = tl.load(s_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=1.0)
-        z_packed = tl.load(z_ptrs, mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)), other=0)
+        scales = tl.load(
+            s_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=1.0,
+        )
+        z_packed = tl.load(
+            z_ptrs,
+            mask=(offs_bn[:, None] < N) & (group_idx[None, :] < tl.cdiv(K, group_size)),
+            other=0,
+        )
         zeros = (z_packed >> ((group_idx[None, :] % 8) * 4)) & 0x0F
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
@@ -1316,7 +1585,7 @@ def _awq_native_tiled_gemm_autotuned(
 def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
     M, K = a.shape
     N = qweight.shape[0]
-    
+
     has_bias = bias is not None
     if has_bias:
         if bias.dim() != 1 or int(bias.shape[0]) != N:
@@ -1325,7 +1594,9 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
             )
         bias = bias.contiguous().reshape(N)
         if bias.device != a.device:
-            raise ValueError("awq_fused_gemm: bias must be on the same device as activations")
+            raise ValueError(
+                "awq_fused_gemm: bias must be on the same device as activations"
+            )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
     bias_ptr_arg = bias if has_bias else a
@@ -1350,7 +1621,9 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
             c.zero_()
 
     if _env_fused_gemm_autotune(M, N, K) and split_k == 1 and M > 1:
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        )
         try:
             _awq_native_tiled_gemm_autotuned[grid](
                 a,
@@ -1381,8 +1654,10 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         except Exception:
             pass
 
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(M, N, K)
-    
+    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(
+        M, N, K
+    )
+
     if split_k > 1:
         grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), split_k)
         _awq_native_tiled_gemm_split_k[grid](
@@ -1461,7 +1736,7 @@ def packed_int4_symmetric_fused_gemm(
 ) -> torch.Tensor:
     m, k = a.shape
     n = qweight.shape[0]
-    
+
     has_bias = bias is not None
     if has_bias:
         if bias.dim() != 1 or int(bias.shape[0]) != n:
@@ -1474,7 +1749,9 @@ def packed_int4_symmetric_fused_gemm(
                 "packed_int4_symmetric_fused_gemm: bias must be on the same device as activations"
             )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError(f"packed_int4_symmetric_fused_gemm: unsupported bias dtype {bias.dtype}")
+            raise ValueError(
+                f"packed_int4_symmetric_fused_gemm: unsupported bias dtype {bias.dtype}"
+            )
     bias_ptr_arg = bias if has_bias else a
 
     use_bf16_dot = _resolve_use_bf16_dot(a, m, n)
@@ -1510,9 +1787,13 @@ def packed_int4_symmetric_fused_gemm(
             and k == 16384
             and (k // 32) % 2 == 0
         ):
-            raw_split_k = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_SPLITK", "4")
-            raw_block_n = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N", "128")
-            raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_GROUPS", "4")
+            raw_split_k = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK", "4")
+            raw_block_n = _env_get(
+                "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N", "128"
+            )
+            raw_block_groups = _env_get(
+                "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_GROUPS", "4"
+            )
             try:
                 o_split_k = int(raw_split_k)
             except ValueError:
@@ -1529,8 +1810,14 @@ def packed_int4_symmetric_fused_gemm(
             block_n = max(32, min(512, block_n))
             block_groups = max(1, min(16, block_groups))
             k_groups = k // 32
-            if n % block_n == 0 and k_groups % o_split_k == 0 and (k_groups // o_split_k) % block_groups == 0:
-                partial = torch.empty((o_split_k, n), device=a.device, dtype=torch.float32)
+            if (
+                n % block_n == 0
+                and k_groups % o_split_k == 0
+                and (k_groups // o_split_k) % block_groups == 0
+            ):
+                partial = torch.empty(
+                    (o_split_k, n), device=a.device, dtype=torch.float32
+                )
                 partial_grid = (triton.cdiv(n, block_n), o_split_k)
                 _packed_int4_symmetric_group32_o_proj_splitk_partial_m1[partial_grid](
                     a,
@@ -1578,11 +1865,19 @@ def packed_int4_symmetric_fused_gemm(
         )
         if use_q_exact or use_o_exact:
             if n == 5376:
-                raw_block_n = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256")
-                raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4")
+                raw_block_n = _env_get(
+                    "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256"
+                )
+                raw_block_groups = _env_get(
+                    "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4"
+                )
             else:
-                raw_block_n = os.environ.get("FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_N", "128")
-                raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "8")
+                raw_block_n = _env_get(
+                    "FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_N", "128"
+                )
+                raw_block_groups = _env_get(
+                    "FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "8"
+                )
             try:
                 block_n = int(raw_block_n)
             except ValueError:
@@ -1617,13 +1912,13 @@ def packed_int4_symmetric_fused_gemm(
                 )
                 return c
 
-        if (
-            _env_awq_o_proj_group32_gemv()
-            and n == 5376
-            and k == 16384
-        ):
-            raw_block_n = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256")
-            raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4")
+        if _env_awq_o_proj_group32_gemv() and n == 5376 and k == 16384:
+            raw_block_n = _env_get(
+                "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256"
+            )
+            raw_block_groups = _env_get(
+                "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4"
+            )
             try:
                 block_n = int(raw_block_n)
             except ValueError:
@@ -1659,8 +1954,12 @@ def packed_int4_symmetric_fused_gemm(
             return c
 
         if _env_awq_group32_gemv_all():
-            raw_block_n = os.environ.get("FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N", "128")
-            raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_GROUPS", "8")
+            raw_block_n = _env_get(
+                "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N", "128"
+            )
+            raw_block_groups = _env_get(
+                "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_GROUPS", "8"
+            )
             try:
                 block_n = int(raw_block_n)
             except ValueError:
@@ -1695,13 +1994,15 @@ def packed_int4_symmetric_fused_gemm(
             )
             return c
 
-        raw_block_n = os.environ.get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_N", "128")
+        raw_block_n = _env_get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_N", "128")
         try:
             block_n = int(raw_block_n)
         except ValueError:
             block_n = 256
         block_n = max(32, min(512, block_n))
-        raw_block_packs = os.environ.get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS", "16")
+        raw_block_packs = _env_get(
+            "FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS", "16"
+        )
         try:
             block_packs = int(raw_block_packs)
         except ValueError:
@@ -1776,7 +2077,9 @@ def packed_int4_symmetric_fused_gemm(
         return c
 
     if _env_fused_gemm_autotune(m, n, k) and split_k == 1 and m > 1:
-        grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
+        grid = lambda meta: (
+            triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
+        )
         try:
             _packed_int4_symmetric_tiled_gemm_autotuned[grid](
                 a,
@@ -1804,8 +2107,10 @@ def packed_int4_symmetric_fused_gemm(
         except Exception:
             pass
 
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(m, n, k)
-    
+    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(
+        m, n, k
+    )
+
     if split_k > 1:
         grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n), split_k)
         _packed_int4_symmetric_tiled_gemm_split_k[grid](
@@ -1884,9 +2189,13 @@ def packed_int4_symmetric_fused_gate_up_m1(
     if m != 1:
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: requires M == 1")
     if int(group_size) != 32 or k % 32 != 0:
-        raise ValueError("packed_int4_symmetric_fused_gate_up_m1: requires group_size=32 and K%32==0")
+        raise ValueError(
+            "packed_int4_symmetric_fused_gate_up_m1: requires group_size=32 and K%32==0"
+        )
     if tuple(gate_qweight.shape) != tuple(up_qweight.shape):
-        raise ValueError("packed_int4_symmetric_fused_gate_up_m1: qweight shape mismatch")
+        raise ValueError(
+            "packed_int4_symmetric_fused_gate_up_m1: qweight shape mismatch"
+        )
     if tuple(gate_scales.shape) != tuple(up_scales.shape):
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: scale shape mismatch")
     if int(gate_qweight.shape[1]) * 8 != k:
@@ -1895,8 +2204,10 @@ def packed_int4_symmetric_fused_gate_up_m1(
         c = torch.empty((1, n), device=a.device, dtype=a.dtype)
     else:
         c = out
-    raw_block_n = os.environ.get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N", "128")
-    raw_block_packs = os.environ.get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16")
+    raw_block_n = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N", "128")
+    raw_block_packs = _env_get(
+        "FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16"
+    )
     try:
         block_n = int(raw_block_n)
     except ValueError:
@@ -1956,7 +2267,9 @@ def packed_int4_symmetric_fused_qkv_m1(
     if m != 1:
         raise ValueError("packed_int4_symmetric_fused_qkv_m1: requires M == 1")
     if int(group_size) != 32 or k % 32 != 0:
-        raise ValueError("packed_int4_symmetric_fused_qkv_m1: requires group_size=32 and K%32==0")
+        raise ValueError(
+            "packed_int4_symmetric_fused_qkv_m1: requires group_size=32 and K%32==0"
+        )
     qn = int(q_qweight.shape[0])
     kn = int(k_qweight.shape[0])
     has_v = v_qweight is not None and v_scales is not None
@@ -1970,8 +2283,10 @@ def packed_int4_symmetric_fused_qkv_m1(
         v_qweight = q_qweight
     if v_scales is None:
         v_scales = q_scales
-    raw_block_n = os.environ.get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N", "256")
-    raw_block_groups = os.environ.get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS", "4")
+    raw_block_n = _env_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N", "256")
+    raw_block_groups = _env_get(
+        "FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS", "4"
+    )
     try:
         block_n = int(raw_block_n)
     except ValueError:
@@ -2069,8 +2384,10 @@ def packed_int4_symmetric_fused_qkv_m1_safe(
             v_scales.contiguous() if has_v else None,
             int(group_size),
         )
-        expected_n = int(q_qweight.shape[0]) + int(k_qweight.shape[0]) + (
-            int(v_qweight.shape[0]) if has_v else 0
+        expected_n = (
+            int(q_qweight.shape[0])
+            + int(k_qweight.shape[0])
+            + (int(v_qweight.shape[0]) if has_v else 0)
         )
         if c.shape != (1, expected_n):
             return c, False, "bad_output_shape"
@@ -2159,7 +2476,11 @@ def awq_fused_gemm_safe(
         return a, False, "k_mismatch"
     if group_size <= 0 or k % int(group_size) != 0:
         return a, False, "group_mismatch"
-    if a.device != qweight.device or a.device != scales.device or a.device != qzeros.device:
+    if (
+        a.device != qweight.device
+        or a.device != scales.device
+        or a.device != qzeros.device
+    ):
         return a, False, "device_mismatch"
     if a.dtype not in (torch.float16, torch.bfloat16):
         return a, False, f"unsupported_dtype_{str(a.dtype)}"

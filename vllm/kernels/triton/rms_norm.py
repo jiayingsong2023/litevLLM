@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
-import triton
-import triton.language as tl
+from vllm.triton_utils import triton, tl
+
 
 @triton.jit
 def _rms_norm_kernel(
-    X_ptr, Y_ptr, W_ptr,
-    stride_x, stride_y,
-    N, eps,
+    X_ptr,
+    Y_ptr,
+    W_ptr,
+    stride_x,
+    stride_y,
+    N,
+    eps,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -30,6 +34,7 @@ def _rms_norm_kernel(
 
     tl.store(Y_ptr + tl.arange(0, BLOCK_SIZE), y, mask=mask)
 
+
 def rms_norm(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -40,24 +45,33 @@ def rms_norm(
     orig_shape = input.shape
     input_2d = input.view(-1, orig_shape[-1])
     out_2d = out.view(-1, orig_shape[-1])
-    
+
     M, N = input_2d.shape
     BLOCK_SIZE = triton.next_power_of_2(N)
-    
+
     grid = (M,)
-    
+
     _rms_norm_kernel[grid](
-        input_2d, out_2d, weight,
-        input_2d.stride(0), out_2d.stride(0),
-        N, epsilon,
+        input_2d,
+        out_2d,
+        weight,
+        input_2d.stride(0),
+        out_2d.stride(0),
+        N,
+        epsilon,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
+
 @triton.jit
 def _fused_add_rms_norm_kernel(
-    X_ptr, Res_ptr, W_ptr,
-    stride_x, stride_res,
-    N, eps,
+    X_ptr,
+    Res_ptr,
+    W_ptr,
+    stride_x,
+    stride_res,
+    N,
+    eps,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -66,7 +80,7 @@ def _fused_add_rms_norm_kernel(
 
     mask = tl.arange(0, BLOCK_SIZE) < N
     cols = tl.arange(0, BLOCK_SIZE)
-    
+
     x = tl.load(X_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     res = tl.load(Res_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
@@ -87,6 +101,7 @@ def _fused_add_rms_norm_kernel(
     # Store normalized output to X
     tl.store(X_ptr + cols, y, mask=mask)
 
+
 def fused_add_rms_norm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -97,14 +112,18 @@ def fused_add_rms_norm(
     orig_shape = input.shape
     input_2d = input.view(-1, orig_shape[-1])
     residual_2d = residual.view(-1, orig_shape[-1])
-    
+
     M, N = input_2d.shape
     BLOCK_SIZE = triton.next_power_of_2(N)
     grid = (M,)
-    
+
     _fused_add_rms_norm_kernel[grid](
-        input_2d, residual_2d, weight,
-        input_2d.stride(0), residual_2d.stride(0),
-        N, epsilon,
+        input_2d,
+        residual_2d,
+        weight,
+        input_2d.stride(0),
+        residual_2d.stride(0),
+        N,
+        epsilon,
         BLOCK_SIZE=BLOCK_SIZE,
     )

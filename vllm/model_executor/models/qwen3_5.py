@@ -17,11 +17,41 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_expert_lru_size,
     moe_fp8_dequant_to_linear_weight,
 )
+_QWEN35_TUNING: dict[str, str] = {
+    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_QWEN35_") or key.startswith("FASTINFERENCE_DISABLE_")
+}
+_QWEN35_TUNING_LOCKED = False
+
+
+def set_qwen35_tuning_config(
+    values: dict[str, object] | None, *, locked: bool = False
+) -> None:
+    """Install Qwen3.5 tuning flags before model construction."""
+    global _QWEN35_TUNING, _QWEN35_TUNING_LOCKED
+    _QWEN35_TUNING = {
+        str(key): str(value)
+        for key, value in (values or {}).items()
+        if (
+            str(key).startswith("FASTINFERENCE_QWEN35_")
+            or str(key).startswith("FASTINFERENCE_DISABLE_")
+        )
+        and value is not None
+    }
+    _QWEN35_TUNING_LOCKED = bool(locked)
+
+
+def _env_get(name: str, default: str = "") -> str:
+    if _QWEN35_TUNING_LOCKED:
+        return _QWEN35_TUNING.get(name, default)
+    return os.environ.get(name, _QWEN35_TUNING.get(name, default))
+
+
+
 
 
 def _env_truthy(name: str) -> bool:
     """True for 1/true/yes/on (case-insensitive). Used for debug / ablation toggles."""
-    v = os.environ.get(name, "").strip().lower()
+    v = _env_get(name, "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
@@ -31,7 +61,11 @@ def _env_qwen35_sdpa_prefill_enabled() -> bool:
     Default OFF: prefill uses HF ``eager_attention_forward`` math (repeat_kv + float32 softmax + causal mask).
     Set FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL=1 to enable SDPA (e2e_full_benchmark sets this for throughput).
     """
-    v = os.environ.get("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0").strip().lower()
+    v = (
+        _env_get("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0")
+        .strip()
+        .lower()
+    )
     return v in ("1", "true", "yes", "on")
 
 
@@ -40,7 +74,9 @@ def _repeat_kv_hf(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    x = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    x = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return x.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -60,14 +96,18 @@ def _hf_eager_causal_attention_prefill(
     value_states = _repeat_kv_hf(value, n_rep)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     seq_len = query.shape[2]
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
+    causal_mask = torch.triu(
+        torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1
+    )
     attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_output = torch.matmul(attn_weights, value_states)
     return attn_output.transpose(1, 2).contiguous()
 
 
-def _hf_conv_state_from_preconv(mixed_b_c_l: torch.Tensor, kernel_size: int) -> torch.Tensor:
+def _hf_conv_state_from_preconv(
+    mixed_b_c_l: torch.Tensor, kernel_size: int
+) -> torch.Tensor:
     """
     Match HF ``F.pad(mixed_qkv, (k - L, 0))`` on the sequence dimension (last).
     Positive pad left-pads when L < k; negative pad crops to the last k positions when L >= k.
@@ -96,7 +136,9 @@ def _torch_causal_conv1d_update(
 
     hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
     new_state = hidden_states_new[:, :, -state_len:].contiguous()
-    out = F.conv1d(hidden_states_new, weight, bias, stride=1, padding=0, groups=hidden_size)
+    out = F.conv1d(
+        hidden_states_new, weight, bias, stride=1, padding=0, groups=hidden_size
+    )
     out = F.silu(out[:, :, -seq_len:])
     return out.to(hidden_states.dtype), new_state
 
@@ -106,7 +148,7 @@ def _env_qwen35_fla_chunk_enabled() -> bool:
     Default ON (CUDA): use FLA fused ``chunk_gated_delta_rule`` to match Hugging Face Qwen3.5 text.
     Set FASTINFERENCE_QWEN35_USE_FLA_CHUNK=0 to force the pure PyTorch reference (slower, drifts vs HF).
     """
-    v = os.environ.get("FASTINFERENCE_QWEN35_USE_FLA_CHUNK", "1").strip().lower()
+    v = _env_get("FASTINFERENCE_QWEN35_USE_FLA_CHUNK", "1").strip().lower()
     return v not in ("0", "false", "no", "off")
 
 
@@ -140,7 +182,8 @@ def _torch_chunk_gated_delta_rule(
         query = _l2norm(query, dim=-1, eps=1e-6)
         key = _l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
     ]
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
@@ -158,10 +201,14 @@ def _torch_chunk_gated_delta_rule(
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
     query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
 
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
@@ -179,7 +226,10 @@ def _torch_chunk_gated_delta_rule(
         else initial_state.to(value)
     )
     core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
 
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
@@ -190,12 +240,17 @@ def _torch_chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
+                -1, -2
+            )
+            @ v_new
         )
 
     if not output_final_state:
         last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
@@ -220,7 +275,8 @@ def _hf_torch_recurrent_gated_delta_rule(
         query = _l2norm(query, dim=-1, eps=1e-6)
         key = _l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
     ]
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
@@ -228,7 +284,9 @@ def _hf_torch_recurrent_gated_delta_rule(
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(
+        value
+    )
     last_recurrent_state = (
         torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
         if initial_state is None
@@ -245,7 +303,9 @@ def _hf_torch_recurrent_gated_delta_rule(
         last_recurrent_state = last_recurrent_state * g_t
         kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(
+            -1
+        ) * delta.unsqueeze(-2)
         core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
 
     if not output_final_state:
@@ -344,7 +404,9 @@ class Qwen3_5RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        output = x.float() * torch.rsqrt(
+            x.float().pow(2).mean(-1, keepdim=True) + self.eps
+        )
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
@@ -393,27 +455,23 @@ class Qwen3_5MoeExpertsLite(nn.Module):
         self.hidden_dim = int(config.hidden_size)
         self.intermediate_dim = int(config.moe_intermediate_size)
         f8 = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else None
-        
+
         self.fp8_moe = bool(
             f8 is not None
             and moe_fp8_enabled()
             and dims_ok_for_moe_fp8(self.hidden_dim, self.intermediate_dim)
         )
-        self.moe_cpu_offload = bool(
-            self.fp8_moe and moe_offload_enabled()
-        )
+        self.moe_cpu_offload = bool(self.fp8_moe and moe_offload_enabled())
         self.lru_size = moe_expert_lru_size()
-        self._lru_gpu: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = (
-            OrderedDict()
-        )
+        self._lru_gpu: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
 
         # Standard ParameterLists for experts - populated during load
-        self.gate_up_proj = nn.ParameterList([
-            nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)
-        ])
-        self.down_proj = nn.ParameterList([
-            nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)
-        ])
+        self.gate_up_proj = nn.ParameterList(
+            [nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)]
+        )
+        self.down_proj = nn.ParameterList(
+            [nn.Parameter(torch.empty(0)) for _ in range(self.num_experts)]
+        )
 
         if self.fp8_moe and self.moe_cpu_offload:
             ou, inn = fp8_scale_shape_2d(2 * self.intermediate_dim, self.hidden_dim)
@@ -430,7 +488,9 @@ class Qwen3_5MoeExpertsLite(nn.Module):
             )
             self.register_buffer(
                 "_gate_up_scale_cpu",
-                torch.empty(self.num_experts, ou, inn, dtype=torch.float32).pin_memory(),
+                torch.empty(
+                    self.num_experts, ou, inn, dtype=torch.float32
+                ).pin_memory(),
                 persistent=True,
             )
             self.register_buffer(
@@ -445,28 +505,45 @@ class Qwen3_5MoeExpertsLite(nn.Module):
             )
             self.register_buffer(
                 "_down_scale_cpu",
-                torch.empty(self.num_experts, ou_d, inn_d, dtype=torch.float32).pin_memory(),
+                torch.empty(
+                    self.num_experts, ou_d, inn_d, dtype=torch.float32
+                ).pin_memory(),
                 persistent=True,
             )
             # Placeholders so load / state_dict can target stable keys (overwritten by loader).
-            self.register_buffer("_gate_up_proj_placeholder", torch.empty(0), persistent=False)
-            self.register_buffer("_down_proj_placeholder", torch.empty(0), persistent=False)
+            self.register_buffer(
+                "_gate_up_proj_placeholder", torch.empty(0), persistent=False
+            )
+            self.register_buffer(
+                "_down_proj_placeholder", torch.empty(0), persistent=False
+            )
         elif self.fp8_moe:
             ou, inn = fp8_scale_shape_2d(2 * self.intermediate_dim, self.hidden_dim)
             ou_d, inn_d = fp8_scale_shape_2d(self.hidden_dim, self.intermediate_dim)
             self.gate_up_proj = nn.Parameter(
-                torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, dtype=f8)
+                torch.empty(
+                    self.num_experts,
+                    2 * self.intermediate_dim,
+                    self.hidden_dim,
+                    dtype=f8,
+                )
             )
             self.gate_up_scale = nn.Parameter(
                 torch.empty(self.num_experts, ou, inn, dtype=torch.float32)
             )
             self.down_proj = nn.Parameter(
-                torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim, dtype=f8)
+                torch.empty(
+                    self.num_experts, self.hidden_dim, self.intermediate_dim, dtype=f8
+                )
             )
-            self.down_scale = nn.Parameter(torch.empty(self.num_experts, ou_d, inn_d, dtype=torch.float32))
+            self.down_scale = nn.Parameter(
+                torch.empty(self.num_experts, ou_d, inn_d, dtype=torch.float32)
+            )
         else:
             self.gate_up_proj = nn.Parameter(
-                torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+                torch.empty(
+                    self.num_experts, 2 * self.intermediate_dim, self.hidden_dim
+                )
             )
             self.down_proj = nn.Parameter(
                 torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
@@ -474,7 +551,12 @@ class Qwen3_5MoeExpertsLite(nn.Module):
 
     def _apply(self, fn):
         # Keep pinned CPU expert buffers on CPU when moving the rest of the model to CUDA.
-        skip = {"_gate_up_fp8_cpu", "_gate_up_scale_cpu", "_down_fp8_cpu", "_down_scale_cpu"}
+        skip = {
+            "_gate_up_fp8_cpu",
+            "_gate_up_scale_cpu",
+            "_down_fp8_cpu",
+            "_down_scale_cpu",
+        }
         for module in self.children():
             module._apply(fn)
         for name, param in self._parameters.items():
@@ -524,7 +606,9 @@ class Qwen3_5MoeExpertsLite(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             if self.moe_cpu_offload:
-                g_fp8, g_s, d_fp8, d_s = self._lru_get_expert_fp8_gpu(int(expert_idx), dev)
+                g_fp8, g_s, d_fp8, d_s = self._lru_get_expert_fp8_gpu(
+                    int(expert_idx), dev
+                )
                 w_g = moe_fp8_dequant_to_linear_weight(g_fp8, g_s, hid_dtype)
                 gate, up = F.linear(current_state, w_g).chunk(2, dim=-1)
                 current_hidden_states = F.silu(gate) * up
@@ -532,7 +616,9 @@ class Qwen3_5MoeExpertsLite(nn.Module):
                 current_hidden_states = F.linear(current_hidden_states, w_d)
             elif self.fp8_moe:
                 w_g = moe_fp8_dequant_to_linear_weight(
-                    self.gate_up_proj[expert_idx], self.gate_up_scale[expert_idx], hid_dtype
+                    self.gate_up_proj[expert_idx],
+                    self.gate_up_scale[expert_idx],
+                    hid_dtype,
                 )
                 gate, up = F.linear(current_state, w_g).chunk(2, dim=-1)
                 current_hidden_states = F.silu(gate) * up
@@ -546,8 +632,12 @@ class Qwen3_5MoeExpertsLite(nn.Module):
                 current_hidden_states = F.silu(gate) * up
                 w_d = self.down_proj[expert_idx].to(device=dev, dtype=hid_dtype)
                 current_hidden_states = F.linear(current_hidden_states, w_d)
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            current_hidden_states = (
+                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            )
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            )
 
         return final_hidden_states
 
@@ -563,13 +653,25 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         sh = int(config.shared_expert_intermediate_size)
         self.shared_expert = nn.Module()
         self.shared_expert.gate_proj = LiteLinear(
-            config.hidden_size, sh, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.gate_proj"
+            config.hidden_size,
+            sh,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_expert.gate_proj",
         )
         self.shared_expert.up_proj = LiteLinear(
-            config.hidden_size, sh, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.up_proj"
+            config.hidden_size,
+            sh,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_expert.up_proj",
         )
         self.shared_expert.down_proj = LiteLinear(
-            sh, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.shared_expert.down_proj"
+            sh,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.shared_expert.down_proj",
         )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -577,11 +679,17 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert.down_proj(
-            F.silu(self.shared_expert.gate_proj(hidden_states_reshaped)) * self.shared_expert.up_proj(hidden_states_reshaped)
+            F.silu(self.shared_expert.gate_proj(hidden_states_reshaped))
+            * self.shared_expert.up_proj(hidden_states_reshaped)
         )
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-        shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+        expert_output = self.experts(
+            hidden_states_reshaped, selected_experts, routing_weights
+        )
+        shared_expert_output = (
+            torch.sigmoid(self.shared_expert_gate(hidden_states_reshaped))
+            * shared_expert_output
+        )
         expert_output = expert_output + shared_expert_output
         return expert_output.reshape(batch_size, sequence_length, hidden_dim)
 
@@ -598,7 +706,9 @@ def _scale_tensor_to_abs_cap(t: torch.Tensor, cap: float) -> torch.Tensor:
     return t * (cap / m.clamp(min=1e-6))
 
 
-def _cap_residual_delta_rms(x_f: torch.Tensor, delta_f: torch.Tensor, factor: float) -> torch.Tensor:
+def _cap_residual_delta_rms(
+    x_f: torch.Tensor, delta_f: torch.Tensor, factor: float
+) -> torch.Tensor:
     """
     Scale down delta when its per-token RMS far exceeds the stream RMS.
     Reduces saturation from the simplified linear-attn path while keeping small deltas intact.
@@ -610,7 +720,9 @@ def _cap_residual_delta_rms(x_f: torch.Tensor, delta_f: torch.Tensor, factor: fl
     return delta_f * s
 
 
-def _residual_merge_fp16(x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: torch.dtype, factor: float) -> torch.Tensor:
+def _residual_merge_fp16(
+    x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: torch.dtype, factor: float
+) -> torch.Tensor:
     # FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER=1: skip RMS cap and output abs-cap (numerical ablation vs HF).
     if _env_truthy("FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER"):
         y = x_f + delta_f
@@ -620,7 +732,9 @@ def _residual_merge_fp16(x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: to
         return y.to(out_dtype)
     d = _cap_residual_delta_rms(x_f, delta_f, factor)
     y = x_f + d
-    y = torch.nan_to_num(y, nan=0.0, posinf=_fp16_safe_abs_max(), neginf=-_fp16_safe_abs_max())
+    y = torch.nan_to_num(
+        y, nan=0.0, posinf=_fp16_safe_abs_max(), neginf=-_fp16_safe_abs_max()
+    )
     y = _scale_tensor_to_abs_cap(y, _fp16_safe_abs_max())
     return y.to(out_dtype)
 
@@ -644,7 +758,9 @@ def _qwen35_try_fused_awq_pair_matmul(
     return try_fused_awq_pair_matmul(x, lin_a, lin_b, owner, cache_key)
 
 
-def _call_litelinear_stable(layer: LiteLinear, x_f32: torch.Tensor, pre_cap: float = 2048.0) -> torch.Tensor:
+def _call_litelinear_stable(
+    layer: LiteLinear, x_f32: torch.Tensor, pre_cap: float = 2048.0
+) -> torch.Tensor:
     """
     Call LiteLinear through its module path (for hook visibility) while limiting fp16 overflow risk.
     We scale only the input magnitude before cast; no inverse-rescale is applied.
@@ -669,7 +785,12 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
     """
 
     def __init__(
-        self, config: LiteConfig, quant_config, prefix="", layer_idx: int = 0, use_moe: bool = False
+        self,
+        config: LiteConfig,
+        quant_config,
+        prefix="",
+        layer_idx: int = 0,
+        use_moe: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -684,7 +805,9 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
 
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+        self.input_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
+        )
         self.linear_attn = nn.Module()
         self.linear_attn.in_proj_qkv = LiteLinear(
             config.hidden_size,
@@ -733,25 +856,47 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear_attn.in_proj_b",
         )
-        self.linear_attn.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
+        self.linear_attn.norm = Qwen3_5RMSNormGated(
+            self.head_v_dim, eps=config.rms_norm_eps
+        )
 
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
+        )
         if use_moe:
-            self.mlp = Qwen3_5MoeSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+            self.mlp = Qwen3_5MoeSparseMoeBlock(
+                config, quant_config, prefix=f"{prefix}.mlp"
+            )
         else:
             self.mlp = nn.Module()
             self.mlp.gate_proj = LiteLinear(
-                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.gate_proj",
             )
             self.mlp.up_proj = LiteLinear(
-                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.up_proj",
             )
             self.mlp.down_proj = LiteLinear(
-                config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.down_proj",
             )
 
     def forward(self, x, positions, kv_cache, attn_metadata):
-        inf_config = attn_metadata.get("config") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "config", None)
+        inf_config = (
+            attn_metadata.get("config")
+            if isinstance(attn_metadata, dict)
+            else getattr(attn_metadata, "config", None)
+        )
         fusion_level = inf_config.fusion_level if inf_config else 2
 
         input_dtype = x.dtype
@@ -800,7 +945,7 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         z = self.linear_attn.in_proj_z(h)
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        if fusion_level >= 1: # Basic fusion (AB)
+        if fusion_level >= 1:  # Basic fusion (AB)
             ab = _qwen35_try_fused_awq_pair_matmul(
                 h,
                 self.linear_attn.in_proj_a,
@@ -829,7 +974,9 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         value = value.reshape(batch_size, -1, self.num_v_heads, self.head_v_dim)
 
         beta = b.sigmoid()
-        g = -self.linear_attn.A_log.float().exp() * F.softplus(a.float() + self.linear_attn.dt_bias.float())
+        g = -self.linear_attn.A_log.float().exp() * F.softplus(
+            a.float() + self.linear_attn.dt_bias.float()
+        )
 
         head_expand = self.num_v_heads // self.num_k_heads
         if head_expand > 1:
@@ -837,19 +984,17 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
             key = key.repeat_interleave(head_expand, dim=2)
 
         incoming_state = None
-        attn_carry_list = (
-            attn_metadata["linear_attn_carry"] if use_stream else None
-        )
-        if use_stream and attn_carry_list is not None and self.layer_idx < len(
-            attn_carry_list
+        attn_carry_list = attn_metadata["linear_attn_carry"] if use_stream else None
+        if (
+            use_stream
+            and attn_carry_list is not None
+            and self.layer_idx < len(attn_carry_list)
         ):
             incoming_state = attn_carry_list[self.layer_idx]
 
         # HF uses ``torch_recurrent_gated_delta_rule`` for decode (seq==1, cached state), not chunk+cumsum.
         use_recurrent_decode = (
-            use_stream
-            and seq_len == 1
-            and incoming_state is not None
+            use_stream and seq_len == 1 and incoming_state is not None
         )
         if use_recurrent_decode:
             core_attn_out, last_state = _hf_torch_recurrent_gated_delta_rule(
@@ -888,22 +1033,24 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
         # [bs, seq, nh_v, hd_v] -> [bs, nh_v, seq, hd_v] for per-head norm
         core_heads = core_attn_out.transpose(1, 2)
         z_heads = z.transpose(1, 2)
-        
+
         # Apply norm per-head. ssm_norm weight [128] will broadcast over [bs, nh_v, seq, 128]
         # correctly if the norm treats the last dimension as feature dimension.
         core_normed_heads = self.linear_attn.norm(core_heads, z_heads)
-        
+
         # [bs, nh_v, seq, hd_v] -> [bs, seq, channels]
-        core_out = core_normed_heads.transpose(1, 2).reshape(batch_size, -1, self.value_dim)
-        
+        core_out = core_normed_heads.transpose(1, 2).reshape(
+            batch_size, -1, self.value_dim
+        )
+
         attn_delta = self.linear_attn.out_proj(core_out.to(input_dtype))
         hidden_states = residual + attn_delta
-        
+
         h_post = self.post_attention_layernorm(hidden_states)
         if self._use_moe:
             mlp_out = self.mlp(h_post)
         else:
-            if fusion_level >= 2: # Fused GateUp
+            if fusion_level >= 2:  # Fused GateUp
                 gu = _qwen35_try_fused_awq_pair_matmul(
                     h_post,
                     self.mlp.gate_proj,
@@ -925,13 +1072,21 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
                 )
         return hidden_states + mlp_out
 
+
 class Qwen3_5FullAttentionLayer(nn.Module):
     """
     Full attention matching HF `Qwen3_5Attention`: fused q/gate from q_proj, per-head q_norm/k_norm,
     sigmoid gate on attention output before o_proj.
     """
 
-    def __init__(self, config: LiteConfig, quant_config, prefix="", layer_idx: int = 0, use_moe: bool = False):
+    def __init__(
+        self,
+        config: LiteConfig,
+        quant_config,
+        prefix="",
+        layer_idx: int = 0,
+        use_moe: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -948,36 +1103,68 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=eps)
         self.self_attn = nn.Module()
         self.self_attn.q_proj = LiteLinear(
-            config.hidden_size, q_out, bias=True, quant_config=quant_config, prefix=f"{prefix}.self_attn.q_proj"
+            config.hidden_size,
+            q_out,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.q_proj",
         )
         self.self_attn.k_proj = LiteLinear(
-            config.hidden_size, kv_out, bias=True, quant_config=quant_config, prefix=f"{prefix}.self_attn.k_proj"
+            config.hidden_size,
+            kv_out,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.k_proj",
         )
         self.self_attn.v_proj = LiteLinear(
-            config.hidden_size, kv_out, bias=True, quant_config=quant_config, prefix=f"{prefix}.self_attn.v_proj"
+            config.hidden_size,
+            kv_out,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.v_proj",
         )
         self.self_attn.o_proj = LiteLinear(
-            attn_out_dim, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.self_attn.o_proj"
+            attn_out_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.o_proj",
         )
         self.self_attn.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=eps)
         self.self_attn.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=eps)
         if use_moe:
-            self.mlp = Qwen3_5MoeSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+            self.mlp = Qwen3_5MoeSparseMoeBlock(
+                config, quant_config, prefix=f"{prefix}.mlp"
+            )
         else:
             self.mlp = nn.Module()
             self.mlp.gate_proj = LiteLinear(
-                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.gate_proj"
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.gate_proj",
             )
             self.mlp.up_proj = LiteLinear(
-                config.hidden_size, config.intermediate_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.up_proj"
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.up_proj",
             )
             self.mlp.down_proj = LiteLinear(
-                config.intermediate_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.mlp.down_proj"
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp.down_proj",
             )
         rope_params = getattr(config, "rope_parameters", {})
         mrope_section = rope_params.get("mrope_section")
-        rotary_dim = int(config.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        rotary_dim = int(
+            config.head_dim * getattr(config, "partial_rotary_factor", 1.0)
+        )
         if mrope_section:
             self.rotary_emb = MRotaryEmbedding(
                 config.head_dim,
@@ -991,17 +1178,25 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             )
         else:
             from .llama import get_rotary_embedding
+
             self.rotary_emb = get_rotary_embedding(config)
         # Legacy ROCm-friendly caps on full-attn matmuls / residuals (off by default for HF parity).
-        self._use_full_attn_stabilizer = _env_truthy("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER")
-        self.kv_cache_dtype = os.environ.get("FASTINFERENCE_KV_TYPE", "auto")
-        self._k_scale_float = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
-        self._v_scale_float = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
+        self._use_full_attn_stabilizer = _env_truthy(
+            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER"
+        )
+        self._use_sdpa_prefill = _env_qwen35_sdpa_prefill_enabled()
+        self.kv_cache_dtype = "turbo_int4"
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
 
     def forward(self, x, positions, kv_cache, attn_metadata):
-        inf_config = attn_metadata.get("config") if isinstance(attn_metadata, dict) else getattr(attn_metadata, "config", None)
+        inf_config = (
+            attn_metadata.get("config")
+            if isinstance(attn_metadata, dict)
+            else getattr(attn_metadata, "config", None)
+        )
         fusion_level = inf_config.fusion_level if inf_config else 2
-        
+
         input_dtype = x.dtype
         h = self.input_layernorm(x)
         bs, seq, _ = h.shape
@@ -1014,10 +1209,12 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         q_part, gate = torch.chunk(q_merged.view(bs, seq, nh, hd * 2), 2, dim=-1)
 
         # Per-head q_norm (weight dim=head_dim), same as HF.
-        q_part = self.self_attn.q_norm(q_part.reshape(bs, -1, nh, hd)).reshape(bs, -1, nh, hd)
+        q_part = self.self_attn.q_norm(q_part.reshape(bs, -1, nh, hd)).reshape(
+            bs, -1, nh, hd
+        )
 
         kv_out = nkv * hd
-        if fusion_level >= 2: # Fused self_attn_kv
+        if fusion_level >= 2:  # Fused self_attn_kv
             kv_merged = _qwen35_try_fused_awq_pair_matmul(
                 h,
                 self.self_attn.k_proj,
@@ -1055,13 +1252,35 @@ class Qwen3_5FullAttentionLayer(nn.Module):
 
         from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
         from vllm.kernels.triton.paged_attention import paged_attention_v1
-        
-        kv_cache_dtype = inf_config.kv_type if inf_config else attn_metadata.get("kv_cache_dtype", self.kv_cache_dtype)
-        k_scale = inf_config.k_scale if inf_config else attn_metadata.get("k_scale", self._k_scale_float)
-        v_scale = inf_config.v_scale if inf_config else attn_metadata.get("v_scale", self._v_scale_float)
-        
-        reshape_and_cache(k, v, k_cache, v_cache, attn_metadata["slot_mapping"], kv_cache_dtype, k_scale, v_scale,
-                          k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
+
+        kv_cache_dtype = (
+            inf_config.kv_type
+            if inf_config
+            else attn_metadata.get("kv_cache_dtype", self.kv_cache_dtype)
+        )
+        k_scale = (
+            inf_config.k_scale
+            if inf_config
+            else attn_metadata.get("k_scale", self._k_scale_float)
+        )
+        v_scale = (
+            inf_config.v_scale
+            if inf_config
+            else attn_metadata.get("v_scale", self._v_scale_float)
+        )
+
+        reshape_and_cache(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            attn_metadata["slot_mapping"],
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+        )
         block_tables = attn_metadata["block_tables"]
         seq_lens = attn_metadata["seq_lens"]
         is_prefill = attn_metadata.get("is_prefill", False)
@@ -1069,12 +1288,16 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         # Chunked prefill: only the first chunk starts at token 0. Direct prefill ignores KV prefix;
         # use paged attention when this step continues after prior chunks (kv_start_indices > 0).
         kv_start_t = attn_metadata.get("kv_start_indices")
-        kv_chunk_start = int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
+        kv_chunk_start = (
+            int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
+        )
 
         # TurboQuant INT4 requires paged_attention for dequantization; skip direct prefill path
         is_int4 = "int4" in str(kv_cache_dtype).lower()
-        use_direct_prefill = seq > 1 and is_prefill and kv_chunk_start == 0 and not is_int4
-        use_sdpa_prefill = use_direct_prefill and _env_qwen35_sdpa_prefill_enabled()
+        use_direct_prefill = (
+            seq > 1 and is_prefill and kv_chunk_start == 0 and not is_int4
+        )
+        use_sdpa_prefill = use_direct_prefill and self._use_sdpa_prefill
         if use_direct_prefill and not use_sdpa_prefill:
             # HF-parity: same as transformers eager_attention_forward + causal (not Triton paged softmax).
             qh = q.view(bs, seq, nh, hd).transpose(1, 2)
@@ -1090,10 +1313,16 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 kh = kh.repeat_interleave(nh // nkv, dim=1)
                 vh = vh.repeat_interleave(nh // nkv, dim=1)
             attn_b = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
-            attn_in = attn_b.transpose(1, 2).reshape(n_tokens, nh, hd).to(dtype=q.dtype).contiguous()
+            attn_in = (
+                attn_b.transpose(1, 2)
+                .reshape(n_tokens, nh, hd)
+                .to(dtype=q.dtype)
+                .contiguous()
+            )
         else:
             attn_in = torch.empty((n_tokens, nh, hd), device=q.device, dtype=q.dtype)
             from vllm.engine.lite_engine import expand_metadata_for_paged_attention
+
             seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
                 bs, seq, is_prefill, seq_lens, block_tables, q.device
             )
@@ -1106,10 +1335,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 def __init__(self, t):
                     self.t = t
                     self.shape = t.shape
+
                 def stride(self, dim=None):
-                    if dim is None: return self.t.stride()
-                    if dim == 0: return 0
+                    if dim is None:
+                        return self.t.stride()
+                    if dim == 0:
+                        return 0
                     return self.t.stride(dim)
+
                 def __getattr__(self, name):
                     return getattr(self.t, name)
 
@@ -1131,6 +1364,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 k_scale_ptrs=k_scale_cache,
                 v_scale_ptrs=v_scale_cache,
                 num_kv_heads=nkv,
+                config=inf_config,
             )
 
         attn_flat = attn_in.reshape(bs, seq, nh * hd)
@@ -1138,7 +1372,9 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         attn_gated = attn_flat * torch.sigmoid(gate.to(dtype=attn_flat.dtype))
 
         if self._use_full_attn_stabilizer:
-            attn_out = _call_litelinear_stable(self.self_attn.o_proj, attn_gated.float(), pre_cap=1024.0)
+            attn_out = _call_litelinear_stable(
+                self.self_attn.o_proj, attn_gated.float(), pre_cap=1024.0
+            )
             hidden_states = _residual_merge_fp16(x.float(), attn_out, input_dtype, 8.0)
         else:
             attn_out = self.self_attn.o_proj(attn_gated)
@@ -1152,10 +1388,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             gp = self.mlp.gate_proj(h_post).float()
             up = self.mlp.up_proj(h_post).float()
             mlp_mid = F.silu(gp) * up
-            mlp_out = _call_litelinear_stable(self.mlp.down_proj, mlp_mid, pre_cap=1536.0)
-            return _residual_merge_fp16(hidden_states.float(), mlp_out, input_dtype, 8.0)
+            mlp_out = _call_litelinear_stable(
+                self.mlp.down_proj, mlp_mid, pre_cap=1536.0
+            )
+            return _residual_merge_fp16(
+                hidden_states.float(), mlp_out, input_dtype, 8.0
+            )
 
-        if fusion_level >= 2: # Fused GateUp
+        if fusion_level >= 2:  # Fused GateUp
             gu = _qwen35_try_fused_awq_pair_matmul(
                 h_post,
                 self.mlp.gate_proj,
@@ -1209,11 +1449,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             elif "ffn_down.weight" in name:
                 params_dict["mlp.down_proj.weight"].data.copy_(loaded_weight)
 
+
 class Qwen2Model(nn.Module):
     def __init__(self, hf_config, quant_config):
         super().__init__()
         self.config = LiteConfig(hf_config)
-        self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            self.config.vocab_size, self.config.hidden_size
+        )
         self.layers = nn.ModuleList()
         for i in range(self.config.num_hidden_layers):
             if (i % 4) != 3:
@@ -1228,7 +1471,9 @@ class Qwen2Model(nn.Module):
                         self.config, quant_config, f"model.layers.{i}", layer_idx=i
                     )
                 )
-        self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
+        self.norm = Qwen3_5RMSNorm(
+            self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6)
+        )
 
 
 class Qwen2MoEModel(nn.Module):
@@ -1237,27 +1482,49 @@ class Qwen2MoEModel(nn.Module):
     def __init__(self, hf_config, quant_config):
         super().__init__()
         self.config = LiteConfig(hf_config)
-        self.embed_tokens = nn.Embedding(self.config.vocab_size, self.config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            self.config.vocab_size, self.config.hidden_size
+        )
         self.layers = nn.ModuleList()
         for i in range(self.config.num_hidden_layers):
             if qwen35_layer_type(i, self.config) == "linear_attention":
                 self.layers.append(
                     Qwen3_5LinearAttentionLayer(
-                        self.config, quant_config, f"model.layers.{i}", layer_idx=i, use_moe=True
+                        self.config,
+                        quant_config,
+                        f"model.layers.{i}",
+                        layer_idx=i,
+                        use_moe=True,
                     )
                 )
             else:
                 self.layers.append(
-                    Qwen3_5FullAttentionLayer(self.config, quant_config, f"model.layers.{i}", layer_idx=i, use_moe=True)
+                    Qwen3_5FullAttentionLayer(
+                        self.config,
+                        quant_config,
+                        f"model.layers.{i}",
+                        layer_idx=i,
+                        use_moe=True,
+                    )
                 )
-        self.norm = Qwen3_5RMSNorm(self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6))
+        self.norm = Qwen3_5RMSNorm(
+            self.config.hidden_size, eps=getattr(self.config, "rms_norm_eps", 1e-6)
+        )
+
 
 class Qwen3_5ForConditionalGeneration(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
-        self.model = Qwen2Model(vllm_config.model_config.hf_config, vllm_config.quant_config)
-        self.lm_head = nn.Linear(self.model.config.hidden_size, self.model.config.vocab_size, bias=False)
-    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
+        self.model = Qwen2Model(
+            vllm_config.model_config.hf_config, vllm_config.quant_config
+        )
+        self.lm_head = nn.Linear(
+            self.model.config.hidden_size, self.model.config.vocab_size, bias=False
+        )
+
+    def forward(
+        self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None
+    ):
         # Match Hugging Face Qwen3_5TextModel: MRoPE uses (3, batch, seq) position_ids (text uses
         # three identical rows after the 4-way split in HF). LiteEngine supplies 2D positions.
         rp = getattr(self.model.config, "rope_parameters", None) or {}
@@ -1268,13 +1535,20 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             x = self.model.layers[i](x, positions, kv_caches[i], attn_metadata)
         return self.lm_head(self.model.norm(x))
 
+
 class Qwen3_5MoeForConditionalGeneration(nn.Module):
     def __init__(self, vllm_config, prefix=""):
         super().__init__()
-        self.model = Qwen2MoEModel(vllm_config.model_config.hf_config, vllm_config.quant_config)
-        self.lm_head = nn.Linear(self.model.config.hidden_size, self.model.config.vocab_size, bias=False)
+        self.model = Qwen2MoEModel(
+            vllm_config.model_config.hf_config, vllm_config.quant_config
+        )
+        self.lm_head = nn.Linear(
+            self.model.config.hidden_size, self.model.config.vocab_size, bias=False
+        )
 
-    def forward(self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None):
+    def forward(
+        self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None
+    ):
         rp = getattr(self.model.config, "rope_parameters", None) or {}
         if positions is not None and positions.ndim == 2 and rp.get("mrope_section"):
             positions = positions.unsqueeze(0).expand(3, -1, -1).contiguous()

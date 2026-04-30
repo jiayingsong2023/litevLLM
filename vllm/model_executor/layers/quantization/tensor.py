@@ -8,8 +8,38 @@ from typing import Optional, Any, Dict
 from collections import defaultdict
 
 
+_AWQ_TENSOR_TUNING: dict[str, str] = {
+    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_AWQ_") or key.startswith("FASTINFERENCE_GEMMA4_DENSE_")
+}
+_AWQ_TENSOR_TUNING_LOCKED = False
+
+
+def set_awq_tensor_tuning_config(
+    values: dict[str, object] | None, *, locked: bool = False
+) -> None:
+    """Install a config snapshot for AWQ execution/cache policy knobs."""
+    global _AWQ_TENSOR_TUNING, _AWQ_TENSOR_TUNING_LOCKED
+    _AWQ_TENSOR_TUNING = {
+        str(key): str(value)
+        for key, value in (values or {}).items()
+        if (
+            str(key).startswith("FASTINFERENCE_AWQ_")
+            or str(key).startswith("FASTINFERENCE_GEMMA4_DENSE_")
+        )
+        and value is not None
+    }
+    _AWQ_TENSOR_TUNING_LOCKED = bool(locked)
+    _refresh_awq_tuning_derived()
+
+
+def _env_get(name: str, default: str = "") -> str:
+    if _AWQ_TENSOR_TUNING_LOCKED:
+        return _AWQ_TENSOR_TUNING.get(name, default)
+    return os.environ.get(name, _AWQ_TENSOR_TUNING.get(name, default))
+
+
 def _env_truthy(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+    return _env_get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _tensor_nbytes(t: Any) -> int:
@@ -85,13 +115,54 @@ class LRUWeightCache:
         self.keys.clear()
         self.item_bytes.clear()
         self.current_bytes = 0
-_USE_HIGH_FIDELITY_ALL_AWQ = os.environ.get("FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL", "0").strip().lower() in (
+
+
+def _refresh_awq_tuning_derived() -> None:
+    global _USE_HIGH_FIDELITY_ALL_AWQ
+    global _USE_HIGH_FIDELITY_PREFIX_MATCH
+    global _USE_AWQ_DENSE_FALLBACK_CACHE
+    global _AWQ_DENSE_FALLBACK_MAX_BYTES
+    global _USE_AWQ_LEGACY_CACHE
+    global _HIGH_FIDELITY_PREFIXES
+
+    _USE_HIGH_FIDELITY_ALL_AWQ = _env_truthy(
+        "FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL", "0"
+    )
+    _USE_HIGH_FIDELITY_PREFIX_MATCH = _env_truthy(
+        "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH", "0"
+    )
+    _USE_AWQ_DENSE_FALLBACK_CACHE = _env_truthy(
+        "FASTINFERENCE_AWQ_DENSE_FALLBACK_CACHE", "1"
+    )
+    _AWQ_DENSE_FALLBACK_MAX_BYTES = int(
+        float(
+            _env_get(
+                "FASTINFERENCE_AWQ_DENSE_FALLBACK_MAX_GB",
+                str(_default_awq_dense_fallback_max_gb()),
+            )
+        )
+        * (1024**3)
+    )
+    _USE_AWQ_LEGACY_CACHE = _env_truthy("FASTINFERENCE_AWQ_LEGACY_CACHE", "0")
+    _GLOBAL_WEIGHT_CACHE.max_bytes = (
+        0 if _USE_AWQ_LEGACY_CACHE else _AWQ_DENSE_FALLBACK_MAX_BYTES
+    )
+    _GLOBAL_WEIGHT_CACHE.clear()
+    _HIGH_FIDELITY_PREFIXES = tuple(
+        part.strip()
+        for part in _env_get(
+            "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIXES",
+            ",".join(_DEFAULT_HIGH_FIDELITY_PREFIXES),
+        ).split(",")
+        if part.strip()
+    )
+_USE_HIGH_FIDELITY_ALL_AWQ = _env_get("FASTINFERENCE_AWQ_HIGH_FIDELITY_ALL", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
-_USE_HIGH_FIDELITY_PREFIX_MATCH = os.environ.get(
+_USE_HIGH_FIDELITY_PREFIX_MATCH = _env_get(
     "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIX_MATCH", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
-_USE_AWQ_DENSE_FALLBACK_CACHE = os.environ.get(
+_USE_AWQ_DENSE_FALLBACK_CACHE = _env_get(
     "FASTINFERENCE_AWQ_DENSE_FALLBACK_CACHE", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
 
@@ -107,7 +178,7 @@ def _default_awq_dense_fallback_max_gb() -> float:
         return 4.0
     if (
         total_gb >= 48.0
-        and os.environ.get("FASTINFERENCE_GEMMA4_DENSE_MLP", "0").strip().lower()
+        and _env_get("FASTINFERENCE_GEMMA4_DENSE_MLP", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ):
         return 44.0
@@ -122,7 +193,7 @@ def _default_awq_dense_fallback_max_gb() -> float:
 
 _AWQ_DENSE_FALLBACK_MAX_BYTES = int(
     float(
-        os.environ.get(
+        _env_get(
             "FASTINFERENCE_AWQ_DENSE_FALLBACK_MAX_GB",
             str(_default_awq_dense_fallback_max_gb()),
         )
@@ -134,29 +205,28 @@ _GLOBAL_WEIGHT_CACHE = LRUWeightCache(
     max_size=512,
     max_bytes=0 if _USE_AWQ_LEGACY_CACHE else _AWQ_DENSE_FALLBACK_MAX_BYTES,
 )
+_DEFAULT_HIGH_FIDELITY_PREFIXES = (
+    ".linear_attn.in_proj_qkv",
+    ".linear_attn.in_proj_z",
+    ".linear_attn.in_proj_a",
+    ".linear_attn.in_proj_b",
+    ".linear_attn.out_proj",
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+    ".shared_expert.gate_proj",
+    ".shared_expert.up_proj",
+    ".shared_expert.down_proj",
+    ".mlp.gate_proj",
+    ".mlp.up_proj",
+    ".mlp.down_proj",
+)
 _HIGH_FIDELITY_PREFIXES = tuple(
     part.strip()
-    for part in os.environ.get(
+    for part in _env_get(
         "FASTINFERENCE_AWQ_HIGH_FIDELITY_PREFIXES",
-        ",".join(
-            [
-                ".linear_attn.in_proj_qkv",
-                ".linear_attn.in_proj_z",
-                ".linear_attn.in_proj_a",
-                ".linear_attn.in_proj_b",
-                ".linear_attn.out_proj",
-                ".self_attn.q_proj",
-                ".self_attn.k_proj",
-                ".self_attn.v_proj",
-                ".self_attn.o_proj",
-                ".shared_expert.gate_proj",
-                ".shared_expert.up_proj",
-                ".shared_expert.down_proj",
-                ".mlp.gate_proj",
-                ".mlp.up_proj",
-                ".mlp.down_proj",
-            ]
-        ),
+        ",".join(_DEFAULT_HIGH_FIDELITY_PREFIXES),
     ).split(",")
     if part.strip()
 )
@@ -248,18 +318,18 @@ def _should_try_gemma4_down_proj_decode_fused(
 
 
 def _env_awq_cache_scope() -> str:
-    scope = os.environ.get("FASTINFERENCE_AWQ_CACHE_SCOPE", "all").strip().lower()
+    scope = _env_get("FASTINFERENCE_AWQ_CACHE_SCOPE", "all").strip().lower()
     if scope not in ("all", "attention_only", "off"):
         return "all"
     return scope
 
 
 def _env_awq_fused_scope(profile_hint: str) -> str:
-    matrix = os.environ.get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
+    matrix = _env_get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
     if matrix not in ("safe", "balanced", "throughput", "strict"):
         matrix = "balanced"
     # Direct env override always wins.
-    raw_override = os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE")
+    raw_override = _env_get("FASTINFERENCE_AWQ_FUSED_SCOPE")
     if raw_override is not None and raw_override.strip() != "":
         scope = raw_override.strip().lower()
         if scope in ("all", "attention_only", "off"):
@@ -281,7 +351,7 @@ def _env_awq_fused_scope(profile_hint: str) -> str:
         )
     else:
         default_scope = "all" if matrix in ("balanced", "throughput") else "attention_only"
-    scope = os.environ.get("FASTINFERENCE_AWQ_FUSED_SCOPE", default_scope).strip().lower()
+    scope = _env_get("FASTINFERENCE_AWQ_FUSED_SCOPE", default_scope).strip().lower()
     if scope not in ("all", "attention_only", "off"):
         return default_scope
     return scope
