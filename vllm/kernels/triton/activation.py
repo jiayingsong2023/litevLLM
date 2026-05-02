@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Element-wise activation kernels.
+
+Memory layout (all kernels):
+  X:    (n_elements,)  contiguous  float16/bfloat16
+  Out:  (n_elements,)  contiguous  float16/bfloat16
+
+Tiling:
+  Grid:  (ceil(n_elements / BLOCK_SIZE),)
+  Each program: BLOCK_SIZE elements, 1D grid over flat tensor.
+
+Register pressure: very low (< 16 fp32 regs). No ILP concerns, no fallback needed.
+"""
+
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
@@ -33,6 +48,22 @@ def _silu_and_mul_kernel(
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """
+    Fused gated-MLP activation: SiLU(x1) * x2.
+
+    Memory layout:
+      X:    (n_rows, 2 * n_cols)  row-major  float16/bfloat16
+            First half (cols 0..n_cols-1): gate input (x1)
+            Second half (cols n_cols..2*n_cols-1): up input (x2)
+      Out:  (n_rows, n_cols)       row-major  float16/bfloat16
+
+    Tiling:
+      Grid:  (n_rows,)
+      Each program: one row, BLOCK_SIZE=n_cols (next power of 2).
+      BLOCK_SIZE typically 1024..14336 depending on intermediate_size.
+
+    Register pressure: low (~8 fp32 regs: x1, x2, y + offsets). No fallback needed.
+    """
     row_idx = tl.program_id(0)
     X_ptr = X + row_idx * stride_x
     Out_ptr = Out + row_idx * stride_out
