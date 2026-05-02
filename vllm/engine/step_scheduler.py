@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 
+from vllm.engine.scheduling_helpers import (
+    is_multimodal,
+    is_multimodal_lora,
+    lora_adapter_key,
+    max_abs_share_gap,
+    normalize_quotas,
+    normalized_share_map,
+    percentile,
+    rotate_candidates,
+    service_class_priority,
+    share_gap_map,
+)
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, PrefillPlan, StepPlan
 
 
@@ -1030,10 +1042,7 @@ class StepScheduler:
 
     @staticmethod
     def _rotate_candidates(request_ids: list[str], cursor: int) -> list[str]:
-        if not request_ids:
-            return []
-        offset = cursor % len(request_ids)
-        return request_ids[offset:] + request_ids[:offset]
+        return rotate_candidates(request_ids, cursor)
 
     def _service_classes_for_ids(
         self,
@@ -1486,10 +1495,7 @@ class StepScheduler:
 
     @staticmethod
     def _normalize_quotas(quotas: dict[str, int]) -> dict[str, int]:
-        return {
-            key: max(0, int(value))
-            for key, value in quotas.items()
-        }
+        return normalize_quotas(quotas)
 
     def _is_fairness_guardrail_triggered(
         self,
@@ -1512,13 +1518,7 @@ class StepScheduler:
 
     @staticmethod
     def _percentile(values: list[float], q: float) -> float:
-        if not values:
-            return 0.0
-        if len(values) == 1:
-            return float(values[0])
-        sorted_values = sorted(float(v) for v in values)
-        idx = int(round((len(sorted_values) - 1) * max(0.0, min(1.0, q))))
-        return sorted_values[idx]
+        return percentile(values, q)
 
     @staticmethod
     def _count_service_classes(
@@ -1564,66 +1564,42 @@ class StepScheduler:
 
     @staticmethod
     def _is_multimodal(request) -> bool:
-        return bool(
-            request.get("is_multimodal")
-            or (request.get("multi_modal_data") or {}).get("image")
-        )
+        return is_multimodal(request)
 
     @classmethod
     def _is_multimodal_lora(cls, request) -> bool:
-        return cls._is_multimodal(request) and bool(request.get("lora_id"))
+        return is_multimodal_lora(request)
 
     @classmethod
     def _is_multimodal_request(cls, scheduler, request_id: str) -> bool:
-        return cls._is_multimodal(scheduler.get_request(request_id))
+        return is_multimodal(scheduler.get_request(request_id))
 
     @classmethod
     def _is_multimodal_lora_request(cls, scheduler, request_id: str) -> bool:
-        return cls._is_multimodal_lora(scheduler.get_request(request_id))
+        return is_multimodal_lora(scheduler.get_request(request_id))
 
     @staticmethod
     def _normalized_share_map(counts: dict[str, int]) -> dict[str, float]:
-        if not counts:
-            return {}
-        normalized = {key: float(value) for key, value in counts.items()}
-        total = sum(normalized.values())
-        if total <= 0:
-            return {key: 0.0 for key in normalized}
-        return {key: value / total for key, value in normalized.items()}
+        return normalized_share_map(counts)
 
     @staticmethod
     def _share_gap_map(
         target_share: dict[str, float],
         baseline_share: dict[str, float],
     ) -> dict[str, float]:
-        keys = sorted(set(target_share) | set(baseline_share))
-        return {
-            key: float(target_share.get(key, 0.0) or 0.0)
-            - float(baseline_share.get(key, 0.0) or 0.0)
-            for key in keys
-        }
+        return share_gap_map(target_share, baseline_share)
 
     @staticmethod
     def _max_abs_share_gap(gaps: dict[str, float]) -> float:
-        return max((abs(float(value or 0.0)) for value in gaps.values()), default=0.0)
+        return max_abs_share_gap(gaps)
 
     @classmethod
     def _lora_adapter_key(cls, request) -> str:
-        lora_id = request.get("lora_id")
-        if not lora_id:
-            return cls.BASE_LORA_ADAPTER
-        return str(lora_id)
+        return lora_adapter_key(request, base_lora_adapter=cls.BASE_LORA_ADAPTER)
 
     @staticmethod
     def _service_class_priority(service_class: object) -> int:
-        priorities = {
-            "latency": 0,
-            "interactive": 0,
-            "balanced": 1,
-            "throughput": 2,
-            "background": 3,
-        }
-        return priorities.get(str(service_class or "latency"), 1)
+        return service_class_priority(service_class)
 
     def _update_prefill_deferrals(
         self,
