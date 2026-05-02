@@ -1,6 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Token embedding lookup kernel.
+
+Memory layout:
+  IDS:    (n_ids,)          contiguous  int64
+  Weight: (vocab_size, d)   row-major   float16/bfloat16
+  Out:    (n_ids, d)        row-major   float16/bfloat16
+
+Tiling:
+  Grid:  (n_ids,)
+  Each program loads one token ID, gathers one row of Weight[d, :],
+  stores one row of Out. BLOCK_SIZE = next_power_of_2(d).
+
+Register pressure: very low (< 10 fp32 regs: embedding vector + offsets).
+No ILP concerns, no fallback needed.
+"""
+
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
