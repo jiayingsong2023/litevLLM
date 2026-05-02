@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
-from pathlib import Path
 import os
+from pathlib import Path
+
 import torch
-from vllm.triton_utils import triton, tl
 
-
+from vllm.triton_utils import tl, triton
 
 _AWQ_FUSED_TUNING: dict[str, str] = {
-    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_AWQ_")
+    key: value
+    for key, value in os.environ.items()
+    if key.startswith("FASTINFERENCE_AWQ_")
 }
 _AWQ_FUSED_TUNING_LOCKED = False
 
@@ -41,11 +43,13 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     Whether to use bf16 operands in tl.dot (vs fp16).
 
-    On ROCm, bf16 dot can be slower than fp16 dot for narrow decode (small M, moderate N);
-    microbench: use fp16 dot there but still write bf16 output (USE_BF16_OUTPUT).
+    On ROCm, bf16 dot can be slower than fp16 dot for narrow decode
+    (small M, moderate N); microbench: use fp16 dot there but still write
+    bf16 output (USE_BF16_OUTPUT).
 
     FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16:
-      - unset or "auto": heuristic (ROCm narrow decode -> fp16 dot; else bf16 when a is bf16)
+      - unset or "auto": heuristic (ROCm narrow decode -> fp16 dot;
+        else bf16 when a is bf16)
       - "1"/"true"/"on": always bf16 dot when a is bf16
       - "0"/"false"/"off": always fp16 dot when a is bf16
     """
@@ -59,7 +63,7 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     if raw in ("1", "true", "yes", "on"):
         return True
     # auto
-    if getattr(torch.version, "hip", None) is not None:
+    if getattr(torch.version, "hip", None) is not None:  # noqa: SIM102
         if m <= 4 and n <= 8192:
             return False
     return True
@@ -118,7 +122,7 @@ def _select_fused_gemm_blocks(
         block_m = 16
         # Decode-heavy Gemma4 shapes prefer wider N tiles, but very wide output
         # projections (e.g. global q / gate-up) still favor 128.
-        if mlp_down_decode_small_m:
+        if mlp_down_decode_small_m:  # noqa: SIM114
             block_n = 128
         elif deep_k_narrow_out and m >= 4:
             block_n = 128
@@ -128,7 +132,7 @@ def _select_fused_gemm_blocks(
             block_n = 128
     elif m <= 32:
         block_m = 32
-        if deep_k_narrow_out:
+        if deep_k_narrow_out:  # noqa: SIM108
             block_n = 128
         else:
             block_n = 256 if n >= 4096 else 128
@@ -218,7 +222,7 @@ def _match_profile_entry(
         return False
     if "k" in row and int(row["k"]) != k:
         return False
-    if "group_size" in row and int(row["group_size"]) != group_size:
+    if "group_size" in row and int(row["group_size"]) != group_size:  # noqa: SIM103
         return False
     return True
 
@@ -277,7 +281,7 @@ def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
     # are kept for medium-M wide-output shapes to avoid unnecessary tuning cost.
     if mm <= 8 and nn >= 4096 and kk >= 4096:
         return True
-    if mm <= 192 and nn >= 4096 and kk >= 4096:
+    if mm <= 192 and nn >= 4096 and kk >= 4096:  # noqa: SIM103
         return False
     return True
 
@@ -365,7 +369,8 @@ def _env_awq_o_proj_splitk_gemv() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-# Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA; autotune picks best per key.
+# Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA;
+# autotune picks best per key.
 _PACKED_FUSED_AUTOTUNE_CONFIGS = [
     triton.Config(
         {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2
@@ -477,10 +482,7 @@ def _packed_int4_symmetric_grouped_gemv_m1(
         bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
         acc += bias_vals.to(tl.float32)
 
-    if USE_BF16_OUTPUT:
-        out = acc.to(tl.bfloat16)
-    else:
-        out = acc.to(tl.float16)
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
 
     c_ptrs = c_ptr + offs_n * stride_cn
     tl.store(c_ptrs, out, mask=mask_n)
@@ -553,10 +555,7 @@ def _packed_int4_symmetric_group32_gemv_m1(
         bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
         acc += bias_vals.to(tl.float32)
 
-    if USE_BF16_OUTPUT:
-        out = acc.to(tl.bfloat16)
-    else:
-        out = acc.to(tl.float16)
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
 
     tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
 
@@ -617,10 +616,7 @@ def _packed_int4_symmetric_group32_gemv_m1_exact(
         bias_vals = tl.load(bias_ptr + offs_n)
         acc += bias_vals.to(tl.float32)
 
-    if USE_BF16_OUTPUT:
-        out = acc.to(tl.bfloat16)
-    else:
-        out = acc.to(tl.float16)
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
 
     tl.store(c_ptr + offs_n * stride_cn, out)
 
@@ -699,10 +695,7 @@ def _packed_int4_symmetric_group32_o_proj_splitk_reduce_m1(
         acc += tl.load(partial_ptr + split_idx * N + offs_n).to(tl.float32)
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n).to(tl.float32)
-    if USE_BF16_OUTPUT:
-        out = acc.to(tl.bfloat16)
-    else:
-        out = acc.to(tl.float16)
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
     tl.store(c_ptr + offs_n * stride_cn, out)
 
 
@@ -816,10 +809,7 @@ def _packed_int4_symmetric_group32_qkv_m1(
                 )
         acc += tl.sum(group_partial, axis=1)
 
-    if USE_BF16_OUTPUT:
-        out = acc.to(tl.bfloat16)
-    else:
-        out = acc.to(tl.float16)
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
     tl.store(c_ptr + offs_t * stride_cn, out, mask=mask_t)
 
 
@@ -922,10 +912,7 @@ def _packed_int4_symmetric_fused_gate_up_m1(
         act = gate_acc / (1.0 + tl.exp(-gate_acc))
     out = act * up_acc
 
-    if USE_BF16_OUTPUT:
-        out_cast = out.to(tl.bfloat16)
-    else:
-        out_cast = out.to(tl.float16)
+    out_cast = out.to(tl.bfloat16) if USE_BF16_OUTPUT else out.to(tl.float16)
     tl.store(c_ptr + offs_n * stride_cn, out_cast, mask=mask_n)
 
 
@@ -1034,10 +1021,11 @@ def _awq_native_tiled_gemm_split_k(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
-    if USE_BF16_OUTPUT:
-        result = accumulator.to(tl.bfloat16)
-    else:
-        result = accumulator.to(tl.float16)
+    result = (
+        accumulator.to(tl.bfloat16)
+        if USE_BF16_OUTPUT
+        else accumulator.to(tl.float16)
+    )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1052,10 +1040,11 @@ def _awq_native_tiled_gemm_split_k(
         if HAS_BIAS:
             bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
             accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-            if USE_BF16_OUTPUT:
-                result = accumulator.to(tl.bfloat16)
-            else:
-                result = accumulator.to(tl.float16)
+            result = (
+                accumulator.to(tl.bfloat16)
+                if USE_BF16_OUTPUT
+                else accumulator.to(tl.float16)
+            )
         tl.store(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
@@ -1164,10 +1153,7 @@ def _awq_native_tiled_gemm_heuristic(
         bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
         accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
     # Store Result (output dtype may be bf16 even when tl.dot used fp16 operands)
-    if USE_BF16_OUTPUT:
-        c = accumulator.to(tl.bfloat16)
-    else:
-        c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
@@ -1265,10 +1251,11 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
-    if USE_BF16_OUTPUT:
-        result = accumulator.to(tl.bfloat16)
-    else:
-        result = accumulator.to(tl.float16)
+    result = (
+        accumulator.to(tl.bfloat16)
+        if USE_BF16_OUTPUT
+        else accumulator.to(tl.float16)
+    )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1282,10 +1269,11 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         if HAS_BIAS:
             bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
             accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-            if USE_BF16_OUTPUT:
-                result = accumulator.to(tl.bfloat16)
-            else:
-                result = accumulator.to(tl.float16)
+            result = (
+                accumulator.to(tl.bfloat16)
+                if USE_BF16_OUTPUT
+                else accumulator.to(tl.float16)
+            )
         tl.store(c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
@@ -1334,8 +1322,9 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
     b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn + (offs_k[None, :] // 8) * stride_bk)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Heuristic: if BLOCK_K is a multiple of group_size (or vice versa), we can optimize scale loads.
-    # Most common: BLOCK_K=64, group_size=128. Scale stays same for 2 iterations.
+    # Heuristic: if BLOCK_K is a multiple of group_size (or vice versa),
+    # we can optimize scale loads. Most common: BLOCK_K=64, group_size=128.
+    # Scale stays same for 2 iterations.
 
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         k_remaining = K - k * BLOCK_K
@@ -1380,10 +1369,7 @@ def _packed_int4_symmetric_tiled_gemm_heuristic(
         bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
         accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
 
-    if USE_BF16_OUTPUT:
-        c = accumulator.to(tl.bfloat16)
-    else:
-        c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
 
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
@@ -1459,7 +1445,7 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
             prod = a.to(tl.float32) * b
             accumulator += tl.sum(prod, axis=1)[None, :]
         else:
-            if BF16_DOT:
+            if BF16_DOT:  # noqa: SIM108
                 accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
             else:
                 accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
@@ -1472,10 +1458,7 @@ def _packed_int4_symmetric_tiled_gemm_autotuned(
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
         accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-    if OUT_BF16:
-        c = accumulator.to(tl.bfloat16)
-    else:
-        c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.bfloat16) if OUT_BF16 else accumulator.to(tl.float16)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
@@ -1561,7 +1544,7 @@ def _awq_native_tiled_gemm_autotuned(
 
         b = (b_unpacked.to(tl.float32) - zeros.to(tl.float32)) * scales.to(tl.float32)
 
-        if BF16_DOT:
+        if BF16_DOT:  # noqa: SIM108
             accumulator += tl.dot(a.to(tl.bfloat16), tl.trans(b.to(tl.bfloat16)))
         else:
             accumulator += tl.dot(a.to(tl.float16), tl.trans(b.to(tl.float16)))
@@ -1574,10 +1557,7 @@ def _awq_native_tiled_gemm_autotuned(
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
         accumulator = accumulator + bias_vals.to(tl.float32)[None, :]
-    if OUT_BF16:
-        c = accumulator.to(tl.bfloat16)
-    else:
-        c = accumulator.to(tl.float16)
+    c = accumulator.to(tl.bfloat16) if OUT_BF16 else accumulator.to(tl.float16)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
@@ -1590,12 +1570,14 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
     if has_bias:
         if bias.dim() != 1 or int(bias.shape[0]) != N:
             raise ValueError(
-                f"awq_fused_gemm: bias must be 1D of size N={N}, got {tuple(bias.shape)}"
+                f"awq_fused_gemm: bias must be 1D of size N={N}, "
+                f"got {tuple(bias.shape)}"
             )
         bias = bias.contiguous().reshape(N)
         if bias.device != a.device:
             raise ValueError(
-                "awq_fused_gemm: bias must be on the same device as activations"
+                "awq_fused_gemm: bias must be on the same "
+                "device as activations"
             )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
@@ -1741,12 +1723,14 @@ def packed_int4_symmetric_fused_gemm(
     if has_bias:
         if bias.dim() != 1 or int(bias.shape[0]) != n:
             raise ValueError(
-                f"packed_int4_symmetric_fused_gemm: bias must be 1D of size N={n}, got {tuple(bias.shape)}"
+                "packed_int4_symmetric_fused_gemm: bias must be 1D of "
+                f"size N={n}, got {tuple(bias.shape)}"
             )
         bias = bias.contiguous().reshape(n)
         if bias.device != a.device:
             raise ValueError(
-                "packed_int4_symmetric_fused_gemm: bias must be on the same device as activations"
+                "packed_int4_symmetric_fused_gemm: bias must be on the "
+                "same device as activations"
             )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(
@@ -2200,10 +2184,7 @@ def packed_int4_symmetric_fused_gate_up_m1(
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: scale shape mismatch")
     if int(gate_qweight.shape[1]) * 8 != k:
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: K mismatch")
-    if out is None:
-        c = torch.empty((1, n), device=a.device, dtype=a.dtype)
-    else:
-        c = out
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype) if out is None else out
     raw_block_n = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N", "128")
     raw_block_packs = _env_get(
         "FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16"
