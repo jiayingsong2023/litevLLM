@@ -1,6 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Row-wise RMSNorm kernels.
+
+Memory layout (both kernels):
+  Input:  (M, N)  row-major  float16/bfloat16
+  Weight: (N,)    contiguous float16/bfloat16 (learned scale, broadcast per row)
+  Output: (M, N)  row-major  float16/bfloat16
+  (fused_add_rms_norm also reads/writes Residual in-place at same shape as Input)
+
+Tiling:
+  Grid:  (M,)
+  Each program: one row of N elements.
+  BLOCK_SIZE = next_power_of_2(N), typically 1024..14336.
+
+Kernels:
+  _rms_norm_kernel:        out = (x * rsqrt(mean(x^2) + eps)) * weight
+  _fused_add_rms_norm_kernel: x = x + residual; residual = x; out = rms_norm(x)
+
+Register pressure: very low (< 12 fp32 regs: x, x_sq, mean_sq, rsqrt, w, y
+plus residual in fused variant). No ILP concerns, no fallback needed.
+"""
+
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
