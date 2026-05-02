@@ -1,6 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Fused RMSNorm + AWQ dequant + GEMM: C = RMSNorm(A) @ dequantize(B).
+
+Memory layout:
+  A (input):     (M, K)         row-major  float16/bfloat16
+  B (qweight):   (N, K // 8)    row-major  int32 (packed 4-bit, 8 values per int32)
+  B (scales):    (N, K // G)    row-major  float16 (G = group_size)
+  B (qzeros):    (N, K // G // 8) row-major int32 (packed 4-bit zeros)
+  norm_w:        (K,)           contiguous float16/bfloat16 (RMSNorm weight)
+  C (output):    (M, N)         row-major  float16/bfloat16
+
+Tiling:
+  Grid:        (ceil(M/64) * ceil(N/64),)  1D grid, programs walk M/N
+  BLOCK_M=64, BLOCK_N=64, BLOCK_K=32
+  num_warps=4, num_stages=2 (fixed, no heuristic).
+
+Kernel phases per program:
+  1. RMSNorm:   sum(A^2) over K -> rsqrt(var/K + eps) -> normalize A row
+  2. GEMM:      iterate K in BLOCK_K steps:
+     a. Load A tile, apply norm scale
+     b. Load packed B tile, unpack nibbles (shift = (k % 8) * 4)
+     c. Load group-wise scales/zeros, dequantize: (unpacked - zero) * scale
+     d. tl.dot(a_normed_fp16, b_dequant_fp16.T) -> accumulate
+
+Register pressure: HIGH (estimated >64 regs per thread).
+  Live values include: var[64], rrms[64], a[64,32], a_normed[64,32],
+  b_packed[64,16], b_unpacked[64,32], scales[64,4], zeros[64,4],
+  b_fp16[32,64] (transposed), accumulator[64,64] (Triton-managed).
+  The combined RMSNorm K-pass + GEMM K-pass doubles per-iteration register demand
+  vs a standalone GEMM. Triton spills to local memory (LDS on ROCm).
+
+Low-ILP fallback: NONE. Fixed tile sizes; no alternative kernel path.
+If occupancy becomes a bottleneck, reduce BLOCK_M or BLOCK_N.
+"""
+
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit

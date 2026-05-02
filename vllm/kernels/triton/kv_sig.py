@@ -15,7 +15,8 @@ The kernel sums over block_size tokens and writes mean = sum / block_size.
 from __future__ import annotations
 
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
@@ -33,7 +34,16 @@ def _kv_sig_finalize_kernel(
     BLOCK_SIZE: tl.constexpr,
     SIG_DIM: tl.constexpr,
 ):
-    """One program per (block, head). Averages over token dim."""
+    """One program per (block, head). Averages over token dim.
+
+    Tiling:
+      Grid: (num_active_blocks, num_kv_heads)
+      Each program sums SIG_DIM elements across block_size tokens,
+      then writes mean = sum / BLOCK_SIZE to sig_cache.
+
+    Register pressure: LOW (>2 * SIG_DIM, typically 64 fp32 per program).
+    No fallback needed.
+    """
     idx = tl.program_id(0)
     block_idx = tl.load(Block_ids_ptr + idx).to(tl.int64)
     head_idx = tl.program_id(1)

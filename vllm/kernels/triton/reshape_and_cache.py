@@ -1,8 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Tuple
+"""
+Reshape and Cache kernel: writes K/V activations into paged KV cache.
+
+Memory layout:
+  key/value (input):   (num_tokens, num_heads, head_size)  row-major  float16
+  key_cache (output):  (num_blocks, block_size, num_kv_heads, kv_head_dim)
+                        float16 / float8_e4m3fn / uint8 (packed int4)
+  value_cache:         same layout as key_cache
+  slot_mapping:        (num_tokens,)  contiguous int64
+                        Maps token index -> (block_idx * block_size + offset).
+  k_scale/v_scale:     scalar or 1-element tensor (float32)
+  k_scale_cache:       (num_blocks, block_size, num_kv_heads, 1)  float32
+                        Per-token-per-head row-wise scales (TurboQuant INT4).
+  sig_temp:            (num_blocks, block_size, num_kv_heads, sig_dim)  float16
+                        Temporary buffer for KV block signature computation.
+                        Written when WRITE_SIG is enabled.
+
+Tiling:
+  Grid:  (num_tokens, num_heads)
+  Each program handles one (token, head) pair.
+  BLOCK_SIZE = head_size (or head_size//2 for INT4 packed dim).
+
+Kernel phases per program:
+  1. Load K (and V) values from input tensor (head_size fp32)
+  2. If COMPUTE_DYNAMIC_SCALE: compute row-wise scale = max(|k|) / max_val,
+     write to k_scale_cache
+  3. Quantize: fp8 conversion, or int4 pack (low/high nibbles)
+  4. Store quantized K/V into cache at slot_mapping[token_idx]
+  5. If WRITE_SIG: accumulate K[:sig_dim] into sig_temp buffer
+
+INT4 packing detail:
+  Contiguous layout: first half of channels -> low nibbles,
+  second half of channels -> high nibbles.
+  Packed value = (low_quant & 0xF) | ((high_quant & 0xF) << 4)
+
+Register pressure: HIGH (INT4 + COMPUTE_DYNAMIC_SCALE + WRITE_SIG path).
+  Live values for K:
+    k[256] (fp32), k_low[128] (fp32), k_high[128] (fp32)     = 512 fp32
+    k_l_q[128] (uint8), k_h_q[128] (uint8)                     (quantized)
+    k_scale (scalar), k_sig[32] (if WRITE_SIG)                 = 32 fp32
+    offsets, slot, block_idx, token_idx                         (scalars)
+  V follows same pattern (another ~512 fp32). Total per-program can
+  exceed 1000 fp32 values before Triton's register allocation and
+  spilling. The constexpr flags (IS_INT4, IS_FP8, COMPUTE_DYNAMIC_SCALE,
+  WRITE_SIG) provide compile-time dead-code elimination, so unused
+  paths do not contribute to register pressure.
+
+Lower-ILP fallback:
+  No dedicated low-register kernel variant. Constexpr specialization
+  already removes unused paths, but the maximum-configuration path
+  (INT4 + dynamic scale + signature write) has no lighter alternative.
+  For latency-sensitive decode (single token), the heavy path is only
+  hit once per block_size tokens (block fill boundary).
+"""
 
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 # Robust float8 type resolution for different Triton versions
@@ -36,7 +90,7 @@ FP8_DTYPE = _get_fp8_dtype()
 # Keys include the device, dtype and the scalar *value* so fp8 callers
 # with non-unit scales stay bitwise-correct without each layer paying the
 # allocation cost after the first step.
-_SCALE_TENSOR_CACHE: Dict[Tuple[torch.device, torch.dtype, float], torch.Tensor] = {}
+_SCALE_TENSOR_CACHE: dict[tuple[torch.device, torch.dtype, float], torch.Tensor] = {}
 
 
 def _get_scalar_scale_tensor(
@@ -173,7 +227,8 @@ def _reshape_and_cache_kernel(
 
     if IS_INT4:
         off_d_half = tl.arange(0, HEAD_DIM // 2)
-        # Contiguous layout: first half of channels in low nibbles, second half in high nibbles
+        # Contiguous layout: first half of channels in low nibbles,
+        # second half of channels in high nibbles.
         k_low = tl.load(base_k_ptr + off_d_half * stride_kd).to(tl.float32)
         k_high = tl.load(base_k_ptr + (off_d_half + HEAD_DIM // 2) * stride_kd).to(
             tl.float32
@@ -312,10 +367,7 @@ def reshape_and_cache(
 
     grid = (num_tokens, num_kv_heads)
     write_sig = sig_temp is not None and sig_temp.numel() > 0
-    if write_sig:
-        s_st = sig_temp.stride()
-    else:
-        s_st = (0, 0, 0, 0)
+    s_st = sig_temp.stride() if write_sig else (0, 0, 0, 0)
     _reshape_and_cache_kernel[grid](
         key,
         value,

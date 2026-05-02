@@ -1,4 +1,79 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+PagedAttention with Online Softmax (Triton).
+
+Memory layout (tensor pointers):
+  Out:          (num_seqs, num_heads, head_size)   row-major  float16/bfloat16
+  Q:            (num_seqs, num_heads, head_size)   row-major  float16/bfloat16
+  K_cache:      (num_blocks, block_size, num_kv_heads, head_size)  float16/fp8/uint8
+  V_cache:      (num_blocks, block_size, num_kv_heads, head_size)  float16/fp8/uint8
+  BlockTables:  (num_seqs, max_blocks_per_seq)     row-major  int32
+  SeqLens:      (num_seqs,)                        contiguous int32
+
+When IS_CACHED (pointer-based block access):
+  K_Ptrs:  (num_seqs, max_blocks_per_seq)  pointer array  float16*/uint8*
+  V_Ptrs:  (num_seqs, max_blocks_per_seq)  pointer array  float16*/uint8*
+
+When HAS_ROW_SCALE (TurboQuant INT4 per-token-per-head scales):
+  K_Scale_Ptrs: (num_seqs, max_blocks_per_seq)  pointer array  float32*
+  V_Scale_Ptrs: (num_seqs, max_blocks_per_seq)  pointer array  float32*
+
+Tiling:
+  Grid:  (num_seqs * num_heads,)
+  Each program handles one (seq, head) pair.
+  BLOCK_D = head_size (128 or 256)
+  BLOCK_N = block_size (typically 16)
+  num_warps / num_stages: selected by _select_paged_attention_launch_config()
+    based on num_seqs, head_size, block_size, kv dtype, scope, and C1 preset.
+
+Kernel phases per program:
+  1. Load Q vector (head_size elements, fp32)
+  2. For each KV block (outer loop over num_blocks):
+     a. Resolve K/V base pointer (block table or cached pointer array)
+     b. Load K tile (BLOCK_N x BLOCK_D), apply fp8/int4 dequant + row scale
+     c. QK = Q @ K^T * scale (BLOCK_N fp32)
+     d. Apply Gemma softcap if enabled: cap * tanh(QK / cap)
+     e. Mask padding tokens with -inf
+     f. Online softmax update: m_new, l_new, alpha
+     g. Load V tile, compute p = softmax(QK), accumulate p @ V
+     h. Update running m_i, l_i, acc
+  3. Final normalization: acc / l_i -> store to Out
+
+INT4 layout detail:
+  K/V are packed uint8: low nibble = channels 0..(head_size/2-1),
+  high nibble = channels (head_size/2)..(head_size-1).
+  Sign extension: ((packed << 28) >> 28) for low, ((packed << 24) >> 28) for high.
+  Q is pre-split into q_low, q_high halves for the dot product.
+
+KV Block Selective Attention (USE_SELECTION):
+  When enabled, only every SELECT_STRIDE-th block participates in attention,
+  plus the first MIN_SELECTED_BLOCKS and the last block (partial fill).
+  Non-selected blocks have their mask forced to all-False, yielding -inf QK.
+  (Full bandwidth savings require a follow-up kernel restructuring - the K/V
+  loads still issue on this path.)
+
+Register pressure: HIGH (estimated >64 regs per thread at head_size=256).
+  Live values (INT4 + HAS_ROW_SCALE path, worst case):
+    q_low[128], q_high[128]                    (256 fp32)
+    acc_low[128], acc_high[128]                (256 fp32)
+    k_l[16,128], k_h[16,128]  per block tile  (2048 fp32, Triton-managed)
+    v_l[16,128], v_h[16,128]  per block tile  (2048 fp32, Triton-managed)
+    qk[16], p[16]                              (32 fp32)
+    m_i, l_i, alpha, delta_m                   (4 fp32 scalars)
+    k_scale[16], v_scale[16]                   (32 fp32, HAS_ROW_SCALE only)
+  Total (excluding Triton-managed tiles): ~580 fp32 live regs.
+  Triton spills excess to LDS (local memory) on ROCm.
+
+Lower-ILP fallback:
+  No dedicated low-register kernel variant exists. Mitigation strategies:
+  - _select_paged_attention_launch_config() reduces num_warps/num_stages
+    for high-head_size scenarios (head_size>=256 -> 2-4 warps, 1-2 stages).
+  - C1 preset (gemma4_c1_preset=True, num_seqs<=1): forces (4,1) for
+    global/local scopes, using minimum occupancy.
+  - For fp8/fp16 (non-INT4) paths, register pressure is approximately
+    halved (no low/high channel duplication).
+"""
+
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
 
@@ -225,13 +300,12 @@ def _paged_attention_kernel(
 
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
-        if USE_SELECTION:
+        if USE_SELECTION and not is_selected:
             # When a block is not selected, extend mask to all-False so
             # K/V loads return `other` values and QK becomes -inf.
             # The loads still issue on this path; bandwidth savings requires
             # a follow-up kernel restructuring.
-            if not is_selected:
-                block_mask = tl.arange(0, BLOCK_N) < 0
+            block_mask = tl.arange(0, BLOCK_N) < 0
 
         k_scale = k_scale_arg
         v_scale = v_scale_arg
