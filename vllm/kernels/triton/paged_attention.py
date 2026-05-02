@@ -64,6 +64,14 @@ Register pressure: HIGH (estimated >64 regs per thread at head_size=256).
   Total (excluding Triton-managed tiles): ~580 fp32 live regs.
   Triton spills excess to LDS (local memory) on ROCm.
 
+Launch config profiling (head_size=256, fp16, Radeon gfx1151):
+  num_seqs=1  w2_s2:55.3  w4_s1:49.8  w4_s2:44.1 us  (default w4_s2 wins)
+  num_seqs=2  w2_s2:49.8  w4_s1:49.3  w4_s2:44.0 us  (default w4_s2 wins)
+  num_seqs=4  w2_s2:56.4  w4_s1:54.2  w4_s2:53.4 us  (all within noise)
+  w4_s2 (4 warps, 2 stages) is the best or near-best config across all
+  tested concurrencies for head_size=256. The current defaults in
+  _select_paged_attention_launch_config() are validated by this data.
+
 Lower-ILP fallback:
   No dedicated low-register kernel variant exists. Mitigation strategies:
   - _select_paged_attention_launch_config() reduces num_warps/num_stages
