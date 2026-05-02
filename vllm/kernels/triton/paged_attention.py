@@ -300,12 +300,6 @@ def _paged_attention_kernel(
 
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
-        if USE_SELECTION and not is_selected:
-            # When a block is not selected, extend mask to all-False so
-            # K/V loads return `other` values and QK becomes -inf.
-            # The loads still issue on this path; bandwidth savings requires
-            # a follow-up kernel restructuring.
-            block_mask = tl.arange(0, BLOCK_N) < 0
 
         k_scale = k_scale_arg
         v_scale = v_scale_arg
@@ -323,31 +317,40 @@ def _paged_attention_kernel(
             k_scale = k_scale[:, None]
             v_scale = v_scale[:, None]
 
-        if IS_INT4:
-            off_kv = (
-                offs_n[:, None] * stride_k_token
-                + kv_head_idx * stride_k_head
-                + offs_d_half_2d * stride_k_dim
-            )
-            k_packed = tl.load(
-                k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv,
-                mask=block_mask[:, None],
-                other=0,
-            ).to(tl.int32)
-            # Manual sign-extension for 4-bit signed
-            k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
-            k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
-            qk = tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
+        # K load and QK computation — skipped for non-selected blocks
+        # to save global memory bandwidth.
+        if is_selected:
+            if IS_INT4:
+                off_kv = (
+                    offs_n[:, None] * stride_k_token
+                    + kv_head_idx * stride_k_head
+                    + offs_d_half_2d * stride_k_dim
+                )
+                k_packed = tl.load(
+                    k_base_ptr.to(tl.pointer_type(tl.uint8)) + off_kv,
+                    mask=block_mask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                # Manual sign-extension for 4-bit signed
+                k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
+                k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
+                qk = tl.sum(
+                    q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1
+                ) * scale
+            else:
+                off_kv = (
+                    offs_n[:, None] * stride_k_token
+                    + kv_head_idx * stride_k_head
+                    + offs_d_2d * stride_k_dim
+                )
+                k = tl.load(
+                    k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0
+                )
+                if IS_FP8:
+                    k = k.to(tl.float32) * k_scale
+                qk = tl.sum(q[None, :] * k, axis=1) * scale
         else:
-            off_kv = (
-                offs_n[:, None] * stride_k_token
-                + kv_head_idx * stride_k_head
-                + offs_d_2d * stride_k_dim
-            )
-            k = tl.load(k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
-            if IS_FP8:
-                k = k.to(tl.float32) * k_scale
-            qk = tl.sum(q[None, :] * k, axis=1) * scale
+            qk = tl.zeros([BLOCK_N], dtype=tl.float32)
 
         # Apply Gemma-style logit soft-capping BEFORE the padding -inf mask.
         # If softcap were applied after mask, tanh(-inf)=-1 would wreck the
@@ -355,6 +358,12 @@ def _paged_attention_kernel(
         if HAS_SOFTCAP:
             inv_softcap = 1.0 / softcap_value
             qk = softcap_value * libdevice.tanh(qk * inv_softcap)
+
+        # Non-selected blocks: force QK to -inf after softcap so they
+        # contribute nothing to the softmax. This replaces the old
+        # approach of narrowing block_mask (which still issued K/V loads).
+        if USE_SELECTION and not is_selected:
+            qk = tl.full([BLOCK_N], -float("inf"), dtype=tl.float32)
 
         qk = tl.where(block_mask, qk, -float("inf"))
         m_curr = tl.max(qk, axis=0)
@@ -372,32 +381,35 @@ def _paged_attention_kernel(
         # Guard against zero sum to avoid NaN in division
         l_new = tl.maximum(l_new, 1e-20)
 
-        if IS_INT4:
-            v_packed = tl.load(
-                v_base_ptr.to(tl.pointer_type(tl.uint8))
-                + offs_n[:, None] * stride_v_token
-                + kv_head_idx * stride_v_head
-                + offs_d_half_2d * stride_v_dim,
-                mask=block_mask[:, None],
-                other=0,
-            ).to(tl.int32)
-            # Manual sign-extension for 4-bit signed
-            v_l = ((v_packed << 28) >> 28).to(tl.float32) * v_scale
-            v_h = ((v_packed << 24) >> 28).to(tl.float32) * v_scale
-            acc_low = acc_low * alpha + tl.sum(p[:, None] * v_l, axis=0)
-            acc_high = acc_high * alpha + tl.sum(p[:, None] * v_h, axis=0)
-        else:
-            v = tl.load(
-                v_base_ptr
-                + offs_n[:, None] * stride_v_token
-                + kv_head_idx * stride_v_head
-                + offs_d_2d * stride_v_dim,
-                mask=block_mask[:, None],
-                other=0.0,
-            )
-            if IS_FP8:
-                v = v.to(tl.float32) * v_scale
-            acc_full = acc_full * alpha + tl.sum(p[:, None] * v, axis=0)
+        # V load and accumulation — skipped for non-selected blocks
+        # to save global memory bandwidth.
+        if is_selected:
+            if IS_INT4:
+                v_packed = tl.load(
+                    v_base_ptr.to(tl.pointer_type(tl.uint8))
+                    + offs_n[:, None] * stride_v_token
+                    + kv_head_idx * stride_v_head
+                    + offs_d_half_2d * stride_v_dim,
+                    mask=block_mask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                # Manual sign-extension for 4-bit signed
+                v_l = ((v_packed << 28) >> 28).to(tl.float32) * v_scale
+                v_h = ((v_packed << 24) >> 28).to(tl.float32) * v_scale
+                acc_low = acc_low * alpha + tl.sum(p[:, None] * v_l, axis=0)
+                acc_high = acc_high * alpha + tl.sum(p[:, None] * v_h, axis=0)
+            else:
+                v = tl.load(
+                    v_base_ptr
+                    + offs_n[:, None] * stride_v_token
+                    + kv_head_idx * stride_v_head
+                    + offs_d_2d * stride_v_dim,
+                    mask=block_mask[:, None],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    v = v.to(tl.float32) * v_scale
+                acc_full = acc_full * alpha + tl.sum(p[:, None] * v, axis=0)
 
         l_i = l_new
         m_i = m_new
