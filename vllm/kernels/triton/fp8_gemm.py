@@ -1,6 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Block-wise FP8 GEMM: C = (A @ B) * scale_a * scale_b.
+
+Memory layout:
+  A:       (M, K)      row-major  float8_e4m3fn
+  B:       (K, N)      row-major  float8_e4m3fn
+  Scale_A: (M//128, K//128) or scalar broadcast  float32
+  Scale_B: (N//128, K//128) or scalar broadcast  float32
+  C:       (M, N)      row-major  float16 (output)
+
+Tiling:
+  Grid:        (ceil(M/64), ceil(N/64))  2D grid
+  BLOCK_M=64, BLOCK_N=64, BLOCK_K=64
+  GROUP_SIZE_M=8 for L2 cache locality on M axis.
+  Inner loop over K dimension: loads fp8 tiles, casts to fp16 via tl.dot.
+
+Register pressure: moderate. Accumulator tile 64x64 fp32 (~4096 values, Triton-managed).
+Per-iteration: a[64,64] fp16, b[64,64] fp16, plus scale loads.
+No dedicated low-ILP fallback; tile sizes are compile-time constexpr.
+"""
+
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
