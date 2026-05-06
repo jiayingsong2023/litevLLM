@@ -39,6 +39,7 @@ def _env_get(name: str, default: str = "") -> str:
         return _AWQ_FUSED_TUNING.get(name, default)
     return os.environ.get(name, _AWQ_FUSED_TUNING.get(name, default))
 
+
 def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     Whether to use bf16 operands in tl.dot (vs fp16).
@@ -165,9 +166,15 @@ def _select_fused_gemm_blocks(
 _PERSISTENT_PROFILE_CACHE: dict[str, list[dict[str, int]]] | None = None
 
 
+def _bundled_persistent_profile_path() -> Path:
+    return Path(__file__).with_name("awq_fused_profile.json")
+
+
 def _persistent_profile_path() -> Path:
     raw = _env_get("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "").strip()
     if not raw:
+        return _bundled_persistent_profile_path()
+    if raw.lower() in ("0", "false", "no", "off"):
         return Path()
     return Path(raw).expanduser()
 
@@ -187,6 +194,10 @@ def _load_persistent_profile() -> dict[str, list[dict[str, int]]]:
         return _PERSISTENT_PROFILE_CACHE
     out: dict[str, list[dict[str, int]]] = {}
     if isinstance(payload, dict):
+        version = payload.get("version", 1)
+        if version != 1:
+            _PERSISTENT_PROFILE_CACHE = {}
+            return _PERSISTENT_PROFILE_CACHE
         for key, value in payload.items():
             if key == "version":
                 continue
@@ -954,7 +965,6 @@ def _awq_native_tiled_gemm_split_k(
     pid_sk = tl.program_id(1)
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
@@ -978,7 +988,6 @@ def _awq_native_tiled_gemm_split_k(
 
     for k in range(0, iters_per_sk):
         curr_k_base = start_k + k * BLOCK_K
-        k_remaining = K - curr_k_base
         mask_k = (offs_k[None, :] < BLOCK_K) & (curr_k_base + offs_k[None, :] < K)
         mask_k = mask_k & (curr_k_base < end_k)
 
@@ -1188,7 +1197,6 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
     pid = tl.program_id(0)
     pid_sk = tl.program_id(1)
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
@@ -1210,7 +1218,6 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
 
     for k in range(0, iters_per_sk):
         curr_k_base = start_k + k * BLOCK_K
-        k_remaining = K - curr_k_base
         mask_k = (offs_k[None, :] < BLOCK_K) & (curr_k_base + offs_k[None, :] < K)
         mask_k = mask_k & (curr_k_base < end_k)
 
