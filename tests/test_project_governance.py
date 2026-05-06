@@ -50,3 +50,18 @@ def test_capability_matrix_is_documented_and_referenced() -> None:
     for doc in referenced_docs:
         text = _read(doc)
         assert "CAPABILITY_MATRIX.md" in text, f"{doc} must reference capability matrix"
+
+
+def test_runtime_factory_does_not_read_fastinference_env_directly() -> None:
+    factory = _read("vllm/engine/runtime_factory.py")
+
+    forbidden_patterns = (
+        "os.environ",
+        "getenv",
+        "FASTINFERENCE_",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in factory, (
+            "runtime_factory must receive runtime policy from RuntimeConfig, "
+            f"not read env directly via {pattern!r}"
+        )
