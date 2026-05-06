@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from vllm.kernels.triton.awq_fused_gemm import (
     _env_fused_gemm_autotune,
+    _load_persistent_profile,
+    _lookup_persistent_blocks,
+    _persistent_profile_path,
     _select_fused_gemm_blocks,
     set_awq_fused_tuning_config,
 )
@@ -43,3 +49,71 @@ def test_env_fused_gemm_autotune_explicit_override() -> None:
     assert _env_fused_gemm_autotune(1, 8192, 5376) is False
     set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "off"})
     assert _env_fused_gemm_autotune(256, 2048, 4096) is False
+
+
+def test_persistent_profile_defaults_to_bundled_profile(monkeypatch) -> None:
+    monkeypatch.delenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", raising=False)
+    set_awq_fused_tuning_config({})
+
+    path = _persistent_profile_path()
+    profile = _load_persistent_profile()
+
+    assert path.name == "awq_fused_profile.json"
+    assert path.is_file()
+    assert profile["packed_int4_symmetric"]
+
+
+def test_lookup_persistent_blocks_uses_bundled_profile(monkeypatch) -> None:
+    monkeypatch.delenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", raising=False)
+    set_awq_fused_tuning_config({})
+
+    assert _lookup_persistent_blocks(
+        "packed_int4_symmetric",
+        m=2,
+        n=8192,
+        k=5376,
+        group_size=32,
+    ) == (16, 256, 64, 8, 2)
+
+
+def test_persistent_profile_env_override_and_disable(monkeypatch, tmp_path) -> None:
+    override_path = tmp_path / "awq_profile.json"
+    override_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "packed_int4_symmetric": [
+                    {
+                        "m_min": 2,
+                        "m_max": 8,
+                        "n": 1234,
+                        "k": 5678,
+                        "group_size": 32,
+                        "block_m": 32,
+                        "block_n": 64,
+                        "block_k": 64,
+                        "num_warps": 4,
+                        "num_stages": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", str(override_path))
+    set_awq_fused_tuning_config({})
+
+    assert _persistent_profile_path() == override_path
+    assert _lookup_persistent_blocks(
+        "packed_int4_symmetric",
+        m=4,
+        n=1234,
+        k=5678,
+        group_size=32,
+    ) == (32, 64, 64, 4, 1)
+
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "off")
+    set_awq_fused_tuning_config({})
+
+    assert _persistent_profile_path() == Path()
+    assert _load_persistent_profile() == {}
