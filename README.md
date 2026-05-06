@@ -98,6 +98,7 @@ uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AW
 ```
 
 ## 📄 开发与架构
+- **能力矩阵（支持面真源）**: 请参考 [docs/CAPABILITY_MATRIX.md](./docs/CAPABILITY_MATRIX.md)
 - **架构深度解析**: 请参考 [docs/ARCHITECTURE_LITE.md](./docs/ARCHITECTURE_LITE.md)
 - **lite-only 当前状态**: 请参考 [docs/LITE_ONLY_STATUS.md](./docs/LITE_ONLY_STATUS.md)
 - **交付状态（DONE/KNOWN_GAPS）**: 请参考 [docs/DELIVERY_STATUS.md](./docs/DELIVERY_STATUS.md)
