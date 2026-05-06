@@ -39,6 +39,7 @@ def _env_get(name: str, default: str = "") -> str:
         return _AWQ_FUSED_TUNING.get(name, default)
     return os.environ.get(name, _AWQ_FUSED_TUNING.get(name, default))
 
+
 def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     Whether to use bf16 operands in tl.dot (vs fp16).
@@ -55,9 +56,7 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     if a.dtype != torch.bfloat16:
         return False
-    raw = (
-        _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
-    )
+    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -107,17 +106,19 @@ def _select_fused_gemm_blocks(
     block_k = 64
     deep_k_narrow_out = k >= 16384 and n <= 6144
     if m == 1:
-        # M=1 decode: route to the GEMV specialization inside the kernel. A
-        # BLOCK_M of 16 would waste 15/16 MFMA lanes on replicated rows; the
-        # GEMV branch needs BLOCK_M==1 to be picked up (constexpr DCE of the
-        # MMA path). Wider N tiles keep the reduction dominated by memory.
-        block_m = 1
         if mlp_down_decode_small_m:
+            # Gemma4-31B down_proj is deep-K/narrow-N. On ROCm, the regular
+            # small-M MMA tile is faster than the GEMV branch for this shape.
+            block_m = 16
             block_n = 128
-        elif n <= 8192 or k >= 16384:
-            block_n = 256
         else:
-            block_n = 128
+            # M=1 decode: route to the GEMV specialization inside the kernel.
+            # A BLOCK_M of 16 would waste 15/16 MFMA lanes on replicated rows;
+            # the GEMV branch needs BLOCK_M==1 to be picked up (constexpr DCE
+            # of the MMA path). Wider N tiles keep the reduction dominated by
+            # memory.
+            block_m = 1
+            block_n = 256 if n <= 8192 or k >= 16384 else 128
     elif m <= 4:
         block_m = 16
         # Decode-heavy Gemma4 shapes prefer wider N tiles, but very wide output
@@ -954,7 +955,6 @@ def _awq_native_tiled_gemm_split_k(
     pid_sk = tl.program_id(1)
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
@@ -978,7 +978,6 @@ def _awq_native_tiled_gemm_split_k(
 
     for k in range(0, iters_per_sk):
         curr_k_base = start_k + k * BLOCK_K
-        k_remaining = K - curr_k_base
         mask_k = (offs_k[None, :] < BLOCK_K) & (curr_k_base + offs_k[None, :] < K)
         mask_k = mask_k & (curr_k_base < end_k)
 
@@ -1022,9 +1021,7 @@ def _awq_native_tiled_gemm_split_k(
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
     result = (
-        accumulator.to(tl.bfloat16)
-        if USE_BF16_OUTPUT
-        else accumulator.to(tl.float16)
+        accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
     )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1188,7 +1185,6 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
     pid = tl.program_id(0)
     pid_sk = tl.program_id(1)
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
@@ -1210,7 +1206,6 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
 
     for k in range(0, iters_per_sk):
         curr_k_base = start_k + k * BLOCK_K
-        k_remaining = K - curr_k_base
         mask_k = (offs_k[None, :] < BLOCK_K) & (curr_k_base + offs_k[None, :] < K)
         mask_k = mask_k & (curr_k_base < end_k)
 
@@ -1252,9 +1247,7 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
     result = (
-        accumulator.to(tl.bfloat16)
-        if USE_BF16_OUTPUT
-        else accumulator.to(tl.float16)
+        accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
     )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1576,8 +1569,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         bias = bias.contiguous().reshape(N)
         if bias.device != a.device:
             raise ValueError(
-                "awq_fused_gemm: bias must be on the same "
-                "device as activations"
+                "awq_fused_gemm: bias must be on the same device as activations"
             )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
@@ -1772,9 +1764,7 @@ def packed_int4_symmetric_fused_gemm(
             and (k // 32) % 2 == 0
         ):
             raw_split_k = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK", "4")
-            raw_block_n = _env_get(
-                "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N", "128"
-            )
+            raw_block_n = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N", "128")
             raw_block_groups = _env_get(
                 "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_GROUPS", "4"
             )
@@ -1938,9 +1928,7 @@ def packed_int4_symmetric_fused_gemm(
             return c
 
         if _env_awq_group32_gemv_all():
-            raw_block_n = _env_get(
-                "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N", "128"
-            )
+            raw_block_n = _env_get("FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N", "128")
             raw_block_groups = _env_get(
                 "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_GROUPS", "8"
             )
@@ -1984,9 +1972,7 @@ def packed_int4_symmetric_fused_gemm(
         except ValueError:
             block_n = 256
         block_n = max(32, min(512, block_n))
-        raw_block_packs = _env_get(
-            "FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS", "16"
-        )
+        raw_block_packs = _env_get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS", "16")
         try:
             block_packs = int(raw_block_packs)
         except ValueError:
@@ -2186,9 +2172,7 @@ def packed_int4_symmetric_fused_gate_up_m1(
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: K mismatch")
     c = torch.empty((1, n), device=a.device, dtype=a.dtype) if out is None else out
     raw_block_n = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N", "128")
-    raw_block_packs = _env_get(
-        "FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16"
-    )
+    raw_block_packs = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16")
     try:
         block_n = int(raw_block_n)
     except ValueError:
@@ -2265,9 +2249,7 @@ def packed_int4_symmetric_fused_qkv_m1(
     if v_scales is None:
         v_scales = q_scales
     raw_block_n = _env_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N", "256")
-    raw_block_groups = _env_get(
-        "FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS", "4"
-    )
+    raw_block_groups = _env_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS", "4")
     try:
         block_n = int(raw_block_n)
     except ValueError:
