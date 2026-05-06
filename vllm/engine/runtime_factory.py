@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from vllm.engine.backend.lite_single_gpu import LiteSingleGpuBackend
@@ -10,63 +9,25 @@ from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.multimodal_processor import LiteMultiModalProcessor
 from vllm.engine.prefill_executor import PrefillExecutor
+from vllm.engine.runtime_config import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.step_scheduler import StepScheduler
-
-
-def _parse_service_class_quotas_env(name: str) -> dict[str, int] | None:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    quotas: dict[str, int] = {}
-    for item in raw.split(","):
-        part = item.strip()
-        if not part or "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key or not value:
-            continue
-        try:
-            quotas[key] = max(0, int(value))
-        except ValueError:
-            continue
-    return quotas or None
-
-
-def _parse_service_class_weights_env(name: str) -> dict[str, int] | None:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    weights: dict[str, int] = {}
-    for item in raw.split(","):
-        part = item.strip()
-        if not part or "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key or not value:
-            continue
-        try:
-            weights[key] = max(1, int(value))
-        except ValueError:
-            continue
-    return weights or None
-
-
-def _parse_service_class_list_env(name: str) -> set[str] | None:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return None
-    values = {item.strip() for item in raw.split(",") if item.strip()}
-    return values or None
 
 
 class LiteRuntimeFactory:
     @classmethod
     def build(cls, engine: Any) -> dict[str, Any]:
+        runtime_config = getattr(engine, "runtime_config", None)
+        scheduler_policy = getattr(
+            runtime_config,
+            "scheduler_policy",
+            SchedulerRuntimePolicy(),
+        )
+        backend_policy = getattr(
+            runtime_config,
+            "backend_policy",
+            BackendRuntimePolicy(),
+        )
         kv_block_manager = KVBlockManager(
             kv_caches=engine.kv_caches,
             kv_scale_caches=engine.kv_scale_caches,
@@ -113,124 +74,78 @@ class LiteRuntimeFactory:
             prefill_catchup_ratio=engine._prefill_catchup_ratio,
             prefill_microbatch_size=engine._prefill_microbatch_size,
             max_admit_per_step=max(1, min(4, engine.max_active_requests)),
-            max_decode_streak=int(
-                os.environ.get("FASTINFERENCE_MAX_DECODE_STREAK", "4")
+            max_decode_streak=scheduler_policy.max_decode_streak,
+            queue_aging_threshold_s=scheduler_policy.queue_aging_threshold_s,
+            max_prefill_deferrals=scheduler_policy.max_prefill_deferrals,
+            service_class_weights=scheduler_policy.service_class_weights,
+            admission_service_class_quotas=(
+                scheduler_policy.admission_service_class_quotas
             ),
-            queue_aging_threshold_s=float(
-                os.environ.get("FASTINFERENCE_QUEUE_AGING_THRESHOLD_S", "2.0")
+            decode_service_class_quotas=scheduler_policy.decode_service_class_quotas,
+            fairness_guardrail_queue_wait_s=(
+                scheduler_policy.fairness_guardrail_queue_wait_s
             ),
-            max_prefill_deferrals=int(
-                os.environ.get("FASTINFERENCE_MAX_PREFILL_DEFERRALS", "2")
+            fairness_guardrail_service_classes=(
+                scheduler_policy.fairness_guardrail_service_classes
             ),
-            service_class_weights=_parse_service_class_weights_env(
-                "FASTINFERENCE_SERVICE_CLASS_WEIGHTS"
+            max_admit_lora_adapters_per_step=(
+                scheduler_policy.max_admit_lora_adapters_per_step
             ),
-            admission_service_class_quotas=_parse_service_class_quotas_env(
-                "FASTINFERENCE_ADMISSION_SERVICE_CLASS_QUOTAS"
+            max_prefill_lora_adapters_per_batch=(
+                scheduler_policy.max_prefill_lora_adapters_per_batch
             ),
-            decode_service_class_quotas=_parse_service_class_quotas_env(
-                "FASTINFERENCE_DECODE_SERVICE_CLASS_QUOTAS"
+            max_decode_lora_adapters_per_batch=(
+                scheduler_policy.max_decode_lora_adapters_per_batch
             ),
-            fairness_guardrail_queue_wait_s=float(
-                os.environ.get("FASTINFERENCE_FAIRNESS_GUARDRAIL_QUEUE_WAIT_S", "0.0")
+            lora_fairness_relax_threshold=(
+                scheduler_policy.lora_fairness_relax_threshold
             ),
-            fairness_guardrail_service_classes=_parse_service_class_list_env(
-                "FASTINFERENCE_FAIRNESS_GUARDRAIL_SERVICE_CLASSES"
+            lora_locality_tighten_threshold=(
+                scheduler_policy.lora_locality_tighten_threshold
             ),
-            max_admit_lora_adapters_per_step=int(
-                os.environ.get("FASTINFERENCE_MAX_ADMIT_LORA_ADAPTERS_PER_STEP", "0")
+            lora_limit_relax_delta=scheduler_policy.lora_limit_relax_delta,
+            lora_limit_tighten_delta=scheduler_policy.lora_limit_tighten_delta,
+            max_admit_multimodal_per_step=(
+                scheduler_policy.max_admit_multimodal_per_step
             ),
-            max_prefill_lora_adapters_per_batch=int(
-                os.environ.get("FASTINFERENCE_MAX_PREFILL_LORA_ADAPTERS_PER_BATCH", "0")
+            max_prefill_multimodal_requests_per_batch=(
+                scheduler_policy.max_prefill_multimodal_requests_per_batch
             ),
-            max_decode_lora_adapters_per_batch=int(
-                os.environ.get("FASTINFERENCE_MAX_DECODE_LORA_ADAPTERS_PER_BATCH", "0")
+            max_decode_multimodal_requests_per_batch=(
+                scheduler_policy.max_decode_multimodal_requests_per_batch
             ),
-            lora_fairness_relax_threshold=float(
-                os.environ.get("FASTINFERENCE_LORA_FAIRNESS_RELAX_THRESHOLD", "0.0")
+            max_admit_multimodal_lora_per_step=(
+                scheduler_policy.max_admit_multimodal_lora_per_step
             ),
-            lora_locality_tighten_threshold=float(
-                os.environ.get("FASTINFERENCE_LORA_LOCALITY_TIGHTEN_THRESHOLD", "0.0")
+            max_prefill_multimodal_lora_requests_per_batch=(
+                scheduler_policy.max_prefill_multimodal_lora_requests_per_batch
             ),
-            lora_limit_relax_delta=int(
-                os.environ.get("FASTINFERENCE_LORA_LIMIT_RELAX_DELTA", "1")
+            max_decode_multimodal_lora_requests_per_batch=(
+                scheduler_policy.max_decode_multimodal_lora_requests_per_batch
             ),
-            lora_limit_tighten_delta=int(
-                os.environ.get("FASTINFERENCE_LORA_LIMIT_TIGHTEN_DELTA", "1")
+            multimodal_prefix_cache_relax_threshold=(
+                scheduler_policy.multimodal_prefix_cache_relax_threshold
             ),
-            max_admit_multimodal_per_step=int(
-                os.environ.get("FASTINFERENCE_MAX_ADMIT_MULTIMODAL_PER_STEP", "0")
+            multimodal_prefix_cache_tighten_threshold=(
+                scheduler_policy.multimodal_prefix_cache_tighten_threshold
             ),
-            max_prefill_multimodal_requests_per_batch=int(
-                os.environ.get(
-                    "FASTINFERENCE_MAX_PREFILL_MULTIMODAL_REQUESTS_PER_BATCH", "0"
-                )
+            multimodal_prefill_limit_relax_delta=(
+                scheduler_policy.multimodal_prefill_limit_relax_delta
             ),
-            max_decode_multimodal_requests_per_batch=int(
-                os.environ.get(
-                    "FASTINFERENCE_MAX_DECODE_MULTIMODAL_REQUESTS_PER_BATCH", "0"
-                )
+            multimodal_prefill_limit_tighten_delta=(
+                scheduler_policy.multimodal_prefill_limit_tighten_delta
             ),
-            max_admit_multimodal_lora_per_step=int(
-                os.environ.get(
-                    "FASTINFERENCE_MAX_ADMIT_MULTIMODAL_LORA_PER_STEP", "0"
-                )
+            multimodal_lora_prefill_limit_relax_delta=(
+                scheduler_policy.multimodal_lora_prefill_limit_relax_delta
             ),
-            max_prefill_multimodal_lora_requests_per_batch=int(
-                os.environ.get(
-                    "FASTINFERENCE_MAX_PREFILL_MULTIMODAL_LORA_REQUESTS_PER_BATCH",
-                    "0",
-                )
+            multimodal_lora_prefill_limit_tighten_delta=(
+                scheduler_policy.multimodal_lora_prefill_limit_tighten_delta
             ),
-            max_decode_multimodal_lora_requests_per_batch=int(
-                os.environ.get(
-                    "FASTINFERENCE_MAX_DECODE_MULTIMODAL_LORA_REQUESTS_PER_BATCH",
-                    "0",
-                )
+            multimodal_lora_fairness_relax_threshold=(
+                scheduler_policy.multimodal_lora_fairness_relax_threshold
             ),
-            multimodal_prefix_cache_relax_threshold=float(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_RELAX_THRESHOLD", "0.0"
-                )
-            ),
-            multimodal_prefix_cache_tighten_threshold=float(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_TIGHTEN_THRESHOLD", "0.0"
-                )
-            ),
-            multimodal_prefill_limit_relax_delta=int(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_PREFILL_LIMIT_RELAX_DELTA", "1"
-                )
-            ),
-            multimodal_prefill_limit_tighten_delta=int(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_PREFILL_LIMIT_TIGHTEN_DELTA", "1"
-                )
-            ),
-            multimodal_lora_prefill_limit_relax_delta=int(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_LORA_PREFILL_LIMIT_RELAX_DELTA",
-                    "1",
-                )
-            ),
-            multimodal_lora_prefill_limit_tighten_delta=int(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_LORA_PREFILL_LIMIT_TIGHTEN_DELTA",
-                    "1",
-                )
-            ),
-            multimodal_lora_fairness_relax_threshold=float(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_LORA_FAIRNESS_RELAX_THRESHOLD",
-                    "0.0",
-                )
-            ),
-            multimodal_lora_locality_tighten_threshold=float(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_LORA_LOCALITY_TIGHTEN_THRESHOLD",
-                    "0.0",
-                )
+            multimodal_lora_locality_tighten_threshold=(
+                scheduler_policy.multimodal_lora_locality_tighten_threshold
             ),
         )
         execution_backend = LiteSingleGpuBackend(
@@ -242,41 +157,18 @@ class LiteRuntimeFactory:
             output_coordinator=engine.output_pipeline,
             kv_block_manager=kv_block_manager,
             lora_registry=engine.lora_registry,
-            max_prefix_cache_entries=int(
-                os.environ.get("FASTINFERENCE_PREFIX_CACHE_MAX_ENTRIES", "8")
+            max_prefix_cache_entries=backend_policy.max_prefix_cache_entries,
+            preemption_mode=backend_policy.preemption_mode,
+            preemption_min_backlog=backend_policy.preemption_min_backlog,
+            preemption_min_decodes=backend_policy.preemption_min_decodes,
+            preemption_max_queue_wait_s=backend_policy.preemption_max_queue_wait_s,
+            preemptible_service_classes=backend_policy.preemptible_service_classes,
+            preempt_multimodal_prefills=backend_policy.preempt_multimodal_prefills,
+            preempt_multimodal_max_queue_wait_s=(
+                backend_policy.preempt_multimodal_max_queue_wait_s
             ),
-            preemption_mode=os.environ.get(
-                "FASTINFERENCE_PREEMPTION_MODE", "defer_prefill"
-            ),
-            preemption_min_backlog=int(
-                os.environ.get("FASTINFERENCE_PREEMPT_MIN_BACKLOG", "1")
-            ),
-            preemption_min_decodes=int(
-                os.environ.get("FASTINFERENCE_PREEMPT_MIN_DECODES", "1")
-            ),
-            preemption_max_queue_wait_s=float(
-                os.environ.get("FASTINFERENCE_PREEMPT_MAX_QUEUE_WAIT_S", "0.0")
-            ),
-            preemptible_service_classes=_parse_service_class_list_env(
-                "FASTINFERENCE_PREEMPTIBLE_SERVICE_CLASSES"
-            ),
-            preempt_multimodal_prefills=(
-                os.environ.get("FASTINFERENCE_PREEMPT_MULTIMODAL_PREFILLS", "").strip().lower()
-                in ("1", "true", "yes", "on")
-            ),
-            preempt_multimodal_max_queue_wait_s=float(
-                os.environ.get(
-                    "FASTINFERENCE_PREEMPT_MULTIMODAL_MAX_QUEUE_WAIT_S", "0.0"
-                )
-            ),
-            multimodal_prefix_cache_protect_threshold=float(
-                os.environ.get(
-                    "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_PROTECT_THRESHOLD",
-                    os.environ.get(
-                        "FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_TIGHTEN_THRESHOLD",
-                        "0.0",
-                    ),
-                )
+            multimodal_prefix_cache_protect_threshold=(
+                backend_policy.multimodal_prefix_cache_protect_threshold
             ),
         )
         runtime_controller = RuntimeController(
