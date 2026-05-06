@@ -12,7 +12,8 @@ human-readable best-per-case rows that can be used to solidify kernel defaults.
 
 Example:
   uv run python tests/tools/bench_gemma4_31b_fused_gemm.py --quick
-  uv run python tests/tools/bench_gemma4_31b_fused_gemm.py --decode-ms 1,2,4 --prefill-ms 128
+  uv run python tests/tools/bench_gemma4_31b_fused_gemm.py \
+    --decode-ms 1,2,4 --prefill-ms 128
 """
 
 from __future__ import annotations
@@ -21,9 +22,9 @@ import argparse
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -61,7 +62,13 @@ def _clear_block_env() -> None:
         os.environ.pop(k, None)
 
 
-def _set_block_env(block_m: int, block_n: int, block_k: int, num_warps: int, num_stages: int) -> None:
+def _set_block_env(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+) -> None:
     os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M"] = str(block_m)
     os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N"] = str(block_n)
     os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K"] = str(block_k)
@@ -83,9 +90,21 @@ def _parse_int_list(raw: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
 
+def filter_shapes_by_label(
+    shapes: list[GemmShape],
+    raw_labels: str,
+) -> list[GemmShape]:
+    labels = {x.strip() for x in raw_labels.split(",") if x.strip()}
+    if not labels:
+        return shapes
+    return [shape for shape in shapes if shape.label in labels]
+
+
 def load_gemma4_31b_shapes(model_path: str) -> list[GemmShape]:
     cfg = json.loads(Path(model_path, "config.json").read_text(encoding="utf-8"))
-    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    text_cfg = (
+        cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    )
     hidden = int(text_cfg["hidden_size"])
     intermediate = int(text_cfg["intermediate_size"])
     num_heads = int(text_cfg["num_attention_heads"])
@@ -134,15 +153,35 @@ def expand_shapes_by_m(
     out: list[GemmShape] = []
     for shape in base_shapes:
         for m in decode_ms:
-            out.append(GemmShape(f"{shape.label}/decode_m{m}", m, shape.n, shape.k, shape.group_size))
+            out.append(
+                GemmShape(
+                    f"{shape.label}/decode_m{m}",
+                    m,
+                    shape.n,
+                    shape.k,
+                    shape.group_size,
+                )
+            )
         for m in prefill_ms:
-            out.append(GemmShape(f"{shape.label}/prefill_m{m}", m, shape.n, shape.k, shape.group_size))
+            out.append(
+                GemmShape(
+                    f"{shape.label}/prefill_m{m}",
+                    m,
+                    shape.n,
+                    shape.k,
+                    shape.group_size,
+                )
+            )
     return out
 
 
 def candidate_configs() -> list[tuple[str, tuple[int, int, int, int, int] | None]]:
     return [
         ("autotune_default", None),
+        ("t1_m1_bn128_w4_s1", (1, 128, 64, 4, 1)),
+        ("t1_m2_bn128_w4_s1", (16, 128, 64, 4, 1)),
+        ("t1_m2_bn256_w4_s1", (16, 256, 64, 4, 1)),
+        ("legacy_bm16_bn128_w8_s2", (16, 128, 64, 8, 2)),
         ("bm16_bn128_bk64_w8_s2", (16, 128, 64, 8, 2)),
         ("bm16_bn256_bk64_w8_s2", (16, 256, 64, 8, 2)),
         ("bm32_bn128_bk64_w8_s2", (32, 128, 64, 8, 2)),
@@ -153,14 +192,26 @@ def candidate_configs() -> list[tuple[str, tuple[int, int, int, int, int] | None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark Gemma4-31B packed INT4 fused GEMM")
+    parser = argparse.ArgumentParser(
+        description="Benchmark Gemma4-31B packed INT4 fused GEMM"
+    )
     parser.add_argument("--model", type=str, default="models/gemma-4-31B-it-AWQ-4bit")
     parser.add_argument("--decode-ms", type=str, default="1,2,4")
     parser.add_argument("--prefill-ms", type=str, default="128,256")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=60)
-    parser.add_argument("--quick", action="store_true", help="Reduce shapes and iterations for a fast sanity run.")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Reduce shapes and iterations for a fast sanity run.",
+    )
     parser.add_argument("--output-json", type=str, default="")
+    parser.add_argument(
+        "--labels",
+        type=str,
+        default="",
+        help="Comma-separated base projection labels to benchmark.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -182,11 +233,20 @@ def main() -> None:
         args.warmup = min(args.warmup, 8)
         args.iters = min(args.iters, 20)
 
-    base_shapes = load_gemma4_31b_shapes(args.model)
+    base_shapes = filter_shapes_by_label(
+        load_gemma4_31b_shapes(args.model), args.labels
+    )
     if args.quick:
         base_shapes = [
-            s for s in base_shapes
-            if s.label in ("attn_local_q_proj", "attn_global_q_proj", "mlp_gate_proj", "mlp_down_proj")
+            s
+            for s in base_shapes
+            if s.label
+            in (
+                "attn_local_q_proj",
+                "attn_global_q_proj",
+                "mlp_gate_proj",
+                "mlp_down_proj",
+            )
         ]
     shapes = expand_shapes_by_m(base_shapes, decode_ms=decode_ms, prefill_ms=prefill_ms)
 
@@ -196,8 +256,19 @@ def main() -> None:
     for shape in shapes:
         _clear_block_env()
         a = torch.randn(shape.m, shape.k, device=device, dtype=torch.bfloat16)
-        qweight = torch.randint(0, 255, (shape.n, shape.k // 8), device=device, dtype=torch.uint8)
-        scales = torch.ones(shape.n, shape.k // shape.group_size, device=device, dtype=torch.float16)
+        qweight = torch.randint(
+            0,
+            255,
+            (shape.n, shape.k // 8),
+            device=device,
+            dtype=torch.uint8,
+        )
+        scales = torch.ones(
+            shape.n,
+            shape.k // shape.group_size,
+            device=device,
+            dtype=torch.float16,
+        )
         out = torch.empty(shape.m, shape.n, device=device, dtype=a.dtype)
         heur = _select_fused_gemm_blocks(shape.m, shape.n, shape.k)
         use_bf16_dot = _resolve_use_bf16_dot(a, shape.m, shape.n)
@@ -210,12 +281,18 @@ def main() -> None:
             else:
                 os.environ["FASTINFERENCE_AWQ_FUSED_AUTOTUNE"] = "1"
 
-            def run_once() -> None:
+            def run_once(
+                a: torch.Tensor = a,
+                qweight: torch.Tensor = qweight,
+                scales: torch.Tensor = scales,
+                out: torch.Tensor = out,
+                group_size: int = shape.group_size,
+            ) -> None:
                 packed_int4_symmetric_fused_gemm(
                     a,
                     qweight,
                     scales,
-                    shape.group_size,
+                    group_size,
                     out=out,
                 )
 
@@ -223,7 +300,9 @@ def main() -> None:
             row = {
                 "config": cfg_name,
                 "ms": ms,
-                "tflops_est": (2.0 * shape.m * shape.n * shape.k) / (ms / 1000.0) / 1e12,
+                "tflops_est": (
+                    (2.0 * shape.m * shape.n * shape.k) / (ms / 1000.0) / 1e12
+                ),
             }
             case_rows.append(row)
 
@@ -253,7 +332,10 @@ def main() -> None:
 
     print("[Gemma4FusedGemmBench] " + json.dumps(summary, ensure_ascii=True))
     if args.output_json:
-        Path(args.output_json).write_text(json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8")
+        Path(args.output_json).write_text(
+            json.dumps(summary, indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":
