@@ -87,6 +87,18 @@ def test_launch_config_global_bucket_by_concurrency():
     assert (warps_high, stages_high) == (4, 2)
 
 
+def test_launch_config_gemma4_31b_c1_global_bucket_uses_stage1():
+    warps, stages = _select_paged_attention_launch_config(
+        num_seqs=1,
+        head_size=512,
+        block_size=16,
+        is_int4=False,
+        is_fp8=True,
+        attn_scope="global",
+    )
+    assert (warps, stages) == (4, 1)
+
+
 def test_launch_config_local_bucket_by_concurrency():
     warps_low, stages_low = _select_paged_attention_launch_config(
         num_seqs=1,
