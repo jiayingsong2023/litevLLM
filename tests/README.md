@@ -11,6 +11,23 @@
 
 ## 主回归入口
 
+Smoke 入口：
+
+```bash
+uv run pytest -q tests/smoke
+```
+
+该入口与 `.github/workflows/smoke.yml` 保持一致，用于覆盖导入链、
+serving 路由和无模型 HTTP 基础语义。
+
+快速回归入口：
+
+```bash
+bash tests/run_regression_suite.sh
+```
+
+该入口包含 smoke、项目治理检查和无需完整模型加载的单元/结构回归。
+
 准确性主入口：
 
 ```bash

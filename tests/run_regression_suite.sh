@@ -7,6 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 uv run pytest \
+  tests/smoke \
+  tests/test_project_governance.py \
   tests/test_kv_default_policy.py \
   tests/test_compressed_tensors_high_fidelity_flag.py \
   tests/test_perf_grid_search.py \

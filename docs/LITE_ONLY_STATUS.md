@@ -12,6 +12,9 @@ For an external-facing DONE/KNOWN_GAPS list, see:
 
 - `docs/DELIVERY_STATUS.md`
 
+For the current supported / experimental / compatibility / unsupported surface,
+use `docs/CAPABILITY_MATRIX.md` as the source of truth.
+
 ## Current Project Position
 FastInference is now a `lite-only` single-GPU inference project. The repository no longer treats `Qwen3.5-35B` as an officially supported model. The maintained support surface is the lite runtime path plus the current regression targets:
 
