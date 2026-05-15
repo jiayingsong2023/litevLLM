@@ -89,9 +89,9 @@ uv run python tests/e2e_moe_batch_scaling.py
 uv run python tests/e2e_gguf_perf.py
 ```
 
-On AMD Radeon 8060S 65GB with ROCm conservative defaults, the 2026-04-30 Gemma4
-default benchmark measured `gemma4_26b_a4b` at `2.30` aggregate TPS and
-`gemma4_31b_q4` at `1.49` aggregate TPS.
+On AMD Radeon 8060S 65GB with ROCm conservative defaults, the 2026-05-15 Gemma4
+default benchmark measured `gemma4_26b_a4b` at `2.33` aggregate TPS and
+`gemma4_31b_q4` at `1.50` aggregate TPS.
 
 ## Core Backend: Triton Only
 

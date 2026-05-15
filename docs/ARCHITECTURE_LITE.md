@@ -17,7 +17,7 @@ LLM / AsyncLLM / OpenAI API Server
   -> vllm/engine/output_pipeline.py
 ```
 
-- **统一配置构建**: offline 与 server 共用 `config_builder.py`，统一生成 `VllmConfig + RuntimeConfig`。
+- **统一配置构建**: offline 与 server 共用 `config_builder.py`，统一生成 `VllmConfig + RuntimeConfig`。模型热路径策略通过 `RuntimeConfig.tuning_env` 与 `attn_metadata["config"]` 显式传递，不再依赖模块初始化阶段的 `os.environ` 直读。
 - **模型能力适配**: `vllm/adapters/` 负责能力探测和 runtime capability 归一化。
 - **执行解耦**: `LiteEngine` 只保留 orchestration，具体 prefill/decode 执行由 executor 层负责。
 - **调度解耦**: `StepScheduler` 做 step 预算与批次选择，`RequestScheduler` 做 request/slot/stream 生命周期。
@@ -64,15 +64,15 @@ LitevLLM has been significantly optimized for Gemma4 dense and MoE models:
 
 ## 7. 核心性能概览 (AMD Radeon 8060S 65GB)
 
-最新 Gemma4 基线来自 2026-04-30 的无参数 `uv run python tests/e2e_full_benchmark.py`，
+最新 Gemma4 基线来自 2026-05-15 的 `uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b,gemma4_31b_q4 --model-process-isolation`，
 即 ROCm conservative defaults、`BS=1`、`prompt~384`、`max_new=24`、`KV cap=512`，并在 ROCm
 上自动启用 per-model process isolation。
 
 | 模型 | Aggregate TPS | TTFT p95 | Prefill TPS agg | Decode TPS agg | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **TinyLlama-1.1B** | **542+** | 历史 fast-path 基线 | - | - | 1:1 HF 对齐 |
-| **Gemma4-26B A4B (MoE)** | **2.30** | **3365.3ms** | **117.08** | **3.25** | Verified stable |
-| **Gemma4-31B (Dense)** | **1.49** | **8741.7ms** | **45.07** | **3.12** | Memory bound, accuracy-gated |
+| **Gemma4-26B A4B (MoE)** | **2.33** | **3267.3ms** | **120.59** | **3.27** | Verified stable |
+| **Gemma4-31B (Dense)** | **1.50** | **8809.4ms** | **44.72** | **3.18** | Memory bound, accuracy-gated |
 
 ---
 *本项目完全遵循 pure-Python 哲学，严禁引入任何需要 C++ 编译器的代码。所有算子均通过 Triton JIT 即时编译生成。*

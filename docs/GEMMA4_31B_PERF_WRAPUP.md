@@ -90,13 +90,13 @@ This confirmed that the dominant steady GPU footprint is not the KV cache. It is
 
 ## Current E2E Baseline
 
-Latest default benchmark command:
+Latest benchmark command:
 
 ```bash
-uv run python tests/e2e_full_benchmark.py
+uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b,gemma4_31b_q4 --model-process-isolation
 ```
 
-Measurement date: `2026-04-30`.
+Measurement date: `2026-05-15`.
 
 Runtime profile:
 
@@ -112,8 +112,8 @@ Observed parent-process summary:
 
 | Model key | Aggregate TPS | TTFT p95 | E2E p95 | Prefill TPS agg | Decode TPS agg |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemma4_26b_a4b` | `2.30` | `3365.3ms` | `10448.0ms` | `117.08` | `3.25` |
-| `gemma4_31b_q4` | `1.49` | `8741.7ms` | `16121.5ms` | `45.07` | `3.12` |
+| `gemma4_26b_a4b` | `2.33` | `3267.3ms` | `10300.4ms` | `120.59` | `3.27` |
+| `gemma4_31b_q4` | `1.50` | `8809.4ms` | `16038.7ms` | `44.72` | `3.18` |
 
 Interpretation:
 
