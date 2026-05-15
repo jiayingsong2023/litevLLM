@@ -65,3 +65,202 @@ def test_runtime_factory_does_not_read_fastinference_env_directly() -> None:
             "runtime_factory must receive runtime policy from RuntimeConfig, "
             f"not read env directly via {pattern!r}"
         )
+
+
+def test_lite_backend_does_not_read_fastinference_env_directly() -> None:
+    backend = _read("vllm/engine/backend/lite_single_gpu.py")
+
+    forbidden_patterns = (
+        "os.environ",
+        "getenv",
+        "FASTINFERENCE_",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in backend, (
+            "lite backend must receive runtime policy from BackendRuntimePolicy, "
+            f"not read env directly via {pattern!r}"
+        )
+
+
+def test_request_builder_does_not_read_fastinference_env_directly() -> None:
+    builder = _read("vllm/engine/request_builder.py")
+
+    forbidden_patterns = (
+        "os.environ",
+        "getenv",
+        "FASTINFERENCE_",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in builder, (
+            "request builder must receive runtime policy from RuntimeConfig, "
+            f"not read env directly via {pattern!r}"
+        )
+
+
+def test_lite_engine_operational_policy_does_not_read_env_directly() -> None:
+    engine = _read("vllm/engine/lite_engine.py")
+
+    forbidden_patterns = (
+        'os.environ.get("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS"',
+        'os.environ.get("FASTINFERENCE_MEM_AUDIT_TOPN"',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in engine, (
+            "lite engine operational policy must come from RuntimeConfig, "
+            f"not direct env read via {pattern!r}"
+        )
+
+
+def test_qwen35_full_attention_policy_uses_runtime_config() -> None:
+    qwen = _read("vllm/model_executor/models/qwen3_5.py")
+
+    forbidden_patterns = (
+        'self._use_full_attn_stabilizer = _env_truthy(',
+        "if self._use_full_attn_stabilizer:",
+        "self._use_sdpa_prefill = _env_qwen35_sdpa_prefill_enabled()",
+        "self._use_sdpa_prefill",
+        '_env_truthy("FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER")',
+        '_env_truthy("FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in qwen, (
+            "Qwen3.5 full-attention runtime policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_local_decode_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy_default_on("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 local decode runtime policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_full_decode_reference_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN")',
+        '_env_truthy("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 full-decode reference policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_legacy_full_precision_kv_write_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        'return _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 legacy full-precision KV write policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_legacy_item_path_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 legacy item-path decode policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_mlp_pair_fusion_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy_default_on("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 MLP pair-fusion policy must come from "
+            f'attn_metadata["config"], not env-derived instance state via {pattern!r}'
+        )
+
+
+def test_gemma4_fp32_residual_guard_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD")',
+        '_env_int_alias("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START"',
+        '_env_int("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN"',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 fp32 residual guard policy must come from RuntimeConfig, "
+            f"not env-derived instance state via {pattern!r}"
+        )
+
+
+def test_gemma4_moe_expert_cache_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_int("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 MoE expert cache policy must come from RuntimeConfig, "
+            f"not env-derived instance state via {pattern!r}"
+        )
+
+
+def test_gemma4_awq_fused_gate_up_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_truthy("FASTINFERENCE_AWQ_FUSED_GATE_UP")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 AWQ fused gate-up policy must come from runtime config, "
+            f"not direct env reads via {pattern!r}"
+        )
+
+
+def test_gemma4_rope_cache_policy_uses_runtime_config() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_env_get("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"',
+        '_env_get("FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX"',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 rope cache policy must come from RuntimeConfig, "
+            f"not env-derived instance state via {pattern!r}"
+        )
+
+
+def test_gemma4_profile_flags_do_not_read_env_at_module_init() -> None:
+    gemma = _read("vllm/model_executor/models/gemma4.py")
+
+    forbidden_patterns = (
+        '_GEMMA4_PROFILE_ENABLED = _env_get("FASTINFERENCE_GEMMA4_LAYER_PROFILE"',
+        '_GEMMA4_ROCTX_PROFILE_ENABLED = _env_get("FASTINFERENCE_GEMMA4_ROCTX_PROFILE"',
+        '_env_truthy("FASTINFERENCE_GEMMA4_LAYER_PROFILE")',
+        '_env_truthy("FASTINFERENCE_GEMMA4_ROCTX_PROFILE")',
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in gemma, (
+            "Gemma4 profile flags must be installed from tuning config, "
+            f"not module-init env reads via {pattern!r}"
+        )

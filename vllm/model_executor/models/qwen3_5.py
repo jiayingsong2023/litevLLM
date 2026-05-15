@@ -55,18 +55,18 @@ def _env_truthy(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-def _env_qwen35_sdpa_prefill_enabled() -> bool:
-    """
-    When ON: full-attention prefill uses ``scaled_dot_product_attention`` (faster, may differ slightly from HF).
-    Default OFF: prefill uses HF ``eager_attention_forward`` math (repeat_kv + float32 softmax + causal mask).
-    Set FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL=1 to enable SDPA (e2e_full_benchmark sets this for throughput).
-    """
-    v = (
-        _env_get("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0")
-        .strip()
-        .lower()
-    )
-    return v in ("1", "true", "yes", "on")
+def _qwen35_config_truthy(
+    inf_config: Any,
+    name: str,
+    default: bool = False,
+) -> bool:
+    tuning_env = getattr(inf_config, "tuning_env", None)
+    if not isinstance(tuning_env, dict):
+        return bool(default)
+    raw = tuning_env.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _repeat_kv_hf(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -721,10 +721,14 @@ def _cap_residual_delta_rms(
 
 
 def _residual_merge_fp16(
-    x_f: torch.Tensor, delta_f: torch.Tensor, out_dtype: torch.dtype, factor: float
+    x_f: torch.Tensor,
+    delta_f: torch.Tensor,
+    out_dtype: torch.dtype,
+    factor: float,
+    *,
+    disable_stabilizer: bool = False,
 ) -> torch.Tensor:
-    # FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER=1: skip RMS cap and output abs-cap (numerical ablation vs HF).
-    if _env_truthy("FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER"):
+    if disable_stabilizer:
         y = x_f + delta_f
         y = torch.nan_to_num(
             y, nan=0.0, posinf=_fp16_safe_abs_max(), neginf=-_fp16_safe_abs_max()
@@ -759,17 +763,20 @@ def _qwen35_try_fused_awq_pair_matmul(
 
 
 def _call_litelinear_stable(
-    layer: LiteLinear, x_f32: torch.Tensor, pre_cap: float = 2048.0
+    layer: LiteLinear,
+    x_f32: torch.Tensor,
+    pre_cap: float = 2048.0,
+    *,
+    disable_input_cap: bool = False,
 ) -> torch.Tensor:
     """
     Call LiteLinear through its module path (for hook visibility) while limiting fp16 overflow risk.
     We scale only the input magnitude before cast; no inverse-rescale is applied.
-    Set FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP=1 to skip input scaling (ablation / alignment with reference).
     """
     if layer.weight.numel() == 0:
         out_shape = (*x_f32.shape[:-1], layer.output_size)
         return torch.zeros(out_shape, device=x_f32.device, dtype=torch.float32)
-    if _env_truthy("FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP"):
+    if disable_input_cap:
         x_safe = x_f32
     else:
         x_safe = _scale_tensor_to_abs_cap(x_f32, pre_cap)
@@ -1180,11 +1187,6 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             from .llama import get_rotary_embedding
 
             self.rotary_emb = get_rotary_embedding(config)
-        # Legacy ROCm-friendly caps on full-attn matmuls / residuals (off by default for HF parity).
-        self._use_full_attn_stabilizer = _env_truthy(
-            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER"
-        )
-        self._use_sdpa_prefill = _env_qwen35_sdpa_prefill_enabled()
         self.kv_cache_dtype = "turbo_int4"
         self._k_scale_float = 1.0
         self._v_scale_float = 1.0
@@ -1196,6 +1198,22 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             else getattr(attn_metadata, "config", None)
         )
         fusion_level = inf_config.fusion_level if inf_config else 2
+        use_full_attn_stabilizer = _qwen35_config_truthy(
+            inf_config,
+            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER",
+        )
+        use_sdpa_prefill_policy = _qwen35_config_truthy(
+            inf_config,
+            "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL",
+        )
+        disable_residual_stabilizer = _qwen35_config_truthy(
+            inf_config,
+            "FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER",
+        )
+        disable_linear_input_cap = _qwen35_config_truthy(
+            inf_config,
+            "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP",
+        )
 
         input_dtype = x.dtype
         h = self.input_layernorm(x)
@@ -1297,7 +1315,7 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         use_direct_prefill = (
             seq > 1 and is_prefill and kv_chunk_start == 0 and not is_int4
         )
-        use_sdpa_prefill = use_direct_prefill and self._use_sdpa_prefill
+        use_sdpa_prefill = use_direct_prefill and use_sdpa_prefill_policy
         if use_direct_prefill and not use_sdpa_prefill:
             # HF-parity: same as transformers eager_attention_forward + causal (not Triton paged softmax).
             qh = q.view(bs, seq, nh, hd).transpose(1, 2)
@@ -1371,11 +1389,20 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         gate = gate.reshape(bs, seq, nh * hd)
         attn_gated = attn_flat * torch.sigmoid(gate.to(dtype=attn_flat.dtype))
 
-        if self._use_full_attn_stabilizer:
+        if use_full_attn_stabilizer:
             attn_out = _call_litelinear_stable(
-                self.self_attn.o_proj, attn_gated.float(), pre_cap=1024.0
+                self.self_attn.o_proj,
+                attn_gated.float(),
+                pre_cap=1024.0,
+                disable_input_cap=disable_linear_input_cap,
             )
-            hidden_states = _residual_merge_fp16(x.float(), attn_out, input_dtype, 8.0)
+            hidden_states = _residual_merge_fp16(
+                x.float(),
+                attn_out,
+                input_dtype,
+                8.0,
+                disable_stabilizer=disable_residual_stabilizer,
+            )
         else:
             attn_out = self.self_attn.o_proj(attn_gated)
             hidden_states = x + attn_out
@@ -1384,15 +1411,22 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         if self._use_moe:
             mlp_out = self.mlp(h_post)
             return hidden_states + mlp_out
-        if self._use_full_attn_stabilizer:
+        if use_full_attn_stabilizer:
             gp = self.mlp.gate_proj(h_post).float()
             up = self.mlp.up_proj(h_post).float()
             mlp_mid = F.silu(gp) * up
             mlp_out = _call_litelinear_stable(
-                self.mlp.down_proj, mlp_mid, pre_cap=1536.0
+                self.mlp.down_proj,
+                mlp_mid,
+                pre_cap=1536.0,
+                disable_input_cap=disable_linear_input_cap,
             )
             return _residual_merge_fp16(
-                hidden_states.float(), mlp_out, input_dtype, 8.0
+                hidden_states.float(),
+                mlp_out,
+                input_dtype,
+                8.0,
+                disable_stabilizer=disable_residual_stabilizer,
             )
 
         if fusion_level >= 2:  # Fused GateUp

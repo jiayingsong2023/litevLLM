@@ -74,6 +74,10 @@ def test_runtime_config_owns_factory_backend_env(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PREEMPT_MULTIMODAL_PREFILLS", "1")
     monkeypatch.setenv("FASTINFERENCE_PREEMPT_MULTIMODAL_MAX_QUEUE_WAIT_S", "2.5")
     monkeypatch.setenv("FASTINFERENCE_MULTIMODAL_PREFIX_CACHE_PROTECT_THRESHOLD", "0.7")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_SAMPLING", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "1")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_IGNORE_EOS", "1")
 
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
@@ -87,6 +91,74 @@ def test_runtime_config_owns_factory_backend_env(monkeypatch) -> None:
     assert backend.preempt_multimodal_prefills is True
     assert backend.preempt_multimodal_max_queue_wait_s == 2.5
     assert backend.multimodal_prefix_cache_protect_threshold == 0.7
+    assert backend.gpu_greedy_sampling is True
+    assert backend.gpu_greedy_max_tokens_only is True
+    assert backend.gpu_greedy_bypass_cpu_policies is True
+    assert backend.gpu_greedy_ignore_eos is True
+
+
+def test_runtime_config_owns_request_builder_default_min_new_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "3")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.default_min_new_tokens == 3
+
+
+def test_runtime_config_invalid_default_min_new_tokens_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "banana")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.default_min_new_tokens == 1
+
+
+def test_runtime_config_owns_lite_engine_operational_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("FASTINFERENCE_MEM_AUDIT_TOPN", "7")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.queue_timeout_s == 12.5
+    assert cfg.memory_audit_topn == 7
+
+
+def test_runtime_config_invalid_mem_audit_topn_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_MEM_AUDIT_TOPN", "banana")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.memory_audit_topn == 20
+
+
+def test_runtime_config_owns_gemma4_fp32_residual_guard_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD", "1")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START", "11")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN", "5")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_26b_fp32_residual_guard_enabled is True
+    assert cfg.gemma4_26b_fp32_residual_guard_start == 11
+    assert cfg.gemma4_26b_fp32_residual_guard_span == 5
+
+
+def test_runtime_config_owns_gemma4_moe_expert_cache_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE", "13")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_expert_cache_size == 13
+
+
+def test_runtime_config_owns_gemma4_rope_cache_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS", "1536")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX", "12")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_rope_cache_max_pos == 1536
+    assert cfg.gemma4_rope_cache_pool_max == 12
 
 
 def test_inference_config_defaults_to_turbo_int4(monkeypatch) -> None:

@@ -21,7 +21,7 @@ from vllm.engine.prefill_executor import PrefillExecutor
 from vllm.engine.request_scheduler import RequestScheduler
 from vllm.engine.request_state import RequestState
 from vllm.engine.request_builder import LiteRequestBuilder
-from vllm.engine.runtime_factory import LiteRuntimeFactory
+from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
 from vllm.engine.runtime_observer import NullRuntimeObserver
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_planner import RuntimePlanner
@@ -489,9 +489,7 @@ class LiteEngine:
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
         )
-        self._queue_timeout_s = float(
-            os.environ.get("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS", "30.0")
-        )
+        self._queue_timeout_s = float(self.runtime_config.queue_timeout_s)
 
         # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
         # These will be reused to avoid Python object creation in every decode step.
@@ -522,7 +520,45 @@ class LiteEngine:
                 dtype=torch.int32,
                 device=self.device,
             )
-        runtime_components = LiteRuntimeFactory.build(self)
+        scheduler_policy = self.runtime_config.scheduler_policy
+        backend_policy = self.runtime_config.backend_policy
+        runtime_context = RuntimeAssemblyContext(
+            kv_caches=self.kv_caches,
+            kv_scale_caches=self.kv_scale_caches,
+            num_blocks_per_seq=self.num_blocks_per_seq,
+            block_size=self.block_size,
+            device=self.device,
+            max_model_len=self.max_model_len,
+            num_layers=self.num_layers,
+            inf_config=self.inf_config,
+            stack_per_layer_carries=self._stack_per_layer_carries,
+            split_per_layer_carries=self._split_per_layer_carries,
+            model=self.model,
+            fast_input_ids=self._fast_input_ids,
+            fast_positions=self._fast_positions,
+            fast_slot_mapping=self._fast_slot_mapping,
+            fast_seq_lens=self._fast_seq_lens,
+            fast_block_tables=self._fast_block_tables,
+            step_token_budget=self._step_token_budget,
+            decode_priority_enabled=self._decode_priority_enabled,
+            prefill_chunk_size=self._prefill_chunk_size,
+            prefill_reserved_tokens=self._prefill_reserved_tokens,
+            prefill_reserve_backlog=self._prefill_reserve_backlog,
+            prefill_catchup_ratio=self._prefill_catchup_ratio,
+            prefill_microbatch_size=self._prefill_microbatch_size,
+            max_active_requests=self.max_active_requests,
+            scheduler_policy=scheduler_policy,
+            backend_policy=backend_policy,
+            scheduler=self.scheduler,
+            observer=self.observer,
+            lora_registry=self.lora_registry,
+            sampling_driver=self.sampling_driver,
+            output_pipeline=self.output_pipeline,
+            queue_timeout_s=self._queue_timeout_s,
+            sig_caches=getattr(self, "sig_caches", None),
+            sig_temp_buffers=getattr(self, "_sig_temp_buffers", None),
+        )
+        runtime_components = LiteRuntimeFactory.build(runtime_context)
         self.kv_block_manager = runtime_components["kv_block_manager"]
         self.input_batch_builder = runtime_components["input_batch_builder"]
         self.multimodal_processor = runtime_components["multimodal_processor"]
@@ -582,11 +618,7 @@ class LiteEngine:
         This is startup-only diagnostics, not used in the hot path.
         """
         device = self.device
-        raw_topn = os.environ.get("FASTINFERENCE_MEM_AUDIT_TOPN", "20").strip()
-        try:
-            topn = max(0, min(200, int(raw_topn)))
-        except ValueError:
-            topn = 20
+        topn = int(self.runtime_config.memory_audit_topn)
         param_total = 0
         buffer_total = 0
         param_count = 0
@@ -838,6 +870,7 @@ class LiteEngine:
                 num_layers=self.num_layers,
                 max_model_len=self.max_model_len,
                 max_tokens_cap=self.execution_policy.max_tokens_cap,
+                default_min_new_tokens=self.runtime_config.default_min_new_tokens,
             )
             self.execution_backend.sampling_driver = self.sampling_driver
             self.execution_backend.output_coordinator = self.output_pipeline
