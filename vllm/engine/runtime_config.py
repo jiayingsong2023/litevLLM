@@ -300,7 +300,8 @@ class RuntimeConfig:
     gemma4_26b_fp32_residual_guard_enabled: bool = False
     gemma4_26b_fp32_residual_guard_start: int = 8
     gemma4_26b_fp32_residual_guard_span: int = 3
-    gemma4_moe_expert_cache_size: int = 8
+    gemma4_moe_expert_cache_size: int = 32
+    gemma4_moe_compute_dtype: str = "auto"
     gemma4_rope_cache_max_pos: int | None = None
     gemma4_rope_cache_pool_max: int = 8
     k_scale: float = 1.0
@@ -372,6 +373,19 @@ class RuntimeConfig:
         gemma4_moe_expert_cache_size = _optional_int(
             "FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"
         )
+        gemma4_moe_compute_dtype = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE", "auto"
+        ).strip().lower()
+        if gemma4_moe_compute_dtype not in (
+            "auto",
+            "fp32",
+            "float32",
+            "fp16",
+            "float16",
+            "bf16",
+            "bfloat16",
+        ):
+            gemma4_moe_compute_dtype = "auto"
         gemma4_rope_cache_max_pos = _optional_int(
             "FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"
         )
@@ -451,8 +465,12 @@ class RuntimeConfig:
                 else 3,
             ),
             gemma4_moe_expert_cache_size=max(
-                0, gemma4_moe_expert_cache_size if gemma4_moe_expert_cache_size is not None else 8
+                0,
+                gemma4_moe_expert_cache_size
+                if gemma4_moe_expert_cache_size is not None
+                else 32,
             ),
+            gemma4_moe_compute_dtype=gemma4_moe_compute_dtype,
             gemma4_rope_cache_max_pos=(
                 max(64, gemma4_rope_cache_max_pos)
                 if gemma4_rope_cache_max_pos is not None

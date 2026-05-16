@@ -1750,6 +1750,20 @@ def _restore_hidden_from_2d(
     return hidden_states_2d.reshape(bsz, seqlen, hidden_dim)
 
 
+def _resolve_gemma4_moe_compute_dtype(
+    policy: str,
+    hidden_dtype: torch.dtype,
+) -> torch.dtype:
+    normalized = str(policy or "auto").strip().lower()
+    if normalized in ("fp32", "float32"):
+        return torch.float32
+    if normalized in ("fp16", "float16"):
+        return torch.float16
+    if normalized in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    return hidden_dtype
+
+
 class Gemma4TopKRouterLite(nn.Module):
     def __init__(self, config: LiteConfig, quant_config: Any, prefix: str):
         super().__init__()
@@ -1896,7 +1910,10 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._expert_cache_dtype: Optional[torch.dtype] = None
         self._max_expert_cache = max(
             0,
-            int(getattr(runtime_config, "gemma4_moe_expert_cache_size", 8)),
+            int(getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)),
+        )
+        self._compute_dtype_policy = str(
+            getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
         )
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
@@ -2003,7 +2020,10 @@ class Gemma4MoeExpertsLite(nn.Module):
             topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(
                 hidden_states_2d.dtype
             )
-        compute_dtype = torch.float32
+        compute_dtype = _resolve_gemma4_moe_compute_dtype(
+            self._compute_dtype_policy,
+            hidden_states_2d.dtype,
+        )
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
         n_tokens = int(hidden_states_2d.shape[0])
         flat_topk_ids = topk_ids.reshape(-1).to(torch.long)

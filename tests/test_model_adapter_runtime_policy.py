@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
@@ -75,6 +76,28 @@ def test_gemma4_runtime_policy_honors_int4_kv_override() -> None:
     assert policy.force_kv_cache_dtype is None
 
 
+def test_gemma4_detect_reports_moe_for_26b_a4b_like_config() -> None:
+    hf_config = SimpleNamespace(
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=256,
+        num_experts=128,
+        top_k_experts=8,
+        moe_intermediate_size=704,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        get_num_kv_heads=lambda _: 8,
+        get_head_size=lambda: 256,
+        get_num_layers=lambda _: 30,
+        get_max_model_len=lambda: 512,
+    )
+
+    caps = Gemma4Adapter().detect(SimpleNamespace(), model_config)
+
+    assert caps.supports_moe is True
+
+
 def test_qwen_runtime_policy_owns_prefill_chunk_preference() -> None:
     policy = Qwen35Adapter().runtime_policy(SimpleNamespace(), _runtime_config())
 
@@ -113,7 +136,7 @@ def test_runtime_planner_honors_explicit_prefill_chunk_over_policy(monkeypatch) 
 
 
 def test_lite_engine_does_not_import_model_specific_tuning_installers() -> None:
-    source = open("vllm/engine/lite_engine.py", encoding="utf-8").read()
+    source = Path("vllm/engine/lite_engine.py").read_text(encoding="utf-8")
 
     assert "vllm.model_executor.models.gemma4" not in source
     assert "vllm.model_executor.models.qwen3_5" not in source

@@ -15,6 +15,22 @@ def _truthy(value: object) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _supports_moe(hf_config: Any) -> bool:
+    if hf_config is None:
+        return False
+    num_experts = _int_or(getattr(hf_config, "num_experts", 0), 0)
+    top_k = _int_or(
+        getattr(
+            hf_config,
+            "num_experts_per_tok",
+            getattr(hf_config, "top_k_experts", 0),
+        ),
+        0,
+    )
+    moe_intermediate = _int_or(getattr(hf_config, "moe_intermediate_size", 0), 0)
+    return num_experts > 0 and top_k > 0 and moe_intermediate > 0
+
+
 class Gemma4Adapter(ModelAdapter):
     model_type = "gemma4"
 
@@ -77,17 +93,31 @@ class Gemma4Adapter(ModelAdapter):
                 attn = getattr(layer, "self_attn", None)
                 if attn is None:
                     continue
-                max_kv_heads = max(max_kv_heads, _int_or(getattr(attn, "num_kv_heads", 0), 0))
-                max_head_dim = max(max_head_dim, _int_or(getattr(attn, "head_dim", 0), 0))
+                max_kv_heads = max(
+                    max_kv_heads,
+                    _int_or(getattr(attn, "num_kv_heads", 0), 0),
+                )
+                max_head_dim = max(
+                    max_head_dim,
+                    _int_or(getattr(attn, "head_dim", 0), 0),
+                )
                 if num_attention_heads <= 0:
                     num_attention_heads = _int_or(getattr(attn, "num_heads", 0), 0)
 
         if max_kv_heads <= 0:
             max_kv_heads = _int_or(model_config.get_num_kv_heads(None), 1)
         if max_head_dim <= 0:
-            hd = getattr(hf_config, "global_head_dim", None) if hf_config is not None else None
+            hd = (
+                getattr(hf_config, "global_head_dim", None)
+                if hf_config is not None
+                else None
+            )
             if hd is None:
-                hd = getattr(hf_config, "head_dim", None) if hf_config is not None else None
+                hd = (
+                    getattr(hf_config, "head_dim", None)
+                    if hf_config is not None
+                    else None
+                )
             max_head_dim = _int_or(hd, _int_or(model_config.get_head_size(), 1))
         if num_attention_heads <= 0:
             num_attention_heads = _int_or(
@@ -104,7 +134,7 @@ class Gemma4Adapter(ModelAdapter):
             num_kv_heads=max_kv_heads,
             head_dim=max_head_dim,
             max_model_len=int(model_config.get_max_model_len()),
-            supports_moe=False,
+            supports_moe=_supports_moe(hf_config),
             supports_fp8_kv=True,
             supports_int4_kv=True,
             supports_paged_prefill=True,

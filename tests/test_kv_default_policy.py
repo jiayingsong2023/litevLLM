@@ -97,7 +97,9 @@ def test_runtime_config_owns_factory_backend_env(monkeypatch) -> None:
     assert backend.gpu_greedy_ignore_eos is True
 
 
-def test_runtime_config_owns_request_builder_default_min_new_tokens(monkeypatch) -> None:
+def test_runtime_config_owns_request_builder_default_min_new_tokens(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "3")
 
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
@@ -149,6 +151,24 @@ def test_runtime_config_owns_gemma4_moe_expert_cache_env(monkeypatch) -> None:
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
     assert cfg.gemma4_moe_expert_cache_size == 13
+
+
+def test_runtime_config_defaults_gemma4_moe_expert_cache_for_topk_headroom(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_expert_cache_size == 32
+
+
+def test_runtime_config_owns_gemma4_moe_compute_dtype_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE", "fp32")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_compute_dtype == "fp32"
 
 
 def test_runtime_config_owns_gemma4_rope_cache_env(monkeypatch) -> None:

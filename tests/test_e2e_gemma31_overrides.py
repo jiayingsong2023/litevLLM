@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import sys
 import argparse
+import sys
 from dataclasses import replace
 
 from tests import e2e_full_benchmark as bench
@@ -161,6 +161,8 @@ def test_gemma4_model_specs_include_recommended_profiles() -> None:
     assert gemma26.stable_env["FASTINFERENCE_AWQ_DECODE_GEMV"] == "1"
     assert gemma26.stable_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] == "1"
     assert gemma26.stable_env["FASTINFERENCE_GPU_GREEDY_SAMPLING"] == "1"
+    assert gemma26.stable_env["FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"] == "32"
+    assert gemma26.stable_env["FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE"] == "auto"
     assert "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ" not in gemma26.stable_env
 
 
