@@ -167,7 +167,7 @@ PYTHONPATH=. uv run python tests/e2e_full_benchmark.py \
   --json-out .tmp_perf_tuned_a.json
 
 # 3) 可选：AWQ fused GEMM 微基准（非整模）
-PYTHONPATH=. uv run python tests/bench_awq_fused_gemm_ab.py
+uv run pytest tests/test_e2e_runtime_stats_benchmark.py -q
 ```
 
 ---
@@ -177,5 +177,4 @@ PYTHONPATH=. uv run python tests/bench_awq_fused_gemm_ab.py
 - **优点**：方向正确（单卡+Triton+性能导向），核心工程能力强（模型适配、KV 与量化实践、回归意识）。
 - **缺点**：高并发控制面（排队/调度反馈/可观测性）尚未产品化，导致吞吐上限与稳定性受限。
 - **突破口**：不是先“重写内核”，而是先补“调度与观测闭环”；把吞吐提升转化为可重复、可解释的工程收益。
-
 

@@ -54,6 +54,22 @@ class Gemma4Adapter(ModelAdapter):
         ):
             force_kv_dtype = "fp8"
 
+        is_moe = _supports_moe(getattr(model_config, "hf_config", None))
+        tuning_env_overrides = {
+            "FASTINFERENCE_AWQ_FUSED_SCOPE": fused_stage,
+            "FASTINFERENCE_AWQ_FUSED_GEMM": "0" if fused_stage == "off" else "1",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE": "0",
+            "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
+            "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
+        }
+        if not is_moe:
+            tuning_env_overrides.update(
+                {
+                    "FASTINFERENCE_AWQ_GROUP32_GEMV_ALL": "1",
+                    "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ": "1",
+                }
+            )
+
         return RuntimeModelPolicy(
             force_kv_cache_dtype=force_kv_dtype,
             force_kv_cache_dtype_when=("turbo_int4", "int4"),
@@ -61,13 +77,7 @@ class Gemma4Adapter(ModelAdapter):
                 "Gemma4 accuracy guard enabled: forcing KV dtype to fp8 "
                 "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
             ),
-            tuning_env_overrides={
-                "FASTINFERENCE_AWQ_FUSED_SCOPE": fused_stage,
-                "FASTINFERENCE_AWQ_FUSED_GEMM": "0"
-                if fused_stage == "off"
-                else "1",
-                "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE": "0",
-            },
+            tuning_env_overrides=tuning_env_overrides,
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:

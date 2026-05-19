@@ -8,7 +8,7 @@ This guide will help you quickly get started with **FastInference** (vLLM Lite) 
 ## Prerequisites
 
 - **OS**: Linux
-- **Python**: 3.10 -- 3.13
+- **Python**: 3.12
 - **Hardware**: Single GPU (NVIDIA or AMD)
 - **Compiler**: None required (No C++ extensions!)
 
@@ -21,8 +21,8 @@ FastInference is designed to be installed without a C++ compiler. We recommend u
 git clone https://github.com/jiayingsong2023/litevLLM.git
 cd litevLLM
 
-# Install in editable mode
-uv pip install -e .
+# Install dependencies
+uv sync
 ```
 
 ## Offline Batched Inference
@@ -43,6 +43,11 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Initialize the engine (automatically uses Triton and LRU caching)
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+outputs = llm.generate(prompts, sampling_params)
+for output in outputs:
+    print(output.outputs[0].text)
+```
 
 ## 💡 Hugging Face Tips
 
@@ -82,16 +87,18 @@ FastInference comes with specialized benchmarks to demonstrate its Triton-powere
 # Default full benchmark: Gemma4 26B A4B + Gemma4 31B Q4
 uv run python tests/e2e_full_benchmark.py
 
-# Measure MoE throughput (Scaling up to BS=32)
-uv run python tests/e2e_moe_batch_scaling.py
+# Measure a specific supported model
+uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b
 
-# Measure GGUF throughput with LRU Caching
-uv run python tests/e2e_gguf_perf.py
+# Run the fast non-model regression suite
+bash tests/run_regression_suite.sh
 ```
 
-On AMD Radeon 8060S 65GB with ROCm conservative defaults, the 2026-05-15 Gemma4
-default benchmark measured `gemma4_26b_a4b` at `2.33` aggregate TPS and
-`gemma4_31b_q4` at `1.50` aggregate TPS.
+On AMD Radeon 8060S 65GB, the 2026-05-19 Gemma4 default benchmark profile
+measured `gemma4_26b_a4b` at `3.62` aggregate TPS / `5.49` decode TPS and
+`gemma4_31b_q4` at `1.43` aggregate TPS / `3.02` decode TPS. The 26B default
+uses the `batched_chunked` MoE int4 decode kernel; the benchmark still pins
+`KV cap=512` for reproducible measurement shape.
 
 ## Core Backend: Triton Only
 

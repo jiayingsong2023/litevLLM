@@ -64,15 +64,16 @@ LitevLLM has been significantly optimized for Gemma4 dense and MoE models:
 
 ## 7. 核心性能概览 (AMD Radeon 8060S 65GB)
 
-最新 Gemma4 基线来自 2026-05-15 的 `uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b,gemma4_31b_q4 --model-process-isolation`，
-即 ROCm conservative defaults、`BS=1`、`prompt~384`、`max_new=24`、`KV cap=512`，并在 ROCm
-上自动启用 per-model process isolation。
+最新 Gemma4 基线来自 2026-05-19 的 `tests/e2e_full_benchmark.py` 默认测量形状，
+即 benchmark recommended profile、`BS=1`、`prompt~384`、`max_new=24`、`KV cap=512`。
+其中 26B 默认使用 `batched_chunked` MoE int4 decode kernel，31B 使用 dense Gemma4
+recommended adapter profile。
 
-| 模型 | Aggregate TPS | TTFT p95 | Prefill TPS agg | Decode TPS agg | 状态 |
+| 模型 | Aggregate TPS | TTFT p50 | Prefill TPS agg | Decode TPS agg | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **TinyLlama-1.1B** | **542+** | 历史 fast-path 基线 | - | - | 1:1 HF 对齐 |
-| **Gemma4-26B A4B (MoE)** | **2.33** | **3267.3ms** | **120.59** | **3.27** | Verified stable |
-| **Gemma4-31B (Dense)** | **1.50** | **8809.4ms** | **44.72** | **3.18** | Memory bound, accuracy-gated |
+| **Gemma4-26B A4B (MoE)** | **3.62** | **2438.6ms** | **161.57** | **5.49** | `batched_chunked` default |
+| **Gemma4-31B (Dense)** | **1.43** | **9181.2ms** | **42.91** | **3.02** | Memory bound, accuracy-gated |
 
 ---
 *本项目完全遵循 pure-Python 哲学，严禁引入任何需要 C++ 编译器的代码。所有算子均通过 Triton JIT 即时编译生成。*

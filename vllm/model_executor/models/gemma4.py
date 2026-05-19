@@ -23,7 +23,10 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from .lite_config import LiteConfig
 
 _GEMMA4_TUNING: dict[str, str] = {
-    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_GEMMA4_") or key.startswith("FASTINFERENCE_KV_MAX_")
+    key: value
+    for key, value in os.environ.items()
+    if key.startswith("FASTINFERENCE_GEMMA4_")
+    or key.startswith("FASTINFERENCE_KV_MAX_")
 }
 _GEMMA4_TUNING_LOCKED = False
 
@@ -1236,6 +1239,7 @@ class Gemma4Attention(nn.Module):
                 if _filled_mask.any():
                     _filled_blocks = torch.unique(_block_ids[_filled_mask])
                     from vllm.kernels.triton.kv_sig import kv_sig_finalize
+
                     kv_sig_finalize(
                         _sig_temp_list[self.layer_idx],
                         _sig_cache_list[self.layer_idx],
@@ -1323,8 +1327,7 @@ class Gemma4Attention(nn.Module):
                     # route softcap>0 through the eager pytorch ref path here.
                     use_triton_local_decode = (
                         _gemma4_config_truthy_default_on(
-                            inf_config,
-                            "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON"
+                            inf_config, "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON"
                         )
                         and block_tables is not None
                         and seq_lens is not None
@@ -1436,16 +1439,16 @@ class Gemma4Attention(nn.Module):
                                     kv_cache=kv_cache,
                                     block_tables=block_tables,
                                     seq_lens=seq_lens,
-                                num_kv_heads=self.num_kv_heads,
-                                head_dim=self.head_dim,
-                                local_window=ctx_window,
-                                kv_cache_dtype=str(kv_dtype_name),
-                                inf_config=inf_config,
-                                kv_scale_cache=(k_scale_cache, v_scale_cache),
-                                seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
-                                max_seq_len_cpu=_meta_cpu_max_seq_len(
-                                    attn_metadata
-                                ),
+                                    num_kv_heads=self.num_kv_heads,
+                                    head_dim=self.head_dim,
+                                    local_window=ctx_window,
+                                    kv_cache_dtype=str(kv_dtype_name),
+                                    inf_config=inf_config,
+                                    kv_scale_cache=(k_scale_cache, v_scale_cache),
+                                    seq_lens_cpu=_meta_cpu_seq_lens(attn_metadata),
+                                    max_seq_len_cpu=_meta_cpu_max_seq_len(
+                                        attn_metadata
+                                    ),
                                 )
                             )
                         q_positions = (
@@ -1546,9 +1549,7 @@ class Gemma4Attention(nn.Module):
                         )
                     )
                     with _gemma4_profile_span("attn_global_kernel"):
-                        _sig_global = _get_sig_for_layer(
-                            attn_metadata, self.layer_idx
-                        )
+                        _sig_global = _get_sig_for_layer(attn_metadata, self.layer_idx)
                         _kv_sel_ratio = float(
                             getattr(inf_config, "kv_select_ratio", 0.0)
                             if inf_config is not None
@@ -1915,6 +1916,12 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._compute_dtype_policy = str(
             getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
         )
+        self._int4_kernel_enabled = bool(
+            getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
+        )
+        self._int4_kernel_strategy = str(
+            getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage")
+        ).strip().lower()
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
         if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
@@ -2024,6 +2031,52 @@ class Gemma4MoeExpertsLite(nn.Module):
             self._compute_dtype_policy,
             hidden_states_2d.dtype,
         )
+        if self._int4_kernel_enabled:
+            from vllm.kernels.triton.gemma4_moe_int4 import (
+                gemma4_moe_int4_decode,
+                gemma4_moe_int4_decode_batched,
+                gemma4_moe_int4_decode_batched_chunked,
+                gemma4_moe_int4_decode_batched_chunked_downpair,
+                gemma4_moe_int4_decode_batched_chunked_pair,
+                gemma4_moe_int4_decode_batched_chunked_splitgate_downpair,
+                gemma4_moe_int4_decode_batched_grouped,
+                gemma4_moe_int4_decode_batched_tuned,
+                gemma4_moe_int4_decode_single_kernel,
+            )
+
+            decode_kernel = (
+                gemma4_moe_int4_decode_single_kernel
+                if self._int4_kernel_strategy == "single"
+                else gemma4_moe_int4_decode_batched_tuned
+                if self._int4_kernel_strategy == "batched_tuned"
+                else gemma4_moe_int4_decode_batched_chunked_pair
+                if self._int4_kernel_strategy == "batched_chunked_pair"
+                else gemma4_moe_int4_decode_batched_chunked_downpair
+                if self._int4_kernel_strategy == "batched_chunked_downpair"
+                else gemma4_moe_int4_decode_batched_chunked_splitgate_downpair
+                if self._int4_kernel_strategy == "batched_chunked_splitgate_downpair"
+                else gemma4_moe_int4_decode_batched_grouped
+                if self._int4_kernel_strategy == "batched_grouped"
+                else gemma4_moe_int4_decode_batched_chunked
+                if self._int4_kernel_strategy == "batched_chunked"
+                else gemma4_moe_int4_decode_batched
+                if self._int4_kernel_strategy == "batched"
+                else gemma4_moe_int4_decode
+            )
+
+            fast_out, used_fast, _ = decode_kernel(
+                hidden_states_2d,
+                topk_weights,
+                topk_ids,
+                getattr(self.gate_up_proj, "qweight", torch.empty(0)),
+                getattr(self.gate_up_proj, "scales", torch.empty(0)),
+                getattr(self.down_proj, "qweight", torch.empty(0)),
+                getattr(self.down_proj, "scales", torch.empty(0)),
+                intermediate_dim=self.intermediate_dim,
+                activation=self.hidden_act,
+            )
+            if used_fast:
+                return fast_out.to(hidden_states_2d.dtype)
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
         n_tokens = int(hidden_states_2d.shape[0])
         flat_topk_ids = topk_ids.reshape(-1).to(torch.long)
@@ -2400,9 +2453,11 @@ class Gemma4TextModel(nn.Module):
     ):
         super().__init__()
         self.config = LiteConfig(hf_config)
-        fp32_residual_guard_enabled, fp32_residual_guard_start, fp32_residual_guard_span = (
-            _gemma4_fp32_residual_guard_policy(runtime_config)
-        )
+        (
+            fp32_residual_guard_enabled,
+            fp32_residual_guard_start,
+            fp32_residual_guard_span,
+        ) = _gemma4_fp32_residual_guard_policy(runtime_config)
         padding_idx = int(getattr(hf_config, "pad_token_id", 0) or 0)
         self.embed_scale = float(self.config.hidden_size) ** 0.5
         self.embed_tokens = nn.Embedding(

@@ -8,6 +8,11 @@ def _env_truthy(name: str) -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def _env_truthy_default(name: str, default: str) -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 def _parse_kv_int_map(raw: str, *, min_value: int) -> dict[str, int] | None:
     raw = raw.strip()
     if not raw:
@@ -263,12 +268,14 @@ class BackendRuntimePolicy:
                     ),
                 )
             ),
-            gpu_greedy_sampling=_env_truthy("FASTINFERENCE_GPU_GREEDY_SAMPLING"),
-            gpu_greedy_max_tokens_only=_env_truthy(
-                "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY"
+            gpu_greedy_sampling=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_SAMPLING", "1"
             ),
-            gpu_greedy_bypass_cpu_policies=_env_truthy(
-                "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES"
+            gpu_greedy_max_tokens_only=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "1"
+            ),
+            gpu_greedy_bypass_cpu_policies=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "1"
             ),
             gpu_greedy_ignore_eos=_env_truthy("FASTINFERENCE_GPU_GREEDY_IGNORE_EOS"),
         )
@@ -302,6 +309,8 @@ class RuntimeConfig:
     gemma4_26b_fp32_residual_guard_span: int = 3
     gemma4_moe_expert_cache_size: int = 32
     gemma4_moe_compute_dtype: str = "auto"
+    gemma4_moe_int4_kernel_enabled: bool = True
+    gemma4_moe_int4_kernel_strategy: str = "batched_chunked"
     gemma4_rope_cache_max_pos: int | None = None
     gemma4_rope_cache_pool_max: int = 8
     k_scale: float = 1.0
@@ -373,9 +382,11 @@ class RuntimeConfig:
         gemma4_moe_expert_cache_size = _optional_int(
             "FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"
         )
-        gemma4_moe_compute_dtype = os.environ.get(
-            "FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE", "auto"
-        ).strip().lower()
+        gemma4_moe_compute_dtype = (
+            os.environ.get("FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE", "auto")
+            .strip()
+            .lower()
+        )
         if gemma4_moe_compute_dtype not in (
             "auto",
             "fp32",
@@ -386,6 +397,24 @@ class RuntimeConfig:
             "bfloat16",
         ):
             gemma4_moe_compute_dtype = "auto"
+        gemma4_moe_int4_kernel_enabled = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        gemma4_moe_int4_kernel_strategy = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", "batched_chunked"
+        ).strip().lower()
+        if gemma4_moe_int4_kernel_strategy not in (
+            "two_stage",
+            "single",
+            "batched",
+            "batched_tuned",
+            "batched_chunked",
+            "batched_chunked_pair",
+            "batched_chunked_downpair",
+            "batched_chunked_splitgate_downpair",
+            "batched_grouped",
+        ):
+            gemma4_moe_int4_kernel_strategy = "batched_chunked"
         gemma4_rope_cache_max_pos = _optional_int(
             "FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"
         )
@@ -471,6 +500,8 @@ class RuntimeConfig:
                 else 32,
             ),
             gemma4_moe_compute_dtype=gemma4_moe_compute_dtype,
+            gemma4_moe_int4_kernel_enabled=gemma4_moe_int4_kernel_enabled,
+            gemma4_moe_int4_kernel_strategy=gemma4_moe_int4_kernel_strategy,
             gemma4_rope_cache_max_pos=(
                 max(64, gemma4_rope_cache_max_pos)
                 if gemma4_rope_cache_max_pos is not None

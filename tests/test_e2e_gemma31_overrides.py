@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 from tests import e2e_full_benchmark as bench
 
@@ -19,10 +20,7 @@ def test_format_targets_uses_model_display_names() -> None:
         bench.MODEL_SPECS["gemma4_26b_a4b"],
         bench.MODEL_SPECS["gemma4_31b_q4"],
     ]
-    assert (
-        bench._format_targets(specs)
-        == "Gemma4-26B A4B (Q4 MoE) + Gemma4-31B (Q4)"
-    )
+    assert bench._format_targets(specs) == "Gemma4-26B A4B (Q4 MoE) + Gemma4-31B (Q4)"
 
 
 def test_parse_args_accepts_gemma31_shape_overrides(monkeypatch) -> None:
@@ -163,7 +161,39 @@ def test_gemma4_model_specs_include_recommended_profiles() -> None:
     assert gemma26.stable_env["FASTINFERENCE_GPU_GREEDY_SAMPLING"] == "1"
     assert gemma26.stable_env["FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"] == "32"
     assert gemma26.stable_env["FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE"] == "auto"
+    assert gemma26.stable_env["FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL"] == "1"
     assert "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ" not in gemma26.stable_env
+
+
+def test_gemma4_adapter_installs_benchmark_recommended_tuning_defaults() -> None:
+    from vllm.adapters.gemma4 import Gemma4Adapter
+
+    adapter = Gemma4Adapter()
+
+    dense_policy = adapter.runtime_policy(
+        SimpleNamespace(hf_config=SimpleNamespace()),
+        SimpleNamespace(tuning_env={}),
+    )
+    dense_env = dense_policy.tuning_env_overrides
+    assert dense_env["FASTINFERENCE_AWQ_DECODE_GEMV"] == "1"
+    assert dense_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] == "1"
+    assert dense_env["FASTINFERENCE_AWQ_GROUP32_GEMV_ALL"] == "1"
+    assert dense_env["FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ"] == "1"
+
+    moe_policy = adapter.runtime_policy(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_experts=128,
+                num_experts_per_tok=8,
+                moe_intermediate_size=1408,
+            )
+        ),
+        SimpleNamespace(tuning_env={}),
+    )
+    moe_env = moe_policy.tuning_env_overrides
+    assert moe_env["FASTINFERENCE_AWQ_DECODE_GEMV"] == "1"
+    assert moe_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] == "1"
+    assert "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ" not in moe_env
 
 
 def test_should_auto_isolate_multi_gemma_on_rocm(monkeypatch) -> None:

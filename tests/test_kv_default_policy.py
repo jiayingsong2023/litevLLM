@@ -97,6 +97,30 @@ def test_runtime_config_owns_factory_backend_env(monkeypatch) -> None:
     assert backend.gpu_greedy_ignore_eos is True
 
 
+def test_runtime_config_defaults_gpu_greedy_benchmark_profile_on(monkeypatch) -> None:
+    monkeypatch.delenv("FASTINFERENCE_GPU_GREEDY_SAMPLING", raising=False)
+    monkeypatch.delenv("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", raising=False)
+    monkeypatch.delenv("FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.backend_policy.gpu_greedy_sampling is True
+    assert cfg.backend_policy.gpu_greedy_max_tokens_only is True
+    assert cfg.backend_policy.gpu_greedy_bypass_cpu_policies is True
+
+
+def test_runtime_config_can_disable_gpu_greedy_benchmark_profile(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_SAMPLING", "0")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "0")
+    monkeypatch.setenv("FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "0")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.backend_policy.gpu_greedy_sampling is False
+    assert cfg.backend_policy.gpu_greedy_max_tokens_only is False
+    assert cfg.backend_policy.gpu_greedy_bypass_cpu_policies is False
+
+
 def test_runtime_config_owns_request_builder_default_min_new_tokens(
     monkeypatch,
 ) -> None:
@@ -169,6 +193,35 @@ def test_runtime_config_owns_gemma4_moe_compute_dtype_env(monkeypatch) -> None:
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
     assert cfg.gemma4_moe_compute_dtype == "fp32"
+
+
+def test_runtime_config_owns_gemma4_moe_int4_kernel_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL", "0")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_int4_kernel_enabled is False
+
+
+def test_runtime_config_owns_gemma4_moe_int4_kernel_strategy_env(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY",
+        "batched_grouped",
+    )
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_int4_kernel_strategy == "batched_grouped"
+
+
+def test_runtime_config_defaults_gemma4_moe_int4_kernel_strategy_to_batched_chunked(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_int4_kernel_strategy == "batched_chunked"
 
 
 def test_runtime_config_owns_gemma4_rope_cache_env(monkeypatch) -> None:

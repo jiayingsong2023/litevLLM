@@ -10,13 +10,13 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | ✅ [1:1 HF 对齐] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | ✅ [FP8 KV 稳定] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.33** | ✅ [MoE 稳定] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.50** | ✅ [Dense 稳定] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **3.62** | ✅ [MoE `batched_chunked`] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.43** | ✅ [Dense 稳定] |
 
-  最新 Gemma4 数值来自 `uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b,gemma4_31b_q4 --model-process-isolation`
-  的当前回归配置（2026-05-15，ROCm conservative defaults）。同次运行中：
-  Gemma4-26B `TTFT p95=3267.3ms`、`prefill_tps_agg=120.59`、`decode_tps_agg=3.27`；
-  Gemma4-31B `TTFT p95=8809.4ms`、`prefill_tps_agg=44.72`、`decode_tps_agg=3.18`。
+  最新 Gemma4 数值来自 `tests/e2e_full_benchmark.py` 的当前默认测量形状
+  （2026-05-19，benchmark recommended profile）。当前报告中：
+  Gemma4-26B `TTFT p50=2438.6ms`、`prefill_tps_agg=161.57`、`decode_tps_agg=5.49`；
+  Gemma4-31B `TTFT p50=9181.2ms`、`prefill_tps_agg=42.91`、`decode_tps_agg=3.02`。
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
