@@ -8,7 +8,8 @@ Covers:
   * Structural guards: mismatched shapes, mismatched group_size, high_fidelity
     flag, and LoRA-active mode must all surface ``None``.
   * ``Gemma4MLP.forward`` routing:
-      - env ``FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION=0`` disables fusion.
+      - ``attn_metadata["config"].tuning_env["FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"]=0``
+        disables fusion.
       - ``lora_mapping is not None`` disables fusion.
       - Activation dispatch (silu vs gelu-tanh) stays consistent between
         fused and unfused branches.
@@ -352,16 +353,29 @@ def _make_mlp(hidden: int = 64, inter: int = 128, act: str = "gelu_pytorch_tanh"
     return mlp
 
 
+def _mk_inf_config(
+    *,
+    pair_fusion: str | None = None,
+    gate_up: str | None = None,
+) -> SimpleNamespace:
+    tuning_env: dict[str, str] = {}
+    if pair_fusion is not None:
+        tuning_env["FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"] = pair_fusion
+    if gate_up is not None:
+        tuning_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] = gate_up
+    return SimpleNamespace(tuning_env=tuning_env)
+
+
 class TestGemma4MLPRouting:
-    def test_env_off_bypasses_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_config_off_bypasses_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mlp = _make_mlp()
         x = torch.randn((1, 4, 64), dtype=torch.float32)
-        monkeypatch.setenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", "0")
+        monkeypatch.setenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", "1")
 
         with mock.patch(
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul"
         ) as helper:
-            out = mlp(x)
+            out = mlp(x, inf_config=_mk_inf_config(pair_fusion="0"))
             helper.assert_not_called()
         assert out.shape == x.shape
 
@@ -375,7 +389,7 @@ class TestGemma4MLPRouting:
         x = torch.randn((1, 4, 64), dtype=torch.float32)
         monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
 
-        out = mlp(x, lora_mapping=[None, "adapter-7"])
+        out = mlp(x, lora_mapping=[None, "adapter-7"], inf_config=_mk_inf_config())
         assert out.shape == x.shape
 
     def test_bare_none_list_still_enters_helper(
@@ -392,7 +406,7 @@ class TestGemma4MLPRouting:
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
             return_value=None,
         ) as helper:
-            _ = mlp(x, lora_mapping=[None])
+            _ = mlp(x, lora_mapping=[None], inf_config=_mk_inf_config())
             assert helper.call_count == 1
 
     def test_default_attempts_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -404,7 +418,7 @@ class TestGemma4MLPRouting:
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
             return_value=None,
         ) as helper:
-            _ = mlp(x)
+            _ = mlp(x, inf_config=_mk_inf_config())
             assert helper.call_count == 1
             args, kwargs = helper.call_args
             # Signature contract: (x, gate_proj, up_proj, owner, "mlp_gate_up", lora_mapping=None)
@@ -420,7 +434,7 @@ class TestGemma4MLPRouting:
         mlp = _make_mlp()
         x = torch.randn((1, 1, 64), dtype=torch.float32)
         direct = torch.randn((1, 1, 128), dtype=torch.float32)
-        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
+        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "0")
         monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
 
         with mock.patch(
@@ -430,9 +444,29 @@ class TestGemma4MLPRouting:
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
             return_value=None,
         ) as pair_helper:
-            out = mlp(x)
+            out = mlp(x, inf_config=_mk_inf_config(gate_up="1"))
         assert out.shape == x.shape
         assert direct_helper.call_count == 1
+        pair_helper.assert_not_called()
+
+    def test_direct_gate_up_helper_off_when_runtime_config_disables(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mlp = _make_mlp()
+        x = torch.randn((1, 1, 64), dtype=torch.float32)
+        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
+        monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
+
+        with mock.patch(
+            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
+            return_value=None,
+        ) as direct_helper, mock.patch(
+            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
+            return_value=None,
+        ) as pair_helper:
+            out = mlp(x, inf_config=_mk_inf_config(pair_fusion="0", gate_up="0"))
+        assert out.shape == x.shape
+        direct_helper.assert_not_called()
         pair_helper.assert_not_called()
 
     def test_fused_branch_numerically_matches_unfused(
@@ -457,7 +491,7 @@ class TestGemma4MLPRouting:
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
             return_value=concat,
         ):
-            y_fused = mlp(x)
+            y_fused = mlp(x, inf_config=_mk_inf_config())
         torch.testing.assert_close(y_fused, y_ref, rtol=1e-6, atol=1e-6)
 
     def test_silu_activation_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -475,5 +509,5 @@ class TestGemma4MLPRouting:
             "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
             return_value=concat,
         ):
-            y_fused = mlp(x)
+            y_fused = mlp(x, inf_config=_mk_inf_config())
         torch.testing.assert_close(y_fused, y_ref, rtol=1e-6, atol=1e-6)

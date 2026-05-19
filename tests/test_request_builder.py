@@ -119,6 +119,47 @@ def test_request_builder_preserves_explicit_service_class() -> None:
     assert request["service_class"] == "background"
 
 
+def test_request_builder_uses_explicit_default_min_new_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "9")
+    builder = LiteRequestBuilder(
+        tokenizer=_Tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=2,
+        max_model_len=16,
+        max_tokens_cap=8,
+        default_min_new_tokens=3,
+    )
+
+    request = builder.build(
+        request_id="r1",
+        prompt="prompt",
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    assert request["sampling_params"].min_tokens == 3
+
+
+def test_request_builder_preserves_explicit_min_tokens() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_Tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=2,
+        max_model_len=16,
+        max_tokens_cap=8,
+        default_min_new_tokens=3,
+    )
+
+    request = builder.build(
+        request_id="r1",
+        prompt="prompt",
+        sampling_params=SamplingParams(max_tokens=4, min_tokens=2),
+    )
+
+    assert request["sampling_params"].min_tokens == 2
+
+
 def test_request_builder_attaches_json_object_structured_output_constraint() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_Tokenizer(),

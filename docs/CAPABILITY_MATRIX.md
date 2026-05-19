@@ -18,7 +18,7 @@ or feature status lists.
 | Area | Status | Notes |
 | :--- | :--- | :--- |
 | Single-GPU lite runtime | Supported | Official path through `LiteEngine`, `RuntimeController`, and the lite backend. |
-| AMD ROCm | Supported | Primary tuning target. Current docs cite ROCm conservative defaults for large-model baselines. |
+| AMD ROCm | Supported | Primary tuning target. Current Gemma4 baselines use the default benchmark recommended profile. |
 | CUDA compatibility | Supported | Maintained where the Python + Triton path supports it. |
 | Multi-GPU distributed runtime | Unsupported | Distributed shims may remain for imports, but are not an official execution path. |
 | C++/CUDA extension source | Unsupported | Enforced by pre-commit outside allowed third-party code. |
@@ -43,6 +43,8 @@ or feature status lists.
 | Safetensors + AWQ loading | Supported | Main optimized weight path. |
 | FP8 KV cache | Supported | Accuracy guard default for Gemma4 when int4 KV is not explicitly allowed. |
 | TurboQuant INT4 KV cache | Supported | Default runtime policy for non-guarded models; guarded by model policy where needed. |
+| Gemma4 recommended adapter profile | Supported | Gemma4 installs AWQ decode GEMV and fused gate-up defaults; dense Gemma4 also installs group32 GEMV and dense down-proj defaults. |
+| Gemma4-26B MoE int4 decode kernel | Supported | Default strategy is `batched_chunked`; slower experimental strategies remain opt-in through `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY`. |
 | PagedAttention decode | Supported | Triton path with selective-attention experiments available. |
 | Prefix cache | Experimental | Minimal runtime and observability exist; defaults still need workload calibration. |
 | Structured outputs | Experimental | Grammar-backed behavior is present and tested, but broad API compatibility should stay gated. |

@@ -8,6 +8,11 @@ def _env_truthy(name: str) -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+def _env_truthy_default(name: str, default: str) -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 def _parse_kv_int_map(raw: str, *, min_value: int) -> dict[str, int] | None:
     raw = raw.strip()
     if not raw:
@@ -32,6 +37,23 @@ def _parse_kv_int_map(raw: str, *, min_value: int) -> dict[str, int] | None:
 def _parse_list(raw: str) -> set[str] | None:
     values = {item.strip() for item in raw.split(",") if item.strip()}
     return values or None
+
+
+def _parse_default_min_new_tokens(raw: str) -> int:
+    value = str(raw).strip().lower()
+    if value in ("", "0", "false", "off", "no"):
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 1
+
+
+def _parse_memory_audit_topn(raw: str) -> int:
+    try:
+        return max(0, min(200, int(str(raw).strip())))
+    except ValueError:
+        return 20
 
 
 @dataclass(frozen=True)
@@ -203,6 +225,10 @@ class BackendRuntimePolicy:
     preempt_multimodal_prefills: bool = False
     preempt_multimodal_max_queue_wait_s: float = 0.0
     multimodal_prefix_cache_protect_threshold: float = 0.0
+    gpu_greedy_sampling: bool = False
+    gpu_greedy_max_tokens_only: bool = False
+    gpu_greedy_bypass_cpu_policies: bool = False
+    gpu_greedy_ignore_eos: bool = False
 
     @classmethod
     def from_env(cls) -> "BackendRuntimePolicy":
@@ -242,6 +268,16 @@ class BackendRuntimePolicy:
                     ),
                 )
             ),
+            gpu_greedy_sampling=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_SAMPLING", "1"
+            ),
+            gpu_greedy_max_tokens_only=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY", "1"
+            ),
+            gpu_greedy_bypass_cpu_policies=_env_truthy_default(
+                "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES", "1"
+            ),
+            gpu_greedy_ignore_eos=_env_truthy("FASTINFERENCE_GPU_GREEDY_IGNORE_EOS"),
         )
 
 
@@ -265,6 +301,18 @@ class RuntimeConfig:
     prefill_reserve_backlog: int
     prefill_catchup_ratio: float
     prefill_microbatch_size: int
+    default_min_new_tokens: int = 0
+    queue_timeout_s: float = 30.0
+    memory_audit_topn: int = 20
+    gemma4_26b_fp32_residual_guard_enabled: bool = False
+    gemma4_26b_fp32_residual_guard_start: int = 8
+    gemma4_26b_fp32_residual_guard_span: int = 3
+    gemma4_moe_expert_cache_size: int = 32
+    gemma4_moe_compute_dtype: str = "auto"
+    gemma4_moe_int4_kernel_enabled: bool = True
+    gemma4_moe_int4_kernel_strategy: str = "batched_chunked"
+    gemma4_rope_cache_max_pos: int | None = None
+    gemma4_rope_cache_pool_max: int = 8
     k_scale: float = 1.0
     v_scale: float = 1.0
     use_prompt_guard: bool = True
@@ -321,6 +369,59 @@ class RuntimeConfig:
             except ValueError:
                 return None
 
+        gemma4_fp32_residual_guard_start = _optional_int(
+            "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_START"
+        )
+        if gemma4_fp32_residual_guard_start is None:
+            gemma4_fp32_residual_guard_start = _optional_int(
+                "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_LAYER"
+            )
+        gemma4_fp32_residual_guard_span = _optional_int(
+            "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN"
+        )
+        gemma4_moe_expert_cache_size = _optional_int(
+            "FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"
+        )
+        gemma4_moe_compute_dtype = (
+            os.environ.get("FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE", "auto")
+            .strip()
+            .lower()
+        )
+        if gemma4_moe_compute_dtype not in (
+            "auto",
+            "fp32",
+            "float32",
+            "fp16",
+            "float16",
+            "bf16",
+            "bfloat16",
+        ):
+            gemma4_moe_compute_dtype = "auto"
+        gemma4_moe_int4_kernel_enabled = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        gemma4_moe_int4_kernel_strategy = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", "batched_chunked"
+        ).strip().lower()
+        if gemma4_moe_int4_kernel_strategy not in (
+            "two_stage",
+            "single",
+            "batched",
+            "batched_tuned",
+            "batched_chunked",
+            "batched_chunked_pair",
+            "batched_chunked_downpair",
+            "batched_chunked_splitgate_downpair",
+            "batched_grouped",
+        ):
+            gemma4_moe_int4_kernel_strategy = "batched_chunked"
+        gemma4_rope_cache_max_pos = _optional_int(
+            "FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"
+        )
+        gemma4_rope_cache_pool_max = _optional_int(
+            "FASTINFERENCE_GEMMA4_ROPE_CACHE_POOL_MAX"
+        )
+
         return cls(
             model_path=str(model_config.model),
             tokenizer_path=str(model_config.tokenizer),
@@ -367,6 +468,52 @@ class RuntimeConfig:
                 4,
                 max(
                     1, int(os.environ.get("FASTINFERENCE_LITE_PREFILL_MICROBATCH", "2"))
+                ),
+            ),
+            default_min_new_tokens=_parse_default_min_new_tokens(
+                os.environ.get("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "0")
+            ),
+            queue_timeout_s=float(
+                os.environ.get("FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS", "30.0")
+            ),
+            memory_audit_topn=_parse_memory_audit_topn(
+                os.environ.get("FASTINFERENCE_MEM_AUDIT_TOPN", "20")
+            ),
+            gemma4_26b_fp32_residual_guard_enabled=_env_truthy(
+                "FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD"
+            ),
+            gemma4_26b_fp32_residual_guard_start=(
+                gemma4_fp32_residual_guard_start
+                if gemma4_fp32_residual_guard_start is not None
+                else 8
+            ),
+            gemma4_26b_fp32_residual_guard_span=max(
+                1,
+                gemma4_fp32_residual_guard_span
+                if gemma4_fp32_residual_guard_span is not None
+                else 3,
+            ),
+            gemma4_moe_expert_cache_size=max(
+                0,
+                gemma4_moe_expert_cache_size
+                if gemma4_moe_expert_cache_size is not None
+                else 32,
+            ),
+            gemma4_moe_compute_dtype=gemma4_moe_compute_dtype,
+            gemma4_moe_int4_kernel_enabled=gemma4_moe_int4_kernel_enabled,
+            gemma4_moe_int4_kernel_strategy=gemma4_moe_int4_kernel_strategy,
+            gemma4_rope_cache_max_pos=(
+                max(64, gemma4_rope_cache_max_pos)
+                if gemma4_rope_cache_max_pos is not None
+                else None
+            ),
+            gemma4_rope_cache_pool_max=max(
+                1,
+                min(
+                    128,
+                    gemma4_rope_cache_pool_max
+                    if gemma4_rope_cache_pool_max is not None
+                    else 8,
                 ),
             ),
             k_scale=float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0")),

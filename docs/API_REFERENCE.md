@@ -6,7 +6,7 @@
 
 ```bash
 uv run python -m vllm.entrypoints.openai.api_server \
-  --model models/Qwen3.5-9B-GGUF \
+  --model models/Qwen3.5-9B-AWQ \
   --policy-mode auto \
   --host 0.0.0.0 \
   --port 8000
@@ -22,7 +22,7 @@ uv run python -m vllm.entrypoints.openai.api_server \
   - `stable`: 低并发/串行优先（大模型可用性优先）
 - 也可通过环境变量 `FASTINF_POLICY_MODE` 设置默认值。
 
-Qwen3.5 额外策略开关（固定策略，不做运行中动态降档）：
+Qwen3.5-9B 额外策略开关（固定策略，不做运行中动态降档）：
 
 - `FASTINFERENCE_QWEN9_AGGRESSIVE`（默认 `1`）
   - 仅作用于 `Qwen3.5-9B Dense` 路径
@@ -30,26 +30,22 @@ Qwen3.5 额外策略开关（固定策略，不做运行中动态降档）：
   - `0`: 关闭激进
 - `FASTINFERENCE_QWEN9_STABLE`（默认 `0`）
   - `1`: 强制 9B 稳定策略（优先级高于 `FASTINFERENCE_QWEN9_AGGRESSIVE`）
-- `FASTINFERENCE_QWEN35_FP32_LINEAR`（默认 `0`，MoE 场景由加载器稳定策略控制）
-  - 用于显式覆盖 35B 线性层计算精度策略
-- `FASTINFERENCE_QWEN35_GROUPED_MOE`（默认 `1`）
-  - 35B MoE expert grouped 批量化开关
-- `FASTINFERENCE_QWEN35_GROUPED_MOE_MIN_TOKENS`（默认 `2`）
-  - 仅在 token 数达到阈值时启用 grouped（`BS=1` 建议保持旧快路径）
+
+Gemma4 默认由 adapter/runtime 安装当前 benchmark recommended profile。常规 API 服务不需要手动设置这些开关；性能回归脚本会额外固定 KV 上限来保证测量形状可复现。
 
 示例：
 
 ```bash
 # 9B 默认激进（可省略 FASTINFERENCE_QWEN9_AGGRESSIVE）
-uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-GGUF
+uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AWQ
 
 # 9B 强制稳定
 FASTINFERENCE_QWEN9_STABLE=1 \
-uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-GGUF
+uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AWQ
 
-# 35B MoE grouped 打开且阈值=2（推荐）
-FASTINFERENCE_QWEN35_GROUPED_MOE=1 FASTINFERENCE_QWEN35_GROUPED_MOE_MIN_TOKENS=2 \
-uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-35B-MoE-GGUF
+# Gemma4-26B A4B 默认使用 batched_chunked MoE int4 decode 策略
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit
 ```
 
 ## 2. 默认可用 API（openai/api_server）
@@ -82,7 +78,7 @@ curl -s http://127.0.0.1:8000/v1/models
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "models/Qwen3.5-9B-GGUF",
+    "model": "models/Qwen3.5-9B-AWQ",
     "messages": [{"role":"user","content":"你好，请用一句话介绍你自己。"}],
     "stream": false,
     "max_tokens": 64
@@ -95,7 +91,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "models/Qwen3.5-9B-GGUF",
+    "model": "models/Qwen3.5-9B-AWQ",
     "messages": [{"role":"user","content":"给我一个三步计划。"}],
     "stream": true
   }'

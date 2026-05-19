@@ -10,13 +10,13 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | ✅ [1:1 HF 对齐] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | ✅ [FP8 KV 稳定] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.30** | ✅ [MoE 稳定] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.49** | ✅ [Dense 稳定] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **3.62** | ✅ [MoE `batched_chunked`] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.43** | ✅ [Dense 稳定] |
 
-  最新 Gemma4 数值来自 `uv run python tests/e2e_full_benchmark.py` 的无参数默认配置
-  （2026-04-30，ROCm conservative defaults，按模型进程隔离顺序执行 26B/31B）。同次运行中：
-  Gemma4-26B `TTFT p95=3365.3ms`、`prefill_tps_agg=117.08`、`decode_tps_agg=3.25`；
-  Gemma4-31B `TTFT p95=8741.7ms`、`prefill_tps_agg=45.07`、`decode_tps_agg=3.12`。
+  最新 Gemma4 数值来自 `tests/e2e_full_benchmark.py` 的当前默认测量形状
+  （2026-05-19，benchmark recommended profile）。当前报告中：
+  Gemma4-26B `TTFT p50=2438.6ms`、`prefill_tps_agg=161.57`、`decode_tps_agg=5.49`；
+  Gemma4-31B `TTFT p50=9181.2ms`、`prefill_tps_agg=42.91`、`decode_tps_agg=3.02`。
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
@@ -29,7 +29,7 @@
 - **统一构建链**: offline 与 OpenAI server 现在统一通过 `vllm/serving/config_builder.py` 构建 `VllmConfig + RuntimeConfig`，不再维护服务端旁路配置对象。
 - **分层执行架构**: `LiteEngine` 负责 orchestration，`StepScheduler` 做 step 级调度，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` / `OutputPipeline` 做采样与输出拼装。
 - **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，避免继续在 engine 主路径中扩散模型名特判。
-- **配置收敛目标**: 运行时主要配置已收敛到 `RuntimeConfig`，但部分历史环境变量兼容路径仍保留。
+- **配置收敛目标**: 运行时主要配置已收敛到 `RuntimeConfig`，模型热路径策略通过 `attn_metadata["config"].tuning_env` 传递；少量历史环境变量兼容路径仍保留。
 - **纯净计算路径**: 主线优先维护 **Safetensors + AWQ**，实验性路径会逐步隔离。
 - **混合加速 Prefill**: 预填充阶段利用硬件原生 SDPA，解码阶段全量回归手写高性能 **Triton PagedAttention**。
 - **自动化元数据展开**: 统一的 `expand_metadata_for_paged_attention` 逻辑，完美支持全模型 Chunked Prefill。
@@ -85,6 +85,11 @@ uv run python tests/e2e_full_benchmark.py
 ```
 
 `tests/run_inference_correctness_regression.sh` 覆盖四个回归目标：TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B。Gemma4 模型目录自动探测，优先本地路径，仅在缺失时回退到 HuggingFace repo id。
+
+Gemma4 的少量 profiling / 诊断开关仍通过模型安装阶段的 tuning 配置生效，当前仅保留为内部观测用途，不作为常规运行参数：
+
+- `FASTINFERENCE_GEMMA4_LAYER_PROFILE`
+- `FASTINFERENCE_GEMMA4_ROCTX_PROFILE`
 
 默认准确度策略为：
 

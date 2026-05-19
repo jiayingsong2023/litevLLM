@@ -8,25 +8,25 @@ A: We have physically removed 70% of the original vLLM code (from 270k to 81k LO
 
 > Q: Does FastInference require a C++ compiler?
 
-A: **No.** This is a major advantage. All performance-critical kernels (Attention, RMSNorm, RoPE, Dequantization) are written in Python using Triton. You can install and run the engine using only `uv pip install -e .`.
+A: **No.** Performance-critical kernels are written in Python using Triton. Use `uv sync` to install the pinned Python 3.12 environment; no project C++ build step is required.
 
 ---
 
-> Q: How does GGUF performance compare to standard vLLM?
+> Q: How do I install and run FastInference locally?
 
-A: FastInference is significantly faster for GGUF on single GPUs. By using a **Global LRU Cache** for dequantized weights, we avoid the overhead of repeated dequantization. Llama-7B GGUF reaches **195+ TPS** on an AMD Strix Point APU.
+A: Use Python 3.12 and run `uv sync` from the repository root. Project commands should use `uv run ...`; the maintained workflow does not use bare `python` or `pip`.
 
 ---
 
-> Q: What should I do if I see "Illegal Memory Access" on my AMD APU?
+> Q: What should I do if I see "Illegal Memory Access" on AMD ROCm?
 
-A: This is a known hardware constraint when running large batches. We have included a stability patch. If the error persists, reduce your Batch Size to 8 or 16. FastInference still provides over **140 TPS** at Batch Size 8 for MoE models.
+A: Reduce concurrency, prompt length, or KV limits first. The default large-model benchmark pins conservative single-request shapes for Gemma4 and enables per-model process isolation when benchmarking multiple large Gemma4 models in one command.
 
 ---
 
 > Q: Can I run multiple LoRA adapters concurrently?
 
-A: Yes. Our **Multi-adapter LiteLoRA** architecture supports routing different tokens in the same batch to different adapters with zero-copy overhead. We have benchmarked this at **663 TPS** with 3 concurrent adapters.
+A: The LiteLoRA runtime exists and is treated as experimental. Validate your workload with smoke, correctness, and performance gates before treating a LoRA profile as production-ready.
 
 ---
 

@@ -8,7 +8,8 @@ assert wiring contracts and gate branches with environment variables.
 """
 from __future__ import annotations
 
-import os
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,37 +21,45 @@ from vllm.model_executor.models.gemma4 import _should_use_full_decode_reference
 # ---------------------------------------------------------------------------
 # Env-gated branch selection for the global-decode ref path.
 # ---------------------------------------------------------------------------
-def test_full_decode_ref_default_is_kernel_path(monkeypatch):
+def test_full_decode_ref_default_is_kernel_path():
     """Default behaviour after Step 3: never force the pytorch ref path, even
     when KV is fp16/bf16. The Triton kernel handles softcap natively now."""
-    monkeypatch.delenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", raising=False)
-    monkeypatch.delenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", raising=False)
-    assert _should_use_full_decode_reference("auto") is False
-    assert _should_use_full_decode_reference("fp16") is False
-    assert _should_use_full_decode_reference("bf16") is False
-    assert _should_use_full_decode_reference("int4") is False
-    assert _should_use_full_decode_reference("fp8") is False
+    assert _should_use_full_decode_reference(None, "auto") is False
+    assert _should_use_full_decode_reference(None, "fp16") is False
+    assert _should_use_full_decode_reference(None, "bf16") is False
+    assert _should_use_full_decode_reference(None, "int4") is False
+    assert _should_use_full_decode_reference(None, "fp8") is False
 
 
-def test_full_decode_ref_legacy_fp16_env_preserves_old_behaviour(monkeypatch):
+def test_full_decode_ref_legacy_fp16_config_preserves_old_behaviour():
     """Operators can still opt into the pre-Step-3 behaviour: fp16/bf16 KV
     falls back to ref, int4/fp8 takes the kernel path."""
-    monkeypatch.delenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", raising=False)
-    monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", "1")
-    assert _should_use_full_decode_reference("auto") is True
-    assert _should_use_full_decode_reference("fp16") is True
-    assert _should_use_full_decode_reference("bf16") is True
-    assert _should_use_full_decode_reference("int4") is False
-    assert _should_use_full_decode_reference("fp8") is False
+    inf_config = SimpleNamespace(
+        tuning_env={"FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN": "1"}
+    )
+    assert _should_use_full_decode_reference(inf_config, "auto") is True
+    assert _should_use_full_decode_reference(inf_config, "fp16") is True
+    assert _should_use_full_decode_reference(inf_config, "bf16") is True
+    assert _should_use_full_decode_reference(inf_config, "int4") is False
+    assert _should_use_full_decode_reference(inf_config, "fp8") is False
 
 
-def test_full_decode_ref_emergency_force_always_returns_true(monkeypatch):
+def test_full_decode_ref_emergency_force_always_returns_true():
     """FORCE_FULL_REF_ATTN is an emergency rollback knob for numerical debugging.
     It must take precedence over the legacy fp16 switch."""
-    monkeypatch.setenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", "1")
-    monkeypatch.delenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", raising=False)
+    inf_config = SimpleNamespace(
+        tuning_env={"FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN": "1"}
+    )
     for kv in ("auto", "fp16", "bf16", "int4", "fp8"):
-        assert _should_use_full_decode_reference(kv) is True
+        assert _should_use_full_decode_reference(inf_config, kv) is True
+
+
+def test_full_decode_ref_ignores_env_without_config(monkeypatch):
+    """Direct environment state should not affect the runtime policy."""
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", "1")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", "1")
+    for kv in ("auto", "fp16", "bf16", "int4", "fp8"):
+        assert _should_use_full_decode_reference(None, kv) is False
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +114,8 @@ def test_softcap_plumbing_expression_matches_expected(cfg_value, expected):
 # insurance policy against future refactors that silently drop the kwarg.
 # ---------------------------------------------------------------------------
 def test_gemma4_paged_attention_calls_all_pass_softcap():
-    src_path = gemma4_mod.__file__
-    with open(src_path, "r", encoding="utf-8") as fh:
+    src_path = Path(gemma4_mod.__file__)
+    with src_path.open("r", encoding="utf-8") as fh:
         src = fh.read()
 
     # There are currently 2 in-module call sites to paged_attention_v1:

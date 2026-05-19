@@ -61,10 +61,10 @@ RUN_GEMMA4_A_STRICT=0 RUN_GEMMA4_26B_A_STRICT=0 bash tests/run_inference_correct
 说明：
 
 - TinyLlama 默认 prompt 集已经移除已知不稳定的 `zh_gd` 用例，避免它阻塞后续 Gemma4 默认路径。
-- Gemma4 默认走当前已验收推荐 profile：
+- Gemma4 普通运行默认走当前已验收推荐 profile：
   - `31B`: `FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1` + `FASTINFERENCE_AWQ_DECODE_GEMV=1` + `FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1` + `FASTINFERENCE_AWQ_FUSED_GATE_UP=1`
-  - `26B`: `FASTINFERENCE_AWQ_DECODE_GEMV=1` + `FASTINFERENCE_AWQ_FUSED_GATE_UP=1`
-  - 两者都默认带 `FASTINFERENCE_GPU_GREEDY_*` 和 `FASTINFERENCE_KV_MAX_*` 限制
+  - `26B`: `FASTINFERENCE_AWQ_DECODE_GEMV=1` + `FASTINFERENCE_AWQ_FUSED_GATE_UP=1`，并默认使用 `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_chunked`
+  - 两者都默认开启 `FASTINFERENCE_GPU_GREEDY_*` benchmark profile；`FASTINFERENCE_KV_MAX_*` 仍由 benchmark / 回归脚本按测量形状显式固定
 
 ## 性能基准入口
 
@@ -85,7 +85,8 @@ uv run python tests/e2e_full_benchmark.py \
 
 当前行为：
 
-- `gemma4_31b_q4` 和 `gemma4_26b_a4b` 的 `stable_env` 已内置当前推荐 profile
+- `gemma4_31b_q4` 和 `gemma4_26b_a4b` 的 adapter/runtime 默认值已内置当前推荐 profile
+- benchmark 的 `stable_env` 仍会固定 `FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1` 与 `FASTINFERENCE_KV_MAX_MODEL_LEN=512`，用于保证默认性能结果可复现
 - 在 ROCm 上，如果一次运行里包含多个 Gemma4 大模型，脚本会默认启用 **per-model process isolation**
 - 这个隔离模式用于避免顺序大模型 benchmark 时的显存残留 / allocator fragmentation 导致的 OOM
 

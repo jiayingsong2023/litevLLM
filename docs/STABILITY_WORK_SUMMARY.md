@@ -55,7 +55,7 @@
 执行流程：
 
 1. `actions/setup-python`（3.12）
-2. `pip install uv`
+2. install `uv` with the official installer if it is not already available
 3. `uv sync`
 4. `uv run pytest -q tests/smoke`
 

@@ -90,17 +90,17 @@ This confirmed that the dominant steady GPU footprint is not the KV cache. It is
 
 ## Current E2E Baseline
 
-Latest default benchmark command:
+Latest benchmark command:
 
 ```bash
-uv run python tests/e2e_full_benchmark.py
+uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b,gemma4_31b_q4 --model-process-isolation
 ```
 
-Measurement date: `2026-04-30`.
+Latest measurement date: `2026-05-19` for the current 26B and 31B single-model default-profile reports.
 
 Runtime profile:
 
-- ROCm conservative defaults
+- benchmark recommended profile now installed by default through runtime/model adapter policy
 - per-model process isolation enabled automatically for Gemma4 26B + 31B
 - `BS=1`
 - `prompt_tokens~384`
@@ -108,18 +108,20 @@ Runtime profile:
 - `FASTINFERENCE_KV_MAX_MODEL_LEN=512`
 - Gemma4 accuracy guard forced runtime KV cache to `fp8`
 
-Observed parent-process summary:
+Current report summary:
 
-| Model key | Aggregate TPS | TTFT p95 | E2E p95 | Prefill TPS agg | Decode TPS agg |
+| Model key | Aggregate TPS | TTFT p50 | E2E p50 | Prefill TPS agg | Decode TPS agg |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemma4_26b_a4b` | `2.30` | `3365.3ms` | `10448.0ms` | `117.08` | `3.25` |
-| `gemma4_31b_q4` | `1.49` | `8741.7ms` | `16121.5ms` | `45.07` | `3.12` |
+| `gemma4_26b_a4b` | `3.62` | `2438.6ms` | `6626.8ms` | `161.57` | `5.49` |
+| `gemma4_31b_q4` | `1.43` | `9181.2ms` | `16804.7ms` | `42.91` | `3.02` |
 
 Interpretation:
 
-- The 26B MoE path has materially better prefill throughput than 31B under this default shape.
-- Decode throughput is close between the two models, around `3.1-3.2` decode tokens/sec.
+- The recommended 26B MoE default is now `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_chunked`.
+- The 26B MoE path now has materially better prefill and decode throughput than 31B under this default shape.
 - 31B remains TTFT/prefill-bound for this conservative default benchmark.
+- The best observed 26B `batched_chunked` report remains `5.62` decode TPS; the latest default-entry verification measured `5.49`.
+- The 2026-05-19 31B single-model run is about `5.15%` below the previous `3.18` decode TPS report, so it should be treated as the current conservative baseline rather than a new best result.
 - These numbers supersede older README headline Gemma4 TPS claims that were measured under different or less clearly pinned profiles.
 
 ## Confirmed Gains
@@ -128,7 +130,7 @@ Interpretation:
 
 This is the strongest confirmed end-to-end win.
 
-Reference: `tests/reports/phase2_p384_local_onoff_gate/20260424_091517/summary.json`
+Reference: archived phase-2 local decode on/off gate report from 2026-04-24.
 
 On `p384`:
 
@@ -144,7 +146,7 @@ This is the only change that clearly crossed a practical per-shape acceptance th
 
 ### 2. MLP fused kernel tuning
 
-Reference: `tests/reports/phase1_gpu_bottleneck/20260424_074651/gpu_bottleneck_summary.json`
+Reference: archived phase-1 GPU bottleneck report from 2026-04-24.
 
 On a tuned `p384,d64,c1` case:
 
@@ -166,7 +168,7 @@ This is valuable operational knowledge even though it did not produce a strong e
 
 ### 1. Original prompt-only bucket default
 
-Reference: `tests/reports/sprint2_matrix/20260424_094410/leaderboard.json`
+Reference: archived sprint-2 matrix leaderboard from 2026-04-24.
 
 The original bucket strategy:
 
@@ -177,7 +179,7 @@ did not hold up on the representative matrix. It underperformed pure `baseline` 
 
 ### 2. Two-dimensional bucket policy as default
 
-Reference: `tests/reports/phase3_2d_bucket_gate/20260424_103634/gate_report.json`
+Reference: archived phase-3 2D bucket gate report from 2026-04-24.
 
 The improved 2D routing was:
 
@@ -209,7 +211,7 @@ Additional local/global launch parameter sweeps did not yield a durable improvem
 
 The project did identify the main bottlenecks clearly.
 
-Reference: `tests/reports/phase1_p384_rootcause/20260424_071804/p384_rootcause_report.json`
+Reference: archived phase-1 p384 root-cause report from 2026-04-24.
 
 The dominant runtime is still:
 
@@ -236,6 +238,10 @@ For production-like default behavior now:
 Recommended policy:
 
 - `FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON=1` (default-on path)
+- `FASTINFERENCE_AWQ_DECODE_GEMV=1` and `FASTINFERENCE_AWQ_FUSED_GATE_UP=1` installed by the Gemma4 adapter
+- `FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1` and `FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1` installed for dense Gemma4
+- `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_chunked` installed as the 26B MoE default
+- `FASTINFERENCE_GPU_GREEDY_*` benchmark profile enabled by default, with `FASTINFERENCE_GPU_GREEDY_IGNORE_EOS` still opt-in
 - scheduler profile default: `baseline`
 - bucket routing: keep available as an experiment, not as the default policy
 - keep fixed decode length benchmarking for regression work

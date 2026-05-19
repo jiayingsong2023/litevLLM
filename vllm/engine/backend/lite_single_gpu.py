@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import os
 import time
 from typing import Any
 
@@ -17,10 +15,6 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 
 logger = init_logger(__name__)
-
-
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class LiteSingleGpuBackend:
@@ -47,6 +41,10 @@ class LiteSingleGpuBackend:
         preempt_multimodal_prefills: bool = False,
         preempt_multimodal_max_queue_wait_s: float = 0.0,
         multimodal_prefix_cache_protect_threshold: float = 0.0,
+        gpu_greedy_sampling: bool = False,
+        gpu_greedy_max_tokens_only: bool = False,
+        gpu_greedy_bypass_cpu_policies: bool = False,
+        gpu_greedy_ignore_eos: bool = False,
     ) -> None:
         self.scheduler = scheduler
         self.observer = observer
@@ -82,6 +80,10 @@ class LiteSingleGpuBackend:
         self.multimodal_prefix_cache_protect_threshold = max(
             0.0, float(multimodal_prefix_cache_protect_threshold)
         )
+        self.gpu_greedy_sampling = bool(gpu_greedy_sampling)
+        self.gpu_greedy_max_tokens_only = bool(gpu_greedy_max_tokens_only)
+        self.gpu_greedy_bypass_cpu_policies = bool(gpu_greedy_bypass_cpu_policies)
+        self.gpu_greedy_ignore_eos = bool(gpu_greedy_ignore_eos)
 
     def maybe_apply_prefix_cache(self, request_state) -> None:
         cache_key = self._prefix_cache_key(request_state)
@@ -270,18 +272,16 @@ class LiteSingleGpuBackend:
             raise error
 
     def _can_use_gpu_greedy_decode(self, request_ids: list[str]) -> bool:
-        if not _env_truthy("FASTINFERENCE_GPU_GREEDY_SAMPLING"):
+        if not self.gpu_greedy_sampling:
             return False
         if not request_ids:
             return False
         # This fast path intentionally handles the latency benchmark shape first:
         # greedy, max-token-bounded decode with no per-token CPU policy work.
-        if not _env_truthy("FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY"):
+        if not self.gpu_greedy_max_tokens_only:
             return False
-        bypass_cpu_policies = _env_truthy(
-            "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES"
-        )
-        ignore_eos = _env_truthy("FASTINFERENCE_GPU_GREEDY_IGNORE_EOS")
+        bypass_cpu_policies = self.gpu_greedy_bypass_cpu_policies
+        ignore_eos = self.gpu_greedy_ignore_eos
         for rid in request_ids:
             req = self.scheduler.get_request(rid)
             sp = req["sampling_params"]
@@ -368,6 +368,10 @@ class LiteSingleGpuBackend:
             "multimodal_prefix_cache_protect_threshold": (
                 self.multimodal_prefix_cache_protect_threshold
             ),
+            "gpu_greedy_sampling": self.gpu_greedy_sampling,
+            "gpu_greedy_max_tokens_only": self.gpu_greedy_max_tokens_only,
+            "gpu_greedy_bypass_cpu_policies": self.gpu_greedy_bypass_cpu_policies,
+            "gpu_greedy_ignore_eos": self.gpu_greedy_ignore_eos,
             "prefix_cache_materialized_hits": materialized_hits,
             "prefix_cache_materialized_exact_hits": self.prefix_cache_materialized_exact_hits,
             "prefix_cache_materialized_partial_hits": self.prefix_cache_materialized_partial_hits,

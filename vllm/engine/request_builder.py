@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import time
 from typing import Any, Optional
 
@@ -23,6 +22,7 @@ class LiteRequestBuilder:
         num_layers: int,
         max_model_len: int,
         max_tokens_cap: int,
+        default_min_new_tokens: int = 0,
     ) -> None:
         self.tokenizer = tokenizer
         self.policies = policies
@@ -30,6 +30,7 @@ class LiteRequestBuilder:
         self.num_layers = num_layers
         self.max_model_len = max_model_len
         self.max_tokens_cap = max_tokens_cap
+        self.default_min_new_tokens = max(0, int(default_min_new_tokens))
 
     def build(
         self,
@@ -46,15 +47,11 @@ class LiteRequestBuilder:
         max_tokens = effective_sampling_params.max_tokens or 16
         max_tokens = min(max_tokens, self.max_tokens_cap)
         effective_sampling_params.max_tokens = max_tokens
-        # Keep env-driven behavior centralized in request building.
-        raw = os.environ.get("FASTINFERENCE_LITE_DEFAULT_MIN_NEW_TOKENS", "0")
         if int(getattr(effective_sampling_params, "min_tokens", 0) or 0) == 0:
-            raw = str(raw).strip().lower()
-            if raw not in ("", "0", "false", "off", "no"):
-                try:
-                    effective_sampling_params.min_tokens = min(max_tokens, max(0, int(raw)))
-                except ValueError:
-                    effective_sampling_params.min_tokens = min(max_tokens, 1)
+            effective_sampling_params.min_tokens = min(
+                max_tokens,
+                self.default_min_new_tokens,
+            )
 
         guarded_prompt = self.policies.normalize_prompt(prompt)
         input_ids = self.tokenizer.encode(guarded_prompt)

@@ -19,7 +19,13 @@ import torch
 from PIL import Image
 
 from vllm import SamplingParams
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.engine.async_llm import AsyncLLM
 
 
@@ -102,6 +108,9 @@ _GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
     "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
     "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
     "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
+    "FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE": "32",
+    "FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE": "auto",
+    "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL": "1",
     "FASTINFERENCE_GPU_GREEDY_SAMPLING": "1",
     "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY": "1",
     "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
@@ -211,12 +220,16 @@ def _read_int_with_default(raw: str | None, default: int) -> int:
 
 
 def _resolve_warmup_config(args: argparse.Namespace) -> WarmupConfig:
-    warmup_preset = str(
-        os.environ.get(
-            "FASTINFERENCE_BENCH_WARMUP_PRESET",
-            getattr(args, "warmup_preset", "default"),
+    warmup_preset = (
+        str(
+            os.environ.get(
+                "FASTINFERENCE_BENCH_WARMUP_PRESET",
+                getattr(args, "warmup_preset", "default"),
+            )
         )
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
     if warmup_preset not in ("default", "off", "cold"):
         warmup_preset = "default"
     if warmup_preset == "off":
@@ -481,12 +494,16 @@ def _resolve_gemma31b_bucket_policy(
     spec: ModelSpec,
     args: argparse.Namespace,
 ) -> tuple[ModelSpec, dict[str, Any]]:
-    enabled_raw = str(
-        os.environ.get(
-            "FASTINFERENCE_GEMMA31B_BUCKET_ENABLE",
-            "1" if bool(getattr(args, "gemma31b_bucket_enable", True)) else "0",
+    enabled_raw = (
+        str(
+            os.environ.get(
+                "FASTINFERENCE_GEMMA31B_BUCKET_ENABLE",
+                "1" if bool(getattr(args, "gemma31b_bucket_enable", True)) else "0",
+            )
         )
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
     enabled = enabled_raw in ("1", "true", "yes", "on")
     short_profile = str(
         os.environ.get(
@@ -534,7 +551,10 @@ def _resolve_gemma31b_bucket_policy(
         short_decode_profile = "catchup_prefill"
     if long_profile not in _GEMMA31B_SCHEDULER_PROFILES:
         long_profile = "baseline"
-    if profile_override not in ("auto_bucket", *tuple(_GEMMA31B_SCHEDULER_PROFILES.keys())):
+    if profile_override not in (
+        "auto_bucket",
+        *tuple(_GEMMA31B_SCHEDULER_PROFILES.keys()),
+    ):
         profile_override = "auto_bucket"
     if profile_override == "auto_bucket":
         if enabled:
@@ -572,7 +592,12 @@ def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSp
     """Downgrade batch/prompt on AMD ROCm unless aggressive mode is enabled."""
     if aggressive or not _is_rocm():
         return spec
-    if spec.key not in ("tinyllama", "qwen35_9b_awq", "gemma4_31b_q4", "gemma4_26b_a4b"):
+    if spec.key not in (
+        "tinyllama",
+        "qwen35_9b_awq",
+        "gemma4_31b_q4",
+        "gemma4_26b_a4b",
+    ):
         return spec
     new_conc = min(spec.concurrent_reqs, _ROCM_E2E_SAFE_CONCURRENT)
     new_prompt = min(spec.prompt_tokens_target, _ROCM_E2E_SAFE_PROMPT_TOKENS)
@@ -636,7 +661,9 @@ def _build_prompt(tokenizer, target_tokens: int) -> str:
     return prompt_text
 
 
-def _write_benchmark_image(image_path: Path, *, request_index: int, image_index: int, size: int) -> None:
+def _write_benchmark_image(
+    image_path: Path, *, request_index: int, image_index: int, size: int
+) -> None:
     image_path.parent.mkdir(parents=True, exist_ok=True)
     color = (
         (64 + request_index * 23 + image_index * 11) % 256,
@@ -663,11 +690,15 @@ def _build_benchmark_requests(
             if image_root is None:
                 raise ValueError("image_root is required for multimodal workloads")
             image_count = (
-                1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                1
+                if workload == "multimodal_single"
+                else max(2, int(multimodal_images_per_request))
             )
             image_blocks: list[dict[str, str]] = []
             for image_index in range(image_count):
-                image_path = image_root / f"req_{request_index:03d}_img_{image_index:02d}.png"
+                image_path = (
+                    image_root / f"req_{request_index:03d}_img_{image_index:02d}.png"
+                )
                 _write_benchmark_image(
                     image_path,
                     request_index=request_index,
@@ -694,7 +725,9 @@ def _p95(values: List[float]) -> float:
 
 
 def _finite_values(values: List[float]) -> List[float]:
-    return [v for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    return [
+        v for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))
+    ]
 
 
 def _fmt_float(value: float, fmt: str) -> str:
@@ -773,7 +806,9 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
         backend.get("prefix_cache_materialized_saved_prefill_tokens", 0) or 0
     )
     lookup_comparisons = float(backend_prefix.get("lookup_comparisons", 0) or 0)
-    lookup_candidates_total = float(backend_prefix.get("lookup_candidates_total", 0) or 0)
+    lookup_candidates_total = float(
+        backend_prefix.get("lookup_candidates_total", 0) or 0
+    )
     preempted_steps = float(observer_preemption.get("preempted_steps", 0) or 0)
     preempted_prefills = float(
         observer_preemption.get("preempted_prefill_requests", 0) or 0
@@ -892,12 +927,8 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
             "registered_adapters": float(
                 lora_runtime.get("registered_adapters", 0) or 0
             ),
-            "active_adapters": float(
-                lora_runtime.get("active_adapters", 0) or 0
-            ),
-            "active_requests": float(
-                lora_runtime.get("active_requests", 0) or 0
-            ),
+            "active_adapters": float(lora_runtime.get("active_adapters", 0) or 0),
+            "active_requests": float(lora_runtime.get("active_requests", 0) or 0),
             "total_routed_requests": float(
                 lora_runtime.get("total_routed_requests", 0) or 0
             ),
@@ -929,7 +960,8 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
             "prefill_step_count": lora_prefill_steps,
             "decode_step_count": lora_decode_steps,
             "mixed_lora_prefill_step_rate": (
-                float(observer_lora.get("mixed_lora_prefill_steps", 0) or 0) / step_count
+                float(observer_lora.get("mixed_lora_prefill_steps", 0) or 0)
+                / step_count
                 if step_count
                 else 0.0
             ),
@@ -963,7 +995,9 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
             "backlog_adapter_share": backlog_adapter_share,
             "adapter_fairness_gap": adapter_fairness_gap,
             "max_adapter_fairness_gap": (
-                max((abs(value) for value in adapter_fairness_gap.values()), default=0.0)
+                max(
+                    (abs(value) for value in adapter_fairness_gap.values()), default=0.0
+                )
             ),
             "mean_abs_adapter_fairness_gap": (
                 sum(abs(value) for value in adapter_fairness_gap.values())
@@ -1138,7 +1172,9 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
                 else 0.0
             ),
             "multimodal_lora_prefill_rate": (
-                float(observer_multimodal.get("prefill_multimodal_lora_requests", 0) or 0)
+                float(
+                    observer_multimodal.get("prefill_multimodal_lora_requests", 0) or 0
+                )
                 / float(observer_multimodal.get("prefill_requests", 0) or 1)
                 if float(observer_multimodal.get("prefill_requests", 0) or 0) > 0
                 else 0.0
@@ -1147,7 +1183,9 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
                 observer_multimodal.get("prefix_cache_hit_rate", 0.0) or 0.0
             ),
             "saved_prefill_tokens_per_request": (
-                float(observer_multimodal.get("prefix_cache_saved_prefill_tokens", 0) or 0)
+                float(
+                    observer_multimodal.get("prefix_cache_saved_prefill_tokens", 0) or 0
+                )
                 / float(observer_multimodal.get("requests", 0) or 1)
                 if float(observer_multimodal.get("requests", 0) or 0) > 0
                 else 0.0
@@ -1184,7 +1222,8 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
                 else 0.0
             ),
             "mixed_multimodal_lora_batch_ratio": float(
-                observer_multimodal.get("mixed_multimodal_lora_prefill_ratio", 0.0) or 0.0
+                observer_multimodal.get("mixed_multimodal_lora_prefill_ratio", 0.0)
+                or 0.0
             ),
             "avg_effective_admit_multimodal_lora_limit": float(
                 observer_multimodal.get(
@@ -1290,9 +1329,7 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
                 or 0
             ),
             "decode_multimodal_lora_limit_relaxed_steps": float(
-                observer_multimodal.get(
-                    "decode_multimodal_lora_limit_relaxed_steps", 0
-                )
+                observer_multimodal.get("decode_multimodal_lora_limit_relaxed_steps", 0)
                 or 0
             ),
             "decode_multimodal_lora_limit_relaxed_by_fairness_steps": float(
@@ -1419,13 +1456,19 @@ def _derive_runtime_phase_diffs(
     benchmark_multimodal = benchmark_metrics.get("multimodal", {})
     if not isinstance(warmup_prefix, dict) or not isinstance(benchmark_prefix, dict):
         warmup_prefix, benchmark_prefix = {}, {}
-    if not isinstance(warmup_preemption, dict) or not isinstance(benchmark_preemption, dict):
+    if not isinstance(warmup_preemption, dict) or not isinstance(
+        benchmark_preemption, dict
+    ):
         warmup_preemption, benchmark_preemption = {}, {}
-    if not isinstance(warmup_fairness, dict) or not isinstance(benchmark_fairness, dict):
+    if not isinstance(warmup_fairness, dict) or not isinstance(
+        benchmark_fairness, dict
+    ):
         warmup_fairness, benchmark_fairness = {}, {}
     if not isinstance(warmup_lora, dict) or not isinstance(benchmark_lora, dict):
         warmup_lora, benchmark_lora = {}, {}
-    if not isinstance(warmup_multimodal, dict) or not isinstance(benchmark_multimodal, dict):
+    if not isinstance(warmup_multimodal, dict) or not isinstance(
+        benchmark_multimodal, dict
+    ):
         warmup_multimodal, benchmark_multimodal = {}, {}
 
     prefix_keys = (
@@ -1458,9 +1501,9 @@ def _derive_runtime_phase_diffs(
     )
     preemption_delta = {}
     for key in preemption_keys:
-        preemption_delta[key] = float(benchmark_preemption.get(key, 0.0) or 0.0) - float(
-            warmup_preemption.get(key, 0.0) or 0.0
-        )
+        preemption_delta[key] = float(
+            benchmark_preemption.get(key, 0.0) or 0.0
+        ) - float(warmup_preemption.get(key, 0.0) or 0.0)
 
     fairness_scalar_keys = (
         "step_count",
@@ -1534,7 +1577,9 @@ def _derive_runtime_phase_diffs(
         warmup_adapter_fairness = {}
     if not isinstance(benchmark_adapter_fairness, dict):
         benchmark_adapter_fairness = {}
-    fairness_keys = sorted(set(warmup_adapter_fairness) | set(benchmark_adapter_fairness))
+    fairness_keys = sorted(
+        set(warmup_adapter_fairness) | set(benchmark_adapter_fairness)
+    )
     lora_delta["adapter_fairness_gap"] = {
         str(key): float(benchmark_adapter_fairness.get(key, 0.0) or 0.0)
         - float(warmup_adapter_fairness.get(key, 0.0) or 0.0)
@@ -1608,9 +1653,9 @@ def _derive_runtime_phase_diffs(
     )
     multimodal_delta = {}
     for key in multimodal_keys:
-        multimodal_delta[key] = float(benchmark_multimodal.get(key, 0.0) or 0.0) - float(
-            warmup_multimodal.get(key, 0.0) or 0.0
-        )
+        multimodal_delta[key] = float(
+            benchmark_multimodal.get(key, 0.0) or 0.0
+        ) - float(warmup_multimodal.get(key, 0.0) or 0.0)
 
     return {
         "baseline_phase": "warmup",
@@ -1942,12 +1987,18 @@ async def _run_single_request(
     end = time.perf_counter()
     first_token_at = token_timestamps[0] if token_timestamps else None
     last_token_at = token_timestamps[-1] if token_timestamps else None
-    ttft_ms = ((first_token_at - start) * 1000.0) if first_token_at is not None else float("nan")
+    ttft_ms = (
+        ((first_token_at - start) * 1000.0)
+        if first_token_at is not None
+        else float("nan")
+    )
     e2e_ms = (end - start) * 1000.0
     decode_tokens = max(0, generated_tokens - 1)
     decode_ms = (
         (last_token_at - first_token_at) * 1000.0
-        if first_token_at is not None and last_token_at is not None and len(token_timestamps) >= 2
+        if first_token_at is not None
+        and last_token_at is not None
+        and len(token_timestamps) >= 2
         else float("nan")
     )
     # Sub-millisecond decode windows are often dominated by scheduling/buffering noise.
@@ -2020,7 +2071,9 @@ async def _run_benchmark_warmup(
             max_tokens=1,
             multi_modal_data=warmup_request.multi_modal_data,
         )
-        warmup_trace.append({"stage": "prefill", "step": float(step), "elapsed_ms": elapsed_ms})
+        warmup_trace.append(
+            {"stage": "prefill", "step": float(step), "elapsed_ms": elapsed_ms}
+        )
         step += 1
 
     if warmup_config.decode_rounds > 0:
@@ -2036,7 +2089,9 @@ async def _run_benchmark_warmup(
             max_tokens=warmup_config.decode_tokens,
             multi_modal_data=warmup_request.multi_modal_data,
         )
-        warmup_trace.append({"stage": "decode", "step": float(step), "elapsed_ms": elapsed_ms})
+        warmup_trace.append(
+            {"stage": "decode", "step": float(step), "elapsed_ms": elapsed_ms}
+        )
         step += 1
 
     burst_concurrency = min(
@@ -2065,7 +2120,9 @@ async def _run_benchmark_warmup(
         if tasks:
             await asyncio.gather(*tasks)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            warmup_trace.append({"stage": "burst", "step": float(step), "elapsed_ms": elapsed_ms})
+            warmup_trace.append(
+                {"stage": "burst", "step": float(step), "elapsed_ms": elapsed_ms}
+            )
             step += 1
     return warmup_trace
 
@@ -2129,7 +2186,9 @@ async def run_benchmark(
                 "workload": {
                     "kind": workload,
                     "multimodal_images_per_request": (
-                        1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                        1
+                        if workload == "multimodal_single"
+                        else max(2, int(multimodal_images_per_request))
                     ),
                     "multimodal_image_size": max(2, int(multimodal_image_size)),
                 },
@@ -2164,8 +2223,7 @@ async def run_benchmark(
                 multimodal_image_size=multimodal_image_size,
             )
         prompt_tokens_by_request = [
-            len(llm.engine.tokenizer.encode(req.prompt))
-            for req in request_specs
+            len(llm.engine.tokenizer.encode(req.prompt)) for req in request_specs
         ]
 
         resolved_warmup = warmup_config or WarmupConfig()
@@ -2209,7 +2267,9 @@ async def run_benchmark(
                 "marking as timeout in summary."
             )
             if awq_stats:
-                print(f"  AWQ_STATS(timeout): {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
+                print(
+                    f"  AWQ_STATS(timeout): {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}"
+                )
             awq_metrics = _derive_awq_metrics(awq_stats) if awq_stats else {}
             benchmark_stats = _collect_runtime_stats(llm, phase="benchmark")
             return {
@@ -2244,7 +2304,9 @@ async def run_benchmark(
                 "workload": {
                     "kind": workload,
                     "multimodal_images_per_request": (
-                        1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                        1
+                        if workload == "multimodal_single"
+                        else max(2, int(multimodal_images_per_request))
                     ),
                     "multimodal_image_size": max(2, int(multimodal_image_size)),
                 },
@@ -2261,7 +2323,9 @@ async def run_benchmark(
                 "warmup_trace": warmup_trace,
             }
         wall_end = time.perf_counter()
-        runtime_stats_by_phase["benchmark"] = _collect_runtime_stats(llm, phase="benchmark")
+        runtime_stats_by_phase["benchmark"] = _collect_runtime_stats(
+            llm, phase="benchmark"
+        )
         runtime_stats_by_phase["phase_diffs"] = _derive_runtime_phase_diffs(
             runtime_stats_by_phase
         )
@@ -2318,18 +2382,29 @@ async def run_benchmark(
             "decode_p95_ms": _p95(decode_ms_list) if decode_ms_list else float("nan"),
             "prompt_tokens_total": prompt_tokens_total,
             "prefill_tps_aggregate": prefill_tps_aggregate,
-            "prefill_tps_p50": median(prefill_tps_list) if prefill_tps_list else float("nan"),
-            "prefill_tps_p95": _p95(prefill_tps_list) if prefill_tps_list else float("nan"),
+            "prefill_tps_p50": median(prefill_tps_list)
+            if prefill_tps_list
+            else float("nan"),
+            "prefill_tps_p95": _p95(prefill_tps_list)
+            if prefill_tps_list
+            else float("nan"),
             "decode_ms_total": decode_ms_total,
             "decode_tokens_total": decode_tokens_total,
             "decode_tps_aggregate": decode_tps_aggregate,
-            "decode_tps_p50": median(decode_tps_list) if decode_tps_list else float("nan"),
-            "decode_tps_p95": _p95(decode_tps_list) if decode_tps_list else float("nan"),
+            "decode_tps_p50": median(decode_tps_list)
+            if decode_tps_list
+            else float("nan"),
+            "decode_tps_p95": _p95(decode_tps_list)
+            if decode_tps_list
+            else float("nan"),
             "stream_output_events_total": float(
                 sum(r.get("stream_output_events", 0.0) for r in request_results)
             ),
             "stream_progressive_token_events_total": float(
-                sum(r.get("stream_progressive_token_events", 0.0) for r in request_results)
+                sum(
+                    r.get("stream_progressive_token_events", 0.0)
+                    for r in request_results
+                )
             ),
             "stream_token_events_total": float(
                 sum(r.get("stream_token_events", 0.0) for r in request_results)
@@ -2344,7 +2419,9 @@ async def run_benchmark(
             "workload": {
                 "kind": workload,
                 "multimodal_images_per_request": (
-                    1 if workload == "multimodal_single" else max(2, int(multimodal_images_per_request))
+                    1
+                    if workload == "multimodal_single"
+                    else max(2, int(multimodal_images_per_request))
                 ),
                 "multimodal_image_size": max(2, int(multimodal_image_size)),
             },
@@ -2379,7 +2456,9 @@ async def run_benchmark(
         ):
             print(line)
         if awq_stats:
-            print(f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}")
+            print(
+                f"  AWQ_STATS: {json.dumps(awq_stats, ensure_ascii=True, sort_keys=True)}"
+            )
         return result
     finally:
         if llm is not None:
@@ -2387,7 +2466,9 @@ async def run_benchmark(
         if image_tmpdir is not None:
             image_tmpdir.cleanup()
         try:
-            from vllm.model_executor.layers.quantization.tensor import clear_global_weight_cache
+            from vllm.model_executor.layers.quantization.tensor import (
+                clear_global_weight_cache,
+            )
 
             clear_global_weight_cache()
         except Exception:
@@ -2719,7 +2800,9 @@ async def main() -> None:
     resolved_scheduler_policy: Dict[str, Dict[str, Any]] = {}
     for key in model_keys:
         if key not in MODEL_SPECS:
-            raise ValueError(f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}")
+            raise ValueError(
+                f"Unknown model key: {key}. Supported: {', '.join(MODEL_SPECS.keys())}"
+            )
         spec = _maybe_apply_rocm_safe_profile(MODEL_SPECS[key], aggressive)
         if key == "tinyllama" and args.tinyllama_concurrent is not None:
             n = int(args.tinyllama_concurrent)

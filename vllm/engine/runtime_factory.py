@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.engine.backend.lite_single_gpu import LiteSingleGpuBackend
@@ -14,66 +15,95 @@ from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.step_scheduler import StepScheduler
 
 
+@dataclass(frozen=True)
+class RuntimeAssemblyContext:
+    kv_caches: Any
+    kv_scale_caches: Any
+    num_blocks_per_seq: int
+    block_size: int
+    device: Any
+    max_model_len: int
+    num_layers: int
+    inf_config: Any
+    stack_per_layer_carries: Any
+    split_per_layer_carries: Any
+    model: Any
+    fast_input_ids: Any
+    fast_positions: Any
+    fast_slot_mapping: Any
+    fast_seq_lens: Any
+    fast_block_tables: Any
+    step_token_budget: int
+    decode_priority_enabled: bool
+    prefill_chunk_size: int
+    prefill_reserved_tokens: int
+    prefill_reserve_backlog: int
+    prefill_catchup_ratio: float
+    prefill_microbatch_size: int
+    max_active_requests: int
+    scheduler_policy: SchedulerRuntimePolicy
+    backend_policy: BackendRuntimePolicy
+    scheduler: Any
+    observer: Any
+    lora_registry: Any
+    sampling_driver: Any
+    output_pipeline: Any
+    queue_timeout_s: float
+    sig_caches: Any | None = None
+    sig_temp_buffers: Any | None = None
+
+
 class LiteRuntimeFactory:
     @classmethod
-    def build(cls, engine: Any) -> dict[str, Any]:
-        runtime_config = getattr(engine, "runtime_config", None)
-        scheduler_policy = getattr(
-            runtime_config,
-            "scheduler_policy",
-            SchedulerRuntimePolicy(),
-        )
-        backend_policy = getattr(
-            runtime_config,
-            "backend_policy",
-            BackendRuntimePolicy(),
-        )
+    def build(cls, context: RuntimeAssemblyContext) -> dict[str, Any]:
+        scheduler_policy = context.scheduler_policy
+        backend_policy = context.backend_policy
         kv_block_manager = KVBlockManager(
-            kv_caches=engine.kv_caches,
-            kv_scale_caches=engine.kv_scale_caches,
-            num_blocks_per_seq=engine.num_blocks_per_seq,
-            block_size=engine.block_size,
+            kv_caches=context.kv_caches,
+            kv_scale_caches=context.kv_scale_caches,
+            num_blocks_per_seq=context.num_blocks_per_seq,
+            block_size=context.block_size,
         )
         input_batch_builder = InputBatchBuilder(
-            device=engine.device,
-            max_model_len=engine.max_model_len,
-            num_layers=engine.num_layers,
+            device=context.device,
+            max_model_len=context.max_model_len,
+            num_layers=context.num_layers,
             kv_block_manager=kv_block_manager,
-            inf_config=engine.inf_config,
-            stack_per_layer_carries=engine._stack_per_layer_carries,
-            split_per_layer_carries=engine._split_per_layer_carries,
-            sig_caches=getattr(engine, "sig_caches", None),
-            sig_temp_buffers=getattr(engine, "_sig_temp_buffers", None),
+            inf_config=context.inf_config,
+            stack_per_layer_carries=context.stack_per_layer_carries,
+            split_per_layer_carries=context.split_per_layer_carries,
+            sig_caches=context.sig_caches,
+            sig_temp_buffers=context.sig_temp_buffers,
         )
         multimodal_processor = LiteMultiModalProcessor(
-            model=engine.model,
-            device=engine.device,
+            model=context.model,
+            device=context.device,
         )
         prefill_executor = PrefillExecutor(
-            model=engine.model,
+            model=context.model,
             input_batch_builder=input_batch_builder,
-            kv_caches=engine.kv_caches,
+            kv_caches=context.kv_caches,
             multimodal_processor=multimodal_processor,
         )
         decode_executor = DecodeExecutor(
-            model=engine.model,
+            model=context.model,
             input_batch_builder=input_batch_builder,
-            kv_caches=engine.kv_caches,
-            fast_input_ids=engine._fast_input_ids,
-            fast_positions=engine._fast_positions,
-            fast_slot_mapping=engine._fast_slot_mapping,
-            fast_seq_lens=engine._fast_seq_lens,
-            fast_block_tables=engine._fast_block_tables,
+            kv_caches=context.kv_caches,
+            fast_input_ids=context.fast_input_ids,
+            fast_positions=context.fast_positions,
+            fast_slot_mapping=context.fast_slot_mapping,
+            fast_seq_lens=context.fast_seq_lens,
+            fast_block_tables=context.fast_block_tables,
         )
         step_scheduler = StepScheduler(
-            step_token_budget=engine._step_token_budget,
-            decode_priority_enabled=engine._decode_priority_enabled,
-            prefill_chunk_size=engine._prefill_chunk_size,
-            prefill_reserved_tokens=engine._prefill_reserved_tokens,
-            prefill_reserve_backlog=engine._prefill_reserve_backlog,
-            prefill_catchup_ratio=engine._prefill_catchup_ratio,
-            prefill_microbatch_size=engine._prefill_microbatch_size,
-            max_admit_per_step=max(1, min(4, engine.max_active_requests)),
+            step_token_budget=context.step_token_budget,
+            decode_priority_enabled=context.decode_priority_enabled,
+            prefill_chunk_size=context.prefill_chunk_size,
+            prefill_reserved_tokens=context.prefill_reserved_tokens,
+            prefill_reserve_backlog=context.prefill_reserve_backlog,
+            prefill_catchup_ratio=context.prefill_catchup_ratio,
+            prefill_microbatch_size=context.prefill_microbatch_size,
+            max_admit_per_step=max(1, min(4, context.max_active_requests)),
             max_decode_streak=scheduler_policy.max_decode_streak,
             queue_aging_threshold_s=scheduler_policy.queue_aging_threshold_s,
             max_prefill_deferrals=scheduler_policy.max_prefill_deferrals,
@@ -149,14 +179,14 @@ class LiteRuntimeFactory:
             ),
         )
         execution_backend = LiteSingleGpuBackend(
-            scheduler=engine.scheduler,
-            observer=engine.observer,
+            scheduler=context.scheduler,
+            observer=context.observer,
             prefill_executor=prefill_executor,
             decode_executor=decode_executor,
-            sampling_driver=engine.sampling_driver,
-            output_coordinator=engine.output_pipeline,
+            sampling_driver=context.sampling_driver,
+            output_coordinator=context.output_pipeline,
             kv_block_manager=kv_block_manager,
-            lora_registry=engine.lora_registry,
+            lora_registry=context.lora_registry,
             max_prefix_cache_entries=backend_policy.max_prefix_cache_entries,
             preemption_mode=backend_policy.preemption_mode,
             preemption_min_backlog=backend_policy.preemption_min_backlog,
@@ -170,14 +200,20 @@ class LiteRuntimeFactory:
             multimodal_prefix_cache_protect_threshold=(
                 backend_policy.multimodal_prefix_cache_protect_threshold
             ),
+            gpu_greedy_sampling=backend_policy.gpu_greedy_sampling,
+            gpu_greedy_max_tokens_only=backend_policy.gpu_greedy_max_tokens_only,
+            gpu_greedy_bypass_cpu_policies=(
+                backend_policy.gpu_greedy_bypass_cpu_policies
+            ),
+            gpu_greedy_ignore_eos=backend_policy.gpu_greedy_ignore_eos,
         )
         runtime_controller = RuntimeController(
-            scheduler=engine.scheduler,
+            scheduler=context.scheduler,
             step_scheduler=step_scheduler,
-            observer=engine.observer,
+            observer=context.observer,
             backend=execution_backend,
-            queue_timeout_s=engine._queue_timeout_s,
-            lora_registry=engine.lora_registry,
+            queue_timeout_s=context.queue_timeout_s,
+            lora_registry=context.lora_registry,
         )
         return {
             "kv_block_manager": kv_block_manager,

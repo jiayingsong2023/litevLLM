@@ -177,6 +177,15 @@ GUI example:
 
 There is a [GitHub CI workflow](https://github.com/pytorch/pytorch-integration-testing/actions/workflows/vllm-profiling.yml) in the PyTorch infrastructure repository that provides continuous profiling for different models on vLLM. This automated profiling helps track performance characteristics over time and across different model configurations.
 
+### Gemma4 internal layer profiling
+
+Gemma4 keeps two lightweight internal profiling hooks for maintainers:
+
+- `FASTINFERENCE_GEMMA4_LAYER_PROFILE`
+- `FASTINFERENCE_GEMMA4_ROCTX_PROFILE`
+
+These are installed through the model tuning config path rather than read ad hoc in the hot path. Set them in the runtime tuning environment before model construction when you need layer-level timing or ROCTX spans for Gemma4 debugging. They are not intended as user-facing runtime switches.
+
 ### How It Works
 
 The workflow currently runs weekly profiling sessions for selected models, generating detailed performance traces that can be analyzed using different tools to identify performance regressions or optimization opportunities. But, it can be triggered manually as well, using the Github Action tool.
