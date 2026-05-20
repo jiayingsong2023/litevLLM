@@ -310,7 +310,11 @@ class RuntimeConfig:
     gemma4_moe_expert_cache_size: int = 32
     gemma4_moe_compute_dtype: str = "auto"
     gemma4_moe_int4_kernel_enabled: bool = True
-    gemma4_moe_int4_kernel_strategy: str = "batched_chunked"
+    gemma4_moe_int4_kernel_strategy: str = "two_stage"
+    gemma4_moe_prefill_grouped_enabled: bool = False
+    gemma4_moe_prefill_grouped_min_tokens: int = 17
+    gemma4_moe_prefill_grouped_strategy: str = "chunked"
+    gemma4_moe_batch_materialize_enabled: bool = False
     gemma4_rope_cache_max_pos: int | None = None
     gemma4_rope_cache_pool_max: int = 8
     k_scale: float = 1.0
@@ -401,7 +405,7 @@ class RuntimeConfig:
             "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL", "1"
         ).strip().lower() not in ("0", "false", "no", "off")
         gemma4_moe_int4_kernel_strategy = os.environ.get(
-            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", "batched_chunked"
+            "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", "two_stage"
         ).strip().lower()
         if gemma4_moe_int4_kernel_strategy not in (
             "two_stage",
@@ -413,8 +417,23 @@ class RuntimeConfig:
             "batched_chunked_downpair",
             "batched_chunked_splitgate_downpair",
             "batched_grouped",
+            "batched_grouped_streaming",
         ):
-            gemma4_moe_int4_kernel_strategy = "batched_chunked"
+            gemma4_moe_int4_kernel_strategy = "two_stage"
+        gemma4_moe_prefill_grouped_enabled = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED", "0"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        gemma4_moe_prefill_grouped_min_tokens = _optional_int(
+            "FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS"
+        )
+        gemma4_moe_prefill_grouped_strategy = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY", "chunked"
+        ).strip().lower()
+        if gemma4_moe_prefill_grouped_strategy not in ("chunked", "fused"):
+            gemma4_moe_prefill_grouped_strategy = "chunked"
+        gemma4_moe_batch_materialize_enabled = os.environ.get(
+            "FASTINFERENCE_GEMMA4_MOE_BATCH_MATERIALIZE", "0"
+        ).strip().lower() not in ("0", "false", "no", "off")
         gemma4_rope_cache_max_pos = _optional_int(
             "FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"
         )
@@ -502,6 +521,15 @@ class RuntimeConfig:
             gemma4_moe_compute_dtype=gemma4_moe_compute_dtype,
             gemma4_moe_int4_kernel_enabled=gemma4_moe_int4_kernel_enabled,
             gemma4_moe_int4_kernel_strategy=gemma4_moe_int4_kernel_strategy,
+            gemma4_moe_prefill_grouped_enabled=gemma4_moe_prefill_grouped_enabled,
+            gemma4_moe_prefill_grouped_min_tokens=max(
+                1,
+                gemma4_moe_prefill_grouped_min_tokens
+                if gemma4_moe_prefill_grouped_min_tokens is not None
+                else 17,
+            ),
+            gemma4_moe_prefill_grouped_strategy=gemma4_moe_prefill_grouped_strategy,
+            gemma4_moe_batch_materialize_enabled=gemma4_moe_batch_materialize_enabled,
             gemma4_rope_cache_max_pos=(
                 max(64, gemma4_rope_cache_max_pos)
                 if gemma4_rope_cache_max_pos is not None

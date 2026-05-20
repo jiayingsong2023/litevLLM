@@ -94,11 +94,18 @@ uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b
 bash tests/run_regression_suite.sh
 ```
 
-On AMD Radeon 8060S 65GB, the 2026-05-19 Gemma4 default benchmark profile
-measured `gemma4_26b_a4b` at `3.62` aggregate TPS / `5.49` decode TPS and
-`gemma4_31b_q4` at `1.43` aggregate TPS / `3.02` decode TPS. The 26B default
-uses the `batched_chunked` MoE int4 decode kernel; the benchmark still pins
+On AMD Radeon 8060S 65GB, the 2026-05-20 Gemma4 default benchmark profile
+measured `gemma4_26b_a4b` at `4.86` aggregate TPS / `9.75` decode TPS and
+`gemma4_31b_q4` at `1.42` aggregate TPS / `3.05` decode TPS. The 26B default
+uses the `two_stage` MoE int4 decode kernel; the benchmark still pins
 `KV cap=512` for reproducible measurement shape.
+`FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_grouped_streaming` is
+available for compact top-k tmp decode experiments. Grouped AWQ prefill is
+currently opt-in with `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1`. The
+`chunked` strategy directly consumes expert-major AWQ weights with a compact
+intermediate chunk; `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY=fused`
+is a single-kernel experiment that avoids dense materialization and full tmp
+traffic, but stays gated because it repeats gate/up work across output tiles.
 
 ## Core Backend: Triton Only
 

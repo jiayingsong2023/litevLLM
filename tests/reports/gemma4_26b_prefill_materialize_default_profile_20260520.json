@@ -1,0 +1,1049 @@
+{
+  "awq_prefix_stats": {
+    "layers.0.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.0.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.0.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.0.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.1.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.1.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.1.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.1.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.10.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.10.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.10.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.10.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.11.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.11.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.11.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.12.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.12.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.12.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.12.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.13.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.13.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.13.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.13.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.14.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.14.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.14.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.14.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.15.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.15.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.15.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.15.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.16.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.16.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.16.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.16.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.17.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.17.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.17.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.18.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.18.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.18.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.18.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.19.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.19.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.19.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.19.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.2.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.2.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.2.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.2.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.20.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.20.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.20.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.20.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.21.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.21.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.21.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.21.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.22.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.22.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.22.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.22.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.23.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.23.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.23.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.24.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.24.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.24.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.24.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.25.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.25.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.25.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.25.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.26.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.26.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.26.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.26.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.27.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.27.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.27.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.27.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.28.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.28.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.28.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.28.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.29.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.29.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.29.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.3.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.3.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.3.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.3.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.4.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.4.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.4.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.4.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.5.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.5.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.5.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.6.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.6.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.6.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.6.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.7.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.7.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.7.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.7.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.8.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.8.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.8.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.8.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.9.self_attn.k_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.9.self_attn.o_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.9.self_attn.q_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    },
+    "layers.9.self_attn.v_proj": {
+      "decision_fused": 1,
+      "fused_attempt": 40,
+      "fused_success": 40,
+      "matmul_calls": 41
+    }
+  },
+  "awq_projection_summary": {
+    "attn_k_proj": {
+      "decision_fused": 30,
+      "fused_attempt": 1200,
+      "fused_success": 1200,
+      "fused_success_rate": 0.9756,
+      "matmul_calls": 1230,
+      "prefixes": 30
+    },
+    "attn_o_proj": {
+      "decision_fused": 30,
+      "fused_attempt": 1200,
+      "fused_success": 1200,
+      "fused_success_rate": 0.9756,
+      "matmul_calls": 1230,
+      "prefixes": 30
+    },
+    "attn_q_proj": {
+      "decision_fused": 30,
+      "fused_attempt": 1200,
+      "fused_success": 1200,
+      "fused_success_rate": 0.9756,
+      "matmul_calls": 1230,
+      "prefixes": 30
+    },
+    "attn_v_proj": {
+      "decision_fused": 25,
+      "fused_attempt": 1000,
+      "fused_success": 1000,
+      "fused_success_rate": 0.9756,
+      "matmul_calls": 1025,
+      "prefixes": 25
+    }
+  },
+  "awq_stats": {
+    "awq_cache_hits": 0,
+    "awq_cache_misses": 0,
+    "awq_dense_builds": 0,
+    "awq_dense_cache_bytes_current": 0,
+    "awq_fused_attempt": 4600,
+    "awq_fused_success": 4600,
+    "awq_matmul_calls": 4715,
+    "cache_bytes": 0,
+    "cache_items": 0,
+    "cache_max_bytes": 15032385536,
+    "cache_max_items": 512
+  },
+  "decode_profiled_steps": 24,
+  "decode_step_mean_ms": 154.727,
+  "decode_step_p50_ms": 154.943,
+  "load_s": 8.901,
+  "model": "models/gemma-4-26B-A4B-it-AWQ-4bit",
+  "phase_breakdown": {
+    "decode": {
+      "layer_spans": {
+        "attn_global": {
+          "avg_ms": 1.061,
+          "count": 120,
+          "share_of_step_wall_pct": 3.43,
+          "time_ms": 127.328
+        },
+        "attn_global_kernel": {
+          "avg_ms": 1.041,
+          "count": 120,
+          "share_of_step_wall_pct": 3.36,
+          "time_ms": 124.914
+        },
+        "attn_k_proj": {
+          "avg_ms": 0.205,
+          "count": 720,
+          "share_of_step_wall_pct": 3.97,
+          "time_ms": 147.373
+        },
+        "attn_local_decode": {
+          "avg_ms": 0.533,
+          "count": 600,
+          "share_of_step_wall_pct": 8.61,
+          "time_ms": 319.914
+        },
+        "attn_local_decode_kernel": {
+          "avg_ms": 0.487,
+          "count": 600,
+          "share_of_step_wall_pct": 7.88,
+          "time_ms": 292.48
+        },
+        "attn_o_proj": {
+          "avg_ms": 0.418,
+          "count": 720,
+          "share_of_step_wall_pct": 8.1,
+          "time_ms": 300.924
+        },
+        "attn_q_proj": {
+          "avg_ms": 0.301,
+          "count": 720,
+          "share_of_step_wall_pct": 5.83,
+          "time_ms": 216.571
+        },
+        "attn_v_proj": {
+          "avg_ms": 0.197,
+          "count": 600,
+          "share_of_step_wall_pct": 3.18,
+          "time_ms": 118.134
+        },
+        "kv_read_local_decode": {
+          "avg_ms": 0.025,
+          "count": 600,
+          "share_of_step_wall_pct": 0.41,
+          "time_ms": 15.044
+        },
+        "kv_write_reshape_and_cache": {
+          "avg_ms": 0.108,
+          "count": 720,
+          "share_of_step_wall_pct": 2.1,
+          "time_ms": 78.106
+        },
+        "layer_dense_mlp": {
+          "avg_ms": 0.507,
+          "count": 720,
+          "share_of_step_wall_pct": 9.83,
+          "time_ms": 365.165
+        },
+        "layer_moe_router": {
+          "avg_ms": 0.412,
+          "count": 720,
+          "share_of_step_wall_pct": 7.99,
+          "time_ms": 296.748
+        },
+        "layer_moe_sparse_experts": {
+          "avg_ms": 0.669,
+          "count": 720,
+          "share_of_step_wall_pct": 12.97,
+          "time_ms": 481.621
+        },
+        "layer_self_attn": {
+          "avg_ms": 2.376,
+          "count": 720,
+          "share_of_step_wall_pct": 46.07,
+          "time_ms": 1710.669
+        },
+        "moe_int4_decode_attempt": {
+          "avg_ms": 0.645,
+          "count": 720,
+          "share_of_step_wall_pct": 12.5,
+          "time_ms": 464.196
+        },
+        "moe_int4_decode_used": {
+          "avg_ms": 0.0,
+          "count": 720,
+          "share_of_step_wall_pct": 0.0,
+          "time_ms": 0.0
+        }
+      },
+      "moe_kernel_spans": {},
+      "runtime_spans": {
+        "backend.decode_step_sync": {
+          "avg_ms": 154.614,
+          "count": 24,
+          "share_of_step_wall_pct": 99.93,
+          "time_ms": 3710.744
+        },
+        "decode_executor.execute_sync_fast": {
+          "avg_ms": 154.176,
+          "count": 24,
+          "share_of_step_wall_pct": 99.64,
+          "time_ms": 3700.235
+        },
+        "sampling.sample_next_token": {
+          "avg_ms": 0.227,
+          "count": 24,
+          "share_of_step_wall_pct": 0.15,
+          "time_ms": 5.441
+        },
+        "scheduler.build_plan": {
+          "avg_ms": 0.043,
+          "count": 24,
+          "share_of_step_wall_pct": 0.03,
+          "time_ms": 1.026
+        }
+      },
+      "wall_ms_total": 3713.457
+    },
+    "prefill": {
+      "layer_spans": {
+        "attn_global": {
+          "avg_ms": 16.704,
+          "count": 5,
+          "share_of_step_wall_pct": 1.55,
+          "time_ms": 83.519
+        },
+        "attn_global_kernel": {
+          "avg_ms": 16.55,
+          "count": 5,
+          "share_of_step_wall_pct": 1.53,
+          "time_ms": 82.752
+        },
+        "attn_k_proj": {
+          "avg_ms": 1.24,
+          "count": 30,
+          "share_of_step_wall_pct": 0.69,
+          "time_ms": 37.19
+        },
+        "attn_local_prefill": {
+          "avg_ms": 8.457,
+          "count": 25,
+          "share_of_step_wall_pct": 3.92,
+          "time_ms": 211.426
+        },
+        "attn_o_proj": {
+          "avg_ms": 2.659,
+          "count": 30,
+          "share_of_step_wall_pct": 1.48,
+          "time_ms": 79.782
+        },
+        "attn_q_proj": {
+          "avg_ms": 10.043,
+          "count": 30,
+          "share_of_step_wall_pct": 5.58,
+          "time_ms": 301.303
+        },
+        "attn_v_proj": {
+          "avg_ms": 1.161,
+          "count": 25,
+          "share_of_step_wall_pct": 0.54,
+          "time_ms": 29.018
+        },
+        "kv_read_local_prefill": {
+          "avg_ms": 3.597,
+          "count": 25,
+          "share_of_step_wall_pct": 1.67,
+          "time_ms": 89.937
+        },
+        "kv_write_reshape_and_cache": {
+          "avg_ms": 0.392,
+          "count": 30,
+          "share_of_step_wall_pct": 0.22,
+          "time_ms": 11.749
+        },
+        "layer_dense_mlp": {
+          "avg_ms": 2.02,
+          "count": 30,
+          "share_of_step_wall_pct": 1.12,
+          "time_ms": 60.589
+        },
+        "layer_moe_router": {
+          "avg_ms": 3.726,
+          "count": 30,
+          "share_of_step_wall_pct": 2.07,
+          "time_ms": 111.769
+        },
+        "layer_moe_sparse_experts": {
+          "avg_ms": 139.97,
+          "count": 30,
+          "share_of_step_wall_pct": 77.76,
+          "time_ms": 4199.091
+        },
+        "layer_self_attn": {
+          "avg_ms": 29.405,
+          "count": 30,
+          "share_of_step_wall_pct": 16.34,
+          "time_ms": 882.163
+        },
+        "moe_int4_decode_attempt": {
+          "avg_ms": 0.016,
+          "count": 30,
+          "share_of_step_wall_pct": 0.01,
+          "time_ms": 0.472
+        },
+        "moe_int4_decode_fallback:input_not_m1_2d": {
+          "avg_ms": 0.0,
+          "count": 30,
+          "share_of_step_wall_pct": 0.0,
+          "time_ms": 0.0
+        },
+        "moe_materialize_one_expert_awq": {
+          "avg_ms": 1.225,
+          "count": 2477,
+          "share_of_step_wall_pct": 56.17,
+          "time_ms": 3033.566
+        },
+        "moe_sparse_expert_down_reduce": {
+          "avg_ms": 0.099,
+          "count": 2477,
+          "share_of_step_wall_pct": 4.55,
+          "time_ms": 245.461
+        },
+        "moe_sparse_expert_gate_up": {
+          "avg_ms": 0.145,
+          "count": 2477,
+          "share_of_step_wall_pct": 6.67,
+          "time_ms": 360.089
+        },
+        "moe_sparse_expert_linear": {
+          "avg_ms": 0.316,
+          "count": 2477,
+          "share_of_step_wall_pct": 14.5,
+          "time_ms": 782.816
+        }
+      },
+      "moe_kernel_spans": {},
+      "runtime_spans": {
+        "backend.run_decodes": {
+          "avg_ms": 0.007,
+          "count": 2,
+          "share_of_step_wall_pct": 0.0,
+          "time_ms": 0.013
+        },
+        "backend.run_prefills": {
+          "avg_ms": 2700.02,
+          "count": 2,
+          "share_of_step_wall_pct": 99.99,
+          "time_ms": 5400.04
+        },
+        "prefill_executor.execute": {
+          "avg_ms": 5391.576,
+          "count": 1,
+          "share_of_step_wall_pct": 99.84,
+          "time_ms": 5391.576
+        },
+        "sampling.sample_next_token": {
+          "avg_ms": 4.161,
+          "count": 1,
+          "share_of_step_wall_pct": 0.08,
+          "time_ms": 4.161
+        },
+        "scheduler.build_plan": {
+          "avg_ms": 0.098,
+          "count": 2,
+          "share_of_step_wall_pct": 0.0,
+          "time_ms": 0.195
+        }
+      },
+      "wall_ms_total": 5400.378
+    }
+  },
+  "prefill_step_mean_ms": 2700.189,
+  "prefill_step_p50_ms": 5400.109,
+  "prefill_steps": 2,
+  "prompt_tokens": 384,
+  "torch_profiler": {
+    "decode": {
+      "cpu_self_ms": 3124.901,
+      "device_event_count": 0,
+      "device_kernel_ms": 0.0,
+      "kernel_launch_count": 91488,
+      "kernel_launch_cpu_ms": 622.209
+    },
+    "enabled": true,
+    "prefill": {
+      "cpu_self_ms": 4883.868,
+      "device_event_count": 0,
+      "device_kernel_ms": 0.0,
+      "kernel_launch_count": 67012,
+      "kernel_launch_cpu_ms": 627.28
+    }
+  }
+}

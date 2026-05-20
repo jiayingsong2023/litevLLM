@@ -7,13 +7,14 @@ import os
 import time
 from collections import OrderedDict
 from typing import Any, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe
 from vllm.model_executor.layers.quantization.tensor import (
     dequantize_awq_pytorch,
     dequantize_symmetric_packed_int4_pytorch,
@@ -71,6 +72,7 @@ _GEMMA4_PROFILE_ENABLED = False
 _GEMMA4_ROCTX_PROFILE_ENABLED = False
 _GEMMA4_PROFILE_STATS: dict[str, dict[str, float]] = {}
 _GEMMA4_PROFILE_PRINTED = False
+_GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS = 8
 _GEMMA4_ROPE_CACHE_POOL: OrderedDict[
     tuple[int, int, float, str, float, str, int, str],
     tuple[torch.Tensor, torch.Tensor],
@@ -1027,12 +1029,6 @@ def _get_rope_with_runtime(
     layer_type: str,
     runtime_config: Any = None,
 ):
-    rope_params = {}
-    cfg_rope = getattr(config, "rope_parameters", None)
-    if isinstance(cfg_rope, dict):
-        layer_rope = cfg_rope.get(layer_type)
-        if isinstance(layer_rope, dict):
-            rope_params = layer_rope
     return Gemma4LayerRotaryEmbedding(
         config, head_size, layer_type, runtime_config=runtime_config
     )
@@ -1839,7 +1835,8 @@ def _materialize_litelinear_dense_weight_awqaware(
     group_size = int(getattr(layer, "group_size", 128))
     if qweight is None or not isinstance(qweight, torch.Tensor) or qweight.numel() <= 1:
         raise RuntimeError(
-            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' has neither dense nor packed weights."
+            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' has neither dense "
+            "nor packed weights."
         )
     if scales is None or not isinstance(scales, torch.Tensor) or scales.numel() <= 1:
         raise RuntimeError(
@@ -1862,7 +1859,8 @@ def _materialize_litelinear_dense_weight_awqaware(
 
     if dense_weight.shape[0] < out_features or dense_weight.shape[1] < in_features:
         raise RuntimeError(
-            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' dequantized weight too small: "
+            f"Layer '{getattr(layer, 'prefix', '<unknown>')}' dequantized weight "
+            "too small: "
             f"got {tuple(dense_weight.shape)}, need ({out_features}, {in_features})"
         )
     return (
@@ -1906,7 +1904,9 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._cached_dtype: Optional[torch.dtype] = None
         self._cached_w1: Optional[torch.Tensor] = None
         self._cached_w2: Optional[torch.Tensor] = None
-        self._expert_weight_cache: "OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._expert_weight_cache: (
+            "OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]"
+        ) = OrderedDict()
         self._expert_cache_device: Optional[torch.device] = None
         self._expert_cache_dtype: Optional[torch.dtype] = None
         self._max_expert_cache = max(
@@ -1919,9 +1919,34 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._int4_kernel_enabled = bool(
             getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
         )
-        self._int4_kernel_strategy = str(
-            getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage")
-        ).strip().lower()
+        self._int4_kernel_strategy = (
+            str(getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage"))
+            .strip()
+            .lower()
+        )
+        self._prefill_grouped_enabled = bool(
+            getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
+        )
+        self._prefill_grouped_min_tokens = max(
+            1,
+            int(getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)),
+        )
+        self._prefill_grouped_strategy = (
+            str(
+                getattr(
+                    runtime_config,
+                    "gemma4_moe_prefill_grouped_strategy",
+                    "chunked",
+                )
+            )
+            .strip()
+            .lower()
+        )
+        if self._prefill_grouped_strategy not in ("chunked", "fused"):
+            self._prefill_grouped_strategy = "chunked"
+        self._batch_materialize_enabled = bool(
+            getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False)
+        )
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
         if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
@@ -2007,6 +2032,75 @@ class Gemma4MoeExpertsLite(nn.Module):
                 self._expert_weight_cache.popitem(last=False)
         return w1, w2
 
+    def _materialize_experts_awq_batch(
+        self,
+        expert_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        qweight_gu = self.gate_up_proj.qweight
+        scales_gu = self.gate_up_proj.scales
+        qweight_d = self.down_proj.qweight
+        scales_d = self.down_proj.scales
+        if (
+            not isinstance(qweight_gu, torch.Tensor)
+            or not isinstance(scales_gu, torch.Tensor)
+            or qweight_gu.ndim != 3
+            or scales_gu.ndim != 3
+            or not isinstance(qweight_d, torch.Tensor)
+            or not isinstance(scales_d, torch.Tensor)
+            or qweight_d.ndim != 3
+            or scales_d.ndim != 3
+        ):
+            return {}
+
+        gsz_gu = max(1, int((qweight_gu.shape[2] * 8) // max(1, scales_gu.shape[2])))
+        gsz_d = max(1, int((qweight_d.shape[2] * 8) // max(1, scales_d.shape[2])))
+        materialized: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for offset in range(
+            0,
+            int(expert_ids.numel()),
+            _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS,
+        ):
+            ids = expert_ids[
+                offset : offset + _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS
+            ].to(device=qweight_gu.device, dtype=torch.long)
+            with _gemma4_profile_span("moe_materialize_expert_batch_awq"):
+                qweight_gu_batch = qweight_gu.index_select(0, ids).to(
+                    device=device,
+                    dtype=torch.int32,
+                )
+                qweight_d_batch = qweight_d.index_select(0, ids).to(
+                    device=device,
+                    dtype=torch.int32,
+                )
+                w1_batch = dequantize_symmetric_packed_int4_pytorch(
+                    qweight_gu_batch,
+                    scales_gu.index_select(0, ids).to(device=device),
+                    group_size=gsz_gu,
+                )
+                w2_batch = dequantize_symmetric_packed_int4_pytorch(
+                    qweight_d_batch,
+                    scales_d.index_select(0, ids).to(device=device),
+                    group_size=gsz_d,
+                )
+            w1_batch = (
+                w1_batch[:, : 2 * self.intermediate_dim, : self.hidden_dim]
+                .contiguous()
+                .to(device=device, dtype=dtype)
+            )
+            w2_batch = (
+                w2_batch[:, : self.hidden_dim, : self.intermediate_dim]
+                .contiguous()
+                .to(device=device, dtype=dtype)
+            )
+            for batch_idx, expert_id in enumerate(ids.tolist()):
+                materialized[int(expert_id)] = (
+                    w1_batch[batch_idx],
+                    w2_batch[batch_idx],
+                )
+        return materialized
+
     def _forward_awq_streaming(
         self,
         hidden_states_2d: torch.Tensor,
@@ -2031,6 +2125,20 @@ class Gemma4MoeExpertsLite(nn.Module):
             self._compute_dtype_policy,
             hidden_states_2d.dtype,
         )
+        n_tokens = int(hidden_states_2d.shape[0])
+        if (
+            self._prefill_grouped_enabled
+            and n_tokens >= self._prefill_grouped_min_tokens
+        ):
+            grouped_out = self._forward_awq_grouped_prefill(
+                hidden_states_2d,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                compute_dtype,
+            )
+            if grouped_out is not None:
+                return grouped_out.to(hidden_states_2d.dtype)
         if self._int4_kernel_enabled:
             from vllm.kernels.triton.gemma4_moe_int4 import (
                 gemma4_moe_int4_decode,
@@ -2040,6 +2148,7 @@ class Gemma4MoeExpertsLite(nn.Module):
                 gemma4_moe_int4_decode_batched_chunked_pair,
                 gemma4_moe_int4_decode_batched_chunked_splitgate_downpair,
                 gemma4_moe_int4_decode_batched_grouped,
+                gemma4_moe_int4_decode_batched_grouped_streaming,
                 gemma4_moe_int4_decode_batched_tuned,
                 gemma4_moe_int4_decode_single_kernel,
             )
@@ -2057,6 +2166,8 @@ class Gemma4MoeExpertsLite(nn.Module):
                 if self._int4_kernel_strategy == "batched_chunked_splitgate_downpair"
                 else gemma4_moe_int4_decode_batched_grouped
                 if self._int4_kernel_strategy == "batched_grouped"
+                else gemma4_moe_int4_decode_batched_grouped_streaming
+                if self._int4_kernel_strategy == "batched_grouped_streaming"
                 else gemma4_moe_int4_decode_batched_chunked
                 if self._int4_kernel_strategy == "batched_chunked"
                 else gemma4_moe_int4_decode_batched
@@ -2064,21 +2175,28 @@ class Gemma4MoeExpertsLite(nn.Module):
                 else gemma4_moe_int4_decode
             )
 
-            fast_out, used_fast, _ = decode_kernel(
-                hidden_states_2d,
-                topk_weights,
-                topk_ids,
-                getattr(self.gate_up_proj, "qweight", torch.empty(0)),
-                getattr(self.gate_up_proj, "scales", torch.empty(0)),
-                getattr(self.down_proj, "qweight", torch.empty(0)),
-                getattr(self.down_proj, "scales", torch.empty(0)),
-                intermediate_dim=self.intermediate_dim,
-                activation=self.hidden_act,
+            with _gemma4_profile_span("moe_int4_decode_attempt"):
+                fast_out, used_fast, fast_reason = decode_kernel(
+                    hidden_states_2d,
+                    topk_weights,
+                    topk_ids,
+                    getattr(self.gate_up_proj, "qweight", torch.empty(0)),
+                    getattr(self.gate_up_proj, "scales", torch.empty(0)),
+                    getattr(self.down_proj, "qweight", torch.empty(0)),
+                    getattr(self.down_proj, "scales", torch.empty(0)),
+                    intermediate_dim=self.intermediate_dim,
+                    activation=self.hidden_act,
             )
             if used_fast:
+                if _GEMMA4_PROFILE_ENABLED:
+                    _gemma4_profile_record("moe_int4_decode_used", 0.0)
                 return fast_out.to(hidden_states_2d.dtype)
+            if _GEMMA4_PROFILE_ENABLED:
+                _gemma4_profile_record(
+                    f"moe_int4_decode_fallback:{fast_reason}",
+                    0.0,
+                )
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
-        n_tokens = int(hidden_states_2d.shape[0])
         flat_topk_ids = topk_ids.reshape(-1).to(torch.long)
         flat_topk_weights = topk_weights.reshape(-1)
         flat_token_idx = torch.arange(
@@ -2091,6 +2209,17 @@ class Gemma4MoeExpertsLite(nn.Module):
         unique_experts, counts = torch.unique_consecutive(
             sorted_expert_ids, return_counts=True
         )
+        batched_expert_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        if (
+            self._batch_materialize_enabled
+            and n_tokens > 1
+            and int(unique_experts.numel()) > 1
+        ):
+            batched_expert_weights = self._materialize_experts_awq_batch(
+                unique_experts,
+                hidden_states_2d.device,
+                compute_dtype,
+            )
 
         start = 0
         for expert_id_t, count_t in zip(unique_experts, counts):
@@ -2103,18 +2232,60 @@ class Gemma4MoeExpertsLite(nn.Module):
             coeff = sorted_weights[start:end].unsqueeze(-1).to(compute_dtype)
             start = end
             x_sel = hidden_states_2d.index_select(0, token_idx).to(compute_dtype)
-            w1e, w2e = self._materialize_one_expert_awq(
-                expert_id,
-                hidden_states_2d.device,
-                compute_dtype,
-            )
+            expert_weights = batched_expert_weights.get(expert_id)
+            if expert_weights is not None:
+                w1e, w2e = expert_weights
+            else:
+                w1e, w2e = self._materialize_one_expert_awq(
+                    expert_id,
+                    hidden_states_2d.device,
+                    compute_dtype,
+                )
             with _gemma4_profile_span("moe_sparse_expert_linear"):
-                gu = F.linear(x_sel, w1e)
+                with _gemma4_profile_span("moe_sparse_expert_gate_up"):
+                    gu = F.linear(x_sel, w1e)
                 g, u = torch.chunk(gu, 2, dim=-1)
                 h = self._apply_gate_activation(g) * u
-                y = F.linear(h, w2e) * coeff
+                with _gemma4_profile_span("moe_sparse_expert_down_reduce"):
+                    y = F.linear(h, w2e) * coeff
             out.index_add_(0, token_idx, y)
         return out.to(hidden_states_2d.dtype)
+
+    def _forward_awq_grouped_prefill(
+        self,
+        hidden_states_2d: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        compute_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if hidden_states_2d.ndim != 2 or int(hidden_states_2d.shape[0]) <= 1:
+            return None
+        del router_logits, compute_dtype
+        from vllm.kernels.triton.gemma4_moe_int4 import (
+            gemma4_moe_int4_prefill_grouped,
+            gemma4_moe_int4_prefill_grouped_fused,
+        )
+
+        prefill_kernel = (
+            gemma4_moe_int4_prefill_grouped_fused
+            if self._prefill_grouped_strategy == "fused"
+            else gemma4_moe_int4_prefill_grouped
+        )
+
+        with _gemma4_profile_span("moe_awq_grouped_prefill"):
+            out, used, _ = prefill_kernel(
+                hidden_states_2d,
+                topk_weights,
+                topk_ids,
+                getattr(self.gate_up_proj, "qweight", torch.empty(0)),
+                getattr(self.gate_up_proj, "scales", torch.empty(0)),
+                getattr(self.down_proj, "qweight", torch.empty(0)),
+                getattr(self.down_proj, "scales", torch.empty(0)),
+                intermediate_dim=self.intermediate_dim,
+                activation=self.hidden_act,
+            )
+        return out if used else None
 
     def _materialize_expert_weights(
         self,

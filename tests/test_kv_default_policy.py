@@ -214,14 +214,55 @@ def test_runtime_config_owns_gemma4_moe_int4_kernel_strategy_env(monkeypatch) ->
     assert cfg.gemma4_moe_int4_kernel_strategy == "batched_grouped"
 
 
-def test_runtime_config_defaults_gemma4_moe_int4_kernel_strategy_to_batched_chunked(
+def test_runtime_config_accepts_gemma4_moe_grouped_streaming_strategy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY",
+        "batched_grouped_streaming",
+    )
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_int4_kernel_strategy == "batched_grouped_streaming"
+
+
+def test_runtime_config_owns_gemma4_moe_grouped_prefill_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED", "1")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS", "17")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY", "fused")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_prefill_grouped_enabled is True
+    assert cfg.gemma4_moe_prefill_grouped_min_tokens == 17
+    assert cfg.gemma4_moe_prefill_grouped_strategy == "fused"
+
+
+def test_runtime_config_defaults_gemma4_moe_grouped_prefill_off(monkeypatch) -> None:
+    monkeypatch.delenv("FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_prefill_grouped_enabled is False
+
+
+def test_runtime_config_owns_gemma4_moe_batch_materialize_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_MOE_BATCH_MATERIALIZE", "1")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.gemma4_moe_batch_materialize_enabled is True
+
+
+def test_runtime_config_defaults_gemma4_moe_int4_kernel_strategy_to_two_stage(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY", raising=False)
 
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
-    assert cfg.gemma4_moe_int4_kernel_strategy == "batched_chunked"
+    assert cfg.gemma4_moe_int4_kernel_strategy == "two_stage"
 
 
 def test_runtime_config_owns_gemma4_rope_cache_env(monkeypatch) -> None:

@@ -12,8 +12,11 @@ from vllm.kernels.triton.gemma4_moe_int4 import (
     gemma4_moe_int4_decode_batched_chunked_pair,
     gemma4_moe_int4_decode_batched_chunked_splitgate_downpair,
     gemma4_moe_int4_decode_batched_grouped,
+    gemma4_moe_int4_decode_batched_grouped_streaming,
     gemma4_moe_int4_decode_batched_tuned,
     gemma4_moe_int4_decode_single_kernel,
+    gemma4_moe_int4_prefill_grouped,
+    gemma4_moe_int4_prefill_grouped_fused,
 )
 from vllm.model_executor.layers.quantization.tensor import (
     dequantize_symmetric_packed_int4_pytorch,
@@ -57,6 +60,8 @@ def _reference_moe(
     down_qweight: torch.Tensor,
     down_scales: torch.Tensor,
     intermediate_dim: int,
+    *,
+    activation: str = "silu",
 ) -> torch.Tensor:
     out = torch.zeros_like(x, dtype=torch.float32)
     for token_idx in range(int(x.shape[0])):
@@ -75,7 +80,10 @@ def _reference_moe(
             ).to(device=x.device, dtype=torch.float32)
             gu = F.linear(token, w1)
             gate, up = torch.chunk(gu[:, : 2 * intermediate_dim], 2, dim=-1)
-            hidden = F.silu(gate) * up
+            if activation in ("gelu", "gelu_pytorch_tanh"):
+                hidden = F.gelu(gate, approximate="tanh") * up
+            else:
+                hidden = F.silu(gate) * up
             route_weight = topk_weights[token_idx : token_idx + 1, pos].float()
             out[token_idx : token_idx + 1] += F.linear(hidden, w2) * route_weight
     return out.to(x.dtype)
@@ -452,6 +460,63 @@ def test_gemma4_moe_int4_decode_batched_chunked_matches_tuned() -> None:
     torch.testing.assert_close(chunked.float(), tuned.float(), rtol=3e-2, atol=3e-2)
 
 
+def test_gemma4_moe_int4_decode_batched_chunked_supports_gelu_tanh() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    torch.manual_seed(1357)
+
+    experts = 5
+    hidden_dim = 64
+    intermediate_dim = 64
+    x = torch.randn((3, hidden_dim), device=device, dtype=torch.float16)
+    topk_ids = torch.tensor([[1, 3], [3, 0], [2, 1]], device=device, dtype=torch.long)
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.40, 0.60], [0.55, 0.45]],
+        device=device,
+        dtype=torch.float16,
+    )
+    gate_up_qweight, gate_up_scales = _make_expert_major_weight(
+        experts,
+        2 * intermediate_dim,
+        hidden_dim,
+        device=device,
+    )
+    down_qweight, down_scales = _make_expert_major_weight(
+        experts,
+        hidden_dim,
+        intermediate_dim,
+        device=device,
+    )
+
+    chunked, used, reason = gemma4_moe_int4_decode_batched_chunked(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation="gelu_pytorch_tanh",
+        block_i_override=64,
+    )
+    ref = _reference_moe(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim,
+        activation="gelu_pytorch_tanh",
+    )
+
+    assert used, reason
+    torch.testing.assert_close(chunked.float(), ref.float(), rtol=3e-2, atol=3e-2)
+
+
 def test_gemma4_moe_int4_decode_batched_chunked_pair_matches_tuned() -> None:
     if not torch.cuda.is_available():
         return
@@ -690,6 +755,66 @@ def test_gemma4_moe_int4_decode_batched_grouped_matches_tuned() -> None:
     torch.testing.assert_close(grouped.float(), tuned.float(), rtol=3e-2, atol=3e-2)
 
 
+def test_gemma4_moe_int4_decode_batched_grouped_streaming_matches_tuned() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    torch.manual_seed(9753)
+
+    experts = 5
+    hidden_dim = 64
+    intermediate_dim = 96
+    x = torch.randn((3, hidden_dim), device=device, dtype=torch.float16)
+    topk_ids = torch.tensor([[1, 3], [3, 0], [2, 1]], device=device, dtype=torch.long)
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.40, 0.60], [0.55, 0.45]],
+        device=device,
+        dtype=torch.float16,
+    )
+    gate_up_qweight, gate_up_scales = _make_expert_major_weight(
+        experts,
+        2 * intermediate_dim,
+        hidden_dim,
+        device=device,
+    )
+    down_qweight, down_scales = _make_expert_major_weight(
+        experts,
+        hidden_dim,
+        intermediate_dim,
+        device=device,
+    )
+
+    streaming, used_streaming, streaming_reason = (
+        gemma4_moe_int4_decode_batched_grouped_streaming(
+            x,
+            topk_weights,
+            topk_ids,
+            gate_up_qweight,
+            gate_up_scales,
+            down_qweight,
+            down_scales,
+            intermediate_dim=intermediate_dim,
+            activation="silu",
+            block_i_override=64,
+        )
+    )
+    tuned, used_tuned, tuned_reason = gemma4_moe_int4_decode_batched_tuned(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation="silu",
+    )
+
+    assert used_streaming, streaming_reason
+    assert used_tuned, tuned_reason
+    torch.testing.assert_close(streaming.float(), tuned.float(), rtol=3e-2, atol=3e-2)
+
+
 def test_gemma4_moe_int4_decode_rejects_prefill_shape() -> None:
     if not torch.cuda.is_available():
         return
@@ -762,3 +887,139 @@ def test_gemma4_moe_int4_decode_batched_rejects_large_prefill_shape() -> None:
     assert out is x
     assert used is False
     assert reason == "batch_too_large_for_decode"
+
+
+def test_gemma4_moe_int4_prefill_grouped_accepts_large_prefill_shape() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    torch.manual_seed(2468)
+
+    experts = 4
+    hidden_dim = 64
+    intermediate_dim = 64
+    n_tokens = 17
+    x = torch.randn((n_tokens, hidden_dim), device=device, dtype=torch.float16)
+    topk_ids = torch.arange(n_tokens, device=device, dtype=torch.long).view(-1, 1) % 4
+    topk_weights = torch.ones((n_tokens, 1), device=device, dtype=torch.float16)
+    gate_up_qweight, gate_up_scales = _make_expert_major_weight(
+        experts,
+        2 * intermediate_dim,
+        hidden_dim,
+        device=device,
+    )
+    down_qweight, down_scales = _make_expert_major_weight(
+        experts,
+        hidden_dim,
+        intermediate_dim,
+        device=device,
+    )
+
+    out, used, reason = gemma4_moe_int4_prefill_grouped(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation="silu",
+        block_i_override=64,
+    )
+    ref = _reference_moe(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim,
+    )
+
+    assert used, reason
+    torch.testing.assert_close(out.float(), ref.float(), rtol=3e-2, atol=3e-2)
+
+
+def test_gemma4_moe_int4_prefill_grouped_fused_matches_reference() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    torch.manual_seed(9753)
+
+    experts = 5
+    hidden_dim = 64
+    intermediate_dim = 32
+    n_tokens = 9
+    x = torch.randn((n_tokens, hidden_dim), device=device, dtype=torch.float16)
+    topk_ids = torch.tensor(
+        [
+            [3, 1],
+            [1, 4],
+            [3, 0],
+            [4, 1],
+            [0, 3],
+            [1, 2],
+            [3, 4],
+            [2, 0],
+            [4, 3],
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.65, 0.35],
+            [0.55, 0.45],
+            [0.80, 0.20],
+            [0.25, 0.75],
+            [0.40, 0.60],
+            [0.70, 0.30],
+            [0.52, 0.48],
+            [0.33, 0.67],
+            [0.58, 0.42],
+        ],
+        device=device,
+        dtype=torch.float16,
+    )
+    gate_up_qweight, gate_up_scales = _make_expert_major_weight(
+        experts,
+        2 * intermediate_dim,
+        hidden_dim,
+        device=device,
+    )
+    down_qweight, down_scales = _make_expert_major_weight(
+        experts,
+        hidden_dim,
+        intermediate_dim,
+        device=device,
+    )
+
+    out, used, reason = gemma4_moe_int4_prefill_grouped_fused(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation="gelu_pytorch_tanh",
+        block_i_override=32,
+        block_h_override=32,
+    )
+    ref = _reference_moe(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim,
+        activation="gelu_pytorch_tanh",
+    )
+
+    assert used, reason
+    torch.testing.assert_close(out.float(), ref.float(), rtol=4e-2, atol=4e-2)

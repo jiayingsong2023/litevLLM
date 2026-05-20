@@ -44,7 +44,8 @@ or feature status lists.
 | FP8 KV cache | Supported | Accuracy guard default for Gemma4 when int4 KV is not explicitly allowed. |
 | TurboQuant INT4 KV cache | Supported | Default runtime policy for non-guarded models; guarded by model policy where needed. |
 | Gemma4 recommended adapter profile | Supported | Gemma4 installs AWQ decode GEMV and fused gate-up defaults; dense Gemma4 also installs group32 GEMV and dense down-proj defaults. |
-| Gemma4-26B MoE int4 decode kernel | Supported | Default strategy is `batched_chunked`; slower experimental strategies remain opt-in through `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY`. |
+| Gemma4-26B MoE int4 decode kernel | Supported | Default strategy is `two_stage`; `batched_chunked` and `batched_grouped_streaming` remain opt-in experiments through `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY`. |
+| Gemma4-26B AWQ grouped prefill MoE | Experimental | Opt-in through `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1` for `M >= 17`; `chunked` directly consumes expert-major AWQ weights with compact intermediate chunks, while `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY=fused` is a single-kernel no-materialize experiment that remains gated after profile regression. |
 | PagedAttention decode | Supported | Triton path with selective-attention experiments available. |
 | Prefix cache | Experimental | Minimal runtime and observability exist; defaults still need workload calibration. |
 | Structured outputs | Experimental | Grammar-backed behavior is present and tested, but broad API compatibility should stay gated. |

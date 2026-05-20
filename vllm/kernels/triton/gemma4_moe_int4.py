@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -13,10 +16,78 @@ _CHUNKED_BLOCK_I = 256
 _CHUNKED_BLOCK_H = 64
 _CHUNKED_BLOCK_PACKS_H = 8
 _CHUNKED_BLOCK_PACKS_I = 8
+_PROFILE_STATS: dict[str, dict[str, float]] = {}
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get(
+        "FASTINFERENCE_GEMMA4_MOE_KERNEL_PROFILE", ""
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def reset_moe_kernel_profile_stats() -> None:
+    _PROFILE_STATS.clear()
+
+
+def get_moe_kernel_profile_stats() -> dict[str, dict[str, float]]:
+    return {
+        scope: {"time_s": float(row["time_s"]), "count": float(row["count"])}
+        for scope, row in _PROFILE_STATS.items()
+    }
+
+
+def _record_profile(scope: str, elapsed_s: float) -> None:
+    row = _PROFILE_STATS.setdefault(scope, {"time_s": 0.0, "count": 0.0})
+    row["time_s"] += float(elapsed_s)
+    row["count"] += 1.0
+
+
+class _ProfileSpan:
+    def __init__(self, scope: str):
+        self.scope = scope
+        self._enabled = False
+        self._start = 0.0
+
+    def __enter__(self) -> "_ProfileSpan":
+        self._enabled = _profile_enabled()
+        if self._enabled:
+            torch.cuda.synchronize()
+            self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._enabled:
+            torch.cuda.synchronize()
+            _record_profile(self.scope, time.perf_counter() - self._start)
+
+
+def _profile_span(scope: str) -> _ProfileSpan:
+    return _ProfileSpan(scope)
 
 
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
+
+
+def _activation_kind(activation: str) -> int:
+    name = str(activation).strip().lower()
+    if name in ("gelu", "gelu_pytorch_tanh"):
+        return 1
+    return 0
+
+
+def _activation_supported(activation: str) -> bool:
+    return str(activation).strip().lower() in (
+        "silu",
+        "swish",
+        "gelu",
+        "gelu_pytorch_tanh",
+    )
 
 
 @triton.jit
@@ -39,6 +110,7 @@ def _gemma4_moe_gate_up_m1_kernel(
     stride_tmp_i: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_PACKS: tl.constexpr,
+    ACT_KIND: tl.constexpr,
 ):
     """
     Decode-only Gemma4 MoE gate/up stage for expert-major symmetric int4.
@@ -123,7 +195,14 @@ def _gemma4_moe_gate_up_m1_kernel(
         gate_acc += tl.sum(gate_partial, axis=1)
         up_acc += tl.sum(up_partial, axis=1)
 
-    act = gate_acc / (1.0 + tl.exp(-gate_acc))
+    if ACT_KIND == 1:
+        # GELU tanh approximation used by Gemma's gelu_pytorch_tanh.
+        # Use sigmoid(2x) identity because tanh is not available everywhere.
+        x3 = gate_acc * gate_acc * gate_acc
+        inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+        act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+    else:
+        act = gate_acc / (1.0 + tl.exp(-gate_acc))
     out = act * up_acc * route_weight
     tl.store(
         tmp_ptr + pid_k * stride_tmp_k + offs_i * stride_tmp_i,
@@ -242,6 +321,7 @@ def _gemma4_moe_gate_up_batched_kernel(
     stride_tmp_i: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_PACKS: tl.constexpr,
+    ACT_KIND: tl.constexpr,
 ):
     """
     Batched decode Gemma4 MoE gate/up stage for expert-major symmetric int4.
@@ -264,9 +344,9 @@ def _gemma4_moe_gate_up_batched_kernel(
     mask_i = offs_i < INTERMEDIATE
     offs_p = tl.arange(0, BLOCK_PACKS)
 
-    expert_id = tl.load(
-        topk_ids_ptr + pid_m * stride_ids_m + pid_k * stride_ids_k
-    ).to(tl.int64)
+    expert_id = tl.load(topk_ids_ptr + pid_m * stride_ids_m + pid_k * stride_ids_k).to(
+        tl.int64
+    )
     route_weight = tl.load(
         topk_weights_ptr + pid_m * stride_w_m + pid_k * stride_w_k
     ).to(tl.float32)
@@ -332,13 +412,17 @@ def _gemma4_moe_gate_up_batched_kernel(
         gate_acc += tl.sum(gate_partial, axis=1)
         up_acc += tl.sum(up_partial, axis=1)
 
-    act = gate_acc / (1.0 + tl.exp(-gate_acc))
+    if ACT_KIND == 1:
+        # GELU tanh approximation used by Gemma's gelu_pytorch_tanh.
+        # Use sigmoid(2x) identity because tanh is not available everywhere.
+        x3 = gate_acc * gate_acc * gate_acc
+        inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+        act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+    else:
+        act = gate_acc / (1.0 + tl.exp(-gate_acc))
     out = act * up_acc * route_weight
     tl.store(
-        tmp_ptr
-        + pid_m * stride_tmp_m
-        + pid_k * stride_tmp_k
-        + offs_i * stride_tmp_i,
+        tmp_ptr + pid_m * stride_tmp_m + pid_k * stride_tmp_k + offs_i * stride_tmp_i,
         out,
         mask=mask_i,
     )
@@ -574,6 +658,7 @@ def _gemma4_moe_gate_up_batched_chunk_kernel(
     stride_tmp_i: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_PACKS: tl.constexpr,
+    ACT_KIND: tl.constexpr,
 ):
     """
     Batched decode gate/up for one intermediate chunk.
@@ -599,9 +684,9 @@ def _gemma4_moe_gate_up_batched_chunk_kernel(
     mask_i = i_idx < INTERMEDIATE
     offs_p = tl.arange(0, BLOCK_PACKS)
 
-    expert_id = tl.load(
-        topk_ids_ptr + pid_m * stride_ids_m + pid_k * stride_ids_k
-    ).to(tl.int64)
+    expert_id = tl.load(topk_ids_ptr + pid_m * stride_ids_m + pid_k * stride_ids_k).to(
+        tl.int64
+    )
     route_weight = tl.load(
         topk_weights_ptr + pid_m * stride_w_m + pid_k * stride_w_k
     ).to(tl.float32)
@@ -667,7 +752,14 @@ def _gemma4_moe_gate_up_batched_chunk_kernel(
         gate_acc += tl.sum(gate_partial, axis=1)
         up_acc += tl.sum(up_partial, axis=1)
 
-    act = gate_acc / (1.0 + tl.exp(-gate_acc))
+    if ACT_KIND == 1:
+        # GELU tanh approximation used by Gemma's gelu_pytorch_tanh.
+        # Use sigmoid(2x) identity because tanh is not available everywhere.
+        x3 = gate_acc * gate_acc * gate_acc
+        inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+        act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+    else:
+        act = gate_acc / (1.0 + tl.exp(-gate_acc))
     out = act * up_acc * route_weight
     tl.store(
         tmp_ptr
@@ -808,7 +900,7 @@ def _gemma4_moe_down_reduce_batched_chunk_kernel(
             acc_ptr + pid_m * stride_acc_m + offs_h * stride_acc_h,
             total,
             mask=mask_h,
-    )
+        )
 
 
 @triton.jit
@@ -1109,6 +1201,7 @@ def _gemma4_moe_single_fused_m1_kernel(
     BLOCK_I: tl.constexpr,
     BLOCK_PACKS_H: tl.constexpr,
     USE_BF16_OUTPUT: tl.constexpr,
+    ACT_KIND: tl.constexpr,
 ):
     """
     Single-launch Gemma4 MoE decode kernel for expert-major symmetric int4.
@@ -1206,9 +1299,15 @@ def _gemma4_moe_single_fused_m1_kernel(
                 gate_acc += tl.sum(gate_partial, axis=1)
                 up_acc += tl.sum(up_partial, axis=1)
 
-            hidden = (
-                gate_acc / (1.0 + tl.exp(-gate_acc)) * up_acc * route_weight
-            )
+            if ACT_KIND == 1:
+                # GELU tanh approximation used by Gemma's gelu_pytorch_tanh.
+                # Use sigmoid(2x) identity because tanh is not available everywhere.
+                x3 = gate_acc * gate_acc * gate_acc
+                inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+                act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+            else:
+                act = gate_acc / (1.0 + tl.exp(-gate_acc))
+            hidden = act * up_acc * route_weight
             down_pack_idx = i_idx // 8
             down_group_idx = i_idx // 32
             down_nibble = i_idx % 8
@@ -1230,14 +1329,186 @@ def _gemma4_moe_single_fused_m1_kernel(
             ).to(tl.float32)
             down_q = (down_packed >> (down_nibble[None, :] * 4)) & 0xF
             acc_h += tl.sum(
-                hidden[None, :]
-                * (down_q.to(tl.float32) - 8.0)
-                * down_scale,
+                hidden[None, :] * (down_q.to(tl.float32) - 8.0) * down_scale,
                 axis=1,
             )
 
     out = acc_h.to(tl.bfloat16) if USE_BF16_OUTPUT else acc_h.to(tl.float16)
     tl.store(out_ptr + offs_h, out, mask=mask_h)
+
+
+@triton.jit
+def _gemma4_moe_prefill_grouped_fused_kernel(
+    x_ptr,
+    route_token_ptr,
+    route_expert_ptr,
+    route_weight_ptr,
+    gate_up_q_ptr,
+    gate_up_s_ptr,
+    down_q_ptr,
+    down_s_ptr,
+    acc_ptr,
+    H: tl.constexpr,
+    INTERMEDIATE: tl.constexpr,
+    stride_x_m: tl.constexpr,
+    stride_x_h: tl.constexpr,
+    stride_gu_e: tl.constexpr,
+    stride_gu_n: tl.constexpr,
+    stride_gu_k: tl.constexpr,
+    stride_gus_e: tl.constexpr,
+    stride_gus_n: tl.constexpr,
+    stride_gus_g: tl.constexpr,
+    stride_d_e: tl.constexpr,
+    stride_d_h: tl.constexpr,
+    stride_d_k: tl.constexpr,
+    stride_ds_e: tl.constexpr,
+    stride_ds_h: tl.constexpr,
+    stride_ds_g: tl.constexpr,
+    stride_acc_m: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_PACKS_H: tl.constexpr,
+    ACT_KIND: tl.constexpr,
+):
+    """
+    Expert-grouped prefill fused MoE kernel for expert-major symmetric int4.
+
+    Layout:
+      x: [M, H]
+      route_token/route_expert/route_weight: [M * top_k], sorted by expert id
+      gate_up_q: [E, 2 * intermediate, H/8]
+      gate_up_s: [E, 2 * intermediate, H/32]
+      down_q: [E, H, intermediate/8]
+      down_s: [E, H, intermediate/32]
+      acc: [M, H], fp32 accumulator zeroed by the caller.
+
+    Tiling:
+      Grid is [H tiles, sorted routes]. Each program computes one routed token
+      contribution for BLOCK_H output rows. It streams gate/up int4 weights
+      for BLOCK_I intermediate rows, applies activation in registers, consumes
+      the matching packed down rows, then atomically accumulates into acc. The
+      sorted route layout groups selected experts without materializing dense
+      expert weights or writing a full [M, top_k, intermediate] tmp tensor.
+    """
+    pid_h = tl.program_id(0)
+    pid_r = tl.program_id(1)
+    token_id = tl.load(route_token_ptr + pid_r).to(tl.int64)
+    expert_id = tl.load(route_expert_ptr + pid_r).to(tl.int64)
+    route_weight = tl.load(route_weight_ptr + pid_r).to(tl.float32)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+    offs_i = tl.arange(0, BLOCK_I)
+    offs_hp = tl.arange(0, BLOCK_PACKS_H)
+    num_h_packs = H // 8
+    acc_h = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for i_base in range(0, tl.cdiv(INTERMEDIATE, BLOCK_I)):
+        i_idx = i_base * BLOCK_I + offs_i
+        mask_i = i_idx < INTERMEDIATE
+        gate_acc = tl.zeros((BLOCK_I,), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_I,), dtype=tl.float32)
+
+        for h_pack_base in range(0, tl.cdiv(num_h_packs, BLOCK_PACKS_H)):
+            h_pack_idx = h_pack_base * BLOCK_PACKS_H + offs_hp
+            mask_hp = h_pack_idx < num_h_packs
+            h_group_idx = h_pack_idx // 4
+            gate_packed = tl.load(
+                gate_up_q_ptr
+                + expert_id * stride_gu_e
+                + i_idx[:, None] * stride_gu_n
+                + h_pack_idx[None, :] * stride_gu_k,
+                mask=mask_i[:, None] & mask_hp[None, :],
+                other=0,
+            ).to(tl.int32)
+            up_packed = tl.load(
+                gate_up_q_ptr
+                + expert_id * stride_gu_e
+                + (INTERMEDIATE + i_idx[:, None]) * stride_gu_n
+                + h_pack_idx[None, :] * stride_gu_k,
+                mask=mask_i[:, None] & mask_hp[None, :],
+                other=0,
+            ).to(tl.int32)
+            gate_scale = tl.load(
+                gate_up_s_ptr
+                + expert_id * stride_gus_e
+                + i_idx[:, None] * stride_gus_n
+                + h_group_idx[None, :] * stride_gus_g,
+                mask=mask_i[:, None] & mask_hp[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            up_scale = tl.load(
+                gate_up_s_ptr
+                + expert_id * stride_gus_e
+                + (INTERMEDIATE + i_idx[:, None]) * stride_gus_n
+                + h_group_idx[None, :] * stride_gus_g,
+                mask=mask_i[:, None] & mask_hp[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            gate_partial = tl.zeros((BLOCK_I, BLOCK_PACKS_H), dtype=tl.float32)
+            up_partial = tl.zeros((BLOCK_I, BLOCK_PACKS_H), dtype=tl.float32)
+            for nibble_h in tl.static_range(0, 8):
+                h_idx = h_pack_idx * 8 + nibble_h
+                x_val = tl.load(
+                    x_ptr + token_id * stride_x_m + h_idx * stride_x_h,
+                    mask=mask_hp & (h_idx < H),
+                    other=0.0,
+                )
+                gate_q = (gate_packed >> (nibble_h * 4)) & 0xF
+                up_q = (up_packed >> (nibble_h * 4)) & 0xF
+                gate_partial += (
+                    x_val[None, :].to(tl.float32)
+                    * (gate_q.to(tl.float32) - 8.0)
+                    * gate_scale
+                )
+                up_partial += (
+                    x_val[None, :].to(tl.float32)
+                    * (up_q.to(tl.float32) - 8.0)
+                    * up_scale
+                )
+            gate_acc += tl.sum(gate_partial, axis=1)
+            up_acc += tl.sum(up_partial, axis=1)
+
+        if ACT_KIND == 1:
+            # GELU tanh approximation used by Gemma's gelu_pytorch_tanh.
+            x3 = gate_acc * gate_acc * gate_acc
+            inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+            act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+        else:
+            act = gate_acc / (1.0 + tl.exp(-gate_acc))
+        hidden = act * up_acc * route_weight
+        down_pack_idx = i_idx // 8
+        down_group_idx = i_idx // 32
+        down_nibble = i_idx % 8
+        down_packed = tl.load(
+            down_q_ptr
+            + expert_id * stride_d_e
+            + offs_h[:, None] * stride_d_h
+            + down_pack_idx[None, :] * stride_d_k,
+            mask=mask_h[:, None] & mask_i[None, :],
+            other=0,
+        ).to(tl.int32)
+        down_scale = tl.load(
+            down_s_ptr
+            + expert_id * stride_ds_e
+            + offs_h[:, None] * stride_ds_h
+            + down_group_idx[None, :] * stride_ds_g,
+            mask=mask_h[:, None] & mask_i[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        down_q = (down_packed >> (down_nibble[None, :] * 4)) & 0xF
+        acc_h += tl.sum(
+            hidden[None, :] * (down_q.to(tl.float32) - 8.0) * down_scale,
+            axis=1,
+        )
+
+    tl.atomic_add(
+        acc_ptr + token_id * stride_acc_m + offs_h * stride_acc_h,
+        acc_h,
+        sem="relaxed",
+        mask=mask_h,
+    )
 
 
 def _group_size_from_shapes(qweight: torch.Tensor, scales: torch.Tensor) -> int:
@@ -1268,7 +1539,7 @@ def _validate_decode_inputs(
         return False, "routing_not_m1"
     if tuple(topk_weights.shape) != tuple(topk_ids.shape):
         return False, "routing_shape_mismatch"
-    if str(activation).lower() not in ("silu", "swish"):
+    if not _activation_supported(activation):
         return False, "unsupported_activation"
     if x.dtype not in (torch.float16, torch.bfloat16):
         return False, f"unsupported_dtype_{str(x.dtype)}"
@@ -1335,7 +1606,72 @@ def _validate_batched_decode_inputs(
         return False, "routing_shape_mismatch"
     if int(topk_weights.shape[0]) != int(x.shape[0]):
         return False, "routing_batch_mismatch"
-    if str(activation).lower() not in ("silu", "swish"):
+    if not _activation_supported(activation):
+        return False, "unsupported_activation"
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        return False, f"unsupported_dtype_{str(x.dtype)}"
+    if (
+        gate_up_qweight.dim() != 3
+        or gate_up_scales.dim() != 3
+        or down_qweight.dim() != 3
+        or down_scales.dim() != 3
+    ):
+        return False, "weights_not_expert_major"
+    if any(
+        tensor.device != x.device
+        for tensor in (
+            topk_weights,
+            topk_ids,
+            gate_up_qweight,
+            gate_up_scales,
+            down_qweight,
+            down_scales,
+        )
+    ):
+        return False, "device_mismatch"
+
+    hidden_dim = int(x.shape[1])
+    intermediate = int(intermediate_dim)
+    if hidden_dim % 32 != 0 or intermediate % 32 != 0:
+        return False, "dims_not_group_aligned"
+    if int(gate_up_qweight.shape[1]) < 2 * intermediate:
+        return False, "gate_up_rows_mismatch"
+    if int(gate_up_qweight.shape[2]) * 8 != hidden_dim:
+        return False, "gate_up_k_mismatch"
+    if int(down_qweight.shape[1]) < hidden_dim:
+        return False, "down_rows_mismatch"
+    if int(down_qweight.shape[2]) * 8 != intermediate:
+        return False, "down_k_mismatch"
+    if _group_size_from_shapes(gate_up_qweight, gate_up_scales) != 32:
+        return False, "gate_up_group_not_32"
+    if _group_size_from_shapes(down_qweight, down_scales) != 32:
+        return False, "down_group_not_32"
+    return True, "ok"
+
+
+def _validate_batched_prefill_inputs(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    *,
+    intermediate_dim: int,
+    activation: str = "silu",
+) -> tuple[bool, str]:
+    if x.dim() != 2:
+        return False, "input_not_2d"
+    if int(x.shape[0]) <= 0:
+        return False, "empty_batch"
+    if topk_weights.dim() != 2 or topk_ids.dim() != 2:
+        return False, "routing_not_2d"
+    if tuple(topk_weights.shape) != tuple(topk_ids.shape):
+        return False, "routing_shape_mismatch"
+    if int(topk_weights.shape[0]) != int(x.shape[0]):
+        return False, "routing_batch_mismatch"
+    if not _activation_supported(activation):
         return False, "unsupported_activation"
     if x.dtype not in (torch.float16, torch.bfloat16):
         return False, f"unsupported_dtype_{str(x.dtype)}"
@@ -1409,6 +1745,7 @@ def gemma4_moe_int4_decode(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     gate_up_q = gate_up_qweight.contiguous()
     gate_up_s = gate_up_scales.contiguous()
@@ -1442,6 +1779,7 @@ def gemma4_moe_int4_decode(
         stride_tmp_i=tmp.stride(1),
         BLOCK_I=block_i,
         BLOCK_PACKS=block_packs,
+        ACT_KIND=act_kind,
         num_warps=4,
         num_stages=1,
     )
@@ -1503,6 +1841,7 @@ def gemma4_moe_int4_decode_batched(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     gate_up_q = gate_up_qweight.contiguous()
     gate_up_s = gate_up_scales.contiguous()
@@ -1546,6 +1885,7 @@ def gemma4_moe_int4_decode_batched(
         stride_tmp_i=tmp.stride(2),
         BLOCK_I=block_i,
         BLOCK_PACKS=block_packs,
+        ACT_KIND=act_kind,
         num_warps=4,
         num_stages=1,
     )
@@ -1616,6 +1956,7 @@ def gemma4_moe_int4_decode_batched_tuned(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     gate_up_q = gate_up_qweight.contiguous()
     gate_up_s = gate_up_scales.contiguous()
@@ -1667,6 +2008,7 @@ def gemma4_moe_int4_decode_batched_tuned(
         stride_tmp_i=tmp.stride(2),
         BLOCK_I=block_i,
         BLOCK_PACKS=_TUNED_GATE_UP_BLOCK_PACKS,
+        ACT_KIND=act_kind,
         num_warps=4,
         num_stages=1,
     )
@@ -1736,6 +2078,7 @@ def gemma4_moe_int4_decode_batched_chunked(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
     if not _is_power_of_two(block_i) or block_i % 32 != 0:
@@ -1755,74 +2098,77 @@ def gemma4_moe_int4_decode_batched_chunked(
     for i_offset in range(0, intermediate, block_i):
         is_first_chunk = i_offset == 0
         is_last_chunk = i_offset + block_i >= intermediate
-        _gemma4_moe_gate_up_batched_chunk_kernel[(n_tokens, top_k)](
-            x_contig,
-            route_ids,
-            route_w,
-            gate_up_q,
-            gate_up_s,
-            tmp,
-            H=hidden_dim,
-            INTERMEDIATE=intermediate,
-            I_OFFSET=i_offset,
-            TMP_OFFSET=0,
-            stride_x_m=x_contig.stride(0),
-            stride_ids_m=route_ids.stride(0),
-            stride_ids_k=route_ids.stride(1),
-            stride_w_m=route_w.stride(0),
-            stride_w_k=route_w.stride(1),
-            stride_gu_e=gate_up_q.stride(0),
-            stride_gu_n=gate_up_q.stride(1),
-            stride_gu_k=gate_up_q.stride(2),
-            stride_gus_e=gate_up_s.stride(0),
-            stride_gus_n=gate_up_s.stride(1),
-            stride_gus_g=gate_up_s.stride(2),
-            stride_tmp_m=tmp.stride(0),
-            stride_tmp_k=tmp.stride(1),
-            stride_tmp_i=tmp.stride(2),
-            BLOCK_I=block_i,
-            BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
-            num_warps=4,
-            num_stages=1,
-        )
-        _gemma4_moe_down_reduce_batched_chunk_kernel[
-            (triton.cdiv(hidden_dim, _CHUNKED_BLOCK_H), n_tokens)
-        ](
-            route_ids,
-            down_q,
-            down_s,
-            tmp,
-            acc,
-            out,
-            H=hidden_dim,
-            INTERMEDIATE=intermediate,
-            TOP_K=top_k,
-            I_OFFSET=i_offset,
-            TMP_OFFSET=0,
-            stride_ids_m=route_ids.stride(0),
-            stride_ids_k=route_ids.stride(1),
-            stride_d_e=down_q.stride(0),
-            stride_d_h=down_q.stride(1),
-            stride_d_k=down_q.stride(2),
-            stride_ds_e=down_s.stride(0),
-            stride_ds_h=down_s.stride(1),
-            stride_ds_g=down_s.stride(2),
-            stride_tmp_m=tmp.stride(0),
-            stride_tmp_k=tmp.stride(1),
-            stride_tmp_i=tmp.stride(2),
-            stride_acc_m=acc.stride(0),
-            stride_acc_h=acc.stride(1),
-            stride_out_m=out.stride(0),
-            stride_out_h=out.stride(1),
-            BLOCK_H=_CHUNKED_BLOCK_H,
-            BLOCK_I=block_i,
-            BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_I,
-            IS_FIRST_CHUNK=is_first_chunk,
-            IS_LAST_CHUNK=is_last_chunk,
-            USE_BF16_OUTPUT=x.dtype == torch.bfloat16,
-            num_warps=4,
-            num_stages=1,
-        )
+        with _profile_span("moe_int4_decode_gate_up_chunk"):
+            _gemma4_moe_gate_up_batched_chunk_kernel[(n_tokens, top_k)](
+                x_contig,
+                route_ids,
+                route_w,
+                gate_up_q,
+                gate_up_s,
+                tmp,
+                H=hidden_dim,
+                INTERMEDIATE=intermediate,
+                I_OFFSET=i_offset,
+                TMP_OFFSET=0,
+                stride_x_m=x_contig.stride(0),
+                stride_ids_m=route_ids.stride(0),
+                stride_ids_k=route_ids.stride(1),
+                stride_w_m=route_w.stride(0),
+                stride_w_k=route_w.stride(1),
+                stride_gu_e=gate_up_q.stride(0),
+                stride_gu_n=gate_up_q.stride(1),
+                stride_gu_k=gate_up_q.stride(2),
+                stride_gus_e=gate_up_s.stride(0),
+                stride_gus_n=gate_up_s.stride(1),
+                stride_gus_g=gate_up_s.stride(2),
+                stride_tmp_m=tmp.stride(0),
+                stride_tmp_k=tmp.stride(1),
+                stride_tmp_i=tmp.stride(2),
+                BLOCK_I=block_i,
+                BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+                ACT_KIND=act_kind,
+                num_warps=4,
+                num_stages=1,
+            )
+        with _profile_span("moe_int4_decode_down_reduce_chunk"):
+            _gemma4_moe_down_reduce_batched_chunk_kernel[
+                (triton.cdiv(hidden_dim, _CHUNKED_BLOCK_H), n_tokens)
+            ](
+                route_ids,
+                down_q,
+                down_s,
+                tmp,
+                acc,
+                out,
+                H=hidden_dim,
+                INTERMEDIATE=intermediate,
+                TOP_K=top_k,
+                I_OFFSET=i_offset,
+                TMP_OFFSET=0,
+                stride_ids_m=route_ids.stride(0),
+                stride_ids_k=route_ids.stride(1),
+                stride_d_e=down_q.stride(0),
+                stride_d_h=down_q.stride(1),
+                stride_d_k=down_q.stride(2),
+                stride_ds_e=down_s.stride(0),
+                stride_ds_h=down_s.stride(1),
+                stride_ds_g=down_s.stride(2),
+                stride_tmp_m=tmp.stride(0),
+                stride_tmp_k=tmp.stride(1),
+                stride_tmp_i=tmp.stride(2),
+                stride_acc_m=acc.stride(0),
+                stride_acc_h=acc.stride(1),
+                stride_out_m=out.stride(0),
+                stride_out_h=out.stride(1),
+                BLOCK_H=_CHUNKED_BLOCK_H,
+                BLOCK_I=block_i,
+                BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_I,
+                IS_FIRST_CHUNK=is_first_chunk,
+                IS_LAST_CHUNK=is_last_chunk,
+                USE_BF16_OUTPUT=x.dtype == torch.bfloat16,
+                num_warps=4,
+                num_stages=1,
+            )
     return out, True, "ok"
 
 
@@ -1859,10 +2205,190 @@ def gemma4_moe_int4_decode_batched_grouped(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
     if not _is_power_of_two(block_i) or block_i % 32 != 0:
         return x, False, "invalid_grouped_tile"
+
+    gate_up_q = gate_up_qweight.contiguous()
+    gate_up_s = gate_up_scales.contiguous()
+    down_q = down_qweight.contiguous()
+    down_s = down_scales.contiguous()
+    x_contig = x.contiguous()
+    route_w = topk_weights.contiguous()
+    route_ids = topk_ids.contiguous()
+
+    tmp = torch.empty((n_tokens, block_i, top_k), device=x.device, dtype=x.dtype)
+    acc = torch.empty((n_tokens, hidden_dim), device=x.device, dtype=torch.float32)
+    out = torch.empty((n_tokens, hidden_dim), device=x.device, dtype=x.dtype)
+    for i_offset in range(0, intermediate, block_i):
+        is_first_chunk = i_offset == 0
+        is_last_chunk = i_offset + block_i >= intermediate
+        with _profile_span("moe_int4_prefill_gate_up_chunk"):
+            _gemma4_moe_gate_up_batched_chunk_kernel[(n_tokens, top_k)](
+                x_contig,
+                route_ids,
+                route_w,
+                gate_up_q,
+                gate_up_s,
+                tmp,
+                H=hidden_dim,
+                INTERMEDIATE=intermediate,
+                I_OFFSET=i_offset,
+                TMP_OFFSET=0,
+                stride_x_m=x_contig.stride(0),
+                stride_ids_m=route_ids.stride(0),
+                stride_ids_k=route_ids.stride(1),
+                stride_w_m=route_w.stride(0),
+                stride_w_k=route_w.stride(1),
+                stride_gu_e=gate_up_q.stride(0),
+                stride_gu_n=gate_up_q.stride(1),
+                stride_gu_k=gate_up_q.stride(2),
+                stride_gus_e=gate_up_s.stride(0),
+                stride_gus_n=gate_up_s.stride(1),
+                stride_gus_g=gate_up_s.stride(2),
+                stride_tmp_m=tmp.stride(0),
+                stride_tmp_k=tmp.stride(2),
+                stride_tmp_i=tmp.stride(1),
+                BLOCK_I=block_i,
+                BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+                ACT_KIND=act_kind,
+                num_warps=4,
+                num_stages=1,
+            )
+        with _profile_span("moe_int4_prefill_down_reduce_chunk"):
+            _gemma4_moe_down_reduce_batched_grouped_chunk_kernel[
+                (triton.cdiv(hidden_dim, _CHUNKED_BLOCK_H), n_tokens)
+            ](
+                route_ids,
+                down_q,
+                down_s,
+                tmp,
+                acc,
+                out,
+                H=hidden_dim,
+                INTERMEDIATE=intermediate,
+                TOP_K=top_k,
+                I_OFFSET=i_offset,
+                stride_ids_m=route_ids.stride(0),
+                stride_ids_k=route_ids.stride(1),
+                stride_d_e=down_q.stride(0),
+                stride_d_h=down_q.stride(1),
+                stride_d_k=down_q.stride(2),
+                stride_ds_e=down_s.stride(0),
+                stride_ds_h=down_s.stride(1),
+                stride_ds_g=down_s.stride(2),
+                stride_tmp_m=tmp.stride(0),
+                stride_tmp_i=tmp.stride(1),
+                stride_tmp_k=tmp.stride(2),
+                stride_acc_m=acc.stride(0),
+                stride_acc_h=acc.stride(1),
+                stride_out_m=out.stride(0),
+                stride_out_h=out.stride(1),
+                BLOCK_H=_CHUNKED_BLOCK_H,
+                BLOCK_I=block_i,
+                BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_I,
+                IS_FIRST_CHUNK=is_first_chunk,
+                IS_LAST_CHUNK=is_last_chunk,
+                USE_BF16_OUTPUT=x.dtype == torch.bfloat16,
+                num_warps=4,
+                num_stages=1,
+            )
+    return out, True, "ok"
+
+
+def gemma4_moe_int4_decode_batched_grouped_streaming(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    *,
+    intermediate_dim: int,
+    activation: str = "silu",
+    block_i_override: int | None = None,
+) -> tuple[torch.Tensor, bool, str]:
+    """
+    Decode grouped/chunked strategy with compact top-k tmp layout.
+
+    The underlying kernels keep only one intermediate chunk in global memory as
+    [M, BLOCK_I, top_k], with route positions adjacent for each intermediate
+    row. This is the low-risk grouped streaming candidate for reducing the
+    tmp[M, top_k, I] write/read footprint without repeating gate/up per H tile.
+    """
+    return gemma4_moe_int4_decode_batched_grouped(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation=activation,
+        block_i_override=block_i_override,
+    )
+
+
+def gemma4_moe_int4_prefill_grouped(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    *,
+    intermediate_dim: int,
+    activation: str = "silu",
+    block_i_override: int | None = None,
+) -> tuple[torch.Tensor, bool, str]:
+    """
+    Prefill grouped Gemma4 MoE path for expert-major symmetric int4 weights.
+
+    Layout:
+      x: [M, H]
+      topk_ids/topk_weights: [M, top_k]
+      gate_up_qweight: [E, 2 * intermediate, H/8]
+      gate_up_scales: [E, 2 * intermediate, H/32]
+      down_qweight: [E, H, intermediate/8]
+      down_scales: [E, H, intermediate/32]
+
+    Tiling:
+      The kernel path streams one intermediate chunk at a time. Gate/up writes
+      a compact [M, BLOCK_I, top_k] route-major chunk, and down/reduce consumes
+      that chunk immediately into a fp32 [M, H] accumulator. This keeps the
+      large [M, top_k, intermediate] buffer out of global memory and consumes
+      packed int4 weights directly without dense expert materialization.
+    """
+    supported, reason = _validate_batched_prefill_inputs(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation=activation,
+    )
+    if not supported:
+        return x, False, reason
+
+    n_tokens = int(x.shape[0])
+    hidden_dim = int(x.shape[1])
+    intermediate = int(intermediate_dim)
+    top_k = int(topk_ids.shape[1])
+    if top_k <= 0:
+        return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
+
+    block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
+    if not _is_power_of_two(block_i) or block_i % 32 != 0:
+        return x, False, "invalid_prefill_grouped_tile"
 
     gate_up_q = gate_up_qweight.contiguous()
     gate_up_s = gate_up_scales.contiguous()
@@ -1905,6 +2431,7 @@ def gemma4_moe_int4_decode_batched_grouped(
             stride_tmp_i=tmp.stride(1),
             BLOCK_I=block_i,
             BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+            ACT_KIND=act_kind,
             num_warps=4,
             num_stages=1,
         )
@@ -1948,6 +2475,121 @@ def gemma4_moe_int4_decode_batched_grouped(
     return out, True, "ok"
 
 
+def gemma4_moe_int4_prefill_grouped_fused(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    *,
+    intermediate_dim: int,
+    activation: str = "silu",
+    block_i_override: int | None = None,
+    block_h_override: int | None = None,
+) -> tuple[torch.Tensor, bool, str]:
+    """
+    Single-kernel grouped prefill path for expert-major symmetric int4 weights.
+
+    The wrapper flattens top-k routes and sorts them by expert id so neighboring
+    programs consume the same expert-major packed weights. The Triton kernel
+    directly dequantizes gate/up and down weights in registers and accumulates
+    each routed contribution into a fp32 output buffer.
+    """
+    supported, reason = _validate_batched_prefill_inputs(
+        x,
+        topk_weights,
+        topk_ids,
+        gate_up_qweight,
+        gate_up_scales,
+        down_qweight,
+        down_scales,
+        intermediate_dim=intermediate_dim,
+        activation=activation,
+    )
+    if not supported:
+        return x, False, reason
+
+    n_tokens = int(x.shape[0])
+    hidden_dim = int(x.shape[1])
+    intermediate = int(intermediate_dim)
+    top_k = int(topk_ids.shape[1])
+    if top_k <= 0:
+        return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
+
+    block_i = int(block_i_override or min(64, intermediate))
+    block_h = int(block_h_override or _CHUNKED_BLOCK_H)
+    if (
+        not _is_power_of_two(block_i)
+        or block_i % 32 != 0
+        or not _is_power_of_two(block_h)
+    ):
+        return x, False, "invalid_prefill_grouped_fused_tile"
+
+    gate_up_q = gate_up_qweight.contiguous()
+    gate_up_s = gate_up_scales.contiguous()
+    down_q = down_qweight.contiguous()
+    down_s = down_scales.contiguous()
+    x_contig = x.contiguous()
+    route_w = topk_weights.contiguous().reshape(-1)
+    route_ids = topk_ids.contiguous().reshape(-1).to(torch.long)
+    route_tokens = torch.arange(
+        n_tokens,
+        device=x.device,
+        dtype=torch.long,
+    ).repeat_interleave(top_k)
+    sort_idx = torch.argsort(route_ids, stable=True)
+    sorted_ids = route_ids.index_select(0, sort_idx).contiguous()
+    sorted_tokens = route_tokens.index_select(0, sort_idx).contiguous()
+    sorted_weights = route_w.index_select(0, sort_idx).contiguous()
+    route_count = int(sorted_ids.numel())
+    if route_count <= 0:
+        return torch.zeros_like(x), True, "ok"
+
+    acc = torch.zeros((n_tokens, hidden_dim), device=x.device, dtype=torch.float32)
+    with _profile_span("moe_int4_prefill_grouped_fused"):
+        _gemma4_moe_prefill_grouped_fused_kernel[
+            (triton.cdiv(hidden_dim, block_h), route_count)
+        ](
+            x_contig,
+            sorted_tokens,
+            sorted_ids,
+            sorted_weights,
+            gate_up_q,
+            gate_up_s,
+            down_q,
+            down_s,
+            acc,
+            H=hidden_dim,
+            INTERMEDIATE=intermediate,
+            stride_x_m=x_contig.stride(0),
+            stride_x_h=x_contig.stride(1),
+            stride_gu_e=gate_up_q.stride(0),
+            stride_gu_n=gate_up_q.stride(1),
+            stride_gu_k=gate_up_q.stride(2),
+            stride_gus_e=gate_up_s.stride(0),
+            stride_gus_n=gate_up_s.stride(1),
+            stride_gus_g=gate_up_s.stride(2),
+            stride_d_e=down_q.stride(0),
+            stride_d_h=down_q.stride(1),
+            stride_d_k=down_q.stride(2),
+            stride_ds_e=down_s.stride(0),
+            stride_ds_h=down_s.stride(1),
+            stride_ds_g=down_s.stride(2),
+            stride_acc_m=acc.stride(0),
+            stride_acc_h=acc.stride(1),
+            BLOCK_H=block_h,
+            BLOCK_I=block_i,
+            BLOCK_PACKS_H=_CHUNKED_BLOCK_PACKS_H,
+            ACT_KIND=act_kind,
+            num_warps=4,
+            num_stages=1,
+        )
+    return acc.to(x.dtype), True, "ok"
+
+
 def gemma4_moe_int4_decode_batched_chunked_pair(
     x: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1981,6 +2623,7 @@ def gemma4_moe_int4_decode_batched_chunked_pair(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
     pair_block_i = block_i * 2
@@ -2033,6 +2676,7 @@ def gemma4_moe_int4_decode_batched_chunked_pair(
             stride_tmp_i=tmp.stride(2),
             BLOCK_I=pair_block_i,
             BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+            ACT_KIND=act_kind,
             num_warps=4,
             num_stages=1,
         )
@@ -2116,6 +2760,7 @@ def gemma4_moe_int4_decode_batched_chunked_downpair(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
     pair_block_i = block_i * 2
@@ -2170,6 +2815,7 @@ def gemma4_moe_int4_decode_batched_chunked_downpair(
             stride_tmp_i=tmp.stride(2),
             BLOCK_I=pair_block_i,
             BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+            ACT_KIND=act_kind,
             num_warps=4,
             num_stages=1,
         )
@@ -2246,6 +2892,7 @@ def gemma4_moe_int4_decode_batched_chunked_splitgate_downpair(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     block_i = int(block_i_override or min(_CHUNKED_BLOCK_I, intermediate))
     pair_block_i = block_i * 2
@@ -2304,6 +2951,7 @@ def gemma4_moe_int4_decode_batched_chunked_splitgate_downpair(
                 stride_tmp_i=tmp.stride(2),
                 BLOCK_I=block_i,
                 BLOCK_PACKS=_CHUNKED_BLOCK_PACKS_H,
+                ACT_KIND=act_kind,
                 num_warps=4,
                 num_stages=1,
             )
@@ -2378,6 +3026,7 @@ def gemma4_moe_int4_decode_single_kernel(
     top_k = int(topk_ids.shape[1])
     if top_k <= 0:
         return torch.zeros_like(x), True, "ok"
+    act_kind = _activation_kind(activation)
 
     gate_up_q = gate_up_qweight.contiguous()
     gate_up_s = gate_up_scales.contiguous()
@@ -2419,6 +3068,7 @@ def gemma4_moe_int4_decode_single_kernel(
         BLOCK_I=block_i,
         BLOCK_PACKS_H=block_packs_h,
         USE_BF16_OUTPUT=x.dtype == torch.bfloat16,
+        ACT_KIND=act_kind,
         num_warps=4,
         num_stages=1,
     )

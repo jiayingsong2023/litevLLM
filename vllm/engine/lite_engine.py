@@ -154,6 +154,7 @@ class LiteEngine:
         self.runtime_config = getattr(
             vllm_config, "runtime_config", None
         ) or RuntimeConfig.from_vllm_config(vllm_config)
+        self.vllm_config.runtime_config = self.runtime_config
         requested_policy_mode = self.runtime_config.policy_mode
         self.adapter = get_model_adapter(None, self.model_config)
         self.runtime_policy = self.adapter.runtime_policy(

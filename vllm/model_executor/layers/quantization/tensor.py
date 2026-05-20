@@ -568,20 +568,31 @@ def dequantize_symmetric_packed_int4_pytorch(
     """
     HF compressed-tensors / pack-quantized checkpoints often ship int4 weights with
     weight_packed + weight_scale only (no zero-point tensor). Nibbles are unsigned
-    in [0, 15]; map to signed with (q - 8) * scale per group (same nibble layout as AWQ).
+    in [0, 15]; map to signed with (q - 8) * scale per group.
     """
     try:
-        n_rows, n_cols_packed = qweight.shape
+        if qweight.dim() < 2:
+            raise RuntimeError(
+                f"qweight must be at least 2D, got {tuple(qweight.shape)}"
+            )
+        leading_shape = tuple(qweight.shape[:-2])
+        n_rows, n_cols_packed = qweight.shape[-2:]
         n_cols = n_cols_packed * 8
         shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
-        qs = ((qweight.unsqueeze(-1) >> shifts) & 0x0F).view(n_rows, n_cols).to(torch.float32)
+        qs = ((qweight.unsqueeze(-1) >> shifts) & 0x0F).reshape(
+            *leading_shape,
+            n_rows,
+            n_cols,
+        ).to(torch.float32)
         qs = qs - 8.0
         if n_cols % group_size != 0:
-            raise RuntimeError(f"n_cols={n_cols} not divisible by group_size={group_size}")
+            raise RuntimeError(
+                f"n_cols={n_cols} not divisible by group_size={group_size}"
+            )
         n_groups = n_cols // group_size
-        qs = qs.view(n_rows, n_groups, group_size)
+        qs = qs.reshape(*leading_shape, n_rows, n_groups, group_size)
         res = qs * scales.to(torch.float32).unsqueeze(-1)
-        return res.view(n_rows, n_cols).to(torch.float16)
+        return res.reshape(*leading_shape, n_rows, n_cols).to(torch.float16)
     except Exception as e:
         raise RuntimeError(f"Symmetric packed int4 dequant error: {e}")
 
