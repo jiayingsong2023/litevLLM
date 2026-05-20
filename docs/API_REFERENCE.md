@@ -43,7 +43,23 @@ uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AW
 FASTINFERENCE_QWEN9_STABLE=1 \
 uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AWQ
 
-# Gemma4-26B A4B 默认使用 batched_chunked MoE int4 decode 策略
+# Gemma4-26B A4B 默认使用 two_stage MoE int4 decode 策略
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+
+# 可选：尝试 packed-int4 grouped prefill（直接消费 expert-major AWQ 权重）
+FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1 \
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+
+# 可选：尝试 single-kernel fused grouped prefill（当前仍为实验路径）
+FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1 \
+FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY=fused \
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+
+# 可选：尝试 compact top-k tmp decode 布局
+FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_grouped_streaming \
 uv run python -m vllm.entrypoints.openai.api_server \
   --model models/gemma-4-26B-A4B-it-AWQ-4bit
 ```

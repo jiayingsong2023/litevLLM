@@ -15,6 +15,43 @@ def _cosine_mean(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((num / den).mean().item())
 
 
+def test_symmetric_packed_int4_dequant_preserves_expert_batch() -> None:
+    qweight = torch.tensor(
+        [
+            [[0x76543210], [0x6EDCBA98]],
+            [[0x01234567], [0x09ABCDEF]],
+        ],
+        dtype=torch.int32,
+    )
+    scales = torch.tensor(
+        [
+            [[0.5], [0.25]],
+            [[0.125], [0.75]],
+        ],
+        dtype=torch.float16,
+    )
+
+    batched = dequantize_symmetric_packed_int4_pytorch(
+        qweight,
+        scales,
+        group_size=8,
+    )
+    stacked = torch.stack(
+        [
+            dequantize_symmetric_packed_int4_pytorch(
+                qweight[expert],
+                scales[expert],
+                group_size=8,
+            )
+            for expert in range(int(qweight.shape[0]))
+        ],
+        dim=0,
+    )
+
+    assert tuple(batched.shape) == (2, 2, 8)
+    torch.testing.assert_close(batched, stacked)
+
+
 def test_packed_int4_fused_matches_dense_when_block_spans_multiple_groups(
     monkeypatch,
 ) -> None:
@@ -37,7 +74,10 @@ def test_packed_int4_fused_matches_dense_when_block_spans_multiple_groups(
     group_size = 32
     x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     qweight = torch.randint(0, 255, (n, k // 8), device=device, dtype=torch.uint8)
-    scales = torch.randn((n, k // group_size), device=device, dtype=torch.float16).abs() + 0.01
+    scales = (
+        torch.randn((n, k // group_size), device=device, dtype=torch.float16).abs()
+        + 0.01
+    )
 
     y_fused = packed_int4_symmetric_fused_gemm(x, qweight, scales, group_size)
 

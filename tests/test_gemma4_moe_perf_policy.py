@@ -94,6 +94,63 @@ def test_gemma4_awq_streaming_can_force_fp32_compute(monkeypatch: Any) -> None:
     assert seen_dtypes == [torch.float32]
 
 
+def test_gemma4_awq_prefill_streaming_batches_selected_expert_materialization(
+    monkeypatch: Any,
+) -> None:
+    experts = Gemma4MoeExpertsLite(
+        _tiny_moe_config(),
+        quant_config=None,
+        prefix="model.layers.0",
+        runtime_config=SimpleNamespace(
+            gemma4_moe_expert_cache_size=0,
+            gemma4_moe_int4_kernel_enabled=False,
+            gemma4_moe_prefill_grouped_enabled=False,
+            gemma4_moe_batch_materialize_enabled=True,
+        ),
+    )
+    monkeypatch.setattr(experts, "_has_awq_packed_expert_major", lambda: True)
+
+    seen: dict[str, Any] = {}
+
+    def fake_batch_materialize(
+        expert_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        seen["expert_ids"] = [int(item) for item in expert_ids.tolist()]
+        seen["dtype"] = dtype
+        return {
+            expert_id: (
+                torch.zeros((4, 4), device=device, dtype=dtype),
+                torch.ones((4, 2), device=device, dtype=dtype),
+            )
+            for expert_id in seen["expert_ids"]
+        }
+
+    monkeypatch.setattr(
+        experts,
+        "_materialize_experts_awq_batch",
+        fake_batch_materialize,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        experts,
+        "_materialize_one_expert_awq",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selected-expert materialization hit")
+        ),
+    )
+
+    x = torch.ones((3, 4), dtype=torch.bfloat16)
+    topk_weights = torch.ones((3, 1), dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[1], [0], [1]], dtype=torch.long)
+
+    out = experts(x, router_logits=None, topk_weights=topk_weights, topk_ids=topk_ids)
+
+    assert seen == {"expert_ids": [0, 1], "dtype": torch.bfloat16}
+    assert torch.equal(out, torch.zeros_like(x))
+
+
 def test_gemma4_awq_streaming_uses_int4_kernel_fast_path(
     monkeypatch: Any,
 ) -> None:
@@ -450,6 +507,187 @@ def test_gemma4_awq_streaming_can_select_batched_grouped_kernel_strategy(
     x = torch.ones((2, 4), dtype=torch.bfloat16)
     topk_weights = torch.ones((2, 1), dtype=torch.bfloat16)
     topk_ids = torch.zeros((2, 1), dtype=torch.long)
+
+    out = experts(x, router_logits=None, topk_weights=topk_weights, topk_ids=topk_ids)
+
+    assert torch.equal(out, expected)
+
+
+def test_gemma4_awq_streaming_can_select_batched_grouped_streaming_strategy(
+    monkeypatch: Any,
+) -> None:
+    experts = Gemma4MoeExpertsLite(
+        _tiny_moe_config(),
+        quant_config=None,
+        prefix="model.layers.0",
+        runtime_config=SimpleNamespace(
+            gemma4_moe_expert_cache_size=0,
+            gemma4_moe_int4_kernel_enabled=True,
+            gemma4_moe_int4_kernel_strategy="batched_grouped_streaming",
+        ),
+    )
+    experts.gate_up_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.gate_up_proj.scales = torch.empty((2, 4, 1), dtype=torch.float16)
+    experts.down_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.down_proj.scales = torch.empty((2, 2, 1), dtype=torch.float16)
+
+    expected = torch.full((2, 4), 31.0, dtype=torch.bfloat16)
+
+    def fake_batched_grouped_streaming(
+        *args: Any, **kwargs: Any
+    ) -> tuple[torch.Tensor, bool, str]:
+        del args, kwargs
+        return expected, True, "ok"
+
+    monkeypatch.setattr(
+        "vllm.kernels.triton.gemma4_moe_int4."
+        "gemma4_moe_int4_decode_batched_grouped_streaming",
+        fake_batched_grouped_streaming,
+    )
+
+    x = torch.ones((2, 4), dtype=torch.bfloat16)
+    topk_weights = torch.ones((2, 1), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((2, 1), dtype=torch.long)
+
+    out = experts(x, router_logits=None, topk_weights=topk_weights, topk_ids=topk_ids)
+
+    assert torch.equal(out, expected)
+
+
+def test_gemma4_awq_prefill_can_use_packed_int4_grouped_kernel(
+    monkeypatch: Any,
+) -> None:
+    experts = Gemma4MoeExpertsLite(
+        _tiny_moe_config(),
+        quant_config=None,
+        prefix="model.layers.0",
+        runtime_config=SimpleNamespace(
+            gemma4_moe_expert_cache_size=0,
+            gemma4_moe_int4_kernel_enabled=True,
+            gemma4_moe_prefill_grouped_enabled=True,
+            gemma4_moe_prefill_grouped_min_tokens=2,
+        ),
+    )
+    monkeypatch.setattr(experts, "_has_awq_packed_expert_major", lambda: True)
+    experts.gate_up_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.gate_up_proj.scales = torch.empty((2, 4, 1), dtype=torch.float16)
+    experts.down_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.down_proj.scales = torch.empty((2, 2, 1), dtype=torch.float16)
+
+    expected = torch.full((3, 4), 37.0, dtype=torch.bfloat16)
+    seen: dict[str, Any] = {}
+
+    def fake_packed_prefill(
+        *args: Any, **kwargs: Any
+    ) -> tuple[torch.Tensor, bool, str]:
+        seen["x_shape"] = tuple(args[0].shape)
+        seen["topk_weights_shape"] = tuple(args[1].shape)
+        seen["topk_ids_shape"] = tuple(args[2].shape)
+        seen["gate_up_shape"] = tuple(args[3].shape)
+        seen["intermediate_dim"] = kwargs["intermediate_dim"]
+        return expected, True, "ok"
+
+    monkeypatch.setattr(
+        "vllm.kernels.triton.gemma4_moe_int4.gemma4_moe_int4_prefill_grouped",
+        fake_packed_prefill,
+    )
+    monkeypatch.setattr(
+        experts,
+        "_materialize_expert_weights",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("all-expert materialization hit")
+        ),
+    )
+    monkeypatch.setattr(
+        experts,
+        "_materialize_one_expert_awq",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selected-expert materialization hit")
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.gemma4.fused_moe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dense fused_moe hit")
+        ),
+    )
+
+    x = torch.ones((3, 4), dtype=torch.bfloat16)
+    topk_weights = torch.tensor(
+        [[0.8], [0.7], [0.6]],
+        dtype=torch.bfloat16,
+    )
+    topk_ids = torch.tensor([[0], [1], [0]], dtype=torch.long)
+
+    out = experts(x, router_logits=None, topk_weights=topk_weights, topk_ids=topk_ids)
+
+    assert torch.equal(out, expected)
+    assert seen == {
+        "x_shape": (3, 4),
+        "topk_weights_shape": (3, 1),
+        "topk_ids_shape": (3, 1),
+        "gate_up_shape": (2, 4, 1),
+        "intermediate_dim": 2,
+    }
+
+
+def test_gemma4_awq_prefill_can_use_packed_int4_grouped_fused_kernel(
+    monkeypatch: Any,
+) -> None:
+    experts = Gemma4MoeExpertsLite(
+        _tiny_moe_config(),
+        quant_config=None,
+        prefix="model.layers.0",
+        runtime_config=SimpleNamespace(
+            gemma4_moe_expert_cache_size=0,
+            gemma4_moe_int4_kernel_enabled=True,
+            gemma4_moe_prefill_grouped_enabled=True,
+            gemma4_moe_prefill_grouped_min_tokens=2,
+            gemma4_moe_prefill_grouped_strategy="fused",
+        ),
+    )
+    monkeypatch.setattr(experts, "_has_awq_packed_expert_major", lambda: True)
+    experts.gate_up_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.gate_up_proj.scales = torch.empty((2, 4, 1), dtype=torch.float16)
+    experts.down_proj.qweight = torch.empty((2, 4, 1), dtype=torch.int32)
+    experts.down_proj.scales = torch.empty((2, 2, 1), dtype=torch.float16)
+
+    expected = torch.full((3, 4), 41.0, dtype=torch.bfloat16)
+
+    def fake_fused_prefill(
+        *args: Any, **kwargs: Any
+    ) -> tuple[torch.Tensor, bool, str]:
+        assert tuple(args[0].shape) == (3, 4)
+        assert tuple(args[1].shape) == (3, 1)
+        assert tuple(args[2].shape) == (3, 1)
+        assert kwargs["intermediate_dim"] == 2
+        return expected, True, "ok"
+
+    monkeypatch.setattr(
+        "vllm.kernels.triton.gemma4_moe_int4."
+        "gemma4_moe_int4_prefill_grouped_fused",
+        fake_fused_prefill,
+    )
+    monkeypatch.setattr(
+        "vllm.kernels.triton.gemma4_moe_int4.gemma4_moe_int4_prefill_grouped",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("chunked grouped prefill hit")
+        ),
+    )
+    monkeypatch.setattr(
+        experts,
+        "_materialize_one_expert_awq",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selected-expert materialization hit")
+        ),
+    )
+
+    x = torch.ones((3, 4), dtype=torch.bfloat16)
+    topk_weights = torch.tensor(
+        [[0.8], [0.7], [0.6]],
+        dtype=torch.bfloat16,
+    )
+    topk_ids = torch.tensor([[0], [1], [0]], dtype=torch.long)
 
     out = experts(x, router_logits=None, topk_weights=topk_weights, topk_ids=topk_ids)
 

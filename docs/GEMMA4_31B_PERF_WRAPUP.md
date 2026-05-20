@@ -112,16 +112,16 @@ Current report summary:
 
 | Model key | Aggregate TPS | TTFT p50 | E2E p50 | Prefill TPS agg | Decode TPS agg |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemma4_26b_a4b` | `3.62` | `2438.6ms` | `6626.8ms` | `161.57` | `5.49` |
-| `gemma4_31b_q4` | `1.43` | `9181.2ms` | `16804.7ms` | `42.91` | `3.02` |
+| `gemma4_26b_a4b` | `4.86` | `2582.0ms` | `4940.0ms` | `152.60` | `9.75` |
+| `gemma4_31b_q4` | `1.42` | `9335.7ms` | `16873.4ms` | `42.20` | `3.05` |
 
 Interpretation:
 
-- The recommended 26B MoE default is now `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_chunked`.
+- The recommended 26B MoE default is now `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=two_stage`.
 - The 26B MoE path now has materially better prefill and decode throughput than 31B under this default shape.
 - 31B remains TTFT/prefill-bound for this conservative default benchmark.
-- The best observed 26B `batched_chunked` report remains `5.62` decode TPS; the latest default-entry verification measured `5.49`.
-- The 2026-05-19 31B single-model run is about `5.15%` below the previous `3.18` decode TPS report, so it should be treated as the current conservative baseline rather than a new best result.
+- `batched_chunked` and `batched_grouped_streaming` remain opt-in 26B MoE experiments; the latest default-entry verification measured `9.75` decode TPS.
+- The 2026-05-20 31B single-model run measured `3.05` decode TPS and should be treated as the current conservative baseline.
 - These numbers supersede older README headline Gemma4 TPS claims that were measured under different or less clearly pinned profiles.
 
 ## Confirmed Gains
@@ -240,7 +240,7 @@ Recommended policy:
 - `FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON=1` (default-on path)
 - `FASTINFERENCE_AWQ_DECODE_GEMV=1` and `FASTINFERENCE_AWQ_FUSED_GATE_UP=1` installed by the Gemma4 adapter
 - `FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1` and `FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1` installed for dense Gemma4
-- `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_chunked` installed as the 26B MoE default
+- `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=two_stage` installed as the 26B MoE default
 - `FASTINFERENCE_GPU_GREEDY_*` benchmark profile enabled by default, with `FASTINFERENCE_GPU_GREEDY_IGNORE_EOS` still opt-in
 - scheduler profile default: `baseline`
 - bucket routing: keep available as an experiment, not as the default policy
