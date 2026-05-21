@@ -112,17 +112,17 @@ Current report summary:
 
 | Model key | Aggregate TPS | TTFT p50 | E2E p50 | Prefill TPS agg | Decode TPS agg |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemma4_26b_a4b` | `4.86` | `2582.0ms` | `4940.0ms` | `152.60` | `9.75` |
-| `gemma4_31b_q4` | `1.42` | `9335.7ms` | `16873.4ms` | `42.20` | `3.05` |
+| `gemma4_26b_a4b` | `5.53` | `2424.9ms` | `4336.2ms` | `162.48` | `12.03` |
+| `gemma4_31b_q4` | `1.62` | `8604.3ms` | `14797.8ms` | `45.79` | `3.71` |
 
 Interpretation:
 
 - The recommended 26B MoE default is now `FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=two_stage`.
-- The 26B MoE path now has materially better prefill and decode throughput than 31B under this default shape.
-- 31B remains TTFT/prefill-bound for this conservative default benchmark.
-- `batched_chunked` and `batched_grouped_streaming` remain opt-in 26B MoE experiments; the latest default-entry verification measured `9.75` decode TPS.
-- The 2026-05-20 31B single-model run measured `3.05` decode TPS and should be treated as the current conservative baseline.
-- These numbers supersede older README headline Gemma4 TPS claims that were measured under different or less clearly pinned profiles.
+- The 26B MoE path has materially better prefill and decode throughput than 31B under this default shape, further optimized by Phase 3's vectorized 2D BatchSampler.
+- 31B remains TTFT/prefill-bound for this conservative default benchmark, but decode TPS has climbed to **3.71**.
+- `batched_chunked` and `batched_grouped_streaming` remain opt-in 26B MoE experiments; the latest default-entry verification with the 2D BatchSampler measured `12.03` decode TPS.
+- The 2026-05-21 31B single-model run measured `3.71` decode TPS and should be treated as the current optimized baseline.
+- These numbers supersede older README headline Gemma4 TPS claims that were measured under older or non-vectorized execution engines.
 
 ## Confirmed Gains
 

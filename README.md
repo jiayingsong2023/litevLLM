@@ -10,13 +10,13 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | ✅ [1:1 HF 对齐] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | ✅ [FP8 KV 稳定] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **4.86** | ✅ [MoE `two_stage`] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.42** | ✅ [Dense 稳定] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **5.53** | ✅ [MoE `two_stage` + 2D Sampler] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **1.62** | ✅ [Dense 稳定 + 2D Sampler] |
 
   最新 Gemma4 数值来自 `tests/e2e_full_benchmark.py` 的当前默认测量形状
-  （2026-05-20，benchmark recommended profile）。当前报告中：
-  Gemma4-26B `TTFT p50=2582.0ms`、`prefill_tps_agg=152.60`、`decode_tps_agg=9.75`；
-  Gemma4-31B `TTFT p50=9335.7ms`、`prefill_tps_agg=42.20`、`decode_tps_agg=3.05`。
+  （2026-05-21，benchmark recommended profile）。当前报告中：
+  Gemma4-26B `TTFT p50=2424.9ms`、`prefill_tps_agg=162.48`、`decode_tps_agg=12.03`；
+  Gemma4-31B `TTFT p50=8604.3ms`、`prefill_tps_agg=45.79`、`decode_tps_agg=3.71`。
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。

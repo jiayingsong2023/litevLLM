@@ -64,16 +64,16 @@ LitevLLM has been significantly optimized for Gemma4 dense and MoE models:
 
 ## 7. 核心性能概览 (AMD Radeon 8060S 65GB)
 
-最新 Gemma4 基线来自 2026-05-20 的 `tests/e2e_full_benchmark.py` 默认测量形状，
+最新 Gemma4 基线来自 2026-05-21 的 `tests/e2e_full_benchmark.py` 默认测量形状，
 即 benchmark recommended profile、`BS=1`、`prompt~384`、`max_new=24`、`KV cap=512`。
 其中 26B 默认使用 `two_stage` MoE int4 decode kernel，31B 使用 dense Gemma4
-recommended adapter profile。
+recommended adapter profile，并且两者都已经完全接入阶段 3 高并发二维向量化 BatchSampler 采样优化。
 
 | 模型 | Aggregate TPS | TTFT p50 | Prefill TPS agg | Decode TPS agg | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **TinyLlama-1.1B** | **542+** | 历史 fast-path 基线 | - | - | 1:1 HF 对齐 |
-| **Gemma4-26B A4B (MoE)** | **4.86** | **2582.0ms** | **152.60** | **9.75** | `two_stage` default |
-| **Gemma4-31B (Dense)** | **1.42** | **9335.7ms** | **42.20** | **3.05** | Memory bound, accuracy-gated |
+| **Gemma4-26B A4B (MoE)** | **5.53** | **2424.9ms** | **162.48** | **12.03** | `two_stage` + 2D Sampler |
+| **Gemma4-31B (Dense)** | **1.62** | **8604.3ms** | **45.79** | **3.71** | `two_stage` + 2D Sampler |
 
 ---
 *本项目完全遵循 pure-Python 哲学，严禁引入任何需要 C++ 编译器的代码。所有算子均通过 Triton JIT 即时编译生成。*
