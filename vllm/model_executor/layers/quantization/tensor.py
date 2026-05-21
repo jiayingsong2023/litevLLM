@@ -692,6 +692,8 @@ class AWQWeight(QuantizedLinearWeight):
                 _awq_prefix_stat_inc(self.prefix, "cache_hit")
                 # print(f">>>> DEBUG: Using CACHED DENSE for {self.prefix}")
                 return _apply_linear_with_cached_weight(x, cached_w, bias)
+            else:
+                return self._slow_matmul_dequant(x, bias)
 
         # SLOW PATH: First time resolution
         if _should_use_high_fidelity_awq(self.prefix, self.high_fidelity):
@@ -715,12 +717,20 @@ class AWQWeight(QuantizedLinearWeight):
         return self.matmul(x, bias) # Re-run with fast path
 
     def _slow_matmul_dequant(self, x, bias):
+        cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
+        if cached_w is not None:
+            _awq_stat_inc("awq_cache_hits")
+            _awq_prefix_stat_inc(self.prefix, "cache_hit")
+            return _apply_linear_with_cached_weight(x, cached_w, bias)
         try:
             from vllm.model_executor.layers.quantization.awq_triton import awq_dequantize_triton
             dense_weight = awq_dequantize_triton(self.qweight, self.scales, self.qzeros, self.group_size)
-        except:
+        except Exception:
             dense_weight = dequantize_awq_pytorch(self.qweight, self.scales, self.qzeros, self.group_size)
+        _awq_cache_put(self.weight_id, dense_weight)
+        _awq_stat_inc("awq_cache_misses")
         _awq_stat_inc("awq_dense_builds")
+        _awq_prefix_stat_inc(self.prefix, "cache_miss")
         _awq_prefix_stat_inc(self.prefix, "dense_build")
         return torch.nn.functional.linear(x, _match_weight_dtype(dense_weight, x), bias)
 

@@ -2222,9 +2222,9 @@ class Gemma4MoeExpertsLite(nn.Module):
             )
 
         start = 0
-        for expert_id_t, count_t in zip(unique_experts, counts):
-            expert_id = int(expert_id_t.item())
-            count = int(count_t.item())
+        unique_experts_cpu = unique_experts.to(device="cpu").tolist()
+        counts_cpu = counts.to(device="cpu").tolist()
+        for expert_id, count in zip(unique_experts_cpu, counts_cpu):
             if count <= 0:
                 continue
             end = start + count
