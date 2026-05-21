@@ -282,52 +282,56 @@ def _paged_attention_kernel(
             )
         else:
             is_selected = True
-        if IS_CACHED:
-            k_base_ptr = tl.load(K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
-                tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
-            )
-            v_base_ptr = tl.load(V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
-                tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
-            )
-            if HAS_ROW_SCALE:
-                ks_base_ptr = tl.load(
-                    K_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
-                ).to(tl.pointer_type(tl.float32))
-                vs_base_ptr = tl.load(
-                    V_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
-                ).to(tl.pointer_type(tl.float32))
-        else:
-            block_idx = tl.load(
-                BlockTables_ptr + seq_idx * stride_bt_seq + i * stride_bt_block
-            )
-            k_base_ptr = K_ptr + block_idx * stride_k_block
-            v_base_ptr = V_ptr + block_idx * stride_v_block
-            if HAS_ROW_SCALE:
-                ks_base_ptr = K_Scale_Ptrs_ptr + block_idx * stride_ks_block
-                vs_base_ptr = V_Scale_Ptrs_ptr + block_idx * stride_vs_block
-
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
-
-        k_scale = k_scale_arg
-        v_scale = v_scale_arg
-        if HAS_ROW_SCALE:
-            k_scale = tl.load(
-                ks_base_ptr + offs_n * stride_ks_token + kv_head_idx * stride_ks_head,
-                mask=block_mask,
-                other=1.0,
-            )
-            v_scale = tl.load(
-                vs_base_ptr + offs_n * stride_vs_token + kv_head_idx * stride_vs_head,
-                mask=block_mask,
-                other=1.0,
-            )
-            k_scale = k_scale[:, None]
-            v_scale = v_scale[:, None]
 
         # K load and QK computation — skipped for non-selected blocks
         # to save global memory bandwidth.
         if is_selected:
+            if IS_CACHED:
+                k_base_ptr = tl.load(
+                    K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                ).to(tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16))
+                v_base_ptr = tl.load(
+                    V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                ).to(tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16))
+                if HAS_ROW_SCALE:
+                    ks_base_ptr = tl.load(
+                        K_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                    ).to(tl.pointer_type(tl.float32))
+                    vs_base_ptr = tl.load(
+                        V_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                    ).to(tl.pointer_type(tl.float32))
+            else:
+                block_idx = tl.load(
+                    BlockTables_ptr + seq_idx * stride_bt_seq + i * stride_bt_block
+                )
+                k_base_ptr = K_ptr + block_idx * stride_k_block
+                v_base_ptr = V_ptr + block_idx * stride_v_block
+                if HAS_ROW_SCALE:
+                    ks_base_ptr = K_Scale_Ptrs_ptr + block_idx * stride_ks_block
+                    vs_base_ptr = V_Scale_Ptrs_ptr + block_idx * stride_vs_block
+
+            k_scale = k_scale_arg
+            v_scale = v_scale_arg
+            if HAS_ROW_SCALE:
+                k_scale = tl.load(
+                    ks_base_ptr
+                    + offs_n * stride_ks_token
+                    + kv_head_idx * stride_ks_head,
+                    mask=block_mask,
+                    other=1.0,
+                )
+                v_scale = tl.load(
+                    vs_base_ptr
+                    + offs_n * stride_vs_token
+                    + kv_head_idx * stride_vs_head,
+                    mask=block_mask,
+                    other=1.0,
+                )
+                k_scale = k_scale[:, None]
+                v_scale = v_scale[:, None]
+
             if IS_INT4:
                 off_kv = (
                     offs_n[:, None] * stride_k_token
@@ -342,56 +346,43 @@ def _paged_attention_kernel(
                 # Manual sign-extension for 4-bit signed
                 k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
                 k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
-                qk = tl.sum(
-                    q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1
-                ) * scale
+                qk = (
+                    tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
+                )
             else:
                 off_kv = (
                     offs_n[:, None] * stride_k_token
                     + kv_head_idx * stride_k_head
                     + offs_d_2d * stride_k_dim
                 )
-                k = tl.load(
-                    k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0
-                )
+                k = tl.load(k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
                 if IS_FP8:
                     k = k.to(tl.float32) * k_scale
                 qk = tl.sum(q[None, :] * k, axis=1) * scale
-        else:
-            qk = tl.zeros([BLOCK_N], dtype=tl.float32)
 
-        # Apply Gemma-style logit soft-capping BEFORE the padding -inf mask.
-        # If softcap were applied after mask, tanh(-inf)=-1 would wreck the
-        # running max. Order: scale -> softcap -> mask -> online softmax.
-        if HAS_SOFTCAP:
-            inv_softcap = 1.0 / softcap_value
-            qk = softcap_value * libdevice.tanh(qk * inv_softcap)
+            # Apply Gemma-style logit soft-capping BEFORE the padding -inf mask.
+            # If softcap were applied after mask, tanh(-inf)=-1 would wreck the
+            # running max. Order: scale -> softcap -> mask -> online softmax.
+            if HAS_SOFTCAP:
+                inv_softcap = 1.0 / softcap_value
+                qk = softcap_value * libdevice.tanh(qk * inv_softcap)
 
-        # Non-selected blocks: force QK to -inf after softcap so they
-        # contribute nothing to the softmax. This replaces the old
-        # approach of narrowing block_mask (which still issued K/V loads).
-        if USE_SELECTION and not is_selected:
-            qk = tl.full([BLOCK_N], -float("inf"), dtype=tl.float32)
+            qk = tl.where(block_mask, qk, -float("inf"))
+            m_curr = tl.max(qk, axis=0)
+            m_new = tl.maximum(m_i, m_curr)
 
-        qk = tl.where(block_mask, qk, -float("inf"))
-        m_curr = tl.max(qk, axis=0)
-        m_new = tl.maximum(m_i, m_curr)
+            # Guard against -inf - (-inf) to avoid NaN
+            delta_m = tl.where(m_i == -float("inf"), 0.0, m_i - m_new)
+            alpha = tl.exp(delta_m).to(tl.float32)
 
-        # Guard against -inf - (-inf) to avoid NaN
-        delta_m = tl.where(m_i == -float("inf"), 0.0, m_i - m_new)
-        alpha = tl.exp(delta_m).to(tl.float32)
+            p = tl.exp((qk - m_new).to(tl.float32)).to(tl.float32)
+            p = tl.where(block_mask, p, 0.0).to(tl.float32)
+            l_curr = tl.sum(p, axis=0).to(tl.float32)
+            l_new = (alpha * l_i + l_curr).to(tl.float32)
 
-        p = tl.exp((qk - m_new).to(tl.float32)).to(tl.float32)
-        p = tl.where(block_mask, p, 0.0).to(tl.float32)
-        l_curr = tl.sum(p, axis=0).to(tl.float32)
-        l_new = (alpha * l_i + l_curr).to(tl.float32)
+            # Guard against zero sum to avoid NaN in division
+            l_new = tl.maximum(l_new, 1e-20)
 
-        # Guard against zero sum to avoid NaN in division
-        l_new = tl.maximum(l_new, 1e-20)
-
-        # V load and accumulation — skipped for non-selected blocks
-        # to save global memory bandwidth.
-        if is_selected:
             if IS_INT4:
                 v_packed = tl.load(
                     v_base_ptr.to(tl.pointer_type(tl.uint8))
@@ -419,8 +410,8 @@ def _paged_attention_kernel(
                     v = v.to(tl.float32) * v_scale
                 acc_full = acc_full * alpha + tl.sum(p[:, None] * v, axis=0)
 
-        l_i = l_new
-        m_i = m_new
+            l_i = l_new
+            m_i = m_new
 
     off_out_base = seq_idx * stride_out_seq + head_idx * stride_out_head
     inv_l_i = 1.0 / tl.maximum(l_i, 1e-20)

@@ -99,7 +99,10 @@ class LiteSingleGpuBackend:
             if (
                 entry is None
                 or prefix_len <= 0
-                or (not exact_hit and prefix_len < self.min_prefix_cache_partial_hit_tokens)
+                or (
+                    not exact_hit
+                    and prefix_len < self.min_prefix_cache_partial_hit_tokens
+                )
             ):
                 self._record_prefix_cache_event(
                     request_state,
@@ -119,7 +122,9 @@ class LiteSingleGpuBackend:
                 saved_prefill_tokens=prefix_len,
             )
 
-        if request_state.get("slot_idx") is None or request_state.get("_prefix_cache_applied"):
+        if request_state.get("slot_idx") is None or request_state.get(
+            "_prefix_cache_applied"
+        ):
             return None
 
         self._ensure_runtime_ready()
@@ -140,7 +145,8 @@ class LiteSingleGpuBackend:
             step_plan.prefills is not None
             and step_plan.decodes is not None
             and not getattr(step_plan, "prefill_starvation_protected", False)
-            and getattr(scheduler, "queued_request_count", 0) >= self.preemption_min_backlog
+            and getattr(scheduler, "queued_request_count", 0)
+            >= self.preemption_min_backlog
             and len(step_plan.decodes.request_ids) >= self.preemption_min_decodes
             and not self._queue_wait_blocks_preemption(step_plan)
             and self._multimodal_prefills_are_preemptible(step_plan, scheduler)
@@ -194,9 +200,11 @@ class LiteSingleGpuBackend:
         if self._can_use_gpu_greedy_decode(request_ids):
             return self._decode_step_gpu_greedy(request_ids, logits)
         results: list[RequestOutput] = []
-        for i, rid in enumerate(request_ids):
-            req = self.scheduler.get_request(rid)
-            token = self.sampling_driver.sample_next_token(logits[i, -1, :], req)
+        requests = [self.scheduler.get_request(rid) for rid in request_ids]
+        next_tokens = self.sampling_driver.sample_batch_tokens(
+            logits[:, -1, :], requests
+        )
+        for rid, req, token in zip(request_ids, requests, next_tokens):
             req["generated_ids"].append(token)
             req["seq_len"] += 1
             self._process_completion(rid, token, results)
@@ -207,11 +215,18 @@ class LiteSingleGpuBackend:
         if step_plan.prefills is None:
             return
         try:
-            logits, _req_dicts_prefill, is_last_chunk_flags = self.prefill_executor.execute(
-                step_plan.prefills.request_ids,
-                self.scheduler,
-                step_plan.prefills.chunk_len,
+            logits, _req_dicts_prefill, is_last_chunk_flags = (
+                self.prefill_executor.execute(
+                    step_plan.prefills.request_ids,
+                    self.scheduler,
+                    step_plan.prefills.chunk_len,
+                )
             )
+
+            finished_indices: list[int] = []
+            finished_rids: list[str] = []
+            finished_reqs: list[dict[str, Any]] = []
+            finished_logits_list: list[torch.Tensor] = []
 
             for i, rid in enumerate(step_plan.prefills.request_ids):
                 req = self.scheduler.get_request(rid)
@@ -219,19 +234,30 @@ class LiteSingleGpuBackend:
                 if not is_last_chunk_flags[i]:
                     continue
                 self._store_prefix_cache_entry(rid, req, logits[i, -1, :])
-                next_token = self.sampling_driver.sample_next_token(
-                    logits[i, -1, :], req
+                finished_indices.append(i)
+                finished_rids.append(rid)
+                finished_reqs.append(req)
+                finished_logits_list.append(logits[i, -1, :])
+
+            if finished_reqs:
+                stacked_logits = torch.stack(finished_logits_list)
+                next_tokens = self.sampling_driver.sample_batch_tokens(
+                    stacked_logits, finished_reqs
                 )
-                req["generated_ids"].append(next_token)
-                req["is_prefill"] = False
-                self._process_completion(rid, next_token, results)
+                for rid, req, next_token in zip(
+                    finished_rids, finished_reqs, next_tokens
+                ):
+                    req["generated_ids"].append(next_token)
+                    req["is_prefill"] = False
+                    self._process_completion(rid, next_token, results)
+
             self.observer.on_prefill_executed(step_plan.prefills, len(results))
         except Exception as e:
             error = ExecutionStepError(f"prefill failed: {e}")
             logger.exception("LiteEngine prefill execution error: %s", error)
             for rid in step_plan.prefills.request_ids:
                 self._free_request(rid)
-            raise error
+            raise error from e
 
     def run_decodes(self, step_plan, results: list[RequestOutput]) -> None:
         self._ensure_runtime_ready()
@@ -241,35 +267,25 @@ class LiteSingleGpuBackend:
             logits, _req_dicts = self.decode_executor.execute_batch(
                 step_plan.decodes.request_ids, self.scheduler
             )
-            is_all_greedy = all(
-                self.scheduler.get_request(rid)["sampling_params"].temperature == 0
-                for rid in step_plan.decodes.request_ids
+            requests = [
+                self.scheduler.get_request(rid) for rid in step_plan.decodes.request_ids
+            ]
+            next_tokens = self.sampling_driver.sample_batch_tokens(
+                logits[:, -1, :], requests
             )
-
-            if is_all_greedy:
-                next_tokens = torch.argmax(logits[:, -1, :], dim=-1).cpu().tolist()
-                for i, rid in enumerate(step_plan.decodes.request_ids):
-                    req_i = self.scheduler.get_request(rid)
-                    token = next_tokens[i]
-                    req_i["generated_ids"].append(token)
-                    req_i["seq_len"] += 1
-                    self._process_completion(rid, token, results)
-            else:
-                for i, rid in enumerate(step_plan.decodes.request_ids):
-                    req_i = self.scheduler.get_request(rid)
-                    token = self.sampling_driver.sample_next_token(
-                        logits[i, -1, :], req_i
-                    )
-                    req_i["generated_ids"].append(token)
-                    req_i["seq_len"] += 1
-                    self._process_completion(rid, token, results)
+            for rid, req_i, token in zip(
+                step_plan.decodes.request_ids, requests, next_tokens
+            ):
+                req_i["generated_ids"].append(token)
+                req_i["seq_len"] += 1
+                self._process_completion(rid, token, results)
             self.observer.on_decode_executed(step_plan.decodes, len(results))
         except Exception as e:
             error = ExecutionStepError(f"decode failed: {e}")
             logger.exception("LiteEngine decode execution error: %s", error)
             for rid in step_plan.decodes.request_ids:
                 self._free_request(rid)
-            raise error
+            raise error from e
 
     def _can_use_gpu_greedy_decode(self, request_ids: list[str]) -> bool:
         if not self.gpu_greedy_sampling:
@@ -308,7 +324,9 @@ class LiteSingleGpuBackend:
             if not bypass_cpu_policies:
                 if req.get("anti_template_token_ids"):
                     return False
-                if req.get("capital_question_bias_token_ids") or req.get("is_chinese_capital_question"):
+                if req.get("capital_question_bias_token_ids") or req.get(
+                    "is_chinese_capital_question"
+                ):
                     return False
         return True
 
@@ -345,26 +363,36 @@ class LiteSingleGpuBackend:
             req["generated_ids"].extend(int(t) for t in pending_tokens)
             req["_pending_token_tensors"] = []
             req.pop("_last_token_tensor", None)
-            last_token = int(pending_tokens[-1]) if pending_tokens else int(req["generated_ids"][-1])
+            last_token = (
+                int(pending_tokens[-1])
+                if pending_tokens
+                else int(req["generated_ids"][-1])
+            )
             self._process_completion(rid, last_token, results)
         return results
 
     def stats(self) -> dict[str, object]:
         materialized_hits = self.prefix_cache_materialized_hits
-        multimodal_processor = getattr(self.prefill_executor, "multimodal_processor", None)
+        multimodal_processor = getattr(
+            self.prefill_executor, "multimodal_processor", None
+        )
         return {
             "backend_type": "lite_single_gpu",
             "block_size": self.block_size,
             "num_blocks_per_seq": self.num_blocks_per_seq,
             "num_kv_layers": self.kv_block_manager.num_layers,
-            "min_prefix_cache_partial_hit_tokens": self.min_prefix_cache_partial_hit_tokens,
+            "min_prefix_cache_partial_hit_tokens": (
+                self.min_prefix_cache_partial_hit_tokens
+            ),
             "preemption_mode": self.preemption_mode,
             "preemption_min_backlog": self.preemption_min_backlog,
             "preemption_min_decodes": self.preemption_min_decodes,
             "preemption_max_queue_wait_s": self.preemption_max_queue_wait_s,
             "preemptible_service_classes": sorted(self.preemptible_service_classes),
             "preempt_multimodal_prefills": self.preempt_multimodal_prefills,
-            "preempt_multimodal_max_queue_wait_s": self.preempt_multimodal_max_queue_wait_s,
+            "preempt_multimodal_max_queue_wait_s": (
+                self.preempt_multimodal_max_queue_wait_s
+            ),
             "multimodal_prefix_cache_protect_threshold": (
                 self.multimodal_prefix_cache_protect_threshold
             ),
@@ -373,8 +401,12 @@ class LiteSingleGpuBackend:
             "gpu_greedy_bypass_cpu_policies": self.gpu_greedy_bypass_cpu_policies,
             "gpu_greedy_ignore_eos": self.gpu_greedy_ignore_eos,
             "prefix_cache_materialized_hits": materialized_hits,
-            "prefix_cache_materialized_exact_hits": self.prefix_cache_materialized_exact_hits,
-            "prefix_cache_materialized_partial_hits": self.prefix_cache_materialized_partial_hits,
+            "prefix_cache_materialized_exact_hits": (
+                self.prefix_cache_materialized_exact_hits
+            ),
+            "prefix_cache_materialized_partial_hits": (
+                self.prefix_cache_materialized_partial_hits
+            ),
             "prefix_cache_materialized_saved_prefill_tokens": (
                 self.prefix_cache_materialized_saved_prefill_tokens
             ),
@@ -386,7 +418,8 @@ class LiteSingleGpuBackend:
             "prefix_cache": self.prefix_cache.stats(),
             "multimodal": (
                 dict(multimodal_processor.stats())
-                if multimodal_processor is not None and hasattr(multimodal_processor, "stats")
+                if multimodal_processor is not None
+                and hasattr(multimodal_processor, "stats")
                 else {}
             ),
         }
@@ -396,8 +429,12 @@ class LiteSingleGpuBackend:
         self.prefix_cache_materialized_exact_hits = 0
         self.prefix_cache_materialized_partial_hits = 0
         self.prefix_cache_materialized_saved_prefill_tokens = 0
-        multimodal_processor = getattr(self.prefill_executor, "multimodal_processor", None)
-        if multimodal_processor is not None and hasattr(multimodal_processor, "reset_stats"):
+        multimodal_processor = getattr(
+            self.prefill_executor, "multimodal_processor", None
+        )
+        if multimodal_processor is not None and hasattr(
+            multimodal_processor, "reset_stats"
+        ):
             multimodal_processor.reset_stats()
         if clear_prefix_cache:
             self.prefix_cache.clear()
@@ -422,7 +459,9 @@ class LiteSingleGpuBackend:
             finish_reason = "completed"
             if next_token in self.sampling_driver.completion_eos_ids(req):
                 finish_reason = "eos"
-            elif len(req["generated_ids"]) >= int(req["sampling_params"].max_tokens or 16):
+            elif len(req["generated_ids"]) >= int(
+                req["sampling_params"].max_tokens or 16
+            ):
                 finish_reason = "max_tokens"
             self.observer.on_request_finished(request_id, finish_reason)
             self._free_request(request_id)
@@ -434,7 +473,9 @@ class LiteSingleGpuBackend:
 
     def _ensure_runtime_ready(self) -> None:
         if self.sampling_driver is None or self.output_coordinator is None:
-            raise RuntimeError("Execution backend is not ready: sampling/output is unset")
+            raise RuntimeError(
+                "Execution backend is not ready: sampling/output is unset"
+            )
 
     def _record_prefix_cache_event(
         self,
@@ -509,7 +550,10 @@ class LiteSingleGpuBackend:
         threshold = self.multimodal_prefix_cache_protect_threshold
         if threshold <= 0:
             return False
-        return float(getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0) >= threshold
+        return (
+            float(getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0)
+            >= threshold
+        )
 
     @staticmethod
     def _is_multimodal_request(request: dict[str, Any]) -> bool:
@@ -596,7 +640,9 @@ class LiteSingleGpuBackend:
         if not image_urls:
             return -1
         digest = hashlib.sha1(
-            json.dumps(image_urls, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(image_urls, ensure_ascii=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
         ).digest()
         return -int.from_bytes(digest[:8], byteorder="big", signed=False) - 2
 

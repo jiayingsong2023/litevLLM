@@ -2845,7 +2845,9 @@ async def main() -> None:
             n = int(args.gemma31b_max_model_len)
             if n < 64:
                 raise ValueError("--gemma31b-max-model-len must be >= 64")
-            spec = replace(spec, max_model_len=n)
+            new_env = dict(spec.stable_env)
+            new_env["FASTINFERENCE_KV_MAX_MODEL_LEN"] = str(n)
+            spec = replace(spec, max_model_len=n, stable_env=new_env)
         if key == "gemma4_31b_q4":
             spec, policy = _resolve_gemma31b_bucket_policy(spec, args)
             resolved_scheduler_policy[key] = policy
@@ -2872,7 +2874,9 @@ async def main() -> None:
             n = int(args.gemma26b_max_model_len)
             if n < 64:
                 raise ValueError("--gemma26b-max-model-len must be >= 64")
-            spec = replace(spec, max_model_len=n)
+            new_env = dict(spec.stable_env)
+            new_env["FASTINFERENCE_KV_MAX_MODEL_LEN"] = str(n)
+            spec = replace(spec, max_model_len=n, stable_env=new_env)
         specs.append(spec)
 
     print("=" * 72)

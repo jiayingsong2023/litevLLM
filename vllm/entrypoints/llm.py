@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import time
-from typing import List, Optional
+from typing import Any
 
 import torch
 
@@ -22,10 +22,24 @@ class LLM:
 
     def __init__(self, model: str, **kwargs):
         self.model_path = model
+        processor_type = kwargs.pop("output_processor", "default")
         self.vllm_config = build_vllm_config(model, **kwargs)
         self.engine = LiteEngine(self.vllm_config)
         self.tokenizer = get_tokenizer(self.vllm_config.model_config)
         self.engine.tokenizer = self.tokenizer
+
+        from vllm.entrypoints.output_processors import (
+            DefaultOutputProcessor,
+            OutputProcessorStrategy,
+            VerlOutputProcessor,
+        )
+
+        if isinstance(processor_type, OutputProcessorStrategy):
+            self.output_processor = processor_type
+        elif processor_type == "verl":
+            self.output_processor = VerlOutputProcessor()
+        else:
+            self.output_processor = DefaultOutputProcessor()
 
     @property
     def model(self):
@@ -34,20 +48,23 @@ class LLM:
     @torch.inference_mode()
     def generate(
         self,
-        prompts: List[str],
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> List[RequestOutput]:
+        prompts: list[str],
+        sampling_params: SamplingParams | None = None,
+    ) -> Any:
         if isinstance(prompts, str):
             prompts = [prompts]
         if sampling_params is None:
             sampling_params = SamplingParams()
 
-        outputs: List[RequestOutput] = []
+        outputs: list[RequestOutput] = []
         batch_capacity = max(1, int(getattr(self.engine, "max_active_requests", 1)))
 
         for batch_start in range(0, len(prompts), batch_capacity):
             batch_prompts = prompts[batch_start : batch_start + batch_capacity]
-            request_ids = [f"offline_{batch_start + i}_{time.time_ns()}" for i in range(len(batch_prompts))]
+            request_ids = [
+                f"offline_{batch_start + i}_{time.time_ns()}"
+                for i in range(len(batch_prompts))
+            ]
             latest_outputs: dict[str, RequestOutput] = {}
 
             for rid, prompt in zip(request_ids, batch_prompts):
@@ -67,7 +84,13 @@ class LLM:
 
             outputs.extend(latest_outputs[rid] for rid in request_ids)
 
-        return outputs
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.tokenizer, "eos_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        return self.output_processor.process_outputs(outputs, pad_token_id=pad_token_id)
 
     def shutdown(self) -> None:
         clear_gguf_cache()
