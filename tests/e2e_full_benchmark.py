@@ -736,6 +736,15 @@ def _fmt_float(value: float, fmt: str) -> str:
     return "n/a"
 
 
+def _format_profile_summary(profile_stats: dict[str, object]) -> str:
+    return (
+        "PROFILE "
+        f"requested={profile_stats.get('requested', 'unknown')} "
+        f"effective={profile_stats.get('effective', 'unknown')} "
+        f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
+    )
+
+
 def _apply_temp_env(env_map: Dict[str, str]) -> Dict[str, Optional[str]]:
     old_env: Dict[str, Optional[str]] = {}
     for key, value in env_map.items():
@@ -2448,12 +2457,7 @@ async def run_benchmark(
             f"Decode TPS p50={_fmt_float(result['decode_tps_p50'], '.2f')}, "
             f"stream_visible={_fmt_float(result['stream_progressive_visible_ratio'] * 100.0, '.1f')}%"
         )
-        print(
-            "  PROFILE "
-            f"requested={profile_stats.get('requested', 'unknown')} "
-            f"effective={profile_stats.get('effective', 'unknown')} "
-            f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
-        )
+        print("  " + _format_profile_summary(profile_stats))
         if spec.concurrent_reqs > 1:
             print(
                 "  [Note] Decode TPS(agg)=decode_tokens_total/decode_ms_total. "
@@ -2972,12 +2976,7 @@ async def main() -> None:
         if r.get("timed_out", 0.0) == 1.0:
             print(f"{key:16} | timeout")
             profile_stats = dict(r.get("profile") or {})
-            print(
-                "PROFILE "
-                f"requested={profile_stats.get('requested', 'unknown')} "
-                f"effective={profile_stats.get('effective', 'unknown')} "
-                f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
-            )
+            print(_format_profile_summary(profile_stats))
             continue
         print(
             f"{key:16} | tps={_fmt_float(r['aggregate_tps'], '.2f')} | "
@@ -2990,12 +2989,7 @@ async def main() -> None:
             f"workload={r.get('workload', {}).get('kind', args.workload)}"
         )
         profile_stats = dict(r.get("profile") or {})
-        print(
-            "PROFILE "
-            f"requested={profile_stats.get('requested', 'unknown')} "
-            f"effective={profile_stats.get('effective', 'unknown')} "
-            f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
-        )
+        print(_format_profile_summary(profile_stats))
     if compile_cache_meta.get("enabled"):
         print(
             "compile_cache      | "

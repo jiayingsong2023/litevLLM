@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from vllm.engine import async_llm as async_llm_module
@@ -242,6 +244,11 @@ def test_runtime_controller_stats_include_profile() -> None:
 
     class FakeRuntimeConfig:
         profile = FakeProfile()
+        kv_cache_dtype = "turbo_int4"
+        block_size = 16
+        kv_max_model_len = None
+        kv_max_active_requests = 4
+        fusion_level = 2
 
     class FakeScheduler:
         active_request_count = 2
@@ -275,7 +282,120 @@ def test_runtime_controller_stats_include_profile() -> None:
         "requested": "auto",
         "effective": "benchmark",
         "kv_cache_dtype": "turbo_int4",
+        "block_size": 16,
+        "kv_max_model_len": None,
+        "kv_max_active_requests": 4,
+        "fusion_level": 2,
     }
+
+
+def test_runtime_controller_profile_stats_use_effective_runtime_config() -> None:
+    class FakeProfile:
+        def stats(self) -> dict[str, object]:
+            return {
+                "requested": "auto",
+                "effective": "benchmark",
+                "kv_cache_dtype": "turbo_int4",
+                "block_size": 16,
+                "kv_max_model_len": 512,
+                "kv_max_active_requests": 4,
+                "fusion_level": 2,
+            }
+
+    scheduler = SimpleNamespace(
+        active_request_count=2,
+        running_request_count=1,
+        queued_request_count=1,
+        available_slots=3,
+        runtime_config=SimpleNamespace(
+            profile=FakeProfile(),
+            kv_cache_dtype="fp8",
+            block_size=32,
+            kv_max_model_len=1024,
+            kv_max_active_requests=1,
+            fusion_level=1,
+        ),
+    )
+
+    class FakeObserver:
+        def stats(self) -> dict[str, object]:
+            return {"step_count": 3}
+
+    class FakeBackend:
+        def stats(self) -> dict[str, object]:
+            return {"backend_type": "fake"}
+
+        def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+            del clear_prefix_cache
+
+    controller = RuntimeController(
+        scheduler=scheduler,
+        step_scheduler=object(),
+        observer=FakeObserver(),
+        backend=FakeBackend(),
+        queue_timeout_s=15.0,
+    )
+
+    assert controller.stats()["profile"] == {
+        "requested": "auto",
+        "effective": "benchmark",
+        "kv_cache_dtype": "fp8",
+        "block_size": 32,
+        "kv_max_model_len": 1024,
+        "kv_max_active_requests": 1,
+        "fusion_level": 1,
+    }
+
+
+def test_runtime_controller_profile_stats_backend_fallback_and_empty() -> None:
+    scheduler = SimpleNamespace(
+        active_request_count=0,
+        running_request_count=0,
+        queued_request_count=0,
+        available_slots=1,
+    )
+
+    class FakeObserver:
+        def stats(self) -> dict[str, object]:
+            return {}
+
+    class BackendWithProfile:
+        def stats(self) -> dict[str, object]:
+            return {"backend_type": "fake"}
+
+        def profile_stats(self) -> dict[str, object]:
+            return {"requested": "backend", "kv_cache_dtype": "fp16"}
+
+        def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+            del clear_prefix_cache
+
+    class BackendWithoutProfile:
+        def stats(self) -> dict[str, object]:
+            return {"backend_type": "fake"}
+
+        def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+            del clear_prefix_cache
+
+    fallback_controller = RuntimeController(
+        scheduler=scheduler,
+        step_scheduler=object(),
+        observer=FakeObserver(),
+        backend=BackendWithProfile(),
+        queue_timeout_s=15.0,
+    )
+    empty_controller = RuntimeController(
+        scheduler=scheduler,
+        step_scheduler=object(),
+        observer=FakeObserver(),
+        backend=BackendWithoutProfile(),
+        queue_timeout_s=15.0,
+    )
+
+    assert fallback_controller.stats()["profile"] == {
+        "requested": "backend",
+        "kv_cache_dtype": "fp16",
+    }
+    assert empty_controller.stats()["profile"] == {}
 
 
 def test_runtime_stats_reset_endpoint_resets_engine_stats() -> None:

@@ -107,15 +107,6 @@ class RuntimeController:
         observer_stats: dict[str, Any] = {}
         if hasattr(self.observer, "stats"):
             observer_stats = dict(self.observer.stats())
-        profile: dict[str, Any] = {}
-        runtime_config = getattr(self.scheduler, "runtime_config", None)
-        if (
-            runtime_config is not None
-            and getattr(runtime_config, "profile", None) is not None
-        ):
-            profile = dict(runtime_config.profile.stats())
-        elif hasattr(self.backend, "profile_stats"):
-            profile = dict(self.backend.profile_stats())
         observed_at_unix_s = time.time()
         return {
             "observed_at_unix_s": observed_at_unix_s,
@@ -124,7 +115,7 @@ class RuntimeController:
                 0.0, time.perf_counter() - self._stats_reset_at_monotonic_s
             ),
             "queue_timeout_s": self.queue_timeout_s,
-            "profile": profile,
+            "profile": self._profile_stats(),
             "scheduler": {
                 "active_request_count": int(
                     getattr(self.scheduler, "active_request_count", 0)
@@ -143,6 +134,37 @@ class RuntimeController:
             if self.lora_registry is not None
             else {},
         }
+
+    def _profile_stats(self) -> dict[str, object]:
+        runtime_config = getattr(self.scheduler, "runtime_config", None)
+        profile = (
+            getattr(runtime_config, "profile", None)
+            if runtime_config is not None
+            else None
+        )
+        if profile is not None:
+            out = dict(profile.stats())
+            out["kv_cache_dtype"] = getattr(
+                runtime_config, "kv_cache_dtype", out.get("kv_cache_dtype")
+            )
+            out["block_size"] = getattr(
+                runtime_config, "block_size", out.get("block_size")
+            )
+            out["kv_max_model_len"] = getattr(
+                runtime_config, "kv_max_model_len", out.get("kv_max_model_len")
+            )
+            out["kv_max_active_requests"] = getattr(
+                runtime_config,
+                "kv_max_active_requests",
+                out.get("kv_max_active_requests"),
+            )
+            out["fusion_level"] = getattr(
+                runtime_config, "fusion_level", out.get("fusion_level")
+            )
+            return out
+        if hasattr(self.backend, "profile_stats"):
+            return dict(self.backend.profile_stats())
+        return {}
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
         if hasattr(self.observer, "reset_stats"):
