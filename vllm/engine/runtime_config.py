@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass, field
 
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
@@ -73,6 +74,13 @@ class RuntimeConfig:
             model_capabilities=getattr(vllm_config, "model_capabilities", None),
             gpu_total_gb=get_total_gpu_memory_gb(),
         )
+        tuning_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("FASTINFERENCE_")
+        }
+        tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
+
         return cls(
             model_path=str(model_config.model),
             tokenizer_path=str(model_config.tokenizer),
@@ -102,7 +110,7 @@ class RuntimeConfig:
             k_scale=profile.k_scale,
             v_scale=profile.v_scale,
             use_prompt_guard=profile.use_prompt_guard,
-            tuning_env={"FASTINFERENCE_PROFILE": profile.requested_name},
+            tuning_env=tuning_env,
             scheduler_policy=profile.scheduler_policy,
             backend_policy=profile.backend_policy,
             profile=profile,

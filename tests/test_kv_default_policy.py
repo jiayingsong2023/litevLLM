@@ -25,6 +25,7 @@ def _mock_vllm_config() -> object:
 
 def test_runtime_config_uses_profile_defaults(monkeypatch) -> None:
     monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV", "1")
     monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
 
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
@@ -35,6 +36,9 @@ def test_runtime_config_uses_profile_defaults(monkeypatch) -> None:
     assert cfg.block_size == 16
     assert cfg.fusion_level == 2
     assert cfg.backend_policy.gpu_greedy_sampling is True
+    assert cfg.tuning_env["FASTINFERENCE_GEMMA4_ALLOW_INT4_KV"] == "1"
+    assert cfg.tuning_env["FASTINFERENCE_KV_TYPE"] == "fp16"
+    assert cfg.tuning_env["FASTINFERENCE_PROFILE"] == "auto"
 
 
 def test_runtime_config_accuracy_profile_is_conservative(monkeypatch) -> None:
