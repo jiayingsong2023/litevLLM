@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
@@ -42,8 +44,20 @@ class RuntimeProfile:
         default_factory=SchedulerRuntimePolicy
     )
     backend_policy: BackendRuntimePolicy = field(default_factory=BackendRuntimePolicy)
-    model_policy: dict[str, Any] = field(default_factory=dict)
-    kernel_policy: dict[str, Any] = field(default_factory=dict)
+    model_policy: Mapping[str, Any] = field(default_factory=dict)
+    kernel_policy: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "model_policy",
+            MappingProxyType(dict(self.model_policy)),
+        )
+        object.__setattr__(
+            self,
+            "kernel_policy",
+            MappingProxyType(dict(self.kernel_policy)),
+        )
 
     def stats(self) -> dict[str, Any]:
         return {
