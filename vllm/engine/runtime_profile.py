@@ -18,6 +18,18 @@ SUPPORTED_PROFILE_NAMES = (
 )
 
 
+def _freeze_policy_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_policy_value(nested) for key, nested in value.items()}
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_policy_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_freeze_policy_value(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True)
 class RuntimeProfile:
     requested_name: str
@@ -51,12 +63,12 @@ class RuntimeProfile:
         object.__setattr__(
             self,
             "model_policy",
-            MappingProxyType(dict(self.model_policy)),
+            _freeze_policy_value(self.model_policy),
         )
         object.__setattr__(
             self,
             "kernel_policy",
-            MappingProxyType(dict(self.kernel_policy)),
+            _freeze_policy_value(self.kernel_policy),
         )
 
     def stats(self) -> dict[str, Any]:

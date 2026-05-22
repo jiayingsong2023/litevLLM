@@ -138,6 +138,44 @@ def test_runtime_profile_policy_dicts_are_immutable_snapshots() -> None:
         profile.kernel_policy["paged_attention"] = "mutated"
 
 
+def test_runtime_profile_nested_policy_values_are_immutable_snapshots() -> None:
+    model_nested = {"y": 1}
+    model_list = ["prefill"]
+    model_set = {"dense"}
+    kernel_nested = {"tile": [16, 16]}
+    model_policy = {
+        "nested": model_nested,
+        "list": model_list,
+        "set": model_set,
+    }
+    kernel_policy = {"nested": kernel_nested}
+    profile = RuntimeProfile(
+        requested_name="benchmark",
+        effective_name="benchmark",
+        description="test",
+        model_policy=model_policy,
+        kernel_policy=kernel_policy,
+    )
+
+    model_nested["y"] = 2
+    model_list.append("decode")
+    model_set.add("moe")
+    kernel_nested["tile"].append(32)
+
+    assert profile.model_policy["nested"]["y"] == 1
+    assert profile.model_policy["list"] == ("prefill",)
+    assert profile.model_policy["set"] == frozenset({"dense"})
+    assert profile.kernel_policy["nested"]["tile"] == (16, 16)
+    with pytest.raises(TypeError):
+        profile.model_policy["nested"]["y"] = 2
+    with pytest.raises(AttributeError):
+        profile.model_policy["list"].append("decode")
+    with pytest.raises(AttributeError):
+        profile.model_policy["set"].add("moe")
+    with pytest.raises(TypeError):
+        profile.kernel_policy["nested"]["tile"][0] = 32
+
+
 def test_runtime_policy_collections_are_immutable_snapshots() -> None:
     service_weights = {"gold": 2}
     fairness_classes = {"gold"}
