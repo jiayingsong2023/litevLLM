@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import time
-import os
 import re
 import torch
 import torch.nn as nn
@@ -55,11 +54,6 @@ def _bytes_to_gib(value: int | float) -> float:
 
 def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).replace("torch.", "")
-
-
-def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
-    ctx = max(floor, int(ctx))
-    return max(block_size, (ctx // block_size) * block_size)
 
 
 def expand_metadata_for_paged_attention(
@@ -116,36 +110,6 @@ def expand_metadata_for_paged_attention(
     return seq_lens, block_tables
 
 
-def _resolve_kv_max_model_len(
-    model_config: Any,
-    vllm_config: VllmConfig,
-    block_size: int,
-) -> int:
-    """Cap KV / slot stride by model config, scheduler, and optional env."""
-    mc = model_config.get_max_model_len()
-    sched = getattr(vllm_config.scheduler_config, "max_model_len", mc)
-    cap = min(int(mc), int(sched), 4096)
-    env = os.environ.get("FASTINFERENCE_KV_MAX_MODEL_LEN", "").strip()
-    if env:
-        cap = min(cap, max(block_size, int(env)))
-    return _align_kv_ctx_len(cap, block_size)
-
-
-def _resolve_kv_max_active_requests(
-    execution_policy_max: int,
-    vllm_config: VllmConfig,
-) -> int:
-    """Match paged KV pool to scheduler concurrency (and optional env)."""
-    sched_seqs = getattr(
-        vllm_config.scheduler_config, "max_num_seqs", execution_policy_max
-    )
-    out = min(int(execution_policy_max), int(sched_seqs))
-    env = os.environ.get("FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS", "").strip()
-    if env:
-        out = min(out, max(1, int(env)))
-    return max(1, out)
-
-
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
@@ -190,14 +154,19 @@ class LiteEngine:
         )
         self._layer_kv_specs = self._resolve_layer_kv_specs()
         self._apply_runtime_model_policy()
-        if "FASTINFERENCE_AWQ_FUSED_SCOPE" in self._active_tuning_env:
-            fused_stage = self._active_tuning_env.get(
-                "FASTINFERENCE_AWQ_FUSED_SCOPE", "all"
-            )
+        fused_stage = next(
+            (
+                value
+                for key, value in self.runtime_policy.tuning_env_overrides.items()
+                if key.endswith("AWQ_FUSED_SCOPE")
+            ),
+            None,
+        )
+        if fused_stage is not None:
             print(
                 ">>>> LiteEngine: fused rollout stage="
                 f"{fused_stage} "
-                "(set FASTINFERENCE_GEMMA4_FUSED_STAGE=off|attention_only|all to override)."
+                "(from runtime profile/model policy)."
             )
 
         # 3. Pre-allocate Block-based KV Cache (paged: block table + fixed pool; block_size tokens/block)
@@ -476,8 +445,9 @@ class LiteEngine:
         )
         if gpu_total_gb > 0 and total_gb > 0.85 * gpu_total_gb:
             print(
-                "     [Warn] Total allocated is high vs GPU size; reduce FASTINFERENCE_KV_MAX_MODEL_LEN "
-                "or FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS, or use FASTINFERENCE_KV_TYPE=fp8, or --frugal scheduling."
+                "     [Warn] Total allocated is high vs GPU size; "
+                "reduce the selected runtime profile context/concurrency limits "
+                "or choose the accuracy profile."
             )
 
         # slot_mapping maps batch tokens to physical indices

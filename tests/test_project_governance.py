@@ -111,6 +111,27 @@ def test_lite_engine_operational_policy_does_not_read_env_directly() -> None:
         )
 
 
+def test_production_engine_only_reads_fastinference_profile() -> None:
+    production_files = [
+        "vllm/engine/runtime_config.py",
+        "vllm/engine/lite_engine.py",
+        "vllm/engine/runtime_factory.py",
+        "vllm/engine/runtime_controller.py",
+        "vllm/engine/backend/lite_single_gpu.py",
+    ]
+    allowed = {"FASTINFERENCE_PROFILE"}
+    for rel in production_files:
+        text = _read(rel)
+        names = set(re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text))
+        if rel == "vllm/engine/runtime_config.py":
+            # Temporary compatibility snapshot for downstream model/kernel paths.
+            names.discard("FASTINFERENCE_")
+        unexpected = names - allowed
+        assert not unexpected, (
+            f"{rel} has production env reads: {sorted(unexpected)}"
+        )
+
+
 def test_qwen35_full_attention_policy_uses_runtime_config() -> None:
     qwen = _read("vllm/model_executor/models/qwen3_5.py")
 
