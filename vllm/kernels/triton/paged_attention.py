@@ -147,6 +147,19 @@ def _select_paged_attention_launch_config(
     if override is not None:
         return override
 
+    # For chunked prefill chunks (query_len > 8, represented as num_seqs in the
+    # flattened kernel launch)
+    if num_seqs > 8:
+        if head_size >= 256:
+            # Gemma4-31B / large heads benefit from high register/warp tiling
+            # under chunked prefill
+            return 8, 2
+        if is_int4 or is_fp8:
+            # Quantized KV cache with flattened prefills gets best L2 cache
+            # and pipeline tiling with 4 warps and 4 stages
+            return 4, 4
+        return 4, 2
+
     # Decode-heavy Gemma4-31B path: head_size=256, block_size=16.
     # Scope-aware bucket:
     # - global/full attention: low concurrency often benefits from leaner launch (2/2),

@@ -68,10 +68,33 @@ class StepScheduler:
         multimodal_lora_prefill_limit_tighten_delta: int = 1,
         multimodal_lora_fairness_relax_threshold: float = 0.0,
         multimodal_lora_locality_tighten_threshold: float = 0.0,
+        min_prefill_chunk_size: int | None = None,
+        max_prefill_chunk_size: int | None = None,
+        prefill_sla_ttft_ms: float | None = None,
     ) -> None:
         self.step_token_budget = max(1, int(step_token_budget))
         self.decode_priority_enabled = decode_priority_enabled
         self.prefill_chunk_size = max(1, int(prefill_chunk_size))
+
+        from vllm.engine.inference_config import LiteInferenceConfig
+
+        config = LiteInferenceConfig.from_env()
+        self.max_prefill_chunk_size = int(
+            max_prefill_chunk_size
+            if max_prefill_chunk_size is not None
+            else self.prefill_chunk_size
+        )
+        self.min_prefill_chunk_size = int(
+            min_prefill_chunk_size
+            if min_prefill_chunk_size is not None
+            else min(self.max_prefill_chunk_size, config.min_prefill_chunk_size)
+        )
+        self.prefill_sla_ttft_ms = float(
+            prefill_sla_ttft_ms
+            if prefill_sla_ttft_ms is not None
+            else config.prefill_sla_ttft_ms
+        )
+
         self.prefill_reserved_tokens = max(0, int(prefill_reserved_tokens))
         self.prefill_reserve_backlog = max(1, int(prefill_reserve_backlog))
         self.prefill_catchup_ratio = min(1.0, max(0.0, float(prefill_catchup_ratio)))
@@ -87,7 +110,8 @@ class StepScheduler:
             ).items()
         }
         self.admission_service_class_quotas = self._normalize_quotas(
-            admission_service_class_quotas or self.DEFAULT_ADMISSION_SERVICE_CLASS_QUOTAS
+            admission_service_class_quotas
+            or self.DEFAULT_ADMISSION_SERVICE_CLASS_QUOTAS
         )
         self.decode_service_class_quotas = self._normalize_quotas(
             decode_service_class_quotas or self.DEFAULT_DECODE_SERVICE_CLASS_QUOTAS
@@ -100,7 +124,9 @@ class StepScheduler:
             for item in (fairness_guardrail_service_classes or set())
             if str(item).strip()
         }
-        self.max_admit_lora_adapters_per_step = max(0, int(max_admit_lora_adapters_per_step))
+        self.max_admit_lora_adapters_per_step = max(
+            0, int(max_admit_lora_adapters_per_step)
+        )
         self.max_prefill_lora_adapters_per_batch = max(
             0, int(max_prefill_lora_adapters_per_batch)
         )
@@ -183,11 +209,44 @@ class StepScheduler:
             self._multimodal_prefix_cache_hit_rate_feedback = 0.0
 
     def build_plan(self, scheduler) -> StepPlan:
+        # Determine the maximum sequence length among all active requests
+        max_active_seq_len = 0
+        for rid in list(scheduler.running_ids) + list(scheduler.queued_ids):
+            try:
+                req = scheduler.get_request(rid)
+                active_len = (
+                    len(req["input_ids"])
+                    if req.get("is_prefill")
+                    else req.get("seq_len", 0)
+                )
+                if active_len > max_active_seq_len:
+                    max_active_seq_len = active_len
+            except KeyError:
+                continue
+
+        # Self-Adaptive Chunk Sizing
+        if max_active_seq_len > 16384:
+            chunk_size = 256
+        elif max_active_seq_len > 8192:
+            chunk_size = 512
+        elif max_active_seq_len > 4096:
+            chunk_size = 1024
+        else:
+            chunk_size = self.max_prefill_chunk_size
+
+        self.prefill_chunk_size = max(
+            self.min_prefill_chunk_size, min(chunk_size, self.max_prefill_chunk_size)
+        )
+
         fast_plan = self._build_single_request_fast_path(scheduler)
         if fast_plan is not None:
             self._update_prefill_deferrals(
-                [rid for rid in fast_plan.prefills.request_ids] if fast_plan.prefills else [],
-                [rid for rid in fast_plan.decodes.request_ids] if fast_plan.decodes else [],
+                [rid for rid in fast_plan.prefills.request_ids]
+                if fast_plan.prefills
+                else [],
+                [rid for rid in fast_plan.decodes.request_ids]
+                if fast_plan.decodes
+                else [],
                 fast_plan.prefills,
             )
             self._update_decode_streak(fast_plan)
@@ -204,11 +263,11 @@ class StepScheduler:
             admit_multimodal_lora_limit_triggered,
             admit_lora_relaxed,
             admit_lora_tightened,
-        ) = self._build_admission_plan(
-            scheduler
-        )
+        ) = self._build_admission_plan(scheduler)
         prefills, decodes = scheduler.classify_requests()
-        fairness_guardrail_triggered = self._is_fairness_guardrail_triggered(queued_metrics)
+        fairness_guardrail_triggered = self._is_fairness_guardrail_triggered(
+            queued_metrics
+        )
         starvation_protected = self._should_protect_prefills(
             prefills,
             decodes,
@@ -239,8 +298,12 @@ class StepScheduler:
             prefill_lora_tightened,
         ) = self._build_prefill_plan(scheduler, prefills, prefill_budget)
         prefill_request_ids = prefill_plan.request_ids if prefill_plan else []
-        prefill_service_classes = self._count_service_classes(scheduler, prefill_request_ids)
-        prefill_lora_adapters = self._count_lora_adapters(scheduler, prefill_request_ids)
+        prefill_service_classes = self._count_service_classes(
+            scheduler, prefill_request_ids
+        )
+        prefill_lora_adapters = self._count_lora_adapters(
+            scheduler, prefill_request_ids
+        )
         (
             decode_plan,
             decode_lora_gap,
@@ -261,7 +324,9 @@ class StepScheduler:
             prefill_plan is None,
         )
         decode_request_ids = decode_plan.request_ids if decode_plan else []
-        decode_service_classes = self._count_service_classes(scheduler, decode_request_ids)
+        decode_service_classes = self._count_service_classes(
+            scheduler, decode_request_ids
+        )
         decode_lora_adapters = self._count_lora_adapters(scheduler, decode_request_ids)
         admitted_request_ids = admissions.request_ids if admissions else []
         plan = StepPlan(
@@ -272,7 +337,9 @@ class StepScheduler:
             queued_before=scheduler.queued_request_count,
             running_before=scheduler.running_request_count,
             multimodal_prefix_cache_hit_rate=self._multimodal_prefix_cache_hit_rate_feedback,
-            prefill_starvation_protected=bool(starvation_protected and prefill_plan is not None),
+            prefill_starvation_protected=bool(
+                starvation_protected and prefill_plan is not None
+            ),
             aged_admission_count=aged_admission_count,
             admitted_service_classes=admitted_service_classes,
             admitted_multimodal_requests=self._count_multimodal_requests(
@@ -287,7 +354,9 @@ class StepScheduler:
             admit_multimodal_lora_limit_triggered=(
                 admit_multimodal_lora_limit_triggered
             ),
-            admitted_lora_adapters=self._count_lora_adapters(scheduler, admitted_request_ids),
+            admitted_lora_adapters=self._count_lora_adapters(
+                scheduler, admitted_request_ids
+            ),
             effective_admit_lora_adapter_limit=effective_admit_lora_limit,
             admit_lora_limit_relaxed=admit_lora_relaxed,
             admit_lora_limit_tightened=admit_lora_tightened,
@@ -309,12 +378,8 @@ class StepScheduler:
             effective_prefill_multimodal_lora_request_limit=(
                 effective_prefill_multimodal_lora_limit
             ),
-            prefill_multimodal_lora_limit_relaxed=(
-                prefill_multimodal_lora_relaxed
-            ),
-            prefill_multimodal_lora_limit_tightened=(
-                prefill_multimodal_lora_tightened
-            ),
+            prefill_multimodal_lora_limit_relaxed=(prefill_multimodal_lora_relaxed),
+            prefill_multimodal_lora_limit_tightened=(prefill_multimodal_lora_tightened),
             prefill_multimodal_lora_limit_relaxed_by_fairness=(
                 prefill_multimodal_lora_relaxed_by_fairness
             ),
@@ -472,7 +537,9 @@ class StepScheduler:
             request_ids.extend(
                 self._select_weighted_requests(
                     scheduler=scheduler,
-                    request_ids=[rid for rid in non_aged_ids if rid not in selected_set],
+                    request_ids=[
+                        rid for rid in non_aged_ids if rid not in selected_set
+                    ],
                     limit=admit_limit - len(request_ids),
                     cursor_attr="_admission_service_cursor",
                     prefer_short_prompts=True,
@@ -547,11 +614,29 @@ class StepScheduler:
     ) -> tuple[int, int]:
         if self.decode_priority_enabled:
             prefill_budget = 0
+            if num_prefills:
+                backlog_factor = (
+                    min(2.0, float(num_prefills) / float(self.prefill_reserve_backlog))
+                    if self.prefill_reserve_backlog > 0
+                    else 1.0
+                )
+                adjusted_catchup_ratio = min(
+                    0.9, self.prefill_catchup_ratio * backlog_factor
+                )
+                if num_prefills >= self.prefill_reserve_backlog:
+                    adjusted_catchup_ratio = max(adjusted_catchup_ratio, 0.35)
+                else:
+                    adjusted_catchup_ratio = max(
+                        adjusted_catchup_ratio, self.prefill_catchup_ratio
+                    )
+            else:
+                adjusted_catchup_ratio = self.prefill_catchup_ratio
+
             if starvation_protected and num_prefills:
                 reserve_tokens = max(
                     1,
                     self.prefill_reserved_tokens,
-                    int(self.step_token_budget * max(self.prefill_catchup_ratio, 0.25)),
+                    int(self.step_token_budget * max(adjusted_catchup_ratio, 0.25)),
                 )
                 prefill_budget = min(self.step_token_budget, reserve_tokens)
             elif num_prefills and not num_decodes:
@@ -559,10 +644,12 @@ class StepScheduler:
             elif num_prefills and num_prefills >= self.prefill_reserve_backlog:
                 reserve_tokens = max(
                     self.prefill_reserved_tokens,
-                    int(self.step_token_budget * self.prefill_catchup_ratio),
+                    int(self.step_token_budget * adjusted_catchup_ratio),
                 )
                 prefill_budget = min(self.step_token_budget, max(1, reserve_tokens))
-            decode_limit = min(num_decodes, max(0, self.step_token_budget - prefill_budget))
+            decode_limit = min(
+                num_decodes, max(0, self.step_token_budget - prefill_budget)
+            )
         else:
             if num_prefills:
                 reserve_tokens = max(1, self.prefill_reserved_tokens or 1)
@@ -644,7 +731,9 @@ class StepScheduler:
             )
         base_processed_len = scheduler.get_request(prefills[0])["seq_len"]
         candidate_prefills = [
-            rid for rid in prefills if scheduler.get_request(rid)["seq_len"] == base_processed_len
+            rid
+            for rid in prefills
+            if scheduler.get_request(rid)["seq_len"] == base_processed_len
         ]
         if not candidate_prefills:
             return (
@@ -669,9 +758,9 @@ class StepScheduler:
             candidate_prefills,
             self._prefill_rr_cursor,
         )[: min(self.prefill_microbatch_size, len(candidate_prefills))]
-        self._prefill_rr_cursor = (
-            self._prefill_rr_cursor + len(request_ids)
-        ) % max(1, len(candidate_prefills))
+        self._prefill_rr_cursor = (self._prefill_rr_cursor + len(request_ids)) % max(
+            1, len(candidate_prefills)
+        )
         (
             request_ids,
             effective_multimodal_limit,
@@ -734,7 +823,8 @@ class StepScheduler:
                 tightened,
             )
         min_remaining = min(
-            len(scheduler.get_request(rid)["input_ids"]) - scheduler.get_request(rid)["seq_len"]
+            len(scheduler.get_request(rid)["input_ids"])
+            - scheduler.get_request(rid)["seq_len"]
             for rid in request_ids
         )
         per_req_budget = max(1, token_budget // max(1, len(request_ids)))
@@ -905,7 +995,9 @@ class StepScheduler:
         relaxed = False
         tightened = False
         if effective_limit > 0:
-            candidate_mm_count = self._count_multimodal_requests(scheduler, candidate_prefills)
+            candidate_mm_count = self._count_multimodal_requests(
+                scheduler, candidate_prefills
+            )
             hit_rate = self._multimodal_prefix_cache_hit_rate_feedback
             if (
                 self.multimodal_prefix_cache_relax_threshold > 0
@@ -915,7 +1007,9 @@ class StepScheduler:
                     candidate_mm_count,
                     effective_limit + self.multimodal_prefill_limit_relax_delta,
                 )
-                relaxed = effective_limit > self.max_prefill_multimodal_requests_per_batch
+                relaxed = (
+                    effective_limit > self.max_prefill_multimodal_requests_per_batch
+                )
             elif (
                 self.multimodal_prefix_cache_tighten_threshold > 0
                 and hit_rate >= self.multimodal_prefix_cache_tighten_threshold
@@ -925,7 +1019,9 @@ class StepScheduler:
                     1,
                     effective_limit - self.multimodal_prefill_limit_tighten_delta,
                 )
-                tightened = effective_limit < self.max_prefill_multimodal_requests_per_batch
+                tightened = (
+                    effective_limit < self.max_prefill_multimodal_requests_per_batch
+                )
         shaped = self._apply_multimodal_request_limit(
             scheduler=scheduler,
             request_ids=request_ids,
@@ -1117,7 +1213,8 @@ class StepScheduler:
         shaped = [
             rid
             for rid in request_ids
-            if (not self._is_multimodal_request(scheduler, rid)) or rid in allowed_multimodal
+            if (not self._is_multimodal_request(scheduler, rid))
+            or rid in allowed_multimodal
         ]
         return shaped or request_ids[:1]
 
@@ -1137,12 +1234,20 @@ class StepScheduler:
         else:
             base_limit = max_multimodal_lora_requests
         relaxed = (
-            max_multimodal_lora_requests > 0 and max_multimodal_lora_requests > base_limit
+            max_multimodal_lora_requests > 0
+            and max_multimodal_lora_requests > base_limit
         )
         tightened = (
-            max_multimodal_lora_requests > 0 and base_limit > 0 and max_multimodal_lora_requests < base_limit
+            max_multimodal_lora_requests > 0
+            and base_limit > 0
+            and max_multimodal_lora_requests < base_limit
         )
-        effective_limit, relaxed_by_fairness, tightened_by_locality, max_fairness_gap = (
+        (
+            effective_limit,
+            relaxed_by_fairness,
+            tightened_by_locality,
+            max_fairness_gap,
+        ) = (
             self._effective_prefill_multimodal_lora_limit(
                 scheduler=scheduler,
                 candidate_request_ids=candidate_request_ids or request_ids,
@@ -1249,7 +1354,9 @@ class StepScheduler:
             return [], max_lora_adapters, {}, False, False
         baseline_share = self._normalized_share_map(baseline_counts)
         pre_limit_gap = self._share_gap_map(
-            self._normalized_share_map(self._count_lora_adapters(scheduler, request_ids)),
+            self._normalized_share_map(
+                self._count_lora_adapters(scheduler, request_ids)
+            ),
             baseline_share,
         )
         effective_limit = max_lora_adapters
@@ -1284,7 +1391,9 @@ class StepScheduler:
                 cursor_attr=cursor_attr,
             )
         fairness_gap = self._share_gap_map(
-            self._normalized_share_map(self._count_lora_adapters(scheduler, request_ids)),
+            self._normalized_share_map(
+                self._count_lora_adapters(scheduler, request_ids)
+            ),
             baseline_share,
         )
         return request_ids, effective_limit, fairness_gap, relaxed, tightened
@@ -1295,8 +1404,7 @@ class StepScheduler:
         request_ids: list[str],
     ) -> list[str]:
         adapters = {
-            self._lora_adapter_key(scheduler.get_request(rid))
-            for rid in request_ids
+            self._lora_adapter_key(scheduler.get_request(rid)) for rid in request_ids
         }
         return sorted(adapters)
 
@@ -1364,7 +1472,9 @@ class StepScheduler:
                 continue
             selected.extend(picked)
             picked_set = set(picked)
-            groups[service_class] = [rid for rid in groups[service_class] if rid not in picked_set]
+            groups[service_class] = [
+                rid for rid in groups[service_class] if rid not in picked_set
+            ]
         while len(selected) < limit:
             progressed = False
             for service_class in rotated_classes:
@@ -1383,7 +1493,9 @@ class StepScheduler:
                     continue
                 selected.extend(picked)
                 picked_set = set(picked)
-                groups[service_class] = [rid for rid in groups[service_class] if rid not in picked_set]
+                groups[service_class] = [
+                    rid for rid in groups[service_class] if rid not in picked_set
+                ]
                 progressed = True
                 if len(selected) >= limit:
                     break
@@ -1415,9 +1527,9 @@ class StepScheduler:
             )
         picked = selected_candidates[:take]
         if intra_class_rotate and picked:
-            self._decode_rr_cursor = (
-                self._decode_rr_cursor + len(picked)
-            ) % max(1, len(candidates))
+            self._decode_rr_cursor = (self._decode_rr_cursor + len(picked)) % max(
+                1, len(candidates)
+            )
         return picked
 
     def _compute_queued_metrics(
@@ -1464,7 +1576,9 @@ class StepScheduler:
                 if self._is_multimodal_lora(request):
                     multimodal_lora_requests += 1
             wait_sums[service_class] = wait_sums.get(service_class, 0.0) + queue_wait_s
-            wait_max[service_class] = max(wait_max.get(service_class, 0.0), queue_wait_s)
+            wait_max[service_class] = max(
+                wait_max.get(service_class, 0.0), queue_wait_s
+            )
             wait_values.setdefault(service_class, []).append(queue_wait_s)
             total_wait += queue_wait_s
             max_wait = max(max_wait, queue_wait_s)
@@ -1489,7 +1603,8 @@ class StepScheduler:
             },
             "service_class_max_wait_s": wait_max,
             "service_class_p95_wait_s": {
-                key: self._percentile(values, 0.95) for key, values in wait_values.items()
+                key: self._percentile(values, 0.95)
+                for key, values in wait_values.items()
             },
         }
 
@@ -1508,9 +1623,7 @@ class StepScheduler:
             return True
         if not self.fairness_guardrail_service_classes:
             return False
-        per_class_p95 = (
-            queued_metrics.get("service_class_p95_wait_s", {}) or {}
-        )
+        per_class_p95 = queued_metrics.get("service_class_p95_wait_s", {}) or {}
         return any(
             float(per_class_p95.get(service_class, 0.0) or 0.0) >= threshold
             for service_class in self.fairness_guardrail_service_classes
@@ -1527,7 +1640,9 @@ class StepScheduler:
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for rid in request_ids:
-            service_class = str(scheduler.get_request(rid).get("service_class") or "latency")
+            service_class = str(
+                scheduler.get_request(rid).get("service_class") or "latency"
+            )
             counts[service_class] = counts.get(service_class, 0) + 1
         return counts
 
@@ -1537,7 +1652,9 @@ class StepScheduler:
         request_ids: list[str],
     ) -> int:
         return sum(
-            1 for rid in request_ids if StepScheduler._is_multimodal(scheduler.get_request(rid))
+            1
+            for rid in request_ids
+            if StepScheduler._is_multimodal(scheduler.get_request(rid))
         )
 
     @staticmethod

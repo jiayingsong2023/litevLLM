@@ -38,6 +38,11 @@ class LiteInferenceConfig:
     kv_select_min_blocks: int = 4
     kv_select_min_context: int = 256
 
+    # Chunked Prefill and SLA Configuration
+    min_prefill_chunk_size: int = 128
+    max_prefill_chunk_size: int = 2048
+    prefill_sla_ttft_ms: float = 2000.0
+
     @classmethod
     def from_env(cls) -> "LiteInferenceConfig":
         # Resolve KV Type.
@@ -109,9 +114,7 @@ class LiteInferenceConfig:
                 1.0,
                 max(
                     0.0,
-                    float(
-                        os.environ.get("FASTINFERENCE_KV_SELECT_RATIO", "0.0")
-                    ),
+                    float(os.environ.get("FASTINFERENCE_KV_SELECT_RATIO", "0.0")),
                 ),
             ),
             kv_select_sig_dim=max(
@@ -125,6 +128,15 @@ class LiteInferenceConfig:
             kv_select_min_context=max(
                 64,
                 int(os.environ.get("FASTINFERENCE_KV_SELECT_MIN_CONTEXT", "256")),
+            ),
+            min_prefill_chunk_size=int(
+                os.environ.get("FASTINFERENCE_MIN_PREFILL_CHUNK", "128")
+            ),
+            max_prefill_chunk_size=int(
+                os.environ.get("FASTINFERENCE_MAX_PREFILL_CHUNK", "2048")
+            ),
+            prefill_sla_ttft_ms=float(
+                os.environ.get("FASTINFERENCE_SLA_TTFT_MS", "2000.0")
             ),
             tuning_env={
                 key: value

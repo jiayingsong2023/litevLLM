@@ -35,7 +35,9 @@ class InputBatchBuilder:
         request_ids: list[str],
         scheduler: Any,
         chunk_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[dict[str, Any]], list[bool]]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, dict[str, Any], list[dict[str, Any]], list[bool]
+    ]:
         curr_input_rows = []
         position_rows = []
         slot_mapping_rows = []
@@ -50,15 +52,21 @@ class InputBatchBuilder:
             slot_idx = req["slot_idx"]
             all_input_ids = req["input_ids"]
             processed_len = req["seq_len"]
-            is_last_chunk = processed_len + chunk_len >= len(all_input_ids)
+            prefix_hit_len = int(
+                req.get("prefix_hit_len") or req.get("_prefix_cache_hit_len") or 0
+            )
+            start_pos = max(processed_len, prefix_hit_len)
+
+            actual_chunk_len = min(chunk_len, len(all_input_ids) - start_pos)
+            is_last_chunk = start_pos + actual_chunk_len >= len(all_input_ids)
             is_last_chunk_flags.append(is_last_chunk)
 
-            curr_chunk_ids = all_input_ids[processed_len : processed_len + chunk_len]
+            curr_chunk_ids = all_input_ids[start_pos : start_pos + actual_chunk_len]
             curr_input_rows.append(curr_chunk_ids)
             position_rows.append(
                 torch.arange(
-                    processed_len,
-                    processed_len + chunk_len,
+                    start_pos,
+                    start_pos + actual_chunk_len,
                     device=self.device,
                     dtype=torch.long,
                 )
@@ -66,8 +74,8 @@ class InputBatchBuilder:
             slot_mapping_rows.append(
                 int(slot_idx) * self.max_model_len
                 + torch.arange(
-                    processed_len,
-                    processed_len + chunk_len,
+                    start_pos,
+                    start_pos + actual_chunk_len,
                     device=self.device,
                     dtype=torch.long,
                 )
@@ -75,8 +83,8 @@ class InputBatchBuilder:
             block_tables.append(
                 self.kv_block_manager.block_table_for_slot(slot_idx, device=self.device)
             )
-            seq_lens_prefill.append(processed_len + chunk_len)
-            kv_start_indices.append(processed_len)
+            seq_lens_prefill.append(start_pos + actual_chunk_len)
+            kv_start_indices.append(start_pos)
 
         curr_input = torch.tensor(curr_input_rows, device=self.device)
         positions = torch.stack(position_rows, dim=0).to(self.device)
@@ -88,7 +96,9 @@ class InputBatchBuilder:
             req_dicts_prefill, self.num_layers, "linear_conv_carry"
         )
         lora_mapping = [req.get("lora_id") for req in req_dicts_prefill]
-        multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts_prefill]
+        multimodal_flags = [
+            self._is_multimodal_request(req) for req in req_dicts_prefill
+        ]
         # CPU-side scalars / lists carried through attn_metadata so hot-path
         # model code (e.g. Gemma4 60-layer loop) can avoid `.item()` D->H syncs.
         seq_lens_cpu_list = [int(v) for v in seq_lens_prefill]
@@ -121,7 +131,9 @@ class InputBatchBuilder:
             "lora_mapping": lora_mapping,
             "lora_adapter_count": self._lora_adapter_count(lora_mapping),
             "mixed_lora_batch": self._is_mixed_lora_batch(lora_mapping),
-            "multimodal_request_count": self._multimodal_request_count(multimodal_flags),
+            "multimodal_request_count": self._multimodal_request_count(
+                multimodal_flags
+            ),
             "has_multimodal_requests": any(multimodal_flags),
             "mixed_multimodal_batch": self._is_mixed_multimodal_batch(multimodal_flags),
             "multimodal_lora_request_count": self._multimodal_lora_request_count(
@@ -131,7 +143,13 @@ class InputBatchBuilder:
                 self._is_multimodal_lora_request(req) for req in req_dicts_prefill
             ),
         }
-        return curr_input, positions, attn_metadata, req_dicts_prefill, is_last_chunk_flags
+        return (
+            curr_input,
+            positions,
+            attn_metadata,
+            req_dicts_prefill,
+            is_last_chunk_flags,
+        )
 
     def build_decode_batch(
         self,
@@ -161,7 +179,10 @@ class InputBatchBuilder:
             ]
         ).to(self.device)
         slot_mapping = torch.tensor(
-            [int(s) * self.max_model_len + p for s, p in zip(slot_indices, pos_indices)],
+            [
+                int(s) * self.max_model_len + p
+                for s, p in zip(slot_indices, pos_indices)
+            ],
             device=self.device,
             dtype=torch.long,
         )
@@ -199,10 +220,14 @@ class InputBatchBuilder:
             "lora_mapping": lora_mapping,
             "lora_adapter_count": self._lora_adapter_count(lora_mapping),
             "mixed_lora_batch": self._is_mixed_lora_batch(lora_mapping),
-            "multimodal_request_count": self._multimodal_request_count(multimodal_flags),
+            "multimodal_request_count": self._multimodal_request_count(
+                multimodal_flags
+            ),
             "has_multimodal_requests": any(multimodal_flags),
             "mixed_multimodal_batch": self._is_mixed_multimodal_batch(multimodal_flags),
-            "multimodal_lora_request_count": self._multimodal_lora_request_count(req_dicts),
+            "multimodal_lora_request_count": self._multimodal_lora_request_count(
+                req_dicts
+            ),
             "has_multimodal_lora_requests": any(
                 self._is_multimodal_lora_request(req) for req in req_dicts
             ),
@@ -250,7 +275,9 @@ class InputBatchBuilder:
         lora_mapping = [req.get("lora_id") for req in req_dicts]
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
 
-        slots_t = torch.tensor([req["slot_idx"] for req in req_dicts], device=self.device)
+        slots_t = torch.tensor(
+            [req["slot_idx"] for req in req_dicts], device=self.device
+        )
         block_tables = fast_block_tables.index_select(0, slots_t)
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
@@ -279,10 +306,14 @@ class InputBatchBuilder:
             "lora_mapping": lora_mapping,
             "lora_adapter_count": self._lora_adapter_count(lora_mapping),
             "mixed_lora_batch": self._is_mixed_lora_batch(lora_mapping),
-            "multimodal_request_count": self._multimodal_request_count(multimodal_flags),
+            "multimodal_request_count": self._multimodal_request_count(
+                multimodal_flags
+            ),
             "has_multimodal_requests": any(multimodal_flags),
             "mixed_multimodal_batch": self._is_mixed_multimodal_batch(multimodal_flags),
-            "multimodal_lora_request_count": self._multimodal_lora_request_count(req_dicts),
+            "multimodal_lora_request_count": self._multimodal_lora_request_count(
+                req_dicts
+            ),
             "has_multimodal_lora_requests": any(
                 self._is_multimodal_lora_request(req) for req in req_dicts
             ),
