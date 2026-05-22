@@ -47,7 +47,7 @@ class RuntimeProfile:
     prefill_catchup_ratio: float = 0.25
     prefill_microbatch_size: int = 2
     min_prefill_chunk_size: int = 128
-    max_prefill_chunk_size: int = 2048
+    max_prefill_chunk_size: int | None = None
     prefill_sla_ttft_ms: float = 2000.0
     default_min_new_tokens: int = 0
     queue_timeout_s: float = 30.0

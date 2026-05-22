@@ -41,7 +41,7 @@ class RuntimeAssemblyContext:
     prefill_catchup_ratio: float
     prefill_microbatch_size: int
     min_prefill_chunk_size: int
-    max_prefill_chunk_size: int
+    max_prefill_chunk_size: int | None
     prefill_sla_ttft_ms: float
     max_active_requests: int
     scheduler_policy: SchedulerRuntimePolicy

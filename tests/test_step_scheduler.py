@@ -53,6 +53,35 @@ def test_step_scheduler_constructor_does_not_read_lite_inference_env(
     assert step_scheduler.prefill_sla_ttft_ms == 1500.0
 
 
+def test_step_scheduler_none_max_prefill_uses_planner_chunk_size() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": list(range(1024)),
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=2048,
+        decode_priority_enabled=True,
+        prefill_chunk_size=512,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        max_prefill_chunk_size=None,
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert step_scheduler.max_prefill_chunk_size == 512
+    assert step_scheduler.prefill_chunk_size == 512
+    assert plan.prefills is not None
+    assert plan.prefills.chunk_len == 512
+
+
 def test_step_scheduler_decode_fast_path_when_only_decodes() -> None:
     scheduler = _scheduler_with_requests(
         [

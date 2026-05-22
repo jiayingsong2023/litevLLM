@@ -60,6 +60,16 @@ def test_runtime_config_latency_profile_caps_kv_shape(monkeypatch) -> None:
     assert cfg.kv_max_model_len == 512
 
 
+def test_runtime_config_default_max_prefill_chunk_preserves_planner(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.max_prefill_chunk_size is None
+
+
 def test_inference_config_from_env_defaults_to_turbo_int4(monkeypatch) -> None:
     monkeypatch.delenv("FASTINFERENCE_KV_TYPE", raising=False)
     monkeypatch.delenv("FASTINFERENCE_KV_FP8", raising=False)

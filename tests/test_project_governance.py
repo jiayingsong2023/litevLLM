@@ -113,6 +113,7 @@ def test_lite_engine_operational_policy_does_not_read_env_directly() -> None:
 
 def test_production_engine_only_reads_fastinference_profile() -> None:
     production_files = [
+        "vllm/engine/runtime_profile.py",
         "vllm/engine/runtime_config.py",
         "vllm/engine/inference_config.py",
         "vllm/engine/lite_engine.py",
