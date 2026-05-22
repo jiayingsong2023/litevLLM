@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 
+from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.request_scheduler import RequestScheduler
 from vllm.engine.step_scheduler import StepScheduler
 
@@ -26,6 +27,30 @@ def _scheduler_with_requests(requests: list[dict]) -> RequestScheduler:
         }
         scheduler.add_request(f"r{i}", state)
     return scheduler
+
+
+def test_step_scheduler_constructor_does_not_read_lite_inference_env(
+    monkeypatch,
+) -> None:
+    def fail_from_env() -> LiteInferenceConfig:
+        raise AssertionError("StepScheduler must not read LiteInferenceConfig.from_env")
+
+    monkeypatch.setattr(LiteInferenceConfig, "from_env", fail_from_env)
+
+    step_scheduler = StepScheduler(
+        step_token_budget=2,
+        decode_priority_enabled=True,
+        prefill_chunk_size=8,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+        min_prefill_chunk_size=4,
+        prefill_sla_ttft_ms=1500.0,
+    )
+
+    assert step_scheduler.min_prefill_chunk_size == 4
+    assert step_scheduler.prefill_sla_ttft_ms == 1500.0
 
 
 def test_step_scheduler_decode_fast_path_when_only_decodes() -> None:

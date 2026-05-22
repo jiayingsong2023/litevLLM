@@ -114,7 +114,9 @@ def test_lite_engine_operational_policy_does_not_read_env_directly() -> None:
 def test_production_engine_only_reads_fastinference_profile() -> None:
     production_files = [
         "vllm/engine/runtime_config.py",
+        "vllm/engine/inference_config.py",
         "vllm/engine/lite_engine.py",
+        "vllm/engine/step_scheduler.py",
         "vllm/engine/runtime_factory.py",
         "vllm/engine/runtime_controller.py",
         "vllm/engine/backend/lite_single_gpu.py",
@@ -122,13 +124,26 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
     allowed = {"FASTINFERENCE_PROFILE"}
     for rel in production_files:
         text = _read(rel)
+        if rel == "vllm/engine/inference_config.py":
+            text = text.split("    @classmethod\n    def from_env", maxsplit=1)[0]
         names = set(re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text))
-        if rel == "vllm/engine/runtime_config.py":
-            # Temporary compatibility snapshot for downstream model/kernel paths.
-            names.discard("FASTINFERENCE_")
         unexpected = names - allowed
         assert not unexpected, (
             f"{rel} has production env reads: {sorted(unexpected)}"
+        )
+
+
+def test_production_step_scheduler_does_not_call_inference_config_from_env() -> None:
+    scheduler = _read("vllm/engine/step_scheduler.py")
+
+    forbidden_patterns = (
+        "LiteInferenceConfig",
+        "from_env()",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in scheduler, (
+            "production StepScheduler must receive prefill policy from "
+            f"RuntimeConfig, not LiteInferenceConfig.from_env via {pattern!r}"
         )
 
 

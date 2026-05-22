@@ -30,6 +30,9 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
         prefill_reserve_backlog=2,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
+        min_prefill_chunk_size=4,
+        max_prefill_chunk_size=8,
+        prefill_sla_ttft_ms=1500.0,
         max_active_requests=4,
         scheduler_policy=SchedulerRuntimePolicy(max_decode_streak=9),
         backend_policy=BackendRuntimePolicy(
@@ -70,6 +73,9 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
 
     step_scheduler = runtime_components["step_scheduler"]
     assert step_scheduler.max_decode_streak == 9
+    assert step_scheduler.min_prefill_chunk_size == 4
+    assert step_scheduler.max_prefill_chunk_size == 8
+    assert step_scheduler.prefill_sla_ttft_ms == 1500.0
 
     backend = runtime_components["execution_backend"]
     stats = backend.stats()

@@ -76,9 +76,6 @@ class StepScheduler:
         self.decode_priority_enabled = decode_priority_enabled
         self.prefill_chunk_size = max(1, int(prefill_chunk_size))
 
-        from vllm.engine.inference_config import LiteInferenceConfig
-
-        config = LiteInferenceConfig.from_env()
         self.max_prefill_chunk_size = int(
             max_prefill_chunk_size
             if max_prefill_chunk_size is not None
@@ -87,12 +84,12 @@ class StepScheduler:
         self.min_prefill_chunk_size = int(
             min_prefill_chunk_size
             if min_prefill_chunk_size is not None
-            else min(self.max_prefill_chunk_size, config.min_prefill_chunk_size)
+            else min(self.max_prefill_chunk_size, 128)
         )
         self.prefill_sla_ttft_ms = float(
             prefill_sla_ttft_ms
             if prefill_sla_ttft_ms is not None
-            else config.prefill_sla_ttft_ms
+            else 2000.0
         )
 
         self.prefill_reserved_tokens = max(0, int(prefill_reserved_tokens))

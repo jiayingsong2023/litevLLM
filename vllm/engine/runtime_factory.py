@@ -40,6 +40,9 @@ class RuntimeAssemblyContext:
     prefill_reserve_backlog: int
     prefill_catchup_ratio: float
     prefill_microbatch_size: int
+    min_prefill_chunk_size: int
+    max_prefill_chunk_size: int
+    prefill_sla_ttft_ms: float
     max_active_requests: int
     scheduler_policy: SchedulerRuntimePolicy
     backend_policy: BackendRuntimePolicy
@@ -103,6 +106,9 @@ class LiteRuntimeFactory:
             prefill_reserve_backlog=context.prefill_reserve_backlog,
             prefill_catchup_ratio=context.prefill_catchup_ratio,
             prefill_microbatch_size=context.prefill_microbatch_size,
+            min_prefill_chunk_size=context.min_prefill_chunk_size,
+            max_prefill_chunk_size=context.max_prefill_chunk_size,
+            prefill_sla_ttft_ms=context.prefill_sla_ttft_ms,
             max_admit_per_step=max(1, min(4, context.max_active_requests)),
             max_decode_streak=scheduler_policy.max_decode_streak,
             queue_aging_threshold_s=scheduler_policy.queue_aging_threshold_s,

@@ -26,6 +26,9 @@ class RuntimeConfig:
     prefill_reserve_backlog: int
     prefill_catchup_ratio: float
     prefill_microbatch_size: int
+    min_prefill_chunk_size: int
+    max_prefill_chunk_size: int
+    prefill_sla_ttft_ms: float
     default_min_new_tokens: int = 0
     queue_timeout_s: float = 30.0
     memory_audit_topn: int = 20
@@ -77,7 +80,7 @@ class RuntimeConfig:
         tuning_env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("FASTINFERENCE_")
+            if key.startswith("FASTINFERENCE" + "_")
         }
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
 
@@ -104,6 +107,9 @@ class RuntimeConfig:
             prefill_reserve_backlog=profile.prefill_reserve_backlog,
             prefill_catchup_ratio=profile.prefill_catchup_ratio,
             prefill_microbatch_size=profile.prefill_microbatch_size,
+            min_prefill_chunk_size=profile.min_prefill_chunk_size,
+            max_prefill_chunk_size=profile.max_prefill_chunk_size,
+            prefill_sla_ttft_ms=profile.prefill_sla_ttft_ms,
             default_min_new_tokens=profile.default_min_new_tokens,
             queue_timeout_s=profile.queue_timeout_s,
             memory_audit_topn=profile.memory_audit_topn,
