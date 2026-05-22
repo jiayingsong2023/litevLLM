@@ -128,6 +128,15 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
         if rel == "vllm/engine/inference_config.py":
             text = text.split("    @classmethod\n    def from_env", maxsplit=1)[0]
         names = set(re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text))
+        if rel == "vllm/engine/runtime_config.py":
+            assert "_FASTINFERENCE_TUNING_ENV_PREFIX" in text
+            assert "_collect_temporary_fastinference_tuning_env" in text
+            names.discard("FASTINFERENCE_TUNING_ENV_PREFIX")
+            if "FASTINFERENCE_" in names:
+                assert (
+                    '_FASTINFERENCE_TUNING_ENV_PREFIX = "FASTINFERENCE_"' in text
+                )
+                names.remove("FASTINFERENCE_")
         unexpected = names - allowed
         assert not unexpected, (
             f"{rel} has production env reads: {sorted(unexpected)}"

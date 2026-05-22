@@ -6,6 +6,18 @@ from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePol
 from vllm.engine.runtime_profile import RuntimeProfile, RuntimeProfileRegistry
 
 
+_FASTINFERENCE_TUNING_ENV_PREFIX = "FASTINFERENCE_"
+
+
+def _collect_temporary_fastinference_tuning_env() -> dict[str, str]:
+    """Temporary bridge for model/kernel tuning until policies are migrated."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(_FASTINFERENCE_TUNING_ENV_PREFIX)
+    }
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     model_path: str
@@ -77,11 +89,7 @@ class RuntimeConfig:
             model_capabilities=getattr(vllm_config, "model_capabilities", None),
             gpu_total_gb=get_total_gpu_memory_gb(),
         )
-        tuning_env = {
-            key: value
-            for key, value in os.environ.items()
-            if key.startswith("FASTINFERENCE" + "_")
-        }
+        tuning_env = _collect_temporary_fastinference_tuning_env()
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
 
         return cls(
