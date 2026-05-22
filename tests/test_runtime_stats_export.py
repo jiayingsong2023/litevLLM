@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from vllm.engine import async_llm as async_llm_module
+from vllm.engine.runtime_controller import RuntimeController
 from vllm.entrypoints.llm import LLM
 from vllm.entrypoints.openai import api_server
 
@@ -20,8 +21,18 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             self.reset_calls.append(clear_prefix_cache)
 
-        def register_lora_adapter(self, *, lora_name: str, lora_path: str | None = None, lora_int_id: int | None = None):
-            return {"lora_name": lora_name, "lora_path": lora_path, "lora_int_id": lora_int_id}
+        def register_lora_adapter(
+            self,
+            *,
+            lora_name: str,
+            lora_path: str | None = None,
+            lora_int_id: int | None = None,
+        ):
+            return {
+                "lora_name": lora_name,
+                "lora_path": lora_path,
+                "lora_int_id": lora_int_id,
+            }
 
         def unregister_lora_adapter(self, lora_name: str) -> bool:
             return lora_name == "demo"
@@ -41,14 +52,18 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
 
     monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
     monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
-    monkeypatch.setattr(async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
 
     llm = async_llm_module.AsyncLLM(DummyConfig())
 
     assert llm.stats() == {"scheduler": {"active_request_count": 1}}
     llm.reset_stats(clear_prefix_cache=True)
     assert llm.engine.reset_calls == [True]
-    assert llm.register_lora_adapter(lora_name="demo", lora_path="/tmp/demo", lora_int_id=7) == {
+    assert llm.register_lora_adapter(
+        lora_name="demo", lora_path="/tmp/demo", lora_int_id=7
+    ) == {
         "lora_name": "demo",
         "lora_path": "/tmp/demo",
         "lora_int_id": 7,
@@ -69,8 +84,18 @@ def test_llm_stats_delegates_to_engine() -> None:
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             self.reset_calls.append(clear_prefix_cache)
 
-        def register_lora_adapter(self, *, lora_name: str, lora_path: str | None = None, lora_int_id: int | None = None):
-            return {"lora_name": lora_name, "lora_path": lora_path, "lora_int_id": lora_int_id}
+        def register_lora_adapter(
+            self,
+            *,
+            lora_name: str,
+            lora_path: str | None = None,
+            lora_int_id: int | None = None,
+        ):
+            return {
+                "lora_name": lora_name,
+                "lora_path": lora_path,
+                "lora_int_id": lora_int_id,
+            }
 
         def unregister_lora_adapter(self, lora_name: str) -> bool:
             return lora_name == "demo"
@@ -80,7 +105,9 @@ def test_llm_stats_delegates_to_engine() -> None:
     assert llm.stats() == {"backend": {"backend_type": "fake"}}
     llm.reset_stats(clear_prefix_cache=True)
     assert llm.engine.reset_calls == [True]
-    assert llm.register_lora_adapter(lora_name="demo", lora_path="/tmp/demo", lora_int_id=7) == {
+    assert llm.register_lora_adapter(
+        lora_name="demo", lora_path="/tmp/demo", lora_int_id=7
+    ) == {
         "lora_name": "demo",
         "lora_path": "/tmp/demo",
         "lora_int_id": 7,
@@ -98,6 +125,11 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
 
         def stats(self) -> dict[str, object]:
             return {
+                "profile": {
+                    "requested": "auto",
+                    "effective": "benchmark",
+                    "kv_cache_dtype": "turbo_int4",
+                },
                 "scheduler": {"active_request_count": 2},
                 "observer": {"step_count": 3},
             }
@@ -121,13 +153,13 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
                 "hit_rate": 0.0,
                 "avg_saved_prefill_tokens_per_request": 0.0,
             },
-                "preemption": {
-                    "preempted_steps": 0,
-                    "preempted_prefill_requests": 0,
-                    "preempted_multimodal_prefill_requests": 0,
-                    "protected_multimodal_prefix_steps": 0,
-                    "protected_multimodal_prefix_prefill_requests": 0,
-                },
+            "preemption": {
+                "preempted_steps": 0,
+                "preempted_prefill_requests": 0,
+                "preempted_multimodal_prefill_requests": 0,
+                "protected_multimodal_prefix_steps": 0,
+                "protected_multimodal_prefix_prefill_requests": 0,
+            },
             "fairness": {
                 "p95_queue_wait_s": 0.0,
                 "max_queue_wait_s": 0.0,
@@ -146,41 +178,41 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
                 "decode_relaxed_steps": 0,
                 "decode_tightened_steps": 0,
             },
-                "multimodal": {
-                    "requests": 0,
-                    "images": 0,
-                    "multimodal_lora_requests": 0,
-                    "queued_requests": 0,
+            "multimodal": {
+                "requests": 0,
+                "images": 0,
+                "multimodal_lora_requests": 0,
+                "queued_requests": 0,
                 "admitted_requests": 0,
                 "prefill_requests": 0,
                 "prefill_multimodal_lora_requests": 0,
                 "decode_requests": 0,
                 "p95_queue_wait_s": 0.0,
                 "prefix_cache_hits": 0,
-                    "prefix_cache_misses": 0,
-                    "prefix_cache_saved_prefill_tokens": 0,
-                    "prefix_cache_hit_rate": 0.0,
-                    "mixed_multimodal_lora_prefill_ratio": 0.0,
-                    "avg_effective_prefill_multimodal_limit": 0.0,
-                    "prefill_multimodal_limit_relaxed_steps": 0,
-                    "prefill_multimodal_limit_tightened_steps": 0,
-                    "prefill_multimodal_limit_triggered_steps": 0,
-                    "avg_effective_admit_multimodal_lora_limit": 0.0,
-                    "avg_effective_prefill_multimodal_lora_limit": 0.0,
-                    "avg_effective_decode_multimodal_lora_limit": 0.0,
-                    "admit_multimodal_lora_limit_triggered_steps": 0,
-                    "prefill_multimodal_lora_limit_relaxed_steps": 0,
-                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
-                    "prefill_multimodal_lora_limit_tightened_steps": 0,
-                    "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
-                    "prefill_multimodal_lora_limit_triggered_steps": 0,
-                    "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
-                    "decode_multimodal_lora_limit_relaxed_steps": 0,
-                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
-                    "decode_multimodal_lora_limit_tightened_steps": 0,
-                    "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
-                    "decode_multimodal_lora_limit_triggered_steps": 0,
-                    "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
+                "prefix_cache_misses": 0,
+                "prefix_cache_saved_prefill_tokens": 0,
+                "prefix_cache_hit_rate": 0.0,
+                "mixed_multimodal_lora_prefill_ratio": 0.0,
+                "avg_effective_prefill_multimodal_limit": 0.0,
+                "prefill_multimodal_limit_relaxed_steps": 0,
+                "prefill_multimodal_limit_tightened_steps": 0,
+                "prefill_multimodal_limit_triggered_steps": 0,
+                "avg_effective_admit_multimodal_lora_limit": 0.0,
+                "avg_effective_prefill_multimodal_lora_limit": 0.0,
+                "avg_effective_decode_multimodal_lora_limit": 0.0,
+                "admit_multimodal_lora_limit_triggered_steps": 0,
+                "prefill_multimodal_lora_limit_relaxed_steps": 0,
+                "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                "prefill_multimodal_lora_limit_tightened_steps": 0,
+                "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                "prefill_multimodal_lora_limit_triggered_steps": 0,
+                "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
+                "decode_multimodal_lora_limit_relaxed_steps": 0,
+                "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                "decode_multimodal_lora_limit_tightened_steps": 0,
+                "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                "decode_multimodal_lora_limit_triggered_steps": 0,
+                "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
                 "prepared_requests": 0,
                 "prepared_images": 0,
                 "embeddings_computed": 0,
@@ -188,9 +220,61 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
             },
         },
         "stats": {
+            "profile": {
+                "requested": "auto",
+                "effective": "benchmark",
+                "kv_cache_dtype": "turbo_int4",
+            },
             "scheduler": {"active_request_count": 2},
             "observer": {"step_count": 3},
         },
+    }
+
+
+def test_runtime_controller_stats_include_profile() -> None:
+    class FakeProfile:
+        def stats(self) -> dict[str, object]:
+            return {
+                "requested": "auto",
+                "effective": "benchmark",
+                "kv_cache_dtype": "turbo_int4",
+            }
+
+    class FakeRuntimeConfig:
+        profile = FakeProfile()
+
+    class FakeScheduler:
+        active_request_count = 2
+        running_request_count = 1
+        queued_request_count = 1
+        available_slots = 3
+        runtime_config = FakeRuntimeConfig()
+
+    class FakeObserver:
+        def stats(self) -> dict[str, object]:
+            return {"step_count": 3}
+
+    class FakeBackend:
+        def stats(self) -> dict[str, object]:
+            return {"backend_type": "fake"}
+
+        def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
+            del clear_prefix_cache
+
+    controller = RuntimeController(
+        scheduler=FakeScheduler(),
+        step_scheduler=object(),
+        observer=FakeObserver(),
+        backend=FakeBackend(),
+        queue_timeout_s=15.0,
+    )
+
+    stats = controller.stats()
+
+    assert stats["profile"] == {
+        "requested": "auto",
+        "effective": "benchmark",
+        "kv_cache_dtype": "turbo_int4",
     }
 
 
@@ -229,13 +313,13 @@ def test_runtime_stats_reset_endpoint_resets_engine_stats() -> None:
                 "hit_rate": 0.0,
                 "avg_saved_prefill_tokens_per_request": 0.0,
             },
-                "preemption": {
-                    "preempted_steps": 0,
-                    "preempted_prefill_requests": 0,
-                    "preempted_multimodal_prefill_requests": 0,
-                    "protected_multimodal_prefix_steps": 0,
-                    "protected_multimodal_prefix_prefill_requests": 0,
-                },
+            "preemption": {
+                "preempted_steps": 0,
+                "preempted_prefill_requests": 0,
+                "preempted_multimodal_prefill_requests": 0,
+                "protected_multimodal_prefix_steps": 0,
+                "protected_multimodal_prefix_prefill_requests": 0,
+            },
             "fairness": {
                 "p95_queue_wait_s": 0.0,
                 "max_queue_wait_s": 0.0,
@@ -254,41 +338,41 @@ def test_runtime_stats_reset_endpoint_resets_engine_stats() -> None:
                 "decode_relaxed_steps": 0,
                 "decode_tightened_steps": 0,
             },
-                "multimodal": {
-                    "requests": 0,
-                    "images": 0,
-                    "multimodal_lora_requests": 0,
-                    "queued_requests": 0,
+            "multimodal": {
+                "requests": 0,
+                "images": 0,
+                "multimodal_lora_requests": 0,
+                "queued_requests": 0,
                 "admitted_requests": 0,
                 "prefill_requests": 0,
                 "prefill_multimodal_lora_requests": 0,
                 "decode_requests": 0,
                 "p95_queue_wait_s": 0.0,
                 "prefix_cache_hits": 0,
-                    "prefix_cache_misses": 0,
-                    "prefix_cache_saved_prefill_tokens": 0,
-                    "prefix_cache_hit_rate": 0.0,
-                    "mixed_multimodal_lora_prefill_ratio": 0.0,
-                    "avg_effective_prefill_multimodal_limit": 0.0,
-                    "prefill_multimodal_limit_relaxed_steps": 0,
-                    "prefill_multimodal_limit_tightened_steps": 0,
-                    "prefill_multimodal_limit_triggered_steps": 0,
-                    "avg_effective_admit_multimodal_lora_limit": 0.0,
-                    "avg_effective_prefill_multimodal_lora_limit": 0.0,
-                    "avg_effective_decode_multimodal_lora_limit": 0.0,
-                    "admit_multimodal_lora_limit_triggered_steps": 0,
-                    "prefill_multimodal_lora_limit_relaxed_steps": 0,
-                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
-                    "prefill_multimodal_lora_limit_tightened_steps": 0,
-                    "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
-                    "prefill_multimodal_lora_limit_triggered_steps": 0,
-                    "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
-                    "decode_multimodal_lora_limit_relaxed_steps": 0,
-                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
-                    "decode_multimodal_lora_limit_tightened_steps": 0,
-                    "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
-                    "decode_multimodal_lora_limit_triggered_steps": 0,
-                    "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
+                "prefix_cache_misses": 0,
+                "prefix_cache_saved_prefill_tokens": 0,
+                "prefix_cache_hit_rate": 0.0,
+                "mixed_multimodal_lora_prefill_ratio": 0.0,
+                "avg_effective_prefill_multimodal_limit": 0.0,
+                "prefill_multimodal_limit_relaxed_steps": 0,
+                "prefill_multimodal_limit_tightened_steps": 0,
+                "prefill_multimodal_limit_triggered_steps": 0,
+                "avg_effective_admit_multimodal_lora_limit": 0.0,
+                "avg_effective_prefill_multimodal_lora_limit": 0.0,
+                "avg_effective_decode_multimodal_lora_limit": 0.0,
+                "admit_multimodal_lora_limit_triggered_steps": 0,
+                "prefill_multimodal_lora_limit_relaxed_steps": 0,
+                "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                "prefill_multimodal_lora_limit_tightened_steps": 0,
+                "prefill_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                "prefill_multimodal_lora_limit_triggered_steps": 0,
+                "avg_prefill_multimodal_lora_max_fairness_gap": 0.0,
+                "decode_multimodal_lora_limit_relaxed_steps": 0,
+                "decode_multimodal_lora_limit_relaxed_by_fairness_steps": 0,
+                "decode_multimodal_lora_limit_tightened_steps": 0,
+                "decode_multimodal_lora_limit_tightened_by_locality_steps": 0,
+                "decode_multimodal_lora_limit_triggered_steps": 0,
+                "avg_decode_multimodal_lora_max_fairness_gap": 0.0,
                 "prepared_requests": 0,
                 "prepared_images": 0,
                 "embeddings_computed": 0,

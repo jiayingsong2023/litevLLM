@@ -482,6 +482,7 @@ class LiteEngine:
 
         # slot_mapping maps batch tokens to physical indices
         self.scheduler = RequestScheduler(self.max_active_requests)
+        setattr(self.scheduler, "runtime_config", self.runtime_config)
         self.lora_registry = LoRARuntimeRegistry()
         self.policies = None
         self.sampling_driver = None

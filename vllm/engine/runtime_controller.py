@@ -107,6 +107,15 @@ class RuntimeController:
         observer_stats: dict[str, Any] = {}
         if hasattr(self.observer, "stats"):
             observer_stats = dict(self.observer.stats())
+        profile: dict[str, Any] = {}
+        runtime_config = getattr(self.scheduler, "runtime_config", None)
+        if (
+            runtime_config is not None
+            and getattr(runtime_config, "profile", None) is not None
+        ):
+            profile = dict(runtime_config.profile.stats())
+        elif hasattr(self.backend, "profile_stats"):
+            profile = dict(self.backend.profile_stats())
         observed_at_unix_s = time.time()
         return {
             "observed_at_unix_s": observed_at_unix_s,
@@ -115,15 +124,24 @@ class RuntimeController:
                 0.0, time.perf_counter() - self._stats_reset_at_monotonic_s
             ),
             "queue_timeout_s": self.queue_timeout_s,
+            "profile": profile,
             "scheduler": {
-                "active_request_count": int(getattr(self.scheduler, "active_request_count", 0)),
-                "running_request_count": int(getattr(self.scheduler, "running_request_count", 0)),
-                "queued_request_count": int(getattr(self.scheduler, "queued_request_count", 0)),
+                "active_request_count": int(
+                    getattr(self.scheduler, "active_request_count", 0)
+                ),
+                "running_request_count": int(
+                    getattr(self.scheduler, "running_request_count", 0)
+                ),
+                "queued_request_count": int(
+                    getattr(self.scheduler, "queued_request_count", 0)
+                ),
                 "available_slots": int(getattr(self.scheduler, "available_slots", 0)),
             },
             "observer": observer_stats,
             "backend": dict(self.backend.stats()),
-            "lora": dict(self.lora_registry.stats()) if self.lora_registry is not None else {},
+            "lora": dict(self.lora_registry.stats())
+            if self.lora_registry is not None
+            else {},
         }
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:

@@ -758,10 +758,12 @@ def _collect_runtime_stats(
     phase: str,
 ) -> Dict[str, object]:
     snapshot = copy.deepcopy(llm.stats())
+    profile_stats = dict(snapshot.get("profile") or {})
     derived_metrics = _derive_runtime_metrics(snapshot)
     return {
         "phase": phase,
         "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "profile": profile_stats,
         "stats": snapshot,
         "derived_metrics": derived_metrics,
     }
@@ -2272,6 +2274,7 @@ async def run_benchmark(
                 )
             awq_metrics = _derive_awq_metrics(awq_stats) if awq_stats else {}
             benchmark_stats = _collect_runtime_stats(llm, phase="benchmark")
+            profile_stats = dict(benchmark_stats.get("profile") or {})
             return {
                 "skipped": 0.0,
                 "timed_out": 1.0,
@@ -2310,6 +2313,7 @@ async def run_benchmark(
                     ),
                     "multimodal_image_size": max(2, int(multimodal_image_size)),
                 },
+                "profile": profile_stats,
                 "runtime_stats": {
                     **runtime_stats_by_phase,
                     "benchmark": benchmark_stats,
@@ -2326,6 +2330,7 @@ async def run_benchmark(
         runtime_stats_by_phase["benchmark"] = _collect_runtime_stats(
             llm, phase="benchmark"
         )
+        profile_stats = dict(runtime_stats_by_phase["benchmark"].get("profile") or {})
         runtime_stats_by_phase["phase_diffs"] = _derive_runtime_phase_diffs(
             runtime_stats_by_phase
         )
@@ -2426,6 +2431,7 @@ async def run_benchmark(
                 "multimodal_image_size": max(2, int(multimodal_image_size)),
             },
             "stable_env": dict(spec.stable_env),
+            "profile": profile_stats,
             "runtime_stats": runtime_stats_by_phase,
             "warmup_trace": warmup_trace,
         }
@@ -2441,6 +2447,12 @@ async def run_benchmark(
             f"Decode TPS(agg)={_fmt_float(result['decode_tps_aggregate'], '.2f')}, "
             f"Decode TPS p50={_fmt_float(result['decode_tps_p50'], '.2f')}, "
             f"stream_visible={_fmt_float(result['stream_progressive_visible_ratio'] * 100.0, '.1f')}%"
+        )
+        print(
+            "  PROFILE "
+            f"requested={profile_stats.get('requested', 'unknown')} "
+            f"effective={profile_stats.get('effective', 'unknown')} "
+            f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
         )
         if spec.concurrent_reqs > 1:
             print(
@@ -2959,6 +2971,13 @@ async def main() -> None:
             continue
         if r.get("timed_out", 0.0) == 1.0:
             print(f"{key:16} | timeout")
+            profile_stats = dict(r.get("profile") or {})
+            print(
+                "PROFILE "
+                f"requested={profile_stats.get('requested', 'unknown')} "
+                f"effective={profile_stats.get('effective', 'unknown')} "
+                f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
+            )
             continue
         print(
             f"{key:16} | tps={_fmt_float(r['aggregate_tps'], '.2f')} | "
@@ -2969,6 +2988,13 @@ async def main() -> None:
             f"decode_tps_p50={_fmt_float(r['decode_tps_p50'], '.2f')} | "
             f"stream_visible={_fmt_float(float(r.get('stream_progressive_visible_ratio', 0.0) or 0.0) * 100.0, '.1f')}% | "
             f"workload={r.get('workload', {}).get('kind', args.workload)}"
+        )
+        profile_stats = dict(r.get("profile") or {})
+        print(
+            "PROFILE "
+            f"requested={profile_stats.get('requested', 'unknown')} "
+            f"effective={profile_stats.get('effective', 'unknown')} "
+            f"kv={profile_stats.get('kv_cache_dtype', 'unknown')}"
         )
     if compile_cache_meta.get("enabled"):
         print(
