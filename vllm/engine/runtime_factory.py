@@ -10,8 +10,8 @@ from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.multimodal_processor import LiteMultiModalProcessor
 from vllm.engine.prefill_executor import PrefillExecutor
-from vllm.engine.runtime_config import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_controller import RuntimeController
+from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.step_scheduler import StepScheduler
 
 
