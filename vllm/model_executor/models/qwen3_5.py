@@ -1,22 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-# GatedDeltaNet helpers below align with Hugging Face `modeling_qwen3_5.py` (torch fallback path).
+# GatedDeltaNet helpers below align with Hugging Face `modeling_qwen3_5.py`
+# (torch fallback path).
 from collections import OrderedDict
+from typing import Any, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Any, Tuple
+
+from vllm.adapters.qwen3_5 import QWEN35_PRODUCTION_MODEL_POLICY
 from vllm.model_executor.layers.lite_linear import LiteLinear
-from .lite_config import LiteConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
     fp8_scale_shape_2d,
-    moe_fp8_enabled,
-    moe_offload_enabled,
     moe_expert_lru_size,
     moe_fp8_dequant_to_linear_weight,
+    moe_fp8_enabled,
+    moe_offload_enabled,
 )
-from vllm.adapters.qwen3_5 import QWEN35_PRODUCTION_MODEL_POLICY
+
+from .lite_config import LiteConfig
 
 
 def _qwen35_model_policy_truthy(
@@ -1231,8 +1235,8 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         else:
             k_scale_cache, v_scale_cache = (None, None)
 
-        from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
         from vllm.kernels.triton.paged_attention import paged_attention_v1
+        from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
 
         kv_cache_dtype = (
             inf_config.kv_type

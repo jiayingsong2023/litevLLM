@@ -43,7 +43,7 @@ class ModelAdapter(Protocol):
         model_config: Any,
         runtime_config: Any,
     ) -> RuntimeModelPolicy:
-        """Return model-specific runtime policy without leaking model names into engine."""
+        """Return model-specific runtime policy without engine model checks."""
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         """Install model-specific tuning config before model construction."""

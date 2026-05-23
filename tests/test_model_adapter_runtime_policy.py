@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.adapters.gemma4 import Gemma4Adapter
-from vllm.adapters.registry import get_model_adapter
 from vllm.adapters.qwen3_5 import Qwen35Adapter
+from vllm.adapters.registry import get_model_adapter
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_planner import RuntimePlanner
 

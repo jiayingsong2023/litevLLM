@@ -35,8 +35,8 @@ def _mock_text_config_vllm_config() -> SimpleNamespace:
 def test_lite_engine_attaches_runtime_config_before_model_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm.engine import lite_engine as lite_engine_module
     from vllm.adapters.base import RuntimeModelPolicy
+    from vllm.engine import lite_engine as lite_engine_module
 
     class StopAfterModelConfigCheck(Exception):
         pass
