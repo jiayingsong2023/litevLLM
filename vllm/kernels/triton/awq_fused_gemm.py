@@ -52,6 +52,13 @@ def _tool_override_get(name: str) -> str | None:
     return raw
 
 
+def _snapshot_override_get(name: str) -> str | None:
+    raw = _AWQ_FUSED_TUNING.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw
+
+
 def _tool_override_bool(
     raw: str | None,
     default: bool | None = None,
@@ -228,31 +235,34 @@ def _select_fused_gemm_blocks(
     return block_m, block_n, block_k, num_warps, num_stages
 
 
-def _fused_gemm_blocks_tool_override() -> tuple[int, int, int, int, int] | None:
-    raw_m = _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M")
+def _fused_gemm_blocks_tool_override(
+    *, snapshot_only: bool = False
+) -> tuple[int, int, int, int, int] | None:
+    get_override = _snapshot_override_get if snapshot_only else _tool_override_get
+    raw_m = get_override("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M")
     if raw_m is None:
         return None
     block_m = max(1, _tool_override_int(raw_m, 64, minimum=1, maximum=1 << 20))
     block_n = _tool_override_int(
-        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N"),
+        get_override("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N"),
         64,
         minimum=16,
         maximum=1 << 20,
     )
     block_k = _tool_override_int(
-        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K"),
+        get_override("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K"),
         32,
         minimum=8,
         maximum=1 << 20,
     )
     num_warps = _tool_override_int(
-        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS"),
+        get_override("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS"),
         4,
         minimum=1,
         maximum=8,
     )
     num_stages = _tool_override_int(
-        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES"),
+        get_override("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES"),
         2,
         minimum=1,
         maximum=4,
@@ -736,7 +746,7 @@ def _resolve_fused_gemm_blocks(
     n: int,
     k: int,
 ) -> tuple[int, int, int, int, int]:
-    override = _fused_gemm_blocks_tool_override()
+    override = _fused_gemm_blocks_tool_override(snapshot_only=True)
     if override is not None:
         return override
     return _select_fused_gemm_blocks(m, n, k)
@@ -750,7 +760,7 @@ def _resolve_packed_int4_fused_gemm_blocks(
     group_size: int,
     split_k: int,
 ) -> tuple[int, int, int, int, int]:
-    override = _fused_gemm_blocks_tool_override()
+    override = _fused_gemm_blocks_tool_override(snapshot_only=True)
     if override is not None:
         return override
     profile_blocks = _lookup_persistent_blocks(

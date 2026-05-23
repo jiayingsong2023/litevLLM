@@ -420,6 +420,7 @@ def test_awq_tensor_production_env_reads_are_tool_only() -> None:
             "FASTINFERENCE_AWQ_POLICY_MATRIX",
             "FASTINFERENCE_AWQ_FUSED_SCOPE",
             "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ",
+            "FASTINFERENCE_GEMMA4_DENSE_MLP",
         ),
         allowed_defs={
             "_env_get",

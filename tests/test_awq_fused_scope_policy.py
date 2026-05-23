@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from vllm.model_executor.layers.quantization.tensor import (
     AWQExecutionPolicy,
+    _default_awq_dense_fallback_max_gb,
     awq_decode_gemv_enabled,
     resolve_awq_execution_policy,
     should_allow_awq_fused,
@@ -92,3 +94,17 @@ def test_resolve_awq_execution_policy_prefers_kernel_policy_over_env(
     assert policy.allow_dense_cache is True
     assert policy.cache_scope == "attention_only"
     assert policy.fused_scope == "all"
+
+
+def test_default_awq_dense_fallback_max_gb_ignores_dense_mlp_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_DENSE_MLP", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", Mock(return_value=True))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        Mock(return_value=SimpleNamespace(total_memory=48 * (1024**3))),
+    )
+
+    assert _default_awq_dense_fallback_max_gb() == 14.0

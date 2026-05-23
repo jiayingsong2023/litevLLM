@@ -180,10 +180,6 @@ def _default_awq_dense_fallback_max_gb() -> float:
         total_gb = float(torch.cuda.get_device_properties(0).total_memory) / (1024**3)
     except Exception:
         return 4.0
-    if total_gb >= 48.0 and _env_get(
-        "FASTINFERENCE_GEMMA4_DENSE_MLP", "0"
-    ).strip().lower() in ("1", "true", "yes", "on"):
-        return 44.0
     if total_gb >= 48.0:
         return 14.0
     if total_gb >= 32.0:
