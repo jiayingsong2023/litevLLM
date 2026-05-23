@@ -125,6 +125,9 @@ class LiteEngine:
             self.model_config,
             self.runtime_config,
         )
+        self._apply_runtime_model_policy()
+        self._install_runtime_policy_on_runtime_config(self.runtime_policy)
+        self.vllm_config.runtime_config = self.runtime_config
         self._install_tuning_configs_for_model(self.runtime_policy)
 
         # 1. Load Model
@@ -138,10 +141,6 @@ class LiteEngine:
             policy_mode=requested_policy_mode,  # type: ignore[arg-type]
         )
         self.adapter = get_model_adapter(self.model, self.model_config)
-        self.runtime_policy = self.adapter.runtime_policy(
-            self.model_config,
-            self.runtime_config,
-        )
         self.model_capabilities = self.adapter.detect(self.model, self.model_config)
         self.vllm_config.model_capabilities = self.model_capabilities
         self.num_attention_heads = self.model_capabilities.num_attention_heads
@@ -153,7 +152,6 @@ class LiteEngine:
             f"{self.num_kv_heads} KV-heads, {self.head_size} head_dim"
         )
         self._layer_kv_specs = self._resolve_layer_kv_specs()
-        self._apply_runtime_model_policy()
         fused_stage = next(
             (
                 value
@@ -559,6 +557,18 @@ class LiteEngine:
         self.runtime_config = replace(
             self.runtime_config,
             kv_cache_dtype=force_kv_dtype,
+        )
+
+    def _install_runtime_policy_on_runtime_config(self, runtime_policy: Any) -> None:
+        object.__setattr__(
+            self.runtime_config,
+            "model_policy",
+            dict(getattr(runtime_policy, "model_policy", {}) or {}),
+        )
+        object.__setattr__(
+            self.runtime_config,
+            "kernel_policy",
+            dict(getattr(runtime_policy, "kernel_policy", {}) or {}),
         )
 
     def _install_tuning_configs_for_model(self, runtime_policy: Any) -> None:

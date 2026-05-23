@@ -188,6 +188,33 @@ def test_model_files_do_not_read_production_policy_env_names() -> None:
             )
 
 
+def test_model_tuning_snapshots_use_narrow_allowlists() -> None:
+    expectations = {
+        "vllm/model_executor/models/gemma4.py": {
+            "_GEMMA4_ALLOWED_TUNING_ENV",
+            "FASTINFERENCE_GEMMA4_LAYER_PROFILE",
+            "FASTINFERENCE_GEMMA4_ROCTX_PROFILE",
+        },
+        "vllm/model_executor/models/qwen3_5.py": {
+            "_QWEN35_ALLOWED_TUNING_ENV",
+        },
+    }
+    forbidden_patterns = (
+        'key.startswith("FASTINFERENCE_GEMMA4_")',
+        'key.startswith("FASTINFERENCE_KV_MAX_")',
+        'key.startswith("FASTINFERENCE_QWEN35_")',
+        'key.startswith("FASTINFERENCE_DISABLE_")',
+    )
+    for rel, required_markers in expectations.items():
+        text = _read(rel)
+        for marker in required_markers:
+            assert marker in text, f"{rel} must document narrow tuning marker {marker}"
+        for pattern in forbidden_patterns:
+            assert pattern not in text, (
+                f"{rel} must not capture tuning env by broad prefix {pattern!r}"
+            )
+
+
 def test_qwen35_full_attention_policy_uses_runtime_config() -> None:
     qwen = _read("vllm/model_executor/models/qwen3_5.py")
 

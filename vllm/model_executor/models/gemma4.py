@@ -23,11 +23,16 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from .lite_config import LiteConfig
 
+_GEMMA4_ALLOWED_TUNING_ENV = frozenset(
+    {
+        "FASTINFERENCE_GEMMA4_LAYER_PROFILE",
+        "FASTINFERENCE_GEMMA4_ROCTX_PROFILE",
+    }
+)
 _GEMMA4_TUNING: dict[str, str] = {
     key: value
     for key, value in os.environ.items()
-    if key.startswith("FASTINFERENCE_GEMMA4_")
-    or key.startswith("FASTINFERENCE_KV_MAX_")
+    if key in _GEMMA4_ALLOWED_TUNING_ENV
 }
 _GEMMA4_TUNING_LOCKED = False
 
@@ -43,11 +48,7 @@ def set_gemma4_tuning_config(
     _GEMMA4_TUNING = {
         str(key): str(value)
         for key, value in (values or {}).items()
-        if (
-            str(key).startswith("FASTINFERENCE_GEMMA4_")
-            or str(key).startswith("FASTINFERENCE_KV_MAX_")
-        )
-        and value is not None
+        if str(key) in _GEMMA4_ALLOWED_TUNING_ENV and value is not None
     }
     _GEMMA4_TUNING_LOCKED = bool(locked)
     _GEMMA4_PROFILE_ENABLED = _truthy_string(

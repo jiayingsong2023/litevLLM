@@ -18,11 +18,11 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_fp8_dequant_to_linear_weight,
 )
 
+_QWEN35_ALLOWED_TUNING_ENV = frozenset[str]()
 _QWEN35_TUNING: dict[str, str] = {
     key: value
     for key, value in os.environ.items()
-    if key.startswith("FASTINFERENCE_QWEN35_")
-    or key.startswith("FASTINFERENCE_DISABLE_")
+    if key in _QWEN35_ALLOWED_TUNING_ENV
 }
 _QWEN35_TUNING_LOCKED = False
 
@@ -35,11 +35,7 @@ def set_qwen35_tuning_config(
     _QWEN35_TUNING = {
         str(key): str(value)
         for key, value in (values or {}).items()
-        if (
-            str(key).startswith("FASTINFERENCE_QWEN35_")
-            or str(key).startswith("FASTINFERENCE_DISABLE_")
-        )
-        and value is not None
+        if str(key) in _QWEN35_ALLOWED_TUNING_ENV and value is not None
     }
     _QWEN35_TUNING_LOCKED = bool(locked)
 

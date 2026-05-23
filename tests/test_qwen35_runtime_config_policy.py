@@ -10,6 +10,19 @@ from vllm.adapters.qwen3_5 import Qwen35Adapter
 from vllm.model_executor.models import qwen3_5
 
 
+def test_qwen35_tuning_config_rejects_migrated_production_policy_names() -> None:
+    qwen3_5.set_qwen35_tuning_config(
+        {
+            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "0",
+            "FASTINFERENCE_QWEN35_USE_FLA_CHUNK": "0",
+            "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP": "1",
+        },
+        locked=True,
+    )
+
+    assert qwen3_5._QWEN35_TUNING == {}
+
+
 def test_qwen35_adapter_exposes_production_model_policy() -> None:
     policy = Qwen35Adapter().runtime_policy(
         SimpleNamespace(hf_config=SimpleNamespace()),

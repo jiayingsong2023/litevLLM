@@ -23,6 +23,22 @@ def test_gemma4_profile_flags_are_derived_from_tuning_env(monkeypatch) -> None:
     assert not gemma4._GEMMA4_ROCTX_PROFILE_ENABLED
 
 
+def test_gemma4_tuning_config_rejects_migrated_production_policy_names() -> None:
+    gemma4.set_gemma4_tuning_config(
+        {
+            "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
+            "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON": "0",
+            "FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION": "0",
+            "FASTINFERENCE_KV_MAX_MODEL_LEN": "2048",
+        },
+        locked=True,
+    )
+
+    assert gemma4._GEMMA4_TUNING == {
+        "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
+    }
+
+
 def test_gemma4_adapter_exposes_production_model_and_kernel_policy() -> None:
     runtime_config = SimpleNamespace(
         tuning_env={},

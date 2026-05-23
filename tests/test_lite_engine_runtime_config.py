@@ -27,16 +27,23 @@ def test_lite_engine_attaches_runtime_config_before_model_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from vllm.engine import lite_engine as lite_engine_module
+    from vllm.adapters.base import RuntimeModelPolicy
 
     class StopAfterModelConfigCheck(Exception):
         pass
 
     class FakeAdapter:
-        def runtime_policy(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
-            return SimpleNamespace()
+        def runtime_policy(self, *_args: Any, **_kwargs: Any) -> RuntimeModelPolicy:
+            return RuntimeModelPolicy(
+                model_policy={"construction_policy": True},
+                kernel_policy={"construction_kernel": "adapter"},
+            )
 
     def fake_get_model(*, vllm_config: Any) -> Any:
-        assert getattr(vllm_config, "runtime_config", None) is not None
+        runtime_config = getattr(vllm_config, "runtime_config", None)
+        assert runtime_config is not None
+        assert runtime_config.model_policy == {"construction_policy": True}
+        assert runtime_config.kernel_policy == {"construction_kernel": "adapter"}
         raise StopAfterModelConfigCheck
 
     monkeypatch.setattr(
