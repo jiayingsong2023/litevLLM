@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -40,6 +41,92 @@ def _env_get(name: str, default: str = "") -> str:
     return os.environ.get(name, _AWQ_FUSED_TUNING.get(name, default))
 
 
+def _tool_override_get(name: str) -> str | None:
+    if name in _AWQ_FUSED_TUNING:
+        return _AWQ_FUSED_TUNING[name]
+    if _AWQ_FUSED_TUNING_LOCKED:
+        return None
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw
+
+
+def _tool_override_bool(
+    raw: str | None,
+    default: bool | None = None,
+) -> bool | None:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _tool_override_int(
+    raw: str | None,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _kernel_policy(
+    config: Any | None = None, policy: dict[str, object] | None = None
+) -> dict[str, object]:
+    if isinstance(policy, dict):
+        return policy
+    if isinstance(config, dict):
+        nested = config.get("kernel_policy")
+        if isinstance(nested, dict):
+            return nested
+        return config
+    kernel_policy = getattr(config, "kernel_policy", None)
+    if isinstance(kernel_policy, dict):
+        return kernel_policy
+    return {}
+
+
+def _kernel_policy_value(
+    config: Any | None,
+    policy: dict[str, object] | None,
+    name: str,
+    default: object = None,
+) -> object:
+    kernel_policy = _kernel_policy(config, policy)
+    if name in kernel_policy:
+        return kernel_policy[name]
+    return default
+
+
+def _policy_truthy(
+    config: Any | None,
+    policy: dict[str, object] | None,
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    raw = _kernel_policy_value(config, policy, name, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fused_gemm_dot_bf16_tool_override() -> str | None:
+    return _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16")
+
+
 def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     Whether to use bf16 operands in tl.dot (vs fp16).
@@ -48,7 +135,7 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     (small M, moderate N); microbench: use fp16 dot there but still write
     bf16 output (USE_BF16_OUTPUT).
 
-    FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16:
+    Tool tuning override:
       - unset or "auto": heuristic (ROCm narrow decode -> fp16 dot;
         else bf16 when a is bf16)
       - "1"/"true"/"on": always bf16 dot when a is bf16
@@ -56,9 +143,7 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
     """
     if a.dtype != torch.bfloat16:
         return False
-    raw = (
-        _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16", "auto").strip().lower()
-    )
+    raw = (_fused_gemm_dot_bf16_tool_override() or "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -79,26 +164,6 @@ def _select_fused_gemm_blocks(
     Decode often uses M in {1..32}; fixed BLOCK_M=64 wastes most warps on the M axis.
     Prefill uses larger M where BLOCK_M=64 is appropriate.
     """
-    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M", "").strip()
-    if raw:
-        try:
-            block_m = max(1, int(raw))
-        except ValueError:
-            block_m = 64
-        raw_n = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N", "").strip()
-        raw_k = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K", "").strip()
-        block_n = int(raw_n) if raw_n else 64
-        block_k = int(raw_k) if raw_k else 32
-        block_n = max(16, block_n)
-        block_k = max(8, block_k)
-        raw_w = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS", "").strip()
-        num_warps = int(raw_w) if raw_w else 4
-        num_warps = max(1, min(8, num_warps))
-        raw_s = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES", "").strip()
-        num_stages = int(raw_s) if raw_s else 2
-        num_stages = max(1, min(4, num_stages))
-        return block_m, block_n, block_k, num_warps, num_stages
-
     k = int(_k)
     # Gemma4-31B MLP down_proj decode hot shape:
     #   n=5376, k=21504, m in {1,2}
@@ -160,6 +225,38 @@ def _select_fused_gemm_blocks(
     else:
         num_warps = 4
     num_stages = 1 if mlp_down_decode_small_m else 2
+    return block_m, block_n, block_k, num_warps, num_stages
+
+
+def _fused_gemm_blocks_tool_override() -> tuple[int, int, int, int, int] | None:
+    raw_m = _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M")
+    if raw_m is None:
+        return None
+    block_m = max(1, _tool_override_int(raw_m, 64, minimum=1, maximum=1 << 20))
+    block_n = _tool_override_int(
+        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N"),
+        64,
+        minimum=16,
+        maximum=1 << 20,
+    )
+    block_k = _tool_override_int(
+        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K"),
+        32,
+        minimum=8,
+        maximum=1 << 20,
+    )
+    num_warps = _tool_override_int(
+        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS"),
+        4,
+        minimum=1,
+        maximum=8,
+    )
+    num_stages = _tool_override_int(
+        _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES"),
+        2,
+        minimum=1,
+        maximum=4,
+    )
     return block_m, block_n, block_k, num_warps, num_stages
 
 
@@ -262,11 +359,22 @@ def _lookup_persistent_blocks(
     return None
 
 
-def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
+def _fused_gemm_autotune_tool_override() -> str | None:
+    return _tool_override_get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE")
+
+
+def _fused_gemm_autotune_enabled(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
     """
     Whether to launch Triton autotune for fused GEMM.
 
-    FASTINFERENCE_AWQ_FUSED_AUTOTUNE:
+    Kernel policy / tool override:
       - "1"/"true"/"on": always autotune (except M==1; see below)
       - "0"/"false"/"off": never autotune
       - unset or "auto": shape-aware default
@@ -281,7 +389,11 @@ def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
     mm, nn, kk = int(m), int(n), int(k)
     if mm == 1:
         return False
-    raw = _env_get("FASTINFERENCE_AWQ_FUSED_AUTOTUNE", "auto").strip().lower()
+    raw = (
+        str(_kernel_policy_value(config, policy, "awq_fused_autotune", "auto"))
+        .strip()
+        .lower()
+    )
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "on"):
@@ -297,22 +409,55 @@ def _env_fused_gemm_autotune(m: int, n: int, k: int) -> bool:
     return True
 
 
-def _select_split_k(m: int, n: int, k: int) -> int:
+def _env_fused_gemm_autotune_tool_override(
+    m: int,
+    n: int,
+    k: int,
+) -> bool:
+    raw = (_fused_gemm_autotune_tool_override() or "auto").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return int(m) != 1
+    return _fused_gemm_autotune_enabled(m, n, k)
+
+
+def _fused_gemm_split_k_tool_override() -> str | None:
+    return _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K")
+
+
+def _select_split_k(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> int:
     """
     Split-K policy for fused int4 GEMM.
 
-    FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K:
+    Kernel policy / tool override:
       - integer >= 1: force value
       - unset/"auto": shape-aware default
     """
-    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", "auto").strip().lower()
+    raw = (
+        str(_kernel_policy_value(config, policy, "awq_fused_gemm_split_k", "auto"))
+        .strip()
+        .lower()
+    )
     if raw not in ("", "auto"):
         try:
             return max(1, int(raw))
         except ValueError:
             return 1
     mm, nn, kk = int(m), int(n), int(k)
-    if _env_awq_decode_gemv() and mm == 1 and nn == 5376 and kk == 21504:
+    if (
+        awq_decode_gemv_enabled(config=config, policy=policy)
+        and mm == 1
+        and nn == 5376
+        and kk == 21504
+    ):
         # Gemma4-31B dense MLP down_proj decode hot shape. Route to split_k=1
         # so the M=1 grouped GEMV specialization can run; the generic split-K
         # kernel was previously chosen here to improve occupancy, but that kept
@@ -340,44 +485,284 @@ def _select_split_k(m: int, n: int, k: int) -> int:
     return 1
 
 
-def _env_awq_decode_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_DECODE_GEMV", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_decode_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_decode_gemv",
+        default=False,
+    )
 
 
-def _env_awq_fused_gate_up() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_fused_gate_up_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_fused_gate_up",
+        default=False,
+    )
 
 
-def _env_awq_o_proj_group32_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV", "1").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_o_proj_group32_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_o_proj_group32_gemv",
+        default=True,
+    )
 
 
-def _env_awq_group32_gemv_all() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_GROUP32_GEMV_ALL", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_group32_gemv_all_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_group32_gemv_all",
+        default=False,
+    )
 
 
-def _env_awq_qo_proj_exact_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_QO_PROJ_EXACT_GEMV", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_qo_proj_exact_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_qo_proj_exact_gemv",
+        default=False,
+    )
 
 
-def _env_awq_q_proj_exact_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_Q_PROJ_EXACT_GEMV", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_q_proj_exact_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_q_proj_exact_gemv",
+        default=False,
+    )
 
 
-def _env_awq_o_proj_exact_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_EXACT_GEMV", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_o_proj_exact_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_o_proj_exact_gemv",
+        default=False,
+    )
 
 
-def _env_awq_o_proj_splitk_gemv() -> bool:
-    raw = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV", "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+def awq_o_proj_splitk_gemv_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    return _policy_truthy(
+        config,
+        policy,
+        "awq_o_proj_splitk_gemv",
+        default=False,
+    )
+
+
+def _o_proj_splitk_gemv_launch_config_tool_override() -> tuple[int, int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK"),
+            4,
+            minimum=2,
+            maximum=8,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N"),
+            128,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_GROUPS"),
+            4,
+            minimum=1,
+            maximum=16,
+        ),
+    )
+
+
+def _exact_gemv_launch_config_tool_override(n: int) -> tuple[int, int]:
+    if n == 5376:
+        return (
+            _tool_override_int(
+                _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N"),
+                256,
+                minimum=32,
+                maximum=512,
+            ),
+            _tool_override_int(
+                _tool_override_get(
+                    "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS"
+                ),
+                4,
+                minimum=1,
+                maximum=16,
+            ),
+        )
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_N"),
+            128,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_GROUPS"),
+            8,
+            minimum=1,
+            maximum=16,
+        ),
+    )
+
+
+def _o_proj_group32_gemv_launch_config_tool_override() -> tuple[int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N"),
+            256,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS"),
+            4,
+            minimum=1,
+            maximum=16,
+        ),
+    )
+
+
+def _group32_gemv_all_launch_config_tool_override() -> tuple[int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N"),
+            128,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_GROUPS"),
+            8,
+            minimum=1,
+            maximum=16,
+        ),
+    )
+
+
+def _decode_gemv_launch_config_tool_override() -> tuple[int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_N"),
+            128,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS"),
+            16,
+            minimum=4,
+            maximum=64,
+        ),
+    )
+
+
+def _fused_gate_up_launch_config_tool_override() -> tuple[int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N"),
+            128,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS"),
+            16,
+            minimum=4,
+            maximum=64,
+        ),
+    )
+
+
+def _qkv_group32_gemv_launch_config_tool_override() -> tuple[int, int]:
+    return (
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N"),
+            256,
+            minimum=32,
+            maximum=512,
+        ),
+        _tool_override_int(
+            _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS"),
+            4,
+            minimum=1,
+            maximum=16,
+        ),
+    )
+
+
+def _resolve_fused_gemm_blocks(
+    m: int,
+    n: int,
+    k: int,
+) -> tuple[int, int, int, int, int]:
+    override = _fused_gemm_blocks_tool_override()
+    if override is not None:
+        return override
+    return _select_fused_gemm_blocks(m, n, k)
+
+
+def _resolve_packed_int4_fused_gemm_blocks(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    group_size: int,
+    split_k: int,
+) -> tuple[int, int, int, int, int]:
+    override = _fused_gemm_blocks_tool_override()
+    if override is not None:
+        return override
+    profile_blocks = _lookup_persistent_blocks(
+        "packed_int4_symmetric",
+        m=m,
+        n=n,
+        k=k,
+        group_size=group_size,
+    )
+    if profile_blocks is not None and split_k == 1 and m > 1:
+        return profile_blocks
+    return _select_fused_gemm_blocks(m, n, k)
 
 
 # Packed int4 + AWQ native: tuned configs for ROCm (gfx1151-class) and CUDA;
@@ -1031,9 +1416,7 @@ def _awq_native_tiled_gemm_split_k(
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
     result = (
-        accumulator.to(tl.bfloat16)
-        if USE_BF16_OUTPUT
-        else accumulator.to(tl.float16)
+        accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
     )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1259,9 +1642,7 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
         b_ptrs += (BLOCK_K // 8) * stride_bk
 
     result = (
-        accumulator.to(tl.bfloat16)
-        if USE_BF16_OUTPUT
-        else accumulator.to(tl.float16)
+        accumulator.to(tl.bfloat16) if USE_BF16_OUTPUT else accumulator.to(tl.float16)
     )
 
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1569,7 +1950,18 @@ def _awq_native_tiled_gemm_autotuned(
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
-def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
+def awq_fused_gemm(
+    a,
+    qweight,
+    scales,
+    qzeros,
+    group_size,
+    out=None,
+    bias=None,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+):
     M, K = a.shape
     N = qweight.shape[0]
 
@@ -1583,8 +1975,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         bias = bias.contiguous().reshape(N)
         if bias.device != a.device:
             raise ValueError(
-                "awq_fused_gemm: bias must be on the same "
-                "device as activations"
+                "awq_fused_gemm: bias must be on the same device as activations"
             )
         if bias.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
@@ -1596,7 +1987,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
     out_bf16 = 1 if use_bf16_output else 0
 
     # Decision for Split-K: Only for extremely narrow M and deep K
-    split_k = _select_split_k(M, N, K)
+    split_k = _select_split_k(M, N, K, config=config, policy=policy)
 
     if out is None:
         if split_k > 1:
@@ -1609,7 +2000,11 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         if split_k > 1:
             c.zero_()
 
-    if _env_fused_gemm_autotune(M, N, K) and split_k == 1 and M > 1:
+    if (
+        _fused_gemm_autotune_enabled(M, N, K, config=config, policy=policy)
+        and split_k == 1
+        and M > 1
+    ):
         grid = lambda meta: (
             triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
         )
@@ -1643,7 +2038,7 @@ def awq_fused_gemm(a, qweight, scales, qzeros, group_size, out=None, bias=None):
         except Exception:
             pass
 
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(
+    block_m, block_n, block_k, num_warps, num_stages = _resolve_fused_gemm_blocks(
         M, N, K
     )
 
@@ -1722,6 +2117,9 @@ def packed_int4_symmetric_fused_gemm(
     group_size: int,
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> torch.Tensor:
     m, k = a.shape
     n = qweight.shape[0]
@@ -1750,7 +2148,7 @@ def packed_int4_symmetric_fused_gemm(
     bf16_dot = 1 if use_bf16_dot else 0
     out_bf16 = 1 if use_bf16_output else 0
 
-    split_k = _select_split_k(m, n, k)
+    split_k = _select_split_k(m, n, k, config=config, policy=policy)
 
     if out is None:
         if split_k > 1:
@@ -1763,7 +2161,7 @@ def packed_int4_symmetric_fused_gemm(
             c.zero_()
 
     if (
-        _env_awq_decode_gemv()
+        awq_decode_gemv_enabled(config=config, policy=policy)
         and m == 1
         and split_k == 1
         and int(group_size) == 32
@@ -1773,33 +2171,14 @@ def packed_int4_symmetric_fused_gemm(
         and c.is_contiguous()
     ):
         if (
-            _env_awq_o_proj_splitk_gemv()
+            awq_o_proj_splitk_gemv_enabled(config=config, policy=policy)
             and n == 5376
             and k == 16384
             and (k // 32) % 2 == 0
         ):
-            raw_split_k = _env_get("FASTINFERENCE_AWQ_O_PROJ_SPLITK", "4")
-            raw_block_n = _env_get(
-                "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_N", "128"
+            o_split_k, block_n, block_groups = (
+                _o_proj_splitk_gemv_launch_config_tool_override()
             )
-            raw_block_groups = _env_get(
-                "FASTINFERENCE_AWQ_O_PROJ_SPLITK_BLOCK_GROUPS", "4"
-            )
-            try:
-                o_split_k = int(raw_split_k)
-            except ValueError:
-                o_split_k = 4
-            try:
-                block_n = int(raw_block_n)
-            except ValueError:
-                block_n = 128
-            try:
-                block_groups = int(raw_block_groups)
-            except ValueError:
-                block_groups = 4
-            o_split_k = max(2, min(8, o_split_k))
-            block_n = max(32, min(512, block_n))
-            block_groups = max(1, min(16, block_groups))
             k_groups = k // 32
             if (
                 n % block_n == 0
@@ -1847,38 +2226,21 @@ def packed_int4_symmetric_fused_gemm(
         use_q_exact = (
             n == 16384
             and k == 5376
-            and (_env_awq_qo_proj_exact_gemv() or _env_awq_q_proj_exact_gemv())
+            and (
+                awq_qo_proj_exact_gemv_enabled(config=config, policy=policy)
+                or awq_q_proj_exact_gemv_enabled(config=config, policy=policy)
+            )
         )
         use_o_exact = (
             n == 5376
             and k == 16384
-            and (_env_awq_qo_proj_exact_gemv() or _env_awq_o_proj_exact_gemv())
+            and (
+                awq_qo_proj_exact_gemv_enabled(config=config, policy=policy)
+                or awq_o_proj_exact_gemv_enabled(config=config, policy=policy)
+            )
         )
         if use_q_exact or use_o_exact:
-            if n == 5376:
-                raw_block_n = _env_get(
-                    "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256"
-                )
-                raw_block_groups = _env_get(
-                    "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4"
-                )
-            else:
-                raw_block_n = _env_get(
-                    "FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_N", "128"
-                )
-                raw_block_groups = _env_get(
-                    "FASTINFERENCE_AWQ_Q_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "8"
-                )
-            try:
-                block_n = int(raw_block_n)
-            except ValueError:
-                block_n = 256 if n == 5376 else 128
-            try:
-                block_groups = int(raw_block_groups)
-            except ValueError:
-                block_groups = 4 if n == 5376 else 8
-            block_n = max(32, min(512, block_n))
-            block_groups = max(1, min(16, block_groups))
+            block_n, block_groups = _exact_gemv_launch_config_tool_override(n)
             if n % block_n == 0 and (k // 32) % block_groups == 0:
                 grid = (triton.cdiv(n, block_n),)
                 _packed_int4_symmetric_group32_gemv_m1_exact[grid](
@@ -1903,23 +2265,12 @@ def packed_int4_symmetric_fused_gemm(
                 )
                 return c
 
-        if _env_awq_o_proj_group32_gemv() and n == 5376 and k == 16384:
-            raw_block_n = _env_get(
-                "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_N", "256"
-            )
-            raw_block_groups = _env_get(
-                "FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV_BLOCK_GROUPS", "4"
-            )
-            try:
-                block_n = int(raw_block_n)
-            except ValueError:
-                block_n = 256
-            try:
-                block_groups = int(raw_block_groups)
-            except ValueError:
-                block_groups = 4
-            block_n = max(32, min(512, block_n))
-            block_groups = max(1, min(16, block_groups))
+        if (
+            awq_o_proj_group32_gemv_enabled(config=config, policy=policy)
+            and n == 5376
+            and k == 16384
+        ):
+            block_n, block_groups = _o_proj_group32_gemv_launch_config_tool_override()
             grid = (triton.cdiv(n, block_n),)
             _packed_int4_symmetric_group32_gemv_m1[grid](
                 a,
@@ -1944,23 +2295,8 @@ def packed_int4_symmetric_fused_gemm(
             )
             return c
 
-        if _env_awq_group32_gemv_all():
-            raw_block_n = _env_get(
-                "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_N", "128"
-            )
-            raw_block_groups = _env_get(
-                "FASTINFERENCE_AWQ_GROUP32_GEMV_BLOCK_GROUPS", "8"
-            )
-            try:
-                block_n = int(raw_block_n)
-            except ValueError:
-                block_n = 256
-            try:
-                block_groups = int(raw_block_groups)
-            except ValueError:
-                block_groups = 4
-            block_n = max(32, min(512, block_n))
-            block_groups = max(1, min(16, block_groups))
+        if awq_group32_gemv_all_enabled(config=config, policy=policy):
+            block_n, block_groups = _group32_gemv_all_launch_config_tool_override()
             grid = (triton.cdiv(n, block_n),)
             _packed_int4_symmetric_group32_gemv_m1[grid](
                 a,
@@ -1985,20 +2321,7 @@ def packed_int4_symmetric_fused_gemm(
             )
             return c
 
-        raw_block_n = _env_get("FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_N", "128")
-        try:
-            block_n = int(raw_block_n)
-        except ValueError:
-            block_n = 256
-        block_n = max(32, min(512, block_n))
-        raw_block_packs = _env_get(
-            "FASTINFERENCE_AWQ_DECODE_GEMV_BLOCK_PACKS", "16"
-        )
-        try:
-            block_packs = int(raw_block_packs)
-        except ValueError:
-            block_packs = 16
-        block_packs = max(4, min(64, block_packs))
+        block_n, block_packs = _decode_gemv_launch_config_tool_override()
         grid = (triton.cdiv(n, block_n),)
         _packed_int4_symmetric_grouped_gemv_m1[grid](
             a,
@@ -2024,50 +2347,11 @@ def packed_int4_symmetric_fused_gemm(
         )
         return c
 
-    profile_blocks = _lookup_persistent_blocks(
-        "packed_int4_symmetric",
-        m=m,
-        n=n,
-        k=k,
-        group_size=int(group_size),
-    )
-
-    # Persistent JSON profiles are tuned for prefill / medium-M; M=1 decode
-    # must use ``_select_fused_gemm_blocks`` so BLOCK_M==1 and the GEMV branch
-    # inside the heuristic kernel are guaranteed.
-    if profile_blocks is not None and split_k == 1 and m > 1:
-        block_m, block_n, block_k, num_warps, num_stages = profile_blocks
-        grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
-        _packed_int4_symmetric_tiled_gemm_heuristic[grid](
-            a,
-            qweight,
-            scales,
-            c,
-            bias_ptr_arg,
-            m,
-            n,
-            k,
-            group_size,
-            a.stride(0),
-            a.stride(1),
-            qweight.stride(0),
-            qweight.stride(1),
-            scales.stride(0),
-            scales.stride(1),
-            c.stride(0),
-            c.stride(1),
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            USE_BF16_DOT=use_bf16_dot,
-            USE_BF16_OUTPUT=use_bf16_output,
-            HAS_BIAS=has_bias,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        return c
-
-    if _env_fused_gemm_autotune(m, n, k) and split_k == 1 and m > 1:
+    if (
+        _fused_gemm_autotune_enabled(m, n, k, config=config, policy=policy)
+        and split_k == 1
+        and m > 1
+    ):
         grid = lambda meta: (
             triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
         )
@@ -2098,8 +2382,14 @@ def packed_int4_symmetric_fused_gemm(
         except Exception:
             pass
 
-    block_m, block_n, block_k, num_warps, num_stages = _select_fused_gemm_blocks(
-        m, n, k
+    block_m, block_n, block_k, num_warps, num_stages = (
+        _resolve_packed_int4_fused_gemm_blocks(
+            m=m,
+            n=n,
+            k=k,
+            group_size=int(group_size),
+            split_k=split_k,
+        )
     )
 
     if split_k > 1:
@@ -2174,6 +2464,8 @@ def packed_int4_symmetric_fused_gate_up_m1(
     *,
     activation: str = "silu",
     out: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> torch.Tensor:
     m, k = a.shape
     n = gate_qweight.shape[0]
@@ -2192,20 +2484,8 @@ def packed_int4_symmetric_fused_gate_up_m1(
     if int(gate_qweight.shape[1]) * 8 != k:
         raise ValueError("packed_int4_symmetric_fused_gate_up_m1: K mismatch")
     c = torch.empty((1, n), device=a.device, dtype=a.dtype) if out is None else out
-    raw_block_n = _env_get("FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_N", "128")
-    raw_block_packs = _env_get(
-        "FASTINFERENCE_AWQ_FUSED_GATE_UP_BLOCK_PACKS", "16"
-    )
-    try:
-        block_n = int(raw_block_n)
-    except ValueError:
-        block_n = 128
-    try:
-        block_packs = int(raw_block_packs)
-    except ValueError:
-        block_packs = 16
-    block_n = max(32, min(512, block_n))
-    block_packs = max(4, min(64, block_packs))
+    del config, policy
+    block_n, block_packs = _fused_gate_up_launch_config_tool_override()
     act = str(activation).lower()
     act_kind = 1 if act in ("gelu", "gelu_pytorch_tanh") else 0
     grid = (triton.cdiv(n, block_n),)
@@ -2250,6 +2530,8 @@ def packed_int4_symmetric_fused_qkv_m1(
     group_size: int,
     *,
     out: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> torch.Tensor:
     m, k = a.shape
     if m != 1:
@@ -2271,20 +2553,8 @@ def packed_int4_symmetric_fused_qkv_m1(
         v_qweight = q_qweight
     if v_scales is None:
         v_scales = q_scales
-    raw_block_n = _env_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N", "256")
-    raw_block_groups = _env_get(
-        "FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS", "4"
-    )
-    try:
-        block_n = int(raw_block_n)
-    except ValueError:
-        block_n = 256
-    try:
-        block_groups = int(raw_block_groups)
-    except ValueError:
-        block_groups = 4
-    block_n = max(32, min(512, block_n))
-    block_groups = max(1, min(16, block_groups))
+    del config, policy
+    block_n, block_groups = _qkv_group32_gemv_launch_config_tool_override()
     grid = (triton.cdiv(total_n, block_n),)
     _packed_int4_symmetric_group32_qkv_m1[grid](
         a,
@@ -2332,8 +2602,11 @@ def packed_int4_symmetric_fused_qkv_m1_safe(
     k_scales: torch.Tensor,
     v_scales: torch.Tensor | None,
     group_size: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
-    if not _env_awq_decode_gemv():
+    if not awq_decode_gemv_enabled(config=config, policy=policy):
         return a, False, "decode_gemv_disabled"
     if a.dim() != 2 or int(a.shape[0]) != 1:
         return a, False, "input_not_m1_2d"
@@ -2371,6 +2644,8 @@ def packed_int4_symmetric_fused_qkv_m1_safe(
             k_scales.contiguous(),
             v_scales.contiguous() if has_v else None,
             int(group_size),
+            config=config,
+            policy=policy,
         )
         expected_n = (
             int(q_qweight.shape[0])
@@ -2394,8 +2669,10 @@ def packed_int4_symmetric_fused_gate_up_m1_safe(
     *,
     activation: str = "silu",
     out: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
-    if not _env_awq_fused_gate_up():
+    if not awq_fused_gate_up_enabled(config=config, policy=policy):
         return a, False, "disabled"
     if a.dim() != 2 or int(a.shape[0]) != 1:
         return a, False, "input_not_m1_2d"
@@ -2433,6 +2710,8 @@ def packed_int4_symmetric_fused_gate_up_m1_safe(
             int(group_size),
             activation=activation,
             out=out,
+            config=config,
+            policy=policy,
         )
         if c.shape != (1, int(gate_qweight.shape[0])):
             return c, False, "bad_output_shape"
@@ -2449,6 +2728,9 @@ def awq_fused_gemm_safe(
     group_size: int,
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
     if a.dim() != 2:
         return a, False, "input_not_2d"
@@ -2493,6 +2775,8 @@ def awq_fused_gemm_safe(
             group_size=group_size,
             out=out,
             bias=bias_arg,
+            config=config,
+            policy=policy,
         )
         if c.shape != (m, n):
             return c, False, "bad_output_shape"
@@ -2508,6 +2792,9 @@ def packed_int4_symmetric_fused_gemm_safe(
     group_size: int,
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
 ) -> tuple[torch.Tensor, bool, str]:
     if a.dim() != 2:
         return a, False, "input_not_2d"
@@ -2544,6 +2831,8 @@ def packed_int4_symmetric_fused_gemm_safe(
             group_size=group_size,
             out=out,
             bias=bias_arg,
+            config=config,
+            policy=policy,
         )
         if c.shape != (m, n):
             return c, False, "bad_output_shape"

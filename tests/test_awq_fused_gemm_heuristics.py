@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 
 from vllm.kernels.triton.awq_fused_gemm import (
-    _env_fused_gemm_autotune,
+    _env_fused_gemm_autotune_tool_override,
+    _fused_gemm_blocks_tool_override,
     _load_persistent_profile,
     _lookup_persistent_blocks,
     _persistent_profile_path,
+    _resolve_packed_int4_fused_gemm_blocks,
     _select_fused_gemm_blocks,
     set_awq_fused_tuning_config,
 )
@@ -36,19 +38,45 @@ def test_select_fused_gemm_blocks_deep_k_narrow_output_decode() -> None:
     assert _select_fused_gemm_blocks(4, 5376, 21504) == (16, 128, 64, 8, 2)
 
 
+def test_select_fused_gemm_blocks_ignores_env_tile_override(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M", "7")
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N", "96")
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K", "48")
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS", "3")
+    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES", "4")
+    set_awq_fused_tuning_config({})
+
+    assert _select_fused_gemm_blocks(1, 8192, 5376) == (1, 256, 64, 8, 2)
+
+
+def test_tool_only_fused_gemm_tile_override_still_supported() -> None:
+    set_awq_fused_tuning_config(
+        {
+            "FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M": "7",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N": "96",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K": "48",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS": "3",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES": "4",
+        },
+        locked=False,
+    )
+
+    assert _fused_gemm_blocks_tool_override() == (7, 96, 48, 3, 4)
+
+
 def test_env_fused_gemm_autotune_auto_prefers_small_m_decode_autotune() -> None:
     set_awq_fused_tuning_config({})
-    assert _env_fused_gemm_autotune(1, 8192, 5376) is False
-    assert _env_fused_gemm_autotune(4, 8192, 5376) is True
-    assert _env_fused_gemm_autotune(128, 21504, 5376) is False
-    assert _env_fused_gemm_autotune(256, 2048, 4096) is True
+    assert _env_fused_gemm_autotune_tool_override(1, 8192, 5376) is False
+    assert _env_fused_gemm_autotune_tool_override(4, 8192, 5376) is True
+    assert _env_fused_gemm_autotune_tool_override(128, 21504, 5376) is False
+    assert _env_fused_gemm_autotune_tool_override(256, 2048, 4096) is True
 
 
 def test_env_fused_gemm_autotune_explicit_override() -> None:
     set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "1"})
-    assert _env_fused_gemm_autotune(1, 8192, 5376) is False
+    assert _env_fused_gemm_autotune_tool_override(1, 8192, 5376) is False
     set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "off"})
-    assert _env_fused_gemm_autotune(256, 2048, 4096) is False
+    assert _env_fused_gemm_autotune_tool_override(256, 2048, 4096) is False
 
 
 def test_persistent_profile_defaults_to_bundled_profile(monkeypatch) -> None:
@@ -74,6 +102,46 @@ def test_lookup_persistent_blocks_uses_bundled_profile(monkeypatch) -> None:
         k=5376,
         group_size=32,
     ) == (16, 256, 64, 8, 2)
+
+
+def test_resolve_packed_int4_fused_gemm_blocks_prefers_persistent_profile(
+    tmp_path,
+) -> None:
+    override_path = tmp_path / "awq_profile.json"
+    override_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "packed_int4_symmetric": [
+                    {
+                        "m_min": 2,
+                        "m_max": 8,
+                        "n": 1234,
+                        "k": 5678,
+                        "group_size": 32,
+                        "block_m": 48,
+                        "block_n": 80,
+                        "block_k": 40,
+                        "num_warps": 5,
+                        "num_stages": 3,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    set_awq_fused_tuning_config(
+        {"FASTINFERENCE_AWQ_FUSED_PROFILE_JSON": str(override_path)},
+        locked=True,
+    )
+
+    assert _resolve_packed_int4_fused_gemm_blocks(
+        m=4,
+        n=1234,
+        k=5678,
+        group_size=32,
+        split_k=1,
+    ) == (48, 80, 40, 5, 3)
 
 
 def test_persistent_profile_env_override_and_disable(monkeypatch, tmp_path) -> None:

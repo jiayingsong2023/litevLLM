@@ -11,6 +11,38 @@ def _read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def _awq_env_context_violations(
+    path: str,
+    *,
+    prefixes: tuple[str, ...],
+    allowed_defs: set[str],
+) -> list[str]:
+    text = _read(path)
+    current_def = "<module>"
+    violations: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        match = re.match(r"def ([A-Za-z0-9_]+)\(", stripped)
+        if match:
+            current_def = match.group(1)
+        if not any(prefix in line for prefix in prefixes):
+            continue
+        if stripped.startswith("#"):
+            continue
+        if current_def in allowed_defs or current_def.endswith("_tool_override"):
+            continue
+        if stripped.startswith("_AWQ_FUSED_TUNING") or stripped.startswith(
+            "_AWQ_TENSOR_TUNING"
+        ):
+            continue
+        if 'key.startswith("FASTINFERENCE_AWQ_")' in line:
+            continue
+        if 'key.startswith("FASTINFERENCE_GEMMA4_DENSE_")' in line:
+            continue
+        violations.append(f"{path}:{lineno}:{current_def}:{stripped}")
+    return violations
+
+
 def test_smoke_workflow_pytest_target_exists() -> None:
     workflow = _read(".github/workflows/smoke.yml")
     targets = re.findall(r"uv run pytest(?: -q)? ([^\n]+)", workflow)
@@ -375,3 +407,49 @@ def test_gemma4_profile_flags_do_not_read_env_at_module_init() -> None:
             "Gemma4 profile flags must be installed from tuning config, "
             f"not module-init env reads via {pattern!r}"
         )
+
+
+def test_awq_tensor_production_env_reads_are_tool_only() -> None:
+    violations = _awq_env_context_violations(
+        "vllm/model_executor/layers/quantization/tensor.py",
+        prefixes=(
+            "FASTINFERENCE_AWQ_FUSED_GEMM",
+            "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE",
+            "FASTINFERENCE_AWQ_DECODE_GEMV",
+            "FASTINFERENCE_AWQ_CACHE_SCOPE",
+            "FASTINFERENCE_AWQ_POLICY_MATRIX",
+            "FASTINFERENCE_AWQ_FUSED_SCOPE",
+            "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ",
+        ),
+        allowed_defs={
+            "_env_get",
+            "_env_truthy",
+            "set_awq_tensor_tuning_config",
+        },
+    )
+
+    assert not violations, (
+        "tensor.py production AWQ policy must come from kernel_policy/defaults; "
+        "migrated FASTINFERENCE_AWQ_* and FASTINFERENCE_GEMMA4_DENSE_* names are only "
+        "allowed in tool-only helpers or tuning snapshot code:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_awq_fused_gemm_production_env_reads_are_tool_only() -> None:
+    violations = _awq_env_context_violations(
+        "vllm/kernels/triton/awq_fused_gemm.py",
+        prefixes=("FASTINFERENCE_AWQ_",),
+        allowed_defs={
+            "_env_get",
+            "set_awq_fused_tuning_config",
+            "_persistent_profile_path",
+        },
+    )
+
+    assert not violations, (
+        "awq_fused_gemm.py production launch policy must come from "
+        "kernel_policy/defaults plus persistent profile lookups; "
+        "FASTINFERENCE_AWQ_* names are only allowed in tool-only helpers, "
+        "tuning snapshot code, or _persistent_profile_path:\n" + "\n".join(violations)
+    )
