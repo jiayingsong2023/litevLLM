@@ -31,7 +31,7 @@ class LiteLinear(nn.Module):
                 or cached_quant_weight is not None
             )
             if has_quant_ready:
-                return self.quant_config.apply(self, x)
+                return self.quant_config.apply(self, x, *args, **kwargs)
 
         if self.weight.numel() == 0:
             # Fallback for empty/unloaded weights

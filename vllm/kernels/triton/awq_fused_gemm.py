@@ -436,6 +436,10 @@ def _fused_gemm_split_k_tool_override() -> str | None:
     return _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K")
 
 
+def _fused_gemm_split_k_snapshot_override() -> str | None:
+    return _snapshot_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K")
+
+
 def _select_split_k(
     m: int,
     n: int,
@@ -451,6 +455,31 @@ def _select_split_k(
       - integer >= 1: force value
       - unset/"auto": shape-aware default
     """
+    raw_tool = _fused_gemm_split_k_tool_override()
+    if raw_tool is not None:
+        raw = raw_tool.strip().lower()
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 1
+
+    raw_policy = _kernel_policy_value(config, policy, "awq_fused_gemm_split_k", None)
+    if raw_policy is not None:
+        raw = str(raw_policy).strip().lower()
+        if raw not in ("", "auto"):
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                return 1
+
+    raw_snapshot = _fused_gemm_split_k_snapshot_override()
+    if raw_snapshot is not None:
+        raw = raw_snapshot.strip().lower()
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 1
+
     raw = (
         str(_kernel_policy_value(config, policy, "awq_fused_gemm_split_k", "auto"))
         .strip()

@@ -63,6 +63,7 @@ def try_fused_awq_pair_matmul(
     cache_key: str,
     *,
     lora_mapping: Any = None,
+    inf_config: Any = None,
 ) -> Optional[torch.Tensor]:
     """Attempt a single quantized matmul that yields the concatenation of
     ``lin_a(x)`` and ``lin_b(x)`` along the last dimension.
@@ -157,7 +158,7 @@ def try_fused_awq_pair_matmul(
 
     lead_shape = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1])
-    out2 = fused_w.matmul(x2, fused_bias)
+    out2 = fused_w.matmul(x2, fused_bias, config=inf_config)
     od = int(lin_a.output_size)
     return out2.reshape(*lead_shape, 2 * od)
 
@@ -169,6 +170,7 @@ def try_fused_awq_gate_up_activation(
     *,
     activation: str,
     lora_mapping: Any = None,
+    inf_config: Any = None,
 ) -> Optional[torch.Tensor]:
     """Attempt decode-only fused gate/up GEMV that returns ``act(gate) * up``.
 
@@ -223,6 +225,7 @@ def try_fused_awq_gate_up_activation(
             up_proj.scales,
             gs,
             activation=activation,
+            config=inf_config,
         )
         if not used:
             return None

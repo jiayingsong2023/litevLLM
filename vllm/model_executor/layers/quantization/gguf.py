@@ -22,7 +22,8 @@ class GGUFConfig(QuantizationConfig):
         layer.gguf_quant_type = None
         layer._quant_weight = None
 
-    def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def apply(self, layer: nn.Module, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        del args, kwargs
         weight = getattr(layer, "_quant_weight", None)
         if weight is None:
             qweight = getattr(layer, "qweight", None)

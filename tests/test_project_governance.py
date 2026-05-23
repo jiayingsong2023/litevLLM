@@ -445,6 +445,7 @@ def test_awq_fused_gemm_production_env_reads_are_tool_only() -> None:
             "_env_get",
             "set_awq_fused_tuning_config",
             "_persistent_profile_path",
+            "_fused_gemm_split_k_snapshot_override",
         },
     )
 
@@ -452,5 +453,6 @@ def test_awq_fused_gemm_production_env_reads_are_tool_only() -> None:
         "awq_fused_gemm.py production launch policy must come from "
         "kernel_policy/defaults plus persistent profile lookups; "
         "FASTINFERENCE_AWQ_* names are only allowed in tool-only helpers, "
-        "tuning snapshot code, or _persistent_profile_path:\n" + "\n".join(violations)
+        "tuning snapshot code, locked snapshot split-k helper, or "
+        "_persistent_profile_path:\n" + "\n".join(violations)
     )

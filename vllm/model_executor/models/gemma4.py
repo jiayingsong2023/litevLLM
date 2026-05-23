@@ -1659,9 +1659,10 @@ class Gemma4MLP(nn.Module):
                 self.up_proj,
                 activation=self.hidden_act,
                 lora_mapping=lora_mapping,
+                inf_config=inf_config,
             )
             if h is not None:
-                return self.down_proj(h, lora_mapping)
+                return self.down_proj(h, lora_mapping, inf_config=inf_config)
 
         if _gemma4_model_policy_truthy(inf_config, "mlp_pair_fusion", default=True):
             from vllm.model_executor.models._fused_awq_pair import (
@@ -1675,16 +1676,17 @@ class Gemma4MLP(nn.Module):
                 self,
                 "mlp_gate_up",
                 lora_mapping=lora_mapping,
+                inf_config=inf_config,
             )
             if gu is not None:
                 gate, up = torch.split(gu, self.intermediate_size, dim=-1)
                 act = self._apply_activation(gate)
-                return self.down_proj(act * up, lora_mapping)
+                return self.down_proj(act * up, lora_mapping, inf_config=inf_config)
 
-        gate = self.gate_proj(x, lora_mapping)
-        up = self.up_proj(x, lora_mapping)
+        gate = self.gate_proj(x, lora_mapping, inf_config=inf_config)
+        up = self.up_proj(x, lora_mapping, inf_config=inf_config)
         act = self._apply_activation(gate)
-        return self.down_proj(act * up, lora_mapping)
+        return self.down_proj(act * up, lora_mapping, inf_config=inf_config)
 
 
 def _is_gemma4_moe_enabled(config: LiteConfig) -> bool:

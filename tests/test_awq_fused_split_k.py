@@ -17,13 +17,18 @@ from unittest import mock
 
 import pytest
 
-from vllm.kernels.triton.awq_fused_gemm import _select_split_k
+from vllm.kernels.triton.awq_fused_gemm import (
+    _select_split_k,
+    set_awq_fused_tuning_config,
+)
 
 
 @pytest.fixture(autouse=True)
 def _clear_env() -> Iterator[None]:
     """Ensure each test sees the ``auto`` default without inherited state."""
     prior = os.environ.pop("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", None)
+    prior_decode = os.environ.pop("FASTINFERENCE_AWQ_DECODE_GEMV", None)
+    set_awq_fused_tuning_config({})
     try:
         yield
     finally:
@@ -31,22 +36,41 @@ def _clear_env() -> Iterator[None]:
             os.environ["FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K"] = prior
         else:
             os.environ.pop("FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K", None)
+        if prior_decode is not None:
+            os.environ["FASTINFERENCE_AWQ_DECODE_GEMV"] = prior_decode
+        else:
+            os.environ.pop("FASTINFERENCE_AWQ_DECODE_GEMV", None)
+        set_awq_fused_tuning_config({})
 
 
 class TestEnvironmentOverrides:
     def test_env_integer_forces_value(self) -> None:
-        with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "3"}):
-            assert _select_split_k(1, 4096, 4096) == 3
+        set_awq_fused_tuning_config(
+            {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "3"},
+            locked=False,
+        )
+        assert _select_split_k(1, 4096, 4096) == 3
 
     def test_env_clamps_below_one(self) -> None:
-        with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "0"}):
-            assert _select_split_k(1, 65536, 65536) == 1
+        set_awq_fused_tuning_config(
+            {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "0"},
+            locked=False,
+        )
+        assert _select_split_k(1, 65536, 65536) == 1
 
     def test_env_rejects_garbage_and_falls_to_one(self) -> None:
-        with mock.patch.dict(
-            os.environ, {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "banana"}
-        ):
-            assert _select_split_k(1, 65536, 65536) == 1
+        set_awq_fused_tuning_config(
+            {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "banana"},
+            locked=False,
+        )
+        assert _select_split_k(1, 65536, 65536) == 1
+
+    def test_locked_snapshot_forces_value(self) -> None:
+        set_awq_fused_tuning_config(
+            {"FASTINFERENCE_AWQ_FUSED_GEMM_SPLIT_K": "5"},
+            locked=True,
+        )
+        assert _select_split_k(1, 4096, 4096) == 5
 
 
 class TestAutoHeuristicDecode:
@@ -64,8 +88,15 @@ class TestAutoHeuristicDecode:
     def test_gemma4_down_proj_uses_split1_when_decode_gemv_enabled(self) -> None:
         # The dedicated M=1 down_proj GEMV path requires split_k=1 so the
         # grouped GEMV specialization can run.
-        with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_DECODE_GEMV": "1"}):
-            assert _select_split_k(1, 5376, 21504) == 1
+        assert (
+            _select_split_k(
+                1,
+                5376,
+                21504,
+                config=mock.Mock(kernel_policy={"awq_decode_gemv": True}),
+            )
+            == 1
+        )
 
     def test_qwen35_wide_deep_triggers_split4(self) -> None:
         # Qwen3.5-9B-class wide-output deep-K (pre-existing rule).

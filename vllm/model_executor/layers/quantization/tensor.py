@@ -807,7 +807,11 @@ class QuantizedLinearWeight(nn.Module, ABC):
 
     @abstractmethod
     def matmul(
-        self, x: torch.Tensor, bias: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        *,
+        config: object | None = None,
     ) -> torch.Tensor:
         pass
 
@@ -830,7 +834,8 @@ class GGUFWeight(QuantizedLinearWeight):
         self.original_shape = original_shape
         self.slice_offset = slice_offset
 
-    def matmul(self, x, bias=None):
+    def matmul(self, x, bias=None, *, config: object | None = None):
+        del config
         n_rows = self.qweight.shape[0]
         n_cols = (
             (self.qweight.shape[1] // 144 * 256)
@@ -878,7 +883,7 @@ class AWQWeight(QuantizedLinearWeight):
         self.high_fidelity = high_fidelity
         self.profile_hint = profile_hint
 
-    def matmul(self, x, bias=None):
+    def matmul(self, x, bias=None, *, config: object | None = None):
         _awq_stat_inc("awq_matmul_calls")
         _awq_prefix_stat_inc(self.prefix, "matmul_calls")
 
@@ -897,6 +902,7 @@ class AWQWeight(QuantizedLinearWeight):
                         self.qzeros,
                         int(self.group_size),
                         bias=bias,
+                        config=config,
                     )
                     if used_fused:
                         _awq_stat_inc("awq_fused_success")
@@ -924,7 +930,9 @@ class AWQWeight(QuantizedLinearWeight):
             _awq_prefix_stat_inc(self.prefix, "high_fidelity_forced")
             return self._slow_matmul_dequant(x, bias)
 
-        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        policy = resolve_awq_execution_policy(
+            self.prefix, x, self.profile_hint, config=config
+        )
         use_fused, reason = should_use_awq_fused_path(
             x=x,
             qweight=self.qweight,
@@ -933,6 +941,8 @@ class AWQWeight(QuantizedLinearWeight):
             group_size=self.group_size,
             prefix=self.prefix,
             policy=policy,
+            config=config,
+            profile_hint=self.profile_hint,
         )
         if use_fused:
             _awq_prefix_stat_inc(self.prefix, "decision_fused")
@@ -941,7 +951,7 @@ class AWQWeight(QuantizedLinearWeight):
             if reason:
                 _awq_prefix_stat_inc(self.prefix, f"reason:{reason}")
         self._cached_fused_decision = use_fused
-        return self.matmul(x, bias)  # Re-run with fast path
+        return self.matmul(x, bias, config=config)  # Re-run with fast path
 
     def _slow_matmul_dequant(self, x, bias):
         cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
@@ -989,7 +999,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
         self.high_fidelity = high_fidelity
         self.profile_hint = profile_hint
 
-    def matmul(self, x, bias=None):
+    def matmul(self, x, bias=None, *, config: object | None = None):
         _awq_stat_inc("awq_matmul_calls")
         _awq_prefix_stat_inc(self.prefix, "matmul_calls")
 
@@ -1025,6 +1035,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
             x,
             self.qweight,
             int(self.group_size),
+            config=config,
         ):
             try:
                 from vllm.kernels.triton.awq_fused_gemm import (
@@ -1039,6 +1050,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     self.scales,
                     int(self.group_size),
                     bias=bias,
+                    config=config,
                 )
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
@@ -1051,10 +1063,10 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
             _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
         if (
-            gemma4_dense_mlp_enabled()
+            gemma4_dense_mlp_enabled(config)
             and _is_gemma4_mlp_proj(self.prefix, self.profile_hint)
         ) or (
-            gemma4_dense_down_proj_enabled()
+            gemma4_dense_down_proj_enabled(config)
             and _is_gemma4_mlp_down_proj(self.prefix, self.profile_hint)
         ):
             self._cached_fused_decision = False
@@ -1076,6 +1088,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     self.scales,
                     int(self.group_size),
                     bias=bias,
+                    config=config,
                 )
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
@@ -1096,12 +1109,14 @@ class PackedInt4Weight(QuantizedLinearWeight):
             _awq_prefix_stat_inc(self.prefix, "high_fidelity_forced")
             return _dense_fallback()
 
-        if awq_fused_gemm_force_enabled():
+        if awq_fused_gemm_force_enabled(config):
             self._cached_fused_decision = True
             _awq_prefix_stat_inc(self.prefix, "decision_fused_forced")
-            return self.matmul(x, bias)
+            return self.matmul(x, bias, config=config)
 
-        policy = resolve_awq_execution_policy(self.prefix, x, self.profile_hint)
+        policy = resolve_awq_execution_policy(
+            self.prefix, x, self.profile_hint, config=config
+        )
         allow_by_scope, scope_reason = should_allow_awq_fused(self.prefix, policy)
         if not allow_by_scope:
             self._cached_fused_decision = False
@@ -1126,6 +1141,6 @@ class PackedInt4Weight(QuantizedLinearWeight):
         self._cached_fused_decision = bool(use_fused)
         if self._cached_fused_decision:
             _awq_prefix_stat_inc(self.prefix, "decision_fused")
-            return self.matmul(x, bias)
+            return self.matmul(x, bias, config=config)
         _awq_prefix_stat_inc(self.prefix, "decision_dense")
         return _dense_fallback()

@@ -97,12 +97,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             profile_hint=str(getattr(layer, "awq_profile_hint", "")),
         )
 
-    def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def apply(
+        self, layer: nn.Module, x: torch.Tensor, *args, **kwargs
+    ) -> torch.Tensor:
+        del args
         weight = getattr(layer, "_quant_weight", None)
         if weight is None:
             weight = self._build_quant_weight(layer)
             layer._quant_weight = weight
-        return weight.matmul(x, getattr(layer, "bias", None))
+        runtime_config = kwargs.get("inf_config", kwargs.get("config"))
+        return weight.matmul(x, getattr(layer, "bias", None), config=runtime_config)
 
     def load_weights(
         self,

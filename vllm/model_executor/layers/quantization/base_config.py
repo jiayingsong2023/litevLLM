@@ -10,7 +10,7 @@ class QuantizationConfig(ABC):
     def init_layer(self, layer: nn.Module): pass
     
     @abstractmethod
-    def apply(self, layer: nn.Module, x): pass
+    def apply(self, layer: nn.Module, x, *args, **kwargs): pass
     
     @abstractmethod
     def load_weights(self, layer: nn.Module, weights_iter): pass

@@ -29,7 +29,10 @@ class AWQConfig(QuantizationConfig):
             layer.group_size = self.group_size
         layer._quant_weight = None
 
-    def apply(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def apply(
+        self, layer: nn.Module, x: torch.Tensor, *args, **kwargs
+    ) -> torch.Tensor:
+        del args
         # Check if already built
         weight = getattr(layer, "_quant_weight", None)
         if weight is None:
@@ -79,7 +82,8 @@ class AWQConfig(QuantizationConfig):
                 )
             layer._quant_weight = weight
 
-        return weight.matmul(x, layer.bias)
+        runtime_config = kwargs.get("inf_config", kwargs.get("config"))
+        return weight.matmul(x, layer.bias, config=runtime_config)
 
     def load_weights(self, layer: nn.Module, weights_iter, expert_idx=None, part=None):
         for name, loaded_weight in weights_iter:

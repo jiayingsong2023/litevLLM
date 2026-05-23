@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.layers.quantization.tensor import (
     AWQExecutionPolicy,
     _default_awq_dense_fallback_max_gb,
+    PackedInt4Weight,
     awq_decode_gemv_enabled,
     resolve_awq_execution_policy,
     should_allow_awq_fused,
@@ -108,3 +109,50 @@ def test_default_awq_dense_fallback_max_gb_ignores_dense_mlp_env(
     )
 
     assert _default_awq_dense_fallback_max_gb() == 14.0
+
+
+def test_packed_int4_weight_matmul_passes_runtime_kernel_policy(monkeypatch) -> None:
+    qweight = torch.zeros((5376, 2688), dtype=torch.uint8)
+    scales = torch.ones((5376, 672), dtype=torch.float16)
+    weight = PackedInt4Weight(
+        qweight,
+        scales,
+        group_size=32,
+        original_shape=(5376, 21504),
+        prefix="layers.0.mlp.down_proj",
+        profile_hint="gemma4_31b_q4",
+    )
+    x = torch.zeros((1, 21504), dtype=torch.bfloat16)
+    inf_config = SimpleNamespace(
+        kernel_policy={
+            "awq_decode_gemv": True,
+            "gemma4_dense_down_proj": True,
+        }
+    )
+    expected = torch.full((1, 5376), 0.25, dtype=torch.bfloat16)
+    seen: dict[str, object] = {}
+
+    def _fake_safe(
+        a, qweight, scales, group_size, out=None, bias=None, *, config=None, policy=None
+    ):
+        seen["config"] = config
+        seen["policy"] = policy
+        return expected, True, "ok"
+
+    monkeypatch.setattr(
+        "vllm.kernels.triton.awq_fused_gemm.packed_int4_symmetric_fused_gemm_safe",
+        _fake_safe,
+    )
+
+    def _raise_dense(*args, **kwargs):
+        raise AssertionError("dense fallback should be bypassed for runtime policy")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.tensor.dequantize_symmetric_packed_int4_pytorch",
+        _raise_dense,
+    )
+
+    y = weight.matmul(x, config=inf_config)
+    assert torch.equal(y, expected)
+    assert seen["config"] is inf_config
+    assert seen["policy"] is None

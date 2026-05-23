@@ -266,7 +266,6 @@ class TestHelperNumericEquivalence:
     def test_direct_fused_gate_up_matches_dense_silu(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
         device = torch.device("cuda")
         n, k, group_size = 257, 288, 32
         gate, up, _ = self._build_pair(n, k, group_size, device)
@@ -277,6 +276,7 @@ class TestHelperNumericEquivalence:
             gate,
             up,
             activation="silu",
+            inf_config=_mk_inf_config(gate_up="1"),
         )
         assert fused is not None
         torch.cuda.synchronize()
@@ -297,7 +297,6 @@ class TestHelperNumericEquivalence:
     def test_direct_fused_gate_up_matches_dense_gelu_tanh(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
         device = torch.device("cuda")
         n, k, group_size = 193, 256, 32
         gate, up, _ = self._build_pair(n, k, group_size, device)
@@ -308,6 +307,7 @@ class TestHelperNumericEquivalence:
             gate,
             up,
             activation="gelu_pytorch_tanh",
+            inf_config=_mk_inf_config(gate_up="1"),
         )
         assert fused is not None
         torch.cuda.synchronize()
@@ -358,12 +358,17 @@ def _mk_inf_config(
     pair_fusion: str | None = None,
     gate_up: str | None = None,
 ) -> SimpleNamespace:
-    tuning_env: dict[str, str] = {}
+    kernel_policy: dict[str, object] = {}
+    model_policy: dict[str, object] = {}
     if pair_fusion is not None:
-        tuning_env["FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"] = pair_fusion
+        model_policy["mlp_pair_fusion"] = pair_fusion == "1"
     if gate_up is not None:
-        tuning_env["FASTINFERENCE_AWQ_FUSED_GATE_UP"] = gate_up
-    return SimpleNamespace(tuning_env=tuning_env)
+        kernel_policy["awq_fused_gate_up"] = gate_up == "1"
+    return SimpleNamespace(
+        tuning_env={},
+        kernel_policy=kernel_policy,
+        model_policy=model_policy,
+    )
 
 
 class TestGemma4MLPRouting:
@@ -448,6 +453,9 @@ class TestGemma4MLPRouting:
         assert out.shape == x.shape
         assert direct_helper.call_count == 1
         pair_helper.assert_not_called()
+        assert direct_helper.call_args.kwargs.get("inf_config").kernel_policy == {
+            "awq_fused_gate_up": True
+        }
 
     def test_direct_gate_up_helper_off_when_runtime_config_disables(
         self, monkeypatch: pytest.MonkeyPatch
