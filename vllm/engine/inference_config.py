@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -31,6 +31,8 @@ class LiteInferenceConfig:
     paged_attn_num_stages_local: int | None = None
     gemma4_c1_preset: bool = False
     tuning_env: dict[str, str] | None = None
+    model_policy: dict[str, object] = field(default_factory=dict)
+    kernel_policy: dict[str, object] = field(default_factory=dict)
 
     # KV Block Selective Attention (decode memory-bandwidth optimization)
     kv_select_ratio: float = 0.0

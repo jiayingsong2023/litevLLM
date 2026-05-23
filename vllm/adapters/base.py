@@ -28,6 +28,8 @@ class RuntimeModelPolicy:
     prefill_chunk_size_high_end: int | None = None
     prefill_chunk_size_standard: int | None = None
     tuning_env_overrides: dict[str, str] = field(default_factory=dict)
+    model_policy: dict[str, object] = field(default_factory=dict)
+    kernel_policy: dict[str, object] = field(default_factory=dict)
 
 
 class ModelAdapter(Protocol):

@@ -58,12 +58,6 @@ def set_gemma4_tuning_config(
     )
 
 
-def _env_get(name: str, default: str = "") -> str:
-    if _GEMMA4_TUNING_LOCKED:
-        return _GEMMA4_TUNING.get(name, default)
-    return os.environ.get(name, _GEMMA4_TUNING.get(name, default))
-
-
 def _truthy_string(raw: object) -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -103,7 +97,9 @@ def _resolve_gemma4_rope_cache_max_pos(
             max_pos = min(max_pos, max(64, int(kv_max_raw)))
         except ValueError:
             pass
-    rope_cap_raw = getattr(runtime_config, "gemma4_rope_cache_max_pos", None)
+    rope_cap_raw = _gemma4_policy_value(runtime_config, "rope_cache_max_pos", None)
+    if rope_cap_raw is None:
+        rope_cap_raw = getattr(runtime_config, "gemma4_rope_cache_max_pos", None)
     if rope_cap_raw is not None:
         try:
             max_pos = min(max_pos, max(64, int(rope_cap_raw)))
@@ -113,7 +109,9 @@ def _resolve_gemma4_rope_cache_max_pos(
 
 
 def _resolve_gemma4_rope_cache_pool_limit(runtime_config: Any = None) -> int:
-    raw = getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
+    raw = _gemma4_policy_value(runtime_config, "rope_cache_pool_max", None)
+    if raw is None:
+        raw = getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
     try:
         return max(1, min(128, int(raw)))
     except ValueError:
@@ -276,48 +274,55 @@ def _get_sig_for_layer(
     return _sig
 
 
-def _env_truthy(name: str) -> bool:
-    return _env_get(name, "").strip().lower() in ("1", "true", "yes", "on")
+def _gemma4_policy_value(
+    inf_config: Any,
+    policy_name: str,
+    default: object = None,
+    *,
+    policy_attr: str = "model_policy",
+) -> object:
+    policy = _meta_get(inf_config, policy_attr, None)
+    if isinstance(policy, dict) and policy_name in policy:
+        return policy[policy_name]
+    return default
 
 
-def _env_truthy_default_on(name: str) -> bool:
-    raw = _env_get(name)
-    if raw is None:
-        return True
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+def _gemma4_model_policy_truthy(
+    inf_config: Any,
+    policy_name: str,
+    *,
+    default: bool = False,
+) -> bool:
+    raw = _gemma4_policy_value(inf_config, policy_name, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = _env_get(name)
-    if raw is None or raw.strip() == "":
-        return int(default)
-    try:
-        return int(raw)
-    except ValueError:
-        return int(default)
-
-
-def _gemma4_config_truthy_default_on(inf_config: Any, name: str) -> bool:
-    tuning_env = _meta_get(inf_config, "tuning_env", None)
-    if not isinstance(tuning_env, dict):
-        return True
-    raw = tuning_env.get(name)
-    if raw is None:
-        return True
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _gemma4_config_truthy_default_off(inf_config: Any, name: str) -> bool:
-    tuning_env = _meta_get(inf_config, "tuning_env", None)
-    if not isinstance(tuning_env, dict):
-        return False
-    raw = tuning_env.get(name)
-    if raw is None:
-        return False
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+def _gemma4_kernel_policy_truthy(
+    inf_config: Any,
+    policy_name: str,
+    *,
+    default: bool = False,
+) -> bool:
+    raw = _gemma4_policy_value(
+        inf_config,
+        policy_name,
+        default,
+        policy_attr="kernel_policy",
+    )
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _gemma4_fp32_residual_guard_policy(runtime_config: Any) -> tuple[bool, int, int]:
+    model_policy = _meta_get(runtime_config, "model_policy", None)
+    if isinstance(model_policy, dict):
+        enabled = bool(model_policy.get("fp32_residual_guard_enabled", False))
+        start = int(model_policy.get("fp32_residual_guard_start", 8))
+        span = max(1, int(model_policy.get("fp32_residual_guard_span", 3)))
+        return enabled, start, span
     enabled = bool(
         getattr(runtime_config, "gemma4_26b_fp32_residual_guard_enabled", False)
     )
@@ -326,16 +331,6 @@ def _gemma4_fp32_residual_guard_policy(runtime_config: Any) -> tuple[bool, int, 
         1, int(getattr(runtime_config, "gemma4_26b_fp32_residual_guard_span", 3))
     )
     return enabled, start, span
-
-
-def _env_int_alias(primary_name: str, legacy_name: str, default: int) -> int:
-    raw = _env_get(primary_name, "").strip()
-    if not raw:
-        raw = _env_get(legacy_name, str(default)).strip()
-    try:
-        return int(raw)
-    except ValueError:
-        return int(default)
 
 
 def _repeat_kv_for_gqa(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -536,9 +531,7 @@ def _gather_recent_kv_batched(
             max_ctx = int(max_seq_len_cpu)
         else:
             max_ctx = min(int(max_seq_len_cpu), int(local_window))
-    elif _gemma4_config_truthy_default_off(
-        inf_config, "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH"
-    ):
+    elif _gemma4_model_policy_truthy(inf_config, "legacy_item_path", default=False):
         max_ctx = int(torch.max(ctx_lens).item()) if bsz > 0 else 0
     else:
         # Conservative upper bound: fall back to cache width instead of a
@@ -795,18 +788,14 @@ def _should_use_full_decode_reference(inf_config: Any, kv_cache_dtype: str) -> b
     # logit soft-capping natively, so full-precision (fp16/bf16) KV no longer
     # needs to fall back to the eager pytorch reference path on the decode hot
     # loop. We still honour two escape hatches:
-    #   FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN=1
+    #   force_full_ref_attn:
     #     Emergency rollback: force ref-path for every dtype (numerical debugging).
-    #   FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN=1
+    #   legacy_fp16_ref_attn:
     #     Preserve the pre-Step-3 behaviour where fp16/bf16 KV forces ref-path
     #     while int4/fp8 still takes the Triton kernel. Useful during rollout.
-    if _gemma4_config_truthy_default_off(
-        inf_config, "FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN"
-    ):
+    if _gemma4_model_policy_truthy(inf_config, "force_full_ref_attn", default=False):
         return True
-    if _gemma4_config_truthy_default_off(
-        inf_config, "FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN"
-    ):
+    if _gemma4_model_policy_truthy(inf_config, "legacy_fp16_ref_attn", default=False):
         kvt = str(kv_cache_dtype).lower()
         return ("int4" not in kvt) and ("fp8" not in kvt)
     return False
@@ -818,8 +807,8 @@ def _is_packed_or_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 
 def _use_legacy_full_precision_kv_write(inf_config: Any) -> bool:
-    return _gemma4_config_truthy_default_off(
-        inf_config, "FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE"
+    return _gemma4_model_policy_truthy(
+        inf_config, "legacy_fullprec_kv_write", default=False
     )
 
 
@@ -996,8 +985,8 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         if max_position_plus_one_cpu is not None and int(max_position_plus_one_cpu) > 0:
             self._ensure_cache_len(int(max_position_plus_one_cpu))
         elif positions.numel() > 0:
-            if _gemma4_config_truthy_default_off(
-                inf_config, "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH"
+            if _gemma4_model_policy_truthy(
+                inf_config, "legacy_item_path", default=False
             ):
                 required_len = int(positions.max().item()) + 1
                 self._ensure_cache_len(required_len)
@@ -1322,8 +1311,8 @@ class Gemma4Attention(nn.Module):
                     # -> -inf mask -> online softmax), so we no longer need to
                     # route softcap>0 through the eager pytorch ref path here.
                     use_triton_local_decode = (
-                        _gemma4_config_truthy_default_on(
-                            inf_config, "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON"
+                        _gemma4_model_policy_truthy(
+                            inf_config, "local_decode_triton", default=True
                         )
                         and block_tables is not None
                         and seq_lens is not None
@@ -1372,9 +1361,10 @@ class Gemma4Attention(nn.Module):
                                 )
                             else:
                                 max_ctx_local = int(_max_cpu)
-                        elif _gemma4_config_truthy_default_off(
+                        elif _gemma4_model_policy_truthy(
                             inf_config,
-                            "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH",
+                            "legacy_item_path",
+                            default=False,
                         ):
                             max_ctx_local = (
                                 int(torch.max(seq_lens_local).item())
@@ -1657,9 +1647,7 @@ class Gemma4MLP(nn.Module):
         # The helper returns None when structural guards trip (mismatched
         # shapes, high-fidelity flag, active LoRA, etc.) and the caller
         # falls back to the two-matmul path below.
-        if _gemma4_config_truthy_default_on(
-            inf_config, "FASTINFERENCE_AWQ_FUSED_GATE_UP"
-        ):
+        if _gemma4_kernel_policy_truthy(inf_config, "awq_fused_gate_up", default=True):
             from vllm.model_executor.models._fused_awq_pair import (
                 try_fused_awq_gate_up_activation,
             )
@@ -1674,9 +1662,7 @@ class Gemma4MLP(nn.Module):
             if h is not None:
                 return self.down_proj(h, lora_mapping)
 
-        if _gemma4_config_truthy_default_on(
-            inf_config, "FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION"
-        ):
+        if _gemma4_model_policy_truthy(inf_config, "mlp_pair_fusion", default=True):
             from vllm.model_executor.models._fused_awq_pair import (
                 try_fused_awq_pair_matmul,
             )
@@ -1904,39 +1890,81 @@ class Gemma4MoeExpertsLite(nn.Module):
         self._cached_dtype: Optional[torch.dtype] = None
         self._cached_w1: Optional[torch.Tensor] = None
         self._cached_w2: Optional[torch.Tensor] = None
-        self._expert_weight_cache: (
-            "OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]"
-        ) = OrderedDict()
+        self._expert_weight_cache: OrderedDict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
         self._expert_cache_device: Optional[torch.device] = None
         self._expert_cache_dtype: Optional[torch.dtype] = None
         self._max_expert_cache = max(
             0,
-            int(getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)),
+            int(
+                _gemma4_policy_value(
+                    runtime_config,
+                    "moe_expert_cache_size",
+                    getattr(runtime_config, "gemma4_moe_expert_cache_size", 32),
+                )
+            ),
         )
         self._compute_dtype_policy = str(
-            getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
+            _gemma4_policy_value(
+                runtime_config,
+                "moe_compute_dtype",
+                getattr(runtime_config, "gemma4_moe_compute_dtype", "auto"),
+            )
         )
         self._int4_kernel_enabled = bool(
-            getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
+            _gemma4_policy_value(
+                runtime_config,
+                "moe_int4_kernel_enabled",
+                getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True),
+            )
         )
         self._int4_kernel_strategy = (
-            str(getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage"))
+            str(
+                _gemma4_policy_value(
+                    runtime_config,
+                    "moe_int4_kernel_strategy",
+                    getattr(
+                        runtime_config,
+                        "gemma4_moe_int4_kernel_strategy",
+                        "two_stage",
+                    ),
+                )
+            )
             .strip()
             .lower()
         )
         self._prefill_grouped_enabled = bool(
-            getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
+            _gemma4_policy_value(
+                runtime_config,
+                "moe_prefill_grouped_enabled",
+                getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False),
+            )
         )
         self._prefill_grouped_min_tokens = max(
             1,
-            int(getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)),
+            int(
+                _gemma4_policy_value(
+                    runtime_config,
+                    "moe_prefill_grouped_min_tokens",
+                    getattr(
+                        runtime_config,
+                        "gemma4_moe_prefill_grouped_min_tokens",
+                        17,
+                    ),
+                )
+            ),
         )
         self._prefill_grouped_strategy = (
             str(
-                getattr(
+                _gemma4_policy_value(
                     runtime_config,
-                    "gemma4_moe_prefill_grouped_strategy",
-                    "chunked",
+                    "moe_prefill_grouped_strategy",
+                    getattr(
+                        runtime_config,
+                        "gemma4_moe_prefill_grouped_strategy",
+                        "chunked",
+                    ),
                 )
             )
             .strip()
@@ -1945,7 +1973,11 @@ class Gemma4MoeExpertsLite(nn.Module):
         if self._prefill_grouped_strategy not in ("chunked", "fused"):
             self._prefill_grouped_strategy = "chunked"
         self._batch_materialize_enabled = bool(
-            getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False)
+            _gemma4_policy_value(
+                runtime_config,
+                "moe_batch_materialize_enabled",
+                getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False),
+            )
         )
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
@@ -2186,7 +2218,7 @@ class Gemma4MoeExpertsLite(nn.Module):
                     getattr(self.down_proj, "scales", torch.empty(0)),
                     intermediate_dim=self.intermediate_dim,
                     activation=self.hidden_act,
-            )
+                )
             if used_fast:
                 if _GEMMA4_PROFILE_ENABLED:
                     _gemma4_profile_record("moe_int4_decode_used", 0.0)

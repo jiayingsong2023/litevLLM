@@ -187,6 +187,8 @@ class LiteEngine:
             paged_attn_num_stages_local=self.runtime_config.paged_attn_num_stages_local,
             gemma4_c1_preset=self.runtime_config.gemma4_c1_preset,
             tuning_env=self._active_tuning_env,
+            model_policy=dict(self.runtime_policy.model_policy),
+            kernel_policy=dict(self.runtime_policy.kernel_policy),
             kv_select_ratio=self.runtime_config.kv_select_ratio,
             kv_select_sig_dim=self.runtime_config.kv_select_sig_dim,
             kv_select_min_blocks=self.runtime_config.kv_select_min_blocks,

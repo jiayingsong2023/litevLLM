@@ -6,61 +6,75 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from vllm.adapters.qwen3_5 import Qwen35Adapter
 from vllm.model_executor.models import qwen3_5
 
 
-def test_qwen35_runtime_flag_reads_attn_config_tuning_env(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "1"}
+def test_qwen35_adapter_exposes_production_model_policy() -> None:
+    policy = Qwen35Adapter().runtime_policy(
+        SimpleNamespace(hf_config=SimpleNamespace()),
+        SimpleNamespace(),
     )
 
-    assert qwen3_5._qwen35_config_truthy(
+    assert policy.model_policy == {
+        "fullattn_stabilizer": True,
+        "fullattn_use_sdpa_prefill": True,
+        "residual_stabilizer": True,
+        "linear_input_cap": True,
+        "fla_chunk_enabled": True,
+    }
+
+
+def test_qwen35_runtime_flag_reads_attn_config_model_policy(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "0")
+    inf_config = SimpleNamespace(model_policy={"fullattn_stabilizer": True})
+
+    assert qwen3_5._qwen35_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER",
+        "fullattn_stabilizer",
     )
 
 
 def test_qwen35_runtime_flag_ignores_env_without_config(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "1")
 
-    assert not qwen3_5._qwen35_config_truthy(
+    assert not qwen3_5._qwen35_model_policy_truthy(
         None,
-        "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER",
+        "fullattn_stabilizer",
     )
 
 
-def test_qwen35_sdpa_prefill_flag_reads_attn_config_tuning_env(monkeypatch) -> None:
+def test_qwen35_sdpa_prefill_flag_reads_attn_config_model_policy(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"fullattn_use_sdpa_prefill": True})
 
-    assert qwen3_5._qwen35_config_truthy(
+    assert qwen3_5._qwen35_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL",
+        "fullattn_use_sdpa_prefill",
     )
 
 
-def test_qwen35_disable_ablation_flags_read_attn_config_tuning_env(
+def test_qwen35_stabilizer_policy_reads_attn_config_model_policy(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER", "0")
     monkeypatch.setenv("FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP", "0")
     inf_config = SimpleNamespace(
-        tuning_env={
-            "FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER": "1",
-            "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP": "1",
+        model_policy={
+            "residual_stabilizer": False,
+            "linear_input_cap": False,
         }
     )
 
-    assert qwen3_5._qwen35_config_truthy(
+    assert not qwen3_5._qwen35_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER",
+        "residual_stabilizer",
+        default=True,
     )
-    assert qwen3_5._qwen35_config_truthy(
+    assert not qwen3_5._qwen35_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP",
+        "linear_input_cap",
+        default=True,
     )
 
 

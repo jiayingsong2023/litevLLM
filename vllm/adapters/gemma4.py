@@ -41,9 +41,11 @@ class Gemma4Adapter(ModelAdapter):
     ) -> RuntimeModelPolicy:
         tuning_env = dict(getattr(runtime_config, "tuning_env", None) or {})
         default_stage = "all"
-        fused_stage = str(
-            tuning_env.get("FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage)
-        ).strip().lower()
+        fused_stage = (
+            str(tuning_env.get("FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage))
+            .strip()
+            .lower()
+        )
         if fused_stage not in ("off", "attention_only", "all"):
             fused_stage = default_stage
 
@@ -55,6 +57,73 @@ class Gemma4Adapter(ModelAdapter):
             force_kv_dtype = "fp8"
 
         is_moe = _supports_moe(getattr(model_config, "hf_config", None))
+        model_policy = {
+            "local_decode_triton": True,
+            "force_full_ref_attn": False,
+            "legacy_fp16_ref_attn": False,
+            "legacy_fullprec_kv_write": False,
+            "legacy_item_path": False,
+            "mlp_pair_fusion": True,
+            "fp32_residual_guard_enabled": bool(
+                getattr(
+                    runtime_config,
+                    "gemma4_26b_fp32_residual_guard_enabled",
+                    False,
+                )
+            ),
+            "fp32_residual_guard_start": int(
+                getattr(runtime_config, "gemma4_26b_fp32_residual_guard_start", 8)
+            ),
+            "fp32_residual_guard_span": int(
+                getattr(runtime_config, "gemma4_26b_fp32_residual_guard_span", 3)
+            ),
+            "moe_expert_cache_size": int(
+                getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)
+            ),
+            "moe_compute_dtype": str(
+                getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
+            ),
+            "moe_int4_kernel_enabled": bool(
+                getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
+            ),
+            "moe_int4_kernel_strategy": str(
+                getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage")
+            ),
+            "moe_prefill_grouped_enabled": bool(
+                getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
+            ),
+            "moe_prefill_grouped_min_tokens": int(
+                getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)
+            ),
+            "moe_prefill_grouped_strategy": str(
+                getattr(
+                    runtime_config, "gemma4_moe_prefill_grouped_strategy", "chunked"
+                )
+            ),
+            "moe_batch_materialize_enabled": bool(
+                getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False)
+            ),
+            "rope_cache_max_pos": getattr(
+                runtime_config, "gemma4_rope_cache_max_pos", None
+            ),
+            "rope_cache_pool_max": int(
+                getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
+            ),
+        }
+        kernel_policy = {
+            "awq_fused_scope": fused_stage,
+            "awq_fused_gemm": fused_stage != "off",
+            "awq_fused_gemm_force": False,
+            "awq_decode_gemv": True,
+            "awq_fused_gate_up": True,
+        }
+        if not is_moe:
+            kernel_policy.update(
+                {
+                    "awq_group32_gemv_all": True,
+                    "gemma4_dense_down_proj": True,
+                }
+            )
         tuning_env_overrides = {
             "FASTINFERENCE_AWQ_FUSED_SCOPE": fused_stage,
             "FASTINFERENCE_AWQ_FUSED_GEMM": "0" if fused_stage == "off" else "1",
@@ -78,6 +147,8 @@ class Gemma4Adapter(ModelAdapter):
                 "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
             ),
             tuning_env_overrides=tuning_env_overrides,
+            model_policy=model_policy,
+            kernel_policy=kernel_policy,
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:

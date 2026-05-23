@@ -17,8 +17,12 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_expert_lru_size,
     moe_fp8_dequant_to_linear_weight,
 )
+
 _QWEN35_TUNING: dict[str, str] = {
-    key: value for key, value in os.environ.items() if key.startswith("FASTINFERENCE_QWEN35_") or key.startswith("FASTINFERENCE_DISABLE_")
+    key: value
+    for key, value in os.environ.items()
+    if key.startswith("FASTINFERENCE_QWEN35_")
+    or key.startswith("FASTINFERENCE_DISABLE_")
 }
 _QWEN35_TUNING_LOCKED = False
 
@@ -40,33 +44,18 @@ def set_qwen35_tuning_config(
     _QWEN35_TUNING_LOCKED = bool(locked)
 
 
-def _env_get(name: str, default: str = "") -> str:
-    if _QWEN35_TUNING_LOCKED:
-        return _QWEN35_TUNING.get(name, default)
-    return os.environ.get(name, _QWEN35_TUNING.get(name, default))
-
-
-
-
-
-def _env_truthy(name: str) -> bool:
-    """True for 1/true/yes/on (case-insensitive). Used for debug / ablation toggles."""
-    v = _env_get(name, "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _qwen35_config_truthy(
+def _qwen35_model_policy_truthy(
     inf_config: Any,
-    name: str,
+    policy_name: str,
     default: bool = False,
 ) -> bool:
-    tuning_env = getattr(inf_config, "tuning_env", None)
-    if not isinstance(tuning_env, dict):
+    policy = getattr(inf_config, "model_policy", None)
+    if not isinstance(policy, dict):
         return bool(default)
-    raw = tuning_env.get(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    raw = policy.get(policy_name, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _repeat_kv_hf(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -143,15 +132,6 @@ def _torch_causal_conv1d_update(
     return out.to(hidden_states.dtype), new_state
 
 
-def _env_qwen35_fla_chunk_enabled() -> bool:
-    """
-    Default ON (CUDA): use FLA fused ``chunk_gated_delta_rule`` to match Hugging Face Qwen3.5 text.
-    Set FASTINFERENCE_QWEN35_USE_FLA_CHUNK=0 to force the pure PyTorch reference (slower, drifts vs HF).
-    """
-    v = _env_get("FASTINFERENCE_QWEN35_USE_FLA_CHUNK", "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
-
-
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
@@ -174,8 +154,8 @@ def _torch_chunk_gated_delta_rule(
     Numerically matches ``fla.ops.gated_delta_rule.naive.naive_chunk_gated_delta_rule``
     (flash-linear-attention reference) for equal inputs on CPU/GPU.
 
-    Set ``FASTINFERENCE_QWEN35_USE_FLA_CHUNK=1`` to use the fused ``fla`` kernel on CUDA
-    when ``flash-linear-attention`` is installed (optional HF-aligned fast path).
+    Adapter policy enables the fused ``fla`` kernel on CUDA when
+    ``flash-linear-attention`` is installed (optional HF-aligned fast path).
     """
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
@@ -325,23 +305,21 @@ def _chunk_gated_delta_rule_backend(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     force_torch: bool = False,
+    fla_chunk_enabled: bool = True,
 ):
     """
-    Dispatch: FLA fused kernel on CUDA when enabled (default: on, matches HF), else PyTorch reference.
-    ``force_torch=True`` (LiteEngine streaming): always use PyTorch chunk so recurrent decode state matches.
+    Dispatch: FLA fused kernel on CUDA when enabled, else PyTorch reference.
+    ``force_torch=True`` keeps streaming decode on the PyTorch chunk path.
     """
-    if (
-        not force_torch
-        and _env_qwen35_fla_chunk_enabled()
-        and query.device.type == "cuda"
-    ):
+    if not force_torch and fla_chunk_enabled and query.device.type == "cuda":
         try:
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         except ImportError:
             import warnings
 
             warnings.warn(
-                "FASTINFERENCE_QWEN35_USE_FLA_CHUNK is enabled but flash-linear-attention is not installed; "
+                "Qwen3.5 FLA chunk policy is enabled but "
+                "flash-linear-attention is not installed; "
                 "falling back to the pure PyTorch chunk rule.",
                 stacklevel=2,
             )
@@ -905,6 +883,11 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
             else getattr(attn_metadata, "config", None)
         )
         fusion_level = inf_config.fusion_level if inf_config else 2
+        fla_chunk_enabled = _qwen35_model_policy_truthy(
+            inf_config,
+            "fla_chunk_enabled",
+            default=True,
+        )
 
         input_dtype = x.dtype
         residual = x
@@ -1025,6 +1008,7 @@ class Qwen3_5LinearAttentionLayer(nn.Module):
                 output_final_state=use_stream,
                 use_qk_l2norm_in_kernel=True,
                 force_torch=use_stream,
+                fla_chunk_enabled=fla_chunk_enabled,
             )
         if (
             use_stream
@@ -1198,21 +1182,23 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             else getattr(attn_metadata, "config", None)
         )
         fusion_level = inf_config.fusion_level if inf_config else 2
-        use_full_attn_stabilizer = _qwen35_config_truthy(
+        use_full_attn_stabilizer = _qwen35_model_policy_truthy(
             inf_config,
-            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER",
+            "fullattn_stabilizer",
         )
-        use_sdpa_prefill_policy = _qwen35_config_truthy(
+        use_sdpa_prefill_policy = _qwen35_model_policy_truthy(
             inf_config,
-            "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL",
+            "fullattn_use_sdpa_prefill",
         )
-        disable_residual_stabilizer = _qwen35_config_truthy(
+        residual_stabilizer = _qwen35_model_policy_truthy(
             inf_config,
-            "FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER",
+            "residual_stabilizer",
+            default=True,
         )
-        disable_linear_input_cap = _qwen35_config_truthy(
+        linear_input_cap = _qwen35_model_policy_truthy(
             inf_config,
-            "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP",
+            "linear_input_cap",
+            default=True,
         )
 
         input_dtype = x.dtype
@@ -1394,14 +1380,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 self.self_attn.o_proj,
                 attn_gated.float(),
                 pre_cap=1024.0,
-                disable_input_cap=disable_linear_input_cap,
+                disable_input_cap=not linear_input_cap,
             )
             hidden_states = _residual_merge_fp16(
                 x.float(),
                 attn_out,
                 input_dtype,
                 8.0,
-                disable_stabilizer=disable_residual_stabilizer,
+                disable_stabilizer=not residual_stabilizer,
             )
         else:
             attn_out = self.self_attn.o_proj(attn_gated)
@@ -1419,14 +1405,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
                 self.mlp.down_proj,
                 mlp_mid,
                 pre_cap=1536.0,
-                disable_input_cap=disable_linear_input_cap,
+                disable_input_cap=not linear_input_cap,
             )
             return _residual_merge_fp16(
                 hidden_states.float(),
                 mlp_out,
                 input_dtype,
                 8.0,
-                disable_stabilizer=disable_residual_stabilizer,
+                disable_stabilizer=not residual_stabilizer,
             )
 
         if fusion_level >= 2:  # Fused GateUp

@@ -133,14 +133,10 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
             assert "_collect_temporary_fastinference_tuning_env" in text
             names.discard("FASTINFERENCE_TUNING_ENV_PREFIX")
             if "FASTINFERENCE_" in names:
-                assert (
-                    '_FASTINFERENCE_TUNING_ENV_PREFIX = "FASTINFERENCE_"' in text
-                )
+                assert '_FASTINFERENCE_TUNING_ENV_PREFIX = "FASTINFERENCE_"' in text
                 names.remove("FASTINFERENCE_")
         unexpected = names - allowed
-        assert not unexpected, (
-            f"{rel} has production env reads: {sorted(unexpected)}"
-        )
+        assert not unexpected, f"{rel} has production env reads: {sorted(unexpected)}"
 
 
 def test_production_step_scheduler_does_not_call_inference_config_from_env() -> None:
@@ -157,11 +153,46 @@ def test_production_step_scheduler_does_not_call_inference_config_from_env() -> 
         )
 
 
+def test_model_files_do_not_read_production_policy_env_names() -> None:
+    production_model_files = [
+        "vllm/model_executor/models/gemma4.py",
+        "vllm/model_executor/models/qwen3_5.py",
+    ]
+    forbidden_names = {
+        "FASTINFERENCE_AWQ_FUSED_GATE_UP",
+        "FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN",
+        "FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN",
+        "FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE",
+        "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH",
+        "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON",
+        "FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION",
+        "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER",
+        "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL",
+        "FASTINFERENCE_QWEN35_USE_FLA_CHUNK",
+        "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP",
+        "FASTINFERENCE_DISABLE_RESIDUAL_STABILIZER",
+    }
+    forbidden_patterns = ("os.environ.get(", "getenv(")
+    for rel in production_model_files:
+        text = _read(rel)
+        found_names = forbidden_names & set(
+            re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text)
+        )
+        assert not found_names, (
+            f"{rel} must receive production model/kernel policy from adapters, "
+            f"not direct env/tuning names: {sorted(found_names)}"
+        )
+        for pattern in forbidden_patterns:
+            assert pattern not in text, (
+                f"{rel} must not read production policy directly via {pattern!r}"
+            )
+
+
 def test_qwen35_full_attention_policy_uses_runtime_config() -> None:
     qwen = _read("vllm/model_executor/models/qwen3_5.py")
 
     forbidden_patterns = (
-        'self._use_full_attn_stabilizer = _env_truthy(',
+        "self._use_full_attn_stabilizer = _env_truthy(",
         "if self._use_full_attn_stabilizer:",
         "self._use_sdpa_prefill = _env_qwen35_sdpa_prefill_enabled()",
         "self._use_sdpa_prefill",
@@ -218,9 +249,7 @@ def test_gemma4_legacy_full_precision_kv_write_policy_uses_runtime_config() -> N
 def test_gemma4_legacy_item_path_policy_uses_runtime_config() -> None:
     gemma = _read("vllm/model_executor/models/gemma4.py")
 
-    forbidden_patterns = (
-        '_env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH")',
-    )
+    forbidden_patterns = ('_env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH")',)
     for pattern in forbidden_patterns:
         assert pattern not in gemma, (
             "Gemma4 legacy item-path decode policy must come from "
@@ -259,9 +288,7 @@ def test_gemma4_fp32_residual_guard_policy_uses_runtime_config() -> None:
 def test_gemma4_moe_expert_cache_policy_uses_runtime_config() -> None:
     gemma = _read("vllm/model_executor/models/gemma4.py")
 
-    forbidden_patterns = (
-        '_env_int("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"',
-    )
+    forbidden_patterns = ('_env_int("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"',)
     for pattern in forbidden_patterns:
         assert pattern not in gemma, (
             "Gemma4 MoE expert cache policy must come from RuntimeConfig, "
@@ -272,9 +299,7 @@ def test_gemma4_moe_expert_cache_policy_uses_runtime_config() -> None:
 def test_gemma4_awq_fused_gate_up_policy_uses_runtime_config() -> None:
     gemma = _read("vllm/model_executor/models/gemma4.py")
 
-    forbidden_patterns = (
-        '_env_truthy("FASTINFERENCE_AWQ_FUSED_GATE_UP")',
-    )
+    forbidden_patterns = ('_env_truthy("FASTINFERENCE_AWQ_FUSED_GATE_UP")',)
     for pattern in forbidden_patterns:
         assert pattern not in gemma, (
             "Gemma4 AWQ fused gate-up policy must come from runtime config, "

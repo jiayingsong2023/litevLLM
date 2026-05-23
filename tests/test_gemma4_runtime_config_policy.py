@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from vllm.adapters.gemma4 import Gemma4Adapter
 from vllm.model_executor.models import gemma4
 
 
@@ -22,17 +23,67 @@ def test_gemma4_profile_flags_are_derived_from_tuning_env(monkeypatch) -> None:
     assert not gemma4._GEMMA4_ROCTX_PROFILE_ENABLED
 
 
-def test_gemma4_local_decode_triton_reads_attn_config_tuning_env(
+def test_gemma4_adapter_exposes_production_model_and_kernel_policy() -> None:
+    runtime_config = SimpleNamespace(
+        tuning_env={},
+        kv_cache_dtype="fp8",
+        gemma4_26b_fp32_residual_guard_enabled=True,
+        gemma4_26b_fp32_residual_guard_start=10,
+        gemma4_26b_fp32_residual_guard_span=2,
+        gemma4_moe_expert_cache_size=24,
+        gemma4_moe_compute_dtype="fp16",
+        gemma4_moe_int4_kernel_enabled=False,
+        gemma4_moe_int4_kernel_strategy="batched",
+        gemma4_moe_prefill_grouped_enabled=True,
+        gemma4_moe_prefill_grouped_min_tokens=33,
+        gemma4_moe_prefill_grouped_strategy="fused",
+        gemma4_moe_batch_materialize_enabled=True,
+        gemma4_rope_cache_max_pos=1536,
+        gemma4_rope_cache_pool_max=12,
+    )
+    model_config = SimpleNamespace(hf_config=SimpleNamespace())
+
+    policy = Gemma4Adapter().runtime_policy(model_config, runtime_config)
+
+    assert policy.model_policy == {
+        "local_decode_triton": True,
+        "force_full_ref_attn": False,
+        "legacy_fp16_ref_attn": False,
+        "legacy_fullprec_kv_write": False,
+        "legacy_item_path": False,
+        "mlp_pair_fusion": True,
+        "fp32_residual_guard_enabled": True,
+        "fp32_residual_guard_start": 10,
+        "fp32_residual_guard_span": 2,
+        "moe_expert_cache_size": 24,
+        "moe_compute_dtype": "fp16",
+        "moe_int4_kernel_enabled": False,
+        "moe_int4_kernel_strategy": "batched",
+        "moe_prefill_grouped_enabled": True,
+        "moe_prefill_grouped_min_tokens": 33,
+        "moe_prefill_grouped_strategy": "fused",
+        "moe_batch_materialize_enabled": True,
+        "rope_cache_max_pos": 1536,
+        "rope_cache_pool_max": 12,
+    }
+    assert policy.kernel_policy["awq_fused_scope"] == "all"
+    assert policy.kernel_policy["awq_fused_gemm"] is True
+    assert policy.kernel_policy["awq_decode_gemv"] is True
+    assert policy.kernel_policy["awq_fused_gate_up"] is True
+    assert policy.kernel_policy["awq_group32_gemv_all"] is True
+    assert policy.kernel_policy["gemma4_dense_down_proj"] is True
+
+
+def test_gemma4_local_decode_triton_reads_attn_config_model_policy(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"local_decode_triton": True})
 
-    assert gemma4._gemma4_config_truthy_default_on(
+    assert gemma4._gemma4_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON",
+        "local_decode_triton",
+        default=True,
     )
 
 
@@ -41,37 +92,36 @@ def test_gemma4_local_decode_triton_ignores_env_without_config(
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON", "0")
 
-    assert gemma4._gemma4_config_truthy_default_on(
+    assert gemma4._gemma4_model_policy_truthy(
         None,
-        "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON",
+        "local_decode_triton",
+        default=True,
     )
 
 
-def test_gemma4_full_decode_ref_reads_attn_config_tuning_env(monkeypatch) -> None:
+def test_gemma4_full_decode_ref_reads_attn_config_model_policy(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", "0")
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"force_full_ref_attn": True})
 
-    assert gemma4._gemma4_config_truthy_default_off(
+    assert gemma4._gemma4_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN",
+        "force_full_ref_attn",
+        default=False,
     )
 
 
-def test_gemma4_full_decode_ref_legacy_fp16_reads_attn_config_tuning_env(
+def test_gemma4_full_decode_ref_legacy_fp16_reads_attn_config_model_policy(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", "0")
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"legacy_fp16_ref_attn": True})
 
-    assert gemma4._gemma4_config_truthy_default_off(
+    assert gemma4._gemma4_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN",
+        "legacy_fp16_ref_attn",
+        default=False,
     )
 
 
@@ -79,27 +129,28 @@ def test_gemma4_full_decode_ref_ignores_env_without_config(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN", "1")
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN", "1")
 
-    assert not gemma4._gemma4_config_truthy_default_off(
+    assert not gemma4._gemma4_model_policy_truthy(
         None,
-        "FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN",
+        "force_full_ref_attn",
+        default=False,
     )
-    assert not gemma4._gemma4_config_truthy_default_off(
+    assert not gemma4._gemma4_model_policy_truthy(
         None,
-        "FASTINFERENCE_GEMMA4_LEGACY_FP16_REF_ATTN",
+        "legacy_fp16_ref_attn",
+        default=False,
     )
 
 
-def test_gemma4_legacy_full_precision_kv_write_reads_attn_config_tuning_env(
+def test_gemma4_legacy_full_precision_kv_write_reads_attn_config_model_policy(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"legacy_fullprec_kv_write": True})
 
-    assert gemma4._gemma4_config_truthy_default_off(
+    assert gemma4._gemma4_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE",
+        "legacy_fullprec_kv_write",
+        default=False,
     )
 
 
@@ -108,30 +159,31 @@ def test_gemma4_legacy_full_precision_kv_write_ignores_env_without_config(
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE", "1")
 
-    assert not gemma4._gemma4_config_truthy_default_off(
+    assert not gemma4._gemma4_model_policy_truthy(
         None,
-        "FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE",
+        "legacy_fullprec_kv_write",
+        default=False,
     )
 
 
-def test_gemma4_legacy_item_path_reads_attn_config_tuning_env(monkeypatch) -> None:
+def test_gemma4_legacy_item_path_reads_attn_config_model_policy(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH", "0")
-    inf_config = SimpleNamespace(
-        tuning_env={"FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH": "1"}
-    )
+    inf_config = SimpleNamespace(model_policy={"legacy_item_path": True})
 
-    assert gemma4._gemma4_config_truthy_default_off(
+    assert gemma4._gemma4_model_policy_truthy(
         inf_config,
-        "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH",
+        "legacy_item_path",
+        default=False,
     )
 
 
 def test_gemma4_legacy_item_path_ignores_env_without_config(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH", "1")
 
-    assert not gemma4._gemma4_config_truthy_default_off(
+    assert not gemma4._gemma4_model_policy_truthy(
         None,
-        "FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH",
+        "legacy_item_path",
+        default=False,
     )
 
 

@@ -21,6 +21,13 @@ class Qwen35Adapter(ModelAdapter):
         return RuntimeModelPolicy(
             prefill_chunk_size_high_end=2048,
             prefill_chunk_size_standard=1024,
+            model_policy={
+                "fullattn_stabilizer": True,
+                "fullattn_use_sdpa_prefill": True,
+                "residual_stabilizer": True,
+                "linear_input_cap": True,
+                "fla_chunk_enabled": True,
+            },
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
