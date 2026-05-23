@@ -23,6 +23,15 @@ def _mock_vllm_config() -> SimpleNamespace:
     )
 
 
+def _mock_text_config_vllm_config() -> SimpleNamespace:
+    config = _mock_vllm_config()
+    config.model_config.hf_config = SimpleNamespace(
+        model_type="paligemma",
+        text_config=SimpleNamespace(model_type="gemma4_text"),
+    )
+    return config
+
+
 def test_lite_engine_attaches_runtime_config_before_model_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,3 +69,29 @@ def test_lite_engine_attaches_runtime_config_before_model_load(
 
     with pytest.raises(StopAfterModelConfigCheck):
         lite_engine_module.LiteEngine(_mock_vllm_config())
+
+
+def test_lite_engine_uses_text_config_adapter_policy_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.engine import lite_engine as lite_engine_module
+
+    class StopAfterModelConfigCheck(Exception):
+        pass
+
+    def fake_get_model(*, vllm_config: Any) -> Any:
+        runtime_config = getattr(vllm_config, "runtime_config", None)
+        assert runtime_config is not None
+        assert runtime_config.model_policy["local_decode_triton"] is True
+        assert runtime_config.kernel_policy["awq_fused_scope"] == "all"
+        raise StopAfterModelConfigCheck
+
+    monkeypatch.setattr(
+        lite_engine_module.LiteEngine,
+        "_install_tuning_configs_for_model",
+        lambda self, _policy: setattr(self, "_active_tuning_env", {}),
+    )
+    monkeypatch.setattr(lite_engine_module, "get_model", fake_get_model)
+
+    with pytest.raises(StopAfterModelConfigCheck):
+        lite_engine_module.LiteEngine(_mock_text_config_vllm_config())

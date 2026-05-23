@@ -3,6 +3,14 @@ from typing import Any
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 
+QWEN35_PRODUCTION_MODEL_POLICY: dict[str, object] = {
+    "fullattn_stabilizer": True,
+    "fullattn_use_sdpa_prefill": True,
+    "residual_stabilizer": True,
+    "linear_input_cap": True,
+    "fla_chunk_enabled": True,
+}
+
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     if value % multiple == 0:
@@ -21,19 +29,13 @@ class Qwen35Adapter(ModelAdapter):
         return RuntimeModelPolicy(
             prefill_chunk_size_high_end=2048,
             prefill_chunk_size_standard=1024,
-            model_policy={
-                "fullattn_stabilizer": True,
-                "fullattn_use_sdpa_prefill": True,
-                "residual_stabilizer": True,
-                "linear_input_cap": True,
-                "fla_chunk_enabled": True,
-            },
+            model_policy=dict(QWEN35_PRODUCTION_MODEL_POLICY),
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
-        from vllm.model_executor.models.qwen3_5 import set_qwen35_tuning_config
-
-        set_qwen35_tuning_config(tuning_env, locked=True)
+        # Qwen3.5 production policy lives in ``model_policy``. No model-local
+        # tuning env remains after migrating full-attention and FLA controls.
+        return None
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)

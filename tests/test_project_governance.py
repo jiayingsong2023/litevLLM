@@ -194,10 +194,7 @@ def test_model_tuning_snapshots_use_narrow_allowlists() -> None:
             "_GEMMA4_ALLOWED_TUNING_ENV",
             "FASTINFERENCE_GEMMA4_LAYER_PROFILE",
             "FASTINFERENCE_GEMMA4_ROCTX_PROFILE",
-        },
-        "vllm/model_executor/models/qwen3_5.py": {
-            "_QWEN35_ALLOWED_TUNING_ENV",
-        },
+        }
     }
     forbidden_patterns = (
         'key.startswith("FASTINFERENCE_GEMMA4_")',
@@ -213,6 +210,22 @@ def test_model_tuning_snapshots_use_narrow_allowlists() -> None:
             assert pattern not in text, (
                 f"{rel} must not capture tuning env by broad prefix {pattern!r}"
             )
+
+
+def test_qwen35_model_has_no_tuning_snapshot_state() -> None:
+    qwen = _read("vllm/model_executor/models/qwen3_5.py")
+
+    forbidden_patterns = (
+        "_QWEN35_TUNING",
+        "_QWEN35_ALLOWED_TUNING_ENV",
+        "set_qwen35_tuning_config",
+        "os.environ.items()",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in qwen, (
+            "Qwen3.5 production policy is adapter-owned; model-local tuning "
+            f"snapshot state must not remain via {pattern!r}"
+        )
 
 
 def test_qwen35_full_attention_policy_uses_runtime_config() -> None:

@@ -7,25 +7,39 @@ from .llama import LlamaAdapter
 from .qwen3_5 import Qwen35Adapter
 
 
+def _hf_config_candidates(model_config: Any) -> tuple[Any, ...]:
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        return ()
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None:
+        return (hf_config,)
+    return (hf_config, text_config)
+
+
 def _looks_like_qwen35(model: Any, model_config: Any) -> bool:
     name = type(model).__name__.lower()
     if "qwen3_5" in name or "qwen35" in name:
         return True
-    hf_config = getattr(model_config, "hf_config", None)
-    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
-    return model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text")
+    for config in _hf_config_candidates(model_config):
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        if model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe_text"):
+            return True
+    return False
 
 
 def _looks_like_gemma4(model: Any, model_config: Any) -> bool:
     name = type(model).__name__.lower()
     if "gemma4" in name:
         return True
-    hf_config = getattr(model_config, "hf_config", None)
-    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
-    if model_type == "gemma4":
-        return True
-    archs = getattr(hf_config, "architectures", []) if hf_config is not None else []
-    return any("gemma4" in str(a).lower() for a in (archs or []))
+    for config in _hf_config_candidates(model_config):
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        if model_type in ("gemma4", "gemma4_text"):
+            return True
+        archs = getattr(config, "architectures", [])
+        if any("gemma4" in str(a).lower() for a in (archs or [])):
+            return True
+    return False
 
 
 def get_model_adapter(model: Any, model_config: Any) -> ModelAdapter:

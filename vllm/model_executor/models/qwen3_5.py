@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # GatedDeltaNet helpers below align with Hugging Face `modeling_qwen3_5.py` (torch fallback path).
-import os
 from collections import OrderedDict
 import torch
 import torch.nn as nn
@@ -17,34 +16,16 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_expert_lru_size,
     moe_fp8_dequant_to_linear_weight,
 )
-
-_QWEN35_ALLOWED_TUNING_ENV = frozenset[str]()
-_QWEN35_TUNING: dict[str, str] = {
-    key: value
-    for key, value in os.environ.items()
-    if key in _QWEN35_ALLOWED_TUNING_ENV
-}
-_QWEN35_TUNING_LOCKED = False
-
-
-def set_qwen35_tuning_config(
-    values: dict[str, object] | None, *, locked: bool = False
-) -> None:
-    """Install Qwen3.5 tuning flags before model construction."""
-    global _QWEN35_TUNING, _QWEN35_TUNING_LOCKED
-    _QWEN35_TUNING = {
-        str(key): str(value)
-        for key, value in (values or {}).items()
-        if str(key) in _QWEN35_ALLOWED_TUNING_ENV and value is not None
-    }
-    _QWEN35_TUNING_LOCKED = bool(locked)
+from vllm.adapters.qwen3_5 import QWEN35_PRODUCTION_MODEL_POLICY
 
 
 def _qwen35_model_policy_truthy(
     inf_config: Any,
     policy_name: str,
-    default: bool = False,
+    default: bool | None = None,
 ) -> bool:
+    if default is None:
+        default = bool(QWEN35_PRODUCTION_MODEL_POLICY.get(policy_name, False))
     policy = getattr(inf_config, "model_policy", None)
     if not isinstance(policy, dict):
         return bool(default)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.adapters.gemma4 import Gemma4Adapter
+from vllm.adapters.registry import get_model_adapter
 from vllm.adapters.qwen3_5 import Qwen35Adapter
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_planner import RuntimePlanner
@@ -31,6 +32,9 @@ def _runtime_config(**overrides: object) -> RuntimeConfig:
         prefill_reserve_backlog=2,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
+        min_prefill_chunk_size=128,
+        max_prefill_chunk_size=2048,
+        prefill_sla_ttft_ms=2000.0,
         tuning_env={},
     )
     values.update(overrides)
@@ -103,6 +107,32 @@ def test_qwen_runtime_policy_owns_prefill_chunk_preference() -> None:
 
     assert policy.prefill_chunk_size_high_end == 2048
     assert policy.prefill_chunk_size_standard == 1024
+
+
+def test_registry_detects_gemma4_text_config_before_model_load() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="paligemma",
+            text_config=SimpleNamespace(model_type="gemma4_text"),
+        )
+    )
+
+    adapter = get_model_adapter(None, model_config)
+
+    assert isinstance(adapter, Gemma4Adapter)
+
+
+def test_registry_detects_qwen35_text_config_before_model_load() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="wrapper",
+            text_config=SimpleNamespace(model_type="qwen3_5_text"),
+        )
+    )
+
+    adapter = get_model_adapter(None, model_config)
+
+    assert isinstance(adapter, Qwen35Adapter)
 
 
 def test_runtime_planner_uses_policy_prefill_chunks(monkeypatch) -> None:

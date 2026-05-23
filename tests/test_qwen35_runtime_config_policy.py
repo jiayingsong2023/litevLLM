@@ -10,17 +10,23 @@ from vllm.adapters.qwen3_5 import Qwen35Adapter
 from vllm.model_executor.models import qwen3_5
 
 
-def test_qwen35_tuning_config_rejects_migrated_production_policy_names() -> None:
-    qwen3_5.set_qwen35_tuning_config(
-        {
-            "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "0",
-            "FASTINFERENCE_QWEN35_USE_FLA_CHUNK": "0",
-            "FASTINFERENCE_DISABLE_LINEAR_INPUT_CAP": "1",
-        },
-        locked=True,
-    )
+def test_qwen35_missing_config_uses_production_on_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "0")
+    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL", "0")
 
-    assert qwen3_5._QWEN35_TUNING == {}
+    assert qwen3_5._qwen35_model_policy_truthy(None, "fullattn_stabilizer")
+    assert qwen3_5._qwen35_model_policy_truthy(None, "fullattn_use_sdpa_prefill")
+    assert qwen3_5._qwen35_model_policy_truthy(None, "residual_stabilizer")
+    assert qwen3_5._qwen35_model_policy_truthy(None, "linear_input_cap")
+
+
+def test_qwen35_install_tuning_config_is_intentional_noop() -> None:
+    adapter = Qwen35Adapter()
+
+    assert adapter.install_tuning_config(
+        {"FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "0"}
+    ) is None
+    assert not hasattr(qwen3_5, "_QWEN35_TUNING")
 
 
 def test_qwen35_adapter_exposes_production_model_policy() -> None:
@@ -48,10 +54,10 @@ def test_qwen35_runtime_flag_reads_attn_config_model_policy(monkeypatch) -> None
     )
 
 
-def test_qwen35_runtime_flag_ignores_env_without_config(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "1")
+def test_qwen35_runtime_flag_uses_default_without_config(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "0")
 
-    assert not qwen3_5._qwen35_model_policy_truthy(
+    assert qwen3_5._qwen35_model_policy_truthy(
         None,
         "fullattn_stabilizer",
     )
