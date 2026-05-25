@@ -29,7 +29,7 @@
 - **统一构建链**: offline 与 OpenAI server 现在统一通过 `vllm/serving/config_builder.py` 构建 `VllmConfig + RuntimeConfig`，不再维护服务端旁路配置对象。
 - **分层执行架构**: `LiteEngine` 负责 orchestration，`StepScheduler` 做 step 级调度，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` / `OutputPipeline` 做采样与输出拼装。
 - **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，避免继续在 engine 主路径中扩散模型名特判。
-- **配置收敛目标**: 运行时主要配置已收敛到 `RuntimeConfig`，模型热路径策略通过 `attn_metadata["config"].tuning_env` 传递；少量历史环境变量兼容路径仍保留。
+- **配置收敛目标**: 生产运行策略以 `Runtime Profiles -> RuntimeConfig` 为真源，模型热路径读取 runtime policy；benchmark / diagnostic tools 才保留调参开关。
 - **纯净计算路径**: 主线优先维护 **Safetensors + AWQ**，实验性路径会逐步隔离。
 - **混合加速 Prefill**: 预填充阶段利用硬件原生 SDPA，解码阶段全量回归手写高性能 **Triton PagedAttention**。
 - **自动化元数据展开**: 统一的 `expand_metadata_for_paged_attention` 逻辑，完美支持全模型 Chunked Prefill。
@@ -53,15 +53,20 @@ LLM / AsyncLLM / OpenAI API Server
 - `vllm/engine/runtime_observer.py`
 - `vllm/engine/errors.py`
 
-## 🛠️ 配置指南 (LiteInferenceConfig)
-通过环境变量控制 `LiteInferenceConfig` 行为，实现性能与精度的平衡：
+## 🛠️ Runtime Profiles
+生产运行通过 `FASTINFERENCE_PROFILE` 选择 `Runtime Profiles`，而不是在 README 中推广一组长期暴露的 kernel / KV 环境变量。
 
-| 环境变量 | 可选值 | 描述 |
+常用 profile：
+
+| Profile | 目标 | 说明 |
 | :--- | :--- | :--- |
-| `FASTINFERENCE_KV_TYPE` | `fp16`, `fp8`, `turbo_int4` | 控制 KV 缓存精度（默认 `turbo_int4`; `auto` 会按 legacy `FASTINFERENCE_KV_FP8` 解析） |
-| `FASTINFERENCE_FUSION_LEVEL` | `0`, `1`, `2` | `1`: AB 融合; `2`: 全量算子融合 (默认) |
-| `FASTINFERENCE_BLOCK_SIZE` | `16`, `32`, `64` | 物理块大小，长文本建议 `32/64` |
-| `FASTINFERENCE_K_SCALE` | `float` | TurboQuant 专用 K 缩放因子 |
+| `auto` | 默认平衡 | 让 registry 按当前模型/硬件选择稳定默认。 |
+| `benchmark` | 基线测量 | 用于仓库默认性能回归和 profile-level 基线比较。 |
+| `latency` | 单请求延迟 | 优先 TTFT / decode latency 的保守策略。 |
+| `throughput` | 吞吐 | 优先批量吞吐和设备利用率。 |
+| `accuracy` | 精度保护 | 优先数值保守配置，适合做 correctness / audit。 |
+
+`benchmark` 和诊断工具可能暴露额外 tuning switches，用于 profile 试验、kernel 探索或内部观测；这些开关不是常规 production runtime controls，也不应替代 `RuntimeConfig` / profile data 作为生产配置入口。
 
 ## 🚀 快速开始
 
@@ -86,7 +91,7 @@ uv run python tests/e2e_full_benchmark.py
 
 `tests/run_inference_correctness_regression.sh` 覆盖四个回归目标：TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B。Gemma4 模型目录自动探测，优先本地路径，仅在缺失时回退到 HuggingFace repo id。
 
-Gemma4 的少量 profiling / 诊断开关仍通过模型安装阶段的 tuning 配置生效，当前仅保留为内部观测用途，不作为常规运行参数：
+Gemma4 的少量 profiling / 诊断开关仍通过模型安装阶段的 tuning 配置生效，当前仅保留为 benchmark / diagnostics 的内部观测用途，不作为常规 production runtime switches：
 
 - `FASTINFERENCE_GEMMA4_LAYER_PROFILE`
 - `FASTINFERENCE_GEMMA4_ROCTX_PROFILE`

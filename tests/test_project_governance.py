@@ -84,6 +84,32 @@ def test_capability_matrix_is_documented_and_referenced() -> None:
         assert "CAPABILITY_MATRIX.md" in text, f"{doc} must reference capability matrix"
 
 
+def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix() -> None:
+    readme = _read("README.md")
+
+    required = (
+        "Runtime Profiles",
+        "FASTINFERENCE_PROFILE",
+        "benchmark",
+        "latency",
+        "throughput",
+        "accuracy",
+    )
+    for marker in required:
+        assert marker in readme, f"README must document runtime profiles via {marker!r}"
+
+    forbidden = (
+        "## 🛠️ 配置指南 (LiteInferenceConfig)",
+        "FASTINFERENCE_KV_TYPE",
+        "FASTINFERENCE_FUSION_LEVEL",
+    )
+    for marker in forbidden:
+        assert marker not in readme, (
+            "README runtime documentation must no longer present legacy env "
+            f"matrix marker {marker!r}"
+        )
+
+
 def test_runtime_factory_does_not_read_fastinference_env_directly() -> None:
     factory = _read("vllm/engine/runtime_factory.py")
 
