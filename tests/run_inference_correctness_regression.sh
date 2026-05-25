@@ -296,7 +296,8 @@ FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
   --apply-chat-template off
 
 echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
-FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.py \
+require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
+FASTINFERENCE_PROFILE=accuracy FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
   --hf-model "$HF_QWEN35_9B_FP16" \

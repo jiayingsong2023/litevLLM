@@ -65,6 +65,55 @@ def test_run_inference_correctness_regression_invokes_gemma4_a_strict(tmp_path: 
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
 
 
+def test_run_inference_correctness_regression_requires_qwen35_fp16_reference(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                "exit 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_awq_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    missing_qwen_fp16_dir = tmp_path / "models" / "Qwen3.5-9B-FP16"
+    tiny_dir.mkdir(parents=True)
+    qwen_awq_dir.mkdir(parents=True)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_awq_dir)
+    env["HF_QWEN35_9B_FP16"] = str(missing_qwen_fp16_dir)
+    env["RUN_GEMMA4_31B"] = "0"
+    env["RUN_GEMMA4_26B"] = "0"
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Missing model directory for Qwen3.5-9B-FP16" in proc.stdout
+
+
 def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
     tmp_path: Path,
 ) -> None:

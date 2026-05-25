@@ -26,10 +26,20 @@ class Qwen35Adapter(ModelAdapter):
         model_config: Any,
         runtime_config: Any,
     ) -> RuntimeModelPolicy:
+        model_policy = dict(QWEN35_PRODUCTION_MODEL_POLICY)
+        profile = getattr(runtime_config, "profile", None)
+        if str(getattr(profile, "effective_name", "")).lower() == "accuracy":
+            model_policy.update(
+                {
+                    "fullattn_stabilizer": False,
+                    "residual_stabilizer": False,
+                    "linear_input_cap": False,
+                }
+            )
         return RuntimeModelPolicy(
             prefill_chunk_size_high_end=2048,
             prefill_chunk_size_standard=1024,
-            model_policy=dict(QWEN35_PRODUCTION_MODEL_POLICY),
+            model_policy=model_policy,
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:

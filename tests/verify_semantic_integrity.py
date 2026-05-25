@@ -1138,10 +1138,16 @@ def run_alignment_test(
                             "and matching greedy argmax)."
                         )
             else:
-                print(
-                    "  [Info] Prefill-only run: no HF prefill comparison (no_hf or HF load failed)."
-                )
-                audit_result = True
+                if no_hf:
+                    print(
+                        "  [Info] Prefill-only run: no HF prefill comparison (--no-hf requested)."
+                    )
+                    audit_result = True
+                else:
+                    print(
+                        "  ❌ FAIL: Prefill-only audit did not complete HF comparison."
+                    )
+                    audit_result = False
         else:
             # Multi-token Generation Audit — Lite full greedy sequence
             engine.add_request(

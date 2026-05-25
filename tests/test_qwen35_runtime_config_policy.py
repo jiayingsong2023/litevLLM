@@ -44,6 +44,23 @@ def test_qwen35_adapter_exposes_production_model_policy() -> None:
     }
 
 
+def test_qwen35_accuracy_profile_uses_hf_faithful_full_attention_policy() -> None:
+    adapter = Qwen35Adapter()
+    runtime_config = SimpleNamespace(
+        profile=SimpleNamespace(effective_name="accuracy"),
+    )
+
+    policy = adapter.runtime_policy(
+        SimpleNamespace(hf_config=SimpleNamespace()),
+        runtime_config,
+    )
+
+    assert policy.model_policy["fullattn_stabilizer"] is False
+    assert policy.model_policy["residual_stabilizer"] is False
+    assert policy.model_policy["linear_input_cap"] is False
+    assert policy.model_policy["fullattn_use_sdpa_prefill"] is True
+
+
 def test_qwen35_runtime_flag_reads_attn_config_model_policy(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_QWEN35_FULLATTN_STABILIZER", "0")
     inf_config = SimpleNamespace(model_policy={"fullattn_stabilizer": True})
