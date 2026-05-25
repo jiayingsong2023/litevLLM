@@ -6,7 +6,9 @@ import subprocess
 from pathlib import Path
 
 
-def test_run_inference_correctness_regression_invokes_gemma4_a_strict(tmp_path: Path) -> None:
+def test_run_inference_correctness_regression_skips_gemma4_31b_a_strict(
+    tmp_path: Path,
+) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -58,10 +60,8 @@ def test_run_inference_correctness_regression_invokes_gemma4_a_strict(tmp_path: 
     assert log_path.exists()
 
     calls = log_path.read_text(encoding="utf-8")
-    assert "run python tests/tools/gemma4_prefill_strict_audit.py" in calls
-    assert "--model" in calls
+    assert "run python tests/tools/gemma4_prefill_strict_audit.py" not in calls
     assert str(gemma_dir) in calls
-    assert "--hf-device cuda" in calls
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
 
 

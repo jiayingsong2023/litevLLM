@@ -39,8 +39,8 @@ RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
 RUN_GEMMA4_26B="${RUN_GEMMA4_26B:-1}"
-RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"
-RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-${RUN_GEMMA4_A_TIER}}"
+RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"  # compatibility no-op; Gemma4-31B uses A-lite only.
+RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-31B strict audit is disabled.
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
@@ -304,13 +304,8 @@ FASTINFERENCE_PROFILE=accuracy FASTINFERENCE_KV_TYPE=turbo_int4 uv run python te
   --prefill-only \
   --apply-chat-template off
 
-if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_STRICT}" == "1" ]]; then
-  echo "[A3-strict] Gemma4-31B Q4 prefill-only strict audit (manual)"
-  GEMMA_HF_ARGS=()
-  if [[ -n "$HF_GEMMA4_31B" ]]; then
-    GEMMA_HF_ARGS=(--hf-model "$HF_GEMMA4_31B")
-  fi
-  "${GEMMA4_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_31B_Q4" "${GEMMA_HF_ARGS[@]}"
+if [[ "${GEMMA4_AVAILABLE}" == "1" && ( "${RUN_GEMMA4_A_STRICT}" == "1" || "${RUN_GEMMA4_A_TIER}" == "1" ) ]]; then
+  echo "[Info] Gemma4-31B A-strict prefill audit is disabled; running Tier-B + A-lite only."
 fi
 
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
