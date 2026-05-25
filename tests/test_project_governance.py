@@ -230,6 +230,13 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
         assert not unexpected, f"{rel} has production env reads: {sorted(unexpected)}"
 
 
+def test_runtime_profile_reads_profile_through_env_registry() -> None:
+    profile = _read("vllm/engine/runtime_profile.py")
+
+    assert "get_public_env" in profile
+    assert 'os.environ.get("FASTINFERENCE_PROFILE"' not in profile
+
+
 def test_production_step_scheduler_does_not_call_inference_config_from_env() -> None:
     scheduler = _read("vllm/engine/step_scheduler.py")
 

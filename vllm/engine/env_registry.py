@@ -625,3 +625,14 @@ def collect_runtime_tuning_env(environ: Mapping[str, str]) -> dict[str, str]:
         if name in FASTINFERENCE_ENV_REGISTRY
         and FASTINFERENCE_ENV_REGISTRY[name].scope is EnvScope.DEPRECATED
     }
+
+
+def get_public_env(
+    environ: Mapping[str, str],
+    name: str,
+    default: str = "",
+) -> str:
+    spec = FASTINFERENCE_ENV_REGISTRY[name]
+    if spec.scope is not EnvScope.PUBLIC:
+        raise ValueError(f"{name} is not a public runtime environment variable")
+    return environ.get(name, default)
