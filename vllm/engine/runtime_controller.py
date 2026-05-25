@@ -96,6 +96,7 @@ class RuntimeController:
         )
         for request_id in admitted:
             req = self.scheduler.get_request(request_id)
+            self.backend.maybe_apply_prefix_cache(req)
             queue_wait_s = max(0.0, now - float(req.get("queued_at") or now))
             self.observer.on_request_admitted(
                 request_id,

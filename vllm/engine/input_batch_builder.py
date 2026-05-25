@@ -58,6 +58,13 @@ class InputBatchBuilder:
             start_pos = max(processed_len, prefix_hit_len)
 
             actual_chunk_len = min(chunk_len, len(all_input_ids) - start_pos)
+            if actual_chunk_len <= 0:
+                raise ValueError(
+                    "zero-token prefill for request "
+                    f"{rid}: start_pos={start_pos}, prompt_len={len(all_input_ids)}, "
+                    f"seq_len={processed_len}, prefix_hit_len={prefix_hit_len}, "
+                    f"chunk_len={chunk_len}"
+                )
             is_last_chunk = start_pos + actual_chunk_len >= len(all_input_ids)
             is_last_chunk_flags.append(is_last_chunk)
 

@@ -158,7 +158,9 @@ def test_runtime_controller_admits_then_uses_decode_fast_path(monkeypatch) -> No
         backend=backend,
         queue_timeout_s=30.0,
     )
-    monkeypatch.setattr("vllm.engine.runtime_controller.time.perf_counter", lambda: 12.0)
+    monkeypatch.setattr(
+        "vllm.engine.runtime_controller.time.perf_counter", lambda: 12.0
+    )
 
     outputs = controller.step()
 
@@ -168,6 +170,7 @@ def test_runtime_controller_admits_then_uses_decode_fast_path(monkeypatch) -> No
     assert len(observer.steps) == 1
     assert len(backend.preempt_calls) == 1
     assert backend.preempt_calls[0][1] is scheduler
+    assert backend.prefix_cache_seen is scheduler.req
     assert backend.fast_path_calls == [["q1"]]
 
 
@@ -181,7 +184,9 @@ def test_runtime_controller_uses_preempted_step_plan(monkeypatch) -> None:
             return StepPlan(
                 admissions=step_plan.admissions,
                 prefills=None,
-                decodes=DecodePlan(request_ids=["q1"], token_budget=1, use_fast_path=True),
+                decodes=DecodePlan(
+                    request_ids=["q1"], token_budget=1, use_fast_path=True
+                ),
                 step_token_budget=step_plan.step_token_budget,
                 queued_before=step_plan.queued_before,
                 running_before=step_plan.running_before,
@@ -195,7 +200,9 @@ def test_runtime_controller_uses_preempted_step_plan(monkeypatch) -> None:
         backend=backend,
         queue_timeout_s=30.0,
     )
-    monkeypatch.setattr("vllm.engine.runtime_controller.time.perf_counter", lambda: 12.0)
+    monkeypatch.setattr(
+        "vllm.engine.runtime_controller.time.perf_counter", lambda: 12.0
+    )
 
     outputs = controller.step()
 
@@ -253,7 +260,9 @@ def test_runtime_controller_stats_snapshot() -> None:
     }
 
 
-def test_runtime_controller_reset_stats_resets_window_and_dependencies(monkeypatch) -> None:
+def test_runtime_controller_reset_stats_resets_window_and_dependencies(
+    monkeypatch,
+) -> None:
     scheduler = _FakeScheduler()
     observer = _FakeObserver()
     backend = _FakeBackend()

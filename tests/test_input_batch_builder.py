@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm.engine.input_batch_builder import InputBatchBuilder
@@ -52,7 +53,9 @@ def test_input_batch_builder_build_prefill() -> None:
             num_blocks_per_seq=2,
             block_size=2,
         ),
-        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
@@ -73,6 +76,30 @@ def test_input_batch_builder_build_prefill() -> None:
     assert last_flags == [False]
 
 
+def test_input_batch_builder_rejects_zero_token_prefill() -> None:
+    scheduler = _scheduler_with_request()
+    scheduler.get_request("r1")["seq_len"] = 4
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=KVBlockManager(
+            kv_caches=[],
+            kv_scale_caches=[],
+            num_blocks_per_seq=2,
+            block_size=2,
+        ),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    with pytest.raises(ValueError, match="zero-token prefill"):
+        builder.build_prefill(["r1"], scheduler, 1)
+
+
 def test_input_batch_builder_build_decode_batch() -> None:
     scheduler = _scheduler_with_request()
     req = scheduler.get_request("r1")
@@ -90,7 +117,9 @@ def test_input_batch_builder_build_decode_batch() -> None:
             num_blocks_per_seq=2,
             block_size=2,
         ),
-        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
@@ -148,7 +177,9 @@ def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
             num_blocks_per_seq=2,
             block_size=2,
         ),
-        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
@@ -204,7 +235,9 @@ def test_input_batch_builder_tracks_multimodal_lora_prefill_contract() -> None:
             num_blocks_per_seq=2,
             block_size=2,
         ),
-        inf_config=type("Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0})(),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
