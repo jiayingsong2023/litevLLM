@@ -43,6 +43,40 @@ def _awq_env_context_violations(
     return violations
 
 
+def test_fastinference_env_names_are_registered() -> None:
+    from vllm.engine.env_registry import FASTINFERENCE_ENV_REGISTRY
+
+    ignored_roots = {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+    }
+    pattern = re.compile(r"(?<![A-Z0-9_])FASTINFERENCE_[A-Z0-9_]*[A-Z0-9](?![A-Z0-9_])")
+    found: set[str] = set()
+    for path in ROOT.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(ROOT)
+        if any(part in ignored_roots for part in rel.parts):
+            continue
+        if rel.parts[:2] == ("tests", "reports"):
+            continue
+        if path.suffix not in {".py", ".sh", ".md", ".toml", ".yaml", ".yml"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        found.update(pattern.findall(text))
+
+    found.discard("FASTINFERENCE_TUNING_ENV_PREFIX")
+    found.discard("FASTINFERENCE_ENV_REGISTRY")
+    unregistered = sorted(found - set(FASTINFERENCE_ENV_REGISTRY))
+    assert not unregistered, "Unregistered FASTINFERENCE_* names: " + ", ".join(
+        unregistered
+    )
+
+
 def test_smoke_workflow_pytest_target_exists() -> None:
     workflow = _read(".github/workflows/smoke.yml")
     targets = re.findall(r"uv run pytest(?: -q)? ([^\n]+)", workflow)
@@ -84,7 +118,9 @@ def test_capability_matrix_is_documented_and_referenced() -> None:
         assert "CAPABILITY_MATRIX.md" in text, f"{doc} must reference capability matrix"
 
 
-def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix() -> None:
+def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix() -> (
+    None
+):
     readme = _read("README.md")
 
     required = (
