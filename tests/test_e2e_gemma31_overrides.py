@@ -218,3 +218,19 @@ def test_should_not_auto_isolate_single_model(monkeypatch) -> None:
         args,
         ["gemma4_31b_q4"],
     )
+
+
+def test_benchmark_clears_warmup_prefix_cache_by_default() -> None:
+    assert bench._clear_prefix_cache_after_warmup(argparse.Namespace()) is True
+    assert (
+        bench._clear_prefix_cache_after_warmup(
+            argparse.Namespace(reuse_warmup_prefix_cache=False)
+        )
+        is True
+    )
+    assert (
+        bench._clear_prefix_cache_after_warmup(
+            argparse.Namespace(reuse_warmup_prefix_cache=True)
+        )
+        is False
+    )

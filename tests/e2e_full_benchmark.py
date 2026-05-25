@@ -588,6 +588,10 @@ def _resolve_gemma31b_bucket_policy(
     return merged_spec, policy
 
 
+def _clear_prefix_cache_after_warmup(args: argparse.Namespace) -> bool:
+    return not bool(getattr(args, "reuse_warmup_prefix_cache", False))
+
+
 def _maybe_apply_rocm_safe_profile(spec: ModelSpec, aggressive: bool) -> ModelSpec:
     """Downgrade batch/prompt on AMD ROCm unless aggressive mode is enabled."""
     if aggressive or not _is_rocm():
@@ -2146,6 +2150,7 @@ async def run_benchmark(
     multimodal_image_size: int = 8,
     warmup_config: WarmupConfig | None = None,
     fixed_decode_len: bool = True,
+    clear_prefix_cache_after_warmup: bool = True,
 ) -> Dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
@@ -2245,7 +2250,7 @@ async def run_benchmark(
             warmup_config=resolved_warmup,
         )
         runtime_stats_by_phase["warmup"] = _collect_runtime_stats(llm, phase="warmup")
-        llm.reset_stats(clear_prefix_cache=False)
+        llm.reset_stats(clear_prefix_cache=clear_prefix_cache_after_warmup)
 
         print("  [Run] Launching concurrent benchmark requests...")
         wall_start = time.perf_counter()
@@ -2777,6 +2782,16 @@ def _parse_args() -> argparse.Namespace:
         help="Disable fixed decode length and allow early stop on EOS.",
     )
     parser.add_argument(
+        "--reuse-warmup-prefix-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep prefix-cache entries created by warmup requests. Default benchmark "
+            "runs clear them so measured TTFT/decode match the repository baseline "
+            "rather than a warm-cache repeated-prompt scenario."
+        ),
+    )
+    parser.add_argument(
         "--model-process-isolation",
         action="store_true",
         default=False,
@@ -2949,6 +2964,9 @@ async def main() -> None:
                     multimodal_image_size=args.multimodal_image_size,
                     warmup_config=warmup_config,
                     fixed_decode_len=bool(args.fixed_decode_len),
+                    clear_prefix_cache_after_warmup=_clear_prefix_cache_after_warmup(
+                        args
+                    ),
                 )
                 runtime_stats_summary[spec.key] = dict(
                     summary[spec.key].get("runtime_stats", {})
