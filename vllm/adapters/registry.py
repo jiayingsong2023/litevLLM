@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .base import ModelAdapter
@@ -10,11 +13,39 @@ from .qwen3_5 import Qwen35Adapter
 def _hf_config_candidates(model_config: Any) -> tuple[Any, ...]:
     hf_config = getattr(model_config, "hf_config", None)
     if hf_config is None:
+        hf_config = _load_local_hf_config(model_config)
+    if hf_config is None:
         return ()
     text_config = getattr(hf_config, "text_config", None)
     if text_config is None:
         return (hf_config,)
     return (hf_config, text_config)
+
+
+def _load_local_hf_config(model_config: Any) -> Any | None:
+    model_path = getattr(model_config, "model", None)
+    if not model_path:
+        return None
+    config_path = Path(str(model_path)) / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    text_config = data.get("text_config")
+    return SimpleNamespace(
+        model_type=data.get("model_type"),
+        architectures=data.get("architectures", []),
+        text_config=SimpleNamespace(
+            model_type=text_config.get("model_type"),
+            architectures=text_config.get("architectures", []),
+        )
+        if isinstance(text_config, dict)
+        else None,
+    )
 
 
 def _looks_like_qwen35(model: Any, model_config: Any) -> bool:

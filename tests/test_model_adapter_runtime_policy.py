@@ -122,6 +122,18 @@ def test_registry_detects_gemma4_text_config_before_model_load() -> None:
     assert isinstance(adapter, Gemma4Adapter)
 
 
+def test_registry_detects_gemma4_local_config_before_model_load(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "gemma4", "text_config": {"model_type": "gemma4_text"}}',
+        encoding="utf-8",
+    )
+    model_config = SimpleNamespace(hf_config=None, model=str(tmp_path))
+
+    adapter = get_model_adapter(None, model_config)
+
+    assert isinstance(adapter, Gemma4Adapter)
+
+
 def test_registry_detects_qwen35_text_config_before_model_load() -> None:
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
