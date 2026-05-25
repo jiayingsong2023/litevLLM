@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -604,3 +605,23 @@ if missing_public:
         "Final public FastInference env names are not registered: "
         + ", ".join(sorted(missing_public))
     )
+
+
+def legacy_env_enabled(environ: Mapping[str, str]) -> bool:
+    return environ.get("FASTINFERENCE_ALLOW_LEGACY_ENV", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def collect_runtime_tuning_env(environ: Mapping[str, str]) -> dict[str, str]:
+    if not legacy_env_enabled(environ):
+        return {}
+    return {
+        name: value
+        for name, value in environ.items()
+        if name in FASTINFERENCE_ENV_REGISTRY
+        and FASTINFERENCE_ENV_REGISTRY[name].scope is EnvScope.DEPRECATED
+    }
