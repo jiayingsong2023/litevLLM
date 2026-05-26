@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from vllm.engine.env_registry import get_public_env
 from vllm.engine.fastinference_config import FastInferenceConfig
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 
@@ -111,9 +110,7 @@ class RuntimeProfileRegistry:
         model_capabilities: Any | None,
         gpu_total_gb: float,
     ) -> RuntimeProfile:
-        requested = (
-            get_public_env(os.environ, "FASTINFERENCE_PROFILE", "auto").strip().lower()
-        )
+        requested = os.environ.get("FASTINFERENCE_PROFILE", "auto").strip().lower()
         return cls.resolve(
             requested_profile=requested,
             model_capabilities=model_capabilities,

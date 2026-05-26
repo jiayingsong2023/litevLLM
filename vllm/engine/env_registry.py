@@ -23,13 +23,7 @@ class FastInferenceEnvSpec:
 
 FINAL_PUBLIC_FASTINFERENCE_ENV: frozenset[str] = frozenset(
     {
-        "FASTINFERENCE_ALLOW_LEGACY_ENV",
-        "FASTINFERENCE_BENCH_PROFILE",
         "FASTINFERENCE_CONFIG",
-        "FASTINFERENCE_DEBUG",
-        "FASTINFERENCE_KV_TYPE",
-        "FASTINFERENCE_LOG_LEVEL",
-        "FASTINFERENCE_PROFILE",
     }
 )
 
@@ -73,7 +67,10 @@ def _removed(name: str, description: str = "") -> FastInferenceEnvSpec:
 
 
 FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
-    "FASTINFERENCE_ALLOW_LEGACY_ENV": _public("FASTINFERENCE_ALLOW_LEGACY_ENV"),
+    "FASTINFERENCE_ALLOW_LEGACY_ENV": _deprecated(
+        "FASTINFERENCE_ALLOW_LEGACY_ENV",
+        replacement="FastInference config field: legacy_env.enabled",
+    ),
     "FASTINFERENCE_AWQ_CACHE_SCOPE": _deprecated(
         "FASTINFERENCE_AWQ_CACHE_SCOPE",
         replacement="RuntimeProfile or structured RuntimeConfig policy",
@@ -242,7 +239,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_BENCH_COMPILE_CACHE_DIR": _tool_only(
         "FASTINFERENCE_BENCH_COMPILE_CACHE_DIR"
     ),
-    "FASTINFERENCE_BENCH_PROFILE": _public("FASTINFERENCE_BENCH_PROFILE"),
+    "FASTINFERENCE_BENCH_PROFILE": _deprecated(
+        "FASTINFERENCE_BENCH_PROFILE",
+        replacement="FastInference config field: benchmark.profile",
+    ),
     "FASTINFERENCE_BENCH_WARMUP_BURST_CONCURRENCY": _tool_only(
         "FASTINFERENCE_BENCH_WARMUP_BURST_CONCURRENCY"
     ),
@@ -273,7 +273,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
         replacement="RuntimeProfile or structured RuntimeConfig policy",
     ),
     "FASTINFERENCE_CONFIG": _public("FASTINFERENCE_CONFIG"),
-    "FASTINFERENCE_DEBUG": _public("FASTINFERENCE_DEBUG"),
+    "FASTINFERENCE_DEBUG": _deprecated(
+        "FASTINFERENCE_DEBUG",
+        replacement="FastInference config field: debug",
+    ),
     "FASTINFERENCE_DEEPSEEK_ATTN_FP32": _tool_only("FASTINFERENCE_DEEPSEEK_ATTN_FP32"),
     "FASTINFERENCE_DEEPSEEK_B_TIER_GREEDY": _tool_only(
         "FASTINFERENCE_DEEPSEEK_B_TIER_GREEDY"
@@ -451,7 +454,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
         "FASTINFERENCE_KV_SIG_DIM",
         replacement="RuntimeProfile or structured RuntimeConfig policy",
     ),
-    "FASTINFERENCE_KV_TYPE": _public("FASTINFERENCE_KV_TYPE"),
+    "FASTINFERENCE_KV_TYPE": _deprecated(
+        "FASTINFERENCE_KV_TYPE",
+        replacement="FastInference config field: kv_type",
+    ),
     "FASTINFERENCE_K_SCALE": _deprecated(
         "FASTINFERENCE_K_SCALE",
         replacement="RuntimeProfile or structured RuntimeConfig policy",
@@ -478,7 +484,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS": _tool_only(
         "FASTINFERENCE_LITE_QUEUE_TIMEOUT_SECONDS"
     ),
-    "FASTINFERENCE_LOG_LEVEL": _public("FASTINFERENCE_LOG_LEVEL"),
+    "FASTINFERENCE_LOG_LEVEL": _deprecated(
+        "FASTINFERENCE_LOG_LEVEL",
+        replacement="FastInference config field: log_level",
+    ),
     "FASTINFERENCE_MAX_DECODE_STREAK": _tool_only("FASTINFERENCE_MAX_DECODE_STREAK"),
     "FASTINFERENCE_MAX_PREFILL_CHUNK": _deprecated(
         "FASTINFERENCE_MAX_PREFILL_CHUNK",
@@ -532,7 +541,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_PREFIX_CACHE_MAX_ENTRIES": _tool_only(
         "FASTINFERENCE_PREFIX_CACHE_MAX_ENTRIES"
     ),
-    "FASTINFERENCE_PROFILE": _public("FASTINFERENCE_PROFILE"),
+    "FASTINFERENCE_PROFILE": _deprecated(
+        "FASTINFERENCE_PROFILE",
+        replacement="FastInference config field: profile",
+    ),
     "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": _tool_only(
         "FASTINFERENCE_QWEN35_FULLATTN_STABILIZER"
     ),
@@ -616,8 +628,12 @@ def legacy_env_enabled(environ: Mapping[str, str]) -> bool:
     }
 
 
-def collect_runtime_tuning_env(environ: Mapping[str, str]) -> dict[str, str]:
-    if not legacy_env_enabled(environ):
+def collect_runtime_tuning_env(
+    environ: Mapping[str, str],
+    *,
+    require_legacy_env_flag: bool = True,
+) -> dict[str, str]:
+    if require_legacy_env_flag and not legacy_env_enabled(environ):
         return {}
     return {
         name: value

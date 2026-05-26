@@ -10,15 +10,7 @@ from vllm.engine.env_registry import (
 
 def test_final_public_fastinference_env_is_below_limit() -> None:
     assert len(FINAL_PUBLIC_FASTINFERENCE_ENV) < 10
-    assert FINAL_PUBLIC_FASTINFERENCE_ENV == {
-        "FASTINFERENCE_PROFILE",
-        "FASTINFERENCE_CONFIG",
-        "FASTINFERENCE_KV_TYPE",
-        "FASTINFERENCE_DEBUG",
-        "FASTINFERENCE_LOG_LEVEL",
-        "FASTINFERENCE_BENCH_PROFILE",
-        "FASTINFERENCE_ALLOW_LEGACY_ENV",
-    }
+    assert FINAL_PUBLIC_FASTINFERENCE_ENV == {"FASTINFERENCE_CONFIG"}
 
 
 def test_kv_fp8_is_deprecated_alias_not_final_public() -> None:
@@ -31,3 +23,18 @@ def test_kv_fp8_is_deprecated_alias_not_final_public() -> None:
 def test_all_final_public_env_names_are_registered_as_public() -> None:
     for name in FINAL_PUBLIC_FASTINFERENCE_ENV:
         assert FASTINFERENCE_ENV_REGISTRY[name].scope is EnvScope.PUBLIC
+
+
+def test_previous_public_runtime_controls_are_deprecated() -> None:
+    expected = {
+        "FASTINFERENCE_ALLOW_LEGACY_ENV",
+        "FASTINFERENCE_BENCH_PROFILE",
+        "FASTINFERENCE_DEBUG",
+        "FASTINFERENCE_KV_TYPE",
+        "FASTINFERENCE_LOG_LEVEL",
+        "FASTINFERENCE_PROFILE",
+    }
+
+    for name in expected:
+        assert FASTINFERENCE_ENV_REGISTRY[name].scope is EnvScope.DEPRECATED
+        assert name not in FINAL_PUBLIC_FASTINFERENCE_ENV

@@ -205,7 +205,7 @@ def test_lite_engine_operational_policy_does_not_read_env_directly() -> None:
         )
 
 
-def test_production_engine_only_reads_fastinference_profile() -> None:
+def test_production_engine_uses_config_not_public_runtime_env_controls() -> None:
     production_files = [
         "vllm/engine/runtime_profile.py",
         "vllm/engine/runtime_config.py",
@@ -216,28 +216,40 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
         "vllm/engine/runtime_controller.py",
         "vllm/engine/backend/lite_single_gpu.py",
     ]
-    allowed = {"FASTINFERENCE_PROFILE"}
+    allowed = {"FASTINFERENCE_CONFIG"}
     for rel in production_files:
         text = _read(rel)
         if rel == "vllm/engine/inference_config.py":
             text = text.split("    @classmethod\n    def from_env", maxsplit=1)[0]
         names = set(re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text))
         if rel == "vllm/engine/runtime_config.py":
-            assert "collect_runtime_tuning_env" in text
+            assert "resolve_fastinference_config" in text
             assert "_collect_temporary_fastinference_tuning_env" not in text
             assert "_FASTINFERENCE_TUNING_ENV_PREFIX" not in text
         file_allowed = set(allowed)
+        if rel == "vllm/engine/runtime_profile.py":
+            file_allowed.add("FASTINFERENCE_PROFILE")
         if rel == "vllm/engine/runtime_config.py":
-            file_allowed.add("FASTINFERENCE_KV_TYPE")
+            file_allowed.add("FASTINFERENCE_PROFILE")
+            file_allowed.update(
+                {
+                    "FASTINFERENCE_ALLOW_LEGACY_ENV",
+                    "FASTINFERENCE_BENCH_PROFILE",
+                    "FASTINFERENCE_DEBUG",
+                    "FASTINFERENCE_KV_TYPE",
+                    "FASTINFERENCE_LOG_LEVEL",
+                }
+            )
         unexpected = names - file_allowed
         assert not unexpected, f"{rel} has production env reads: {sorted(unexpected)}"
 
 
-def test_runtime_profile_reads_profile_through_env_registry() -> None:
+def test_runtime_profile_has_config_resolver_for_production_path() -> None:
     profile = _read("vllm/engine/runtime_profile.py")
+    production_text = profile.split("    @classmethod\n    def resolve_from_env", maxsplit=1)[0]
 
-    assert "get_public_env" in profile
-    assert 'os.environ.get("FASTINFERENCE_PROFILE"' not in profile
+    assert "resolve_from_config" in profile
+    assert 'os.environ.get("FASTINFERENCE_PROFILE"' not in production_text
 
 
 def test_production_step_scheduler_does_not_call_inference_config_from_env() -> None:

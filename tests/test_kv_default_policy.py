@@ -71,7 +71,7 @@ def test_runtime_config_config_kv_type_auto_uses_profile(monkeypatch) -> None:
 def test_runtime_config_collects_deprecated_env_when_compat_enabled(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("FASTINFERENCE_ALLOW_LEGACY_ENV", "1")
+    monkeypatch.delenv("FASTINFERENCE_ALLOW_LEGACY_ENV", raising=False)
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV", "1")
     monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
     vllm_config = _mock_vllm_config()
