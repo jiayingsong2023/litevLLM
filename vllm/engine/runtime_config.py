@@ -2,7 +2,7 @@
 import os
 from dataclasses import dataclass, field
 
-from vllm.engine.env_registry import collect_runtime_tuning_env
+from vllm.engine.env_registry import collect_runtime_tuning_env, get_public_env
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import RuntimeProfile, RuntimeProfileRegistry
 
@@ -80,6 +80,13 @@ class RuntimeConfig:
         )
         tuning_env = collect_runtime_tuning_env(os.environ)
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
+        kv_cache_dtype = (
+            get_public_env(os.environ, "FASTINFERENCE_KV_TYPE", profile.kv_cache_dtype)
+            .strip()
+            .lower()
+        )
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = profile.kv_cache_dtype
 
         return cls(
             model_path=str(model_config.model),
@@ -91,7 +98,7 @@ class RuntimeConfig:
                 getattr(scheduler_config, "max_num_batched_tokens", 4096)
             ),
             block_size=profile.block_size,
-            kv_cache_dtype=profile.kv_cache_dtype,
+            kv_cache_dtype=kv_cache_dtype,
             kv_max_model_len=profile.kv_max_model_len,
             kv_max_active_requests=profile.kv_max_active_requests,
             fusion_level=profile.fusion_level,

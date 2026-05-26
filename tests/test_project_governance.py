@@ -226,7 +226,10 @@ def test_production_engine_only_reads_fastinference_profile() -> None:
             assert "collect_runtime_tuning_env" in text
             assert "_collect_temporary_fastinference_tuning_env" not in text
             assert "_FASTINFERENCE_TUNING_ENV_PREFIX" not in text
-        unexpected = names - allowed
+        file_allowed = set(allowed)
+        if rel == "vllm/engine/runtime_config.py":
+            file_allowed.add("FASTINFERENCE_KV_TYPE")
+        unexpected = names - file_allowed
         assert not unexpected, f"{rel} has production env reads: {sorted(unexpected)}"
 
 
