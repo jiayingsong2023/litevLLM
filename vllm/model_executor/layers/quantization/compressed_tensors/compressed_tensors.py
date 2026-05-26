@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Iterable, Optional
 
 import torch
@@ -36,11 +35,18 @@ def _read_bits_group_size(cfg: Dict[str, Any]) -> tuple[int, int]:
     return weight_bits, group_size
 
 
-def _compressed_tensors_high_fidelity_enabled() -> bool:
+def _compressed_tensors_high_fidelity_enabled(config: object | None = None) -> bool:
     # Throughput-first default for pack-quantized checkpoints:
-    # keep fused int4 path enabled unless explicitly forced to strict mode.
-    raw = os.environ.get("FASTINFERENCE_COMPRESSED_TENSORS_HIGH_FIDELITY", "0")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    # keep fused int4 path enabled unless policy explicitly requests strict mode.
+    policy = getattr(config, "kernel_policy", None)
+    if isinstance(config, dict):
+        policy = config.get("kernel_policy", config)
+    if isinstance(policy, dict) and "compressed_tensors_high_fidelity" in policy:
+        raw = policy["compressed_tensors_high_fidelity"]
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 class CompressedTensorsConfig(QuantizationConfig):
@@ -76,7 +82,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 f"'{getattr(layer, 'prefix', '<unknown>')}'"
             )
         gs = int(getattr(layer, "group_size", self.group_size))
-        high_fidelity = _compressed_tensors_high_fidelity_enabled()
+        high_fidelity = _compressed_tensors_high_fidelity_enabled(
+            getattr(layer, "_fastinference_config", None)
+        )
         if qzeros is not None and isinstance(qzeros, torch.Tensor) and qzeros.numel() > 1:
             return AWQWeight(
                 qweight,
@@ -106,6 +114,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight = self._build_quant_weight(layer)
             layer._quant_weight = weight
         runtime_config = kwargs.get("inf_config", kwargs.get("config"))
+        if runtime_config is not None:
+            layer._fastinference_config = runtime_config
         return weight.matmul(x, getattr(layer, "bias", None), config=runtime_config)
 
     def load_weights(

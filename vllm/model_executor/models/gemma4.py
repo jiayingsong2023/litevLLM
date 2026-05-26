@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
 import time
 from collections import OrderedDict
 from typing import Any, Optional
@@ -29,11 +28,7 @@ _GEMMA4_ALLOWED_TUNING_ENV = frozenset(
         "FASTINFERENCE_GEMMA4_ROCTX_PROFILE",
     }
 )
-_GEMMA4_TUNING: dict[str, str] = {
-    key: value
-    for key, value in os.environ.items()
-    if key in _GEMMA4_ALLOWED_TUNING_ENV
-}
+_GEMMA4_TUNING: dict[str, str] = {}
 _GEMMA4_TUNING_LOCKED = False
 
 

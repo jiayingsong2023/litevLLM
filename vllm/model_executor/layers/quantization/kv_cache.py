@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-import os
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -156,10 +155,10 @@ class TurboKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # For TurboQuant, we default to 15.0 (max_abs / 15.0) if not provided.
-        # Symmetric quantization to [0, 15] often uses k_scale = max_abs / 15.0
-        k_scale = float(os.environ.get("FASTINFERENCE_K_SCALE", "1.0"))
-        v_scale = float(os.environ.get("FASTINFERENCE_V_SCALE", "1.0"))
+        # Runtime-configured defaults are currently 1.0. Checkpoint-provided
+        # scales still take precedence when present on the attention layer.
+        k_scale = 1.0
+        v_scale = 1.0
         
         if hasattr(layer, "k_scale") and layer.k_scale > 0:
             k_scale = layer.k_scale.item()

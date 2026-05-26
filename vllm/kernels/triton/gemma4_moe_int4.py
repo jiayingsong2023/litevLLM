@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 import time
 
 import torch
@@ -20,14 +19,7 @@ _PROFILE_STATS: dict[str, dict[str, float]] = {}
 
 
 def _profile_enabled() -> bool:
-    return os.environ.get(
-        "FASTINFERENCE_GEMMA4_MOE_KERNEL_PROFILE", ""
-    ).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return False
 
 
 def reset_moe_kernel_profile_stats() -> None:

@@ -7,7 +7,7 @@ from gguf import dequantize, GGMLQuantizationType
 
 _CACHE_CAPACITY = int(os.environ.get("VLLM_GGUF_CACHE_SIZE", "300"))
 _DEQUANT_CACHE = OrderedDict()
-_USE_FP8_WEIGHTS = os.environ.get("FASTINFERENCE_GGUF_FP8", "1") == "1"
+_USE_FP8_WEIGHTS = True
 
 def ggml_dequantize_fallback(W: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     global _DEQUANT_CACHE

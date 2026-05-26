@@ -4,7 +4,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from vllm.engine.fastinference_config import FastInferenceConfig, LegacyEnvConfig
-from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.runtime_config import RuntimeConfig
 
 
@@ -134,23 +133,3 @@ def test_runtime_config_default_max_prefill_chunk_preserves_planner(
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
     assert cfg.max_prefill_chunk_size is None
-
-
-def test_inference_config_from_env_defaults_to_turbo_int4(monkeypatch) -> None:
-    monkeypatch.delenv("FASTINFERENCE_KV_TYPE", raising=False)
-    monkeypatch.delenv("FASTINFERENCE_KV_FP8", raising=False)
-
-    cfg = LiteInferenceConfig.from_env()
-
-    assert cfg.kv_type == "turbo_int4"
-
-
-def test_inference_config_from_env_auto_respects_legacy_fp8_toggle(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "auto")
-    monkeypatch.setenv("FASTINFERENCE_KV_FP8", "1")
-
-    cfg = LiteInferenceConfig.from_env()
-
-    assert cfg.kv_type == "fp8"

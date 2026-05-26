@@ -830,13 +830,6 @@ def _awq_profile_hint_from_model_path(model_path: str) -> str:
     return ""
 
 
-def _awq_policy_matrix_mode() -> str:
-    raw = os.environ.get("FASTINFERENCE_AWQ_POLICY_MATRIX", "balanced").strip().lower()
-    if raw not in ("safe", "balanced", "throughput", "strict"):
-        return "balanced"
-    return raw
-
-
 def _looks_like_hf_repo_id(model_ref: str) -> bool:
     return isinstance(model_ref, str) and ("/" in model_ref) and (not os.path.isabs(model_ref))
 

@@ -6,11 +6,14 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 
 
-def test_compressed_tensors_high_fidelity_default_off(monkeypatch) -> None:
-    monkeypatch.delenv("FASTINFERENCE_COMPRESSED_TENSORS_HIGH_FIDELITY", raising=False)
+def test_compressed_tensors_high_fidelity_default_off() -> None:
     assert _compressed_tensors_high_fidelity_enabled() is False
 
 
-def test_compressed_tensors_high_fidelity_on(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_COMPRESSED_TENSORS_HIGH_FIDELITY", "1")
-    assert _compressed_tensors_high_fidelity_enabled() is True
+def test_compressed_tensors_high_fidelity_uses_kernel_policy() -> None:
+    assert (
+        _compressed_tensors_high_fidelity_enabled(
+            {"kernel_policy": {"compressed_tensors_high_fidelity": True}}
+        )
+        is True
+    )

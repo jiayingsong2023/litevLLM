@@ -203,13 +203,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 cache_config.cache_dtype = "fp8"
                 cache_config.calculate_kv_scales = False
         
-        # Support TurboQuant INT4 via environment variable or explicit config
-        import os
-        if os.environ.get("FASTINFERENCE_KV_TYPE") == "turbo_int4":
-            kv_cache_dtype = "int4"
-            if cache_config is not None:
-                cache_config.cache_dtype = "int4"
-
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype
         )

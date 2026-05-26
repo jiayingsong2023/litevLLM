@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -99,20 +98,6 @@ class RuntimeProfileRegistry:
     ) -> RuntimeProfile:
         return cls.resolve(
             requested_profile=config.profile,
-            model_capabilities=model_capabilities,
-            gpu_total_gb=gpu_total_gb,
-        )
-
-    @classmethod
-    def resolve_from_env(
-        cls,
-        *,
-        model_capabilities: Any | None,
-        gpu_total_gb: float,
-    ) -> RuntimeProfile:
-        requested = os.environ.get("FASTINFERENCE_PROFILE", "auto").strip().lower()
-        return cls.resolve(
-            requested_profile=requested,
             model_capabilities=model_capabilities,
             gpu_total_gb=gpu_total_gb,
         )

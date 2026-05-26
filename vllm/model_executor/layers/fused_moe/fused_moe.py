@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import os
 import collections
 from typing import Any, Optional
 
@@ -59,8 +58,7 @@ class FP8ExpertCache:
         self.cache[key] = val
         return val
 
-# LRU Cache Size controllable by Env Var
-_lru_cache_size = int(os.environ.get("FASTINFERENCE_MOE_LRU_SIZE", "32"))
+_lru_cache_size = 32
 _global_fp8_cache = FP8ExpertCache(max_size=_lru_cache_size)
 
 def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
@@ -70,7 +68,7 @@ def fused_moe(hidden_states, w1, w2, gating_output, topk, renormalize=True):
     M, K = hidden_states.shape
     E = w1.shape[0]
     
-    fp8_enabled = os.environ.get("FASTINFERENCE_DEEPSEEK_FP8", "0") == "1"
+    fp8_enabled = False
     
     # 1. Routing
     routing_weights = torch.softmax(gating_output, dim=-1)

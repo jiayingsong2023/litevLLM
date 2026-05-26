@@ -121,5 +121,10 @@ def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
     vllm_config.fastinference_config = fastinference_config
     vllm_config.fastinference_config_path = kwargs.get("fastinference_config_path")
     runtime_config = RuntimeConfig.from_vllm_config(vllm_config)
+    cache_config.cache_dtype = (
+        "int4"
+        if runtime_config.kv_cache_dtype in ("turbo_int4", "int4")
+        else runtime_config.kv_cache_dtype
+    )
     vllm_config.runtime_config = runtime_config
     return vllm_config

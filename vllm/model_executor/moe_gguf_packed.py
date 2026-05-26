@@ -2,7 +2,6 @@
 """Shared MoE expert GGUF packed-row helpers."""
 from __future__ import annotations
 
-import os
 import numpy as np
 import torch
 
@@ -10,15 +9,7 @@ _SUPPORTED_MOE_GGUF_TYPES = frozenset({2, 12, 14})  # Q4_0, Q4_K, Q6_K (same as 
 
 
 def moe_packed_gguf_enabled() -> bool:
-    raw = os.environ.get("FASTINFERENCE_MOE_PACKED_GGUF")
-    if raw is None:
-        raw = os.environ.get("FASTINFERENCE_QWEN35_MOE_PACKED_GGUF", "0")
-    return raw.strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return False
 
 
 def qwen35_moe_packed_gguf_enabled() -> bool:

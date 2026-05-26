@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
@@ -8,12 +7,7 @@ from typing import Optional, Any, Dict
 from collections import defaultdict
 
 
-_AWQ_TENSOR_TUNING: dict[str, str] = {
-    key: value
-    for key, value in os.environ.items()
-    if key.startswith("FASTINFERENCE_AWQ_")
-    or key.startswith("FASTINFERENCE_GEMMA4_DENSE_")
-}
+_AWQ_TENSOR_TUNING: dict[str, str] = {}
 _AWQ_TENSOR_TUNING_LOCKED = False
 
 
@@ -25,20 +19,14 @@ def set_awq_tensor_tuning_config(
     _AWQ_TENSOR_TUNING = {
         str(key): str(value)
         for key, value in (values or {}).items()
-        if (
-            str(key).startswith("FASTINFERENCE_AWQ_")
-            or str(key).startswith("FASTINFERENCE_GEMMA4_DENSE_")
-        )
-        and value is not None
+        if value is not None
     }
     _AWQ_TENSOR_TUNING_LOCKED = bool(locked)
     _refresh_awq_tuning_derived()
 
 
 def _env_get(name: str, default: str = "") -> str:
-    if _AWQ_TENSOR_TUNING_LOCKED:
-        return _AWQ_TENSOR_TUNING.get(name, default)
-    return os.environ.get(name, _AWQ_TENSOR_TUNING.get(name, default))
+    return _AWQ_TENSOR_TUNING.get(name, default)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:

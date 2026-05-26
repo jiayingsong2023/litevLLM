@@ -266,6 +266,84 @@ def test_production_step_scheduler_does_not_call_inference_config_from_env() -> 
         )
 
 
+def test_lite_inference_config_has_no_env_factory() -> None:
+    inference_config = _read("vllm/engine/inference_config.py")
+
+    forbidden_patterns = (
+        "def from_env",
+        "os.environ.get(\"FASTINFERENCE_",
+        "os.environ.items()",
+    )
+    for pattern in forbidden_patterns:
+        assert pattern not in inference_config, (
+            "LiteInferenceConfig must be populated from RuntimeConfig/config "
+            f"rather than hidden env controls via {pattern!r}"
+        )
+
+
+def test_kv_attention_layers_do_not_read_fastinference_env_directly() -> None:
+    production_files = [
+        "vllm/model_executor/layers/attention/attention.py",
+        "vllm/model_executor/layers/quantization/kv_cache.py",
+    ]
+    forbidden_patterns = (
+        "os.environ.get(\"FASTINFERENCE_",
+        "os.getenv(\"FASTINFERENCE_",
+        "FASTINFERENCE_KV_TYPE",
+        "FASTINFERENCE_K_SCALE",
+        "FASTINFERENCE_V_SCALE",
+    )
+    for rel in production_files:
+        text = _read(rel)
+        for pattern in forbidden_patterns:
+            assert pattern not in text, (
+                f"{rel} must receive KV policy from RuntimeConfig/cache metadata, "
+                f"not hidden env controls via {pattern!r}"
+            )
+
+
+def test_awq_kernels_do_not_capture_fastinference_env_by_prefix() -> None:
+    production_files = [
+        "vllm/kernels/triton/awq_fused_gemm.py",
+        "vllm/model_executor/layers/quantization/tensor.py",
+    ]
+    forbidden_patterns = (
+        "os.environ.items()",
+        'key.startswith("FASTINFERENCE_AWQ_")',
+        'key.startswith("FASTINFERENCE_GEMMA4_DENSE_")',
+    )
+    for rel in production_files:
+        text = _read(rel)
+        for pattern in forbidden_patterns:
+            assert pattern not in text, (
+                f"{rel} must not capture arbitrary tuning env by prefix via "
+                f"{pattern!r}"
+            )
+
+
+def test_production_runtime_has_no_direct_fastinference_env_reads() -> None:
+    ignored = {
+        "vllm/engine/env_registry.py",
+        "vllm/engine/fastinference_config.py",
+        "vllm/engine/runtime_config.py",
+        "vllm/engine/runtime_profile.py",
+    }
+    pattern = re.compile(r"os\.environ\.get\(\"(FASTINFERENCE_[A-Z0-9_]+)\"")
+    violations: list[str] = []
+    for path in (ROOT / "vllm").rglob("*.py"):
+        rel = str(path.relative_to(ROOT))
+        if rel in ignored or "__pycache__" in rel:
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            match = pattern.search(line)
+            if match:
+                violations.append(f"{rel}:{lineno}:{match.group(1)}")
+    assert not violations, (
+        "Production runtime must not directly read FASTINFERENCE_* env outside "
+        "the config/registry bridge: " + ", ".join(violations)
+    )
+
+
 def test_model_files_do_not_read_production_policy_env_names() -> None:
     production_model_files = [
         "vllm/model_executor/models/gemma4.py",

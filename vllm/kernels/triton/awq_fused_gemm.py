@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -8,11 +7,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_AWQ_FUSED_TUNING: dict[str, str] = {
-    key: value
-    for key, value in os.environ.items()
-    if key.startswith("FASTINFERENCE_AWQ_")
-}
+_AWQ_FUSED_TUNING: dict[str, str] = {}
 _AWQ_FUSED_TUNING_LOCKED = False
 
 
@@ -29,27 +24,20 @@ def set_awq_fused_tuning_config(
     _AWQ_FUSED_TUNING = {
         str(key): str(value)
         for key, value in (values or {}).items()
-        if str(key).startswith("FASTINFERENCE_AWQ_") and value is not None
+        if value is not None
     }
     _AWQ_FUSED_TUNING_LOCKED = bool(locked)
     _PERSISTENT_PROFILE_CACHE = None
 
 
 def _env_get(name: str, default: str = "") -> str:
-    if _AWQ_FUSED_TUNING_LOCKED:
-        return _AWQ_FUSED_TUNING.get(name, default)
-    return os.environ.get(name, _AWQ_FUSED_TUNING.get(name, default))
+    return _AWQ_FUSED_TUNING.get(name, default)
 
 
 def _tool_override_get(name: str) -> str | None:
     if name in _AWQ_FUSED_TUNING:
         return _AWQ_FUSED_TUNING[name]
-    if _AWQ_FUSED_TUNING_LOCKED:
-        return None
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return None
-    return raw
+    return None
 
 
 def _snapshot_override_get(name: str) -> str | None:

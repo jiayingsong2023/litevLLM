@@ -32,10 +32,7 @@ def _scheduler_with_requests(requests: list[dict]) -> RequestScheduler:
 def test_step_scheduler_constructor_does_not_read_lite_inference_env(
     monkeypatch,
 ) -> None:
-    def fail_from_env() -> LiteInferenceConfig:
-        raise AssertionError("StepScheduler must not read LiteInferenceConfig.from_env")
-
-    monkeypatch.setattr(LiteInferenceConfig, "from_env", fail_from_env)
+    assert not hasattr(LiteInferenceConfig, "from_env")
 
     step_scheduler = StepScheduler(
         step_token_budget=2,

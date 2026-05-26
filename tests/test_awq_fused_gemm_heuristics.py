@@ -144,8 +144,7 @@ def test_resolve_packed_int4_fused_gemm_blocks_prefers_persistent_profile(
     ) == (48, 80, 40, 5, 3)
 
 
-def test_production_resolver_ignores_ambient_env_tile_override_on_profile_hit(
-    monkeypatch,
+def test_production_resolver_uses_config_profile_and_ignores_ambient_tile_override(
     tmp_path,
 ) -> None:
     override_path = tmp_path / "awq_profile.json"
@@ -171,13 +170,9 @@ def test_production_resolver_ignores_ambient_env_tile_override_on_profile_hit(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", str(override_path))
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_M", "7")
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_N", "96")
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_BLOCK_K", "48")
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_WARPS", "3")
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GEMM_NUM_STAGES", "4")
-    set_awq_fused_tuning_config({})
+    set_awq_fused_tuning_config(
+        {"FASTINFERENCE_AWQ_FUSED_PROFILE_JSON": str(override_path)}
+    )
 
     assert _resolve_packed_int4_fused_gemm_blocks(
         m=4,
@@ -188,7 +183,7 @@ def test_production_resolver_ignores_ambient_env_tile_override_on_profile_hit(
     ) == (48, 80, 40, 5, 3)
 
 
-def test_persistent_profile_env_override_and_disable(monkeypatch, tmp_path) -> None:
+def test_persistent_profile_config_override_and_disable(tmp_path) -> None:
     override_path = tmp_path / "awq_profile.json"
     override_path.write_text(
         json.dumps(
@@ -212,8 +207,9 @@ def test_persistent_profile_env_override_and_disable(monkeypatch, tmp_path) -> N
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", str(override_path))
-    set_awq_fused_tuning_config({})
+    set_awq_fused_tuning_config(
+        {"FASTINFERENCE_AWQ_FUSED_PROFILE_JSON": str(override_path)}
+    )
 
     assert _persistent_profile_path() == override_path
     assert _lookup_persistent_blocks(
@@ -224,8 +220,7 @@ def test_persistent_profile_env_override_and_disable(monkeypatch, tmp_path) -> N
         group_size=32,
     ) == (32, 64, 64, 4, 1)
 
-    monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_PROFILE_JSON", "off")
-    set_awq_fused_tuning_config({})
+    set_awq_fused_tuning_config({"FASTINFERENCE_AWQ_FUSED_PROFILE_JSON": "off"})
 
     assert _persistent_profile_path() == Path()
     assert _load_persistent_profile() == {}

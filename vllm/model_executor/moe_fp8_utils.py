@@ -2,7 +2,6 @@
 """Shared MoE FP8 block quant/dequant helpers and runtime flags."""
 from __future__ import annotations
 
-import os
 import torch
 
 _MOE_FP8_BLOCK = 64
@@ -12,23 +11,12 @@ def moe_fp8_block_size() -> int:
     return _MOE_FP8_BLOCK
 
 
-def _env_truthy(*names: str) -> bool:
-    for name in names:
-        raw = os.environ.get(name)
-        if raw is None:
-            continue
-        if raw.strip().lower() in ("1", "true", "yes", "on"):
-            return True
-        return False
+def moe_fp8_enabled() -> bool:
     return False
 
 
-def moe_fp8_enabled() -> bool:
-    return _env_truthy("FASTINFERENCE_MOE_FP8", "FASTINFERENCE_QWEN35_MOE_FP8")
-
-
 def moe_offload_enabled() -> bool:
-    return _env_truthy("FASTINFERENCE_MOE_OFFLOAD", "FASTINFERENCE_QWEN35_MOE_OFFLOAD")
+    return False
 
 
 def qwen35_moe_fp8_enabled() -> bool:
@@ -42,7 +30,7 @@ def qwen35_moe_offload_enabled() -> bool:
 
 
 def moe_expert_lru_size() -> int:
-    return max(1, int(os.environ.get("FASTINFERENCE_MOE_LRU_SIZE", "32")))
+    return 32
 
 
 def dims_ok_for_moe_fp8(hidden: int, inter: int) -> bool:
