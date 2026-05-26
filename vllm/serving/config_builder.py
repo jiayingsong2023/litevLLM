@@ -6,6 +6,7 @@ from typing import Any
 from transformers import AutoConfig
 
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.engine.fastinference_config import resolve_fastinference_config
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
 
@@ -113,6 +114,12 @@ def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
         group_size, weight_bits = _read_awq_group_size_and_bits(model_path)
         vllm_config.quant_config = AWQConfig(weight_bits=weight_bits, group_size=group_size)
 
+    fastinference_config = resolve_fastinference_config(
+        config=kwargs.get("fastinference_config"),
+        path=kwargs.get("fastinference_config_path"),
+    )
+    vllm_config.fastinference_config = fastinference_config
+    vllm_config.fastinference_config_path = kwargs.get("fastinference_config_path")
     runtime_config = RuntimeConfig.from_vllm_config(vllm_config)
     vllm_config.runtime_config = runtime_config
     return vllm_config
