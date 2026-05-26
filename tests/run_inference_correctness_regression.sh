@@ -237,7 +237,7 @@ fi
 FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
 echo "[2/2] Qwen3.5-9B AWQ"
-FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
+FASTINFERENCE_PROFILE=accuracy FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
 GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then

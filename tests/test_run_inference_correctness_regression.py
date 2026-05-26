@@ -128,7 +128,7 @@ def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'printf "KV=%s CMD=%s\\n" "${{FASTINFERENCE_KV_TYPE:-}}" "$*" >> "{log_path}"',
+                f'printf "PROFILE=%s KV=%s CMD=%s\\n" "${{FASTINFERENCE_PROFILE:-}}" "${{FASTINFERENCE_KV_TYPE:-}}" "$*" >> "{log_path}"',
                 "exit 0",
             ]
         )
@@ -169,6 +169,10 @@ def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
     assert str(gemma26_dir) in calls
+    assert (
+        "PROFILE=accuracy KV=turbo_int4 CMD=run python "
+        "tests/tools/quality_bar_spotcheck.py"
+    ) in calls
     # Gemma4-26B defaults to turbo_int4 KV in correctness regression.
     assert "KV=turbo_int4" in calls
 
