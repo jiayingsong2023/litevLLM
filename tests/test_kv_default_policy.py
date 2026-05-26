@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from vllm.engine.fastinference_config import FastInferenceConfig, LegacyEnvConfig
 from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.runtime_config import RuntimeConfig
 
@@ -20,6 +21,7 @@ def _mock_vllm_config() -> object:
             max_num_batched_tokens=512,
         ),
         runtime_policy_mode="auto",
+        fastinference_config=FastInferenceConfig(),
     )
 
 
@@ -40,22 +42,27 @@ def test_runtime_config_uses_profile_defaults(monkeypatch) -> None:
     assert cfg.tuning_env == {"FASTINFERENCE_PROFILE": "auto"}
 
 
-def test_runtime_config_public_kv_type_overrides_profile(monkeypatch) -> None:
-    monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp8")
+def test_runtime_config_config_kv_type_overrides_profile(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(kv_type="fp8")
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.profile.requested_name == "auto"
     assert cfg.kv_cache_dtype == "fp8"
     assert cfg.tuning_env == {"FASTINFERENCE_PROFILE": "auto"}
 
 
-def test_runtime_config_public_kv_type_auto_uses_profile(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "auto")
+def test_runtime_config_config_kv_type_auto_uses_profile(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_PROFILE", "benchmark")
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(
+        profile="accuracy",
+        kv_type="auto",
+    )
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.profile.requested_name == "accuracy"
     assert cfg.kv_cache_dtype == "fp8"
@@ -64,12 +71,15 @@ def test_runtime_config_public_kv_type_auto_uses_profile(monkeypatch) -> None:
 def test_runtime_config_collects_deprecated_env_when_compat_enabled(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
     monkeypatch.setenv("FASTINFERENCE_ALLOW_LEGACY_ENV", "1")
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV", "1")
     monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(
+        legacy_env=LegacyEnvConfig(enabled=True),
+    )
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.tuning_env["FASTINFERENCE_GEMMA4_ALLOW_INT4_KV"] == "1"
     assert "FASTINFERENCE_KV_TYPE" not in cfg.tuning_env
@@ -79,20 +89,27 @@ def test_runtime_config_collects_deprecated_env_when_compat_enabled(
 def test_runtime_config_accuracy_profile_defaults_to_fp8(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
     monkeypatch.delenv("FASTINFERENCE_KV_TYPE", raising=False)
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(profile="accuracy")
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.profile.requested_name == "accuracy"
     assert cfg.kv_cache_dtype == "fp8"
 
 
-def test_runtime_config_public_kv_type_overrides_accuracy_profile(
+def test_runtime_config_config_kv_type_overrides_accuracy_profile(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "turbo_int4")
+    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp8")
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(
+        profile="accuracy",
+        kv_type="turbo_int4",
+    )
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.profile.requested_name == "accuracy"
     assert cfg.kv_cache_dtype == "turbo_int4"
@@ -100,8 +117,10 @@ def test_runtime_config_public_kv_type_overrides_accuracy_profile(
 
 def test_runtime_config_latency_profile_caps_kv_shape(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "latency")
+    vllm_config = _mock_vllm_config()
+    vllm_config.fastinference_config = FastInferenceConfig(profile="latency")
 
-    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+    cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.kv_max_active_requests == 1
     assert cfg.kv_max_model_len == 512

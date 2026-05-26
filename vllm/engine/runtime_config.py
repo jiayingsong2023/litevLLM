@@ -2,7 +2,8 @@
 import os
 from dataclasses import dataclass, field
 
-from vllm.engine.env_registry import collect_runtime_tuning_env, get_public_env
+from vllm.engine.env_registry import collect_runtime_tuning_env
+from vllm.engine.fastinference_config import resolve_fastinference_config
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import RuntimeProfile, RuntimeProfileRegistry
 
@@ -74,17 +75,22 @@ class RuntimeConfig:
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
 
-        profile = RuntimeProfileRegistry.resolve_from_env(
+        fastinference_config = resolve_fastinference_config(
+            config=getattr(vllm_config, "fastinference_config", None),
+            path=getattr(vllm_config, "fastinference_config_path", None),
+        )
+        profile = RuntimeProfileRegistry.resolve_from_config(
+            fastinference_config,
             model_capabilities=getattr(vllm_config, "model_capabilities", None),
             gpu_total_gb=get_total_gpu_memory_gb(),
         )
-        tuning_env = collect_runtime_tuning_env(os.environ)
-        tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
-        kv_cache_dtype = (
-            get_public_env(os.environ, "FASTINFERENCE_KV_TYPE", profile.kv_cache_dtype)
-            .strip()
-            .lower()
+        tuning_env = (
+            collect_runtime_tuning_env(os.environ)
+            if fastinference_config.legacy_env.enabled
+            else {}
         )
+        tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
+        kv_cache_dtype = fastinference_config.kv_type.strip().lower()
         if kv_cache_dtype == "auto":
             kv_cache_dtype = profile.kv_cache_dtype
 
