@@ -14,7 +14,9 @@
 #   - exception: Gemma4-26B-A4B defaults to A-strict + A-lite + B
 #
 # Usage:
-#   FASTINFERENCE_KV_TYPE=fp16 bash tests/run_inference_correctness_regression.sh  # force fp16 KV globally
+#   FASTINFERENCE_CONFIG=/path/to/config.toml bash tests/run_inference_correctness_regression.sh
+#     # config locator is supported by the runtime, but this script installs
+#     # per-model temporary configs for reproducible regression behavior.
 #   SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh   # B-tier only (faster)
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
@@ -24,6 +26,33 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 # KV defaults are now handled per-model inside this script.
+
+FI_REGRESSION_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fastinference-correctness-config.XXXXXX")"
+cleanup_fastinference_regression_config() {
+  rm -rf "$FI_REGRESSION_CONFIG_DIR"
+}
+trap cleanup_fastinference_regression_config EXIT
+
+write_fastinference_config() {
+  local path="$1"
+  local profile="$2"
+  local kv_type="$3"
+  local legacy_enabled="$4"
+  cat >"$path" <<EOF
+profile = "${profile}"
+kv_type = "${kv_type}"
+
+[legacy_env]
+enabled = ${legacy_enabled}
+EOF
+}
+
+CONFIG_TINY_FP8="${FI_REGRESSION_CONFIG_DIR}/tiny-fp8.toml"
+CONFIG_QWEN_ACCURACY_TURBO="${FI_REGRESSION_CONFIG_DIR}/qwen-accuracy-turbo.toml"
+CONFIG_GEMMA_BENCH_TURBO_LEGACY="${FI_REGRESSION_CONFIG_DIR}/gemma-benchmark-turbo-legacy.toml"
+write_fastinference_config "$CONFIG_TINY_FP8" "auto" "fp8" "false"
+write_fastinference_config "$CONFIG_QWEN_ACCURACY_TURBO" "accuracy" "turbo_int4" "false"
+write_fastinference_config "$CONFIG_GEMMA_BENCH_TURBO_LEGACY" "benchmark" "turbo_int4" "true"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
@@ -46,7 +75,7 @@ RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
 
 GEMMA4_31B_RECOMMENDED_ENV=(
-  FASTINFERENCE_KV_TYPE=turbo_int4
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_BENCH_TURBO_LEGACY}"
   FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
   FASTINFERENCE_KV_MAX_MODEL_LEN=512
   FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1
@@ -59,7 +88,7 @@ GEMMA4_31B_RECOMMENDED_ENV=(
 )
 
 GEMMA4_26B_RECOMMENDED_ENV=(
-  FASTINFERENCE_KV_TYPE=turbo_int4
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_BENCH_TURBO_LEGACY}"
   FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
   FASTINFERENCE_KV_MAX_MODEL_LEN=512
   FASTINFERENCE_AWQ_DECODE_GEMV=1
@@ -234,10 +263,10 @@ if [[ -f "$TINYLLAMA_PROMPTS_FILE" ]]; then
 else
   echo "[Warn] TINYLLAMA_PROMPTS_FILE not found, fallback to built-in minimal set: $TINYLLAMA_PROMPTS_FILE"
 fi
-FASTINFERENCE_KV_TYPE=fp8 "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
+FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
 echo "[2/2] Qwen3.5-9B AWQ"
-FASTINFERENCE_PROFILE=accuracy FASTINFERENCE_KV_TYPE=turbo_int4 "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
+FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
 GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
@@ -287,7 +316,7 @@ fi
 echo ""
 echo "=== Tier-A-strict (<=14B, HF parity) ==="
 echo "[A1] TinyLlama — Lite vs HF same tree"
-FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
+FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_TINYLLAMA" \
   --preset tinyllama \
   --hf-same-as-lite \
@@ -297,7 +326,7 @@ FASTINFERENCE_KV_TYPE=fp8 uv run python tests/verify_semantic_integrity.py \
 
 echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
 require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
-FASTINFERENCE_PROFILE=accuracy FASTINFERENCE_KV_TYPE=turbo_int4 uv run python tests/verify_semantic_integrity.py \
+FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
   --hf-model "$HF_QWEN35_9B_FP16" \

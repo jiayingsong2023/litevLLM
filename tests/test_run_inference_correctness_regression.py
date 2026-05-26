@@ -114,7 +114,7 @@ def test_run_inference_correctness_regression_requires_qwen35_fp16_reference(
     assert "Missing model directory for Qwen3.5-9B-FP16" in proc.stdout
 
 
-def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
+def test_run_inference_correctness_regression_uses_config_for_gemma4_26b(
     tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -128,7 +128,7 @@ def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'printf "PROFILE=%s KV=%s CMD=%s\\n" "${{FASTINFERENCE_PROFILE:-}}" "${{FASTINFERENCE_KV_TYPE:-}}" "$*" >> "{log_path}"',
+                f'printf "CONFIG=%s CMD=%s\\n" "${{FASTINFERENCE_CONFIG:-}}" "$*" >> "{log_path}"',
                 "exit 0",
             ]
         )
@@ -169,12 +169,8 @@ def test_run_inference_correctness_regression_uses_turbo_int4_kv_for_gemma4_26b(
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
     assert str(gemma26_dir) in calls
-    assert (
-        "PROFILE=accuracy KV=turbo_int4 CMD=run python "
-        "tests/tools/quality_bar_spotcheck.py"
-    ) in calls
-    # Gemma4-26B defaults to turbo_int4 KV in correctness regression.
-    assert "KV=turbo_int4" in calls
+    assert "CONFIG=/tmp/fastinference-correctness-config." in calls
+    assert "gemma-benchmark-turbo-legacy.toml" in calls
 
 
 def test_run_inference_correctness_regression_uses_default_local_gemma_paths(
