@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.engine.fastinference_config import FastInferenceConfig
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import (
     SUPPORTED_PROFILE_NAMES,
@@ -48,22 +49,22 @@ def test_auto_profile_resolves_to_named_effective_profile(monkeypatch) -> None:
     assert profile.backend_policy.gpu_greedy_sampling is True
 
 
-def test_env_profile_is_the_only_fastinference_runtime_selector(monkeypatch) -> None:
+def test_config_profile_is_the_runtime_selector(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
 
-    profile = RuntimeProfileRegistry.resolve_from_env(
+    profile = RuntimeProfileRegistry.resolve_from_config(
+        FastInferenceConfig(profile="latency"),
         model_capabilities=_caps("llama"),
         gpu_total_gb=24.0,
     )
 
-    assert profile.requested_name == "accuracy"
-    assert profile.kv_cache_dtype == "fp8"
+    assert profile.requested_name == "latency"
+    assert profile.effective_name == "latency"
 
 
-def test_unknown_profile_falls_back_to_auto(monkeypatch) -> None:
-    monkeypatch.setenv("FASTINFERENCE_PROFILE", "experimental_local")
-    profile = RuntimeProfileRegistry.resolve_from_env(
+def test_unknown_profile_falls_back_to_auto_in_pure_resolver() -> None:
+    profile = RuntimeProfileRegistry.resolve(
+        requested_profile="experimental_local",
         model_capabilities=_caps("llama"),
         gpu_total_gb=24.0,
     )
