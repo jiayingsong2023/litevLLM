@@ -25,6 +25,6 @@ uv run pytest \
   tests/test_gemma4_reference_loader.py \
   tests/test_gemma4_diagnostics_warn_only.py \
   tests/test_run_inference_correctness_regression.py \
-  tests/test_kv_block_sig.py \
   tests/test_kv_selective_attention.py \
+  tests/test_paged_attention_kernel_structure.py \
   -v --tb=short "$@"

@@ -56,8 +56,7 @@ Register pressure: HIGH (estimated >64 regs per thread at head_size=256).
   Live values (INT4 + HAS_ROW_SCALE path, worst case):
     q_low[128], q_high[128]                    (256 fp32)
     acc_low[128], acc_high[128]                (256 fp32)
-    k_l[16,128], k_h[16,128]  per block tile  (2048 fp32, Triton-managed)
-    v_l[16,128], v_h[16,128]  per block tile  (2048 fp32, Triton-managed)
+    staged K/V unpack tile[16,128]             (1024 fp32, Triton-managed)
     qk[16], p[16]                              (32 fp32)
     m_i, l_i, alpha, delta_m                   (4 fp32 scalars)
     k_scale[16], v_scale[16]                   (32 fp32, HAS_ROW_SCALE only)
@@ -110,9 +109,7 @@ def build_selective_block_indices(
         sel = [
             i
             for i in range(n)
-            if (i % select_stride == 0)
-            or (i < min_selected_blocks)
-            or (i == n - 1)
+            if (i % select_stride == 0) or (i < min_selected_blocks) or (i == n - 1)
         ]
         blocks.extend(sel)
         offsets.append(len(blocks))
@@ -289,11 +286,10 @@ def _paged_attention_kernel(
     # Initialize accumulators
     m_i = -float("inf")
     l_i = 0.0
-    acc_low = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
-    acc_high = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
-    acc_full = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     if IS_INT4:
+        acc_low = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
+        acc_high = tl.zeros([BLOCK_D // 2], dtype=tl.float32)
         offs_d_half = tl.arange(0, BLOCK_D // 2)
         offs_d_half_2d = offs_d_half[None, :]
         # Contiguous layout: low channels in low nibbles, high channels in high.
@@ -310,6 +306,7 @@ def _paged_attention_kernel(
             + (offs_d_half + BLOCK_D // 2) * stride_q_dim
         ).to(tl.float32)
     else:
+        acc_full = tl.zeros([BLOCK_D], dtype=tl.float32)
         offs_d_2d = tl.arange(0, BLOCK_D)[None, :]
         off_q = (
             seq_idx * stride_q_seq
@@ -333,21 +330,18 @@ def _paged_attention_kernel(
         num_iters = num_blocks
 
     for idx in range(0, num_iters):
-        if USE_SELECTION:
-            i = tl.load(ActiveBlocks_ptr + active_start + idx)
-        else:
-            i = idx
+        i = tl.load(ActiveBlocks_ptr + active_start + idx) if USE_SELECTION else idx
         global_token_idx = i * block_size + offs_n
         block_mask = global_token_idx < seq_len
 
         # K load and QK computation
         if IS_CACHED:
-            k_base_ptr = tl.load(
-                K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
-            ).to(tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16))
-            v_base_ptr = tl.load(
-                V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
-            ).to(tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16))
+            k_base_ptr = tl.load(K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
+                tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
+            )
+            v_base_ptr = tl.load(V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
+                tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
+            )
             if HAS_ROW_SCALE:
                 ks_base_ptr = tl.load(
                     K_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
@@ -369,16 +363,12 @@ def _paged_attention_kernel(
         v_scale = v_scale_arg
         if HAS_ROW_SCALE:
             k_scale = tl.load(
-                ks_base_ptr
-                + offs_n * stride_ks_token
-                + kv_head_idx * stride_ks_head,
+                ks_base_ptr + offs_n * stride_ks_token + kv_head_idx * stride_ks_head,
                 mask=block_mask,
                 other=1.0,
             )
             v_scale = tl.load(
-                vs_base_ptr
-                + offs_n * stride_vs_token
-                + kv_head_idx * stride_vs_head,
+                vs_base_ptr + offs_n * stride_vs_token + kv_head_idx * stride_vs_head,
                 mask=block_mask,
                 other=1.0,
             )
@@ -398,10 +388,10 @@ def _paged_attention_kernel(
             ).to(tl.int32)
             # Manual sign-extension for 4-bit signed
             k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
+            qk_low = tl.sum(q_low[None, :] * k_l, axis=1)
             k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
-            qk = (
-                tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
-            )
+            qk_high = tl.sum(q_high[None, :] * k_h, axis=1)
+            qk = (qk_low + qk_high) * scale
         else:
             off_kv = (
                 offs_n[:, None] * stride_k_token
@@ -446,10 +436,10 @@ def _paged_attention_kernel(
                 other=0,
             ).to(tl.int32)
             # Manual sign-extension for 4-bit signed
-            v_l = ((v_packed << 28) >> 28).to(tl.float32) * v_scale
-            v_h = ((v_packed << 24) >> 28).to(tl.float32) * v_scale
-            acc_low = acc_low * alpha + tl.sum(p[:, None] * v_l, axis=0)
-            acc_high = acc_high * alpha + tl.sum(p[:, None] * v_h, axis=0)
+            v_low_unpacked = ((v_packed << 28) >> 28).to(tl.float32) * v_scale
+            acc_low = acc_low * alpha + tl.sum(p[:, None] * v_low_unpacked, axis=0)
+            v_high_unpacked = ((v_packed << 24) >> 28).to(tl.float32) * v_scale
+            acc_high = acc_high * alpha + tl.sum(p[:, None] * v_high_unpacked, axis=0)
         else:
             v = tl.load(
                 v_base_ptr

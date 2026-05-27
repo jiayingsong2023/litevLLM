@@ -77,12 +77,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-### 1. 运行回归测试 (验证精度)
+### 1. 运行回归测试
 ```bash
-# 快速 lite 回归（结构 smoke + 单测）
+# 快速代码回归（结构 smoke + 单测，无完整模型加载）
 uv run bash tests/run_regression_suite.sh
 
-# 推理精度/质量回归
+# 推理准确性/质量回归（本地模型语义门禁）
 uv run bash tests/run_inference_correctness_regression.sh
 
 # Gemma4 26B/31B 默认性能回归
