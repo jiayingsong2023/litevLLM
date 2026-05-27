@@ -40,7 +40,6 @@ def _profile_reshape_and_cache() -> None:
     num_kv_heads = 8
     num_tokens = 16  # one block worth
     block_size = 16
-    sig_dim = 32
     num_total_blocks = 1024
     warmup = 20
     iters = 200
@@ -59,19 +58,17 @@ def _profile_reshape_and_cache() -> None:
             "v_scale": 1.0,
             "k_scale_cache": None,
             "v_scale_cache": None,
-            "sig_temp": None,
         },
         {
-            "label": "int4 (no dynamic scale, no sig)",
+            "label": "int4 (no dynamic scale)",
             "kv_cache_dtype": "turbo_int4",
             "k_scale": 1.0,
             "v_scale": 1.0,
             "k_scale_cache": None,
             "v_scale_cache": None,
-            "sig_temp": None,
         },
         {
-            "label": "int4 + dynamic scale (no sig)",
+            "label": "int4 + dynamic scale",
             "kv_cache_dtype": "turbo_int4",
             "k_scale": 1.0,
             "v_scale": 1.0,
@@ -80,23 +77,6 @@ def _profile_reshape_and_cache() -> None:
             ),
             "v_scale_cache": torch.randn(
                 num_total_blocks, block_size, num_kv_heads, dtype=torch.float32, device=device
-            ),
-            "sig_temp": None,
-        },
-        {
-            "label": "int4 + dynamic scale + WRITE_SIG (heaviest)",
-            "kv_cache_dtype": "turbo_int4",
-            "k_scale": 1.0,
-            "v_scale": 1.0,
-            "k_scale_cache": torch.randn(
-                num_total_blocks, block_size, num_kv_heads, dtype=torch.float32, device=device
-            ),
-            "v_scale_cache": torch.randn(
-                num_total_blocks, block_size, num_kv_heads, dtype=torch.float32, device=device
-            ),
-            "sig_temp": torch.zeros(
-                num_total_blocks, block_size, num_kv_heads, sig_dim,
-                dtype=torch.float16, device=device,
             ),
         },
     ]
@@ -122,7 +102,6 @@ def _profile_reshape_and_cache() -> None:
             k_scale=cfg["k_scale"], v_scale=cfg["v_scale"],
             k_scale_cache=cfg["k_scale_cache"],
             v_scale_cache=cfg["v_scale_cache"],
-            sig_temp=cfg["sig_temp"], sig_dim=sig_dim,
         )
 
         # warmup

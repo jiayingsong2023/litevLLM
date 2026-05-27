@@ -12,10 +12,6 @@ Memory layout:
   k_scale/v_scale:     scalar or 1-element tensor (float32)
   k_scale_cache:       (num_blocks, block_size, num_kv_heads, 1)  float32
                         Per-token-per-head row-wise scales (TurboQuant INT4).
-  sig_temp:            (num_blocks, block_size, num_kv_heads, sig_dim)  float16
-                        Temporary buffer for KV block signature computation.
-                        Written when WRITE_SIG is enabled.
-
 Tiling:
   Grid:  (num_tokens, num_heads)
   Each program handles one (token, head) pair.
@@ -27,30 +23,28 @@ Kernel phases per program:
      write to k_scale_cache
   3. Quantize: fp8 conversion, or int4 pack (low/high nibbles)
   4. Store quantized K/V into cache at slot_mapping[token_idx]
-  5. If WRITE_SIG: accumulate K[:sig_dim] into sig_temp buffer
 
 INT4 packing detail:
   Contiguous layout: first half of channels -> low nibbles,
   second half of channels -> high nibbles.
   Packed value = (low_quant & 0xF) | ((high_quant & 0xF) << 4)
 
-Register pressure: HIGH (INT4 + COMPUTE_DYNAMIC_SCALE + WRITE_SIG path).
+Register pressure: HIGH (INT4 + COMPUTE_DYNAMIC_SCALE path).
   Live values for K:
     k[256] (fp32), k_low[128] (fp32), k_high[128] (fp32)     = 512 fp32
     k_l_q[128] (uint8), k_h_q[128] (uint8)                     (quantized)
-    k_scale (scalar), k_sig[32] (if WRITE_SIG)                 = 32 fp32
+    k_scale (scalar)
     offsets, slot, block_idx, token_idx                         (scalars)
   V follows same pattern (another ~512 fp32). Total per-program can
   exceed 1000 fp32 values before Triton's register allocation and
-  spilling. The constexpr flags (IS_INT4, IS_FP8, COMPUTE_DYNAMIC_SCALE,
-  WRITE_SIG) provide compile-time dead-code elimination, so unused
+  spilling. The constexpr flags (IS_INT4, IS_FP8, COMPUTE_DYNAMIC_SCALE)
+  provide compile-time dead-code elimination, so unused
   paths do not contribute to register pressure.
 
 Profiling (head_dim=256, block_size=16, Radeon gfx1151):
   fp16:                               42.2 us  6.2 GB/s
-  int4 (no dynamic scale, no sig):    44.8 us  3.7 GB/s
-  int4 + dynamic scale (no sig):      45.0 us  3.6 GB/s
-  int4 + dynamic scale + WRITE_SIG:   45.4 us  3.6 GB/s
+  int4 (no dynamic scale):            44.8 us  3.7 GB/s
+  int4 + dynamic scale:               45.0 us  3.6 GB/s
   The heaviest path is within 8% of the lightest — constexpr specialization
   fully eliminates unused-path register pressure. No split K/V kernel or
   lower-ILP fallback is needed. The GB/s differences reflect data volume
@@ -161,17 +155,10 @@ def _reshape_and_cache_kernel(
     stride_vsb,
     stride_vss,
     stride_vsh,
-    Sig_temp_ptr,
-    stride_stb,
-    stride_sts,
-    stride_sth,
-    stride_std,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    SIG_DIM: tl.constexpr,
     IS_FP8: tl.constexpr,
     IS_INT4: tl.constexpr,
-    WRITE_SIG: tl.constexpr,
     COMPUTE_DYNAMIC_SCALE: tl.constexpr,
     FP8_DTYPE: tl.constexpr,
 ):
@@ -310,23 +297,6 @@ def _reshape_and_cache_kernel(
             tl.store(kc_ptr, k.to(key_cache.dtype.element_ty))
             tl.store(vc_ptr, v.to(value_cache.dtype.element_ty))
 
-    if WRITE_SIG:
-        # Write the first SIG_DIM elements of the dequantized K (fp32
-        # registers) to the temp signature buffer. These are averaged
-        # later by the signature finalize kernel to produce per-block
-        # mean K vectors for selective attention scoring.
-        off_sig_d = tl.arange(0, SIG_DIM)
-        sig_slot_ptr = (
-            Sig_temp_ptr
-            + block_idx * stride_stb
-            + block_offset * stride_sts
-            + head_idx * stride_sth
-            + off_sig_d * stride_std
-        )
-        k_sig = tl.load(base_k_ptr + off_sig_d * stride_kd).to(tl.float32)
-        tl.store(sig_slot_ptr, k_sig.to(Sig_temp_ptr.dtype.element_ty))
-
-
 def reshape_and_cache(
     key,
     value,
@@ -338,8 +308,6 @@ def reshape_and_cache(
     v_scale=1.0,
     k_scale_cache=None,
     v_scale_cache=None,
-    sig_temp=None,
-    sig_dim=32,
 ):
     num_tokens, num_kv_heads, head_dim = key.shape
     block_size = key_cache.shape[1]
@@ -371,8 +339,6 @@ def reshape_and_cache(
             vs = _get_scalar_scale_tensor(v_scale, value.device)
 
     grid = (num_tokens, num_kv_heads)
-    write_sig = sig_temp is not None and sig_temp.numel() > 0
-    s_st = sig_temp.stride() if write_sig else (0, 0, 0, 0)
     _reshape_and_cache_kernel[grid](
         key,
         value,
@@ -401,17 +367,10 @@ def reshape_and_cache(
         vs.stride(0) if compute_dynamic else 0,
         vs.stride(1) if compute_dynamic else 0,
         vs.stride(2) if compute_dynamic else 0,
-        sig_temp if write_sig else key_cache,
-        s_st[0],
-        s_st[1],
-        s_st[2],
-        s_st[3],
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
-        SIG_DIM=sig_dim,
         IS_FP8=is_fp8,
         IS_INT4=is_int4,
-        WRITE_SIG=write_sig,
         COMPUTE_DYNAMIC_SCALE=compute_dynamic,
         FP8_DTYPE=FP8_DTYPE,
     )

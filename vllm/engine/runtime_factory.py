@@ -52,8 +52,6 @@ class RuntimeAssemblyContext:
     sampling_driver: Any
     output_pipeline: Any
     queue_timeout_s: float
-    sig_caches: Any | None = None
-    sig_temp_buffers: Any | None = None
 
 
 class LiteRuntimeFactory:
@@ -75,8 +73,6 @@ class LiteRuntimeFactory:
             inf_config=context.inf_config,
             stack_per_layer_carries=context.stack_per_layer_carries,
             split_per_layer_carries=context.split_per_layer_carries,
-            sig_caches=context.sig_caches,
-            sig_temp_buffers=context.sig_temp_buffers,
         )
         multimodal_processor = LiteMultiModalProcessor(
             model=context.model,

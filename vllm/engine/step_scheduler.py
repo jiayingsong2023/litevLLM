@@ -13,6 +13,12 @@ from vllm.engine.scheduling_helpers import (
     service_class_priority,
     share_gap_map,
 )
+from vllm.engine.scheduling_constraints import (
+    ServiceClassSelector,
+    LoRAConstraint,
+    MultiModalConstraint,
+    MultiModalLoRAConstraint,
+)
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, PrefillPlan, StepPlan
 
 
@@ -194,6 +200,11 @@ class StepScheduler:
         self._prefill_multimodal_lora_cursor = 0
         self._decode_multimodal_lora_cursor = 0
         self._multimodal_prefix_cache_hit_rate_feedback = 0.0
+
+        self._service_class_selector = ServiceClassSelector()
+        self._lora_constraint = LoRAConstraint()
+        self._multimodal_constraint = MultiModalConstraint()
+        self._multimodal_lora_constraint = MultiModalLoRAConstraint()
 
     def update_runtime_feedback(self, stats: dict[str, object] | None) -> None:
         observer = stats.get("observer") if isinstance(stats, dict) else None
@@ -858,63 +869,12 @@ class StepScheduler:
         candidate_request_ids: list[str],
         current_request_ids: list[str],
     ) -> tuple[int, bool, bool, float]:
-        base_limit = self.max_prefill_multimodal_lora_requests_per_batch
-        if base_limit <= 0:
-            return 0, False, False, 0.0
-        hit_rate = self._multimodal_prefix_cache_hit_rate_feedback
-        candidate_count = self._count_multimodal_lora_requests(
-            scheduler, candidate_request_ids
+        return self._multimodal_lora_constraint._effective_prefill_multimodal_lora_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            candidate_request_ids=candidate_request_ids,
+            current_request_ids=current_request_ids,
         )
-        effective_limit = base_limit
-        baseline_counts = self._count_multimodal_lora_adapters(
-            scheduler, candidate_request_ids
-        )
-        current_counts = self._count_multimodal_lora_adapters(
-            scheduler, current_request_ids
-        )
-        fairness_gap = self._share_gap_map(
-            self._normalized_share_map(current_counts),
-            self._normalized_share_map(baseline_counts),
-        )
-        max_gap = self._max_abs_share_gap(fairness_gap)
-        relaxed_by_fairness = False
-        tightened_by_locality = False
-        if (
-            self.multimodal_lora_fairness_relax_threshold > 0
-            and max_gap >= self.multimodal_lora_fairness_relax_threshold
-        ):
-            effective_limit = min(
-                candidate_count,
-                effective_limit + self.multimodal_lora_prefill_limit_relax_delta,
-            )
-            relaxed_by_fairness = effective_limit > base_limit
-        elif (
-            self.multimodal_prefix_cache_relax_threshold > 0
-            and hit_rate <= self.multimodal_prefix_cache_relax_threshold
-        ):
-            effective_limit = min(
-                candidate_count,
-                effective_limit + self.multimodal_lora_prefill_limit_relax_delta,
-            )
-        elif (
-            self.multimodal_prefix_cache_tighten_threshold > 0
-            and hit_rate >= self.multimodal_prefix_cache_tighten_threshold
-            and (
-                self.multimodal_lora_locality_tighten_threshold <= 0
-                or max_gap <= self.multimodal_lora_locality_tighten_threshold
-            )
-            and effective_limit > 1
-        ):
-            effective_limit = max(
-                1,
-                effective_limit - self.multimodal_lora_prefill_limit_tighten_delta,
-            )
-            tightened_by_locality = (
-                self.multimodal_lora_locality_tighten_threshold > 0
-                and max_gap <= self.multimodal_lora_locality_tighten_threshold
-                and effective_limit < base_limit
-            )
-        return effective_limit, relaxed_by_fairness, tightened_by_locality, max_gap
 
     def _effective_decode_multimodal_lora_limit(
         self,
@@ -923,63 +883,12 @@ class StepScheduler:
         candidate_request_ids: list[str],
         current_request_ids: list[str],
     ) -> tuple[int, bool, bool, float]:
-        base_limit = self.max_decode_multimodal_lora_requests_per_batch
-        if base_limit <= 0:
-            return 0, False, False, 0.0
-        hit_rate = self._multimodal_prefix_cache_hit_rate_feedback
-        candidate_count = self._count_multimodal_lora_requests(
-            scheduler, candidate_request_ids
+        return self._multimodal_lora_constraint._effective_decode_multimodal_lora_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            candidate_request_ids=candidate_request_ids,
+            current_request_ids=current_request_ids,
         )
-        effective_limit = base_limit
-        baseline_counts = self._count_multimodal_lora_adapters(
-            scheduler, candidate_request_ids
-        )
-        current_counts = self._count_multimodal_lora_adapters(
-            scheduler, current_request_ids
-        )
-        fairness_gap = self._share_gap_map(
-            self._normalized_share_map(current_counts),
-            self._normalized_share_map(baseline_counts),
-        )
-        max_gap = self._max_abs_share_gap(fairness_gap)
-        relaxed_by_fairness = False
-        tightened_by_locality = False
-        if (
-            self.multimodal_lora_fairness_relax_threshold > 0
-            and max_gap >= self.multimodal_lora_fairness_relax_threshold
-        ):
-            effective_limit = min(
-                candidate_count,
-                effective_limit + self.multimodal_lora_prefill_limit_relax_delta,
-            )
-            relaxed_by_fairness = effective_limit > base_limit
-        elif (
-            self.multimodal_prefix_cache_relax_threshold > 0
-            and hit_rate <= self.multimodal_prefix_cache_relax_threshold
-        ):
-            effective_limit = min(
-                candidate_count,
-                effective_limit + self.multimodal_lora_prefill_limit_relax_delta,
-            )
-        elif (
-            self.multimodal_prefix_cache_tighten_threshold > 0
-            and hit_rate >= self.multimodal_prefix_cache_tighten_threshold
-            and (
-                self.multimodal_lora_locality_tighten_threshold <= 0
-                or max_gap <= self.multimodal_lora_locality_tighten_threshold
-            )
-            and effective_limit > 1
-        ):
-            effective_limit = max(
-                1,
-                effective_limit - self.multimodal_lora_prefill_limit_tighten_delta,
-            )
-            tightened_by_locality = (
-                self.multimodal_lora_locality_tighten_threshold > 0
-                and max_gap <= self.multimodal_lora_locality_tighten_threshold
-                and effective_limit < base_limit
-            )
-        return effective_limit, relaxed_by_fairness, tightened_by_locality, max_gap
 
     def _shape_multimodal_prefill_batch(
         self,
@@ -988,45 +897,12 @@ class StepScheduler:
         request_ids: list[str],
         candidate_prefills: list[str],
     ) -> tuple[list[str], int, bool, bool, bool]:
-        effective_limit = self.max_prefill_multimodal_requests_per_batch
-        relaxed = False
-        tightened = False
-        if effective_limit > 0:
-            candidate_mm_count = self._count_multimodal_requests(
-                scheduler, candidate_prefills
-            )
-            hit_rate = self._multimodal_prefix_cache_hit_rate_feedback
-            if (
-                self.multimodal_prefix_cache_relax_threshold > 0
-                and hit_rate <= self.multimodal_prefix_cache_relax_threshold
-            ):
-                effective_limit = min(
-                    candidate_mm_count,
-                    effective_limit + self.multimodal_prefill_limit_relax_delta,
-                )
-                relaxed = (
-                    effective_limit > self.max_prefill_multimodal_requests_per_batch
-                )
-            elif (
-                self.multimodal_prefix_cache_tighten_threshold > 0
-                and hit_rate >= self.multimodal_prefix_cache_tighten_threshold
-                and effective_limit > 1
-            ):
-                effective_limit = max(
-                    1,
-                    effective_limit - self.multimodal_prefill_limit_tighten_delta,
-                )
-                tightened = (
-                    effective_limit < self.max_prefill_multimodal_requests_per_batch
-                )
-        shaped = self._apply_multimodal_request_limit(
+        return self._multimodal_constraint.shape_multimodal_prefill_batch(
             scheduler=scheduler,
+            step_scheduler=self,
             request_ids=request_ids,
-            max_multimodal_requests=effective_limit,
-            cursor_attr="_prefill_multimodal_cursor",
+            candidate_prefills=candidate_prefills,
         )
-        triggered = shaped != request_ids
-        return shaped, effective_limit, triggered, relaxed, tightened
 
     def _build_decode_plan(
         self,
@@ -1162,26 +1038,13 @@ class StepScheduler:
         max_lora_adapters: int,
         cursor_attr: str,
     ) -> list[str]:
-        if max_lora_adapters <= 0 or len(request_ids) <= 1:
-            return request_ids
-        adapter_order = self._lora_adapters_for_ids(scheduler, request_ids)
-        if len(adapter_order) <= max_lora_adapters:
-            return request_ids
-        cursor = getattr(self, cursor_attr) % max(1, len(adapter_order))
-        allowed_adapters = set(
-            self._rotate_candidates(adapter_order, cursor)[:max_lora_adapters]
+        return self._lora_constraint.apply_lora_adapter_batch_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            max_lora_adapters=max_lora_adapters,
+            cursor_attr=cursor_attr,
         )
-        setattr(
-            self,
-            cursor_attr,
-            (getattr(self, cursor_attr) + 1) % max(1, len(adapter_order)),
-        )
-        shaped = [
-            rid
-            for rid in request_ids
-            if self._lora_adapter_key(scheduler.get_request(rid)) in allowed_adapters
-        ]
-        return shaped or request_ids[:1]
 
     def _apply_multimodal_request_limit(
         self,
@@ -1191,29 +1054,13 @@ class StepScheduler:
         max_multimodal_requests: int,
         cursor_attr: str,
     ) -> list[str]:
-        if max_multimodal_requests <= 0 or len(request_ids) <= 1:
-            return request_ids
-        multimodal_ids = [
-            rid for rid in request_ids if self._is_multimodal_request(scheduler, rid)
-        ]
-        if len(multimodal_ids) <= max_multimodal_requests:
-            return request_ids
-        cursor = getattr(self, cursor_attr) % max(1, len(multimodal_ids))
-        allowed_multimodal = set(
-            self._rotate_candidates(multimodal_ids, cursor)[:max_multimodal_requests]
+        return self._multimodal_constraint.apply_multimodal_request_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            max_multimodal_requests=max_multimodal_requests,
+            cursor_attr=cursor_attr,
         )
-        setattr(
-            self,
-            cursor_attr,
-            (getattr(self, cursor_attr) + 1) % max(1, len(multimodal_ids)),
-        )
-        shaped = [
-            rid
-            for rid in request_ids
-            if (not self._is_multimodal_request(scheduler, rid))
-            or rid in allowed_multimodal
-        ]
-        return shaped or request_ids[:1]
 
     def _apply_multimodal_lora_request_limit(
         self,
@@ -1224,105 +1071,13 @@ class StepScheduler:
         cursor_attr: str,
         candidate_request_ids: list[str] | None = None,
     ) -> tuple[list[str], int, bool, bool, bool, bool, bool, float]:
-        if cursor_attr == "_prefill_multimodal_lora_cursor":
-            base_limit = self.max_prefill_multimodal_lora_requests_per_batch
-        elif cursor_attr == "_decode_multimodal_lora_cursor":
-            base_limit = self.max_decode_multimodal_lora_requests_per_batch
-        else:
-            base_limit = max_multimodal_lora_requests
-        relaxed = (
-            max_multimodal_lora_requests > 0
-            and max_multimodal_lora_requests > base_limit
-        )
-        tightened = (
-            max_multimodal_lora_requests > 0
-            and base_limit > 0
-            and max_multimodal_lora_requests < base_limit
-        )
-        (
-            effective_limit,
-            relaxed_by_fairness,
-            tightened_by_locality,
-            max_fairness_gap,
-        ) = (
-            self._effective_prefill_multimodal_lora_limit(
-                scheduler=scheduler,
-                candidate_request_ids=candidate_request_ids or request_ids,
-                current_request_ids=request_ids,
-            )
-            if cursor_attr == "_prefill_multimodal_lora_cursor"
-            else self._effective_decode_multimodal_lora_limit(
-                scheduler=scheduler,
-                candidate_request_ids=candidate_request_ids or request_ids,
-                current_request_ids=request_ids,
-            )
-            if cursor_attr == "_decode_multimodal_lora_cursor"
-            else (max_multimodal_lora_requests, False, False, 0.0)
-        )
-        if cursor_attr in {
-            "_prefill_multimodal_lora_cursor",
-            "_decode_multimodal_lora_cursor",
-        }:
-            max_multimodal_lora_requests = effective_limit
-            relaxed = max_multimodal_lora_requests > base_limit
-            tightened = (
-                max_multimodal_lora_requests > 0
-                and base_limit > 0
-                and max_multimodal_lora_requests < base_limit
-            )
-        if max_multimodal_lora_requests <= 0 or len(request_ids) <= 1:
-            return (
-                request_ids,
-                max(0, int(max_multimodal_lora_requests)),
-                False,
-                relaxed,
-                tightened,
-                relaxed_by_fairness,
-                tightened_by_locality,
-                max_fairness_gap,
-            )
-        multimodal_lora_ids = [
-            rid
-            for rid in request_ids
-            if self._is_multimodal_lora_request(scheduler, rid)
-        ]
-        if len(multimodal_lora_ids) <= max_multimodal_lora_requests:
-            return (
-                request_ids,
-                max_multimodal_lora_requests,
-                False,
-                relaxed,
-                tightened,
-                relaxed_by_fairness,
-                tightened_by_locality,
-                max_fairness_gap,
-            )
-        cursor = getattr(self, cursor_attr) % max(1, len(multimodal_lora_ids))
-        allowed_multimodal_lora = set(
-            self._rotate_candidates(multimodal_lora_ids, cursor)[
-                :max_multimodal_lora_requests
-            ]
-        )
-        setattr(
-            self,
-            cursor_attr,
-            (getattr(self, cursor_attr) + 1) % max(1, len(multimodal_lora_ids)),
-        )
-        shaped = [
-            rid
-            for rid in request_ids
-            if (not self._is_multimodal_lora_request(scheduler, rid))
-            or rid in allowed_multimodal_lora
-        ]
-        return (
-            shaped or request_ids[:1],
-            max_multimodal_lora_requests,
-            True,
-            relaxed,
-            tightened,
-            relaxed_by_fairness,
-            tightened_by_locality,
-            max_fairness_gap,
+        return self._multimodal_lora_constraint.apply_multimodal_lora_request_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            max_multimodal_lora_requests=max_multimodal_lora_requests,
+            cursor_attr=cursor_attr,
+            candidate_request_ids=candidate_request_ids,
         )
 
     def _count_multimodal_lora_adapters(
@@ -1330,13 +1085,9 @@ class StepScheduler:
         scheduler,
         request_ids: list[str],
     ) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for rid in request_ids:
-            if not self._is_multimodal_lora_request(scheduler, rid):
-                continue
-            adapter_key = self._lora_adapter_key(scheduler.get_request(rid))
-            counts[adapter_key] = counts.get(adapter_key, 0) + 1
-        return counts
+        return self._multimodal_lora_constraint.count_multimodal_lora_adapters(
+            scheduler, request_ids
+        )
 
     def _shape_lora_batch(
         self,
@@ -1347,63 +1098,21 @@ class StepScheduler:
         max_lora_adapters: int,
         cursor_attr: str,
     ) -> tuple[list[str], int, dict[str, float], bool, bool]:
-        if not request_ids:
-            return [], max_lora_adapters, {}, False, False
-        baseline_share = self._normalized_share_map(baseline_counts)
-        pre_limit_gap = self._share_gap_map(
-            self._normalized_share_map(
-                self._count_lora_adapters(scheduler, request_ids)
-            ),
-            baseline_share,
+        return self._lora_constraint.shape_lora_batch(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            baseline_counts=baseline_counts,
+            max_lora_adapters=max_lora_adapters,
+            cursor_attr=cursor_attr,
         )
-        effective_limit = max_lora_adapters
-        relaxed = False
-        tightened = False
-        if effective_limit > 0:
-            adapter_count = len(self._lora_adapters_for_ids(scheduler, request_ids))
-            max_gap = self._max_abs_share_gap(pre_limit_gap)
-            if (
-                self.lora_fairness_relax_threshold > 0
-                and max_gap >= self.lora_fairness_relax_threshold
-            ):
-                effective_limit = min(
-                    adapter_count,
-                    effective_limit + self.lora_limit_relax_delta,
-                )
-                relaxed = effective_limit > max_lora_adapters
-            elif (
-                self.lora_locality_tighten_threshold > 0
-                and max_gap <= self.lora_locality_tighten_threshold
-                and effective_limit > 1
-            ):
-                effective_limit = max(
-                    1,
-                    effective_limit - self.lora_limit_tighten_delta,
-                )
-                tightened = effective_limit < max_lora_adapters
-            request_ids = self._apply_lora_adapter_batch_limit(
-                scheduler=scheduler,
-                request_ids=request_ids,
-                max_lora_adapters=effective_limit,
-                cursor_attr=cursor_attr,
-            )
-        fairness_gap = self._share_gap_map(
-            self._normalized_share_map(
-                self._count_lora_adapters(scheduler, request_ids)
-            ),
-            baseline_share,
-        )
-        return request_ids, effective_limit, fairness_gap, relaxed, tightened
 
     def _lora_adapters_for_ids(
         self,
         scheduler,
         request_ids: list[str],
     ) -> list[str]:
-        adapters = {
-            self._lora_adapter_key(scheduler.get_request(rid)) for rid in request_ids
-        }
-        return sorted(adapters)
+        return self._lora_constraint.lora_adapters_for_ids(scheduler, request_ids)
 
     def _select_weighted_requests(
         self,
@@ -1416,96 +1125,16 @@ class StepScheduler:
         intra_class_rotate: bool = False,
         quotas: dict[str, int] | None = None,
     ) -> list[str]:
-        if limit <= 0 or not request_ids:
-            return []
-        groups: dict[str, list[str]] = {}
-        request_meta: dict[str, tuple[str, int, float]] = {}
-        for rid in request_ids:
-            request = scheduler.get_request(rid)
-            service_class = str(request.get("service_class") or "latency")
-            request_meta[rid] = (
-                service_class,
-                len(request.get("input_ids", [])),
-                float(request.get("queued_at") or 0.0),
-            )
-            groups.setdefault(service_class, []).append(rid)
-        for service_class, grouped_ids in groups.items():
-            groups[service_class] = sorted(
-                grouped_ids,
-                key=lambda rid: (
-                    request_meta[rid][1] if prefer_short_prompts else 0,
-                    -request_meta[rid][2],
-                    rid,
-                ),
-            )
-        service_classes = sorted(
-            groups,
-            key=lambda service_class: (
-                self._service_class_priority(service_class),
-                service_class,
-            ),
+        return self._service_class_selector.select_weighted_requests(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            limit=limit,
+            cursor_attr=cursor_attr,
+            prefer_short_prompts=prefer_short_prompts,
+            intra_class_rotate=intra_class_rotate,
+            quotas=quotas,
         )
-        if not service_classes:
-            return []
-        selected: list[str] = []
-        cursor = getattr(self, cursor_attr) % len(service_classes)
-        rotated_classes = self._rotate_candidates(service_classes, cursor)
-        requested_quotas = self._normalize_quotas(quotas or {})
-        for service_class in rotated_classes:
-            if len(selected) >= limit:
-                break
-            candidates = groups.get(service_class, [])
-            if not candidates:
-                continue
-            quota = requested_quotas.get(service_class, 0)
-            if quota <= 0:
-                continue
-            picked = self._take_candidates(
-                candidates=candidates,
-                take=min(quota, limit - len(selected), len(candidates)),
-                intra_class_rotate=intra_class_rotate,
-            )
-            if not picked:
-                continue
-            selected.extend(picked)
-            picked_set = set(picked)
-            groups[service_class] = [
-                rid for rid in groups[service_class] if rid not in picked_set
-            ]
-        while len(selected) < limit:
-            progressed = False
-            for service_class in rotated_classes:
-                candidates = groups.get(service_class, [])
-                if not candidates:
-                    continue
-                quota = self.service_class_weights.get(service_class, 1)
-                if quota <= 0:
-                    continue
-                picked = self._take_candidates(
-                    candidates=candidates,
-                    take=min(quota, limit - len(selected), len(candidates)),
-                    intra_class_rotate=intra_class_rotate,
-                )
-                if not picked:
-                    continue
-                selected.extend(picked)
-                picked_set = set(picked)
-                groups[service_class] = [
-                    rid for rid in groups[service_class] if rid not in picked_set
-                ]
-                progressed = True
-                if len(selected) >= limit:
-                    break
-            if not progressed:
-                break
-            cursor = (cursor + 1) % len(service_classes)
-            rotated_classes = self._rotate_candidates(service_classes, cursor)
-        setattr(
-            self,
-            cursor_attr,
-            (getattr(self, cursor_attr) + 1) % max(1, len(service_classes)),
-        )
-        return selected
 
     def _take_candidates(
         self,
@@ -1514,20 +1143,12 @@ class StepScheduler:
         take: int,
         intra_class_rotate: bool,
     ) -> list[str]:
-        if take <= 0 or not candidates:
-            return []
-        selected_candidates = candidates
-        if intra_class_rotate and len(candidates) > 1:
-            selected_candidates = self._rotate_candidates(
-                candidates,
-                self._decode_rr_cursor,
-            )
-        picked = selected_candidates[:take]
-        if intra_class_rotate and picked:
-            self._decode_rr_cursor = (self._decode_rr_cursor + len(picked)) % max(
-                1, len(candidates)
-            )
-        return picked
+        return self._service_class_selector._take_candidates(
+            step_scheduler=self,
+            candidates=candidates,
+            take=take,
+            intra_class_rotate=intra_class_rotate,
+        )
 
     def _compute_queued_metrics(
         self,
@@ -1643,38 +1264,30 @@ class StepScheduler:
             counts[service_class] = counts.get(service_class, 0) + 1
         return counts
 
-    @staticmethod
     def _count_multimodal_requests(
+        self,
         scheduler,
         request_ids: list[str],
     ) -> int:
-        return sum(
-            1
-            for rid in request_ids
-            if StepScheduler._is_multimodal(scheduler.get_request(rid))
+        return self._multimodal_constraint.count_multimodal_requests(
+            scheduler, request_ids
         )
 
-    @staticmethod
     def _count_multimodal_lora_requests(
+        self,
         scheduler,
         request_ids: list[str],
     ) -> int:
-        return sum(
-            1
-            for rid in request_ids
-            if StepScheduler._is_multimodal_lora(scheduler.get_request(rid))
+        return self._multimodal_lora_constraint.count_multimodal_lora_requests(
+            scheduler, request_ids
         )
 
-    @staticmethod
     def _count_lora_adapters(
+        self,
         scheduler,
         request_ids: list[str],
     ) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for rid in request_ids:
-            adapter = StepScheduler._lora_adapter_key(scheduler.get_request(rid))
-            counts[adapter] = counts.get(adapter, 0) + 1
-        return counts
+        return self._lora_constraint.count_lora_adapters(scheduler, request_ids)
 
     @staticmethod
     def _is_multimodal(request) -> bool:

@@ -17,8 +17,6 @@ class InputBatchBuilder:
         inf_config: Any,
         stack_per_layer_carries: Any,
         split_per_layer_carries: Any,
-        sig_caches: list[torch.Tensor] | None = None,
-        sig_temp_buffers: list[torch.Tensor] | None = None,
     ) -> None:
         self.device = device
         self.max_model_len = max_model_len
@@ -27,8 +25,6 @@ class InputBatchBuilder:
         self.inf_config = inf_config
         self._stack_per_layer_carries = stack_per_layer_carries
         self._split_per_layer_carries = split_per_layer_carries
-        self.sig_caches = sig_caches or []
-        self.sig_temp_buffers = sig_temp_buffers or []
 
     def build_prefill(
         self,
@@ -133,8 +129,6 @@ class InputBatchBuilder:
             "k_scale": self.inf_config.k_scale,
             "v_scale": self.inf_config.v_scale,
             "config": self.inf_config,
-            "sig_cache": self.sig_caches,
-            "sig_temp": self.sig_temp_buffers,
             "lora_mapping": lora_mapping,
             "lora_adapter_count": self._lora_adapter_count(lora_mapping),
             "mixed_lora_batch": self._is_mixed_lora_batch(lora_mapping),

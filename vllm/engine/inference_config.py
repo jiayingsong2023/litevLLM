@@ -35,9 +35,7 @@ class LiteInferenceConfig:
 
     # KV Block Selective Attention (decode memory-bandwidth optimization)
     kv_select_ratio: float = 0.0
-    kv_select_sig_dim: int = 32
     kv_select_min_blocks: int = 4
-    kv_select_min_context: int = 256
 
     # Chunked Prefill and SLA Configuration
     min_prefill_chunk_size: int = 128

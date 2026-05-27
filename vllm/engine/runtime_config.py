@@ -70,9 +70,7 @@ class RuntimeConfig:
     gemma4_c1_preset: bool = False
     tuning_env: dict[str, str] | None = None
     kv_select_ratio: float = 0.0
-    kv_select_sig_dim: int = 32
     kv_select_min_blocks: int = 4
-    kv_select_min_context: int = 256
     scheduler_policy: SchedulerRuntimePolicy = field(
         default_factory=SchedulerRuntimePolicy
     )
