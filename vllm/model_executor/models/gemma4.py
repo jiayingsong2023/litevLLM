@@ -5,6 +5,7 @@ import atexit
 import json
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -32,26 +33,72 @@ _GEMMA4_TUNING: dict[str, str] = {}
 _GEMMA4_TUNING_LOCKED = False
 
 
+@dataclass
+class Gemma4LayerConfig:
+    """Per-instance tuning/profile configuration for Gemma4 layers.
+
+    Replaces the module-level globals ``_GEMMA4_TUNING``,
+    ``_GEMMA4_PROFILE_ENABLED``, ``_GEMMA4_ROCTX_PROFILE_ENABLED``,
+    ``_GEMMA4_PROFILE_STATS``, ``_GEMMA4_PROFILE_PRINTED``, and
+    ``_GEMMA4_ROPE_CACHE_POOL``.
+
+    Instance lifetime is tied to the owning ``Gemma4DecoderLayer``.
+    """
+
+    profile_enabled: bool = False
+    roctx_profile_enabled: bool = False
+    profile_stats: dict[str, dict[str, float]] = field(default_factory=dict)
+    profile_printed: bool = False
+    tuning: dict[str, str] = field(default_factory=dict)
+    tuning_locked: bool = False
+
+
 def set_gemma4_tuning_config(
     values: dict[str, object] | None, *, locked: bool = False
-) -> None:
-    """Install Gemma4 tuning flags before model construction."""
-    global _GEMMA4_TUNING
-    global _GEMMA4_TUNING_LOCKED
-    global _GEMMA4_PROFILE_ENABLED
-    global _GEMMA4_ROCTX_PROFILE_ENABLED
-    _GEMMA4_TUNING = {
+) -> Gemma4LayerConfig:
+    """Build a Gemma4LayerConfig from tuning overrides.
+
+    Returns a new ``Gemma4LayerConfig`` instance -- no module-level side effects.
+    The returned config can be installed on a ``Gemma4DecoderLayer`` via
+    ``layer.set_config(config)``.
+
+    For backward compatibility, callers that need the old module-level mutation
+    can use ``_apply_global_tuning_config(config)``.
+    """
+    tuning = {
         str(key): str(value)
         for key, value in (values or {}).items()
         if str(key) in _GEMMA4_ALLOWED_TUNING_ENV and value is not None
     }
-    _GEMMA4_TUNING_LOCKED = bool(locked)
-    _GEMMA4_PROFILE_ENABLED = _truthy_string(
-        _GEMMA4_TUNING.get("FASTINFERENCE_GEMMA4_LAYER_PROFILE")
+    profile_enabled = _truthy_string(
+        tuning.get("FASTINFERENCE_GEMMA4_LAYER_PROFILE")
     )
-    _GEMMA4_ROCTX_PROFILE_ENABLED = _truthy_string(
-        _GEMMA4_TUNING.get("FASTINFERENCE_GEMMA4_ROCTX_PROFILE")
+    roctx_enabled = _truthy_string(
+        tuning.get("FASTINFERENCE_GEMMA4_ROCTX_PROFILE")
     )
+
+    return Gemma4LayerConfig(
+        tuning=tuning,
+        tuning_locked=bool(locked),
+        profile_enabled=profile_enabled,
+        roctx_profile_enabled=roctx_enabled,
+    )
+
+
+# Backward-compat shim: keep module-level mutation for callers
+# that don't yet use the instance config path.
+def _apply_global_tuning_config(config: Gemma4LayerConfig) -> None:
+    """Apply a Gemma4LayerConfig to the legacy module-level globals.
+
+    Deprecated: new code should pass the config to Gemma4DecoderLayer
+    via ``set_config()``.
+    """
+    global _GEMMA4_TUNING, _GEMMA4_TUNING_LOCKED
+    global _GEMMA4_PROFILE_ENABLED, _GEMMA4_ROCTX_PROFILE_ENABLED
+    _GEMMA4_TUNING = dict(config.tuning)
+    _GEMMA4_TUNING_LOCKED = config.tuning_locked
+    _GEMMA4_PROFILE_ENABLED = config.profile_enabled
+    _GEMMA4_ROCTX_PROFILE_ENABLED = config.roctx_profile_enabled
 
 
 def _truthy_string(raw: object) -> bool:
@@ -126,28 +173,36 @@ def _gemma4_profile_record(scope: str, elapsed_s: float) -> None:
 
 
 class _Gemma4ProfileSpan:
-    def __init__(self, scope: str):
+    def __init__(self, scope: str, layer_config: Gemma4LayerConfig | None = None):
         self.scope = scope
+        self._layer_config = layer_config or Gemma4LayerConfig()
         self._start = 0.0
 
     def __enter__(self) -> "_Gemma4ProfileSpan":
-        if _GEMMA4_ROCTX_PROFILE_ENABLED:
+        if self._layer_config.roctx_profile_enabled:
             _gemma4_range_push(self.scope)
-        if _GEMMA4_PROFILE_ENABLED:
+        if self._layer_config.profile_enabled:
             _gemma4_profile_sync()
             self._start = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if _GEMMA4_PROFILE_ENABLED:
+        if self._layer_config.profile_enabled:
             _gemma4_profile_sync()
-            _gemma4_profile_record(self.scope, time.perf_counter() - self._start)
-        if _GEMMA4_ROCTX_PROFILE_ENABLED:
+            elapsed = time.perf_counter() - self._start
+            bucket = self._layer_config.profile_stats.setdefault(
+                self.scope, {"time_s": 0.0, "count": 0.0}
+            )
+            bucket["time_s"] += float(elapsed)
+            bucket["count"] += 1.0
+        if self._layer_config.roctx_profile_enabled:
             _gemma4_range_pop()
 
 
-def _gemma4_profile_span(scope: str) -> _Gemma4ProfileSpan:
-    return _Gemma4ProfileSpan(scope)
+def _gemma4_profile_span(
+    scope: str, layer_config: Gemma4LayerConfig | None = None
+) -> _Gemma4ProfileSpan:
+    return _Gemma4ProfileSpan(scope, layer_config)
 
 
 def _dump_gemma4_profile() -> None:
@@ -1074,6 +1129,7 @@ class Gemma4Attention(nn.Module):
         self.rotary_emb = _get_rope_with_runtime(
             config, self.head_dim, self.layer_type, runtime_config=runtime_config
         )
+        self._layer_config = Gemma4LayerConfig()
 
     @staticmethod
     def _apply_head_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -1097,12 +1153,12 @@ class Gemma4Attention(nn.Module):
         attn_metadata: Any,
         lora_mapping: Any = None,
     ) -> torch.Tensor:
-        with _gemma4_profile_span("attn_q_proj"):
+        with _gemma4_profile_span("attn_q_proj", self._layer_config):
             q = self.q_proj(x, lora_mapping)
-        with _gemma4_profile_span("attn_k_proj"):
+        with _gemma4_profile_span("attn_k_proj", self._layer_config):
             k = self.k_proj(x, lora_mapping)
         if self.v_proj is not None:
-            with _gemma4_profile_span("attn_v_proj"):
+            with _gemma4_profile_span("attn_v_proj", self._layer_config):
                 v = self.v_proj(x, lora_mapping)
         else:
             v = k
@@ -1162,7 +1218,7 @@ class Gemma4Attention(nn.Module):
                 and _should_use_full_decode_reference(inf_config, str(kv_cache_dtype))
                 and (not _is_packed_or_quantized_kv_cache(str(kv_cache_dtype)))
             ):
-                with _gemma4_profile_span("kv_write_full_precision"):
+                with _gemma4_profile_span("kv_write_full_precision", self._layer_config):
                     _write_full_precision_kv_cache(
                         k,
                         v,
@@ -1173,7 +1229,7 @@ class Gemma4Attention(nn.Module):
                         self.head_dim,
                     )
             else:
-                with _gemma4_profile_span("kv_write_reshape_and_cache"):
+                with _gemma4_profile_span("kv_write_reshape_and_cache", self._layer_config):
                     reshape_and_cache(
                         k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
                         v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
@@ -1189,7 +1245,7 @@ class Gemma4Attention(nn.Module):
 
             is_prefill = bool(_meta_get(attn_metadata, "is_prefill", False))
             if is_local and is_prefill and seqlen > 1:
-                with _gemma4_profile_span("attn_local_prefill"):
+                with _gemma4_profile_span("attn_local_prefill", self._layer_config):
                     block_tables = _meta_get(attn_metadata, "block_tables", None)
                     seq_lens = _meta_get(attn_metadata, "seq_lens", None)
                     kv_start_t = _meta_get(attn_metadata, "kv_start_indices", None)
@@ -1207,7 +1263,7 @@ class Gemma4Attention(nn.Module):
                             None, :
                         ]
                     )
-                    with _gemma4_profile_span("kv_read_local_prefill"):
+                    with _gemma4_profile_span("kv_read_local_prefill", self._layer_config):
                         k_ctx, v_ctx, k_positions, k_valid = _gather_recent_kv_batched(
                             kv_cache=kv_cache,
                             block_tables=block_tables,
@@ -1253,7 +1309,7 @@ class Gemma4Attention(nn.Module):
                             .view(bsz, seqlen, -1)
                         )
             elif is_local and not is_prefill:
-                with _gemma4_profile_span("attn_local_decode"):
+                with _gemma4_profile_span("attn_local_decode", self._layer_config):
                     block_tables = _meta_get(attn_metadata, "block_tables", None)
                     seq_lens = _meta_get(attn_metadata, "seq_lens", None)
                     kv_dtype_name = (
@@ -1284,7 +1340,7 @@ class Gemma4Attention(nn.Module):
                             device=q.device,
                             dtype=q.dtype,
                         )
-                        with _gemma4_profile_span("kv_read_local_decode"):
+                        with _gemma4_profile_span("kv_read_local_decode", self._layer_config):
                             seq_lens_local, block_tables_local = (
                                 _get_or_build_local_decode_aligned_metadata(
                                     attn_metadata=attn_metadata,
@@ -1335,7 +1391,7 @@ class Gemma4Attention(nn.Module):
                                 if int(seq_lens_local.numel()) > 0
                                 else 0
                             )
-                        with _gemma4_profile_span("attn_local_decode_kernel"):
+                        with _gemma4_profile_span("attn_local_decode_kernel", self._layer_config):
                             paged_attention_v1(
                                 attn_out,
                                 q.reshape(
@@ -1371,7 +1427,7 @@ class Gemma4Attention(nn.Module):
                             )
                         out = attn_out.view(bsz, seqlen, -1)
                     else:
-                        with _gemma4_profile_span("kv_read_local_decode"):
+                        with _gemma4_profile_span("kv_read_local_decode", self._layer_config):
                             k_ctx, v_ctx, k_positions, k_valid = (
                                 _gather_recent_kv_batched(
                                     kv_cache=kv_cache,
@@ -1411,7 +1467,7 @@ class Gemma4Attention(nn.Module):
                             .view(bsz, seqlen, -1)
                         )
             else:
-                with _gemma4_profile_span("attn_global"):
+                with _gemma4_profile_span("attn_global", self._layer_config):
                     from vllm.engine.lite_engine import (
                         expand_metadata_for_paged_attention,
                     )
@@ -1435,7 +1491,7 @@ class Gemma4Attention(nn.Module):
                         outs = []
                         _global_seq_lens_cpu = _meta_cpu_seq_lens(attn_metadata)
                         for bi in range(bsz):
-                            with _gemma4_profile_span("kv_read_global_ref"):
+                            with _gemma4_profile_span("kv_read_global_ref", self._layer_config):
                                 _slc_hint = None
                                 if _global_seq_lens_cpu is not None and bi < len(
                                     _global_seq_lens_cpu
@@ -1486,7 +1542,7 @@ class Gemma4Attention(nn.Module):
                             getattr(self.config, "max_position_embeddings", 4096),
                         )
                     )
-                    with _gemma4_profile_span("attn_global_kernel"):
+                    with _gemma4_profile_span("attn_global_kernel", self._layer_config):
                         _kv_sel_ratio = float(
                             getattr(inf_config, "kv_select_ratio", 0.0)
                             if inf_config is not None
@@ -1530,7 +1586,7 @@ class Gemma4Attention(nn.Module):
                         )
                     out = attn_out.view(bsz, seqlen, -1)
         else:
-            with _gemma4_profile_span("attn_nocache"):
+            with _gemma4_profile_span("attn_nocache", self._layer_config):
                 out = _causal_attention_ref(
                     q.transpose(1, 2),
                     k.transpose(1, 2),
@@ -1539,7 +1595,7 @@ class Gemma4Attention(nn.Module):
                     local_window=local_window,
                     softcap=softcap,
                 ).view(bsz, seqlen, -1)
-        with _gemma4_profile_span("attn_o_proj"):
+        with _gemma4_profile_span("attn_o_proj", self._layer_config):
             return self.o_proj(out, lora_mapping)
 
 
@@ -1571,6 +1627,7 @@ class Gemma4MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.down_proj",
         )
+        self._layer_config = Gemma4LayerConfig()
 
     def _apply_activation(self, gate: torch.Tensor) -> torch.Tensor:
         # Keep activation dispatch isolated so the fused and unfused branches
@@ -1931,6 +1988,7 @@ class Gemma4MoeExpertsLite(nn.Module):
                 getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False),
             )
         )
+        self._layer_config = Gemma4LayerConfig()
 
     def _apply_gate_activation(self, gate: torch.Tensor) -> torch.Tensor:
         if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
@@ -1959,7 +2017,7 @@ class Gemma4MoeExpertsLite(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with _gemma4_profile_span("moe_materialize_one_expert_awq"):
+        with _gemma4_profile_span("moe_materialize_one_expert_awq", self._layer_config):
             return self._materialize_one_expert_awq_impl(expert_id, device, dtype)
 
     def _materialize_one_expert_awq_impl(
@@ -2049,7 +2107,7 @@ class Gemma4MoeExpertsLite(nn.Module):
             ids = expert_ids[
                 offset : offset + _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS
             ].to(device=qweight_gu.device, dtype=torch.long)
-            with _gemma4_profile_span("moe_materialize_expert_batch_awq"):
+            with _gemma4_profile_span("moe_materialize_expert_batch_awq", self._layer_config):
                 qweight_gu_batch = qweight_gu.index_select(0, ids).to(
                     device=device,
                     dtype=torch.int32,
@@ -2159,7 +2217,7 @@ class Gemma4MoeExpertsLite(nn.Module):
                 else gemma4_moe_int4_decode
             )
 
-            with _gemma4_profile_span("moe_int4_decode_attempt"):
+            with _gemma4_profile_span("moe_int4_decode_attempt", self._layer_config):
                 fast_out, used_fast, fast_reason = decode_kernel(
                     hidden_states_2d,
                     topk_weights,
@@ -2172,14 +2230,20 @@ class Gemma4MoeExpertsLite(nn.Module):
                     activation=self.hidden_act,
                 )
             if used_fast:
-                if _GEMMA4_PROFILE_ENABLED:
-                    _gemma4_profile_record("moe_int4_decode_used", 0.0)
+                if self._layer_config.profile_enabled:
+                    bucket = self._layer_config.profile_stats.setdefault(
+                        "moe_int4_decode_used", {"time_s": 0.0, "count": 0.0}
+                    )
+                    bucket["time_s"] += 0.0
+                    bucket["count"] += 1.0
                 return fast_out.to(hidden_states_2d.dtype)
-            if _GEMMA4_PROFILE_ENABLED:
-                _gemma4_profile_record(
+            if self._layer_config.profile_enabled:
+                bucket = self._layer_config.profile_stats.setdefault(
                     f"moe_int4_decode_fallback:{fast_reason}",
-                    0.0,
+                    {"time_s": 0.0, "count": 0.0},
                 )
+                bucket["time_s"] += 0.0
+                bucket["count"] += 1.0
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
         flat_topk_ids = topk_ids.reshape(-1).to(torch.long)
         flat_topk_weights = topk_weights.reshape(-1)
@@ -2225,12 +2289,12 @@ class Gemma4MoeExpertsLite(nn.Module):
                     hidden_states_2d.device,
                     compute_dtype,
                 )
-            with _gemma4_profile_span("moe_sparse_expert_linear"):
-                with _gemma4_profile_span("moe_sparse_expert_gate_up"):
+            with _gemma4_profile_span("moe_sparse_expert_linear", self._layer_config):
+                with _gemma4_profile_span("moe_sparse_expert_gate_up", self._layer_config):
                     gu = F.linear(x_sel, w1e)
                 g, u = torch.chunk(gu, 2, dim=-1)
                 h = self._apply_gate_activation(g) * u
-                with _gemma4_profile_span("moe_sparse_expert_down_reduce"):
+                with _gemma4_profile_span("moe_sparse_expert_down_reduce", self._layer_config):
                     y = F.linear(h, w2e) * coeff
             out.index_add_(0, token_idx, y)
         return out.to(hidden_states_2d.dtype)
@@ -2257,7 +2321,7 @@ class Gemma4MoeExpertsLite(nn.Module):
             else gemma4_moe_int4_prefill_grouped
         )
 
-        with _gemma4_profile_span("moe_awq_grouped_prefill"):
+        with _gemma4_profile_span("moe_awq_grouped_prefill", self._layer_config):
             out, used, _ = prefill_kernel(
                 hidden_states_2d,
                 topk_weights,
@@ -2422,6 +2486,7 @@ class Gemma4SparseMoeBlock(nn.Module):
             config, quant_config, prefix, runtime_config=runtime_config
         )
         self.shared_mlp = Gemma4MLP(config, quant_config, prefix)
+        self._layer_config = Gemma4LayerConfig()
 
     def forward_branches(
         self,
@@ -2526,6 +2591,14 @@ class Gemma4DecoderLayer(nn.Module):
             )
         else:
             self.mlp = Gemma4MLP(config, quant_config, prefix)
+        self._layer_config = Gemma4LayerConfig()
+
+    def set_config(self, config: Gemma4LayerConfig) -> None:
+        """Install per-instance tuning/profile configuration."""
+        self._layer_config = config
+        # Propagate to sub-layers
+        self.self_attn._layer_config = config
+        self.mlp._layer_config = config
 
     def forward(
         self,
@@ -2538,7 +2611,7 @@ class Gemma4DecoderLayer(nn.Module):
         inf_config = _meta_get(attn_metadata, "config", None)
         residual = x
         h = self.input_layernorm(x)
-        with _gemma4_profile_span("layer_self_attn"):
+        with _gemma4_profile_span("layer_self_attn", self._layer_config):
             h = self.self_attn(h, positions, kv_cache, attn_metadata, lora_mapping)
         h = self.post_attention_layernorm(h)
         guard_hit = (
@@ -2559,7 +2632,7 @@ class Gemma4DecoderLayer(nn.Module):
             # - dense MLP branch consumes pre_feedforward_layernorm(residual)
             # - router consumes raw residual (before pre-FF norms)
             # - sparse experts consume pre_feedforward_layernorm_2(residual)
-            with _gemma4_profile_span("layer_dense_mlp"):
+            with _gemma4_profile_span("layer_dense_mlp", self._layer_config):
                 dense_out = self.mlp.shared_mlp(
                     h_dense, lora_mapping=lora_mapping, inf_config=inf_config
                 )
@@ -2567,7 +2640,7 @@ class Gemma4DecoderLayer(nn.Module):
                 dense_out = self.post_feedforward_layernorm_1(dense_out)
 
             router_in_2d, router_shape = _reshape_hidden_to_2d(residual)
-            with _gemma4_profile_span("layer_moe_router"):
+            with _gemma4_profile_span("layer_moe_router", self._layer_config):
                 router_logits, routing_weights, selected_experts = self.mlp.router(
                     router_in_2d
                 )
@@ -2576,7 +2649,7 @@ class Gemma4DecoderLayer(nn.Module):
             else:
                 sparse_in = residual
             sparse_in_2d, _ = _reshape_hidden_to_2d(sparse_in)
-            with _gemma4_profile_span("layer_moe_sparse_experts"):
+            with _gemma4_profile_span("layer_moe_sparse_experts", self._layer_config):
                 sparse_out_2d = self.mlp.experts(
                     sparse_in_2d,
                     router_logits,
@@ -2588,7 +2661,7 @@ class Gemma4DecoderLayer(nn.Module):
                 sparse_out = self.post_feedforward_layernorm_2(sparse_out)
             h = dense_out + sparse_out
         else:
-            with _gemma4_profile_span("layer_dense_mlp"):
+            with _gemma4_profile_span("layer_dense_mlp", self._layer_config):
                 h = self.mlp(h_dense, lora_mapping, inf_config=inf_config)
         h = self.post_feedforward_layernorm(h)
         if guard_hit:
