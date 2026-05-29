@@ -2,13 +2,20 @@
 from typing import Any
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
+from .policy_keys import (
+    QWEN35_FLA_CHUNK_ENABLED,
+    QWEN35_FULLATTN_STABILIZER,
+    QWEN35_FULLATTN_USE_SDPA_PREFILL,
+    QWEN35_LINEAR_INPUT_CAP,
+    QWEN35_RESIDUAL_STABILIZER,
+)
 
 QWEN35_PRODUCTION_MODEL_POLICY: dict[str, object] = {
-    "fullattn_stabilizer": True,
-    "fullattn_use_sdpa_prefill": True,
-    "residual_stabilizer": True,
-    "linear_input_cap": True,
-    "fla_chunk_enabled": True,
+    QWEN35_FULLATTN_STABILIZER: True,
+    QWEN35_FULLATTN_USE_SDPA_PREFILL: True,
+    QWEN35_RESIDUAL_STABILIZER: True,
+    QWEN35_LINEAR_INPUT_CAP: True,
+    QWEN35_FLA_CHUNK_ENABLED: True,
 }
 
 
@@ -31,9 +38,9 @@ class Qwen35Adapter(ModelAdapter):
         if str(getattr(profile, "effective_name", "")).lower() == "accuracy":
             model_policy.update(
                 {
-                    "fullattn_stabilizer": False,
-                    "residual_stabilizer": False,
-                    "linear_input_cap": False,
+                    QWEN35_FULLATTN_STABILIZER: False,
+                    QWEN35_RESIDUAL_STABILIZER: False,
+                    QWEN35_LINEAR_INPUT_CAP: False,
                 }
             )
         return RuntimeModelPolicy(
