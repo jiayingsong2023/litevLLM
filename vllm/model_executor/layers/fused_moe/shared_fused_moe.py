@@ -3,10 +3,14 @@
 
 import torch
 
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+try:
+    from vllm.distributed import (
+        get_tensor_model_parallel_world_size,
+        tensor_model_parallel_all_reduce,
+    )
+except ImportError:
+    def get_tensor_model_parallel_world_size(): return 1
+    def tensor_model_parallel_all_reduce(x): return x
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
 # TODO(bnell): Add shared + fused combo function? e.g. +

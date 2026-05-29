@@ -8,12 +8,18 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from vllm.distributed import (
-    divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+try:
+    from vllm.distributed import (
+        divide,
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        tensor_model_parallel_all_reduce,
+    )
+except ImportError:
+    def divide(a, b): return a // b
+    def get_tensor_model_parallel_rank(): return 0
+    def get_tensor_model_parallel_world_size(): return 1
+    def tensor_model_parallel_all_reduce(x): return x
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,

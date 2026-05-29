@@ -14,16 +14,23 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
-from vllm.distributed import (
-    get_dp_group,
-    get_ep_group,
-    get_pcp_group,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+try:
+    from vllm.distributed import (
+        get_dp_group,
+        get_ep_group,
+        get_pcp_group,
+        get_tensor_model_parallel_world_size,
+        tensor_model_parallel_all_reduce,
+    )
+except ImportError:
+    def get_dp_group(): return None
+    def get_ep_group(): return None
+    def get_pcp_group(): return None
+    def get_tensor_model_parallel_world_size(): return 1
+    def tensor_model_parallel_all_reduce(x): return x
 try:
     from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
-except ModuleNotFoundError:
+except ImportError:
     class EplbLayerState:  # type: ignore[no-redef]
 
         @staticmethod

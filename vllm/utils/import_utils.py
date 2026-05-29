@@ -18,8 +18,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 def import_pynvml():
-    import vllm.third_party.pynvml as pynvml
-
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("pynvml unavailable in this build")
+        return None
     return pynvml
 
 @cache
@@ -31,14 +34,6 @@ def import_triton_kernels():
             f"Loading module triton_kernels from {triton_kernels.__file__}.",
             scope="local",
         )
-    elif _has_module("vllm.third_party.triton_kernels"):
-        import vllm.third_party.triton_kernels as triton_kernels
-
-        logger.debug_once(
-            f"Loading module triton_kernels from {triton_kernels.__file__}.",
-            scope="local",
-        )
-        sys.modules["triton_kernels"] = triton_kernels
     else:
         logger.info_once(
             "triton_kernels unavailable in this build. "
@@ -317,9 +312,7 @@ def has_pplx() -> bool:
     return _has_module("deep_ep")
 
 def has_deep_gemm() -> bool:
-    is_available = _has_module("triton_kernels") or _has_module(
-        "vllm.third_party.triton_kernels"
-    )
+    is_available = _has_module("triton_kernels")
     if is_available:
         import_triton_kernels()
     return is_available

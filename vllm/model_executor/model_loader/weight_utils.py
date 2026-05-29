@@ -676,7 +676,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
             )
             tp_rank = get_tensor_model_parallel_rank()
             tp_world = get_tensor_model_parallel_world_size()
-        except Exception:
+        except ImportError:
             tp_rank = 0
             tp_world = 1
 
