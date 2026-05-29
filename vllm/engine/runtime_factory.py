@@ -104,6 +104,38 @@ class LiteRuntimeFactory:
             fast_seq_lens=context.fast_seq_lens,
             fast_block_tables=context.fast_block_tables,
         )
+        from vllm.engine.step_scheduler import (
+            LoraSchedulingParams,
+            MultiModalSchedulingParams,
+        )
+
+        lora_params = LoraSchedulingParams(
+            max_admit_lora_adapters_per_step=scheduler_policy.max_admit_lora_adapters_per_step,
+            max_prefill_lora_adapters_per_batch=scheduler_policy.max_prefill_lora_adapters_per_batch,
+            max_decode_lora_adapters_per_batch=scheduler_policy.max_decode_lora_adapters_per_batch,
+            lora_fairness_relax_threshold=scheduler_policy.lora_fairness_relax_threshold,
+            lora_locality_tighten_threshold=scheduler_policy.lora_locality_tighten_threshold,
+            lora_limit_relax_delta=scheduler_policy.lora_limit_relax_delta,
+            lora_limit_tighten_delta=scheduler_policy.lora_limit_tighten_delta,
+        )
+
+        multimodal_params = MultiModalSchedulingParams(
+            max_admit_multimodal_per_step=scheduler_policy.max_admit_multimodal_per_step,
+            max_prefill_multimodal_requests_per_batch=scheduler_policy.max_prefill_multimodal_requests_per_batch,
+            max_decode_multimodal_requests_per_batch=scheduler_policy.max_decode_multimodal_requests_per_batch,
+            max_admit_multimodal_lora_per_step=scheduler_policy.max_admit_multimodal_lora_per_step,
+            max_prefill_multimodal_lora_requests_per_batch=scheduler_policy.max_prefill_multimodal_lora_requests_per_batch,
+            max_decode_multimodal_lora_requests_per_batch=scheduler_policy.max_decode_multimodal_lora_requests_per_batch,
+            multimodal_prefix_cache_relax_threshold=scheduler_policy.multimodal_prefix_cache_relax_threshold,
+            multimodal_prefix_cache_tighten_threshold=scheduler_policy.multimodal_prefix_cache_tighten_threshold,
+            multimodal_prefill_limit_relax_delta=scheduler_policy.multimodal_prefill_limit_relax_delta,
+            multimodal_prefill_limit_tighten_delta=scheduler_policy.multimodal_prefill_limit_tighten_delta,
+            multimodal_lora_prefill_limit_relax_delta=scheduler_policy.multimodal_lora_prefill_limit_relax_delta,
+            multimodal_lora_prefill_limit_tighten_delta=scheduler_policy.multimodal_lora_prefill_limit_tighten_delta,
+            multimodal_lora_fairness_relax_threshold=scheduler_policy.multimodal_lora_fairness_relax_threshold,
+            multimodal_lora_locality_tighten_threshold=scheduler_policy.multimodal_lora_locality_tighten_threshold,
+        )
+
         step_scheduler = StepScheduler(
             step_token_budget=context.step_token_budget,
             decode_priority_enabled=context.decode_priority_enabled,
@@ -130,65 +162,8 @@ class LiteRuntimeFactory:
             fairness_guardrail_service_classes=(
                 scheduler_policy.fairness_guardrail_service_classes
             ),
-            max_admit_lora_adapters_per_step=(
-                scheduler_policy.max_admit_lora_adapters_per_step
-            ),
-            max_prefill_lora_adapters_per_batch=(
-                scheduler_policy.max_prefill_lora_adapters_per_batch
-            ),
-            max_decode_lora_adapters_per_batch=(
-                scheduler_policy.max_decode_lora_adapters_per_batch
-            ),
-            lora_fairness_relax_threshold=(
-                scheduler_policy.lora_fairness_relax_threshold
-            ),
-            lora_locality_tighten_threshold=(
-                scheduler_policy.lora_locality_tighten_threshold
-            ),
-            lora_limit_relax_delta=scheduler_policy.lora_limit_relax_delta,
-            lora_limit_tighten_delta=scheduler_policy.lora_limit_tighten_delta,
-            max_admit_multimodal_per_step=(
-                scheduler_policy.max_admit_multimodal_per_step
-            ),
-            max_prefill_multimodal_requests_per_batch=(
-                scheduler_policy.max_prefill_multimodal_requests_per_batch
-            ),
-            max_decode_multimodal_requests_per_batch=(
-                scheduler_policy.max_decode_multimodal_requests_per_batch
-            ),
-            max_admit_multimodal_lora_per_step=(
-                scheduler_policy.max_admit_multimodal_lora_per_step
-            ),
-            max_prefill_multimodal_lora_requests_per_batch=(
-                scheduler_policy.max_prefill_multimodal_lora_requests_per_batch
-            ),
-            max_decode_multimodal_lora_requests_per_batch=(
-                scheduler_policy.max_decode_multimodal_lora_requests_per_batch
-            ),
-            multimodal_prefix_cache_relax_threshold=(
-                scheduler_policy.multimodal_prefix_cache_relax_threshold
-            ),
-            multimodal_prefix_cache_tighten_threshold=(
-                scheduler_policy.multimodal_prefix_cache_tighten_threshold
-            ),
-            multimodal_prefill_limit_relax_delta=(
-                scheduler_policy.multimodal_prefill_limit_relax_delta
-            ),
-            multimodal_prefill_limit_tighten_delta=(
-                scheduler_policy.multimodal_prefill_limit_tighten_delta
-            ),
-            multimodal_lora_prefill_limit_relax_delta=(
-                scheduler_policy.multimodal_lora_prefill_limit_relax_delta
-            ),
-            multimodal_lora_prefill_limit_tighten_delta=(
-                scheduler_policy.multimodal_lora_prefill_limit_tighten_delta
-            ),
-            multimodal_lora_fairness_relax_threshold=(
-                scheduler_policy.multimodal_lora_fairness_relax_threshold
-            ),
-            multimodal_lora_locality_tighten_threshold=(
-                scheduler_policy.multimodal_lora_locality_tighten_threshold
-            ),
+            lora_params=lora_params,
+            multimodal_params=multimodal_params,
         )
         execution_backend = LiteSingleGpuBackend(
             scheduler=context.scheduler,

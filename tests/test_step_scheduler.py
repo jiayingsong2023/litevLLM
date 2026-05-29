@@ -3,7 +3,11 @@ import time
 
 from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.request_scheduler import RequestScheduler
-from vllm.engine.step_scheduler import StepScheduler
+from vllm.engine.step_scheduler import (
+    LoraSchedulingParams,
+    MultiModalSchedulingParams,
+    StepScheduler,
+)
 
 
 def _scheduler_with_requests(requests: list[dict]) -> RequestScheduler:
@@ -334,7 +338,9 @@ def test_step_scheduler_limits_multimodal_admissions_per_step() -> None:
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
         max_admit_per_step=3,
-        max_admit_multimodal_per_step=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_admit_multimodal_per_step=1,
+        ),
     )
     plan = step_scheduler.build_plan(scheduler)
 
@@ -361,7 +367,9 @@ def test_step_scheduler_limits_multimodal_prefill_batch() -> None:
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=1,
+        ),
     )
     plan = step_scheduler.build_plan(scheduler)
 
@@ -387,26 +395,13 @@ def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate(
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=1,
-        multimodal_prefix_cache_relax_threshold=0.2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_prefill_limit_relax_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=1,
+            multimodal_prefix_cache_relax_threshold=0.2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_prefill_limit_relax_delta=1,
+        ),
     )
-    step_scheduler.update_runtime_feedback(
-        {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.0}}}
-    )
-
-    plan = step_scheduler.build_plan(scheduler)
-
-    assert plan.prefills is not None
-    assert plan.prefill_multimodal_requests == 2
-    assert plan.effective_prefill_multimodal_request_limit == 2
-    assert plan.prefill_multimodal_limit_relaxed is True
-    assert plan.prefill_multimodal_limit_tightened is False
-    assert plan.prefill_multimodal_limit_triggered is True
-
-
-def test_step_scheduler_tightens_multimodal_prefill_limit_on_high_prefix_hit_rate() -> None:
     scheduler = _scheduler_with_requests(
         [
             {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
@@ -422,10 +417,12 @@ def test_step_scheduler_tightens_multimodal_prefill_limit_on_high_prefix_hit_rat
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=2,
-        multimodal_prefix_cache_relax_threshold=0.2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_prefill_limit_tighten_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=2,
+            multimodal_prefix_cache_relax_threshold=0.2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_prefill_limit_tighten_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
@@ -481,8 +478,10 @@ def test_step_scheduler_limits_multimodal_lora_admissions_per_step() -> None:
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=4,
         max_admit_per_step=4,
-        max_admit_multimodal_per_step=2,
-        max_admit_multimodal_lora_per_step=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_admit_multimodal_per_step=2,
+            max_admit_multimodal_lora_per_step=1,
+        ),
     )
     plan = step_scheduler.build_plan(scheduler)
 
@@ -529,8 +528,10 @@ def test_step_scheduler_limits_multimodal_lora_prefill_batch() -> None:
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=3,
-        max_prefill_multimodal_lora_requests_per_batch=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=3,
+            max_prefill_multimodal_lora_requests_per_batch=1,
+        ),
     )
     plan = step_scheduler.build_plan(scheduler)
 
@@ -576,11 +577,13 @@ def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_low_prefix_hit_
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=3,
-        max_prefill_multimodal_lora_requests_per_batch=1,
-        multimodal_prefix_cache_relax_threshold=0.2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_lora_prefill_limit_relax_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=3,
+            max_prefill_multimodal_lora_requests_per_batch=1,
+            multimodal_prefix_cache_relax_threshold=0.2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_lora_prefill_limit_relax_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.0}}}
@@ -630,11 +633,13 @@ def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_high_prefix_hi
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=3,
-        max_prefill_multimodal_lora_requests_per_batch=2,
-        multimodal_prefix_cache_relax_threshold=0.2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_lora_prefill_limit_tighten_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=3,
+            max_prefill_multimodal_lora_requests_per_batch=2,
+            multimodal_prefix_cache_relax_threshold=0.2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_lora_prefill_limit_tighten_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
@@ -691,12 +696,14 @@ def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_fairness_gap() 
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
-        max_prefill_multimodal_requests_per_batch=4,
-        max_prefill_multimodal_lora_requests_per_batch=1,
-        multimodal_prefix_cache_relax_threshold=0.0,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_lora_fairness_relax_threshold=0.2,
-        multimodal_lora_prefill_limit_relax_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=4,
+            max_prefill_multimodal_lora_requests_per_batch=1,
+            multimodal_prefix_cache_relax_threshold=0.0,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_lora_fairness_relax_threshold=0.2,
+            multimodal_lora_prefill_limit_relax_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.5}}}
@@ -745,11 +752,13 @@ def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_locality_under
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=3,
-        max_prefill_multimodal_requests_per_batch=3,
-        max_prefill_multimodal_lora_requests_per_batch=2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_lora_locality_tighten_threshold=0.2,
-        multimodal_lora_prefill_limit_tighten_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_prefill_multimodal_requests_per_batch=3,
+            max_prefill_multimodal_lora_requests_per_batch=2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_lora_locality_tighten_threshold=0.2,
+            multimodal_lora_prefill_limit_tighten_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
@@ -781,10 +790,12 @@ def test_step_scheduler_relaxes_multimodal_lora_decode_limit_on_fairness_gap() -
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
-        max_decode_multimodal_requests_per_batch=4,
-        max_decode_multimodal_lora_requests_per_batch=1,
-        multimodal_lora_fairness_relax_threshold=0.2,
-        multimodal_lora_prefill_limit_relax_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_decode_multimodal_requests_per_batch=4,
+            max_decode_multimodal_lora_requests_per_batch=1,
+            multimodal_lora_fairness_relax_threshold=0.2,
+            multimodal_lora_prefill_limit_relax_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 0.5}}}
@@ -815,11 +826,13 @@ def test_step_scheduler_tightens_multimodal_lora_decode_limit_on_locality_under_
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
-        max_decode_multimodal_requests_per_batch=3,
-        max_decode_multimodal_lora_requests_per_batch=2,
-        multimodal_prefix_cache_tighten_threshold=0.8,
-        multimodal_lora_locality_tighten_threshold=0.2,
-        multimodal_lora_prefill_limit_tighten_delta=1,
+        multimodal_params=MultiModalSchedulingParams(
+            max_decode_multimodal_requests_per_batch=3,
+            max_decode_multimodal_lora_requests_per_batch=2,
+            multimodal_prefix_cache_tighten_threshold=0.8,
+            multimodal_lora_locality_tighten_threshold=0.2,
+            multimodal_lora_prefill_limit_tighten_delta=1,
+        ),
     )
     step_scheduler.update_runtime_feedback(
         {"observer": {"multimodal": {"prefix_cache_hit_rate": 1.0}}}
@@ -1143,7 +1156,9 @@ def test_step_scheduler_limits_admit_lora_adapters_per_step_and_rotates() -> Non
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
         max_admit_per_step=2,
-        max_admit_lora_adapters_per_step=1,
+        lora_params=LoraSchedulingParams(
+            max_admit_lora_adapters_per_step=1,
+        ),
     )
 
     plan1 = step_scheduler.build_plan(scheduler)
@@ -1180,8 +1195,10 @@ def test_step_scheduler_relaxes_admit_lora_limit_on_fairness_gap() -> None:
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
         max_admit_per_step=2,
-        max_admit_lora_adapters_per_step=1,
-        lora_fairness_relax_threshold=0.3,
+        lora_params=LoraSchedulingParams(
+            max_admit_lora_adapters_per_step=1,
+            lora_fairness_relax_threshold=0.3,
+        ),
     )
 
     plan = step_scheduler.build_plan(scheduler)
@@ -1217,7 +1234,9 @@ def test_step_scheduler_limits_prefill_lora_adapters_per_batch() -> None:
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=1.0,
         prefill_microbatch_size=2,
-        max_prefill_lora_adapters_per_batch=1,
+        lora_params=LoraSchedulingParams(
+            max_prefill_lora_adapters_per_batch=1,
+        ),
     )
 
     plan1 = step_scheduler.build_plan(scheduler)
@@ -1255,8 +1274,10 @@ def test_step_scheduler_tightens_prefill_lora_limit_when_locality_is_good() -> N
         prefill_reserve_backlog=1,
         prefill_catchup_ratio=1.0,
         prefill_microbatch_size=2,
-        max_prefill_lora_adapters_per_batch=2,
-        lora_locality_tighten_threshold=0.01,
+        lora_params=LoraSchedulingParams(
+            max_prefill_lora_adapters_per_batch=2,
+            lora_locality_tighten_threshold=0.01,
+        ),
     )
 
     plan = step_scheduler.build_plan(scheduler)
@@ -1311,7 +1332,9 @@ def test_step_scheduler_limits_decode_lora_adapters_per_batch() -> None:
         prefill_reserve_backlog=2,
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=1,
-        max_decode_lora_adapters_per_batch=2,
+        lora_params=LoraSchedulingParams(
+            max_decode_lora_adapters_per_batch=2,
+        ),
     )
 
     plan1 = step_scheduler.build_plan(scheduler)

@@ -21,6 +21,39 @@ from vllm.engine.scheduling_constraints import (
 )
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, PrefillPlan, StepPlan
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class LoraSchedulingParams:
+    """LoRA scheduling constraints as a frozen value object."""
+    max_admit_lora_adapters_per_step: int = 0
+    max_prefill_lora_adapters_per_batch: int = 0
+    max_decode_lora_adapters_per_batch: int = 0
+    lora_fairness_relax_threshold: float = 0.0
+    lora_locality_tighten_threshold: float = 0.0
+    lora_limit_relax_delta: int = 1
+    lora_limit_tighten_delta: int = 1
+
+
+@dataclass(frozen=True)
+class MultiModalSchedulingParams:
+    """MultiModal scheduling constraints as a frozen value object."""
+    max_admit_multimodal_per_step: int = 0
+    max_prefill_multimodal_requests_per_batch: int = 0
+    max_decode_multimodal_requests_per_batch: int = 0
+    max_admit_multimodal_lora_per_step: int = 0
+    max_prefill_multimodal_lora_requests_per_batch: int = 0
+    max_decode_multimodal_lora_requests_per_batch: int = 0
+    multimodal_prefix_cache_relax_threshold: float = 0.0
+    multimodal_prefix_cache_tighten_threshold: float = 0.0
+    multimodal_prefill_limit_relax_delta: int = 1
+    multimodal_prefill_limit_tighten_delta: int = 1
+    multimodal_lora_prefill_limit_relax_delta: int = 1
+    multimodal_lora_prefill_limit_tighten_delta: int = 1
+    multimodal_lora_fairness_relax_threshold: float = 0.0
+    multimodal_lora_locality_tighten_threshold: float = 0.0
+
 
 class StepScheduler:
     DEFAULT_SERVICE_CLASS_WEIGHTS = {
@@ -53,27 +86,8 @@ class StepScheduler:
         decode_service_class_quotas: dict[str, int] | None = None,
         fairness_guardrail_queue_wait_s: float = 0.0,
         fairness_guardrail_service_classes: set[str] | None = None,
-        max_admit_lora_adapters_per_step: int = 0,
-        max_prefill_lora_adapters_per_batch: int = 0,
-        max_decode_lora_adapters_per_batch: int = 0,
-        lora_fairness_relax_threshold: float = 0.0,
-        lora_locality_tighten_threshold: float = 0.0,
-        lora_limit_relax_delta: int = 1,
-        lora_limit_tighten_delta: int = 1,
-        max_admit_multimodal_per_step: int = 0,
-        max_prefill_multimodal_requests_per_batch: int = 0,
-        max_decode_multimodal_requests_per_batch: int = 0,
-        max_admit_multimodal_lora_per_step: int = 0,
-        max_prefill_multimodal_lora_requests_per_batch: int = 0,
-        max_decode_multimodal_lora_requests_per_batch: int = 0,
-        multimodal_prefix_cache_relax_threshold: float = 0.0,
-        multimodal_prefix_cache_tighten_threshold: float = 0.0,
-        multimodal_prefill_limit_relax_delta: int = 1,
-        multimodal_prefill_limit_tighten_delta: int = 1,
-        multimodal_lora_prefill_limit_relax_delta: int = 1,
-        multimodal_lora_prefill_limit_tighten_delta: int = 1,
-        multimodal_lora_fairness_relax_threshold: float = 0.0,
-        multimodal_lora_locality_tighten_threshold: float = 0.0,
+        lora_params: LoraSchedulingParams | None = None,
+        multimodal_params: MultiModalSchedulingParams | None = None,
         min_prefill_chunk_size: int | None = None,
         max_prefill_chunk_size: int | None = None,
         prefill_sla_ttft_ms: float | None = None,
@@ -127,63 +141,29 @@ class StepScheduler:
             for item in (fairness_guardrail_service_classes or set())
             if str(item).strip()
         }
-        self.max_admit_lora_adapters_per_step = max(
-            0, int(max_admit_lora_adapters_per_step)
-        )
-        self.max_prefill_lora_adapters_per_batch = max(
-            0, int(max_prefill_lora_adapters_per_batch)
-        )
-        self.max_decode_lora_adapters_per_batch = max(
-            0, int(max_decode_lora_adapters_per_batch)
-        )
-        self.lora_fairness_relax_threshold = max(
-            0.0, float(lora_fairness_relax_threshold)
-        )
-        self.lora_locality_tighten_threshold = max(
-            0.0, float(lora_locality_tighten_threshold)
-        )
-        self.lora_limit_relax_delta = max(1, int(lora_limit_relax_delta))
-        self.lora_limit_tighten_delta = max(1, int(lora_limit_tighten_delta))
-        self.max_admit_multimodal_per_step = max(0, int(max_admit_multimodal_per_step))
-        self.max_prefill_multimodal_requests_per_batch = max(
-            0, int(max_prefill_multimodal_requests_per_batch)
-        )
-        self.max_decode_multimodal_requests_per_batch = max(
-            0, int(max_decode_multimodal_requests_per_batch)
-        )
-        self.max_admit_multimodal_lora_per_step = max(
-            0, int(max_admit_multimodal_lora_per_step)
-        )
-        self.max_prefill_multimodal_lora_requests_per_batch = max(
-            0, int(max_prefill_multimodal_lora_requests_per_batch)
-        )
-        self.max_decode_multimodal_lora_requests_per_batch = max(
-            0, int(max_decode_multimodal_lora_requests_per_batch)
-        )
-        self.multimodal_prefix_cache_relax_threshold = max(
-            0.0, float(multimodal_prefix_cache_relax_threshold)
-        )
-        self.multimodal_prefix_cache_tighten_threshold = max(
-            0.0, float(multimodal_prefix_cache_tighten_threshold)
-        )
-        self.multimodal_prefill_limit_relax_delta = max(
-            1, int(multimodal_prefill_limit_relax_delta)
-        )
-        self.multimodal_prefill_limit_tighten_delta = max(
-            1, int(multimodal_prefill_limit_tighten_delta)
-        )
-        self.multimodal_lora_prefill_limit_relax_delta = max(
-            1, int(multimodal_lora_prefill_limit_relax_delta)
-        )
-        self.multimodal_lora_prefill_limit_tighten_delta = max(
-            1, int(multimodal_lora_prefill_limit_tighten_delta)
-        )
-        self.multimodal_lora_fairness_relax_threshold = max(
-            0.0, float(multimodal_lora_fairness_relax_threshold)
-        )
-        self.multimodal_lora_locality_tighten_threshold = max(
-            0.0, float(multimodal_lora_locality_tighten_threshold)
-        )
+        _lora = lora_params or LoraSchedulingParams()
+        _mm = multimodal_params or MultiModalSchedulingParams()
+        self.max_admit_lora_adapters_per_step = max(0, int(_lora.max_admit_lora_adapters_per_step))
+        self.max_prefill_lora_adapters_per_batch = max(0, int(_lora.max_prefill_lora_adapters_per_batch))
+        self.max_decode_lora_adapters_per_batch = max(0, int(_lora.max_decode_lora_adapters_per_batch))
+        self.lora_fairness_relax_threshold = max(0.0, float(_lora.lora_fairness_relax_threshold))
+        self.lora_locality_tighten_threshold = max(0.0, float(_lora.lora_locality_tighten_threshold))
+        self.lora_limit_relax_delta = max(1, int(_lora.lora_limit_relax_delta))
+        self.lora_limit_tighten_delta = max(1, int(_lora.lora_limit_tighten_delta))
+        self.max_admit_multimodal_per_step = max(0, int(_mm.max_admit_multimodal_per_step))
+        self.max_prefill_multimodal_requests_per_batch = max(0, int(_mm.max_prefill_multimodal_requests_per_batch))
+        self.max_decode_multimodal_requests_per_batch = max(0, int(_mm.max_decode_multimodal_requests_per_batch))
+        self.max_admit_multimodal_lora_per_step = max(0, int(_mm.max_admit_multimodal_lora_per_step))
+        self.max_prefill_multimodal_lora_requests_per_batch = max(0, int(_mm.max_prefill_multimodal_lora_requests_per_batch))
+        self.max_decode_multimodal_lora_requests_per_batch = max(0, int(_mm.max_decode_multimodal_lora_requests_per_batch))
+        self.multimodal_prefix_cache_relax_threshold = max(0.0, float(_mm.multimodal_prefix_cache_relax_threshold))
+        self.multimodal_prefix_cache_tighten_threshold = max(0.0, float(_mm.multimodal_prefix_cache_tighten_threshold))
+        self.multimodal_prefill_limit_relax_delta = max(1, int(_mm.multimodal_prefill_limit_relax_delta))
+        self.multimodal_prefill_limit_tighten_delta = max(1, int(_mm.multimodal_prefill_limit_tighten_delta))
+        self.multimodal_lora_prefill_limit_relax_delta = max(1, int(_mm.multimodal_lora_prefill_limit_relax_delta))
+        self.multimodal_lora_prefill_limit_tighten_delta = max(1, int(_mm.multimodal_lora_prefill_limit_tighten_delta))
+        self.multimodal_lora_fairness_relax_threshold = max(0.0, float(_mm.multimodal_lora_fairness_relax_threshold))
+        self.multimodal_lora_locality_tighten_threshold = max(0.0, float(_mm.multimodal_lora_locality_tighten_threshold))
         self._decode_only_streak = 0
         self._decode_rr_cursor = 0
         self._prefill_rr_cursor = 0
