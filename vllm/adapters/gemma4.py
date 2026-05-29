@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any
+from typing import Any, cast
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 from .policy_keys import (
+    Gemma4ModelPolicy,
     GEMMA4_AWQ_DECODE_GEMV,
     GEMMA4_AWQ_FUSED_GATE_UP,
     GEMMA4_AWQ_FUSED_GEMM,
@@ -85,7 +86,7 @@ class Gemma4Adapter(ModelAdapter):
             force_kv_dtype = "fp8"
 
         is_moe = _supports_moe(getattr(model_config, "hf_config", None))
-        model_policy = {
+        model_policy: Gemma4ModelPolicy = cast(Gemma4ModelPolicy, {
             GEMMA4_LOCAL_DECODE_TRITON: True,
             GEMMA4_FORCE_FULL_REF_ATTN: False,
             GEMMA4_LEGACY_FP16_REF_ATTN: False,
@@ -138,6 +139,7 @@ class Gemma4Adapter(ModelAdapter):
                 getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
             ),
         }
+        )
         kernel_policy = {
             GEMMA4_AWQ_FUSED_SCOPE: fused_stage,
             GEMMA4_AWQ_FUSED_GEMM: fused_stage != "off",
@@ -175,7 +177,7 @@ class Gemma4Adapter(ModelAdapter):
                 "(set FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 to override)."
             ),
             tuning_env_overrides=tuning_env_overrides,
-            model_policy=model_policy,
+            model_policy=model_policy,  # type: ignore[arg-type]
             kernel_policy=kernel_policy,
         )
 

@@ -41,3 +41,43 @@ QWEN35_FULLATTN_USE_SDPA_PREFILL = "fullattn_use_sdpa_prefill"
 QWEN35_RESIDUAL_STABILIZER = "residual_stabilizer"
 QWEN35_LINEAR_INPUT_CAP = "linear_input_cap"
 QWEN35_FLA_CHUNK_ENABLED = "fla_chunk_enabled"
+
+from typing import TypedDict
+
+
+class Gemma4ModelPolicy(TypedDict, total=False):
+    """Typed model_policy for Gemma4 models.
+
+    Keys match the GEMMA4_* constants defined above.
+    total=False means all keys are optional.
+    """
+
+    local_decode_triton: bool
+    force_full_ref_attn: bool
+    legacy_fp16_ref_attn: bool
+    legacy_fullprec_kv_write: bool
+    legacy_item_path: bool
+    mlp_pair_fusion: bool
+    fp32_residual_guard_enabled: bool
+    fp32_residual_guard_start: int
+    fp32_residual_guard_span: int
+    moe_expert_cache_size: int
+    moe_compute_dtype: str
+    moe_int4_kernel_enabled: bool
+    moe_int4_kernel_strategy: str
+    moe_prefill_grouped_enabled: bool
+    moe_prefill_grouped_min_tokens: int
+    moe_prefill_grouped_strategy: str
+    moe_batch_materialize_enabled: bool
+    rope_cache_max_pos: int | None
+    rope_cache_pool_max: int
+
+
+class Qwen35ModelPolicy(TypedDict, total=False):
+    """Typed model_policy for Qwen3.5 models."""
+
+    fullattn_stabilizer: bool
+    fullattn_use_sdpa_prefill: bool
+    residual_stabilizer: bool
+    linear_input_cap: bool
+    fla_chunk_enabled: bool
