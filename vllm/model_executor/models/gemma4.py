@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import atexit
-import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -51,6 +50,9 @@ class Gemma4LayerConfig:
     profile_printed: bool = False
     tuning: dict[str, str] = field(default_factory=dict)
     tuning_locked: bool = False
+    rope_cache_pool: "OrderedDict[tuple[int, int, float, str, float, str, int, str], tuple[torch.Tensor, torch.Tensor]]" = field(  # noqa: E501
+        default_factory=OrderedDict
+    )
 
 
 def set_gemma4_tuning_config(
@@ -178,7 +180,7 @@ class _Gemma4ProfileSpan:
         self._layer_config = layer_config or Gemma4LayerConfig()
         self._start = 0.0
 
-    def __enter__(self) -> "_Gemma4ProfileSpan":
+    def __enter__(self) -> _Gemma4ProfileSpan:
         if self._layer_config.roctx_profile_enabled:
             _gemma4_range_push(self.scope)
         if self._layer_config.profile_enabled:
@@ -205,38 +207,28 @@ def _gemma4_profile_span(
     return _Gemma4ProfileSpan(scope, layer_config)
 
 
-def _dump_gemma4_profile() -> None:
-    global _GEMMA4_PROFILE_PRINTED
-    if (
-        (not _GEMMA4_PROFILE_ENABLED)
-        or _GEMMA4_PROFILE_PRINTED
-        or (not _GEMMA4_PROFILE_STATS)
-    ):
+def _dump_gemma4_profile(config: Gemma4LayerConfig | None = None) -> None:
+    """Dump per-instance or global profile stats."""
+    if config is None:
+        global _GEMMA4_PROFILE_PRINTED
+        if (not _GEMMA4_PROFILE_ENABLED) or _GEMMA4_PROFILE_PRINTED or (not _GEMMA4_PROFILE_STATS):  # noqa: E501
+            return
+        _GEMMA4_PROFILE_PRINTED = True
+        stats = _GEMMA4_PROFILE_STATS
+        label = "[gemma4-profile]"
+    else:
+        if not config.profile_enabled or not config.profile_stats or config.profile_printed:  # noqa: E501
+            return
+        config.profile_printed = True
+        stats = config.profile_stats
+        label = "[gemma4-profile]"
+
+    total_s = sum(v["time_s"] for v in stats.values())
+    if total_s <= 0:
         return
-    _GEMMA4_PROFILE_PRINTED = True
-    total_s = sum(v["time_s"] for v in _GEMMA4_PROFILE_STATS.values())
-    rows = []
-    for scope, data in sorted(
-        _GEMMA4_PROFILE_STATS.items(),
-        key=lambda item: item[1]["time_s"],
-        reverse=True,
-    ):
-        time_s = float(data["time_s"])
-        count = int(data["count"])
-        rows.append(
-            {
-                "scope": scope,
-                "time_s": time_s,
-                "time_ms": time_s * 1000.0,
-                "share_pct": (time_s / total_s * 100.0) if total_s > 0 else 0.0,
-                "count": count,
-                "avg_ms": (time_s * 1000.0 / count) if count > 0 else 0.0,
-            }
-        )
-    print(
-        "[Gemma4LayerProfile] "
-        + json.dumps({"total_s": total_s, "rows": rows}, ensure_ascii=True)
-    )
+    for scope, v in sorted(stats.items()):
+        print(f"{label} {scope}: {v['time_s']:.4f}s ({int(v['count'])} calls, "
+              f"{100.0 * v['time_s'] / total_s:.1f}%)")
 
 
 atexit.register(_dump_gemma4_profile)
@@ -254,7 +246,7 @@ def _meta_get(meta: Any, key: str, default: Any = None) -> Any:
     return getattr(meta, key, default)
 
 
-def _meta_cpu_seq_lens(meta: Any) -> Optional[list[int]]:
+def _meta_cpu_seq_lens(meta: Any) -> list[int] | None:
     """
     Return the host-side per-sequence length list if the engine-side builder
     has already surfaced it; otherwise return None.
@@ -268,7 +260,7 @@ def _meta_cpu_seq_lens(meta: Any) -> Optional[list[int]]:
     return None
 
 
-def _meta_cpu_max_seq_len(meta: Any) -> Optional[int]:
+def _meta_cpu_max_seq_len(meta: Any) -> int | None:
     raw = _meta_get(meta, "max_seq_len_cpu", None)
     if raw is None:
         return None
@@ -280,7 +272,7 @@ def _meta_cpu_max_seq_len(meta: Any) -> Optional[int]:
 
 def _resolve_max_position_plus_one_cpu(
     attn_metadata: Any, positions: torch.Tensor
-) -> Optional[int]:
+) -> int | None:
     """
     Best-effort CPU-side upper bound for RoPE cache extension.
 
@@ -381,11 +373,11 @@ def _causal_attention_ref(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    local_window: Optional[int] = None,
-    softcap: Optional[float] = None,
-    key_padding_mask: Optional[torch.Tensor] = None,
-    q_positions: Optional[torch.Tensor] = None,
-    k_positions: Optional[torch.Tensor] = None,
+    local_window: int | None = None,
+    softcap: float | None = None,
+    key_padding_mask: torch.Tensor | None = None,
+    q_positions: torch.Tensor | None = None,
+    k_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     n_rep = q.shape[1] // k.shape[1]
     k_full = _repeat_kv_for_gqa(k, n_rep)
@@ -426,7 +418,7 @@ def _causal_attention_ref(
 
 def _decode_int4_row(
     cache: torch.Tensor,
-    scale_cache: Optional[torch.Tensor],
+    scale_cache: torch.Tensor | None,
     block_idx: int,
     block_offset: int,
     num_kv_heads: int,
@@ -450,7 +442,7 @@ def _decode_int4_row(
 
 def _decode_int4_rows(
     packed_rows: torch.Tensor,
-    scales: Optional[torch.Tensor],
+    scales: torch.Tensor | None,
     head_dim: int,
 ) -> torch.Tensor:
     # packed_rows: [T, num_kv_heads, head_dim/2] uint8/int32
@@ -477,10 +469,10 @@ def _gather_recent_kv(
     batch_idx: int,
     num_kv_heads: int,
     head_dim: int,
-    local_window: Optional[int],
+    local_window: int | None,
     kv_cache_dtype: str,
-    kv_scale_cache: Optional[tuple[Any, Any]] = None,
-    seq_len_cpu: Optional[int] = None,
+    kv_scale_cache: tuple[Any, Any] | None = None,
+    seq_len_cpu: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     k_cache, v_cache = kv_cache
     block_size = int(k_cache.shape[1])
@@ -537,12 +529,12 @@ def _gather_recent_kv_batched(
     seq_lens: torch.Tensor,
     num_kv_heads: int,
     head_dim: int,
-    local_window: Optional[int],
+    local_window: int | None,
     kv_cache_dtype: str,
     inf_config: Any = None,
-    kv_scale_cache: Optional[tuple[Any, Any]] = None,
-    seq_lens_cpu: Optional[list[int]] = None,
-    max_seq_len_cpu: Optional[int] = None,
+    kv_scale_cache: tuple[Any, Any] | None = None,
+    seq_lens_cpu: list[int] | None = None,
+    max_seq_len_cpu: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     k_cache, v_cache = kv_cache
     block_size = int(k_cache.shape[1])
@@ -646,7 +638,7 @@ def _build_local_decode_aligned_metadata(
     seq_lens: torch.Tensor,
     local_window: int,
     block_size: int,
-    seq_lens_cpu: Optional[list[int]] = None,
+    seq_lens_cpu: list[int] | None = None,
     inf_config: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -780,7 +772,7 @@ def _local_prefill_attention_sdpa(
     q_positions: torch.Tensor,
     k_positions: torch.Tensor,
     k_valid: torch.Tensor,
-    local_window: Optional[int],
+    local_window: int | None,
     scale: float,
 ) -> torch.Tensor:
     qh = q.transpose(1, 2).contiguous()
@@ -891,6 +883,7 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         head_size: int,
         layer_type: str,
         runtime_config: Any = None,
+        layer_config: Gemma4LayerConfig | None = None,
     ):
         super().__init__()
         self.head_size = int(head_size)
@@ -901,6 +894,11 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         )
         self._rope_cache_pool_limit = _resolve_gemma4_rope_cache_pool_limit(
             runtime_config
+        )
+        self._rope_cache_pool = (
+            layer_config.rope_cache_pool
+            if layer_config is not None
+            else _GEMMA4_ROPE_CACHE_POOL
         )
         self.apply_rotary_emb = ApplyRotaryEmb(is_neox_style=True)
 
@@ -918,10 +916,8 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
             rope_params.get("partial_rotary_factor", 1.0)
         )
         self._inv_freq_cpu = self._build_inv_freq().cpu()
-        self._last_cache_key: Optional[
-            tuple[int, int, float, str, float, str, int, str]
-        ] = None
-        self._last_cache_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._last_cache_key: tuple[int, int, float, str, float, str, int, str] | None = None
+        self._last_cache_value: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def _build_inv_freq(self) -> torch.Tensor:
         if self.rope_type == "proportional":
@@ -986,9 +982,10 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         key = self._cache_pool_key(device=device, dtype=dtype)
         if self._last_cache_key == key and self._last_cache_value is not None:
             return self._last_cache_value
-        cached = _GEMMA4_ROPE_CACHE_POOL.get(key)
+        pool = self._rope_cache_pool
+        cached = pool.get(key)
         if cached is not None:
-            _GEMMA4_ROPE_CACHE_POOL.move_to_end(key)
+            pool.move_to_end(key)
             self._last_cache_key = key
             self._last_cache_value = cached
             return cached
@@ -999,12 +996,12 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos().to(dtype=dtype)
         sin = freqs.sin().to(dtype=dtype)
-        _GEMMA4_ROPE_CACHE_POOL[key] = (cos, sin)
+        pool[key] = (cos, sin)
         self._last_cache_key = key
         self._last_cache_value = (cos, sin)
         pool_limit = int(self._rope_cache_pool_limit)
-        while len(_GEMMA4_ROPE_CACHE_POOL) > pool_limit:
-            _GEMMA4_ROPE_CACHE_POOL.popitem(last=False)
+        while len(pool) > pool_limit:
+            pool.popitem(last=False)
         return cos, sin
 
     def forward(
@@ -1012,7 +1009,7 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        max_position_plus_one_cpu: Optional[int] = None,
+        max_position_plus_one_cpu: int | None = None,
         inf_config: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Prefer a caller-provided CPU-side bound to avoid a GPU->CPU
@@ -1052,9 +1049,14 @@ def _get_rope_with_runtime(
     head_size: int,
     layer_type: str,
     runtime_config: Any = None,
+    layer_config: Gemma4LayerConfig | None = None,
 ):
     return Gemma4LayerRotaryEmbedding(
-        config, head_size, layer_type, runtime_config=runtime_config
+        config,
+        head_size,
+        layer_type,
+        runtime_config=runtime_config,
+        layer_config=layer_config,
     )
 
 
@@ -1126,10 +1128,14 @@ class Gemma4Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=_get_eps(config))
         self.k_norm = RMSNorm(self.head_dim, eps=_get_eps(config))
         self.v_norm_eps = _get_eps(config)
-        self.rotary_emb = _get_rope_with_runtime(
-            config, self.head_dim, self.layer_type, runtime_config=runtime_config
-        )
         self._layer_config = Gemma4LayerConfig()
+        self.rotary_emb = _get_rope_with_runtime(
+            config,
+            self.head_dim,
+            self.layer_type,
+            runtime_config=runtime_config,
+            layer_config=self._layer_config,
+        )
 
     @staticmethod
     def _apply_head_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -1895,15 +1901,15 @@ class Gemma4MoeExpertsLite(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts.down_proj",
         )
-        self._cached_device: Optional[torch.device] = None
-        self._cached_dtype: Optional[torch.dtype] = None
-        self._cached_w1: Optional[torch.Tensor] = None
-        self._cached_w2: Optional[torch.Tensor] = None
+        self._cached_device: torch.device | None = None
+        self._cached_dtype: torch.dtype | None = None
+        self._cached_w1: torch.Tensor | None = None
+        self._cached_w2: torch.Tensor | None = None
         self._expert_weight_cache: OrderedDict[
             int, tuple[torch.Tensor, torch.Tensor]
         ] = OrderedDict()
-        self._expert_cache_device: Optional[torch.device] = None
-        self._expert_cache_dtype: Optional[torch.dtype] = None
+        self._expert_cache_device: torch.device | None = None
+        self._expert_cache_dtype: torch.dtype | None = None
         self._max_expert_cache = max(
             0,
             int(
@@ -2146,9 +2152,9 @@ class Gemma4MoeExpertsLite(nn.Module):
     def _forward_awq_streaming(
         self,
         hidden_states_2d: torch.Tensor,
-        router_logits: Optional[torch.Tensor],
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if topk_weights is None or topk_ids is None:
             if router_logits is None:
@@ -2302,11 +2308,11 @@ class Gemma4MoeExpertsLite(nn.Module):
     def _forward_awq_grouped_prefill(
         self,
         hidden_states_2d: torch.Tensor,
-        router_logits: Optional[torch.Tensor],
+        router_logits: torch.Tensor | None,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         compute_dtype: torch.dtype,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if hidden_states_2d.ndim != 2 or int(hidden_states_2d.shape[0]) <= 1:
             return None
         del router_logits, compute_dtype
@@ -2430,9 +2436,9 @@ class Gemma4MoeExpertsLite(nn.Module):
     def forward(
         self,
         hidden_states_2d: torch.Tensor,
-        router_logits: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
+        router_logits: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._has_awq_packed_expert_major():
             return self._forward_awq_streaming(
@@ -2492,7 +2498,7 @@ class Gemma4SparseMoeBlock(nn.Module):
         self,
         hidden_states_dense: torch.Tensor,
         hidden_states_sparse: torch.Tensor,
-        hidden_states_router: Optional[torch.Tensor] = None,
+        hidden_states_router: torch.Tensor | None = None,
         lora_mapping: Any = None,
         inf_config: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2563,9 +2569,9 @@ class Gemma4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=_get_eps(config)
         )
-        self.pre_feedforward_layernorm_2: Optional[RMSNorm] = None
-        self.post_feedforward_layernorm_1: Optional[RMSNorm] = None
-        self.post_feedforward_layernorm_2: Optional[RMSNorm] = None
+        self.pre_feedforward_layernorm_2: RMSNorm | None = None
+        self.post_feedforward_layernorm_1: RMSNorm | None = None
+        self.post_feedforward_layernorm_2: RMSNorm | None = None
         self.layer_scalar = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         self._fp32_residual_guard_enabled = bool(fp32_residual_guard_enabled)
         self._fp32_residual_guard_start = int(fp32_residual_guard_start)

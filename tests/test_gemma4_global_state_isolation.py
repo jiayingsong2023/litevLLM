@@ -7,8 +7,12 @@ each returned config is independent.
 """
 
 import pytest
+import torch
 
-from vllm.model_executor.models.gemma4 import set_gemma4_tuning_config
+from vllm.model_executor.models.gemma4 import (
+    Gemma4LayerConfig,
+    set_gemma4_tuning_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,3 +53,20 @@ def test_profile_flag_isolation():
     )
     assert config_a.profile_enabled is True
     assert config_b.profile_enabled is False
+
+
+def test_rope_cache_isolation_across_configs():
+    """Two Gemma4LayerConfig instances should have independent rope caches."""
+    config_a = Gemma4LayerConfig()
+    config_b = Gemma4LayerConfig()
+
+    # Simulate a cache entry with a unique key
+    key_a = (0, 128, 1.0, "default", 10000.0, "linear", 4096, "llama3")
+    config_a.rope_cache_pool[key_a] = (
+        torch.randn(1, 128), torch.randn(1, 128)
+    )
+
+    assert key_a in config_a.rope_cache_pool
+    assert key_a not in config_b.rope_cache_pool, (
+        "config_b's rope cache should be independent of config_a's"
+    )
