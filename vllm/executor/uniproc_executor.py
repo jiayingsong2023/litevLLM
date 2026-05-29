@@ -4,7 +4,11 @@ from typing import Any, Callable, List, Optional, Union, Tuple
 from concurrent.futures import Future
 
 from vllm.logger import init_logger
-from vllm.core.sched.output import GrammarOutput, SchedulerOutput
+try:
+    from vllm.core.sched.output import GrammarOutput, SchedulerOutput
+except ImportError:
+    GrammarOutput = None  # type: ignore[assignment]
+    SchedulerOutput = None  # type: ignore[assignment]
 from vllm.executor.abstract import Executor
 from vllm.v1_outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.serial_utils import run_method

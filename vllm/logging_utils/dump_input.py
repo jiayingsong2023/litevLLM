@@ -9,7 +9,10 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.core.sched.output import SchedulerOutput
+try:
+    from vllm.core.sched.output import SchedulerOutput
+except ImportError:
+    SchedulerOutput = None  # type: ignore[assignment]
 from vllm.metrics.stats import SchedulerStats
 from vllm.version import __version__ as VLLM_VERSION
 

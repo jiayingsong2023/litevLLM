@@ -17,7 +17,11 @@ from diskcache import Cache
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
-from vllm.core.sched.output import GrammarOutput, SchedulerOutput
+try:
+    from vllm.core.sched.output import GrammarOutput, SchedulerOutput
+except ImportError:
+    GrammarOutput = None  # type: ignore[assignment]
+    SchedulerOutput = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     import outlines_core as oc
