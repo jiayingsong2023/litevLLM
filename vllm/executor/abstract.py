@@ -15,7 +15,6 @@ from vllm.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.engine.v1 import ReconfigureDistributedRequest
 from vllm.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1_outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 

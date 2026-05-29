@@ -14,7 +14,10 @@ from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.attention.backend import AttentionMetadata
-from vllm.worker.ubatch_utils import UBatchSlices
+try:
+    from vllm.worker.ubatch_utils import UBatchSlices
+except ImportError:
+    UBatchSlices = None  # type: ignore[assignment,misc]
 
 logger = init_logger(__name__)
 
