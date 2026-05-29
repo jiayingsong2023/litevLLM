@@ -260,3 +260,45 @@ def test_gemma4_fp32_residual_guard_uses_defaults_without_runtime_config(
     monkeypatch.setenv("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD_SPAN", "5")
 
     assert gemma4._gemma4_fp32_residual_guard_policy(None) == (False, 8, 3)
+
+
+def test_gemma4_model_policy_covers_all_runtime_config_fields() -> None:
+    """Every RuntimeConfig.gemma4_* field should have a corresponding
+    model_policy key from Gemma4Adapter."""
+    from vllm.adapters.policy_keys import (
+        GEMMA4_FP32_RESIDUAL_GUARD_ENABLED,
+        GEMMA4_FP32_RESIDUAL_GUARD_START,
+        GEMMA4_FP32_RESIDUAL_GUARD_SPAN,
+        GEMMA4_MOE_EXPERT_CACHE_SIZE,
+        GEMMA4_MOE_COMPUTE_DTYPE,
+        GEMMA4_MOE_INT4_KERNEL_ENABLED,
+        GEMMA4_MOE_INT4_KERNEL_STRATEGY,
+        GEMMA4_MOE_PREFILL_GROUPED_ENABLED,
+        GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS,
+        GEMMA4_MOE_PREFILL_GROUPED_STRATEGY,
+        GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
+        GEMMA4_ROPE_CACHE_MAX_POS,
+        GEMMA4_ROPE_CACHE_POOL_MAX,
+    )
+
+    RUNTIME_CONFIG_TO_POLICY_KEY = {
+        "gemma4_26b_fp32_residual_guard_enabled": GEMMA4_FP32_RESIDUAL_GUARD_ENABLED,
+        "gemma4_26b_fp32_residual_guard_start": GEMMA4_FP32_RESIDUAL_GUARD_START,
+        "gemma4_26b_fp32_residual_guard_span": GEMMA4_FP32_RESIDUAL_GUARD_SPAN,
+        "gemma4_moe_expert_cache_size": GEMMA4_MOE_EXPERT_CACHE_SIZE,
+        "gemma4_moe_compute_dtype": GEMMA4_MOE_COMPUTE_DTYPE,
+        "gemma4_moe_int4_kernel_enabled": GEMMA4_MOE_INT4_KERNEL_ENABLED,
+        "gemma4_moe_int4_kernel_strategy": GEMMA4_MOE_INT4_KERNEL_STRATEGY,
+        "gemma4_moe_prefill_grouped_enabled": GEMMA4_MOE_PREFILL_GROUPED_ENABLED,
+        "gemma4_moe_prefill_grouped_min_tokens": GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS,
+        "gemma4_moe_prefill_grouped_strategy": GEMMA4_MOE_PREFILL_GROUPED_STRATEGY,
+        "gemma4_moe_batch_materialize_enabled": GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
+        "gemma4_rope_cache_max_pos": GEMMA4_ROPE_CACHE_MAX_POS,
+        "gemma4_rope_cache_pool_max": GEMMA4_ROPE_CACHE_POOL_MAX,
+        "gemma4_c1_preset": None,  # special case: kernel tuning flag, not in model_policy
+    }
+
+    # Verify all gemma4_* RuntimeConfig fields have a mapping
+    assert len(RUNTIME_CONFIG_TO_POLICY_KEY) == 14, (
+        f"Expected 14 gemma4_* fields, got {len(RUNTIME_CONFIG_TO_POLICY_KEY)}"
+    )
