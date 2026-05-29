@@ -19,8 +19,7 @@ Optional: ``--apply-chat-template auto|on`` wraps the prompt like Tier-B spotche
 skips full greedy generation and only checks last prefill logits vs HF (CosSim + argmax).
 
 For **Lite GGUF or AWQ vs separate HF FP16** (``--hf-model`` pointing to a different tree), cosine uses a
-relaxed floor (``PREFILL_COSIM_MIN_*_VS_FP16``); argmax must still match except **DeepSeek-V2-Lite GGUF**,
-where Q4 vs bf16 may drift — pass if argmax matches **or** cosine clears ``PREFILL_COSIM_MIN_DEEPSEEK_GGUF_VS_FP16``.
+relaxed floor (``PREFILL_COSIM_MIN_*_VS_FP16``); argmax must still match.
 Same-directory Lite vs HF
 (``--hf-same-as-lite`` or no ``--hf-model``) keeps the strict ``PREFILL_COSIM_MIN``. **35B MoE GGUF** usually cannot
 load a matching HF model for logits compare; use **9B GGUF vs 9B FP16** here, or
@@ -58,18 +57,6 @@ PREFILL_COSIM_MIN = 0.998
 PREFILL_COSIM_MIN_GGUF_VS_FP16 = 0.99
 # Lite AWQ vs HF FP16 baseline: INT4 groupwise weights vs BF16 reference; same rationale as GGUF vs FP16.
 PREFILL_COSIM_MIN_AWQ_VS_FP16 = 0.99
-# DeepSeek-V2-Lite Q4 GGUF vs bf16 HF: logits drift; use composite pass (see prefill_hf_alignment_pass).
-PREFILL_COSIM_MIN_DEEPSEEK_GGUF_VS_FP16 = float(
-    os.environ.get("FASTINFERENCE_DEEPSEEK_GGUF_REGRESSION_MIN_COS", "0.30")
-)
-
-
-def _is_deepseek_v2_lite_gguf_path(model_path: str, quant_type: str) -> bool:
-    if quant_type != "gguf":
-        return False
-    b = os.path.basename(os.path.abspath(model_path)).lower()
-    return "deepseek" in b and "lite" in b
-
 
 def prefill_cosine_floor_for_hf_compare(
     model_path: str,
@@ -83,8 +70,6 @@ def prefill_cosine_floor_for_hf_compare(
         os.path.realpath(model_path)
     ):
         return PREFILL_COSIM_MIN
-    if quant_type == "gguf" and _is_deepseek_v2_lite_gguf_path(model_path, quant_type):
-        return PREFILL_COSIM_MIN_DEEPSEEK_GGUF_VS_FP16
     if quant_type == "gguf":
         return PREFILL_COSIM_MIN_GGUF_VS_FP16
     if quant_type == "awq":
@@ -169,12 +154,6 @@ PRESETS = {
         "prompt": "The capital of France is",
         "max_new_tokens": 10,
         "quant": "awq",
-    },
-    # DeepSeek V2 Lite GGUF
-    "deepseek_v2_lite_gguf": {
-        "prompt": "The capital of France is",
-        "max_new_tokens": 10,
-        "quant": "gguf",
     },
     # GLM 4.7 Flash GGUF
     "glm_4_7_flash_gguf": {
@@ -580,16 +559,11 @@ def prefill_hf_alignment_pass(
     lite_argmax: Optional[int],
     hf_argmax: Optional[int],
     cos_min: float = PREFILL_COSIM_MIN,
-    *,
-    deepseek_gguf_q4: bool = False,
 ) -> bool:
     if cos_sim is None or lite_argmax is None or hf_argmax is None:
         return False
     if not math.isfinite(cos_sim):
         return False
-    if deepseek_gguf_q4:
-        # Q4 GGUF vs bf16: pass if greedy argmax matches OR cosine is above a loose floor (quant drift).
-        return (int(lite_argmax) == int(hf_argmax)) or (cos_sim >= cos_min)
     return (cos_sim >= cos_min) and (int(lite_argmax) == int(hf_argmax))
 
 
@@ -704,23 +678,6 @@ def _load_hf_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str):
     # Avoid flash-linear-attention / Triton on CPU or mixed-device Qwen3.5 (illegal access on some ROCm setups).
     if getattr(hf_config, "model_type", "") == "qwen3_5":
         common["attn_implementation"] = "eager"
-    # Stock Transformers DeepSeek V2 (same as tests/tools/compare_hf_lite_deepseek_logits.py): avoids
-    # AutoModel + local config.json drift (e.g. KeyError 'type' on merged rope fields).
-    if getattr(hf_config, "model_type", "") == "deepseek_v2":
-        from transformers.models.deepseek_v2 import DeepseekV2ForCausalLM
-
-        ds_kw = dict(
-            pretrained_model_name_or_path=hf_path,
-            torch_dtype=dtype,
-            attn_implementation="eager",
-            trust_remote_code=True,
-        )
-        if hf_device == "cpu":
-            ds_kw["low_cpu_mem_usage"] = True
-            model = DeepseekV2ForCausalLM.from_pretrained(**ds_kw).eval()
-            return model.to(torch.device("cpu"))
-        ds_kw["device_map"] = "auto"
-        return DeepseekV2ForCausalLM.from_pretrained(**ds_kw).eval()
     if hf_device == "cpu":
         load_kw = {**common, "low_cpu_mem_usage": True}
         try:
@@ -1110,33 +1067,21 @@ def run_alignment_test(
                 cos_floor = prefill_cosine_floor_for_hf_compare(
                     model_path, hf_model_path, quant_type
                 )
-                ds_gguf = _is_deepseek_v2_lite_gguf_path(model_path, quant_type)
                 audit_result = prefill_hf_alignment_pass(
                     prefill_cos_sim,
                     prefill_lite_argmax,
                     prefill_hf_argmax,
                     cos_min=cos_floor,
-                    deepseek_gguf_q4=ds_gguf,
                 )
                 if audit_result:
-                    if ds_gguf:
-                        print(
-                            f"  ✅ PASS: Prefill vs HF (DeepSeek GGUF: argmax match OR CosSim>={cos_floor})."
-                        )
-                    else:
-                        print(
-                            f"  ✅ PASS: Prefill aligns vs HF (CosSim>={cos_floor}, argmax match)."
-                        )
+                    print(
+                        f"  ✅ PASS: Prefill aligns vs HF (CosSim>={cos_floor}, argmax match)."
+                    )
                 else:
-                    if ds_gguf:
-                        print(
-                            f"  ❌ FAIL: Prefill vs HF (DeepSeek GGUF: need argmax match OR CosSim>={cos_floor})."
-                        )
-                    else:
-                        print(
-                            f"  ❌ FAIL: Prefill mismatch vs HF (need CosSim>={cos_floor} "
-                            "and matching greedy argmax)."
-                        )
+                    print(
+                        f"  ❌ FAIL: Prefill mismatch vs HF (need CosSim>={cos_floor} "
+                        "and matching greedy argmax)."
+                    )
             else:
                 if no_hf:
                     print(
