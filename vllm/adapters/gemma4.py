@@ -153,8 +153,8 @@ class Gemma4Adapter(ModelAdapter):
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         from vllm.model_executor.models.gemma4 import (
-            set_gemma4_tuning_config,
             _apply_global_tuning_config,
+            set_gemma4_tuning_config,
         )
         config = set_gemma4_tuning_config(tuning_env, locked=True)
         _apply_global_tuning_config(config)
