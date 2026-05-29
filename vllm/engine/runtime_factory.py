@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import torch
+import torch.nn as nn
 
 from vllm.engine.backend.lite_single_gpu import LiteSingleGpuBackend
 from vllm.engine.decode_executor import DecodeExecutor
@@ -14,25 +17,32 @@ from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.step_scheduler import StepScheduler
 
+if TYPE_CHECKING:
+    from vllm.engine.sampling_driver import SamplingDriver
+    from vllm.engine.output_pipeline import OutputPipeline
+    from vllm.engine.lora_runtime import LoRARuntimeRegistry
+    from vllm.engine.request_scheduler import RequestScheduler
+    from vllm.engine.runtime_observer import RuntimeObserver
+
 
 @dataclass(frozen=True)
 class RuntimeAssemblyContext:
-    kv_caches: Any
-    kv_scale_caches: Any
+    kv_caches: list[torch.Tensor]
+    kv_scale_caches: list[torch.Tensor]
     num_blocks_per_seq: int
     block_size: int
-    device: Any
+    device: torch.device
     max_model_len: int
     num_layers: int
     inf_config: Any
     stack_per_layer_carries: Any
     split_per_layer_carries: Any
-    model: Any
-    fast_input_ids: Any
-    fast_positions: Any
-    fast_slot_mapping: Any
-    fast_seq_lens: Any
-    fast_block_tables: Any
+    model: nn.Module
+    fast_input_ids: torch.Tensor
+    fast_positions: torch.Tensor
+    fast_slot_mapping: torch.Tensor
+    fast_seq_lens: torch.Tensor
+    fast_block_tables: torch.Tensor
     step_token_budget: int
     decode_priority_enabled: bool
     prefill_chunk_size: int
@@ -46,11 +56,11 @@ class RuntimeAssemblyContext:
     max_active_requests: int
     scheduler_policy: SchedulerRuntimePolicy
     backend_policy: BackendRuntimePolicy
-    scheduler: Any
-    observer: Any
-    lora_registry: Any
-    sampling_driver: Any
-    output_pipeline: Any
+    scheduler: "RequestScheduler"
+    observer: "RuntimeObserver"
+    lora_registry: "LoRARuntimeRegistry"
+    sampling_driver: "SamplingDriver"
+    output_pipeline: "OutputPipeline"
     queue_timeout_s: float
 
 
