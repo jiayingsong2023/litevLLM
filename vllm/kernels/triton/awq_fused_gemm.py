@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.text_utils import truthy
 
 _AWQ_FUSED_TUNING: dict[str, str] = {}
 _AWQ_FUSED_TUNING_LOCKED = False
@@ -103,19 +104,6 @@ def _kernel_policy_value(
     if name in kernel_policy:
         return kernel_policy[name]
     return default
-
-
-def _policy_truthy(
-    config: Any | None,
-    policy: dict[str, object] | None,
-    name: str,
-    *,
-    default: bool,
-) -> bool:
-    raw = _kernel_policy_value(config, policy, name, default)
-    if isinstance(raw, bool):
-        return raw
-    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _fused_gemm_dot_bf16_tool_override() -> str | None:
@@ -517,12 +505,8 @@ def awq_decode_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_decode_gemv",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_decode_gemv", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_fused_gate_up_enabled(
@@ -530,12 +514,8 @@ def awq_fused_gate_up_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_fused_gate_up",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_fused_gate_up", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_o_proj_group32_gemv_enabled(
@@ -543,12 +523,8 @@ def awq_o_proj_group32_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_o_proj_group32_gemv",
-        default=True,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_o_proj_group32_gemv", True)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_group32_gemv_all_enabled(
@@ -556,12 +532,8 @@ def awq_group32_gemv_all_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_group32_gemv_all",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_group32_gemv_all", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_qo_proj_exact_gemv_enabled(
@@ -569,12 +541,8 @@ def awq_qo_proj_exact_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_qo_proj_exact_gemv",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_qo_proj_exact_gemv", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_q_proj_exact_gemv_enabled(
@@ -582,12 +550,8 @@ def awq_q_proj_exact_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_q_proj_exact_gemv",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_q_proj_exact_gemv", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_o_proj_exact_gemv_enabled(
@@ -595,12 +559,8 @@ def awq_o_proj_exact_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_o_proj_exact_gemv",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_o_proj_exact_gemv", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def awq_o_proj_splitk_gemv_enabled(
@@ -608,12 +568,8 @@ def awq_o_proj_splitk_gemv_enabled(
     config: Any | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    return _policy_truthy(
-        config,
-        policy,
-        "awq_o_proj_splitk_gemv",
-        default=False,
-    )
+    raw = _kernel_policy_value(config, policy, "awq_o_proj_splitk_gemv", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
 
 
 def _o_proj_splitk_gemv_launch_config_tool_override() -> tuple[int, int, int]:

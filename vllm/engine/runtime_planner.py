@@ -6,19 +6,7 @@ import torch
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb
 from vllm.engine.runtime_config import RuntimeConfig
-
-
-def _dtype_nbytes(dtype: torch.dtype) -> int:
-    f8 = getattr(torch, "float8_e4m3fn", None)
-    if f8 is not None and dtype == f8:
-        return 1
-    if dtype == torch.uint8:
-        return 1
-    if dtype in (torch.float16, torch.bfloat16):
-        return 2
-    if dtype == torch.float32:
-        return 4
-    return 2
+from vllm.utils.torch_utils import dtype_nbytes
 
 
 def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
@@ -67,13 +55,21 @@ class RuntimePlanner:
         is_high_end_gpu = gpu_total_gb > 24.0
 
         block_size = self.runtime_config.block_size
-        max_model_len = min(self.caps.max_model_len, self.runtime_config.max_model_len, 4096)
+        max_model_len = min(
+            self.caps.max_model_len, self.runtime_config.max_model_len, 4096
+        )
         if self.runtime_config.kv_max_model_len:
             max_model_len = min(max_model_len, self.runtime_config.kv_max_model_len)
         max_model_len = _align_kv_ctx_len(max_model_len, block_size)
 
-        max_active_requests = min(execution_policy_max, self.runtime_config.max_num_seqs)
-        if is_high_end_gpu and max_active_requests < 16 and self.runtime_config.kv_max_active_requests == 4:
+        max_active_requests = min(
+            execution_policy_max, self.runtime_config.max_num_seqs
+        )
+        if (
+            is_high_end_gpu
+            and max_active_requests < 16
+            and self.runtime_config.kv_max_active_requests == 4
+        ):
             max_active_requests = 16
         if self.runtime_config.kv_max_active_requests != 4:
             max_active_requests = self.runtime_config.kv_max_active_requests
@@ -82,7 +78,9 @@ class RuntimePlanner:
         num_blocks_per_seq = max_model_len // block_size
         num_total_blocks = max_active_requests * num_blocks_per_seq
         default_budget = 8192 if is_high_end_gpu else 4096
-        step_token_budget = max(1, int(self.runtime_config.max_num_batched_tokens or default_budget))
+        step_token_budget = max(
+            1, int(self.runtime_config.max_num_batched_tokens or default_budget)
+        )
 
         if self.runtime_config.prefill_chunk_size > 0:
             prefill_chunk_size = self.runtime_config.prefill_chunk_size
@@ -138,7 +136,7 @@ class RuntimePlanner:
             * execution_plan.block_size
             * self.caps.num_kv_heads
             * kv_head_dim
-            * _dtype_nbytes(kv_dtype)
+            * dtype_nbytes(kv_dtype)
         )
         return KVCachePlan(
             kv_dtype=kv_dtype,

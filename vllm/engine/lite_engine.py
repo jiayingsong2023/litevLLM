@@ -1,28 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
-import time
-import re
-import torch
-import torch.nn as nn
-import copy
+from collections.abc import AsyncIterator
 from dataclasses import replace
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
+from typing import Any
+
+import torch
+
 from vllm.adapters import get_model_adapter
 from vllm.config import VllmConfig
-from vllm.engine.decode_executor import DecodeExecutor
 from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
+from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
-from vllm.engine.input_batch_builder import InputBatchBuilder
-from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.lora_runtime import LoRARuntimeRegistry
 from vllm.engine.output_pipeline import OutputPipeline
-from vllm.engine.prefill_executor import PrefillExecutor
-from vllm.engine.request_scheduler import RequestScheduler
-from vllm.engine.request_state import RequestState
 from vllm.engine.request_builder import LiteRequestBuilder
+from vllm.engine.request_scheduler import RequestScheduler
+from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
 from vllm.engine.runtime_observer import NullRuntimeObserver
-from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_planner import RuntimePlanner
 from vllm.engine.sampling_driver import SamplingDriver
 from vllm.logger import init_logger
@@ -30,22 +24,9 @@ from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput
 from vllm.policies import build_generation_policies
 from vllm.sampling_params import SamplingParams
-from vllm.engine.inference_config import LiteInferenceConfig
+from vllm.utils.torch_utils import dtype_nbytes
 
 logger = init_logger(__name__)
-
-
-def _dtype_nbytes(dtype: torch.dtype) -> int:
-    f8 = getattr(torch, "float8_e4m3fn", None)
-    if f8 is not None and dtype == f8:
-        return 1
-    if dtype == torch.uint8:
-        return 1
-    if dtype in (torch.float16, torch.bfloat16):
-        return 2
-    if dtype == torch.float32:
-        return 4
-    return 2
 
 
 def _bytes_to_gib(value: int | float) -> float:
@@ -63,8 +44,8 @@ def expand_metadata_for_paged_attention(
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
     q_device: torch.device,
-    seq_lens_cpu: Optional[List[int]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    seq_lens_cpu: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Expands seq_lens and block_tables for PagedAttention kernels during prefill.
     Standardizes 'Chunked Prefill' logic across Llama and Qwen architectures.
@@ -242,7 +223,7 @@ class LiteEngine:
             )
         elif kv_plan.kv_dtype == torch.float8_e4m3fn:
             self.inf_config.kv_type = "fp8"
-            print(f">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
+            print(">>>> LiteEngine: KV Cache quantized to FP8 (e4m3fn) [STABLE]")
             self.kv_dtype = kv_plan.kv_dtype
             self.kv_head_dim = kv_plan.kv_head_dim
         else:
@@ -417,7 +398,7 @@ class LiteEngine:
 
         # slot_mapping maps batch tokens to physical indices
         self.scheduler = RequestScheduler(self.max_active_requests)
-        setattr(self.scheduler, "runtime_config", self.runtime_config)
+        self.scheduler.runtime_config = self.runtime_config
         self.lora_registry = LoRARuntimeRegistry()
         self.policies = None
         self.sampling_driver = None
@@ -573,8 +554,8 @@ class LiteEngine:
         buffer_total = 0
         param_count = 0
         buffer_count = 0
-        param_dtype_bytes: Dict[str, int] = {}
-        buffer_dtype_bytes: Dict[str, int] = {}
+        param_dtype_bytes: dict[str, int] = {}
+        buffer_dtype_bytes: dict[str, int] = {}
         param_rows: list[dict[str, Any]] = []
         buffer_rows: list[dict[str, Any]] = []
 
@@ -636,7 +617,7 @@ class LiteEngine:
             "buffers_top": sorted(buffer_rows, key=lambda x: -int(x["bytes"]))[:topn],
         }
 
-    def _resolve_layer_kv_specs(self) -> Optional[list[tuple[int, int]]]:
+    def _resolve_layer_kv_specs(self) -> list[tuple[int, int]] | None:
         """
         Best-effort per-layer KV specs in unpacked domain: (num_kv_heads, head_dim).
         Falls back to model-capability-wide uniform dimensions when model internals are not inspectable.
@@ -650,8 +631,8 @@ class LiteEngine:
                 attn = getattr(layer, "self_attn", None)
                 if attn is None:
                     return None
-                nkv = int(getattr(attn, "num_kv_heads"))
-                hdim = int(getattr(attn, "head_dim"))
+                nkv = int(attn.num_kv_heads)
+                hdim = int(attn.head_dim)
                 if nkv <= 0 or hdim <= 0:
                     return None
                 specs.append((nkv, hdim))
@@ -678,7 +659,7 @@ class LiteEngine:
                 * self.block_size
                 * self.num_kv_heads
                 * self.kv_head_dim
-                * _dtype_nbytes(self.kv_dtype)
+                * dtype_nbytes(self.kv_dtype)
             )
             if not needs_scale_cache:
                 return data
@@ -688,7 +669,7 @@ class LiteEngine:
                 * self.num_total_blocks
                 * self.block_size
                 * self.num_kv_heads
-                * _dtype_nbytes(torch.float32)
+                * dtype_nbytes(torch.float32)
             )
         data = 0
         scale = 0
@@ -700,14 +681,14 @@ class LiteEngine:
                 * self.block_size
                 * nkv
                 * cache_hdim
-                * _dtype_nbytes(self.kv_dtype)
+                * dtype_nbytes(self.kv_dtype)
             )
             scale += (
                 2
                 * self.num_total_blocks
                 * self.block_size
                 * nkv
-                * _dtype_nbytes(torch.float32)
+                * dtype_nbytes(torch.float32)
             )
         return int(data + (scale if needs_scale_cache else 0))
 
@@ -719,7 +700,7 @@ class LiteEngine:
                 * self.num_total_blocks
                 * self.block_size
                 * self.num_kv_heads
-                * _dtype_nbytes(torch.float32)
+                * dtype_nbytes(torch.float32)
             )
         total = 0
         for i in range(self.num_layers):
@@ -729,7 +710,7 @@ class LiteEngine:
                 * self.num_total_blocks
                 * self.block_size
                 * nkv
-                * _dtype_nbytes(torch.float32)
+                * dtype_nbytes(torch.float32)
             )
         return int(total)
 
@@ -740,10 +721,10 @@ class LiteEngine:
 
     @staticmethod
     def _stack_per_layer_carries(
-        req_dicts: List[Dict[str, Any]], num_layers: int, key: str
-    ) -> List[Optional[torch.Tensor]]:
+        req_dicts: list[dict[str, Any]], num_layers: int, key: str
+    ) -> list[torch.Tensor | None]:
         """Batch (B, ...) tensors per layer for Qwen3.5 linear-attn streaming state."""
-        stacked: List[Optional[torch.Tensor]] = []
+        stacked: list[torch.Tensor | None] = []
         for li in range(num_layers):
             parts = [r[key][li] for r in req_dicts]
             if all(p is None for p in parts):
@@ -760,8 +741,8 @@ class LiteEngine:
 
     @staticmethod
     def _split_per_layer_carries(
-        stacked: List[Optional[torch.Tensor]],
-        req_dicts: List[Dict[str, Any]],
+        stacked: list[torch.Tensor | None],
+        req_dicts: list[dict[str, Any]],
         key: str,
     ) -> None:
         for li, t in enumerate(stacked):
@@ -797,9 +778,9 @@ class LiteEngine:
         request_id: str,
         prompt: str,
         sampling_params: SamplingParams,
-        lora_id: Optional[str] = None,
-        lora_request: Optional[Any] = None,
-        multi_modal_data: Optional[dict[str, Any]] = None,
+        lora_id: str | None = None,
+        lora_request: Any | None = None,
+        multi_modal_data: dict[str, Any] | None = None,
     ):
         if self.policies is None:
             self.policies = build_generation_policies(
@@ -887,10 +868,10 @@ class LiteEngine:
             self.scheduler.free_request(request_id)
 
     @torch.inference_mode()
-    def step(self) -> List[RequestOutput]:
+    def step(self) -> list[RequestOutput]:
         return self.runtime_controller.step()
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         return self.runtime_controller.stats()
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:

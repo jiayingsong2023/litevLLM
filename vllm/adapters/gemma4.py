@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Any, cast
 
+from vllm.utils.text_utils import truthy
+
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 from .policy_keys import (
-    Gemma4ModelPolicy,
     GEMMA4_AWQ_DECODE_GEMV,
     GEMMA4_AWQ_FUSED_GATE_UP,
     GEMMA4_AWQ_FUSED_GEMM,
@@ -30,6 +31,7 @@ from .policy_keys import (
     GEMMA4_MOE_PREFILL_GROUPED_STRATEGY,
     GEMMA4_ROPE_CACHE_MAX_POS,
     GEMMA4_ROPE_CACHE_POOL_MAX,
+    Gemma4ModelPolicy,
 )
 
 
@@ -38,10 +40,6 @@ def _int_or(value: Any, default: int) -> int:
         return int(value)
     except Exception:
         return int(default)
-
-
-def _truthy(value: object) -> bool:
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _supports_moe(hf_config: Any) -> bool:
@@ -80,65 +78,71 @@ class Gemma4Adapter(ModelAdapter):
 
         kv_dtype = str(getattr(runtime_config, "kv_cache_dtype", "")).lower()
         force_kv_dtype = None
-        if kv_dtype in ("turbo_int4", "int4") and not _truthy(
+        if kv_dtype in ("turbo_int4", "int4") and not truthy(
             tuning_env.get("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV")
         ):
             force_kv_dtype = "fp8"
 
         is_moe = _supports_moe(getattr(model_config, "hf_config", None))
-        model_policy: Gemma4ModelPolicy = cast(Gemma4ModelPolicy, {
-            GEMMA4_LOCAL_DECODE_TRITON: True,
-            GEMMA4_FORCE_FULL_REF_ATTN: False,
-            GEMMA4_LEGACY_FP16_REF_ATTN: False,
-            GEMMA4_LEGACY_FULLPREC_KV_WRITE: False,
-            GEMMA4_LEGACY_ITEM_PATH: False,
-            GEMMA4_MLP_PAIR_FUSION: True,
-            GEMMA4_FP32_RESIDUAL_GUARD_ENABLED: bool(
-                getattr(
-                    runtime_config,
-                    "gemma4_26b_fp32_residual_guard_enabled",
-                    False,
-                )
-            ),
-            GEMMA4_FP32_RESIDUAL_GUARD_START: int(
-                getattr(runtime_config, "gemma4_26b_fp32_residual_guard_start", 8)
-            ),
-            GEMMA4_FP32_RESIDUAL_GUARD_SPAN: int(
-                getattr(runtime_config, "gemma4_26b_fp32_residual_guard_span", 3)
-            ),
-            GEMMA4_MOE_EXPERT_CACHE_SIZE: int(
-                getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)
-            ),
-            GEMMA4_MOE_COMPUTE_DTYPE: str(
-                getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
-            ),
-            GEMMA4_MOE_INT4_KERNEL_ENABLED: bool(
-                getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
-            ),
-            GEMMA4_MOE_INT4_KERNEL_STRATEGY: str(
-                getattr(runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage")
-            ),
-            GEMMA4_MOE_PREFILL_GROUPED_ENABLED: bool(
-                getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
-            ),
-            GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS: int(
-                getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)
-            ),
-            GEMMA4_MOE_PREFILL_GROUPED_STRATEGY: str(
-                getattr(
-                    runtime_config, "gemma4_moe_prefill_grouped_strategy", "chunked"
-                )
-            ),
-            GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED: bool(
-                getattr(runtime_config, "gemma4_moe_batch_materialize_enabled", False)
-            ),
-            GEMMA4_ROPE_CACHE_MAX_POS: getattr(
-                runtime_config, "gemma4_rope_cache_max_pos", None
-            ),
-            GEMMA4_ROPE_CACHE_POOL_MAX: int(
-                getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
-            ),
-        }
+        model_policy: Gemma4ModelPolicy = cast(
+            Gemma4ModelPolicy,
+            {
+                GEMMA4_LOCAL_DECODE_TRITON: True,
+                GEMMA4_FORCE_FULL_REF_ATTN: False,
+                GEMMA4_LEGACY_FP16_REF_ATTN: False,
+                GEMMA4_LEGACY_FULLPREC_KV_WRITE: False,
+                GEMMA4_LEGACY_ITEM_PATH: False,
+                GEMMA4_MLP_PAIR_FUSION: True,
+                GEMMA4_FP32_RESIDUAL_GUARD_ENABLED: bool(
+                    getattr(
+                        runtime_config,
+                        "gemma4_26b_fp32_residual_guard_enabled",
+                        False,
+                    )
+                ),
+                GEMMA4_FP32_RESIDUAL_GUARD_START: int(
+                    getattr(runtime_config, "gemma4_26b_fp32_residual_guard_start", 8)
+                ),
+                GEMMA4_FP32_RESIDUAL_GUARD_SPAN: int(
+                    getattr(runtime_config, "gemma4_26b_fp32_residual_guard_span", 3)
+                ),
+                GEMMA4_MOE_EXPERT_CACHE_SIZE: int(
+                    getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)
+                ),
+                GEMMA4_MOE_COMPUTE_DTYPE: str(
+                    getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
+                ),
+                GEMMA4_MOE_INT4_KERNEL_ENABLED: bool(
+                    getattr(runtime_config, "gemma4_moe_int4_kernel_enabled", True)
+                ),
+                GEMMA4_MOE_INT4_KERNEL_STRATEGY: str(
+                    getattr(
+                        runtime_config, "gemma4_moe_int4_kernel_strategy", "two_stage"
+                    )
+                ),
+                GEMMA4_MOE_PREFILL_GROUPED_ENABLED: bool(
+                    getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
+                ),
+                GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS: int(
+                    getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)
+                ),
+                GEMMA4_MOE_PREFILL_GROUPED_STRATEGY: str(
+                    getattr(
+                        runtime_config, "gemma4_moe_prefill_grouped_strategy", "chunked"
+                    )
+                ),
+                GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED: bool(
+                    getattr(
+                        runtime_config, "gemma4_moe_batch_materialize_enabled", False
+                    )
+                ),
+                GEMMA4_ROPE_CACHE_MAX_POS: getattr(
+                    runtime_config, "gemma4_rope_cache_max_pos", None
+                ),
+                GEMMA4_ROPE_CACHE_POOL_MAX: int(
+                    getattr(runtime_config, "gemma4_rope_cache_pool_max", 8)
+                ),
+            },
         )
         kernel_policy = {
             GEMMA4_AWQ_FUSED_SCOPE: fused_stage,
