@@ -13,7 +13,7 @@ SUPPORTED_CONFIG_PROFILES = frozenset(
 )
 SUPPORTED_KV_TYPES = frozenset({"auto", "fp16", "fp8", "turbo_int4"})
 _TOP_LEVEL_FIELDS = frozenset(
-    {"profile", "kv_type", "debug", "log_level", "benchmark", "legacy_env"}
+    {"profile", "kv_type", "debug", "log_level", "benchmark", "legacy_env", "tuning_keyvals"}
 )
 
 
@@ -35,6 +35,7 @@ class FastInferenceConfig:
     log_level: str = "info"
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     legacy_env: LegacyEnvConfig = field(default_factory=LegacyEnvConfig)
+    tuning_keyvals: dict[str, str] = field(default_factory=dict)
 
 
 def _as_mapping(value: object, field_name: str) -> Mapping[str, Any]:
@@ -66,6 +67,7 @@ def config_from_mapping(data: Mapping[str, Any]) -> FastInferenceConfig:
 
     benchmark_data = _as_mapping(data.get("benchmark"), "benchmark")
     legacy_data = _as_mapping(data.get("legacy_env"), "legacy_env")
+    tuning_raw = _as_mapping(data.get("tuning_keyvals"), "tuning_keyvals")
 
     return FastInferenceConfig(
         profile=_validate_profile(data.get("profile", "auto")),
@@ -77,6 +79,7 @@ def config_from_mapping(data: Mapping[str, Any]) -> FastInferenceConfig:
             or "default",
         ),
         legacy_env=LegacyEnvConfig(enabled=bool(legacy_data.get("enabled", False))),
+        tuning_keyvals={str(k): str(v) for k, v in tuning_raw.items()},
     )
 
 

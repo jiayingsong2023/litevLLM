@@ -93,13 +93,7 @@ class RuntimeConfig:
             model_capabilities=getattr(vllm_config, "model_capabilities", None),
             gpu_total_gb=get_total_gpu_memory_gb(),
         )
-        tuning_env = (
-            collect_runtime_tuning_env(os.environ, require_legacy_env_flag=False)
-            if fastinference_config.legacy_env.enabled
-            else {}
-        )
-        for migrated_name in _CONFIG_FILE_MIGRATED_RUNTIME_ENV:
-            tuning_env.pop(migrated_name, None)
+        tuning_env = dict(fastinference_config.tuning_keyvals)
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
         kv_cache_dtype = fastinference_config.kv_type.strip().lower()
         if kv_cache_dtype == "auto":

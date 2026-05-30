@@ -38,6 +38,7 @@ write_fastinference_config() {
   local profile="$2"
   local kv_type="$3"
   local legacy_enabled="$4"
+  shift 4
   cat >"$path" <<EOF
 profile = "${profile}"
 kv_type = "${kv_type}"
@@ -45,14 +46,39 @@ kv_type = "${kv_type}"
 [legacy_env]
 enabled = ${legacy_enabled}
 EOF
+  # Append tuning_keyvals if any remain
+  if [ $# -gt 0 ]; then
+    printf "\n[tuning_keyvals]\n" >>"$path"
+    while [ $# -gt 0 ]; do
+      local key="$1"
+      local value="$2"
+      shift 2
+      printf '%s = "%s"\n' "$key" "$value" >>"$path"
+    done
+  fi
 }
 
 CONFIG_TINY_FP8="${FI_REGRESSION_CONFIG_DIR}/tiny-fp8.toml"
 CONFIG_QWEN_ACCURACY_TURBO="${FI_REGRESSION_CONFIG_DIR}/qwen-accuracy-turbo.toml"
-CONFIG_GEMMA_BENCH_TURBO_LEGACY="${FI_REGRESSION_CONFIG_DIR}/gemma-benchmark-turbo-legacy.toml"
+CONFIG_GEMMA_31B="${FI_REGRESSION_CONFIG_DIR}/gemma31b-benchmark-turbo.toml"
+CONFIG_GEMMA_26B="${FI_REGRESSION_CONFIG_DIR}/gemma26b-benchmark-turbo.toml"
 write_fastinference_config "$CONFIG_TINY_FP8" "auto" "fp8" "false"
 write_fastinference_config "$CONFIG_QWEN_ACCURACY_TURBO" "accuracy" "turbo_int4" "false"
-write_fastinference_config "$CONFIG_GEMMA_BENCH_TURBO_LEGACY" "benchmark" "turbo_int4" "true"
+write_fastinference_config "$CONFIG_GEMMA_31B" "benchmark" "turbo_int4" "false" \
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS 1 \
+  FASTINFERENCE_KV_MAX_MODEL_LEN 512 \
+  FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ 1 \
+  FASTINFERENCE_AWQ_DECODE_GEMV 1 \
+  FASTINFERENCE_AWQ_GROUP32_GEMV_ALL 1 \
+  FASTINFERENCE_AWQ_FUSED_GATE_UP 1 \
+  FASTINFERENCE_GPU_GREEDY_SAMPLING 1 \
+  FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY 1 \
+  FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES 1
+write_fastinference_config "$CONFIG_GEMMA_26B" "benchmark" "turbo_int4" "false" \
+  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS 1 \
+  FASTINFERENCE_KV_MAX_MODEL_LEN 512 \
+  FASTINFERENCE_AWQ_DECODE_GEMV 1 \
+  FASTINFERENCE_AWQ_FUSED_GATE_UP 1
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
@@ -73,30 +99,6 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
-
-GEMMA4_31B_RECOMMENDED_ENV=(
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_BENCH_TURBO_LEGACY}"
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
-  FASTINFERENCE_KV_MAX_MODEL_LEN=512
-  FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1
-  FASTINFERENCE_AWQ_DECODE_GEMV=1
-  FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1
-  FASTINFERENCE_AWQ_FUSED_GATE_UP=1
-  FASTINFERENCE_GPU_GREEDY_SAMPLING=1
-  FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY=1
-  FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES=1
-)
-
-GEMMA4_26B_RECOMMENDED_ENV=(
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_BENCH_TURBO_LEGACY}"
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1
-  FASTINFERENCE_KV_MAX_MODEL_LEN=512
-  FASTINFERENCE_AWQ_DECODE_GEMV=1
-  FASTINFERENCE_AWQ_FUSED_GATE_UP=1
-  FASTINFERENCE_GPU_GREEDY_SAMPLING=1
-  FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY=1
-  FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES=1
-)
 
 print_gemma4_profile() {
   local label="$1"
@@ -229,7 +231,8 @@ resolve_gemma4_26b_model_ref() {
 SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
   --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
 GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
-  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal)
+  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal
+  --max-model-len 512)
 GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
   --max-new-tokens 32
   --temperature 0
@@ -282,8 +285,8 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
     else
       echo "[Warn] GEMMA4_PROMPTS_FILE not found, fallback to built-in minimal set: $GEMMA4_PROMPTS_FILE"
     fi
-    print_gemma4_profile "Gemma4-31B" "${GEMMA4_31B_RECOMMENDED_ENV[*]}"
-    env "${GEMMA4_31B_RECOMMENDED_ENV[@]}" \
+    print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
+    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
   else
     echo "[Warn] Gemma4 model dir not found, skipping: $MODEL_GEMMA4_31B_Q4"
@@ -300,8 +303,8 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
       GEMMA4_26B_PROMPT_ARGS=(--prompts-file "$GEMMA4_PROMPTS_FILE")
     fi
-    print_gemma4_profile "Gemma4-26B" "${GEMMA4_26B_RECOMMENDED_ENV[*]}"
-    env "${GEMMA4_26B_RECOMMENDED_ENV[@]}" \
+    print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
+    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
   else
     echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
@@ -350,15 +353,15 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
   echo ""
   echo "=== Tier-A-lite (>14B, key-point audit) ==="
   echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
-  print_gemma4_profile "Gemma4-31B" "${GEMMA4_31B_RECOMMENDED_ENV[*]}"
-  env "${GEMMA4_31B_RECOMMENDED_ENV[@]}" \
+  print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
     "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
 fi
 
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
   echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
-  print_gemma4_profile "Gemma4-26B" "${GEMMA4_26B_RECOMMENDED_ENV[*]}"
-  env "${GEMMA4_26B_RECOMMENDED_ENV[@]}" \
+  print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
     "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
 fi
 

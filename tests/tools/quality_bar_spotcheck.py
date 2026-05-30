@@ -795,8 +795,8 @@ def _build_engine(
     max_model_len: int = 2048,
     max_num_seqs: int = 32,
 ) -> LiteEngine:
-    m_cfg = ModelConfig(model=model_path, tokenizer=model_path)
-    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=4)
+    m_cfg = ModelConfig(model=model_path, tokenizer=model_path, max_model_len=max_model_len)
+    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=0)
     # Keep batched-token budget in line with max_model_len for short spotcheck prompts.
     mbt = min(8192, max(512, max_model_len * 4))
     s_cfg = SchedulerConfig(
@@ -1154,7 +1154,7 @@ def main() -> int:
             gpu_mu = 0.55
         if max_len is None:
             max_len = 1024
-        max_seqs = 4
+        max_seqs = 1
     if gpu_mu is None:
         gpu_mu = 0.9
     if max_len is None:
