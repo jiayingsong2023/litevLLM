@@ -11,6 +11,16 @@ def _read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def _read_package(dir_path: str) -> str:
+    """Read all .py files in a package directory and concatenate them."""
+    pkg_dir = ROOT / dir_path
+    parts = []
+    for f in sorted(pkg_dir.iterdir()):
+        if f.suffix == ".py":
+            parts.append(f.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 def _awq_env_context_violations(
     path: str,
     *,
@@ -347,7 +357,7 @@ def test_production_runtime_has_no_direct_fastinference_env_reads() -> None:
 
 def test_model_files_do_not_read_production_policy_env_names() -> None:
     production_model_files = [
-        "vllm/model_executor/models/gemma4.py",
+        "vllm/model_executor/models/gemma4/",
         "vllm/model_executor/models/qwen3_5.py",
     ]
     forbidden_names = {
@@ -366,7 +376,7 @@ def test_model_files_do_not_read_production_policy_env_names() -> None:
     }
     forbidden_patterns = ("os.environ.get(", "getenv(")
     for rel in production_model_files:
-        text = _read(rel)
+        text = _read_package(rel) if rel.endswith("/") else _read(rel)
         found_names = forbidden_names & set(
             re.findall(r"FASTINFERENCE_[A-Z0-9_]+", text)
         )
@@ -382,7 +392,7 @@ def test_model_files_do_not_read_production_policy_env_names() -> None:
 
 def test_model_tuning_snapshots_use_narrow_allowlists() -> None:
     expectations = {
-        "vllm/model_executor/models/gemma4.py": {
+        "vllm/model_executor/models/gemma4/": {
             "_GEMMA4_ALLOWED_TUNING_ENV",
             "FASTINFERENCE_GEMMA4_LAYER_PROFILE",
             "FASTINFERENCE_GEMMA4_ROCTX_PROFILE",
@@ -395,7 +405,7 @@ def test_model_tuning_snapshots_use_narrow_allowlists() -> None:
         'key.startswith("FASTINFERENCE_DISABLE_")',
     )
     for rel, required_markers in expectations.items():
-        text = _read(rel)
+        text = _read_package(rel) if rel.endswith("/") else _read(rel)
         for marker in required_markers:
             assert marker in text, f"{rel} must document narrow tuning marker {marker}"
         for pattern in forbidden_patterns:
@@ -439,7 +449,7 @@ def test_qwen35_full_attention_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_local_decode_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_env_truthy_default_on("FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON")',
@@ -452,7 +462,7 @@ def test_gemma4_local_decode_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_full_decode_reference_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_env_truthy("FASTINFERENCE_GEMMA4_FORCE_FULL_REF_ATTN")',
@@ -466,7 +476,7 @@ def test_gemma4_full_decode_reference_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_legacy_full_precision_kv_write_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         'return _env_truthy("FASTINFERENCE_GEMMA4_LEGACY_FULLPREC_KV_WRITE")',
@@ -479,7 +489,7 @@ def test_gemma4_legacy_full_precision_kv_write_policy_uses_runtime_config() -> N
 
 
 def test_gemma4_legacy_item_path_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = ('_env_truthy("FASTINFERENCE_GEMMA4_LEGACY_ITEM_PATH")',)
     for pattern in forbidden_patterns:
@@ -490,7 +500,7 @@ def test_gemma4_legacy_item_path_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_mlp_pair_fusion_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_env_truthy_default_on("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION")',
@@ -503,7 +513,7 @@ def test_gemma4_mlp_pair_fusion_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_fp32_residual_guard_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_env_truthy("FASTINFERENCE_GEMMA4_26B_FP32_RESIDUAL_GUARD")',
@@ -518,7 +528,7 @@ def test_gemma4_fp32_residual_guard_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_moe_expert_cache_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = ('_env_int("FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE"',)
     for pattern in forbidden_patterns:
@@ -529,7 +539,7 @@ def test_gemma4_moe_expert_cache_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_awq_fused_gate_up_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = ('_env_truthy("FASTINFERENCE_AWQ_FUSED_GATE_UP")',)
     for pattern in forbidden_patterns:
@@ -540,7 +550,7 @@ def test_gemma4_awq_fused_gate_up_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_rope_cache_policy_uses_runtime_config() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_env_get("FASTINFERENCE_GEMMA4_ROPE_CACHE_MAX_POS"',
@@ -554,7 +564,7 @@ def test_gemma4_rope_cache_policy_uses_runtime_config() -> None:
 
 
 def test_gemma4_profile_flags_do_not_read_env_at_module_init() -> None:
-    gemma = _read("vllm/model_executor/models/gemma4.py")
+    gemma = _read_package("vllm/model_executor/models/gemma4/")
 
     forbidden_patterns = (
         '_GEMMA4_PROFILE_ENABLED = _env_get("FASTINFERENCE_GEMMA4_LAYER_PROFILE"',

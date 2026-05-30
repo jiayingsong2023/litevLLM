@@ -114,9 +114,13 @@ def test_softcap_plumbing_expression_matches_expected(cfg_value, expected):
 # insurance policy against future refactors that silently drop the kwarg.
 # ---------------------------------------------------------------------------
 def test_gemma4_paged_attention_calls_all_pass_softcap():
-    src_path = Path(gemma4_mod.__file__)
-    with src_path.open("r", encoding="utf-8") as fh:
-        src = fh.read()
+    # gemma4 is now a subpackage; scan all .py files in the directory.
+    src_dir = Path(gemma4_mod.__file__).resolve().parent
+    parts = []
+    for f in sorted(src_dir.iterdir()):
+        if f.suffix == ".py":
+            parts.append(f.read_text(encoding="utf-8"))
+    src = "\n".join(parts)
 
     # There are currently 2 in-module call sites to paged_attention_v1:
     # one for local decode and one for global decode. Both must propagate
@@ -129,7 +133,7 @@ def test_gemma4_paged_attention_calls_all_pass_softcap():
     )
     softcap_kwarg_count = src.count("softcap=(")
     assert softcap_kwarg_count >= 2, (
-        "paged_attention_v1 call sites in gemma4.py must each pass softcap=(...)"
+        "paged_attention_v1 call sites in gemma4 must each pass softcap=(...)"
         f" via the Step 3 plumbing expression. Found {softcap_kwarg_count} sites."
     )
 
