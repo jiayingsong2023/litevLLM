@@ -669,16 +669,8 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     def _loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         if loaded_weight.size() == param.size():
             return default_weight_loader(param, loaded_weight)
-        try:
-            from vllm.distributed import (
-                get_tensor_model_parallel_rank,
-                get_tensor_model_parallel_world_size,
-            )
-            tp_rank = get_tensor_model_parallel_rank()
-            tp_world = get_tensor_model_parallel_world_size()
-        except ImportError:
-            tp_rank = 0
-            tp_world = 1
+        tp_rank = 0
+        tp_world = 1
 
         if tp_world <= 1:
             narrowed = loaded_weight.narrow(shard_axis, 0, param.size(shard_axis))

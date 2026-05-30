@@ -10,17 +10,10 @@ import torch
 
 # from vllm.compilation.cuda_graph import CUDAGraphStat
 class CUDAGraphStat: pass
-try:
-    from vllm.core.sched.output import SchedulerOutput
-except ImportError:
-    SchedulerOutput = None  # type: ignore[assignment]
+SchedulerOutput = None  # type: ignore[assignment]
 
-if TYPE_CHECKING:
-    from vllm.distributed.kv_events import KVConnectorKVEvents
-    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
-else:
-    KVConnectorStats = object
-    KVConnectorKVEvents = object
+KVConnectorStats = object
+KVConnectorKVEvents = object
 
 class LogprobsLists(NamedTuple):
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]

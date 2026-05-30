@@ -17,11 +17,8 @@ from diskcache import Cache
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
-try:
-    from vllm.core.sched.output import GrammarOutput, SchedulerOutput
-except ImportError:
-    GrammarOutput = None  # type: ignore[assignment]
-    SchedulerOutput = None  # type: ignore[assignment]
+GrammarOutput = None  # type: ignore[assignment]
+SchedulerOutput = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     import outlines_core as oc
@@ -30,7 +27,6 @@ if TYPE_CHECKING:
     import xgrammar as xgr
 
     from vllm.tokenizers import TokenizerLike
-    from vllm.worker.gpu_input_batch import InputBatch
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     oc = LazyLoader("oc", globals(), "outlines_core")

@@ -14,10 +14,6 @@ from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.attention.backend import AttentionMetadata
-try:
-    from vllm.worker.ubatch_utils import UBatchSlices
-except ImportError:
-    UBatchSlices = None  # type: ignore[assignment,misc]
 
 logger = init_logger(__name__)
 
@@ -149,7 +145,7 @@ class ForwardContext:
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
     batch_descriptor: BatchDescriptor | None = None
 
-    ubatch_slices: UBatchSlices | None = None
+    ubatch_slices: Any | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False

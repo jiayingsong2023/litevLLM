@@ -14,30 +14,22 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
-try:
-    from vllm.distributed import (
-        get_dp_group,
-        get_ep_group,
-        get_pcp_group,
-        get_tensor_model_parallel_world_size,
-        tensor_model_parallel_all_reduce,
-    )
-except ImportError:
-    def get_dp_group(): return None
-    def get_ep_group(): return None
-    def get_pcp_group(): return None
-    def get_tensor_model_parallel_world_size(): return 1
-    def tensor_model_parallel_all_reduce(x): return x
-try:
-    from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
-except ImportError:
-    class EplbLayerState:  # type: ignore[no-redef]
+def get_dp_group(): return None
+def get_ep_group(): return None
+def get_pcp_group(): return None
+def get_tensor_model_parallel_world_size(): return 1
+def tensor_model_parallel_all_reduce(x): return x
 
-        @staticmethod
-        def build_initial_global_physical_to_logical_map(
-            num_experts: int, num_redundant_experts: int = 0
-        ) -> list[int]:
-            return list(range(num_experts + num_redundant_experts))
+class EplbLayerState:  # type: ignore[no-redef]
+
+    @staticmethod
+    def build_initial_global_physical_to_logical_map(
+        num_experts: int, num_redundant_experts: int = 0
+    ) -> list[int]:
+        return list(range(num_experts + num_redundant_experts))
+
+def dbo_current_ubatch_id(): return 0
+
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,

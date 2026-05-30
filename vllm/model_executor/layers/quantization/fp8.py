@@ -11,10 +11,7 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-try:
-    from vllm.distributed import get_tensor_model_parallel_world_size
-except ImportError:
-    def get_tensor_model_parallel_world_size(): return 1
+def get_tensor_model_parallel_world_size(): return 1
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.batch_invariant import (

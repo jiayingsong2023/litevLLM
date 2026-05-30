@@ -19,10 +19,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.utils.math_utils import cdiv
 from vllm.kv_cache_interface import KVCacheSpec, MambaSpec
 
-if TYPE_CHECKING:
-    from vllm.core.sched.output import SchedulerOutput
-    from vllm.worker.gpu_input_batch import InputBatch
-
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase

@@ -11,11 +11,8 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.import_utils import resolve_obj_by_qualname
-try:
-    from vllm.core.sched.output import GrammarOutput, SchedulerOutput
-except ImportError:
-    GrammarOutput = None  # type: ignore[assignment]
-    SchedulerOutput = None  # type: ignore[assignment]
+GrammarOutput = None  # type: ignore[assignment]
+SchedulerOutput = None  # type: ignore[assignment]
 from vllm.engine.v1 import ReconfigureDistributedRequest
 from vllm.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1_outputs import DraftTokenIds, ModelRunnerOutput
