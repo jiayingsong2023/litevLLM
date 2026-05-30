@@ -125,7 +125,7 @@ def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix(
 
     required = (
         "Runtime Profiles",
-        "FASTINFERENCE_PROFILE",
+        "tuning_keyvals",
         "benchmark",
         "latency",
         "throughput",
@@ -136,6 +136,7 @@ def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix(
 
     forbidden = (
         "## 🛠️ 配置指南 (LiteInferenceConfig)",
+        "FASTINFERENCE_PROFILE",
         "FASTINFERENCE_KV_TYPE",
         "FASTINFERENCE_FUSION_LEVEL",
     )
