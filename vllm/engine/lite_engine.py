@@ -602,6 +602,7 @@ class LiteEngine:
             awq_stats = get_awq_runtime_stats()
             awq_cache_bytes = int(awq_stats.get("cache_bytes", 0) or 0)
         except Exception:
+            logger.debug("AWQ runtime stats not available", exc_info=True)
             awq_cache_bytes = 0
 
         return {
@@ -640,6 +641,10 @@ class LiteEngine:
                 return None
             return specs
         except Exception:
+            logger.debug(
+                "_resolve_layer_kv_specs: best-effort fallback, "
+                "per-layer KV specs not available",
+            )
             return None
 
     def _layer_kv_cache_shape_for_layer(self, layer_idx: int) -> tuple[int, int]:
