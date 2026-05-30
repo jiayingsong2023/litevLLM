@@ -67,21 +67,18 @@ def test_runtime_config_config_kv_type_auto_uses_profile(monkeypatch) -> None:
     assert cfg.kv_cache_dtype == "fp8"
 
 
-def test_runtime_config_collects_deprecated_env_when_compat_enabled(
+def test_runtime_config_reads_tuning_keyvals_from_config(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("FASTINFERENCE_ALLOW_LEGACY_ENV", raising=False)
-    monkeypatch.setenv("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV", "1")
-    monkeypatch.setenv("FASTINFERENCE_KV_TYPE", "fp16")
     vllm_config = _mock_vllm_config()
     vllm_config.fastinference_config = FastInferenceConfig(
-        legacy_env=LegacyEnvConfig(enabled=True),
+        tuning_keyvals={"FASTINFERENCE_GEMMA4_ALLOW_INT4_KV": "1"},
     )
 
     cfg = RuntimeConfig.from_vllm_config(vllm_config)
 
     assert cfg.tuning_env["FASTINFERENCE_GEMMA4_ALLOW_INT4_KV"] == "1"
-    assert "FASTINFERENCE_KV_TYPE" not in cfg.tuning_env
     assert cfg.tuning_env["FASTINFERENCE_PROFILE"] == "auto"
 
 
