@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from vllm.engine.errors import RequestRejectedError
 from vllm.engine.runtime_controller import RuntimeController
+from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, StepPlan
 
 
@@ -286,3 +288,66 @@ def test_runtime_controller_reset_stats_resets_window_and_dependencies(
     assert stats["observed_at_unix_s"] == 101.0
     assert stats["stats_window_started_at_unix_s"] == 100.0
     assert stats["stats_window_elapsed_s"] == 1.0
+
+
+class _TimeoutScheduler:
+    def __init__(self) -> None:
+        self.active_request_count = 1
+        self.running_request_count = 0
+        self.queued_request_count = 1
+        self.available_slots = 0
+        self.published = []
+        self.expired_request = {"queued_at": 1.0, "lora_id": "adapter-a"}
+
+    def reject_expired_queued_requests(self, *, now: float, max_queue_wait_s: float):
+        assert now == 10.0
+        assert max_queue_wait_s == 5.0
+        self.active_request_count = 0
+        self.queued_request_count = 0
+        return [
+            (
+                "q-timeout",
+                "queue timeout after 9.000s (limit=5.000s)",
+                self.expired_request,
+            )
+        ]
+
+    def publish_exception(self, request_id, exc):
+        self.published.append((request_id, exc))
+
+
+class _UnexpectedStepScheduler:
+    def build_plan(self, scheduler):
+        del scheduler
+        raise AssertionError("expired queued request should stop the step")
+
+
+def test_runtime_controller_queue_timeout_is_observable(monkeypatch) -> None:
+    scheduler = _TimeoutScheduler()
+    observer = InMemoryRuntimeObserver()
+    lora_registry = _FakeLoRARegistry()
+    controller = RuntimeController(
+        scheduler=scheduler,
+        step_scheduler=_UnexpectedStepScheduler(),
+        observer=observer,
+        backend=_FakeBackend(),
+        queue_timeout_s=5.0,
+        lora_registry=lora_registry,
+    )
+    monkeypatch.setattr(
+        "vllm.engine.runtime_controller.time.perf_counter", lambda: 10.0
+    )
+
+    outputs = controller.step()
+
+    assert outputs == []
+    assert observer.rejected == [
+        ("q-timeout", "queue timeout after 9.000s (limit=5.000s)")
+    ]
+    assert observer.stats()["rejections"] == {
+        "reasons": {"queue_timeout": 1},
+        "queue_timeout": 1,
+    }
+    assert scheduler.published
+    assert scheduler.published[0][0] == "q-timeout"
+    assert isinstance(scheduler.published[0][1], RequestRejectedError)

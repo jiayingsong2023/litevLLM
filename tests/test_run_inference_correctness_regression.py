@@ -170,7 +170,7 @@ def test_run_inference_correctness_regression_uses_config_for_gemma4_26b(
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
     assert str(gemma26_dir) in calls
     assert "CONFIG=/tmp/fastinference-correctness-config." in calls
-    assert "gemma-benchmark-turbo-legacy.toml" in calls
+    assert "gemma26b-benchmark-turbo.toml" in calls
 
 
 def test_run_inference_correctness_regression_uses_default_local_gemma_paths(

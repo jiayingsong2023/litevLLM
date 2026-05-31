@@ -98,6 +98,13 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
     observer.on_request_finished("r1", "eos")
     observer.on_request_aborted("r3")
     observer.on_background_error(RuntimeError("boom"), ["r4"])
+    observer.on_model_surface_resolved(
+        event_name="experimental_model_surface",
+        model_name="models/custom-llama-8b",
+        model_type="llama",
+        status="experimental",
+        reason="model_not_in_regression_surface",
+    )
 
     assert observer.added == ["r1"]
     assert observer.admitted == [("r1", 0.125, "latency")]
@@ -119,6 +126,7 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
     assert observer.preempted_prefill_requests == 2
     assert observer.preempted_multimodal_prefill_requests == 1
     assert observer.rejected == [("r2", "capacity")]
+    assert observer.rejection_reason_counts == {"capacity": 1}
     assert observer.step_count == 1
     assert observer.step_multimodal_admitted_requests == 1
     assert observer.step_multimodal_lora_admitted_requests == 1
@@ -170,6 +178,15 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
     assert observer.finished == [("r1", "eos")]
     assert observer.aborted == ["r3"]
     assert observer.background_errors
+    assert observer.model_surface_events == [
+        {
+            "event_name": "experimental_model_surface",
+            "model_name": "models/custom-llama-8b",
+            "model_type": "llama",
+            "status": "experimental",
+            "reason": "model_not_in_regression_surface",
+        }
+    ]
 
 
 def test_inmemory_runtime_observer_stats_snapshot() -> None:
@@ -201,6 +218,13 @@ def test_inmemory_runtime_observer_stats_snapshot() -> None:
     observer.on_request_finished("r1", "eos")
     observer.on_request_aborted("r3")
     observer.on_background_error(RuntimeError("boom"), ["r4"])
+    observer.on_model_surface_resolved(
+        event_name="experimental_model_surface",
+        model_name="models/custom-llama-8b",
+        model_type="llama",
+        status="experimental",
+        reason="model_not_in_regression_surface",
+    )
     observer.on_step_started(
         StepPlan(
             admissions=None,
@@ -264,6 +288,20 @@ def test_inmemory_runtime_observer_stats_snapshot() -> None:
     assert stats["finished_requests"] == 1
     assert stats["aborted_requests"] == 1
     assert stats["background_error_count"] == 1
+    assert stats["rejections"] == {
+        "reasons": {"capacity": 1},
+        "queue_timeout": 0,
+    }
+    assert stats["model_surface"] == {
+        "events": 1,
+        "experimental_events": 1,
+        "supported_events": 0,
+        "last_event_name": "experimental_model_surface",
+        "last_model_name": "models/custom-llama-8b",
+        "last_model_type": "llama",
+        "last_status": "experimental",
+        "last_reason": "model_not_in_regression_surface",
+    }
     assert stats["prefix_cache"] == {
         "events": 1,
         "hits": 1,
@@ -393,6 +431,20 @@ def test_inmemory_runtime_observer_reset_stats() -> None:
         "background_error_count": 0,
         "step_count": 0,
         "first_token_count": 0,
+        "rejections": {
+            "reasons": {},
+            "queue_timeout": 0,
+        },
+        "model_surface": {
+            "events": 0,
+            "experimental_events": 0,
+            "supported_events": 0,
+            "last_event_name": "",
+            "last_model_name": "",
+            "last_model_type": "",
+            "last_status": "",
+            "last_reason": "",
+        },
         "multimodal": {
             "requests": 0,
             "images": 0,

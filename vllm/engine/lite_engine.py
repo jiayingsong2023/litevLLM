@@ -11,6 +11,7 @@ from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
 from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb, select_loadtime_policy
 from vllm.engine.lora_runtime import LoRARuntimeRegistry
+from vllm.engine.model_surface import resolve_model_surface
 from vllm.engine.output_pipeline import OutputPipeline
 from vllm.engine.request_builder import LiteRequestBuilder
 from vllm.engine.request_scheduler import RequestScheduler
@@ -123,6 +124,10 @@ class LiteEngine:
         )
         self.adapter = get_model_adapter(self.model, self.model_config)
         self.model_capabilities = self.adapter.detect(self.model, self.model_config)
+        self.model_surface = resolve_model_surface(
+            model_name=str(getattr(self.model_config, "model", "")),
+            capabilities=self.model_capabilities,
+        )
         self.vllm_config.model_capabilities = self.model_capabilities
         self.num_attention_heads = self.model_capabilities.num_attention_heads
         self.num_kv_heads = self.model_capabilities.num_kv_heads
@@ -407,6 +412,7 @@ class LiteEngine:
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
         )
+        self._record_model_surface_event()
         self._queue_timeout_s = float(self.runtime_config.queue_timeout_s)
 
         # Pre-allocate tensors for SYNC FAST PATH (BS=1 to max_active_requests)
@@ -513,6 +519,26 @@ class LiteEngine:
             self.runtime_config,
             "kernel_policy",
             dict(getattr(runtime_policy, "kernel_policy", {}) or {}),
+        )
+
+    def _record_model_surface_event(self) -> None:
+        surface = self.model_surface
+        self.observer.on_model_surface_resolved(
+            event_name=surface.event_name,
+            model_name=surface.model_name,
+            model_type=surface.model_type,
+            status=surface.status,
+            reason=surface.reason,
+        )
+        log = logger.warning if surface.status == "experimental" else logger.info
+        log(
+            "LiteEngine model surface event=%s model=%s model_type=%s "
+            "status=%s reason=%s",
+            surface.event_name,
+            surface.model_name,
+            surface.model_type,
+            surface.status,
+            surface.reason,
         )
 
     def _install_tuning_configs_for_model(self, runtime_policy: Any) -> None:

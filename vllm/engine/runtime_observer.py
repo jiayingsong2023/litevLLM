@@ -74,6 +74,17 @@ class RuntimeObserver:
     def on_background_error(self, exc: BaseException, request_ids: list[str]) -> None:
         pass
 
+    def on_model_surface_resolved(
+        self,
+        *,
+        event_name: str,
+        model_name: str,
+        model_type: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        pass
+
     def stats(self) -> dict[str, Any]:
         return {}
 
@@ -89,6 +100,7 @@ class NullRuntimeObserver(RuntimeObserver):
 class InMemoryRuntimeObserver(RuntimeObserver):
     added: list[str] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
+    rejection_reason_counts: dict[str, int] = field(default_factory=dict)
     admitted: list[tuple[str, float, str]] = field(default_factory=list)
     prefix_cache_events: list[tuple[str, bool, bool, int, int]] = field(default_factory=list)
     prefix_cache_hits: int = 0
@@ -138,6 +150,7 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     first_tokens: list[tuple[str, float]] = field(default_factory=list)
     aborted: list[str] = field(default_factory=list)
     background_errors: list[str] = field(default_factory=list)
+    model_surface_events: list[dict[str, str]] = field(default_factory=list)
     step_count: int = 0
     multimodal_requests: int = 0
     multimodal_images: int = 0
@@ -186,6 +199,10 @@ class InMemoryRuntimeObserver(RuntimeObserver):
 
     def on_request_rejected(self, request_id: str, reason: str) -> None:
         self.rejected.append((request_id, reason))
+        reason_key = self._rejection_reason_key(reason)
+        self.rejection_reason_counts[reason_key] = (
+            self.rejection_reason_counts.get(reason_key, 0) + 1
+        )
 
     def on_request_admitted(
         self,
@@ -444,9 +461,31 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     def on_background_error(self, exc: BaseException, request_ids: list[str]) -> None:
         self.background_errors.append(f"{type(exc).__name__}:{exc}:{','.join(request_ids)}")
 
+    def on_model_surface_resolved(
+        self,
+        *,
+        event_name: str,
+        model_name: str,
+        model_type: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        self.model_surface_events.append(
+            {
+                "event_name": str(event_name),
+                "model_name": str(model_name),
+                "model_type": str(model_type),
+                "status": str(status),
+                "reason": str(reason),
+            }
+        )
+
     def stats(self) -> dict[str, Any]:
         prefix_cache_hits = self.prefix_cache_hits
         prefix_cache_events = len(self.prefix_cache_events)
+        model_surface_last = (
+            self.model_surface_events[-1] if self.model_surface_events else {}
+        )
         return {
             "added_requests": len(self.added),
             "rejected_requests": len(self.rejected),
@@ -456,6 +495,28 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             "background_error_count": len(self.background_errors),
             "step_count": self.step_count,
             "first_token_count": len(self.first_tokens),
+            "rejections": {
+                "reasons": dict(self.rejection_reason_counts),
+                "queue_timeout": self.rejection_reason_counts.get("queue_timeout", 0),
+            },
+            "model_surface": {
+                "events": len(self.model_surface_events),
+                "experimental_events": sum(
+                    1
+                    for event in self.model_surface_events
+                    if event["status"] == "experimental"
+                ),
+                "supported_events": sum(
+                    1
+                    for event in self.model_surface_events
+                    if event["status"] == "supported"
+                ),
+                "last_event_name": model_surface_last.get("event_name", ""),
+                "last_model_name": model_surface_last.get("model_name", ""),
+                "last_model_type": model_surface_last.get("model_type", ""),
+                "last_status": model_surface_last.get("status", ""),
+                "last_reason": model_surface_last.get("reason", ""),
+            },
             "multimodal": {
                 "requests": self.multimodal_requests,
                 "images": self.multimodal_images,
@@ -670,6 +731,7 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     def reset_stats(self) -> None:
         self.added.clear()
         self.rejected.clear()
+        self.rejection_reason_counts.clear()
         self.admitted.clear()
         self.prefix_cache_events.clear()
         self.prefix_cache_hits = 0
@@ -719,6 +781,7 @@ class InMemoryRuntimeObserver(RuntimeObserver):
         self.first_tokens.clear()
         self.aborted.clear()
         self.background_errors.clear()
+        self.model_surface_events.clear()
         self.step_count = 0
         self.multimodal_requests = 0
         self.multimodal_images = 0
@@ -754,6 +817,13 @@ class InMemoryRuntimeObserver(RuntimeObserver):
         self.multimodal_lora_decode_max_fairness_gap_sum = 0.0
         self.multimodal_max_queue_wait_s = 0.0
         self.multimodal_queue_wait_samples_s.clear()
+
+    @staticmethod
+    def _rejection_reason_key(reason: str) -> str:
+        normalized = str(reason or "unknown").strip().lower()
+        if normalized.startswith("queue timeout"):
+            return "queue_timeout"
+        return normalized.replace(" ", "_") or "unknown"
 
     @staticmethod
     def _merge_counts(target: dict[str, int], delta: dict[str, int]) -> None:
@@ -891,6 +961,25 @@ class LoggingRuntimeObserver(RuntimeObserver):
     def on_background_error(self, exc: BaseException, request_ids: list[str]) -> None:
         logger.exception(
             "runtime background error requests=%s exc=%s", request_ids, exc
+        )
+
+    def on_model_surface_resolved(
+        self,
+        *,
+        event_name: str,
+        model_name: str,
+        model_type: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        log = logger.warning if status == "experimental" else logger.info
+        log(
+            "runtime model surface event=%s model=%s model_type=%s status=%s reason=%s",
+            event_name,
+            model_name,
+            model_type,
+            status,
+            reason,
         )
 
     def stats(self) -> dict[str, Any]:
