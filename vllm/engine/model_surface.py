@@ -16,7 +16,7 @@ class ModelSurface:
 
 
 _SUPPORTED_MODEL_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("tinyllama", ("tinyllama-1.1b-chat-v1.0",)),
+    ("llama", ("tinyllama-1.1b-chat-v1.0",)),
     ("qwen3_5", ("qwen3.5-9b-awq",)),
     ("gemma4", ("gemma-4-31b-it-awq-4bit", "gemma-4-26b-a4b-it-awq-4bit")),
 )
