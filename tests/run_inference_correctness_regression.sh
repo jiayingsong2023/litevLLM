@@ -10,8 +10,8 @@
 #
 # Policy:
 #   - models <= 14B: A-strict + B
-#   - models > 14B:  A-lite + B
-#   - exception: Gemma4-26B-A4B defaults to A-strict + A-lite + B
+#   - models > 14B:  B by default; A-tier is opt-in via RUN_GEMMA4_LARGE_A_TIER=1
+#   - exception: Gemma4-26B-A4B strict/lite A-tier also requires the same opt-in
 #
 # Usage:
 #   FASTINFERENCE_CONFIG=/path/to/config.toml bash tests/run_inference_correctness_regression.sh
@@ -20,6 +20,8 @@
 #   SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh   # B-tier only (faster)
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
+#   RUN_GEMMA4_LARGE_A_TIER=1 bash tests/run_inference_correctness_regression.sh
+#     # opt in to Gemma4 31B/26B A-tier checks on machines with enough free VRAM
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -99,6 +101,7 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
+RUN_GEMMA4_LARGE_A_TIER="${RUN_GEMMA4_LARGE_A_TIER:-0}"
 
 print_gemma4_profile() {
   local label="$1"
@@ -340,29 +343,47 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && ( "${RUN_GEMMA4_A_STRICT}" == "1" || "${RU
   echo "[Info] Gemma4-31B A-strict prefill audit is disabled; running Tier-B + A-lite only."
 fi
 
+GEMMA4_LARGE_A_TIER_REQUESTED=0
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
-  echo "[A3-strict-26B] Gemma4-26B A4B prefill-only strict audit (manual)"
-  GEMMA26_HF_ARGS=()
-  if [[ -n "$HF_GEMMA4_26B" ]]; then
-    GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
-  fi
-  "${GEMMA4_26B_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_26B_A4B" "${GEMMA26_HF_ARGS[@]}"
+  GEMMA4_LARGE_A_TIER_REQUESTED=1
 fi
-
 if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
-  echo ""
-  echo "=== Tier-A-lite (>14B, key-point audit) ==="
-  echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
-  print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
-    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+  GEMMA4_LARGE_A_TIER_REQUESTED=1
+fi
+if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
+  GEMMA4_LARGE_A_TIER_REQUESTED=1
 fi
 
-if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
-  echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
-  print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
-    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
+if [[ "${RUN_GEMMA4_LARGE_A_TIER}" != "1" ]]; then
+  if [[ "${GEMMA4_LARGE_A_TIER_REQUESTED}" == "1" ]]; then
+    echo "[Info] Skipping Gemma4 large-model A-tier by default to avoid sequential 31B/26B validation OOM."
+    echo "[Info] Set RUN_GEMMA4_LARGE_A_TIER=1 to opt in on machines with enough free VRAM."
+  fi
+else
+  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
+    echo "[A3-strict-26B] Gemma4-26B A4B prefill-only strict audit (manual)"
+    GEMMA26_HF_ARGS=()
+    if [[ -n "$HF_GEMMA4_26B" ]]; then
+      GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
+    fi
+    "${GEMMA4_26B_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_26B_A4B" "${GEMMA26_HF_ARGS[@]}"
+  fi
+
+  if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
+    echo ""
+    echo "=== Tier-A-lite (>14B, key-point audit) ==="
+    echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
+    print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
+    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
+      "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+  fi
+
+  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
+    echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
+    print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
+    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
+      "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
+  fi
 fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then

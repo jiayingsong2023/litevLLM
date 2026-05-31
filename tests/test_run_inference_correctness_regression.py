@@ -65,6 +65,69 @@ def test_run_inference_correctness_regression_skips_gemma4_31b_a_strict(
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
 
 
+
+
+def test_run_inference_correctness_regression_skips_large_gemma_a_tier_by_default(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    log_path = tmp_path / "uv_calls.log"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'printf "%s\n" "$*" >> "{log_path}"',
+                "exit 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_awq_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    qwen_fp16_dir = tmp_path / "models" / "Qwen3.5-9B-FP16"
+    gemma31_dir = tmp_path / "models" / "gemma-4-31B-it-AWQ-4bit"
+    gemma26_dir = tmp_path / "models" / "gemma-4-26B-A4B-it-AWQ-4bit"
+    for model_dir in (tiny_dir, qwen_awq_dir, qwen_fp16_dir, gemma31_dir, gemma26_dir):
+        model_dir.mkdir(parents=True)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_awq_dir)
+    env["HF_QWEN35_9B_FP16"] = str(qwen_fp16_dir)
+    env["MODEL_GEMMA4_31B_Q4"] = str(gemma31_dir)
+    env["MODEL_GEMMA4_26B_A4B"] = str(gemma26_dir)
+    env["RUN_GEMMA4_31B"] = "1"
+    env["RUN_GEMMA4_26B"] = "1"
+    env.pop("RUN_GEMMA4_LARGE_A_TIER", None)
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    calls = log_path.read_text(encoding="utf-8")
+    assert "run python tests/tools/quality_bar_spotcheck.py" in calls
+    assert str(gemma31_dir) in calls
+    assert str(gemma26_dir) in calls
+    assert "run python tests/tools/gemma4_prefill_strict_audit.py" not in calls
+    assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
+    assert "Skipping Gemma4 large-model A-tier" in proc.stdout
+
 def test_run_inference_correctness_regression_requires_qwen35_fp16_reference(
     tmp_path: Path,
 ) -> None:
