@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.engine.sampling_driver import SamplingDriver
@@ -58,6 +59,37 @@ def test_2d_batch_sampler_greedy():
 
     tokens = driver.sample_batch_tokens(logits, requests)
     assert tokens == [1, 0, 4]
+
+
+def test_2d_batch_sampler_greedy_skips_sort_and_softmax(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tokenizer = DummyTokenizer()
+    policies = DummyPolicies()
+    driver = SamplingDriver(tokenizer, None, policies)
+
+    logits = torch.tensor(
+        [
+            [1.0, 5.0, 2.0],
+            [9.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    requests = [
+        {"generated_ids": [], "sampling_params": SamplingParams(temperature=0.0)},
+        {"generated_ids": [], "sampling_params": SamplingParams(temperature=0.0)},
+    ]
+
+    def _unexpected_sort(*args, **kwargs):
+        raise AssertionError("greedy sampling should not sort the vocab")
+
+    def _unexpected_softmax(*args, **kwargs):
+        raise AssertionError("greedy sampling should not compute softmax")
+
+    monkeypatch.setattr(torch, "sort", _unexpected_sort)
+    monkeypatch.setattr(torch, "softmax", _unexpected_softmax)
+
+    assert driver.sample_batch_tokens(logits, requests) == [1, 0]
 
 
 def test_2d_batch_sampler_mixed_params_and_penalties():

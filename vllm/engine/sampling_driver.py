@@ -186,6 +186,13 @@ class SamplingDriver:
 
             logits[i] = row_logits
 
+        greedy_flags = [
+            float(getattr(req["sampling_params"], "temperature", 0.0) or 0.0) <= 1e-6
+            for req in requests
+        ]
+        if all(greedy_flags):
+            return [int(torch.argmax(logits[i]).item()) for i in range(B)]
+
         # Extract parameters into tensors
         temps = torch.tensor(
             [
