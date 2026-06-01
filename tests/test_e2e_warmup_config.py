@@ -82,8 +82,105 @@ def test_resolve_warmup_config_cold_preset(monkeypatch) -> None:
 
 
 def test_resolve_compile_cache_env(tmp_path: Path) -> None:
-    args = argparse.Namespace(compile_cache_dir=str(tmp_path / "compile_cache"), compile_cache_clear=False)
+    args = argparse.Namespace(
+        compile_cache_dir=str(tmp_path / "compile_cache"), compile_cache_clear=False
+    )
     env_map, meta = bench._resolve_compile_cache_env(args)
     assert meta["enabled"] is True
     assert "TRITON_CACHE_DIR" in env_map
     assert "TORCHINDUCTOR_CACHE_DIR" in env_map
+
+
+def test_runtime_metrics_include_async_driver_snapshot() -> None:
+    metrics = bench._derive_runtime_metrics(
+        {
+            "observer": {"step_count": 8},
+            "backend": {},
+            "async_driver": {
+                "steps": 10,
+                "backpressure_sleeps": 7,
+                "idle_waits": 2,
+                "background_errors": 1,
+                "min_step_interval_s": 0.003,
+            },
+        }
+    )
+
+    async_metrics = metrics["async_driver"]
+    assert async_metrics["steps"] == 10.0
+    assert async_metrics["backpressure_sleep_rate"] == 0.7
+    assert async_metrics["background_error_rate"] == 0.1
+    assert async_metrics["observer_step_gap"] == 2.0
+
+
+def test_runtime_phase_diffs_include_async_driver_delta() -> None:
+    diffs = bench._derive_runtime_phase_diffs(
+        {
+            "warmup": {
+                "derived_metrics": {
+                    "async_driver": {
+                        "steps": 2,
+                        "backpressure_sleeps": 1,
+                        "idle_waits": 1,
+                        "background_errors": 0,
+                        "backpressure_sleep_rate": 0.5,
+                    }
+                }
+            },
+            "benchmark": {
+                "derived_metrics": {
+                    "async_driver": {
+                        "steps": 7,
+                        "backpressure_sleeps": 6,
+                        "idle_waits": 1,
+                        "background_errors": 1,
+                        "backpressure_sleep_rate": 0.857,
+                    }
+                }
+            },
+        }
+    )
+
+    async_delta = diffs["async_driver"]["benchmark_delta"]
+    assert async_delta["steps"] == 5.0
+    assert async_delta["backpressure_sleeps"] == 5.0
+    assert async_delta["background_errors"] == 1.0
+    assert async_delta["backpressure_sleep_rate"] > 0.35
+    assert any(
+        line.startswith("  RUNTIME(async):")
+        for line in bench._format_runtime_phase_diff_summary(diffs)
+    )
+
+
+def test_evaluate_perf_regressions_warns_without_failing() -> None:
+    warnings = bench._evaluate_perf_regressions(
+        {
+            "gemma4_31b_q4": {
+                "aggregate_tps": 8.0,
+                "prefill_tps_aggregate": 100.0,
+                "decode_tps_aggregate": 4.0,
+                "ttft_p50_ms": 130.0,
+            }
+        },
+        {
+            "gemma4_31b_q4": {
+                "aggregate_tps": 10.0,
+                "prefill_tps_aggregate": 100.0,
+                "decode_tps_aggregate": 5.0,
+                "ttft_p50_ms": 100.0,
+            }
+        },
+        min_tps_ratio=0.85,
+        max_latency_ratio=1.25,
+    )
+
+    assert {item["metric"] for item in warnings} == {
+        "aggregate_tps",
+        "decode_tps_aggregate",
+        "ttft_p50_ms",
+    }
+    assert all("model" in item for item in warnings)
+    assert all(
+        line.startswith("PERF WARNING:")
+        for line in bench._format_perf_regression_warnings(warnings)
+    )

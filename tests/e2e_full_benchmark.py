@@ -400,6 +400,9 @@ _CLI_OPTS_WITH_VALUES = {
     "--gemma31b-bucket-short-decode-profile",
     "--gemma31b-bucket-long-profile",
     "--gemma31b-schedule-profile",
+    "--perf-baseline-json",
+    "--perf-warn-min-tps-ratio",
+    "--perf-warn-max-latency-ratio",
 }
 
 
@@ -786,6 +789,7 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     observer = snapshot.get("observer", {})
     backend = snapshot.get("backend", {})
     lora_runtime = snapshot.get("lora", {})
+    async_driver = snapshot.get("async_driver", {})
     if not isinstance(observer, dict) or not isinstance(backend, dict):
         return {}
 
@@ -812,9 +816,18 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
         backend_multimodal = {}
     if not isinstance(lora_runtime, dict):
         lora_runtime = {}
+    if not isinstance(async_driver, dict):
+        async_driver = {}
 
     request_count = float(observer_prefix.get("events", 0) or 0)
     step_count = float(observer.get("step_count", 0) or 0)
+    async_steps = float(async_driver.get("steps", 0) or 0)
+    async_backpressure_sleeps = float(async_driver.get("backpressure_sleeps", 0) or 0)
+    async_idle_waits = float(async_driver.get("idle_waits", 0) or 0)
+    async_background_errors = float(async_driver.get("background_errors", 0) or 0)
+    async_min_step_interval_s = float(
+        async_driver.get("min_step_interval_s", 0.0) or 0.0
+    )
     admitted_requests = float(observer.get("admitted_requests", 0) or 0)
     materialized_hits = float(backend.get("prefix_cache_materialized_hits", 0) or 0)
     materialized_saved = float(
@@ -869,6 +882,21 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
     adapter_fairness_gap = _share_gap_map(admitted_adapter_share, backlog_adapter_share)
 
     return {
+        "async_driver": {
+            "steps": async_steps,
+            "backpressure_sleeps": async_backpressure_sleeps,
+            "idle_waits": async_idle_waits,
+            "background_errors": async_background_errors,
+            "min_step_interval_s": async_min_step_interval_s,
+            "backpressure_sleep_rate": (
+                async_backpressure_sleeps / async_steps if async_steps else 0.0
+            ),
+            "idle_wait_rate": async_idle_waits / async_steps if async_steps else 0.0,
+            "background_error_rate": (
+                async_background_errors / async_steps if async_steps else 0.0
+            ),
+            "observer_step_gap": async_steps - step_count,
+        },
         "prefix_cache": {
             "request_count": request_count,
             "lookup_hit_rate": float(backend_prefix.get("hit_rate", 0.0) or 0.0),
@@ -1459,6 +1487,8 @@ def _derive_runtime_phase_diffs(
     if not isinstance(warmup_metrics, dict) or not isinstance(benchmark_metrics, dict):
         return {}
 
+    warmup_async = warmup_metrics.get("async_driver", {})
+    benchmark_async = benchmark_metrics.get("async_driver", {})
     warmup_prefix = warmup_metrics.get("prefix_cache", {})
     benchmark_prefix = benchmark_metrics.get("prefix_cache", {})
     warmup_preemption = warmup_metrics.get("preemption", {})
@@ -1469,6 +1499,8 @@ def _derive_runtime_phase_diffs(
     benchmark_lora = benchmark_metrics.get("lora", {})
     warmup_multimodal = warmup_metrics.get("multimodal", {})
     benchmark_multimodal = benchmark_metrics.get("multimodal", {})
+    if not isinstance(warmup_async, dict) or not isinstance(benchmark_async, dict):
+        warmup_async, benchmark_async = {}, {}
     if not isinstance(warmup_prefix, dict) or not isinstance(benchmark_prefix, dict):
         warmup_prefix, benchmark_prefix = {}, {}
     if not isinstance(warmup_preemption, dict) or not isinstance(
@@ -1485,6 +1517,22 @@ def _derive_runtime_phase_diffs(
         benchmark_multimodal, dict
     ):
         warmup_multimodal, benchmark_multimodal = {}, {}
+
+    async_keys = (
+        "steps",
+        "backpressure_sleeps",
+        "idle_waits",
+        "background_errors",
+        "backpressure_sleep_rate",
+        "idle_wait_rate",
+        "background_error_rate",
+        "observer_step_gap",
+    )
+    async_delta = {}
+    for key in async_keys:
+        async_delta[key] = float(benchmark_async.get(key, 0.0) or 0.0) - float(
+            warmup_async.get(key, 0.0) or 0.0
+        )
 
     prefix_keys = (
         "request_count",
@@ -1675,6 +1723,11 @@ def _derive_runtime_phase_diffs(
     return {
         "baseline_phase": "warmup",
         "target_phase": "benchmark",
+        "async_driver": {
+            "warmup": dict(warmup_async),
+            "benchmark": dict(benchmark_async),
+            "benchmark_delta": async_delta,
+        },
         "prefix_cache": {
             "warmup": dict(warmup_prefix),
             "benchmark": dict(benchmark_prefix),
@@ -1710,6 +1763,19 @@ def _format_runtime_phase_diff_summary(
         return []
 
     lines: list[str] = []
+    async_driver = phase_diffs.get("async_driver", {})
+    if isinstance(async_driver, dict):
+        async_delta = async_driver.get("benchmark_delta", {})
+        if isinstance(async_delta, dict):
+            lines.append(
+                "  RUNTIME(async): "
+                f"steps_delta={float(async_delta.get('steps', 0.0) or 0.0):+.0f}, "
+                f"backpressure_delta={float(async_delta.get('backpressure_sleeps', 0.0) or 0.0):+.0f}, "
+                f"idle_wait_delta={float(async_delta.get('idle_waits', 0.0) or 0.0):+.0f}, "
+                f"error_delta={float(async_delta.get('background_errors', 0.0) or 0.0):+.0f}, "
+                f"sleep_rate_delta={float(async_delta.get('backpressure_sleep_rate', 0.0) or 0.0):+.3f}"
+            )
+
     prefix_cache = phase_diffs.get("prefix_cache", {})
     if isinstance(prefix_cache, dict):
         prefix_delta = prefix_cache.get("benchmark_delta", {})
@@ -1835,8 +1901,18 @@ def _format_runtime_snapshot_summary(snapshot: Dict[str, object]) -> list[str]:
     if not isinstance(derived, dict):
         return []
     lines: list[str] = []
+    async_driver = derived.get("async_driver", {})
     lora = derived.get("lora", {})
     multimodal = derived.get("multimodal", {})
+    if isinstance(async_driver, dict):
+        lines.append(
+            "  RUNTIME(async,current): "
+            f"steps={float(async_driver.get('steps', 0.0) or 0.0):.0f}, "
+            f"backpressure_sleeps={float(async_driver.get('backpressure_sleeps', 0.0) or 0.0):.0f}, "
+            f"idle_waits={float(async_driver.get('idle_waits', 0.0) or 0.0):.0f}, "
+            f"errors={float(async_driver.get('background_errors', 0.0) or 0.0):.0f}, "
+            f"sleep_rate={float(async_driver.get('backpressure_sleep_rate', 0.0) or 0.0):.3f}"
+        )
     if isinstance(lora, dict):
         lines.append(
             "  RUNTIME(lora,current): "
@@ -2502,6 +2578,98 @@ async def run_benchmark(
             torch.cuda.empty_cache()
 
 
+def _safe_metric(value: object) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _load_perf_baseline(path: str) -> dict[str, Any]:
+    if not path.strip():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    summary = payload.get("summary", payload)
+    return dict(summary) if isinstance(summary, dict) else {}
+
+
+def _evaluate_perf_regressions(
+    summary: dict[str, dict[str, Any]],
+    baseline: dict[str, Any],
+    *,
+    min_tps_ratio: float,
+    max_latency_ratio: float,
+) -> list[dict[str, object]]:
+    if not baseline:
+        return []
+    warnings: list[dict[str, object]] = []
+    throughput_metrics = (
+        "aggregate_tps",
+        "prefill_tps_aggregate",
+        "decode_tps_aggregate",
+    )
+    latency_metrics = ("ttft_p50_ms", "ttft_p95_ms", "e2e_p50_ms", "e2e_p95_ms")
+    min_tps_ratio = max(0.0, float(min_tps_ratio))
+    max_latency_ratio = max(1.0, float(max_latency_ratio))
+    for model_key, current in summary.items():
+        if current.get("skipped", 0.0) == 1.0 or current.get("timed_out", 0.0) == 1.0:
+            continue
+        base = baseline.get(model_key, {})
+        if not isinstance(base, dict):
+            continue
+        for metric in throughput_metrics:
+            cur = _safe_metric(current.get(metric))
+            ref = _safe_metric(base.get(metric))
+            if cur is None or ref is None or ref <= 0.0:
+                continue
+            ratio = cur / ref
+            if ratio < min_tps_ratio:
+                warnings.append(
+                    {
+                        "model": model_key,
+                        "metric": metric,
+                        "kind": "throughput_drop",
+                        "current": cur,
+                        "baseline": ref,
+                        "ratio": ratio,
+                        "threshold": min_tps_ratio,
+                    }
+                )
+        for metric in latency_metrics:
+            cur = _safe_metric(current.get(metric))
+            ref = _safe_metric(base.get(metric))
+            if cur is None or ref is None or ref <= 0.0:
+                continue
+            ratio = cur / ref
+            if ratio > max_latency_ratio:
+                warnings.append(
+                    {
+                        "model": model_key,
+                        "metric": metric,
+                        "kind": "latency_increase",
+                        "current": cur,
+                        "baseline": ref,
+                        "ratio": ratio,
+                        "threshold": max_latency_ratio,
+                    }
+                )
+    return warnings
+
+
+def _format_perf_regression_warnings(warnings: list[dict[str, object]]) -> list[str]:
+    lines: list[str] = []
+    for item in warnings:
+        lines.append(
+            "PERF WARNING: "
+            f"model={item.get('model')} metric={item.get('metric')} "
+            f"kind={item.get('kind')} current={_fmt_float(float(item.get('current', float('nan'))), '.3f')} "
+            f"baseline={_fmt_float(float(item.get('baseline', float('nan'))), '.3f')} "
+            f"ratio={_fmt_float(float(item.get('ratio', float('nan'))), '.3f')} "
+            f"threshold={_fmt_float(float(item.get('threshold', float('nan'))), '.3f')}"
+        )
+    return lines
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="End-to-end performance benchmark focused on Gemma4 26B/31B models."
@@ -2792,6 +2960,30 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--perf-baseline-json",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Optional prior e2e_full_benchmark JSON. When provided, this run "
+            "emits structured warnings for throughput drops or latency increases."
+        ),
+    )
+    parser.add_argument(
+        "--perf-warn-min-tps-ratio",
+        type=float,
+        default=0.85,
+        metavar="RATIO",
+        help="Warn when current throughput metric is below this fraction of baseline.",
+    )
+    parser.add_argument(
+        "--perf-warn-max-latency-ratio",
+        type=float,
+        default=1.25,
+        metavar="RATIO",
+        help="Warn when current latency metric exceeds this multiple of baseline.",
+    )
+    parser.add_argument(
         "--model-process-isolation",
         action="store_true",
         default=False,
@@ -2813,6 +3005,7 @@ async def main() -> None:
     args = _parse_args()
     aggressive = _is_e2e_aggressive(args)
     warmup_config = _resolve_warmup_config(args)
+    perf_baseline = _load_perf_baseline(args.perf_baseline_json)
     compile_cache_env, compile_cache_meta = _resolve_compile_cache_env(args)
     compile_cache_before = _cache_dir_stats(compile_cache_meta.get("cache_dir"))
     compile_cache_after = dict(compile_cache_before)
@@ -3008,6 +3201,15 @@ async def main() -> None:
         )
         profile_stats = dict(r.get("profile") or {})
         print(_format_profile_summary(profile_stats))
+    perf_regression_warnings = _evaluate_perf_regressions(
+        summary,
+        perf_baseline,
+        min_tps_ratio=float(args.perf_warn_min_tps_ratio),
+        max_latency_ratio=float(args.perf_warn_max_latency_ratio),
+    )
+    for line in _format_perf_regression_warnings(perf_regression_warnings):
+        print(line)
+
     if compile_cache_meta.get("enabled"):
         print(
             "compile_cache      | "
@@ -3044,6 +3246,7 @@ async def main() -> None:
             "resolved_scheduler_policy": resolved_scheduler_policy,
             "summary": summary,
             "runtime_stats": runtime_stats_summary,
+            "perf_regressions": perf_regression_warnings,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -3078,6 +3281,7 @@ async def main() -> None:
             },
             "resolved_scheduler_policy": resolved_scheduler_policy,
             "runtime_stats": runtime_stats_summary,
+            "perf_regressions": perf_regression_warnings,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(args.runtime_stats_out, "w", encoding="utf-8") as f:

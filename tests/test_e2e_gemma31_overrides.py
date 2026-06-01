@@ -234,3 +234,23 @@ def test_benchmark_clears_warmup_prefix_cache_by_default() -> None:
         )
         is False
     )
+
+
+def test_parse_args_accepts_perf_baseline_warning_flags(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "e2e_full_benchmark.py",
+            "--perf-baseline-json",
+            "/tmp/baseline.json",
+            "--perf-warn-min-tps-ratio",
+            "0.9",
+            "--perf-warn-max-latency-ratio",
+            "1.1",
+        ],
+    )
+    args = bench._parse_args()
+    assert args.perf_baseline_json == "/tmp/baseline.json"
+    assert args.perf_warn_min_tps_ratio == 0.9
+    assert args.perf_warn_max_latency_ratio == 1.1
