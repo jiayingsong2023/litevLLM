@@ -67,11 +67,46 @@ def gemma4_engine(gemma4_smoke_mod: Any, gemma4_model_path: str) -> Any:
     }
 
 
-def test_resolve_default_model_path_prefers_local_candidates(gemma4_smoke_mod: Any) -> None:
+def test_resolve_default_model_path_prefers_local_candidates(
+    gemma4_smoke_mod: Any,
+) -> None:
     path = gemma4_smoke_mod.resolve_default_model_path()
     if path is None:
         pytest.skip("Gemma4 local model dir not found.")
     assert Path(path).exists()
+
+
+def test_build_engine_applies_max_model_len_to_model_config(
+    gemma4_smoke_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeEngine:
+        def __init__(self, vllm_config: Any) -> None:
+            captured["vllm_config"] = vllm_config
+
+    monkeypatch.setattr(gemma4_smoke_mod, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(
+        gemma4_smoke_mod, "get_tokenizer", lambda *args, **kwargs: object()
+    )
+
+    args = gemma4_smoke_mod._build_parser().parse_args(
+        [
+            "--model",
+            "dummy-gemma4",
+            "--max-model-len",
+            "512",
+            "--max-num-batched-tokens",
+            "1024",
+        ]
+    )
+
+    gemma4_smoke_mod._build_engine(args)
+
+    cfg = captured["vllm_config"]
+    assert cfg.model_config.max_model_len == 512
+    assert cfg.scheduler_config.max_model_len == 512
+    assert cfg.scheduler_config.max_num_seqs == 1
 
 
 def test_gemma4_single_text_generation_finishes(
@@ -95,5 +130,7 @@ def test_gemma4_single_text_generation_finishes(
 
 
 def test_text_only_kwargs_reject_multimodal_inputs() -> None:
-    with pytest.raises(NotImplementedError, match="text-only path does not support multimodal input"):
+    with pytest.raises(
+        NotImplementedError, match="text-only path does not support multimodal input"
+    ):
         _assert_text_only_kwargs({"pixel_values": torch.zeros(1)})

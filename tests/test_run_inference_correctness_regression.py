@@ -65,9 +65,7 @@ def test_run_inference_correctness_regression_skips_gemma4_31b_a_strict(
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
 
 
-
-
-def test_run_inference_correctness_regression_skips_large_gemma_a_tier_by_default(
+def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default(
     tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -81,7 +79,13 @@ def test_run_inference_correctness_regression_skips_large_gemma_a_tier_by_defaul
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'printf "%s\n" "$*" >> "{log_path}"',
+                (
+                    'printf "CONFIG=%s KV_LEN=%s ACTIVE=%s CMD=%s\n" '
+                    '"${FASTINFERENCE_CONFIG:-}" '
+                    '"${FASTINFERENCE_KV_MAX_MODEL_LEN:-}" '
+                    '"${FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS:-}" '
+                    '"$*" >> "' + str(log_path) + '"'
+                ),
                 "exit 0",
             ]
         )
@@ -124,9 +128,20 @@ def test_run_inference_correctness_regression_skips_large_gemma_a_tier_by_defaul
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
     assert str(gemma31_dir) in calls
     assert str(gemma26_dir) in calls
-    assert "run python tests/tools/gemma4_prefill_strict_audit.py" not in calls
-    assert "run python tests/tools/gemma4_single_prompt_smoke.py" not in calls
-    assert "Skipping Gemma4 large-model A-tier" in proc.stdout
+    assert "run python tests/tools/gemma4_prefill_strict_audit.py" in calls
+    assert "--preset gemma4_26b_a4b" in calls
+    assert "run python tests/tools/gemma4_single_prompt_smoke.py" in calls
+    assert f"--model {gemma31_dir}" in calls
+    assert f"--model {gemma26_dir}" in calls
+    assert (
+        "KV_LEN=512 ACTIVE=1 CMD=run python tests/tools/gemma4_single_prompt_smoke.py"
+        in calls
+    )
+    assert "Gemma4-31B A-strict prefill audit is disabled" in proc.stdout
+    assert "Skipping Gemma4 large-model A-tier" not in proc.stdout
+    assert "Cleanup after Gemma4-31B A-lite" in proc.stdout
+    assert "Cleanup after Gemma4-26B A-lite" in proc.stdout
+
 
 def test_run_inference_correctness_regression_requires_qwen35_fp16_reference(
     tmp_path: Path,
@@ -191,7 +206,11 @@ def test_run_inference_correctness_regression_uses_config_for_gemma4_26b(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'printf "CONFIG=%s CMD=%s\\n" "${{FASTINFERENCE_CONFIG:-}}" "$*" >> "{log_path}"',
+                (
+                    'printf "CONFIG=%s CMD=%s\\n" '
+                    '"${FASTINFERENCE_CONFIG:-}" '
+                    '"$*" >> "' + str(log_path) + '"'
+                ),
                 "exit 0",
             ]
         )
@@ -338,4 +357,7 @@ def test_run_inference_correctness_regression_uses_tinyllama_prompts_file(
 
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     calls = log_path.read_text(encoding="utf-8")
-    assert "--prompts-file tests/tools/fixtures/tinyllama_correctness_prompts_default.json" in calls
+    assert (
+        "--prompts-file tests/tools/fixtures/tinyllama_correctness_prompts_default.json"
+        in calls
+    )

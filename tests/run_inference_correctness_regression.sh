@@ -10,8 +10,8 @@
 #
 # Policy:
 #   - models <= 14B: A-strict + B
-#   - models > 14B:  B by default; A-tier is opt-in via RUN_GEMMA4_LARGE_A_TIER=1
-#   - exception: Gemma4-26B-A4B strict/lite A-tier also requires the same opt-in
+#   - models > 14B: B + isolated A-lite by default
+#   - exception: Gemma4-31B strict HF parity is disabled; Gemma4-26B keeps a prefill-only strict audit
 #
 # Usage:
 #   FASTINFERENCE_CONFIG=/path/to/config.toml bash tests/run_inference_correctness_regression.sh
@@ -20,8 +20,7 @@
 #   SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh   # B-tier only (faster)
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
-#   RUN_GEMMA4_LARGE_A_TIER=1 bash tests/run_inference_correctness_regression.sh
-#     # opt in to Gemma4 31B/26B A-tier checks on machines with enough free VRAM
+#   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,6 +63,8 @@ CONFIG_TINY_FP8="${FI_REGRESSION_CONFIG_DIR}/tiny-fp8.toml"
 CONFIG_QWEN_ACCURACY_TURBO="${FI_REGRESSION_CONFIG_DIR}/qwen-accuracy-turbo.toml"
 CONFIG_GEMMA_31B="${FI_REGRESSION_CONFIG_DIR}/gemma31b-benchmark-turbo.toml"
 CONFIG_GEMMA_26B="${FI_REGRESSION_CONFIG_DIR}/gemma26b-benchmark-turbo.toml"
+CONFIG_GEMMA_31B_A_LITE="${FI_REGRESSION_CONFIG_DIR}/gemma31b-a-lite-latency.toml"
+CONFIG_GEMMA_26B_A_LITE="${FI_REGRESSION_CONFIG_DIR}/gemma26b-a-lite-latency.toml"
 write_fastinference_config "$CONFIG_TINY_FP8" "auto" "fp8" "false"
 write_fastinference_config "$CONFIG_QWEN_ACCURACY_TURBO" "accuracy" "turbo_int4" "false"
 write_fastinference_config "$CONFIG_GEMMA_31B" "benchmark" "turbo_int4" "false" \
@@ -81,6 +82,8 @@ write_fastinference_config "$CONFIG_GEMMA_26B" "benchmark" "turbo_int4" "false" 
   FASTINFERENCE_KV_MAX_MODEL_LEN 512 \
   FASTINFERENCE_AWQ_DECODE_GEMV 1 \
   FASTINFERENCE_AWQ_FUSED_GATE_UP 1
+write_fastinference_config "$CONFIG_GEMMA_31B_A_LITE" "latency" "fp8" "false"
+write_fastinference_config "$CONFIG_GEMMA_26B_A_LITE" "latency" "fp8" "false"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
@@ -101,8 +104,6 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
-RUN_GEMMA4_LARGE_A_TIER="${RUN_GEMMA4_LARGE_A_TIER:-0}"
-
 print_gemma4_profile() {
   local label="$1"
   shift
@@ -140,6 +141,17 @@ warn_if_repo_id_proxy_is_unsupported() {
     echo "[Warn] Current ALL_PROXY uses 'socks://' (${proxy}), which httpx/huggingface_hub rejects."
     echo "[Warn] Prefer a local model dir under models/, or switch proxy to 'socks5://'."
   fi
+}
+
+cleanup_after_model_step() {
+  local label="$1"
+  echo "[Info] Cleanup after ${label}"
+  uv run python -c 'import gc; gc.collect(); import torch;
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+    if ipc_collect is not None:
+        ipc_collect()' >/dev/null 2>&1 || true
 }
 
 require_model_ref() {
@@ -291,6 +303,7 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
     print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
     FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
+    cleanup_after_model_step "Gemma4-31B Tier-B"
   else
     echo "[Warn] Gemma4 model dir not found, skipping: $MODEL_GEMMA4_31B_Q4"
   fi
@@ -309,6 +322,7 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
     print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
     FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
+    cleanup_after_model_step "Gemma4-26B Tier-B"
   else
     echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
   fi
@@ -339,51 +353,47 @@ FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" uv run python tests/verify_se
   --prefill-only \
   --apply-chat-template off
 
-if [[ "${GEMMA4_AVAILABLE}" == "1" && ( "${RUN_GEMMA4_A_STRICT}" == "1" || "${RUN_GEMMA4_A_TIER}" == "1" ) ]]; then
+if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
   echo "[Info] Gemma4-31B A-strict prefill audit is disabled; running Tier-B + A-lite only."
 fi
 
-GEMMA4_LARGE_A_TIER_REQUESTED=0
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
-  GEMMA4_LARGE_A_TIER_REQUESTED=1
-fi
-if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
-  GEMMA4_LARGE_A_TIER_REQUESTED=1
-fi
-if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
-  GEMMA4_LARGE_A_TIER_REQUESTED=1
-fi
-
-if [[ "${RUN_GEMMA4_LARGE_A_TIER}" != "1" ]]; then
-  if [[ "${GEMMA4_LARGE_A_TIER_REQUESTED}" == "1" ]]; then
-    echo "[Info] Skipping Gemma4 large-model A-tier by default to avoid sequential 31B/26B validation OOM."
-    echo "[Info] Set RUN_GEMMA4_LARGE_A_TIER=1 to opt in on machines with enough free VRAM."
+  echo "[A3-strict-26B] Gemma4-26B A4B prefill-only strict audit (manual)"
+  GEMMA26_HF_ARGS=()
+  if [[ -n "$HF_GEMMA4_26B" ]]; then
+    GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
   fi
-else
-  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]; then
-    echo "[A3-strict-26B] Gemma4-26B A4B prefill-only strict audit (manual)"
-    GEMMA26_HF_ARGS=()
-    if [[ -n "$HF_GEMMA4_26B" ]]; then
-      GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
-    fi
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
     "${GEMMA4_26B_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_26B_A4B" "${GEMMA26_HF_ARGS[@]}"
-  fi
+  cleanup_after_model_step "Gemma4-26B A-strict"
+fi
 
-  if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
-    echo ""
-    echo "=== Tier-A-lite (>14B, key-point audit) ==="
-    echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
-    print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
-    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
-      "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
-  fi
+if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
+  echo ""
+  echo "=== Tier-A-lite (>14B, key-point audit) ==="
+  echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
+  print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B_A_LITE}"
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B_A_LITE}" \
+    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
+    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
+    FASTINFERENCE_AWQ_DECODE_GEMV=1 \
+    FASTINFERENCE_AWQ_FUSED_GATE_UP=1 \
+    FASTINFERENCE_AWQ_GROUP32_GEMV_ALL=1 \
+    FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ=1 \
+    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+  cleanup_after_model_step "Gemma4-31B A-lite"
+fi
 
-  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
-    echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
-    print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
-    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
-      "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
-  fi
+if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
+  echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
+  print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B_A_LITE}"
+  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B_A_LITE}" \
+    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
+    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
+    FASTINFERENCE_AWQ_DECODE_GEMV=1 \
+    FASTINFERENCE_AWQ_FUSED_GATE_UP=1 \
+    "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
+  cleanup_after_model_step "Gemma4-26B A-lite"
 fi
 
 if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then

@@ -19,9 +19,15 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.engine.lite_engine import LiteEngine
 from vllm.model_executor.model_loader import get_tokenizer
 from vllm.outputs import RequestOutput
@@ -32,7 +38,8 @@ DEFAULT_A_LITE_PROMPTS: list[tuple[str, str]] = [
     ("zh_capital", "法国的首都是哪里？请用一句话回答。"),
     (
         "chat_intro",
-        "Please introduce yourself briefly and list two ways you can help with coding tasks.",
+        "Please introduce yourself briefly and list two ways you can help "
+        "with coding tasks.",
     ),
 ]
 
@@ -44,7 +51,7 @@ DEFAULT_MODEL_PATH_CANDIDATES: tuple[str, ...] = (
 )
 
 
-def resolve_default_model_path() -> Optional[str]:
+def resolve_default_model_path() -> str | None:
     env_model = os.environ.get("MODEL_GEMMA4_31B_Q4", "").strip()
     if env_model:
         return env_model
@@ -91,9 +98,7 @@ def _looks_like_preformatted_chat(text: str) -> bool:
     s = text.lstrip()
     if len(s) >= 12 and "<|im_start|>" in s[:400]:
         return True
-    if s.startswith("<|") and "user" in s[:120].lower():
-        return True
-    return False
+    return s.startswith("<|") and "user" in s[:120].lower()
 
 
 def _apply_chat_template(tokenizer: Any, text: str) -> str:
@@ -181,7 +186,7 @@ def _run_single_request(
     req_id = f"gemma4_a_lite_{prompt_id}"
     engine.add_request(req_id, wrapped_prompt, sp)
 
-    final_output: Optional[RequestOutput] = None
+    final_output: RequestOutput | None = None
     step_count = 0
     while engine.active_request_count > 0 and step_count < step_budget:
         step_count += 1
@@ -210,6 +215,7 @@ def _build_engine(args: argparse.Namespace) -> tuple[LiteEngine, Any, float]:
     model_cfg = ModelConfig(
         model=model_path,
         tokenizer=args.tokenizer or model_path,
+        max_model_len=args.max_model_len,
     )
     cache_cfg = CacheConfig(
         block_size=args.block_size,
@@ -242,8 +248,12 @@ def _resolve_prompts(args: argparse.Namespace) -> list[tuple[str, str]]:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Gemma4 A-lite audit (LiteEngine)")
     p.add_argument("--model", type=str, required=True, help="Model path")
-    p.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path (default: --model)")
-    p.add_argument("--prompt", type=str, default=None, help="Optional single custom prompt")
+    p.add_argument(
+        "--tokenizer", type=str, default=None, help="Tokenizer path (default: --model)"
+    )
+    p.add_argument(
+        "--prompt", type=str, default=None, help="Optional single custom prompt"
+    )
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
@@ -267,7 +277,8 @@ def main() -> int:
 
     print(
         f"[A-lite] model={args.model} quant={_read_quant_method(args.model)} "
-        f"prompts={len(prompts)} max_new_tokens={args.max_new_tokens} load_s={load_s:.2f}"
+        f"prompts={len(prompts)} max_new_tokens={args.max_new_tokens} "
+        f"load_s={load_s:.2f}"
     )
 
     failures = 0
