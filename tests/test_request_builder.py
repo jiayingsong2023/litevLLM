@@ -8,6 +8,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from vllm.engine.request_builder import LiteRequestBuilder
+from vllm.engine.request_state import RequestState
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 
@@ -53,7 +54,7 @@ def _hf_tokenizer():
         "AC": 5,
         "{": 6,
         "}": 7,
-        "\"": 8,
+        '"': 8,
         ":": 9,
         ",": 10,
         "1": 11,
@@ -70,6 +71,18 @@ def _hf_tokenizer():
         unk_token="[UNK]",
         eos_token="[UNK]",
     )
+
+
+def test_request_state_declares_all_engine_request_fields() -> None:
+    request = RequestState(
+        request_id="r-state",
+        prompt="prompt",
+        guarded_prompt="guarded",
+        input_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=4),
+    ).to_engine_request()
+
+    assert set(request) == RequestState.engine_request_fields()
 
 
 def test_request_builder_attaches_choice_structured_output_constraint() -> None:
@@ -209,7 +222,7 @@ def test_request_builder_marks_multimodal_lora_request() -> None:
     assert request["is_multimodal_lora"] is True
 
 
-def test_request_builder_attaches_structured_output_constraint_for_multimodal_request() -> None:
+def test_request_builder_adds_structured_constraint_for_multimodal() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_hf_tokenizer(),
         policies=_Policies(),
@@ -250,7 +263,7 @@ def test_request_builder_rejects_unsupported_structured_output_type() -> None:
             prompt="prompt",
             sampling_params=SamplingParams(
                 max_tokens=4,
-                structured_outputs=StructuredOutputsParams(grammar="root ::= \"x\""),
+                structured_outputs=StructuredOutputsParams(grammar='root ::= "x"'),
             ),
         )
     except ValueError as exc:
@@ -259,7 +272,7 @@ def test_request_builder_rejects_unsupported_structured_output_type() -> None:
         raise AssertionError("expected unsupported structured outputs type to fail")
 
 
-def test_request_builder_attaches_grammar_structured_output_constraint_for_hf_tokenizer() -> None:
+def test_request_builder_adds_grammar_constraint_for_hf_tokenizer() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_hf_tokenizer(),
         policies=_Policies(),
@@ -281,7 +294,7 @@ def test_request_builder_attaches_grammar_structured_output_constraint_for_hf_to
     assert request["structured_output_constraint"] is not None
 
 
-def test_request_builder_attaches_choice_structured_output_constraint_for_hf_tokenizer() -> None:
+def test_request_builder_adds_choice_constraint_for_hf_tokenizer() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_hf_tokenizer(),
         policies=_Policies(),
@@ -303,7 +316,7 @@ def test_request_builder_attaches_choice_structured_output_constraint_for_hf_tok
     assert request["structured_output_constraint"] is not None
 
 
-def test_request_builder_attaches_json_structured_output_constraint_for_hf_tokenizer() -> None:
+def test_request_builder_adds_json_constraint_for_hf_tokenizer() -> None:
     builder = LiteRequestBuilder(
         tokenizer=_hf_tokenizer(),
         policies=_Policies(),

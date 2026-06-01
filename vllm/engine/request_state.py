@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -16,13 +16,13 @@ class RequestState:
     guarded_prompt: str
     input_ids: list[int]
     sampling_params: SamplingParams
-    lora_id: Optional[str] = None
-    lora_int_id: Optional[int] = None
-    lora_path: Optional[str] = None
-    rng: Optional[torch.Generator] = None
+    lora_id: str | None = None
+    lora_int_id: int | None = None
+    lora_path: str | None = None
+    rng: torch.Generator | None = None
     generated_ids: list[int] = field(default_factory=list)
     finished: bool = False
-    slot_idx: Optional[int] = None
+    slot_idx: int | None = None
     seq_len: int = 0
     is_prefill: bool = True
     linear_attn_carry: list[torch.Tensor | None] = field(default_factory=list)
@@ -37,8 +37,38 @@ class RequestState:
     is_multimodal: bool = False
     is_multimodal_lora: bool = False
 
-    def to_engine_request(self) -> dict[str, Any]:
+    @classmethod
+    def engine_request_fields(cls) -> set[str]:
         return {
+            "request_id",
+            "input_ids",
+            "generated_ids",
+            "sampling_params",
+            "finished",
+            "prompt",
+            "guarded_prompt",
+            "slot_idx",
+            "seq_len",
+            "is_prefill",
+            "lora_id",
+            "lora_int_id",
+            "lora_path",
+            "rng",
+            "linear_attn_carry",
+            "linear_conv_carry",
+            "low_info_hits",
+            "is_chinese_capital_question",
+            "capital_question_bias_token_ids",
+            "anti_template_token_ids",
+            "structured_output_constraint",
+            "service_class",
+            "multi_modal_data",
+            "is_multimodal",
+            "is_multimodal_lora",
+        }
+
+    def to_engine_request(self) -> dict[str, Any]:
+        request = {
             "request_id": self.request_id,
             "input_ids": self.input_ids,
             "generated_ids": self.generated_ids,
@@ -65,3 +95,11 @@ class RequestState:
             "is_multimodal": self.is_multimodal,
             "is_multimodal_lora": self.is_multimodal_lora,
         }
+        missing = self.engine_request_fields() - set(request)
+        extra = set(request) - self.engine_request_fields()
+        if missing or extra:
+            raise AssertionError(
+                f"RequestState engine fields mismatch: missing={sorted(missing)} "
+                f"extra={sorted(extra)}"
+            )
+        return request

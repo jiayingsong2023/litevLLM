@@ -6,11 +6,11 @@ import asyncio
 import pytest
 
 from vllm.engine import async_llm as async_llm_module
+from vllm.engine.async_driver import AsyncDriver
+from vllm.engine.request_scheduler import RequestScheduler
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.engine.async_driver import AsyncDriver
-from vllm.engine.request_scheduler import RequestScheduler
 
 
 def _request_output(request_id: str, finished: bool) -> RequestOutput:
@@ -59,7 +59,9 @@ async def test_request_scheduler_stream_raises_published_exception() -> None:
 def test_request_scheduler_enqueue_and_admit_releases_queue() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
     scheduler.add_request("r1", {"slot_idx": 0, "is_prefill": True})
-    scheduler.enqueue_request("r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2]})
+    scheduler.enqueue_request(
+        "r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2]}
+    )
 
     assert scheduler.active_request_count == 2
     assert scheduler.running_request_count == 1
@@ -99,6 +101,52 @@ def test_request_scheduler_rejects_expired_queued_requests() -> None:
     assert scheduler.queued_ids == ["r2"]
 
 
+def test_async_driver_default_backpressure_interval_is_positive() -> None:
+    class FakeEngine:
+        active_request_count = 0
+
+        def step(self):
+            return []
+
+    driver = AsyncDriver(FakeEngine())
+
+    assert driver.stats()["min_step_interval_s"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_async_driver_applies_positive_backpressure_interval() -> None:
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        if len(sleep_delays) >= 2:
+            engine.active_request_count = 0
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.active_request_count = 1
+            self.calls = 0
+
+        def step(self):
+            self.calls += 1
+            return []
+
+    engine = FakeEngine()
+    driver = AsyncDriver(
+        engine,
+        min_step_interval_s=0.002,
+        sleep_fn=fake_sleep,
+    )
+    driver.notify_new_work()
+    await asyncio.sleep(0.01)
+    driver.shutdown()
+
+    assert engine.calls >= 2
+    assert sleep_delays[:2] == [0.002, 0.002]
+    assert driver.stats()["steps"] >= 2
+    assert driver.stats()["backpressure_sleeps"] >= 2
+
+
 @pytest.mark.asyncio
 async def test_async_driver_propagates_background_error_to_engine() -> None:
     class FakeEngine:
@@ -126,8 +174,50 @@ async def test_async_driver_propagates_background_error_to_engine() -> None:
     assert "driver-failure" in str(engine.error)
 
 
+def test_async_llm_stats_include_async_driver_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        def __init__(self, _vllm_config) -> None:
+            self.tokenizer = None
+
+        def stats(self) -> dict[str, object]:
+            return {"scheduler": {"active_request_count": 1}}
+
+    class FakeDriver:
+        def __init__(self, engine) -> None:
+            self.engine = engine
+
+        def stats(self) -> dict[str, object]:
+            return {"steps": 3, "backpressure_sleeps": 2}
+
+        def shutdown(self) -> None:
+            return None
+
+    class DummyConfig:
+        class ModelConfig:
+            model = "dummy"
+
+        model_config = ModelConfig()
+
+    monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
+
+    llm = async_llm_module.AsyncLLM(DummyConfig())
+
+    assert llm.stats() == {
+        "scheduler": {"active_request_count": 1},
+        "async_driver": {"steps": 3, "backpressure_sleeps": 2},
+    }
+
+
 @pytest.mark.asyncio
-async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_async_llm_generate_abort_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
@@ -153,7 +243,9 @@ async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPat
                     break
 
         def abort_request(self, request_id: str) -> None:
-            self.streams[request_id].put_nowait(_request_output(request_id, finished=True))
+            self.streams[request_id].put_nowait(
+                _request_output(request_id, finished=True)
+            )
 
     class FakeDriver:
         def __init__(self, engine) -> None:
@@ -174,7 +266,9 @@ async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
     monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
-    monkeypatch.setattr(async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
 
     llm = async_llm_module.AsyncLLM(DummyConfig())
     agen = llm.generate("hi", SamplingParams(max_tokens=4), "req-1")
@@ -188,7 +282,9 @@ async def test_async_llm_generate_abort_end_to_end(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_async_llm_generate_passes_lora_request(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_async_llm_generate_passes_lora_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
@@ -203,7 +299,9 @@ async def test_async_llm_generate_passes_lora_request(monkeypatch: pytest.Monkey
             lora_id=None,
             lora_request=None,
         ) -> None:
-            self.calls.append((request_id, prompt, sampling_params, lora_id, lora_request))
+            self.calls.append(
+                (request_id, prompt, sampling_params, lora_id, lora_request)
+            )
             queue = asyncio.Queue()
             queue.put_nowait(_request_output(request_id, finished=True))
             self.streams[request_id] = queue
@@ -234,14 +332,18 @@ async def test_async_llm_generate_passes_lora_request(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
     monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
-    monkeypatch.setattr(async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
 
     llm = async_llm_module.AsyncLLM(DummyConfig())
     agen = llm.generate(
         "hi",
         SamplingParams(max_tokens=4),
         "req-1",
-        lora_request=LoRARequest(lora_name="adapter-a", lora_int_id=3, lora_path="/tmp/a"),
+        lora_request=LoRARequest(
+            lora_name="adapter-a", lora_int_id=3, lora_path="/tmp/a"
+        ),
     )
     output = await agen.__anext__()
 
