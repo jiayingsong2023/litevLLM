@@ -59,4 +59,4 @@ or feature status lists.
 | Smoke | `uv run pytest -q tests/smoke` | Import, routing, and no-model HTTP sanity checks. |
 | Fast regression | `bash tests/run_regression_suite.sh` | Unit and structural smoke tests without full model loads. |
 | Correctness | `bash tests/run_inference_correctness_regression.sh` | Local-model quality and semantic gates. |
-| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, and profile-level performance baselines. |
+| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, profile-level baselines, async runtime counters, and optional baseline warning reports. |

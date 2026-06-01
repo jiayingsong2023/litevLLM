@@ -89,6 +89,8 @@ uv run python tests/e2e_full_benchmark.py \
 - benchmark 的 `stable_env` 仍会固定 `FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1` 与 `FASTINFERENCE_KV_MAX_MODEL_LEN=512`，用于保证默认性能结果可复现
 - 在 ROCm 上，如果一次运行里包含多个 Gemma4 大模型，脚本会默认启用 **per-model process isolation**
 - 这个隔离模式用于避免顺序大模型 benchmark 时的显存残留 / allocator fragmentation 导致的 OOM
+- benchmark 会在 stdout 和 JSON 中记录 `RUNTIME(async)` / `RUNTIME(async,current)`，用于观察 async driver step、backpressure sleep、idle wait 和 background error
+- 如果提供历史 JSON baseline，benchmark 会生成 advisory `perf_regressions` warning；默认不阻断运行
 
 可显式控制：
 
@@ -106,6 +108,21 @@ uv run python tests/e2e_full_benchmark.py --no-model-process-isolation ...
 - `--gemma26b-prompt-tokens N`
 - `--warmup-preset default|off|cold`
 - `--json-out <path>`
+- `--runtime-stats-out <path>`
+- `--perf-baseline-json <path>`
+- `--perf-warn-min-tps-ratio RATIO`，默认 `0.85`
+- `--perf-warn-max-latency-ratio RATIO`，默认 `1.25`
+
+性能 baseline 用法示例：
+
+```bash
+uv run python tests/e2e_full_benchmark.py --json-out /tmp/current.json
+uv run python tests/e2e_full_benchmark.py \
+  --perf-baseline-json /tmp/current.json \
+  --json-out /tmp/next.json
+```
+
+`perf_regressions` 只记录吞吐下降或延迟上升的 warning，适合写入 PR 说明；是否阻断由人工根据改动范围判断。
 
 ## Gemma4 专项工具
 
