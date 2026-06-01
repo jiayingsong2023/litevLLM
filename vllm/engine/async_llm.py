@@ -23,7 +23,14 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.engine = LiteEngine(vllm_config)
         self.engine.tokenizer = get_tokenizer(vllm_config.model_config)
-        self.driver = AsyncDriver(self.engine)
+        runtime_config = getattr(vllm_config, "runtime_config", None)
+        min_step_interval_s = float(
+            getattr(runtime_config, "async_driver_min_step_interval_s", 0.001)
+        )
+        self.driver = AsyncDriver(
+            self.engine,
+            min_step_interval_s=min_step_interval_s,
+        )
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig, **kwargs):

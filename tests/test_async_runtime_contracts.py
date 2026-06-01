@@ -174,6 +174,41 @@ async def test_async_driver_propagates_background_error_to_engine() -> None:
     assert "driver-failure" in str(engine.error)
 
 
+def test_async_llm_passes_runtime_backpressure_interval_to_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        def __init__(self, _vllm_config) -> None:
+            self.tokenizer = None
+
+    class FakeDriver:
+        def __init__(self, engine, *, min_step_interval_s: float) -> None:
+            self.engine = engine
+            self.min_step_interval_s = min_step_interval_s
+
+        def shutdown(self) -> None:
+            return None
+
+    class DummyConfig:
+        class ModelConfig:
+            model = "dummy"
+
+        model_config = ModelConfig()
+        runtime_config = type(
+            "RuntimeConfig", (), {"async_driver_min_step_interval_s": 0.007}
+        )()
+
+    monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
+
+    llm = async_llm_module.AsyncLLM(DummyConfig())
+
+    assert llm.driver.min_step_interval_s == 0.007
+
+
 def test_async_llm_stats_include_async_driver_stats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -185,7 +220,8 @@ def test_async_llm_stats_include_async_driver_stats(
             return {"scheduler": {"active_request_count": 1}}
 
     class FakeDriver:
-        def __init__(self, engine) -> None:
+        def __init__(self, engine, *, min_step_interval_s: float = 0.001) -> None:
+            del min_step_interval_s
             self.engine = engine
 
         def stats(self) -> dict[str, object]:
@@ -248,7 +284,8 @@ async def test_async_llm_generate_abort_end_to_end(
             )
 
     class FakeDriver:
-        def __init__(self, engine) -> None:
+        def __init__(self, engine, *, min_step_interval_s: float = 0.001) -> None:
+            del min_step_interval_s
             self.engine = engine
             self.notified = 0
 
@@ -315,7 +352,8 @@ async def test_async_llm_generate_passes_lora_request(
                     break
 
     class FakeDriver:
-        def __init__(self, engine) -> None:
+        def __init__(self, engine, *, min_step_interval_s: float = 0.001) -> None:
+            del min_step_interval_s
             self.engine = engine
 
         def notify_new_work(self) -> None:

@@ -40,7 +40,8 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
             return lora_name == "demo"
 
     class FakeDriver:
-        def __init__(self, engine) -> None:
+        def __init__(self, engine, *, min_step_interval_s: float = 0.001) -> None:
+            del min_step_interval_s
             self.engine = engine
 
         def shutdown(self) -> None:
@@ -134,6 +135,13 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
                 },
                 "scheduler": {"active_request_count": 2},
                 "observer": {"step_count": 3},
+                "async_driver": {
+                    "steps": 7,
+                    "backpressure_sleeps": 5,
+                    "idle_waits": 2,
+                    "background_errors": 1,
+                    "min_step_interval_s": 0.001,
+                },
             }
 
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
@@ -179,6 +187,13 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
                 "prefill_tightened_steps": 0,
                 "decode_relaxed_steps": 0,
                 "decode_tightened_steps": 0,
+            },
+            "async_driver": {
+                "steps": 7,
+                "backpressure_sleeps": 5,
+                "idle_waits": 2,
+                "background_errors": 1,
+                "min_step_interval_s": 0.001,
             },
             "multimodal": {
                 "requests": 0,
@@ -229,6 +244,13 @@ def test_runtime_stats_endpoint_returns_engine_snapshot() -> None:
             },
             "scheduler": {"active_request_count": 2},
             "observer": {"step_count": 3},
+            "async_driver": {
+                "steps": 7,
+                "backpressure_sleeps": 5,
+                "idle_waits": 2,
+                "background_errors": 1,
+                "min_step_interval_s": 0.001,
+            },
         },
     }
 
@@ -457,6 +479,13 @@ def test_runtime_stats_reset_endpoint_resets_engine_stats() -> None:
                 "prefill_tightened_steps": 0,
                 "decode_relaxed_steps": 0,
                 "decode_tightened_steps": 0,
+            },
+            "async_driver": {
+                "steps": 0,
+                "backpressure_sleeps": 0,
+                "idle_waits": 0,
+                "background_errors": 0,
+                "min_step_interval_s": 0.0,
             },
             "multimodal": {
                 "requests": 0,

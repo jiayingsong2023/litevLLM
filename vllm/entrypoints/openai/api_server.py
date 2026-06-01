@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import json
-import time
 import os
-from typing import AsyncGenerator, Optional
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+import time
+from collections.abc import AsyncGenerator
+
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.engine.async_llm import AsyncLLM
-from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.serving.config_builder import build_vllm_config
 
 logger = init_logger(__name__)
 app = FastAPI()
-engine: Optional[AsyncLLM] = None
+engine: AsyncLLM | None = None
 
 
 def _require_engine() -> AsyncLLM:
@@ -33,7 +34,9 @@ def _parse_structured_outputs(body: dict) -> StructuredOutputsParams | None:
             grammar=raw_structured.get("grammar"),
             structural_tag=raw_structured.get("structural_tag"),
             json_object=bool(raw_structured.get("json_object", False)),
-            choice=list(raw_structured["choice"]) if raw_structured.get("choice") is not None else None,
+            choice=list(raw_structured["choice"])
+            if raw_structured.get("choice") is not None
+            else None,
         )
 
     response_format = body.get("response_format")
@@ -46,14 +49,21 @@ def _parse_structured_outputs(body: dict) -> StructuredOutputsParams | None:
     if rf_type == "json_schema":
         json_schema = response_format.get("json_schema")
         if not isinstance(json_schema, dict):
-            raise HTTPException(status_code=400, detail="response_format.json_schema must be an object")
+            raise HTTPException(
+                status_code=400, detail="response_format.json_schema must be an object"
+            )
         schema = json_schema.get("schema") or json_schema.get("json_schema")
         if not isinstance(schema, dict):
-            raise HTTPException(status_code=400, detail="response_format.json_schema.schema must be an object")
+            raise HTTPException(
+                status_code=400,
+                detail="response_format.json_schema.schema must be an object",
+            )
         return StructuredOutputsParams(json=schema)
     if rf_type == "text" or rf_type is None:
         return None
-    raise HTTPException(status_code=400, detail=f"unsupported response_format.type: {rf_type}")
+    raise HTTPException(
+        status_code=400, detail=f"unsupported response_format.type: {rf_type}"
+    )
 
 
 def _parse_chat_message_content(
@@ -65,31 +75,40 @@ def _parse_chat_message_content(
     if isinstance(content, str):
         return content, None
     if not isinstance(content, list):
-        raise HTTPException(status_code=400, detail="message content must be a string or content block list")
+        raise HTTPException(
+            status_code=400,
+            detail="message content must be a string or content block list",
+        )
 
     text_parts: list[str] = []
     images: list[dict[str, str]] = []
     for item in content:
         if not isinstance(item, dict):
-            raise HTTPException(status_code=400, detail="message content block must be an object")
+            raise HTTPException(
+                status_code=400, detail="message content block must be an object"
+            )
         block_type = item.get("type")
         if block_type == "text":
             text = item.get("text")
             if not isinstance(text, str):
-                raise HTTPException(status_code=400, detail="text content block must include string text")
+                raise HTTPException(
+                    status_code=400,
+                    detail="text content block must include string text",
+                )
             text_parts.append(text)
             continue
         if block_type == "image_url":
             raw = item.get("image_url")
-            if isinstance(raw, dict):
-                url = raw.get("url")
-            else:
-                url = raw
+            url = raw.get("url") if isinstance(raw, dict) else raw
             if not isinstance(url, str) or not url.strip():
-                raise HTTPException(status_code=400, detail="image_url block must include non-empty url")
+                raise HTTPException(
+                    status_code=400, detail="image_url block must include non-empty url"
+                )
             images.append({"image": url.strip()})
             continue
-        raise HTTPException(status_code=400, detail=f"unsupported message content type: {block_type}")
+        raise HTTPException(
+            status_code=400, detail=f"unsupported message content type: {block_type}"
+        )
 
     prompt = "\n".join(part for part in text_parts if part)
     multi_modal_data = {"image": images} if images else None
@@ -111,6 +130,7 @@ def _summarize_runtime_stats(stats: dict) -> dict:
     lora_observer = observer.get("lora", {})
     multimodal_observer = observer.get("multimodal", {})
     multimodal_backend = stats.get("backend", {}).get("multimodal", {})
+    async_driver = stats.get("async_driver", {})
     if not isinstance(prefix_cache, dict):
         prefix_cache = {}
     if not isinstance(preemption, dict):
@@ -123,6 +143,8 @@ def _summarize_runtime_stats(stats: dict) -> dict:
         multimodal_observer = {}
     if not isinstance(multimodal_backend, dict):
         multimodal_backend = {}
+    if not isinstance(async_driver, dict):
+        async_driver = {}
     return {
         "prefix_cache": {
             "hit_rate": float(prefix_cache.get("hit_rate", 0.0) or 0.0),
@@ -142,8 +164,7 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 preemption.get("protected_multimodal_prefix_steps", 0) or 0
             ),
             "protected_multimodal_prefix_prefill_requests": int(
-                preemption.get("protected_multimodal_prefix_prefill_requests", 0)
-                or 0
+                preemption.get("protected_multimodal_prefix_prefill_requests", 0) or 0
             ),
         },
         "fairness": {
@@ -182,6 +203,15 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 lora_observer.get("decode_tightened_steps", 0) or 0
             ),
         },
+        "async_driver": {
+            "steps": int(async_driver.get("steps", 0) or 0),
+            "backpressure_sleeps": int(async_driver.get("backpressure_sleeps", 0) or 0),
+            "idle_waits": int(async_driver.get("idle_waits", 0) or 0),
+            "background_errors": int(async_driver.get("background_errors", 0) or 0),
+            "min_step_interval_s": float(
+                async_driver.get("min_step_interval_s", 0.0) or 0.0
+            ),
+        },
         "multimodal": {
             "requests": int(multimodal_observer.get("requests", 0) or 0),
             "images": int(multimodal_observer.get("images", 0) or 0),
@@ -189,8 +219,12 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 multimodal_observer.get("multimodal_lora_requests", 0) or 0
             ),
             "queued_requests": int(multimodal_observer.get("queued_requests", 0) or 0),
-            "admitted_requests": int(multimodal_observer.get("admitted_requests", 0) or 0),
-            "prefill_requests": int(multimodal_observer.get("prefill_requests", 0) or 0),
+            "admitted_requests": int(
+                multimodal_observer.get("admitted_requests", 0) or 0
+            ),
+            "prefill_requests": int(
+                multimodal_observer.get("prefill_requests", 0) or 0
+            ),
             "prefill_multimodal_lora_requests": int(
                 multimodal_observer.get("prefill_multimodal_lora_requests", 0) or 0
             ),
@@ -199,7 +233,8 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 multimodal_observer.get("p95_queue_wait_s", 0.0) or 0.0
             ),
             "mixed_multimodal_lora_prefill_ratio": float(
-                multimodal_observer.get("mixed_multimodal_lora_prefill_ratio", 0.0) or 0.0
+                multimodal_observer.get("mixed_multimodal_lora_prefill_ratio", 0.0)
+                or 0.0
             ),
             "avg_effective_prefill_multimodal_limit": float(
                 multimodal_observer.get("avg_effective_prefill_multimodal_limit", 0.0)
@@ -284,9 +319,7 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 or 0
             ),
             "decode_multimodal_lora_limit_relaxed_steps": int(
-                multimodal_observer.get(
-                    "decode_multimodal_lora_limit_relaxed_steps", 0
-                )
+                multimodal_observer.get("decode_multimodal_lora_limit_relaxed_steps", 0)
                 or 0
             ),
             "decode_multimodal_lora_limit_relaxed_by_fairness_steps": int(
@@ -328,9 +361,7 @@ def _summarize_runtime_stats(stats: dict) -> dict:
             "prepared_requests": int(
                 multimodal_backend.get("prepared_requests", 0) or 0
             ),
-            "prepared_images": int(
-                multimodal_backend.get("prepared_images", 0) or 0
-            ),
+            "prepared_images": int(multimodal_backend.get("prepared_images", 0) or 0),
             "embeddings_computed": int(
                 multimodal_backend.get("embeddings_computed", 0) or 0
             ),
@@ -340,13 +371,23 @@ def _summarize_runtime_stats(stats: dict) -> dict:
         },
     }
 
+
 @app.get("/v1/models")
 async def show_available_models():
     model_config = await _require_engine().get_model_config()
-    return JSONResponse(content={
-        "object": "list",
-        "data": [{"id": model_config.model, "object": "model", "created": int(time.time()), "owned_by": "fastinference"}]
-    })
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [
+                {
+                    "id": model_config.model,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "fastinference",
+                }
+            ],
+        }
+    )
 
 
 @app.get("/debug/runtime_stats")
@@ -377,6 +418,7 @@ async def reset_runtime_stats(clear_prefix_cache: bool = False):
         }
     )
 
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: Request):
     runtime_engine = _require_engine()
@@ -385,7 +427,7 @@ async def create_chat_completion(request: Request):
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     max_tokens = body.get("max_tokens", 128)
-    
+
     prompt, multi_modal_data = _parse_chat_message_content(messages)
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -393,7 +435,7 @@ async def create_chat_completion(request: Request):
         structured_outputs=_parse_structured_outputs(body),
     )
     request_id = f"chat-{int(time.time())}"
-    
+
     async def generate_stream() -> AsyncGenerator[str, None]:
         last_text = ""
         async for output in runtime_engine.generate(
@@ -403,14 +445,24 @@ async def create_chat_completion(request: Request):
             multi_modal_data=multi_modal_data,
         ):
             current_text = output.outputs[0].text if output.outputs else ""
-            delta_text = current_text[len(last_text):] if current_text.startswith(last_text) else current_text
+            delta_text = (
+                current_text[len(last_text) :]
+                if current_text.startswith(last_text)
+                else current_text
+            )
             last_text = current_text
             chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": "stop" if output.finished else None}]
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": delta_text},
+                        "finish_reason": "stop" if output.finished else None,
+                    }
+                ],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -426,14 +478,26 @@ async def create_chat_completion(request: Request):
             multi_modal_data=multi_modal_data,
         ):
             final_output = output
-        
-        return JSONResponse(content={
-            "id": request_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": final_output.outputs[0].text}, "finish_reason": "stop"}]
-        })
+
+        return JSONResponse(
+            content={
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": final_output.outputs[0].text,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description="FastInference OpenAI API Server")
@@ -452,9 +516,12 @@ def main():
     global engine
     v_config = build_vllm_config(args.model, policy_mode=args.policy_mode)
     engine = AsyncLLM(v_config)
-    
-    logger.info(f"FastInference API Server starting on http://{args.host}:{args.port}")
+
+    logger.info(
+        "FastInference API Server starting on http://%s:%s", args.host, args.port
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
 
 if __name__ == "__main__":
     main()

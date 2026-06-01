@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from vllm.engine.fastinference_config import FastInferenceConfig, LegacyEnvConfig
+from vllm.engine.fastinference_config import FastInferenceConfig
 from vllm.engine.runtime_config import RuntimeConfig
 
 
@@ -120,6 +120,19 @@ def test_runtime_config_latency_profile_caps_kv_shape(monkeypatch) -> None:
 
     assert cfg.kv_max_active_requests == 1
     assert cfg.kv_max_model_len == 512
+
+
+def test_runtime_config_exposes_async_driver_backpressure_interval(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.async_driver_min_step_interval_s > 0.0
+    assert cfg.profile.async_driver_min_step_interval_s == (
+        cfg.async_driver_min_step_interval_s
+    )
 
 
 def test_runtime_config_default_max_prefill_chunk_preserves_planner(

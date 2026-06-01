@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 from dataclasses import dataclass, field
 
-from vllm.engine.env_registry import collect_runtime_tuning_env
 from vllm.engine.fastinference_config import resolve_fastinference_config
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import RuntimeProfile, RuntimeProfileRegistry
@@ -44,6 +42,7 @@ class RuntimeConfig:
     prefill_sla_ttft_ms: float
     default_min_new_tokens: int = 0
     queue_timeout_s: float = 30.0
+    async_driver_min_step_interval_s: float = 0.001
     memory_audit_topn: int = 20
     gemma4_26b_fp32_residual_guard_enabled: bool = False
     gemma4_26b_fp32_residual_guard_start: int = 8
@@ -127,6 +126,7 @@ class RuntimeConfig:
             prefill_sla_ttft_ms=profile.prefill_sla_ttft_ms,
             default_min_new_tokens=profile.default_min_new_tokens,
             queue_timeout_s=profile.queue_timeout_s,
+            async_driver_min_step_interval_s=profile.async_driver_min_step_interval_s,
             memory_audit_topn=profile.memory_audit_topn,
             k_scale=profile.k_scale,
             v_scale=profile.v_scale,

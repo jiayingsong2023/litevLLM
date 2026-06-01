@@ -51,6 +51,7 @@ class RuntimeProfile:
     prefill_sla_ttft_ms: float = 2000.0
     default_min_new_tokens: int = 0
     queue_timeout_s: float = 30.0
+    async_driver_min_step_interval_s: float = 0.001
     memory_audit_topn: int = 20
     k_scale: float = 1.0
     v_scale: float = 1.0
@@ -84,6 +85,7 @@ class RuntimeProfile:
             "kv_max_model_len": self.kv_max_model_len,
             "kv_max_active_requests": self.kv_max_active_requests,
             "fusion_level": self.fusion_level,
+            "async_driver_min_step_interval_s": self.async_driver_min_step_interval_s,
         }
 
 
