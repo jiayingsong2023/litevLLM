@@ -1594,13 +1594,14 @@ def packed_int4_symmetric_fused_gate_up_silu_down_m1(
         policy=policy,
     )
 
-    # Step 2: down_proj — try fp16_vec (B+C) first, then fp16 (A), then split-K.
+    # Step 2: down_proj — try fp16 GEMV first, then vec variant, then split-K.
     k_groups = intermediate // 32
     if k_groups % 8 == 0:
-        # Large K (>= 256 groups = 8192 elements): vectorized fp16 GEMV
+        # Large K (>= 256 groups = 8192 elements): fp16 GEMV for throughput
         if k_groups >= 256:
+            # Direction A (fp16 parallel): best occupancy on RDNA 3.5
             try:
-                result = packed_int4_symmetric_group32_gemv_m1_fp16_vec(
+                result = packed_int4_symmetric_group32_gemv_m1_fp16(
                     h.contiguous(),
                     down_qweight,
                     down_scales,
@@ -1613,8 +1614,9 @@ def packed_int4_symmetric_fused_gate_up_silu_down_m1(
                 return result
             except Exception:
                 pass
+            # Direction B (vec sequential): fallback, lower occupancy
             try:
-                result = packed_int4_symmetric_group32_gemv_m1_fp16(
+                result = packed_int4_symmetric_group32_gemv_m1_fp16_vec(
                     h.contiguous(),
                     down_qweight,
                     down_scales,
