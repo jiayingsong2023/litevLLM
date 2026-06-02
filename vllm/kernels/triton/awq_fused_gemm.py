@@ -1034,6 +1034,151 @@ def _packed_int4_symmetric_group32_gemv_m1_fp16(
     tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
 
 
+@triton.jit
+def _packed_int4_symmetric_group32_gemv_m1_fp16_vec(
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    N,
+    K,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cn,
+    REDUCE_EVERY: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """
+    Direction B: fp16 GEMV with sequential group processing.
+
+    Processes one quant group at a time (vs BLOCK_GROUPS in parallel).
+    Sequential K indices within each group of 32 enable better L1 cache
+    locality: successive scalar loads hit the same cache line line instead
+    of jumping between BLOCK_GROUPS different cache lines.
+
+    Scale loads also use [BLOCK_N] contiguous access (stride=1 along
+    group dimension) instead of [BLOCK_N, BLOCK_GROUPS] with N-stride gaps.
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    num_groups = tl.cdiv(K, 32)
+    acc_fp16 = tl.zeros((BLOCK_N,), dtype=tl.float16)
+    acc_fp32 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    group = 0
+    while group < num_groups:
+        # Scales: contiguous [BLOCK_N] — single stride_sn gap per N element
+        scale_vec = tl.load(
+            s_ptr + offs_n * stride_sn + group * stride_sk,
+            mask=mask_n,
+            other=0.0,
+        ).to(tl.float16)
+
+        group_partial = tl.zeros((BLOCK_N,), dtype=tl.float16)
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group * 4 + pack_in_group
+            packed = tl.load(
+                b_ptr + offs_n * stride_bn + pack_idx * stride_bk,
+                mask=mask_n,
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                # Sequential K indices → hardware coalescing within 32-element group
+                k_idx = group * 32 + pack_in_group * 8 + nibble
+                a_val = tl.load(
+                    a_ptr + k_idx * stride_ak,
+                    mask=k_idx < K,
+                    other=0.0,
+                )
+                q = (packed >> (nibble * 4)) & 0xF
+                group_partial += (
+                    a_val.to(tl.float16)
+                    * (q.to(tl.float16) - 8.0)
+                    * scale_vec
+                )
+        acc_fp16 += group_partial
+
+        group += 1
+        if group % REDUCE_EVERY == 0:
+            acc_fp32 += acc_fp16.to(tl.float32)
+            acc_fp16 = tl.zeros((BLOCK_N,), dtype=tl.float16)
+
+    acc = acc_fp32 + acc_fp16.to(tl.float32)
+
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias_vals.to(tl.float32)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
+
+
+def packed_int4_symmetric_group32_gemv_m1_fp16_vec(
+    a: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    *,
+    bias: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+    reduce_every: int = 64,
+    block_groups: int = 4,
+    block_n: int = 64,
+) -> torch.Tensor:
+    """Direction B+C: fp16 GEMV with vectorized activation preload + coalesced scales.
+
+    On top of the fp16 accumulation kernel, replaces 32 scalar activation loads
+    per quant group with one contiguous 32-element vector load (1 cache line).
+    Scale loads use per-group coalesced access to improve L1 hit rate.
+
+    Same interface as packed_int4_symmetric_group32_gemv_m1_fp16.
+    """
+    del config, policy
+    if int(group_size) != 32:
+        raise ValueError("group_size must be 32")
+    m, k = a.shape
+    n = int(qweight.shape[0])
+    if m != 1:
+        raise ValueError("M must be 1 for fp16 GEMV")
+
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype)
+    a_flat = a.reshape(-1).contiguous()
+    grid = (triton.cdiv(n, block_n),)
+    _packed_int4_symmetric_group32_gemv_m1_fp16_vec[grid](
+        a_flat,
+        qweight,
+        scales,
+        c,
+        bias if bias is not None else torch.empty(0),
+        n,
+        k,
+        a_flat.stride(0),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        c.stride(1),
+        REDUCE_EVERY=reduce_every,
+        BLOCK_GROUPS=block_groups,
+        BLOCK_N=block_n,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        HAS_BIAS=bias is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    return c
+
+
 def packed_int4_symmetric_group32_gemv_m1_fp16(
     a: torch.Tensor,
     qweight: torch.Tensor,
@@ -1449,12 +1594,25 @@ def packed_int4_symmetric_fused_gate_up_silu_down_m1(
         policy=policy,
     )
 
-    # Step 2: down_proj — try fp16 GEMV first (2× ALU on RDNA 3.5),
-    # fall back to split-K fp32 GEMV.
+    # Step 2: down_proj — try fp16_vec (B+C) first, then fp16 (A), then split-K.
     k_groups = intermediate // 32
     if k_groups % 8 == 0:
-        # Large K (>= 256 groups = 8192 elements): fp16 GEMV for throughput
+        # Large K (>= 256 groups = 8192 elements): vectorized fp16 GEMV
         if k_groups >= 256:
+            try:
+                result = packed_int4_symmetric_group32_gemv_m1_fp16_vec(
+                    h.contiguous(),
+                    down_qweight,
+                    down_scales,
+                    int(group_size),
+                    bias=None,
+                    reduce_every=64,
+                    block_groups=4,
+                    block_n=64,
+                )
+                return result
+            except Exception:
+                pass
             try:
                 result = packed_int4_symmetric_group32_gemv_m1_fp16(
                     h.contiguous(),
