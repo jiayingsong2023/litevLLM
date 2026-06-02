@@ -557,13 +557,12 @@ class Gemma4MoeExpertsLite(nn.Module):
                     bucket["time_s"] += 0.0
                     bucket["count"] += 1.0
                 return fast_out.to(hidden_states_2d.dtype)
-            if self._layer_config.profile_enabled:
-                bucket = self._layer_config.profile_stats.setdefault(
-                    f"moe_int4_decode_fallback:{fast_reason}",
-                    {"time_s": 0.0, "count": 0.0},
-                )
-                bucket["time_s"] += 0.0
-                bucket["count"] += 1.0
+            bucket = self._layer_config.profile_stats.setdefault(
+                f"moe_int4_decode_fallback:{fast_reason}",
+                {"time_s": 0.0, "count": 0.0},
+            )
+            bucket["time_s"] += 0.0
+            bucket["count"] += 1.0
         out = torch.zeros_like(hidden_states_2d, dtype=compute_dtype)
         flat_topk_ids = topk_ids.reshape(-1).to(torch.long)
         flat_topk_weights = topk_weights.reshape(-1)
