@@ -66,6 +66,54 @@ class Gemma4MLP(nn.Module):
         # for non-LoRA requests (see vllm/engine/input_batch_builder.py).
         # The outer env gate only toggles the optimization wholesale.
         #
+        # P1c: Fused gate+up -> silu -> down_proj for M=1 decode.
+        # Eliminates the intermediate 21504-dim tensor round-trip by
+        # chaining gate/up GEMV + down_proj split-K in a single Python call.
+        if (
+            x.shape[0] == 1
+            and int(x.shape[1]) % 32 == 0
+            and _gemma4_kernel_policy_truthy(
+                inf_config, "awq_fused_gate_up", default=True
+            )
+        ):
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import (
+                    packed_int4_symmetric_fused_gate_up_silu_down_m1,
+                )
+
+                gate_qweight = getattr(self.gate_proj, "qweight", None)
+                gate_scales = getattr(self.gate_proj, "scales", None)
+                up_qweight = getattr(self.up_proj, "qweight", None)
+                up_scales = getattr(self.up_proj, "scales", None)
+                down_qweight = getattr(self.down_proj, "qweight", None)
+                down_scales = getattr(self.down_proj, "scales", None)
+                group_size = int(getattr(self.gate_proj, "group_size", 32))
+
+                if (
+                    gate_qweight is not None
+                    and gate_scales is not None
+                    and up_qweight is not None
+                    and up_scales is not None
+                    and down_qweight is not None
+                    and down_scales is not None
+                ):
+                    out = packed_int4_symmetric_fused_gate_up_silu_down_m1(
+                        x.reshape(1, -1).contiguous(),
+                        gate_qweight,
+                        up_qweight,
+                        gate_scales,
+                        up_scales,
+                        down_qweight,
+                        down_scales,
+                        intermediate=self.intermediate_size,
+                        group_size=group_size,
+                        config=inf_config,
+                    )
+                    if out is not None:
+                        return out.view(*x.shape[:-1], out.shape[-1])
+            except Exception:
+                pass
+
         # The helper returns None when structural guards trip (mismatched
         # shapes, high-fidelity flag, active LoRA, etc.) and the caller
         # falls back to the two-matmul path below.

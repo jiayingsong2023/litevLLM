@@ -1250,6 +1250,57 @@ def _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
     return c
 
 
+def packed_int4_symmetric_fused_gate_up_silu_down_m1(
+    a: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    up_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    up_scales: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    *,
+    intermediate: int,
+    group_size: int = 32,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> torch.Tensor | None:
+    """
+    Fused gate+up -> silu -> down_proj for M=1 MLP decode.
+
+    Replaces three kernel launches + torch ops with a single fused call:
+      1. gate/up GEMV (fused, single kernel) -> h = silu(gate) * up
+      2. down_proj split-K GEMV from h
+
+    Returns [1, hidden] output tensor, or None if any step fails.
+    """
+    # Step 1: fused gate/up GEMV (activates inside the kernel)
+    h = packed_int4_symmetric_fused_gate_up_m1(
+        a,
+        gate_qweight,
+        up_qweight,
+        gate_scales,
+        up_scales,
+        int(group_size),
+        config=config,
+        policy=policy,
+    )
+
+    # Step 2: down_proj using split-K GEMV
+    k_groups = intermediate // 32
+    if k_groups % 8 == 0:
+        return _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
+            h.contiguous(),
+            down_qweight,
+            down_scales,
+            bias=None,
+            split_k=4,
+            block_groups=4,
+            block_n=64,
+        )
+
+    return None
+
+
 @triton.jit
 def _packed_int4_symmetric_group32_qkv_m1(
     a_ptr,
