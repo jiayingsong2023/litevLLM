@@ -1051,6 +1051,32 @@ class PackedInt4Weight(QuantizedLinearWeight):
             int(self.group_size),
             config=config,
         ):
+            # Try split-K for large-K shapes (31B down_proj: k=21504)
+            k_dim = int(x.shape[1])
+            k_groups = k_dim // 32
+            if k_dim >= 16384 and k_groups % 8 == 0:
+                try:
+                    from vllm.kernels.triton.awq_fused_gemm import (
+                        _packed_int4_symmetric_group32_gemv_m1_splitk_launch,
+                    )
+
+                    _awq_stat_inc("awq_fused_attempt")
+                    _awq_prefix_stat_inc(self.prefix, "fused_attempt")
+                    _awq_prefix_stat_inc(self.prefix, "decision_splitk_down_proj")
+                    out = _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
+                        x.reshape(1, -1).contiguous(),
+                        self.qweight,
+                        self.scales,
+                        bias=bias,
+                        split_k=8,
+                        block_groups=4,
+                        block_n=64,
+                    )
+                    _awq_stat_inc("awq_fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "fused_success")
+                    return out.view(*x.shape[:-1], out.shape[-1])
+                except Exception:
+                    _awq_prefix_stat_inc(self.prefix, "splitk_runtime_exception")
             try:
                 from vllm.kernels.triton.awq_fused_gemm import (
                     packed_int4_symmetric_fused_gemm_safe,
