@@ -518,6 +518,15 @@ def awq_fused_gate_up_enabled(
     return raw if isinstance(raw, bool) else truthy(raw)
 
 
+def awq_mlp_streaming_fusion_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    raw = _kernel_policy_value(config, policy, "awq_mlp_streaming_fusion", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
+
+
 def awq_o_proj_group32_gemv_enabled(
     *,
     config: Any | None = None,
@@ -663,6 +672,10 @@ def _group32_gemv_all_launch_config_tool_override() -> tuple[int, int]:
     )
 
 
+def _gemma4_down_proj_group32_gemv_launch_config() -> tuple[int, int]:
+    return 128, 8
+
+
 def _decode_gemv_launch_config_tool_override() -> tuple[int, int]:
     return (
         _tool_override_int(
@@ -697,21 +710,43 @@ def _fused_gate_up_launch_config_tool_override() -> tuple[int, int]:
     )
 
 
-def _qkv_group32_gemv_launch_config_tool_override() -> tuple[int, int]:
+def _qkv_group32_gemv_launch_config_tool_override() -> tuple[int, int] | None:
+    raw_block_n = _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N")
+    raw_groups = _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS")
+    if raw_block_n is None and raw_groups is None:
+        return None
     return (
         _tool_override_int(
-            _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_N"),
+            raw_block_n,
             256,
             minimum=32,
             maximum=512,
         ),
         _tool_override_int(
-            _tool_override_get("FASTINFERENCE_AWQ_QKV_GROUP32_GEMV_BLOCK_GROUPS"),
+            raw_groups,
             4,
             minimum=1,
             maximum=16,
         ),
     )
+
+
+def _qkv_group32_gemv_launch_config(
+    *,
+    total_n: int,
+    k: int,
+    has_v: bool,
+) -> tuple[int, int]:
+    override = _qkv_group32_gemv_launch_config_tool_override()
+    if override is not None:
+        return override
+    # Gemma4-31B exact decode shapes. Values are updated from the local
+    # QKV/QK microbenchmark gate rather than Triton autotune at launch time.
+    if int(k) == 5376 and int(total_n) == 16384 and bool(has_v):
+        return 128, 8
+    if int(k) == 5376 and int(total_n) == 18432 and not bool(has_v):
+        return 128, 8
+    return 256, 4
 
 
 def _resolve_fused_gemm_blocks(
@@ -865,6 +900,84 @@ def _packed_int4_symmetric_grouped_gemv_m1(
 
     c_ptrs = c_ptr + offs_n * stride_cn
     tl.store(c_ptrs, out, mask=mask_n)
+
+
+@triton.jit
+def _packed_int4_symmetric_group32_interleaved_gemv_m1(
+    a_ptr,
+    packed_ptr,
+    c_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_ak,
+    stride_pn,
+    stride_pg,
+    stride_pl,
+    stride_cn,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SCALE_KIND: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+):
+    """
+    Experimental M=1 symmetric packed-int4 GEMV with interleaved group layout.
+
+    Memory layout:
+      packed[n, group, 0:4] = four int32 qweight packs for 32 K values
+      packed[n, group, 4]   = fp16/bf16 scale bit pattern in int32 lane
+
+    Tiling:
+      one program computes BLOCK_N output rows. BLOCK_GROUPS quant groups are
+      loaded per loop; scale and four qweight packs come from one grouped
+      tensor to test whether co-locating metadata improves global read behavior.
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    num_groups = K // 32
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for group_base in range(0, tl.cdiv(num_groups, BLOCK_GROUPS)):
+        group_idx = group_base * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < num_groups
+        scale_bits = tl.load(
+            packed_ptr
+            + offs_n[:, None] * stride_pn
+            + group_idx[None, :] * stride_pg
+            + 4 * stride_pl,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0,
+        ).to(tl.uint32)
+        scale_u16 = (scale_bits & 0xFFFF).to(tl.uint16)
+        if SCALE_KIND == 1:
+            scale = scale_u16.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        else:
+            scale = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        group_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+        for pack_in_group in tl.static_range(0, 4):
+            packed = tl.load(
+                packed_ptr
+                + offs_n[:, None] * stride_pn
+                + group_idx[None, :] * stride_pg
+                + pack_in_group * stride_pl,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0
+                )
+                q = (packed >> (nibble * 4)) & 0xF
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
+        acc += tl.sum(group_partial, axis=1)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
 
 
 @triton.jit
@@ -1293,6 +1406,159 @@ def _packed_int4_symmetric_fused_gate_up_m1(
 
     out_cast = out.to(tl.bfloat16) if USE_BF16_OUTPUT else out.to(tl.float16)
     tl.store(c_ptr + offs_n * stride_cn, out_cast, mask=mask_n)
+
+
+@triton.jit
+def _packed_int4_symmetric_mlp_streaming_m1_recompute(
+    a_ptr,
+    gate_ptr,
+    up_ptr,
+    down_ptr,
+    gate_s_ptr,
+    up_s_ptr,
+    down_s_ptr,
+    c_ptr,
+    HIDDEN: tl.constexpr,
+    INTERMEDIATE: tl.constexpr,
+    stride_ak,
+    stride_gn,
+    stride_gk,
+    stride_un,
+    stride_uk,
+    stride_dn,
+    stride_dk,
+    stride_gsn,
+    stride_gsk,
+    stride_usn,
+    stride_usk,
+    stride_dsn,
+    stride_dsk,
+    stride_cn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_H_GROUPS: tl.constexpr,
+    ACT_KIND: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+):
+    """
+    Experimental M=1 MLP streaming candidate for symmetric packed-int4.
+
+    Memory layout:
+      gate/up qweight:  [INTERMEDIATE, HIDDEN / 8] packed uint32/int32 nibbles
+      down qweight:     [HIDDEN, INTERMEDIATE / 8] packed uint32/int32 nibbles
+      scales:           [out_features, K / 32]
+      output:           [1, HIDDEN]
+
+    Tiling:
+      each program owns BLOCK_N output hidden rows. For each BLOCK_I
+      intermediate tile it recomputes gate/up values from the input token,
+      applies activation, then accumulates the matching down_proj contribution.
+
+    This kernel is intentionally a P2c negative-control candidate: gate/up is
+    recomputed for every output tile, so it should not be promoted unless a
+    benchmark disproves that cost model.
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < HIDDEN
+    offs_i = tl.arange(0, BLOCK_I)
+    offs_hg = tl.arange(0, BLOCK_H_GROUPS)
+    out_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for i_base in range(0, tl.cdiv(INTERMEDIATE, BLOCK_I)):
+        inter_idx = i_base * BLOCK_I + offs_i
+        mask_i = inter_idx < INTERMEDIATE
+        gate_acc = tl.zeros((BLOCK_I,), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_I,), dtype=tl.float32)
+
+        for h_group_base in range(0, tl.cdiv(HIDDEN // 32, BLOCK_H_GROUPS)):
+            h_group = h_group_base * BLOCK_H_GROUPS + offs_hg
+            mask_hg = h_group < (HIDDEN // 32)
+            gate_scale = tl.load(
+                gate_s_ptr
+                + inter_idx[:, None] * stride_gsn
+                + h_group[None, :] * stride_gsk,
+                mask=mask_i[:, None] & mask_hg[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            up_scale = tl.load(
+                up_s_ptr
+                + inter_idx[:, None] * stride_usn
+                + h_group[None, :] * stride_usk,
+                mask=mask_i[:, None] & mask_hg[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            gate_partial = tl.zeros((BLOCK_I, BLOCK_H_GROUPS), dtype=tl.float32)
+            up_partial = tl.zeros((BLOCK_I, BLOCK_H_GROUPS), dtype=tl.float32)
+            for pack_in_group in tl.static_range(0, 4):
+                h_pack = h_group * 4 + pack_in_group
+                gate_packed = tl.load(
+                    gate_ptr
+                    + inter_idx[:, None] * stride_gn
+                    + h_pack[None, :] * stride_gk,
+                    mask=mask_i[:, None] & mask_hg[None, :],
+                    other=0,
+                ).to(tl.int32)
+                up_packed = tl.load(
+                    up_ptr
+                    + inter_idx[:, None] * stride_un
+                    + h_pack[None, :] * stride_uk,
+                    mask=mask_i[:, None] & mask_hg[None, :],
+                    other=0,
+                ).to(tl.int32)
+                for nibble in tl.static_range(0, 8):
+                    h_idx = h_group * 32 + pack_in_group * 8 + nibble
+                    aval = tl.load(
+                        a_ptr + h_idx * stride_ak,
+                        mask=mask_hg & (h_idx < HIDDEN),
+                        other=0.0,
+                    )
+                    gate_q = (gate_packed >> (nibble * 4)) & 0xF
+                    up_q = (up_packed >> (nibble * 4)) & 0xF
+                    gate_partial += (
+                        aval[None, :].to(tl.float32)
+                        * (gate_q.to(tl.float32) - 8.0)
+                        * gate_scale
+                    )
+                    up_partial += (
+                        aval[None, :].to(tl.float32)
+                        * (up_q.to(tl.float32) - 8.0)
+                        * up_scale
+                    )
+            gate_acc += tl.sum(gate_partial, axis=1)
+            up_acc += tl.sum(up_partial, axis=1)
+
+        if ACT_KIND == 1:
+            x3 = gate_acc * gate_acc * gate_acc
+            inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+            act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+        else:
+            act = gate_acc / (1.0 + tl.exp(-gate_acc))
+        h_val = act * up_acc
+
+        down_group = inter_idx // 32
+        down_pack = inter_idx // 8
+        down_nibble = inter_idx - down_pack * 8
+        down_scale = tl.load(
+            down_s_ptr
+            + offs_n[:, None] * stride_dsn
+            + down_group[None, :] * stride_dsk,
+            mask=mask_n[:, None] & mask_i[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        down_packed = tl.load(
+            down_ptr
+            + offs_n[:, None] * stride_dn
+            + down_pack[None, :] * stride_dk,
+            mask=mask_n[:, None] & mask_i[None, :],
+            other=0,
+        ).to(tl.int32)
+        down_q = (down_packed >> (down_nibble[None, :] * 4)) & 0xF
+        down_partial = h_val[None, :] * (down_q.to(tl.float32) - 8.0) * down_scale
+        out_acc += tl.sum(down_partial, axis=1)
+
+    out = out_acc.to(tl.bfloat16) if USE_BF16_OUTPUT else out_acc.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
 
 
 @triton.jit
@@ -2248,6 +2514,32 @@ def packed_int4_symmetric_fused_gemm(
                 )
                 return c
 
+        if n == 5376 and k == 21504:
+            block_n, block_groups = _gemma4_down_proj_group32_gemv_launch_config()
+            grid = (triton.cdiv(n, block_n),)
+            _packed_int4_symmetric_group32_gemv_m1[grid](
+                a,
+                qweight,
+                scales,
+                c,
+                bias_ptr_arg,
+                n,
+                k,
+                a.stride(1),
+                qweight.stride(0),
+                qweight.stride(1),
+                scales.stride(0),
+                scales.stride(1),
+                c.stride(1),
+                BLOCK_GROUPS=block_groups,
+                BLOCK_N=block_n,
+                USE_BF16_OUTPUT=use_bf16_output,
+                HAS_BIAS=has_bias,
+                num_warps=8 if block_n >= 128 else 4,
+                num_stages=1,
+            )
+            return c
+
         if (
             awq_o_proj_group32_gemv_enabled(config=config, policy=policy)
             and n == 5376
@@ -2502,6 +2794,221 @@ def packed_int4_symmetric_fused_gate_up_m1(
     return c
 
 
+def pack_awq_group32_interleaved_qweight_scales(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    """Pack group32 qweight and fp16/bf16 scales into an int32 layout.
+
+    Layout is ``[N, K_groups, 5]``: four qweight int32 packs followed by the
+    scale bit pattern stored in the low 16 bits of an int32 lane.
+    """
+    if qweight.dim() != 2 or scales.dim() != 2:
+        raise ValueError("interleaved AWQ pack requires 2D qweight and scales")
+    n, k_packs = int(qweight.shape[0]), int(qweight.shape[1])
+    groups = int(scales.shape[1])
+    if k_packs != groups * 4:
+        raise ValueError("interleaved AWQ pack requires group_size=32 qweight")
+    if int(scales.shape[0]) != n:
+        raise ValueError("interleaved AWQ pack qweight/scales N mismatch")
+    if scales.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("interleaved AWQ pack requires fp16 or bf16 scales")
+    packed = torch.empty((n, groups, 5), device=qweight.device, dtype=torch.int32)
+    packed[:, :, :4] = qweight.to(torch.int32).reshape(n, groups, 4)
+    scale_bits = scales.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    packed[:, :, 4] = scale_bits
+    return packed.contiguous()
+
+
+def packed_int4_symmetric_group32_interleaved_gemv_m1(
+    a: torch.Tensor,
+    packed: torch.Tensor,
+    group_size: int,
+    *,
+    scale_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    m, k = a.shape
+    if m != 1:
+        raise ValueError("group32_interleaved_gemv_m1: requires M == 1")
+    if int(group_size) != 32 or k % 32 != 0:
+        raise ValueError("group32_interleaved_gemv_m1: requires group_size=32")
+    if packed.dim() != 3 or int(packed.shape[2]) != 5:
+        raise ValueError("group32_interleaved_gemv_m1: packed shape must be [N,G,5]")
+    n = int(packed.shape[0])
+    if int(packed.shape[1]) * 32 != k:
+        raise ValueError("group32_interleaved_gemv_m1: K mismatch")
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype) if out is None else out
+    block_n = 128
+    block_groups = 8
+    grid = (triton.cdiv(n, block_n),)
+    _packed_int4_symmetric_group32_interleaved_gemv_m1[grid](
+        a,
+        packed,
+        c,
+        N=n,
+        K=k,
+        stride_ak=a.stride(1),
+        stride_pn=packed.stride(0),
+        stride_pg=packed.stride(1),
+        stride_pl=packed.stride(2),
+        stride_cn=c.stride(1),
+        BLOCK_GROUPS=block_groups,
+        BLOCK_N=block_n,
+        SCALE_KIND=1 if scale_dtype == torch.bfloat16 else 0,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        num_warps=8,
+        num_stages=1,
+    )
+    return c
+
+
+def packed_int4_symmetric_group32_interleaved_gemv_m1_safe(
+    a: torch.Tensor,
+    packed: torch.Tensor,
+    group_size: int,
+    *,
+    scale_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, bool, str]:
+    if a.dim() != 2 or int(a.shape[0]) != 1:
+        return a, False, "input_not_m1_2d"
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        return a, False, f"unsupported_dtype_{str(a.dtype)}"
+    if packed.device != a.device:
+        return a, False, "device_mismatch"
+    try:
+        c = packed_int4_symmetric_group32_interleaved_gemv_m1(
+            a.contiguous(),
+            packed.contiguous(),
+            int(group_size),
+            scale_dtype=scale_dtype,
+        )
+        if c.shape != (1, int(packed.shape[0])):
+            return c, False, "bad_output_shape"
+        return c, True, "ok"
+    except Exception:
+        return a, False, "kernel_exception"
+
+
+def packed_int4_symmetric_mlp_streaming_m1_recompute(
+    a: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    up_qweight: torch.Tensor,
+    down_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    up_scales: torch.Tensor,
+    down_scales: torch.Tensor,
+    group_size: int,
+    *,
+    activation: str = "silu",
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    m, hidden = a.shape
+    intermediate = int(gate_qweight.shape[0])
+    if m != 1:
+        raise ValueError("mlp_streaming_m1_recompute: requires M == 1")
+    if int(group_size) != 32 or hidden % 32 != 0 or intermediate % 32 != 0:
+        raise ValueError("mlp_streaming_m1_recompute: requires group32 aligned shapes")
+    if tuple(gate_qweight.shape) != tuple(up_qweight.shape):
+        raise ValueError("mlp_streaming_m1_recompute: gate/up qweight mismatch")
+    if tuple(gate_scales.shape) != tuple(up_scales.shape):
+        raise ValueError("mlp_streaming_m1_recompute: gate/up scales mismatch")
+    if int(gate_qweight.shape[1]) * 8 != hidden:
+        raise ValueError("mlp_streaming_m1_recompute: gate/up K mismatch")
+    if int(down_qweight.shape[0]) != hidden:
+        raise ValueError("mlp_streaming_m1_recompute: down N mismatch")
+    if int(down_qweight.shape[1]) * 8 != intermediate:
+        raise ValueError("mlp_streaming_m1_recompute: down K mismatch")
+    c = torch.empty((1, hidden), device=a.device, dtype=a.dtype) if out is None else out
+    block_n = 64
+    block_i = 16
+    block_h_groups = 8
+    act = str(activation).lower()
+    act_kind = 1 if act in ("gelu", "gelu_pytorch_tanh") else 0
+    grid = (triton.cdiv(hidden, block_n),)
+    _packed_int4_symmetric_mlp_streaming_m1_recompute[grid](
+        a,
+        gate_qweight,
+        up_qweight,
+        down_qweight,
+        gate_scales,
+        up_scales,
+        down_scales,
+        c,
+        HIDDEN=hidden,
+        INTERMEDIATE=intermediate,
+        stride_ak=a.stride(1),
+        stride_gn=gate_qweight.stride(0),
+        stride_gk=gate_qweight.stride(1),
+        stride_un=up_qweight.stride(0),
+        stride_uk=up_qweight.stride(1),
+        stride_dn=down_qweight.stride(0),
+        stride_dk=down_qweight.stride(1),
+        stride_gsn=gate_scales.stride(0),
+        stride_gsk=gate_scales.stride(1),
+        stride_usn=up_scales.stride(0),
+        stride_usk=up_scales.stride(1),
+        stride_dsn=down_scales.stride(0),
+        stride_dsk=down_scales.stride(1),
+        stride_cn=c.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_I=block_i,
+        BLOCK_H_GROUPS=block_h_groups,
+        ACT_KIND=act_kind,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        num_warps=4,
+        num_stages=1,
+    )
+    return c
+
+
+def packed_int4_symmetric_mlp_streaming_m1_recompute_safe(
+    a: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    up_qweight: torch.Tensor,
+    down_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    up_scales: torch.Tensor,
+    down_scales: torch.Tensor,
+    group_size: int,
+    *,
+    activation: str = "silu",
+) -> tuple[torch.Tensor, bool, str]:
+    if a.dim() != 2 or int(a.shape[0]) != 1:
+        return a, False, "input_not_m1_2d"
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        return a, False, f"unsupported_dtype_{str(a.dtype)}"
+    if int(group_size) != 32:
+        return a, False, "group_size_not_32"
+    tensors = [
+        gate_qweight,
+        up_qweight,
+        down_qweight,
+        gate_scales,
+        up_scales,
+        down_scales,
+    ]
+    if any(t.device != a.device for t in tensors):
+        return a, False, "device_mismatch"
+    try:
+        c = packed_int4_symmetric_mlp_streaming_m1_recompute(
+            a.contiguous(),
+            gate_qweight.contiguous(),
+            up_qweight.contiguous(),
+            down_qweight.contiguous(),
+            gate_scales.contiguous(),
+            up_scales.contiguous(),
+            down_scales.contiguous(),
+            int(group_size),
+            activation=activation,
+        )
+        if c.shape != (1, int(a.shape[1])):
+            return c, False, "bad_output_shape"
+        return c, True, "ok"
+    except Exception:
+        return a, False, "kernel_exception"
+
+
 def packed_int4_symmetric_fused_qkv_m1(
     a: torch.Tensor,
     q_qweight: torch.Tensor,
@@ -2537,7 +3044,11 @@ def packed_int4_symmetric_fused_qkv_m1(
     if v_scales is None:
         v_scales = q_scales
     del config, policy
-    block_n, block_groups = _qkv_group32_gemv_launch_config_tool_override()
+    block_n, block_groups = _qkv_group32_gemv_launch_config(
+        total_n=total_n,
+        k=k,
+        has_v=has_v,
+    )
     grid = (triton.cdiv(total_n, block_n),)
     _packed_int4_symmetric_group32_qkv_m1[grid](
         a,

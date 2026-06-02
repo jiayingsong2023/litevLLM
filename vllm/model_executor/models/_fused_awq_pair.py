@@ -28,7 +28,7 @@ without re-concatenating int4 bytes per step.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,7 @@ from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.layers.quantization.tensor import (
     AWQWeight,
     PackedInt4Weight,
+    record_awq_audit_event,
 )
 
 
@@ -64,7 +65,7 @@ def try_fused_awq_pair_matmul(
     *,
     lora_mapping: Any = None,
     inf_config: Any = None,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Attempt a single quantized matmul that yields the concatenation of
     ``lin_a(x)`` and ``lin_b(x)`` along the last dimension.
 
@@ -86,7 +87,7 @@ def try_fused_awq_pair_matmul(
 
     ba = getattr(lin_a, "bias", None)
     bb = getattr(lin_b, "bias", None)
-    fused_bias: Optional[torch.Tensor] = None
+    fused_bias: torch.Tensor | None = None
     if ba is not None and bb is not None:
         fused_bias = torch.cat([ba.reshape(-1), bb.reshape(-1)], dim=0).contiguous()
     elif ba is not None or bb is not None:
@@ -171,7 +172,7 @@ def try_fused_awq_gate_up_activation(
     activation: str,
     lora_mapping: Any = None,
     inf_config: Any = None,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Attempt decode-only fused gate/up GEMV that returns ``act(gate) * up``.
 
     This is intentionally narrower than ``try_fused_awq_pair_matmul``: it only
@@ -184,7 +185,10 @@ def try_fused_awq_gate_up_activation(
         return None
     if gate_proj.output_size != up_proj.output_size:
         return None
-    if getattr(gate_proj, "bias", None) is not None or getattr(up_proj, "bias", None) is not None:
+    if (
+        getattr(gate_proj, "bias", None) is not None
+        or getattr(up_proj, "bias", None) is not None
+    ):
         return None
     if getattr(gate_proj, "force_high_fidelity_awq", False) or getattr(
         up_proj, "force_high_fidelity_awq", False
@@ -232,3 +236,107 @@ def try_fused_awq_gate_up_activation(
         return out2.reshape(*lead_shape, int(gate_proj.output_size))
     except Exception:
         return None
+
+
+def try_fused_awq_mlp_streaming(
+    x: torch.Tensor,
+    gate_proj: LiteLinear,
+    up_proj: LiteLinear,
+    down_proj: LiteLinear,
+    *,
+    activation: str,
+    lora_mapping: Any = None,
+    inf_config: Any = None,
+    prefix: str = "",
+) -> torch.Tensor | None:
+    """Attempt full Gemma-style AWQ MLP streaming fusion.
+
+    This P2 helper is deliberately default-off. Until an isolated Triton
+    candidate beats the current two-stage path, it only centralizes structural
+    guards and audit visibility while preserving the existing fallback path.
+    """
+    audit_prefix = prefix or str(getattr(gate_proj, "prefix", "mlp"))
+
+    def record_fallback(reason: str) -> None:
+        shape = {
+            "m": int(x.reshape(-1, x.shape[-1]).shape[0]) if x.dim() >= 2 else -1,
+            "hidden": int(
+                getattr(gate_proj, "input_size", x.shape[-1] if x.dim() else -1)
+            ),
+            "intermediate": int(getattr(gate_proj, "output_size", -1)),
+            "out": int(getattr(down_proj, "output_size", -1)),
+        }
+        record_awq_audit_event(
+            audit_prefix,
+            "mlp_streaming_fallback",
+            shape=shape,
+            reason=reason,
+        )
+
+    try:
+        from vllm.kernels.triton.awq_fused_gemm import (
+            awq_mlp_streaming_fusion_enabled,
+        )
+
+        if not awq_mlp_streaming_fusion_enabled(config=inf_config):
+            record_fallback("disabled")
+            return None
+    except Exception:
+        record_fallback("policy_error")
+        return None
+
+    record_awq_audit_event(
+        audit_prefix,
+        "mlp_streaming_attempt",
+        shape={
+            "m": int(x.reshape(-1, x.shape[-1]).shape[0]) if x.dim() >= 2 else -1,
+            "hidden": int(
+                getattr(gate_proj, "input_size", x.shape[-1] if x.dim() else -1)
+            ),
+            "intermediate": int(getattr(gate_proj, "output_size", -1)),
+            "out": int(getattr(down_proj, "output_size", -1)),
+        },
+        reason="policy_enabled",
+    )
+    if _lora_is_active(lora_mapping):
+        record_fallback("lora_active")
+        return None
+    if x.dim() < 2 or int(x.reshape(-1, x.shape[-1]).shape[0]) != 1:
+        record_fallback("input_not_m1")
+        return None
+    if gate_proj.input_size != up_proj.input_size:
+        record_fallback("gate_up_input_mismatch")
+        return None
+    if gate_proj.output_size != up_proj.output_size:
+        record_fallback("gate_up_output_mismatch")
+        return None
+    if down_proj.input_size != gate_proj.output_size:
+        record_fallback("down_input_mismatch")
+        return None
+    if (
+        getattr(gate_proj, "bias", None) is not None
+        or getattr(up_proj, "bias", None) is not None
+    ):
+        record_fallback("gate_up_bias")
+        return None
+    if getattr(down_proj, "bias", None) is not None:
+        record_fallback("down_bias")
+        return None
+    if int(getattr(gate_proj, "group_size", 128)) != 32:
+        record_fallback("gate_group_size_not_32")
+        return None
+    if int(getattr(up_proj, "group_size", 128)) != 32:
+        record_fallback("up_group_size_not_32")
+        return None
+    if int(getattr(down_proj, "group_size", 128)) != 32:
+        record_fallback("down_group_size_not_32")
+        return None
+    za = getattr(gate_proj, "qzeros", None)
+    zb = getattr(up_proj, "qzeros", None)
+    zd = getattr(down_proj, "qzeros", None)
+    if not all(z is None or z.numel() <= 1 for z in (za, zb, zd)):
+        record_fallback("asymmetric_awq")
+        return None
+    del activation
+    record_fallback("requires_cross_program_sharing")
+    return None

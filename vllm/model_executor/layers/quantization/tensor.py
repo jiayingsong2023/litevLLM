@@ -9,6 +9,12 @@ from collections import defaultdict
 
 _AWQ_TENSOR_TUNING: dict[str, str] = {}
 _AWQ_TENSOR_TUNING_LOCKED = False
+_AWQ_AUDIT_EVENTS: dict[str, int] = defaultdict(int)
+_AWQ_AUDIT_PREFIX_EVENTS: dict[str, dict[str, int]] = {}
+_AWQ_AUDIT_FIRST_FALLBACKS: dict[
+    tuple[str, str, str, tuple[tuple[str, int], ...]],
+    dict[str, Any],
+] = {}
 
 
 def set_awq_tensor_tuning_config(
@@ -236,6 +242,91 @@ def _awq_prefix_stat_inc(prefix: str, key: str, delta: int = 1) -> None:
     bucket[key] += int(delta)
 
 
+def _compact_shape(shape: dict[str, Any] | None) -> dict[str, int]:
+    if not shape:
+        return {}
+    out: dict[str, int] = {}
+    for key, value in shape.items():
+        try:
+            out[str(key)] = int(value)
+        except Exception:
+            continue
+    return out
+
+
+def _tensor_dtype_name(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        return str(value.dtype).replace("torch.", "")
+    return str(value)
+
+
+def _shape_for_matmul(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    group_size: int,
+) -> dict[str, int]:
+    m = int(x.reshape(-1, x.shape[-1]).shape[0]) if x.dim() > 0 else 1
+    k = int(x.shape[-1]) if x.dim() > 0 else 0
+    n = int(qweight.shape[0]) if qweight.dim() > 0 else 0
+    return {"m": m, "n": n, "k": k, "group_size": int(group_size)}
+
+
+def _dtypes_for_quant_matmul(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None = None,
+) -> dict[str, str]:
+    out = {
+        "x": _tensor_dtype_name(x),
+        "qweight": _tensor_dtype_name(qweight),
+        "scales": _tensor_dtype_name(scales),
+    }
+    if isinstance(qzeros, torch.Tensor):
+        out["qzeros"] = _tensor_dtype_name(qzeros)
+    return out
+
+
+def record_awq_audit_event(
+    prefix: str,
+    event: str,
+    *,
+    shape: dict[str, Any] | None = None,
+    dtypes: dict[str, Any] | None = None,
+    decision_path: list[str] | tuple[str, ...] | None = None,
+    reason: str = "",
+) -> None:
+    """Record coarse AWQ fast-path audit events without per-token trace spam."""
+    event_key = str(event)
+    prefix_key = str(prefix or "<unknown>")
+    compact_shape = _compact_shape(shape)
+    _AWQ_AUDIT_EVENTS[event_key] += 1
+    prefix_bucket = _AWQ_AUDIT_PREFIX_EVENTS.setdefault(
+        prefix_key,
+        defaultdict(int),  # type: ignore[arg-type]
+    )
+    prefix_bucket[event_key] += 1
+    if "fallback" not in event_key:
+        return
+
+    reason_key = str(reason or "")
+    shape_key = tuple(sorted(compact_shape.items()))
+    key = (prefix_key, event_key, reason_key, shape_key)
+    existing = _AWQ_AUDIT_FIRST_FALLBACKS.get(key)
+    if existing is not None:
+        existing["count"] = int(existing.get("count", 0)) + 1
+        return
+    _AWQ_AUDIT_FIRST_FALLBACKS[key] = {
+        "prefix": prefix_key,
+        "event": event_key,
+        "shape": compact_shape,
+        "dtypes": {str(k): _tensor_dtype_name(v) for k, v in (dtypes or {}).items()},
+        "decision_path": [str(item) for item in (decision_path or [])],
+        "reason": reason_key,
+        "count": 1,
+    }
+
+
 def _bool_like(value: object, default: bool) -> bool:
     if value is None:
         return default
@@ -303,6 +394,13 @@ def awq_decode_gemv_enabled(config: object | None = None) -> bool:
 def awq_group32_gemv_all_enabled(config: object | None = None) -> bool:
     return _bool_like(
         _kernel_policy_value(config, "awq_group32_gemv_all", False),
+        False,
+    )
+
+
+def awq_group32_interleaved_down_proj_enabled(config: object | None = None) -> bool:
+    return _bool_like(
+        _kernel_policy_value(config, "awq_group32_interleaved_down_proj", False),
         False,
     )
 
@@ -387,7 +485,32 @@ def _env_awq_decode_gemv_tool_override() -> bool:
     return _env_truthy("FASTINFERENCE_AWQ_DECODE_GEMV", "0")
 
 
-def _should_try_gemma4_down_proj_decode_fused(
+def _should_try_gemma4_down_proj_interleaved(
+    prefix: str,
+    profile_hint: str,
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    config: object | None = None,
+) -> bool:
+    if not awq_group32_interleaved_down_proj_enabled(config):
+        return False
+    if not _is_gemma4_mlp_down_proj(prefix, profile_hint):
+        return False
+    if int(group_size) != 32:
+        return False
+    if scales.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if x.dim() < 2:
+        return False
+    m = int(x.reshape(-1, x.shape[-1]).shape[0])
+    k = int(x.shape[-1])
+    n = int(qweight.shape[0])
+    return m == 1 and n == 5376 and k == 21504
+
+
+def _should_try_gemma4_down_proj_fused(
     prefix: str,
     profile_hint: str,
     x: torch.Tensor,
@@ -408,7 +531,7 @@ def _should_try_gemma4_down_proj_decode_fused(
     m = int(x.reshape(-1, x.shape[-1]).shape[0])
     k = int(x.shape[-1])
     n = int(qweight.shape[0])
-    return m == 1 and n == 5376 and k == 21504
+    return m >= 1 and n == 5376 and k == 21504
 
 
 def _env_awq_cache_scope_tool_override() -> str:
@@ -552,6 +675,9 @@ def should_use_awq_fused_path(
 def reset_awq_runtime_stats() -> None:
     _AWQ_RUNTIME_STATS.clear()
     _AWQ_RUNTIME_PREFIX_STATS.clear()
+    _AWQ_AUDIT_EVENTS.clear()
+    _AWQ_AUDIT_PREFIX_EVENTS.clear()
+    _AWQ_AUDIT_FIRST_FALLBACKS.clear()
     _awq_stat_set("awq_matmul_calls", 0)
     _awq_stat_set("awq_fused_attempt", 0)
     _awq_stat_set("awq_fused_success", 0)
@@ -559,11 +685,15 @@ def reset_awq_runtime_stats() -> None:
     _awq_stat_set("awq_cache_misses", 0)
     _awq_stat_set("awq_dense_builds", 0)
     _awq_stat_set("awq_dense_cache_bytes_current", 0)
+    _awq_stat_set("awq_interleaved_builds", 0)
+    _awq_stat_set("awq_interleaved_cache_bytes", 0)
 
 
 def get_awq_runtime_stats() -> Dict[str, int]:
     out = dict(_AWQ_RUNTIME_STATS)
     out.update(_GLOBAL_WEIGHT_CACHE.get_memory_stats())
+    for key, value in _AWQ_AUDIT_EVENTS.items():
+        out[f"audit:{key}"] = int(value)
     return out
 
 
@@ -582,9 +712,33 @@ def get_awq_runtime_prefix_stats(limit: int = 20) -> Dict[str, Dict[str, int]]:
     return out
 
 
+def get_awq_runtime_audit_summary(limit: int = 20) -> dict[str, Any]:
+    rows = sorted(
+        _AWQ_AUDIT_PREFIX_EVENTS.items(),
+        key=lambda kv: (-sum(int(v) for v in kv[1].values()), kv[0]),
+    )
+    prefixes: dict[str, dict[str, int]] = {}
+    for prefix, stats in rows[: max(0, int(limit))]:
+        prefixes[prefix] = {str(k): int(v) for k, v in stats.items()}
+
+    qkv_projection_paths = {
+        key: int(value)
+        for key, value in sorted(_AWQ_AUDIT_EVENTS.items())
+        if key.startswith("qkv_") or key.startswith("qk_")
+    }
+    return {
+        "events": {str(k): int(v) for k, v in sorted(_AWQ_AUDIT_EVENTS.items())},
+        "prefixes": prefixes,
+        "first_fallbacks": list(_AWQ_AUDIT_FIRST_FALLBACKS.values()),
+        "qkv_projection_paths": qkv_projection_paths,
+    }
+
+
 def clear_global_weight_cache() -> None:
     _GLOBAL_WEIGHT_CACHE.clear()
     _awq_stat_set("awq_dense_cache_bytes_current", 0)
+    _awq_stat_set("awq_interleaved_builds", 0)
+    _awq_stat_set("awq_interleaved_cache_bytes", 0)
 
 
 def _match_weight_dtype(weight: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -830,7 +984,6 @@ class GGUFWeight(QuantizedLinearWeight):
             if self.quant_type >= 12
             else (self.qweight.shape[1] // 18 * 32)
         )
-        bs = x.shape[0] if x.dim() > 1 else 1
         cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
         if cached_w is None:
             if self.quant_type == 2:
@@ -897,10 +1050,36 @@ class AWQWeight(QuantizedLinearWeight):
                         _awq_prefix_stat_inc(self.prefix, "fused_success")
                         return out.view(*x.shape[:-1], out.shape[-1])
                     _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
+                    record_awq_audit_event(
+                        self.prefix,
+                        "fused_runtime_fallback",
+                        shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                        dtypes=_dtypes_for_quant_matmul(
+                            x, self.qweight, self.scales, self.qzeros
+                        ),
+                        decision_path=[
+                            "cached_fused_decision=True",
+                            "awq_fused_gemm_safe",
+                        ],
+                        reason=str(reason or "used_fused_false"),
+                    )
                     if reason:
                         _awq_prefix_stat_inc(self.prefix, f"reason:{reason}")
-                except Exception:
+                except Exception as exc:
                     _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
+                    record_awq_audit_event(
+                        self.prefix,
+                        "fused_runtime_exception_fallback",
+                        shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                        dtypes=_dtypes_for_quant_matmul(
+                            x, self.qweight, self.scales, self.qzeros
+                        ),
+                        decision_path=[
+                            "cached_fused_decision=True",
+                            "awq_fused_gemm_safe",
+                        ],
+                        reason=type(exc).__name__,
+                    )
             # Fallback to cached dense or dequant
             cached_w = _GLOBAL_WEIGHT_CACHE.get(self.weight_id)
             if cached_w is not None:
@@ -1017,7 +1196,75 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 x, _match_weight_dtype(dense_weight, x), bias
             )
 
-        if _should_try_gemma4_down_proj_decode_fused(
+        if _should_try_gemma4_down_proj_interleaved(
+            self.prefix,
+            self.profile_hint,
+            x,
+            self.qweight,
+            self.scales,
+            int(self.group_size),
+            config=config,
+        ):
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import (
+                    pack_awq_group32_interleaved_qweight_scales,
+                    packed_int4_symmetric_group32_interleaved_gemv_m1_safe,
+                )
+
+                packed = getattr(self, "_interleaved_group32_cache", None)
+                if packed is None or packed.device != self.qweight.device:
+                    packed = pack_awq_group32_interleaved_qweight_scales(
+                        self.qweight, self.scales
+                    )
+                    self._interleaved_group32_cache = packed
+                    _awq_stat_inc("awq_interleaved_builds")
+                    _awq_prefix_stat_inc(self.prefix, "interleaved_build")
+                    _awq_stat_inc("awq_interleaved_cache_bytes", _tensor_nbytes(packed))
+                out, used_interleaved, reason = (
+                    packed_int4_symmetric_group32_interleaved_gemv_m1_safe(
+                        x.reshape(-1, x.shape[-1]).contiguous(),
+                        packed,
+                        int(self.group_size),
+                        scale_dtype=self.scales.dtype,
+                    )
+                )
+                if used_interleaved:
+                    _awq_stat_inc("awq_fused_attempt")
+                    _awq_stat_inc("awq_fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "interleaved_success")
+                    record_awq_audit_event(
+                        self.prefix,
+                        "interleaved_down_proj_success",
+                        shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                        dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                        decision_path=[
+                            "awq_group32_interleaved_down_proj=True",
+                            "gemma4_31b_down_proj_exact_shape",
+                        ],
+                        reason="ok",
+                    )
+                    return out.view(*x.shape[:-1], out.shape[-1])
+                _awq_prefix_stat_inc(self.prefix, "interleaved_runtime_fallback")
+                record_awq_audit_event(
+                    self.prefix,
+                    "interleaved_down_proj_fallback",
+                    shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                    dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                    decision_path=["awq_group32_interleaved_down_proj=True"],
+                    reason=str(reason or "used_interleaved_false"),
+                )
+            except Exception as exc:
+                _awq_prefix_stat_inc(self.prefix, "interleaved_runtime_exception")
+                record_awq_audit_event(
+                    self.prefix,
+                    "interleaved_down_proj_exception_fallback",
+                    shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                    dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                    decision_path=["awq_group32_interleaved_down_proj=True"],
+                    reason=type(exc).__name__,
+                )
+
+        if _should_try_gemma4_down_proj_fused(
             self.prefix,
             self.profile_hint,
             x,
@@ -1044,7 +1291,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     _awq_stat_inc("awq_fused_success")
                     _awq_prefix_stat_inc(self.prefix, "fused_success")
                     _awq_prefix_stat_inc(
-                        self.prefix, "decision_fused_gemma4_down_proj_decode"
+                        self.prefix, "decision_fused_gemma4_down_proj"
                     )
                     return out.view(*x.shape[:-1], out.shape[-1])
             except Exception:
@@ -1059,6 +1306,19 @@ class PackedInt4Weight(QuantizedLinearWeight):
         ):
             self._cached_fused_decision = False
             _awq_prefix_stat_inc(self.prefix, "decision_dense_gemma4_mlp")
+            record_awq_audit_event(
+                self.prefix,
+                "dense_fallback",
+                shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                decision_path=[
+                    f"profile_hint={self.profile_hint}",
+                    f"gemma4_dense_mlp={gemma4_dense_mlp_enabled(config)}",
+                    f"gemma4_dense_down_proj={gemma4_dense_down_proj_enabled(config)}",
+                    f"awq_decode_gemv={awq_decode_gemv_enabled(config)}",
+                ],
+                reason="decision_dense_gemma4_mlp",
+            )
             return _dense_fallback()
 
         use_fused_cached = getattr(self, "_cached_fused_decision", None)
@@ -1082,10 +1342,32 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     _awq_stat_inc("awq_fused_success")
                     _awq_prefix_stat_inc(self.prefix, "fused_success")
                     return out.view(*x.shape[:-1], out.shape[-1])
-            except Exception:
+            except Exception as exc:
                 _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
+                record_awq_audit_event(
+                    self.prefix,
+                    "fused_runtime_exception_fallback",
+                    shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                    dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                    decision_path=[
+                        "cached_fused_decision=True",
+                        "packed_int4_safe",
+                    ],
+                    reason=type(exc).__name__,
+                )
             self._cached_fused_decision = False
             _awq_prefix_stat_inc(self.prefix, "fused_runtime_fallback")
+            record_awq_audit_event(
+                self.prefix,
+                "fused_runtime_fallback",
+                shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                dtypes=_dtypes_for_quant_matmul(x, self.qweight, self.scales),
+                decision_path=[
+                    "cached_fused_decision=True",
+                    "packed_int4_safe",
+                ],
+                reason="used_fused_false",
+            )
             return _dense_fallback()
 
         if use_fused_cached is False:

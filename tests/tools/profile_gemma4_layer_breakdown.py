@@ -393,6 +393,14 @@ def main() -> int:
         help="Number of per-layer AWQ prefixes to include in the JSON summary.",
     )
     parser.add_argument(
+        "--enable-awq-interleaved-down-proj",
+        action="store_true",
+        help=(
+            "Enable experimental Gemma4-31B down_proj group32 interleaved "
+            "layout for this diagnostic run."
+        ),
+    )
+    parser.add_argument(
         "--json-out",
         type=str,
         default="",
@@ -413,6 +421,7 @@ def main() -> int:
     os.environ.setdefault("FASTINFERENCE_KV_TYPE", args.kv_type)
 
     from vllm.model_executor.layers.quantization.tensor import (
+        get_awq_runtime_audit_summary,
         get_awq_runtime_prefix_stats,
         get_awq_runtime_stats,
         reset_awq_runtime_stats,
@@ -440,6 +449,10 @@ def main() -> int:
         f"prompt_tokens≈{args.prompt_tokens} decode_steps={args.decode_steps}"
     )
     engine, tokenizer, load_s = smoke._build_engine(build_args)
+    if args.enable_awq_interleaved_down_proj:
+        policy = dict(getattr(engine.inf_config, "kernel_policy", {}) or {})
+        policy["awq_group32_interleaved_down_proj"] = True
+        engine.inf_config.kernel_policy = policy
     runtime_timer_stats = _install_runtime_timers(engine)
     _force_enable_layer_profile()
     _reset_layer_profile()
@@ -523,6 +536,9 @@ def main() -> int:
 
     awq_stats = get_awq_runtime_stats()
     awq_prefix_stats = get_awq_runtime_prefix_stats(limit=args.awq_prefix_limit)
+    awq_audit_summary = get_awq_runtime_audit_summary(
+        limit=args.awq_prefix_limit
+    )
     summary = {
         "model": model_path,
         "load_s": round(load_s, 3),
@@ -559,6 +575,7 @@ def main() -> int:
             "decode": decode_profiler_summary,
         },
         "awq_stats": awq_stats,
+        "awq_audit_summary": awq_audit_summary,
         "awq_projection_summary": _summarize_awq_projection_prefixes(awq_prefix_stats),
         "awq_prefix_stats": awq_prefix_stats,
     }

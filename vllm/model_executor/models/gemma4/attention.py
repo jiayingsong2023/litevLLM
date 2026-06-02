@@ -8,6 +8,8 @@ import torch.nn as nn
 
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
+from vllm.model_executor.layers.quantization.tensor import record_awq_audit_event
+from vllm.model_executor.models.lite_config import LiteConfig
 
 from .config import Gemma4LayerConfig
 from .kv_utils import (
@@ -21,7 +23,6 @@ from .kv_utils import (
     _use_legacy_full_precision_kv_write,
     _write_full_precision_kv_cache,
 )
-from vllm.model_executor.models.lite_config import LiteConfig
 from .policy_utils import (
     _gemma4_model_policy_truthy,
     _get_eps,
@@ -32,6 +33,83 @@ from .policy_utils import (
 )
 from .profiling import _gemma4_profile_span
 from .rope import _get_rope_with_runtime, _is_local_layer, _layer_type_for_idx
+
+
+def _linear_quant_attr(layer: LiteLinear, name: str) -> torch.Tensor | None:
+    value = getattr(layer, name, None)
+    return value if isinstance(value, torch.Tensor) and value.numel() > 1 else None
+
+
+def _try_fused_awq_qkv_decode(
+    x: torch.Tensor,
+    q_proj: LiteLinear,
+    k_proj: LiteLinear,
+    v_proj: LiteLinear | None,
+    *,
+    inf_config: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    x2 = x.reshape(-1, x.shape[-1])
+    if int(x2.shape[0]) != 1:
+        return None
+    q_qweight = _linear_quant_attr(q_proj, "qweight")
+    k_qweight = _linear_quant_attr(k_proj, "qweight")
+    q_scales = _linear_quant_attr(q_proj, "scales")
+    k_scales = _linear_quant_attr(k_proj, "scales")
+    if q_qweight is None or k_qweight is None:
+        return None
+    if q_scales is None or k_scales is None:
+        return None
+    qzeros = _linear_quant_attr(q_proj, "qzeros")
+    kzeros = _linear_quant_attr(k_proj, "qzeros")
+    if qzeros is not None or kzeros is not None:
+        return None
+    group_size = int(getattr(q_proj, "group_size", 128))
+    if int(getattr(k_proj, "group_size", 128)) != group_size:
+        return None
+
+    v_qweight = None
+    v_scales = None
+    if v_proj is not None:
+        v_qweight = _linear_quant_attr(v_proj, "qweight")
+        v_scales = _linear_quant_attr(v_proj, "scales")
+        vzeros = _linear_quant_attr(v_proj, "qzeros")
+        if v_qweight is None or v_scales is None or vzeros is not None:
+            return None
+        if int(getattr(v_proj, "group_size", 128)) != group_size:
+            return None
+
+    try:
+        from vllm.kernels.triton.awq_fused_gemm import (
+            packed_int4_symmetric_fused_qkv_m1_safe,
+        )
+
+        fused, used, _ = packed_int4_symmetric_fused_qkv_m1_safe(
+            x2.contiguous(),
+            q_qweight,
+            k_qweight,
+            v_qweight,
+            q_scales,
+            k_scales,
+            v_scales,
+            group_size,
+            config=inf_config,
+        )
+    except Exception:
+        return None
+    if not used:
+        return None
+
+    q_n = int(q_qweight.shape[0])
+    k_n = int(k_qweight.shape[0])
+    q = fused[:, :q_n]
+    k = fused[:, q_n : q_n + k_n]
+    v = k if v_proj is None else fused[:, q_n + k_n :]
+    lead_shape = x.shape[:-1]
+    return (
+        q.reshape(*lead_shape, q_n),
+        k.reshape(*lead_shape, k_n),
+        v.reshape(*lead_shape, int(v.shape[-1])),
+    )
 
 
 class Gemma4Attention(nn.Module):
@@ -133,15 +211,68 @@ class Gemma4Attention(nn.Module):
         attn_metadata: Any,
         lora_mapping: Any = None,
     ) -> torch.Tensor:
-        with _gemma4_profile_span("attn_q_proj", self._layer_config):
-            q = self.q_proj(x, lora_mapping)
-        with _gemma4_profile_span("attn_k_proj", self._layer_config):
-            k = self.k_proj(x, lora_mapping)
-        if self.v_proj is not None:
-            with _gemma4_profile_span("attn_v_proj", self._layer_config):
-                v = self.v_proj(x, lora_mapping)
+        inf_config = _meta_get(attn_metadata, "config", None)
+        is_prefill_for_audit = bool(_meta_get(attn_metadata, "is_prefill", False))
+        is_decode_m1 = int(x.reshape(-1, x.shape[-1]).shape[0]) == 1
+        attn_prefix = getattr(
+            self.q_proj,
+            "prefix",
+            "<unknown>.self_attn.q_proj",
+        ).rsplit(".", 1)[0]
+        fused_qkv = None
+        if (not is_prefill_for_audit) and is_decode_m1:
+            fused_qkv = _try_fused_awq_qkv_decode(
+                x,
+                self.q_proj,
+                self.k_proj,
+                self.v_proj,
+                inf_config=inf_config,
+            )
+        if fused_qkv is not None:
+            q, k, v = fused_qkv
+            event = "qk_fused_decode" if self.v_proj is None else "qkv_fused_decode"
+            record_awq_audit_event(
+                attn_prefix,
+                event,
+                shape={
+                    "m": 1,
+                    "hidden": int(x.shape[-1]),
+                    "q": int(self.q_size),
+                    "k": int(self.kv_size),
+                    "v": 0 if self.v_proj is None else int(self.kv_size),
+                },
+                reason="packed_int4_symmetric_fused_qkv_m1_safe",
+            )
         else:
-            v = k
+            if (not is_prefill_for_audit) and is_decode_m1:
+                event = (
+                    "qk_separate_decode"
+                    if self.v_proj is None
+                    else "qkv_separate_decode"
+                )
+                shape = {
+                    "m": 1,
+                    "hidden": int(x.shape[-1]),
+                    "q": int(self.q_size),
+                    "k": int(self.kv_size),
+                }
+                if self.v_proj is not None:
+                    shape["v"] = int(self.kv_size)
+                record_awq_audit_event(
+                    attn_prefix,
+                    event,
+                    shape=shape,
+                    reason="gemma4_attention_forward_uses_separate_litelinears",
+                )
+            with _gemma4_profile_span("attn_q_proj", self._layer_config):
+                q = self.q_proj(x, lora_mapping, inf_config=inf_config)
+            with _gemma4_profile_span("attn_k_proj", self._layer_config):
+                k = self.k_proj(x, lora_mapping, inf_config=inf_config)
+            if self.v_proj is not None:
+                with _gemma4_profile_span("attn_v_proj", self._layer_config):
+                    v = self.v_proj(x, lora_mapping, inf_config=inf_config)
+            else:
+                v = k
         bsz, seqlen = x.shape[:2]
         q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -154,7 +285,6 @@ class Gemma4Attention(nn.Module):
         max_pos_plus_one_cpu = _resolve_max_position_plus_one_cpu(
             attn_metadata, positions
         )
-        inf_config = _meta_get(attn_metadata, "config", None)
         q, k = self.rotary_emb(
             positions,
             q,

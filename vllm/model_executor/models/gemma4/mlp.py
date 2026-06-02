@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.lite_linear import LiteLinear
+from vllm.model_executor.models.lite_config import LiteConfig
 
 from .config import Gemma4LayerConfig
-from vllm.model_executor.models.lite_config import LiteConfig
 from .policy_utils import _gemma4_kernel_policy_truthy, _gemma4_model_policy_truthy
 
 
@@ -57,6 +57,23 @@ class Gemma4MLP(nn.Module):
         lora_mapping: Any = None,
         inf_config: Any = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.models._fused_awq_pair import (
+            try_fused_awq_mlp_streaming,
+        )
+
+        streamed = try_fused_awq_mlp_streaming(
+            x,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
+            activation=self.hidden_act,
+            lora_mapping=lora_mapping,
+            inf_config=inf_config,
+            prefix=getattr(self.gate_proj, "prefix", "").rsplit(".mlp.", 1)[0] + ".mlp",
+        )
+        if streamed is not None:
+            return streamed
+
         # Step 4 pair fusion: concat gate_proj and up_proj into a single
         # quantized GEMM, halving the per-layer kernel launches for AWQ/int4
         # weights.
