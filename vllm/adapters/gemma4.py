@@ -107,7 +107,7 @@ class Gemma4Adapter(ModelAdapter):
                     getattr(runtime_config, "gemma4_26b_fp32_residual_guard_span", 3)
                 ),
                 GEMMA4_MOE_EXPERT_CACHE_SIZE: int(
-                    getattr(runtime_config, "gemma4_moe_expert_cache_size", 32)
+                    getattr(runtime_config, "gemma4_moe_expert_cache_size", 8)
                 ),
                 GEMMA4_MOE_COMPUTE_DTYPE: str(
                     getattr(runtime_config, "gemma4_moe_compute_dtype", "auto")
@@ -121,7 +121,7 @@ class Gemma4Adapter(ModelAdapter):
                     )
                 ),
                 GEMMA4_MOE_PREFILL_GROUPED_ENABLED: bool(
-                    getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", False)
+                    getattr(runtime_config, "gemma4_moe_prefill_grouped_enabled", True)
                 ),
                 GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS: int(
                     getattr(runtime_config, "gemma4_moe_prefill_grouped_min_tokens", 17)

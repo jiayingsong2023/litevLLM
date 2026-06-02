@@ -515,27 +515,35 @@ class Gemma4MoeExpertsLite(nn.Module):
                 gemma4_moe_int4_decode_single_kernel,
             )
 
-            decode_kernel = (
-                gemma4_moe_int4_decode_single_kernel
-                if self._int4_kernel_strategy == "single"
-                else gemma4_moe_int4_decode_batched_tuned
-                if self._int4_kernel_strategy == "batched_tuned"
-                else gemma4_moe_int4_decode_batched_chunked_pair
-                if self._int4_kernel_strategy == "batched_chunked_pair"
-                else gemma4_moe_int4_decode_batched_chunked_downpair
-                if self._int4_kernel_strategy == "batched_chunked_downpair"
-                else gemma4_moe_int4_decode_batched_chunked_splitgate_downpair
-                if self._int4_kernel_strategy == "batched_chunked_splitgate_downpair"
-                else gemma4_moe_int4_decode_batched_grouped
-                if self._int4_kernel_strategy == "batched_grouped"
-                else gemma4_moe_int4_decode_batched_grouped_streaming
-                if self._int4_kernel_strategy == "batched_grouped_streaming"
-                else gemma4_moe_int4_decode_batched_chunked
-                if self._int4_kernel_strategy == "batched_chunked"
-                else gemma4_moe_int4_decode_batched
-                if self._int4_kernel_strategy == "batched"
-                else gemma4_moe_int4_decode
-            )
+            # Shape-aware strategy table:
+            # - single-token decode: two_stage (lowest overhead)
+            # - small batch, few experts: batched_chunked (good reuse)
+            # - small batch, many experts: streaming (reduces materialization)
+            # - prefill: handled above via grouped_prefill
+            # - fallback: user-specified default strategy
+            n_unique = int(topk_ids.unique().numel())
+            if n_tokens == 1:
+                strategy = "two_stage"
+            elif n_tokens <= 8 and n_unique <= 4:
+                strategy = "batched_chunked"
+            elif n_tokens <= 8:
+                strategy = "batched_grouped_streaming"
+            else:
+                strategy = self._int4_kernel_strategy  # user-specified default
+
+            decode_kernel_map = {
+                "single": gemma4_moe_int4_decode_single_kernel,
+                "two_stage": gemma4_moe_int4_decode,
+                "batched_tuned": gemma4_moe_int4_decode_batched_tuned,
+                "batched_chunked_pair": gemma4_moe_int4_decode_batched_chunked_pair,
+                "batched_chunked_downpair": gemma4_moe_int4_decode_batched_chunked_downpair,
+                "batched_chunked_splitgate_downpair": gemma4_moe_int4_decode_batched_chunked_splitgate_downpair,
+                "batched_grouped": gemma4_moe_int4_decode_batched_grouped,
+                "batched_grouped_streaming": gemma4_moe_int4_decode_batched_grouped_streaming,
+                "batched_chunked": gemma4_moe_int4_decode_batched_chunked,
+                "batched": gemma4_moe_int4_decode_batched,
+            }
+            decode_kernel = decode_kernel_map.get(strategy, gemma4_moe_int4_decode)
 
             with _gemma4_profile_span("moe_int4_decode_attempt", self._layer_config):
                 fast_out, used_fast, fast_reason = decode_kernel(
