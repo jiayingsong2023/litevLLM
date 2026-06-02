@@ -1970,7 +1970,7 @@ def _format_runtime_snapshot_summary(snapshot: Dict[str, object]) -> list[str]:
     return lines
 
 
-def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
+def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, object]:
     attempts = float(stats.get("awq_fused_attempt", 0))
     success = float(stats.get("awq_fused_success", 0))
     ratio = (success / attempts) if attempts > 0 else 0.0
@@ -1981,6 +1981,8 @@ def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
         "awq_cache_hits": float(stats.get("awq_cache_hits", 0)),
         "awq_cache_misses": float(stats.get("awq_cache_misses", 0)),
         "awq_dense_cache_bytes_peak": float(stats.get("cache_bytes", 0)),
+        "awq_dense_builds": float(stats.get("awq_dense_builds", 0)),
+        "awq_matmul_calls": float(stats.get("awq_matmul_calls", 0)),
     }
 
 
@@ -2348,12 +2350,17 @@ async def run_benchmark(
             )
         except asyncio.TimeoutError:
             awq_stats: Dict = {}
+            awq_prefix_stats: Dict = {}
             if spec.quant in ("awq", "compressed-tensors"):
                 from vllm.model_executor.layers.quantization.tensor import (
                     get_awq_runtime_stats,
                 )
 
                 awq_stats = get_awq_runtime_stats()
+                from vllm.model_executor.layers.quantization.tensor import (
+                    get_awq_runtime_prefix_stats,
+                )
+                awq_prefix_stats = get_awq_runtime_prefix_stats(limit=200)
             print(
                 f"  [Timeout] Exceeded {spec.max_run_seconds}s for {spec.display_name}; "
                 "marking as timeout in summary."
@@ -2393,6 +2400,7 @@ async def run_benchmark(
                 "stream_token_events_total": 0.0,
                 "stream_progressive_visible_ratio": 0.0,
                 "awq_runtime_stats": awq_stats,
+                "awq_prefix_stats": awq_prefix_stats,
                 "awq_metrics": awq_metrics,
                 "workload": {
                     "kind": workload,
@@ -2452,13 +2460,18 @@ async def run_benchmark(
             else 0.0
         )
         awq_stats = {}
-        awq_metrics: Dict[str, float] = {}
+        awq_prefix_stats = {}
+        awq_metrics = {}
         if spec.quant in ("awq", "compressed-tensors"):
             from vllm.model_executor.layers.quantization.tensor import (
                 get_awq_runtime_stats,
             )
 
             awq_stats = get_awq_runtime_stats()
+            from vllm.model_executor.layers.quantization.tensor import (
+                get_awq_runtime_prefix_stats,
+            )
+            awq_prefix_stats = get_awq_runtime_prefix_stats(limit=200)
             awq_metrics = _derive_awq_metrics(awq_stats)
 
         result = {
@@ -2510,6 +2523,7 @@ async def run_benchmark(
                 else 0.0
             ),
             "awq_runtime_stats": awq_stats,
+            "awq_prefix_stats": awq_prefix_stats,
             "awq_metrics": awq_metrics,
             "workload": {
                 "kind": workload,
