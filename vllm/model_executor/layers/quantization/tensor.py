@@ -219,6 +219,7 @@ _HIGH_FIDELITY_PREFIXES = tuple(
 
 _AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
 _AWQ_RUNTIME_PREFIX_STATS: Dict[str, Dict[str, int]] = {}
+_awq_first_fallback_logged: set[str] = set()
 
 
 def _awq_stat_inc(key: str, delta: int = 1) -> None:
@@ -550,8 +551,10 @@ def should_use_awq_fused_path(
 
 
 def reset_awq_runtime_stats() -> None:
+    global _awq_first_fallback_logged
     _AWQ_RUNTIME_STATS.clear()
     _AWQ_RUNTIME_PREFIX_STATS.clear()
+    _awq_first_fallback_logged.clear()
     _awq_stat_set("awq_matmul_calls", 0)
     _awq_stat_set("awq_fused_attempt", 0)
     _awq_stat_set("awq_fused_success", 0)
@@ -1013,6 +1016,29 @@ class PackedInt4Weight(QuantizedLinearWeight):
             _awq_stat_inc("awq_dense_builds")
             _awq_prefix_stat_inc(self.prefix, "cache_miss")
             _awq_prefix_stat_inc(self.prefix, "dense_build")
+
+            # NEW: first-fallback detailed log (shape + dtype + decision state)
+            global _awq_first_fallback_logged
+            if self.prefix not in _awq_first_fallback_logged:
+                _awq_first_fallback_logged.add(self.prefix)
+                import sys
+
+                n_actual = (
+                    int(self.original_shape[0])
+                    if self.original_shape is not None
+                    else int(dense_weight.shape[0])
+                )
+                print(
+                    f"[AWQ_DENSE_FALLBACK] prefix={self.prefix} "
+                    f"m={int(x.shape[0])} n={n_actual} k={int(x.shape[1])} "
+                    f"x_dtype={x.dtype} w_dtype={dense_weight.dtype} "
+                    f"cached_decision={getattr(self, '_cached_fused_decision', None)} "
+                    f"profile_hint={getattr(self, 'profile_hint', None)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            # END NEW
+
             return torch.nn.functional.linear(
                 x, _match_weight_dtype(dense_weight, x), bias
             )
