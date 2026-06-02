@@ -7,17 +7,14 @@ microbenchmarks have regressed whole-model decode latency.
 """
 from __future__ import annotations
 
-import os
-from unittest import mock
-
 import pytest
 import torch
 
 from vllm.kernels.triton.awq_fused_gemm import (
-    _env_awq_o_proj_splitk_gemv,
-    _env_awq_qo_proj_exact_gemv,
-    _env_awq_o_proj_group32_gemv,
-    _env_fused_gemm_autotune,
+    _fused_gemm_autotune_enabled,
+    awq_o_proj_group32_gemv_enabled,
+    awq_qo_proj_exact_gemv_enabled,
+    awq_o_proj_splitk_gemv_enabled,
     packed_int4_symmetric_fused_gemm,
     packed_int4_symmetric_fused_qkv_m1_safe,
 )
@@ -28,35 +25,27 @@ from vllm.model_executor.layers.quantization.tensor import (
 
 
 def test_env_autotune_never_true_for_m1_even_when_forced_on() -> None:
-    with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "1"}):
-        assert _env_fused_gemm_autotune(1, 8192, 8192) is False
-        assert _env_fused_gemm_autotune(1, 43008, 5376) is False
+    assert _fused_gemm_autotune_enabled(1, 8192, 8192, policy={"awq_fused_autotune": "1"}) is False
+    assert _fused_gemm_autotune_enabled(1, 43008, 5376, policy={"awq_fused_autotune": "1"}) is False
 
 
 def test_env_autotune_true_for_m2_when_forced_on() -> None:
-    with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_FUSED_AUTOTUNE": "1"}):
-        assert _env_fused_gemm_autotune(2, 8192, 8192) is True
+    assert _fused_gemm_autotune_enabled(2, 8192, 8192, policy={"awq_fused_autotune": "1"}) is True
 
 
 def test_o_proj_group32_gemv_default_enabled_and_overridable() -> None:
-    with mock.patch.dict(os.environ, {}, clear=True):
-        assert _env_awq_o_proj_group32_gemv() is True
-    with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_O_PROJ_GROUP32_GEMV": "0"}):
-        assert _env_awq_o_proj_group32_gemv() is False
+    assert awq_o_proj_group32_gemv_enabled() is True
+    assert awq_o_proj_group32_gemv_enabled(policy={"awq_o_proj_group32_gemv": False}) is False
 
 
 def test_qo_proj_exact_gemv_default_enabled_and_overridable() -> None:
-    with mock.patch.dict(os.environ, {}, clear=True):
-        assert _env_awq_qo_proj_exact_gemv() is False
-    with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_QO_PROJ_EXACT_GEMV": "1"}):
-        assert _env_awq_qo_proj_exact_gemv() is True
+    assert awq_qo_proj_exact_gemv_enabled() is False
+    assert awq_qo_proj_exact_gemv_enabled(policy={"awq_qo_proj_exact_gemv": True}) is True
 
 
 def test_o_proj_splitk_gemv_default_disabled_and_overridable() -> None:
-    with mock.patch.dict(os.environ, {}, clear=True):
-        assert _env_awq_o_proj_splitk_gemv() is False
-    with mock.patch.dict(os.environ, {"FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV": "1"}):
-        assert _env_awq_o_proj_splitk_gemv() is True
+    assert awq_o_proj_splitk_gemv_enabled() is False
+    assert awq_o_proj_splitk_gemv_enabled(policy={"awq_o_proj_splitk_gemv": True}) is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
@@ -448,3 +437,39 @@ def test_gemma4_down_proj_decode_bypasses_dense_fallback_when_gemv_enabled(
     y = weight.matmul(x)
     assert y.shape == (1, 5376)
     assert torch.equal(y, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+def test_packed_int4_m1_splitk_gemv_matches_dense_downproj_shape() -> None:
+    """split-K GEMV matches dense reference for 31B down_proj (n=5376, k=21504)."""
+    from vllm.kernels.triton.awq_fused_gemm import (
+        _packed_int4_symmetric_group32_gemv_m1_splitk_launch,
+    )
+    from vllm.model_executor.layers.quantization.tensor import (
+        dequantize_symmetric_packed_int4_pytorch,
+    )
+
+    torch.manual_seed(42)
+    n, k = 5376, 21504
+    group_size = 32
+    device = "cuda"
+    a = torch.randn((1, k), dtype=torch.float16, device=device)
+    qweight = torch.randint(0, 255, (n, k // 8), device=device, dtype=torch.uint8)
+    scales = torch.randn((n, k // group_size), device=device, dtype=torch.float16).abs() + 0.01
+    bias = torch.randn((n,), device=device, dtype=torch.float16) * 0.01
+
+    out = _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
+        a, qweight.to(torch.int32), scales, bias=bias, split_k=8, block_groups=4, block_n=64
+    )
+
+    dense_weight = dequantize_symmetric_packed_int4_pytorch(
+        qweight.to(torch.int32), scales, group_size=group_size,
+    ).to(dtype=a.dtype)
+    ref = torch.nn.functional.linear(a, dense_weight, bias)
+
+    cos = float(
+        ((out.float() * ref.float()).sum() / (out.float().norm() * ref.float().norm() + 1e-8)).item()
+    )
+    mae = float((out.float() - ref.float()).abs().mean().item())
+    assert cos > 0.995, f"cos={cos}"
+    assert mae < 0.15, f"mae={mae}"

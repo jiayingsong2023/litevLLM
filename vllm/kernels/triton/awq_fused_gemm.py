@@ -1079,6 +1079,178 @@ def _packed_int4_symmetric_group32_o_proj_splitk_reduce_m1(
 
 
 @triton.jit
+def _packed_int4_symmetric_group32_gemv_m1_splitk(
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    partial_ptr,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    N: tl.constexpr,
+    K_GROUPS: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    General M=1 group32 split-K GEMV for large-K shapes (e.g. down_proj).
+
+    Memory:
+      a: [K] input activation (fp16/bf16)
+      b: [N, K//8] packed-int4 weights
+      s: [N, K//32] fp16 scales
+      partial: [SPLIT_K, N] fp32 accumulator
+
+    Grid: [cdiv(N, BLOCK_N), SPLIT_K]. Each program handles one N-tile
+    over K_GROUPS//SPLIT_K quant groups (32 K elements each), then writes
+    its partial result. A second kernel reduces across SPLIT_K.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    groups_per_split = K_GROUPS // SPLIT_K
+    group_start = pid_k * groups_per_split
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for group_iter in range(0, tl.cdiv(groups_per_split, BLOCK_GROUPS)):
+        group_idx = group_start + group_iter * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < K_GROUPS
+        scale = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + group_idx[None, :] * stride_sk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        group_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group_idx * 4 + pack_in_group
+            mask_pack = mask_g
+            packed = tl.load(
+                b_ptr + offs_n[:, None] * stride_bn + pack_idx[None, :] * stride_bk,
+                mask=mask_n[:, None] & mask_pack[None, :],
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                mask_k = mask_g & (k_idx < K_GROUPS * 32)
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak, mask=mask_k, other=0.0
+                )
+                q = (packed >> (nibble * 4)) & 0xF
+                group_partial += (
+                    aval[None, :].to(tl.float32)
+                    * (q.to(tl.float32) - 8.0)
+                    * scale
+                )
+        acc += tl.sum(group_partial, axis=1)
+
+    tl.store(partial_ptr + pid_k * N + offs_n, acc, mask=mask_n)
+
+
+@triton.jit
+def _packed_int4_symmetric_group32_gemv_m1_splitk_reduce(
+    partial_ptr,
+    c_ptr,
+    bias_ptr,
+    stride_cn,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """
+    Reduce split-K partials: sum partial[0:SPLIT_K, N] along split dim,
+    add bias, cast to output dtype, write to c[N].
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k in tl.static_range(0, SPLIT_K):
+        p = tl.load(partial_ptr + k * N + offs_n, mask=mask_n, other=0.0)
+        acc += p.to(tl.float32)
+
+    if HAS_BIAS:
+        b = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += b.to(tl.float32)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
+
+
+def _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
+    a: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    split_k: int = 4,
+    block_groups: int = 4,
+    block_n: int = 64,
+) -> torch.Tensor:
+    """M=1 group32 split-K GEMV launcher.
+
+    Targets large-K shapes (31B down_proj: k=21504) where single-grid
+    GEMV underutilizes memory bandwidth. Splits K into split_k parts,
+    runs independent partial accumulations, then reduces.
+    """
+    m, k = a.shape
+    n = int(qweight.shape[0])
+    k_groups = k // 32
+    if k_groups % split_k != 0:
+        raise ValueError(
+            f"split_k={split_k} must divide k_groups={k_groups} (k={k})"
+        )
+
+    partial = torch.empty(
+        (split_k, n), device=a.device, dtype=torch.float32
+    )
+    grid = (triton.cdiv(n, block_n), split_k)
+    _packed_int4_symmetric_group32_gemv_m1_splitk[grid](
+        a,
+        qweight,
+        scales,
+        partial,
+        a.stride(1),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        N=n,
+        K_GROUPS=k_groups,
+        SPLIT_K=split_k,
+        BLOCK_GROUPS=block_groups,
+        BLOCK_N=block_n,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype)
+    grid_reduce = (triton.cdiv(n, block_n),)
+    _packed_int4_symmetric_group32_gemv_m1_splitk_reduce[grid_reduce](
+        partial,
+        c,
+        bias if bias is not None else torch.empty(0),
+        c.stride(1),
+        N=n,
+        SPLIT_K=split_k,
+        BLOCK_N=block_n,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        HAS_BIAS=bias is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    return c
+
+
+@triton.jit
 def _packed_int4_symmetric_group32_qkv_m1(
     a_ptr,
     q_ptr,
