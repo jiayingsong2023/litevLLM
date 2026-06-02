@@ -473,3 +473,62 @@ def test_packed_int4_m1_splitk_gemv_matches_dense_downproj_shape() -> None:
     mae = float((out.float() - ref.float()).abs().mean().item())
     assert cos > 0.995, f"cos={cos}"
     assert mae < 0.15, f"mae={mae}"
+
+
+def test_packed_int4_m1_fp16_gemv_matches_fp32_gemv() -> None:
+    """fp16-accumulation GEMV matches fp32 GEMV for 31B down_proj shape.
+
+    Direction A: verifies that the fp16 main loop with periodic fp32 reduction
+    produces results numerically close to the existing fp32 GEMV.
+    """
+    import torch
+    from vllm.kernels.triton.awq_fused_gemm import (
+        packed_int4_symmetric_group32_gemv_m1_fp16,
+        _packed_int4_symmetric_group32_gemv_m1_splitk_launch,
+    )
+
+    torch.manual_seed(42)
+    n, k = 5376, 21504
+    device = "cuda"
+    a = torch.randn((1, k), dtype=torch.float16, device=device)
+
+    # Build packed-int4 weights (same as split-K test)
+    k_packed = k // 8
+    qweight = torch.zeros((n, k_packed), dtype=torch.uint32, device=device)
+    scales = torch.zeros((n, k // 32), dtype=torch.float16, device=device)
+    dense_ref = torch.randn((n, k), dtype=torch.float16, device=device) * 0.02
+    for row in range(n):
+        for g in range(k // 32):
+            group_slice = slice(g * 32, (g + 1) * 32)
+            w_group = dense_ref[row, group_slice].float()
+            s = w_group.abs().max() / 7.0
+            scales[row, g] = float(s)
+            q_vals = torch.clamp(
+                torch.round(w_group / max(float(s), 1e-8)), -8, 7
+            ).to(torch.int32)
+            for pack in range(4):
+                val = 0
+                for nib in range(8):
+                    q = int(q_vals[pack * 8 + nib]) & 0xF
+                    val |= q << (nib * 4)
+                qweight[row, g * 4 + pack] = val
+
+    # Reference: existing split-K fp32 GEMV
+    qw_i32 = qweight.to(torch.int32)
+    ref = _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
+        a, qw_i32, scales, bias=None, split_k=8, block_groups=4, block_n=64
+    )
+
+    # Test: fp16 GEMV
+    out = packed_int4_symmetric_group32_gemv_m1_fp16(
+        a, qw_i32, scales, 32, bias=None, reduce_every=64, block_groups=4, block_n=64
+    )
+
+    # fp16 accumulation may drift slightly; use relaxed cosine tolerance
+    cos = float(
+        ((out.float() * ref.float()).sum()
+         / (out.float().norm() * ref.float().norm() + 1e-8)).item()
+    )
+    mae = float((out.float() - ref.float()).abs().mean().item())
+    assert cos > 0.98, f"cos={cos} (fp16 may drift vs fp32)"
+    assert mae < 0.30, f"mae={mae} (fp16 may drift vs fp32)"

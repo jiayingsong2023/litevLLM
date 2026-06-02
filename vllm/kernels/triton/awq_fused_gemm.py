@@ -940,6 +940,170 @@ def _packed_int4_symmetric_group32_gemv_m1(
 
 
 @triton.jit
+def _packed_int4_symmetric_group32_gemv_m1_fp16(
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    N,
+    K,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cn,
+    REDUCE_EVERY: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """
+    M=1 group32 GEMV with fp16 main loop + periodic fp32 reduction.
+
+    RDNA 3.5 has 2× fp16 throughput vs fp32 (29.7 vs 14.85 TFLOPS).
+    This kernel keeps the hot inner loop in fp16 and reduces to fp32
+    every REDUCE_EVERY quant groups to bound numerical drift.
+
+    Memory layout (same as _packed_int4_symmetric_group32_gemv_m1):
+      a: [K] fp16/bf16 input activation
+      b: [N, K//8] int32 packed-int4 weights
+      s: [N, K//32] fp16 scales
+      c: [N] output
+
+    Grid: [cdiv(N, BLOCK_N)].
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    num_groups = tl.cdiv(K, 32)
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+
+    # fp16 accumulator for the hot loop (2× ALU throughput on RDNA 3.5)
+    acc_fp16 = tl.zeros((BLOCK_N,), dtype=tl.float16)
+    # fp32 accumulator for periodic reduction
+    acc_fp32 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for group_base in range(0, tl.cdiv(num_groups, BLOCK_GROUPS)):
+        group_idx = group_base * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < num_groups
+        scale = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + group_idx[None, :] * stride_sk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float16)
+        group_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float16)
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group_idx * 4 + pack_in_group
+            packed = tl.load(
+                b_ptr + offs_n[:, None] * stride_bn + pack_idx[None, :] * stride_bk,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0
+                )
+                q = (packed >> (nibble * 4)) & 0xF
+                group_partial += (
+                    aval[None, :].to(tl.float16)
+                    * (q.to(tl.float16) - 8.0)
+                    * scale
+                )
+        acc_fp16 += tl.sum(group_partial, axis=1)
+
+        # Periodic fp32 reduction to bound numerical drift.
+        # REDUCE_EVERY=64 → reduce every 64*32=2048 K elements.
+        if (group_base + 1) % REDUCE_EVERY == 0:
+            acc_fp32 += acc_fp16.to(tl.float32)
+            acc_fp16 = tl.zeros((BLOCK_N,), dtype=tl.float16)
+
+    # Final reduction: residual fp16 → fp32
+    acc = acc_fp32 + acc_fp16.to(tl.float32)
+
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias_vals.to(tl.float32)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
+
+
+def packed_int4_symmetric_group32_gemv_m1_fp16(
+    a: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    *,
+    bias: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+    reduce_every: int = 64,
+    block_groups: int = 4,
+    block_n: int = 64,
+) -> torch.Tensor:
+    """M=1 group32 GEMV with fp16 main loop + periodic fp32 reduction.
+
+    On RDNA 3.5, fp16 throughput is 2× fp32. This launcher runs the hot
+    inner loop entirely in fp16 and reduces to fp32 every *reduce_every*
+    quant groups (1 group = 32 K elements). Matches the existing fp32
+    GEMV interface for drop-in dispatch.
+
+    Args:
+        a: [1, K] input activation
+        qweight: [N, K//8] int32 packed-int4 weights
+        scales: [N, K//32] fp16 scales
+        group_size: quantization group size (must be 32)
+        bias: optional [N] bias
+        reduce_every: reduce fp16→fp32 every N groups (default 64 = 2048 K elems)
+        block_groups: tile size for quant groups
+        block_n: tile size for N dimension
+
+    Returns:
+        [1, N] output tensor
+    """
+    del config, policy
+    if int(group_size) != 32:
+        raise ValueError("group_size must be 32")
+    m, k = a.shape
+    n = int(qweight.shape[0])
+    if m != 1:
+        raise ValueError("M must be 1 for fp16 GEMV")
+
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype)
+    a_flat = a.reshape(-1).contiguous()
+    grid = (triton.cdiv(n, block_n),)
+    _packed_int4_symmetric_group32_gemv_m1_fp16[grid](
+        a_flat,
+        qweight,
+        scales,
+        c,
+        bias if bias is not None else torch.empty(0),
+        n,
+        k,
+        a_flat.stride(0),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        c.stride(1),
+        REDUCE_EVERY=reduce_every,
+        BLOCK_GROUPS=block_groups,
+        BLOCK_N=block_n,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        HAS_BIAS=bias is not None,
+        num_warps=4,
+        num_stages=1,
+    )
+    return c
+
+
+@triton.jit
 def _packed_int4_symmetric_group32_gemv_m1_exact(
     a_ptr,
     b_ptr,
@@ -1285,9 +1449,26 @@ def packed_int4_symmetric_fused_gate_up_silu_down_m1(
         policy=policy,
     )
 
-    # Step 2: down_proj using split-K GEMV
+    # Step 2: down_proj — try fp16 GEMV first (2× ALU on RDNA 3.5),
+    # fall back to split-K fp32 GEMV.
     k_groups = intermediate // 32
     if k_groups % 8 == 0:
+        # Large K (>= 256 groups = 8192 elements): fp16 GEMV for throughput
+        if k_groups >= 256:
+            try:
+                result = packed_int4_symmetric_group32_gemv_m1_fp16(
+                    h.contiguous(),
+                    down_qweight,
+                    down_scales,
+                    int(group_size),
+                    bias=None,
+                    reduce_every=64,
+                    block_groups=4,
+                    block_n=64,
+                )
+                return result
+            except Exception:
+                pass
         return _packed_int4_symmetric_group32_gemv_m1_splitk_launch(
             h.contiguous(),
             down_qweight,
