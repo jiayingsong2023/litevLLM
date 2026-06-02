@@ -133,16 +133,75 @@ class Gemma4Attention(nn.Module):
         attn_metadata: Any,
         lora_mapping: Any = None,
     ) -> torch.Tensor:
-        with _gemma4_profile_span("attn_q_proj", self._layer_config):
-            q = self.q_proj(x, lora_mapping)
-        with _gemma4_profile_span("attn_k_proj", self._layer_config):
-            k = self.k_proj(x, lora_mapping)
-        if self.v_proj is not None:
-            with _gemma4_profile_span("attn_v_proj", self._layer_config):
-                v = self.v_proj(x, lora_mapping)
-        else:
-            v = k
         bsz, seqlen = x.shape[:2]
+        inf_config = _meta_get(attn_metadata, "config", None)
+
+        # Decode-only: attempt fused QKV GEMV to replace three separate
+        # q_proj/k_proj/v_proj kernel launches with one.
+        fused_qkv = None
+        if (
+            seqlen == 1
+            and x.shape[0] == 1
+            and int(x.shape[1]) % 32 == 0
+            and self.v_proj is not None
+        ):
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import (
+                    packed_int4_symmetric_fused_qkv_m1_safe,
+                )
+
+                _q_weight = getattr(self.q_proj, "qweight", None)
+                _k_weight = getattr(self.k_proj, "qweight", None)
+                _v_weight = getattr(self.v_proj, "qweight", None)
+                _q_scale = getattr(self.q_proj, "scales", None)
+                _k_scale = getattr(self.k_proj, "scales", None)
+                _v_scale = getattr(self.v_proj, "scales", None)
+                _g = int(getattr(self.q_proj, "group_size", 32))
+
+                if (
+                    _q_weight is not None
+                    and _k_weight is not None
+                    and _v_weight is not None
+                    and _q_scale is not None
+                    and _k_scale is not None
+                    and _v_scale is not None
+                ):
+                    with _gemma4_profile_span(
+                        "attn_fused_qkv", self._layer_config
+                    ):
+                        qkv, fused_ok, _reason = (
+                            packed_int4_symmetric_fused_qkv_m1_safe(
+                                x.reshape(1, -1).contiguous(),
+                                _q_weight,
+                                _k_weight,
+                                _v_weight,
+                                _q_scale,
+                                _k_scale,
+                                _v_scale,
+                                _g,
+                                config=inf_config,
+                            )
+                        )
+                    if fused_ok:
+                        fused_qkv = qkv
+            except Exception:
+                pass
+
+        if fused_qkv is not None:
+            qkv_flat = fused_qkv.view(bsz, seqlen, -1)
+            q = qkv_flat[..., : self.q_size]
+            k = qkv_flat[..., self.q_size : self.q_size + self.kv_size]
+            v = qkv_flat[..., self.q_size + self.kv_size :]
+        else:
+            with _gemma4_profile_span("attn_q_proj", self._layer_config):
+                q = self.q_proj(x, lora_mapping)
+            with _gemma4_profile_span("attn_k_proj", self._layer_config):
+                k = self.k_proj(x, lora_mapping)
+            if self.v_proj is not None:
+                with _gemma4_profile_span("attn_v_proj", self._layer_config):
+                    v = self.v_proj(x, lora_mapping)
+            else:
+                v = k
         q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
