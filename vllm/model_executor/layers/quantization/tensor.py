@@ -1077,6 +1077,26 @@ class PackedInt4Weight(QuantizedLinearWeight):
                     return out.view(*x.shape[:-1], out.shape[-1])
                 except Exception:
                     _awq_prefix_stat_inc(self.prefix, "splitk_runtime_exception")
+            # HIP GEMV: native AMD codegen, ~1.4× Triton BW for M=1 shapes
+            if int(x.shape[0]) == 1 and int(self.group_size) == 32:
+                try:
+                    from vllm.kernels.hip import int4_gemv_m1
+
+                    _awq_stat_inc("awq_fused_attempt")
+                    _awq_prefix_stat_inc(self.prefix, "fused_attempt")
+                    _awq_prefix_stat_inc(self.prefix, "decision_hip_gemv")
+                    out = int4_gemv_m1(
+                        x.reshape(1, -1).contiguous(),
+                        self.qweight,
+                        self.scales,
+                        int(self.group_size),
+                        bias=bias,
+                    )
+                    _awq_stat_inc("awq_fused_success")
+                    _awq_prefix_stat_inc(self.prefix, "fused_success")
+                    return out.view(*x.shape[:-1], out.shape[-1])
+                except Exception:
+                    _awq_prefix_stat_inc(self.prefix, "hip_runtime_fallback")
             try:
                 from vllm.kernels.triton.awq_fused_gemm import (
                     packed_int4_symmetric_fused_gemm_safe,
