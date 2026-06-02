@@ -1594,12 +1594,26 @@ def packed_int4_symmetric_fused_gate_up_silu_down_m1(
         policy=policy,
     )
 
-    # Step 2: down_proj — try fp16 GEMV first, then vec variant, then split-K.
+    # Step 2: down_proj — try HIP kernel first, then Triton fp16, then vec, then split-K.
     k_groups = intermediate // 32
     if k_groups % 8 == 0:
-        # Large K (>= 256 groups = 8192 elements): fp16 GEMV for throughput
+        # Large K (>= 256 groups = 8192 elements): prefer HIP for max BW
         if k_groups >= 256:
-            # Direction A (fp16 parallel): best occupancy on RDNA 3.5
+            # HIP GEMV: native AMD codegen, ~2× Triton BW (60+ GB/s)
+            try:
+                from vllm.kernels.hip import int4_group32_gemv_m1_fp16_hip
+
+                result = int4_group32_gemv_m1_fp16_hip(
+                    h.contiguous(),
+                    down_qweight,
+                    down_scales,
+                    int(group_size),
+                    bias=None,
+                )
+                return result
+            except Exception:
+                pass
+            # Triton fp16 GEMV (Direction A): parallel BLOCK_GROUPS
             try:
                 result = packed_int4_symmetric_group32_gemv_m1_fp16(
                     h.contiguous(),
