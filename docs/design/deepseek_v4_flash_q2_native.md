@@ -54,6 +54,13 @@ layers, an indexer that selects visible compressed rows. The DeepSeek V4 Flash
 model must therefore own a separate compressed KV implementation instead of
 pretending to be a standard paged-KV model.
 
+However, DeepSeek V4 Flash must preserve the most important engineering
+property of PagedAttention: logical KV growth must not require one large
+contiguous full-context allocation. The DeepSeek path uses a different
+attention algorithm, but it must keep page/block-based memory ownership.
+Raw SWA rows, compressed attention rows, and ratio-4 indexer rows are stored in
+paged chunk pools with explicit page tables.
+
 ## Proposed Modules
 
 ```text
@@ -88,9 +95,12 @@ flowchart TD
     Async --> Engine["LiteEngine"]
     Engine --> Model["DeepSeekV4FlashForCausalLM"]
     Model --> Store["DS4 GGUF mmap WeightStore"]
-    Model --> KV["DeepSeekV4CompressedKVCache"]
+    Model --> KV["Paged DeepSeekV4CompressedKVCache"]
     Model --> Attn["Hybrid raw + compressed attention"]
     Model --> MoE["Top-6 routed MoE"]
+    KV --> RawPages["raw SWA page pool"]
+    KV --> CompPages["compressed KV page pools"]
+    KV --> IndexPages["ratio-4 indexer page pool"]
     Store --> Q8["Q8_0 linear kernels"]
     Store --> Q2["IQ2_XXS / Q2_K expert kernels"]
     Attn --> Logits["logits"]
@@ -165,6 +175,40 @@ project rule of documenting memory layout and program tiling in ASCII comments.
 - compressed rows store attention/value-width data
 - ratio-4 layers also store indexer KV rows
 
+The KV layout must be paged:
+
+- it must not allocate one contiguous `[layer, context, width]` full-context
+  tensor
+- raw SWA rows use a small raw page pool
+- ratio-4 compressed rows use a compressed page pool
+- ratio-128 compressed rows use a compressed page pool
+- ratio-4 indexer rows use a separate indexer page pool because the row width
+  differs from attention compressed rows
+- logical row ids are resolved through page tables into `(chunk_id, page_id,
+  row_offset)` physical addresses
+
+The first implementation should allocate medium-sized chunks and grow on
+demand. This keeps the PagedAttention memory advantage without forcing
+DeepSeek V4 to use the PagedAttention algorithm. A suitable first shape is:
+
+- raw page: 16 raw rows
+- compressed page: 64 compressed rows
+- indexer page: 64 indexer rows
+- chunk: 64 pages
+
+The compressed attention kernel contract should consume page tables, not a
+single contiguous compressed cache:
+
+```text
+raw_page_table
+raw_page_chunks
+compressed_page_table
+compressed_page_chunks
+indexer_page_table
+indexer_page_chunks
+selected_compressed_row_ids
+```
+
 The first implementation should support contexts 4096 and 8192. It should not
 allocate for 1M tokens. Context expansion must go through explicit profiling and
 memory estimation changes.
@@ -215,6 +259,8 @@ Required safeguards:
 - startup memory estimate for weights, KV, scratch, and expert cache
 - hard cap on context length for the first release
 - hard cap on expert cache size
+- maximum single KV allocation size for each page-pool chunk
+- tests that reject accidental full-context contiguous KV allocation
 - fail-fast if estimated memory exceeds configured budget
 - runtime counters for expert cache hits, misses, loaded bytes, and evictions
 
@@ -239,6 +285,8 @@ Phase gates:
 
 4. Compressed KV:
    - validate raw SWA and compressed row accounting for 4K and 8K contexts
+   - validate page-table mapping for raw, compressed, and indexer rows
+   - validate no single KV allocation scales as full context by full row width
 
 5. Model smoke:
    - load target GGUF
@@ -282,4 +330,3 @@ The first native release is accepted when:
 - startup memory estimation is printed or available in runtime stats.
 - expert cache hit/miss counters are visible in runtime stats.
 - existing smoke tests still pass.
-

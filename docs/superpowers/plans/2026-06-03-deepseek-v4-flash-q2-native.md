@@ -4,7 +4,7 @@
 
 **Goal:** Add experimental native FastInference support for `DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf` with `batch=1`, `context=4096/8192`, greedy decode, and OpenAI-compatible REST access.
 
-**Architecture:** Implement a DeepSeek V4 Flash model family as a vertical lite model package with strict DS4 GGUF parsing, mmap-backed weight descriptors, model-local compressed KV, and Triton quant kernels. Keep `LiteEngine`, `StepScheduler`, and `RequestScheduler` model-agnostic; DeepSeek-specific behavior belongs in `vllm/adapters/deepseek_v4_flash.py`, `vllm/model_executor/models/deepseek_v4_flash/`, and `vllm/kernels/triton/deepseek_v4_flash/`.
+**Architecture:** Implement a DeepSeek V4 Flash model family as a vertical lite model package with strict DS4 GGUF parsing, mmap-backed weight descriptors, model-local paged compressed KV, and Triton quant kernels. Keep `LiteEngine`, `StepScheduler`, and `RequestScheduler` model-agnostic; DeepSeek-specific behavior belongs in `vllm/adapters/deepseek_v4_flash.py`, `vllm/model_executor/models/deepseek_v4_flash/`, and `vllm/kernels/triton/deepseek_v4_flash/`.
 
 **Tech Stack:** Python 3.12, uv, PyTorch, Triton through `vllm/triton_utils/`, mmap, pytest, FastAPI/OpenAI-compatible REST.
 
@@ -20,7 +20,7 @@ Create:
 - `vllm/model_executor/models/deepseek_v4_flash/gguf_reader.py` - strict GGUF v3 metadata and tensor directory parser.
 - `vllm/model_executor/models/deepseek_v4_flash/weight_store.py` - semantic tensor binding, mmap lifetime, memory/cache counters.
 - `vllm/model_executor/models/deepseek_v4_flash/quant.py` - PyTorch reference decode/dot helpers for Q8_0, IQ2_XXS, and Q2_K.
-- `vllm/model_executor/models/deepseek_v4_flash/compressed_kv.py` - raw SWA and compressed KV row accounting/state.
+- `vllm/model_executor/models/deepseek_v4_flash/compressed_kv.py` - raw SWA and compressed KV page tables, chunk pools, and row accounting/state.
 - `vllm/model_executor/models/deepseek_v4_flash/attention.py` - model-local attention reference and Triton call wrappers.
 - `vllm/model_executor/models/deepseek_v4_flash/moe.py` - router/top-k and routed expert execution wrappers.
 - `vllm/model_executor/models/deepseek_v4_flash/model.py` - `DeepSeekV4FlashForCausalLM` integration.
@@ -29,7 +29,7 @@ Create:
 - `vllm/kernels/triton/deepseek_v4_flash/iq2_xxs.py` - IQ2_XXS decode/dot kernels.
 - `vllm/kernels/triton/deepseek_v4_flash/q2_k.py` - Q2_K decode/dot kernels.
 - `vllm/kernels/triton/deepseek_v4_flash/routed_moe.py` - batch=1 top-6 routed expert kernels.
-- `vllm/kernels/triton/deepseek_v4_flash/compressed_attention.py` - raw/compressed attention kernels.
+- `vllm/kernels/triton/deepseek_v4_flash/compressed_attention.py` - raw/compressed attention kernels that consume page tables instead of contiguous full-context KV tensors.
 - `tests/deepseek_v4_flash/fixtures.py` - synthetic GGUF and quant block fixtures.
 - `tests/deepseek_v4_flash/test_gguf_reader.py`
 - `tests/deepseek_v4_flash/test_config_memory.py`
@@ -37,6 +37,7 @@ Create:
 - `tests/deepseek_v4_flash/test_triton_q8_linear.py`
 - `tests/deepseek_v4_flash/test_triton_q2_iq2.py`
 - `tests/deepseek_v4_flash/test_compressed_kv.py`
+- `tests/deepseek_v4_flash/test_compressed_attention_contract.py`
 - `tests/deepseek_v4_flash/test_adapter_registry.py`
 - `tests/deepseek_v4_flash/test_model_smoke_no_weights.py`
 - `tests/smoke/test_deepseek_v4_flash_http_smoke.py`
@@ -878,7 +879,7 @@ git add vllm/kernels/triton/deepseek_v4_flash/__init__.py \
 git commit -m "feat(kernels): add deepseek q8 linear wrapper"
 ```
 
-### Task 6: Compressed KV row accounting
+### Task 6: Paged compressed KV allocator and row accounting
 
 **Files:**
 - Create: `vllm/model_executor/models/deepseek_v4_flash/compressed_kv.py`
@@ -891,6 +892,7 @@ Create `tests/deepseek_v4_flash/test_compressed_kv.py`:
 ```python
 from vllm.model_executor.models.deepseek_v4_flash.compressed_kv import (
     DeepSeekV4CompressedKVLayout,
+    DeepSeekV4KVPageAllocator,
 )
 
 
@@ -911,6 +913,40 @@ def test_layout_rejects_context_above_first_release_cap() -> None:
         assert "8192" in str(exc)
     else:
         raise AssertionError("context above first-release cap must fail")
+
+
+def test_page_allocator_maps_raw_rows_without_full_context_allocation() -> None:
+    layout = DeepSeekV4CompressedKVLayout(context_length=8192)
+    allocator = DeepSeekV4KVPageAllocator(layout)
+    ref = allocator.allocate_raw_row(layer_idx=0, logical_row=129)
+    assert ref.chunk_id == 0
+    assert ref.page_id == 8
+    assert ref.row_offset == 1
+    assert allocator.raw_pool.max_chunk_bytes < 8192 * 512 * 4
+
+
+def test_page_allocator_maps_ratio4_compressed_and_indexer_rows() -> None:
+    layout = DeepSeekV4CompressedKVLayout(context_length=8192)
+    allocator = DeepSeekV4KVPageAllocator(layout)
+    comp_ref = allocator.allocate_compressed_row(layer_idx=2, logical_row=65)
+    index_ref = allocator.allocate_indexer_row(layer_idx=2, logical_row=65)
+    assert comp_ref.page_id == 1
+    assert comp_ref.row_offset == 1
+    assert index_ref.page_id == 1
+    assert index_ref.row_offset == 1
+    assert allocator.compressed_pool.row_width == 512
+    assert allocator.indexer_pool.row_width == 128
+
+
+def test_indexer_rows_are_rejected_for_ratio128_layers() -> None:
+    layout = DeepSeekV4CompressedKVLayout(context_length=8192)
+    allocator = DeepSeekV4KVPageAllocator(layout)
+    try:
+        allocator.allocate_indexer_row(layer_idx=3, logical_row=0)
+    except ValueError as exc:
+        assert "indexer" in str(exc)
+    else:
+        raise AssertionError("ratio-128 layers must not allocate indexer rows")
 ```
 
 - [ ] **Step 2: Run test to verify failure**
@@ -941,6 +977,40 @@ from .config import (
 
 
 @dataclass(frozen=True)
+class DeepSeekV4PageRef:
+    chunk_id: int
+    page_id: int
+    row_offset: int
+
+
+@dataclass(frozen=True)
+class DeepSeekV4KVPagePool:
+    name: str
+    page_rows: int
+    pages_per_chunk: int
+    row_width: int
+    bytes_per_value: int
+
+    @property
+    def max_chunk_bytes(self) -> int:
+        return self.page_rows * self.pages_per_chunk * self.row_width * self.bytes_per_value
+
+    def resolve(self, logical_row: int) -> DeepSeekV4PageRef:
+        if logical_row < 0:
+            raise ValueError("logical row must be non-negative")
+        rows_per_chunk = self.page_rows * self.pages_per_chunk
+        chunk_id = logical_row // rows_per_chunk
+        row_in_chunk = logical_row % rows_per_chunk
+        page_id = row_in_chunk // self.page_rows
+        row_offset = row_in_chunk % self.page_rows
+        return DeepSeekV4PageRef(
+            chunk_id=chunk_id,
+            page_id=page_id,
+            row_offset=row_offset,
+        )
+
+
+@dataclass(frozen=True)
 class DeepSeekV4CompressedKVLayout:
     context_length: int
     raw_window: int = DEEPSEEK_V4_FLASH_SHAPE.sliding_window
@@ -956,6 +1026,58 @@ class DeepSeekV4CompressedKVLayout:
 
     def has_indexer_cache(self, layer_idx: int) -> bool:
         return layer_compress_ratio(layer_idx) == 4
+
+
+class DeepSeekV4KVPageAllocator:
+    """Logical-to-physical page mapping for DeepSeek V4 compressed KV.
+
+    This allocator preserves the PagedAttention memory property: logical KV
+    growth is mapped through page tables and chunk pools instead of one
+    full-context contiguous allocation.
+    """
+
+    def __init__(self, layout: DeepSeekV4CompressedKVLayout) -> None:
+        self.layout = layout
+        self.raw_pool = DeepSeekV4KVPagePool(
+            name="raw",
+            page_rows=16,
+            pages_per_chunk=64,
+            row_width=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
+            bytes_per_value=4,
+        )
+        self.compressed_pool = DeepSeekV4KVPagePool(
+            name="compressed",
+            page_rows=64,
+            pages_per_chunk=64,
+            row_width=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
+            bytes_per_value=2,
+        )
+        self.indexer_pool = DeepSeekV4KVPagePool(
+            name="indexer",
+            page_rows=64,
+            pages_per_chunk=64,
+            row_width=DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
+            bytes_per_value=4,
+        )
+
+    def allocate_raw_row(self, layer_idx: int, logical_row: int) -> DeepSeekV4PageRef:
+        self._validate_layer(layer_idx)
+        return self.raw_pool.resolve(logical_row)
+
+    def allocate_compressed_row(self, layer_idx: int, logical_row: int) -> DeepSeekV4PageRef:
+        self._validate_layer(layer_idx)
+        if self.layout.layer_comp_capacity(layer_idx) == 0:
+            raise ValueError(f"layer {layer_idx} has no compressed KV rows")
+        return self.compressed_pool.resolve(logical_row)
+
+    def allocate_indexer_row(self, layer_idx: int, logical_row: int) -> DeepSeekV4PageRef:
+        self._validate_layer(layer_idx)
+        if not self.layout.has_indexer_cache(layer_idx):
+            raise ValueError(f"layer {layer_idx} has no ratio-4 indexer cache")
+        return self.indexer_pool.resolve(logical_row)
+
+    def _validate_layer(self, layer_idx: int) -> None:
+        layer_compress_ratio(layer_idx)
 ```
 
 - [ ] **Step 4: Run tests**
@@ -973,7 +1095,130 @@ Expected: tests pass.
 ```bash
 git add vllm/model_executor/models/deepseek_v4_flash/compressed_kv.py \
   tests/deepseek_v4_flash/test_compressed_kv.py
-git commit -m "feat: add deepseek compressed kv layout"
+git commit -m "feat: add deepseek paged compressed kv layout"
+```
+
+### Task 6A: Compressed attention page-table contract
+
+**Files:**
+- Create: `vllm/kernels/triton/deepseek_v4_flash/compressed_attention.py`
+- Test: `tests/deepseek_v4_flash/test_compressed_attention_contract.py`
+
+- [ ] **Step 1: Write failing tests**
+
+Create `tests/deepseek_v4_flash/test_compressed_attention_contract.py`:
+
+```python
+from vllm.kernels.triton.deepseek_v4_flash.compressed_attention import (
+    DeepSeekV4CompressedAttentionInputs,
+)
+
+
+def test_compressed_attention_inputs_require_page_tables() -> None:
+    inputs = DeepSeekV4CompressedAttentionInputs(
+        raw_page_table_name="raw_page_table",
+        compressed_page_table_name="compressed_page_table",
+        indexer_page_table_name="indexer_page_table",
+        selected_rows_name="selected_compressed_row_ids",
+    )
+    assert inputs.uses_page_tables is True
+
+
+def test_compressed_attention_contract_rejects_contiguous_cache_name() -> None:
+    try:
+        DeepSeekV4CompressedAttentionInputs(
+            raw_page_table_name="raw_page_table",
+            compressed_page_table_name="contiguous_comp_cache",
+            indexer_page_table_name="indexer_page_table",
+            selected_rows_name="selected_compressed_row_ids",
+        )
+    except ValueError as exc:
+        assert "page table" in str(exc)
+    else:
+        raise AssertionError("compressed attention must not accept contiguous cache contract")
+```
+
+- [ ] **Step 2: Run test to verify failure**
+
+Run:
+
+```bash
+uv run pytest tests/deepseek_v4_flash/test_compressed_attention_contract.py -q
+```
+
+Expected: fails with `ModuleNotFoundError` for `compressed_attention`.
+
+- [ ] **Step 3: Add page-table contract object**
+
+Create `vllm/kernels/triton/deepseek_v4_flash/compressed_attention.py`:
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DeepSeekV4CompressedAttentionInputs:
+    """Kernel input contract for DeepSeek V4 compressed attention.
+
+    Memory layout:
+    - raw_page_table maps logical raw SWA rows to raw page chunks.
+    - compressed_page_table maps logical compressed rows to compressed page chunks.
+    - indexer_page_table maps ratio-4 indexer rows to indexer page chunks.
+    - selected_rows contains compressed logical row ids selected by the indexer.
+
+    Tiling:
+    - Kernel implementations must tile over selected logical rows and resolve
+      physical addresses through page tables.
+    - The contract intentionally rejects a single contiguous full-context
+      compressed cache.
+    """
+
+    raw_page_table_name: str
+    compressed_page_table_name: str
+    indexer_page_table_name: str
+    selected_rows_name: str
+
+    def __post_init__(self) -> None:
+        names = (
+            self.raw_page_table_name,
+            self.compressed_page_table_name,
+            self.indexer_page_table_name,
+        )
+        if any("contiguous" in name or "full_context" in name for name in names):
+            raise ValueError("DeepSeek V4 compressed attention requires page table inputs")
+
+    @property
+    def uses_page_tables(self) -> bool:
+        return all(
+            "page_table" in name
+            for name in (
+                self.raw_page_table_name,
+                self.compressed_page_table_name,
+                self.indexer_page_table_name,
+            )
+        )
+```
+
+- [ ] **Step 4: Run tests**
+
+Run:
+
+```bash
+uv run pytest tests/deepseek_v4_flash/test_compressed_attention_contract.py \
+  tests/deepseek_v4_flash/test_compressed_kv.py -q
+```
+
+Expected: tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add vllm/kernels/triton/deepseek_v4_flash/compressed_attention.py \
+  tests/deepseek_v4_flash/test_compressed_attention_contract.py
+git commit -m "feat(kernels): define deepseek compressed attention contract"
 ```
 
 ### Task 7: Adapter and registry detection
@@ -1608,6 +1853,15 @@ uv run pytest tests/deepseek_v4_flash -q
 
 Expected: all DeepSeek unit tests pass; GPU kernel tests may skip on machines without a visible GPU.
 
+- [ ] Run the paged compressed KV contract tests explicitly:
+
+```bash
+uv run pytest tests/deepseek_v4_flash/test_compressed_kv.py \
+  tests/deepseek_v4_flash/test_compressed_attention_contract.py -q
+```
+
+Expected: tests pass and confirm DeepSeek compressed attention uses page-table inputs instead of a contiguous full-context KV cache.
+
 - [ ] Run smoke tests:
 
 ```bash
@@ -1640,4 +1894,3 @@ Expected: no unstaged or uncommitted changes.
 - Keep every Triton import routed through `vllm/triton_utils/`.
 - Run the real `DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf` inspect command before attempting a full model load.
 - Defer 1M context, speculative decoding, distributed execution, and DeepSeek V4 Pro until the first native release is stable.
-
