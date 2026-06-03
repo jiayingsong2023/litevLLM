@@ -1,154 +1,148 @@
-# FastInference API 参考（Lite）
+# FastInference API Reference
 
-本文档面向当前 Lite 路线，汇总项目中的主要 HTTP API、最小请求字段和示例。
+This page documents the maintained HTTP surface in
+`vllm.entrypoints.openai.api_server`.
 
-## 1. 启动服务
+## Start The Server
 
 ```bash
 uv run python -m vllm.entrypoints.openai.api_server \
   --model models/Qwen3.5-9B-AWQ \
-  --policy-mode auto \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-默认服务入口：`http://127.0.0.1:8000`
+The server uses `vllm/serving/config_builder.py` to build `VllmConfig` and
+`RuntimeConfig`, then serves requests through `AsyncLLM` and `LiteEngine`.
 
-策略参数说明：
-
-- `--policy-mode auto|aggressive|stable`
-  - `auto`: 启动时根据显存与模型规模一次性选择策略（推荐）
-  - `aggressive`: 高并发高吞吐（小模型优先）
-  - `stable`: 低并发/串行优先（大模型可用性优先）
-- 也可通过环境变量 `FASTINF_POLICY_MODE` 设置默认值。
-
-Qwen3.5-9B 额外策略开关（固定策略，不做运行中动态降档）：
-
-- `FASTINFERENCE_QWEN9_AGGRESSIVE`（默认 `1`）
-  - 仅作用于 `Qwen3.5-9B Dense` 路径
-  - `1`: 激进高吞吐
-  - `0`: 关闭激进
-- `FASTINFERENCE_QWEN9_STABLE`（默认 `0`）
-  - `1`: 强制 9B 稳定策略（优先级高于 `FASTINFERENCE_QWEN9_AGGRESSIVE`）
-
-Gemma4 默认由 adapter/runtime 安装当前 benchmark recommended profile。常规 API 服务不需要手动设置这些开关；性能回归脚本会额外固定 KV 上限来保证测量形状可复现。
-
-示例：
+Optional load-time policy mode:
 
 ```bash
-# 9B 默认激进（可省略 FASTINFERENCE_QWEN9_AGGRESSIVE）
-uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AWQ
-
-# 9B 强制稳定
-FASTINFERENCE_QWEN9_STABLE=1 \
-uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AWQ
-
-# Gemma4-26B A4B 默认使用 two_stage MoE int4 decode 策略
 uv run python -m vllm.entrypoints.openai.api_server \
-  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+  --model models/Qwen3.5-9B-AWQ \
+  --policy-mode auto
+```
 
-# 可选：尝试 packed-int4 grouped prefill（直接消费 expert-major AWQ 权重）
-FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1 \
-uv run python -m vllm.entrypoints.openai.api_server \
-  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+`--policy-mode` accepts `auto`, `aggressive`, or `stable`. Runtime profiles and
+KV policy should be configured with `FASTINFERENCE_CONFIG` and TOML.
 
-# 可选：尝试 single-kernel fused grouped prefill（当前仍为实验路径）
-FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1 \
-FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY=fused \
-uv run python -m vllm.entrypoints.openai.api_server \
-  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+## Runtime Config File
 
-# 可选：尝试 compact top-k tmp decode 布局
-FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_grouped_streaming \
+```toml
+profile = "latency"
+kv_type = "fp8"
+
+[tuning_keyvals]
+FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
+FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
+```
+
+```bash
+FASTINFERENCE_CONFIG=configs/latency.toml \
 uv run python -m vllm.entrypoints.openai.api_server \
   --model models/gemma-4-26B-A4B-it-AWQ-4bit
 ```
 
-## 2. 默认可用 API（openai/api_server）
+## GET `/v1/models`
 
-### GET `/v1/models`
-
-- 用途：查看当前加载模型
-- 响应：OpenAI 风格 `list`，`data[0].id` 为模型标识
-
-示例：
+Returns the currently loaded model in OpenAI-style list form.
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
-### POST `/v1/chat/completions`
+## POST `/v1/chat/completions`
 
-- 用途：聊天补全
-- 最小请求字段：
-  - `model: string`
-  - `messages: [{role, content}]`
-- 常用可选字段：
-  - `stream: bool`（默认 `false`）
-  - `max_tokens: int`（默认 `128`）
-  - `temperature: float`（默认 `0.7`）
+Minimum request:
 
-非流式示例：
+```json
+{
+  "model": "models/Qwen3.5-9B-AWQ",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+Common fields:
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `stream` | boolean | Server-sent events when `true`. |
+| `max_tokens` | integer | Defaults to the server sampling default. |
+| `temperature` | number | Passed into `SamplingParams`. |
+| `top_p` | number | Passed into `SamplingParams`. |
+| `structured_outputs` | object | Native structured output request. |
+| `response_format` | object | OpenAI-compatible JSON object/schema mapping. |
+
+Non-streaming example:
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "models/Qwen3.5-9B-AWQ",
-    "messages": [{"role":"user","content":"你好，请用一句话介绍你自己。"}],
+    "messages": [{"role": "user", "content": "Give me a three-step plan."}],
     "stream": false,
     "max_tokens": 64
   }'
 ```
 
-流式示例（SSE）：
+Streaming example:
 
 ```bash
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "models/Qwen3.5-9B-AWQ",
-    "messages": [{"role":"user","content":"给我一个三步计划。"}],
-    "stream": true
+    "messages": [{"role": "user", "content": "Count to five."}],
+    "stream": true,
+    "max_tokens": 32
   }'
 ```
 
-## 3. 扩展 API（tokenize / pooling / embedding / classify / score）
+JSON response-format example:
 
-以下接口在 `vllm.entrypoints` 中已实现路由与协议，通常由更完整的服务装配流程挂载。
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "models/Qwen3.5-9B-AWQ",
+    "messages": [{"role": "user", "content": "Return {\"ok\": true}."}],
+    "response_format": {"type": "json_object"},
+    "max_tokens": 32
+  }'
+```
 
-### Tokenize
+## Multimodal Message Content
 
-- `POST /tokenize`
-  - 请求：`{ model?, prompt }` 或 `chat messages` 形式
-  - 响应：`{ count, max_model_len, tokens, token_strs? }`
-- `POST /detokenize`
-  - 请求：`{ model?, tokens: number[] }`
-  - 响应：`{ prompt }`
+The chat endpoint accepts OpenAI-style content blocks with text and `image_url`
+items. Multimodal support is experimental; validate model-specific behavior
+before treating it as production-ready.
 
-### Pooling / Embedding / Classify / Score
+```json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Describe this image."},
+      {"type": "image_url", "image_url": {"url": "file:///path/to/image.png"}}
+    ]
+  }]
+}
+```
 
-- `POST /pooling`
-- `POST /v1/embeddings`
-- `POST /classify`
-- `POST /score`
-- 兼容别名：
-  - `POST /v1/score`
-  - `POST /rerank`
-  - `POST /v1/rerank`
-  - `POST /v2/rerank`
+## Runtime Stats
 
-这些接口的请求模型定义可参考：
+`GET /debug/stats` returns a compact summary of runtime observer counters,
+including prefix cache, preemption, fairness, LoRA, async driver, and
+multimodal counters.
 
-- `vllm/entrypoints/pooling/pooling/protocol.py`
-- `vllm/entrypoints/pooling/embed/protocol.py`
-- `vllm/entrypoints/pooling/classify/protocol.py`
-- `vllm/entrypoints/pooling/score/protocol.py`
-- `vllm/entrypoints/serve/tokenize/protocol.py`
+```bash
+curl -s http://127.0.0.1:8000/debug/stats
+```
 
-## 4. 错误响应格式
+## Error Shape
 
-统一错误结构（摘要）：
+Errors use a compact OpenAI-style envelope:
 
 ```json
 {
@@ -161,17 +155,8 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 }
 ```
 
-## 5. 回归建议
-
-建议每次 API 相关变更后执行：
+## API Verification
 
 ```bash
 uv run pytest -q tests/smoke
 ```
-
-其中已经覆盖了：
-
-- 关键模块导入回归
-- 服务路径一致性回归
-- HTTP smoke（`/tokenize`、`/detokenize`、`/v1/chat/completions`）
-- 真实模型轻量加载回归

@@ -1,115 +1,117 @@
-# Quickstart (LitevLLM)
+# FastInference Quickstart
 
-This guide will help you quickly get started with **FastInference** (vLLM Lite) to perform:
-
-- [Offline batched inference](#offline-batched-inference)
-- [Online serving using gRPC/OpenAI-compatible server](#online-serving)
+This guide covers the maintained lite-only path: Python 3.12, `uv`, one local
+GPU, and the bundled `LLM` / OpenAI-compatible entrypoints.
 
 ## Prerequisites
 
-- **OS**: Linux
-- **Python**: 3.12
-- **Hardware**: Single GPU (NVIDIA or AMD)
-- **Compiler**: None required (No C++ extensions!)
+- Linux
+- Python 3.12
+- One AMD ROCm or CUDA GPU
+- `uv`
+- Local model directories for model-loading tests and benchmarks
 
-## Installation
+FastInference does not require a project C++ build step. Use `uv` for all
+project commands.
 
-FastInference is designed to be installed without a C++ compiler. We recommend using [uv](https://docs.astral.sh/uv/) for the fastest setup.
+## Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/jiayingsong2023/litevLLM.git
-cd litevLLM
-
-# Install dependencies
 uv sync
 ```
 
-## Offline Batched Inference
+If the machine cannot reach Hugging Face directly, set the mirror before model
+download or tokenizer access:
 
-The simplest way to use FastInference is via the `LLM` class.
-
-```python
-from vllm import LLM, SamplingParams
-
-# Define prompts
-prompts = [
-    "Hello, my name is",
-    "The capital of France is",
-]
-
-# Configure sampling
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-
-# Initialize the engine (automatically uses Triton and LRU caching)
-llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-outputs = llm.generate(prompts, sampling_params)
-for output in outputs:
-    print(output.outputs[0].text)
-```
-
-## 💡 Hugging Face Tips
-
-### Automatic Mirror (For China Users)
-If you cannot connect to Hugging Face Hub, use the official mirror by setting this environment variable before starting:
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-### Offline Mode
-To run FastInference in a completely firewalled environment:
-1. Pre-download the model: `huggingface-cli download meta-llama/Llama-3-8B`
-2. Run with the local path: `llm = LLM(model="/path/to/local/model")`
-3. Force offline mode: `export HF_HUB_OFFLINE=1`
+For offline environments, download models ahead of time and pass local paths to
+the engine.
 
-## Online Serving
+## Offline Inference
 
-## Online Serving
+```python
+from vllm import LLM, SamplingParams
 
-FastInference supports both gRPC and HTTP (OpenAI-compatible) entrypoints.
+llm = LLM(model="models/TinyLlama-1.1B-Chat-v1.0")
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=64)
 
-### Starting the gRPC Server
-```bash
-uv run python -m vllm.entrypoints.grpc_server --model models/TinyLlama-1.1B-Chat-v1.0 --port 50051
+outputs = llm.generate(
+    ["Hello, my name is", "The capital of France is"],
+    sampling_params,
+)
+for output in outputs:
+    print(output.outputs[0].text)
 ```
 
-### Starting the OpenAI API Server
+## OpenAI-Compatible Server
+
 ```bash
-vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8000
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/Qwen3.5-9B-AWQ \
+  --host 0.0.0.0 \
+  --port 8000
 ```
 
-## Performance Benchmarking
-
-FastInference comes with specialized benchmarks to demonstrate its Triton-powered speed.
+Smoke test:
 
 ```bash
-# Default full benchmark: Gemma4 26B A4B + Gemma4 31B Q4
-uv run python tests/e2e_full_benchmark.py
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "models/Qwen3.5-9B-AWQ",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 32
+  }'
+```
 
-# Measure a specific supported model
-uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b
+## Runtime Profiles
 
-# Run the fast non-model regression suite
+Create a TOML file and point `FASTINFERENCE_CONFIG` at it:
+
+```toml
+profile = "benchmark"
+kv_type = "turbo_int4"
+
+[tuning_keyvals]
+FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
+FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
+```
+
+```bash
+FASTINFERENCE_CONFIG=configs/local-benchmark.toml \
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/gemma-4-31B-it-AWQ-4bit
+```
+
+Supported profiles are `auto`, `benchmark`, `latency`, `throughput`, and
+`accuracy`. `auto` currently resolves to the benchmark-recommended stable
+profile.
+
+## Regression Commands
+
+```bash
+# Fast unit/smoke gate, no full model loads.
 bash tests/run_regression_suite.sh
+
+# Local-model quality and semantic gates.
+bash tests/run_inference_correctness_regression.sh
+
+# Gemma4 26B/31B end-to-end performance baseline.
+uv run python tests/e2e_full_benchmark.py
 ```
 
-On AMD Radeon 8060S 65GB, the 2026-05-21 Gemma4 default benchmark profile
-measured `gemma4_26b_a4b` at `5.53` aggregate TPS / `12.03` decode TPS and
-`gemma4_31b_q4` at `1.62` aggregate TPS / `3.71` decode TPS. The 26B default
-uses the `two_stage` MoE int4 decode kernel; the benchmark still pins
-`KV cap=512` for reproducible measurement shape. Both models leverage the vectorized 2D BatchSampler.
-`FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=batched_grouped_streaming` is
-available for compact top-k tmp decode experiments. Grouped AWQ prefill is
-currently opt-in with `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1`. The
-`chunked` strategy directly consumes expert-major AWQ weights with a compact
-intermediate chunk; `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED_STRATEGY=fused`
-is a single-kernel experiment that avoids dense materialization and full tmp
-traffic, but stays gated because it repeats gate/up work across output tiles.
+On smaller GPUs, skip the heavier A-tier correctness checks:
 
-## Core Backend: Triton Only
+```bash
+SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
+```
 
-FastInference standardizes on **OpenAI Triton** for all performance-critical operators. 
-- No need to select `FLASH_ATTN` or `FLASHINFER`.
-- The engine automatically uses the optimized `TritonAttention` backend.
-- Supports **AMD Strix Point** (gfx1151) out of the box with stability-first IO paths.
+## Supported Models
+
+The maintained regression targets are listed in
+[Supported Models](../models/supported_models.md). Do not assume upstream vLLM
+model compatibility unless the model has a FastInference adapter, smoke test,
+and correctness gate.

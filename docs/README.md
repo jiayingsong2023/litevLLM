@@ -1,68 +1,82 @@
 ---
 hide:
   - navigation
-  - toc
 ---
 
-# Welcome to vLLM
+# FastInference Documentation
 
-<figure markdown="span">
-  ![](./assets/logos/vllm-logo-text-light.png){ align="center" alt="vLLM Light" class="logo-light" width="60%" }
-  ![](./assets/logos/vllm-logo-text-dark.png){ align="center" alt="vLLM Dark" class="logo-dark" width="60%" }
-</figure>
+FastInference is a lite-only, single-GPU inference runtime derived from vLLM.
+The maintained path is pure Python plus Triton, with AMD ROCm as the primary
+tuning target and CUDA compatibility kept where the same path supports it.
 
-<p style="text-align:center">
-<strong>Easy, fast, and cheap LLM serving for everyone
-</strong>
-</p>
+This documentation covers the current repository, not upstream vLLM. For model
+and feature status, use the capability matrix as the source of truth.
 
-<p style="text-align:center">
-<script async defer src="https://buttons.github.io/buttons.js"></script>
-<a class="github-button" href="https://github.com/vllm-project/vllm" data-show-count="true" data-size="large" aria-label="Star">Star</a>
-<a class="github-button" href="https://github.com/vllm-project/vllm/subscription" data-show-count="true" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
-<a class="github-button" href="https://github.com/vllm-project/vllm/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
-</p>
+## Start Here
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+- [Quickstart](getting_started/quickstart.md) - local setup, offline inference,
+  OpenAI-compatible serving, and regression commands.
+- [Capability Matrix](CAPABILITY_MATRIX.md) - supported, experimental,
+  compatibility, and unsupported areas.
+- [Architecture](ARCHITECTURE_LITE.md) - current lite runtime control plane and
+  execution path.
+- [API Reference](API_REFERENCE.md) - maintained HTTP surface for the bundled
+  OpenAI-compatible server.
+- [Inference Accuracy](INFERENCE_ACCURACY.md) - correctness tiers and local
+  model quality gates.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has evolved into a community-driven project with contributions from both academia and industry.
+## Maintained Runtime Path
 
-Where to get started with vLLM depends on the type of user. If you are looking to:
+```text
+LLM / AsyncLLM / OpenAI API Server
+  -> vllm/serving/config_builder.py
+  -> vllm/engine/lite_engine.py
+  -> vllm/engine/step_scheduler.py
+  -> vllm/engine/request_scheduler.py
+  -> vllm/engine/prefill_executor.py + vllm/engine/decode_executor.py
+  -> vllm/engine/sampling_driver.py
+  -> vllm/engine/output_pipeline.py
+```
 
-- Run open-source models on vLLM, we recommend starting with the [Quickstart Guide](./getting_started/quickstart.md)
-- Build applications with vLLM, we recommend starting with the [User Guide](./usage/README.md)
-- Build vLLM, we recommend starting with [Developer Guide](./contributing/README.md)
+The control plane lives in `vllm/engine/`; model capability policy belongs in
+`vllm/adapters/`; hot kernels live under `vllm/kernels/triton/` and use
+`vllm/triton_utils/` for Triton imports.
 
-For information about the development of vLLM, see:
+## Configuration
 
-- [Roadmap](https://roadmap.vllm.ai)
-- [Releases](https://github.com/vllm-project/vllm/releases)
+Production configuration is resolved through `FastInferenceConfig` and
+`RuntimeConfig`. The public environment entrypoint is `FASTINFERENCE_CONFIG`,
+which points at a TOML file:
 
-vLLM is fast with:
+```toml
+profile = "benchmark"
+kv_type = "turbo_int4"
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests
-- Fast model execution with CUDA/HIP graph
-- Quantization: [GPTQ](https://arxiv.org/abs/2210.17323), [AWQ](https://arxiv.org/abs/2306.00978), INT4, INT8, and FP8
-- Optimized CUDA kernels, including integration with FlashAttention and FlashInfer.
-- Speculative decoding
-- Chunked prefill
+[tuning_keyvals]
+FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
+FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
+```
 
-vLLM is flexible and easy to use with:
+Supported profile names are `auto`, `benchmark`, `latency`, `throughput`, and
+`accuracy`. Legacy `FASTINFERENCE_*` switches may still exist for tests,
+benchmarks, or compatibility, but they are not the preferred production
+configuration surface.
 
-- Seamless integration with popular HuggingFace models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data and expert parallelism support for distributed inference
-- Streaming outputs
-- OpenAI-compatible API server
-- Support for NVIDIA GPUs, AMD CPUs and GPUs, Intel CPUs and GPUs, PowerPC CPUs, Arm CPUs, and TPU. Additionally, support for diverse hardware plugins such as Intel Gaudi, IBM Spyre and Huawei Ascend.
-- Prefix caching support
-- Multi-LoRA support
+## Current Regression Targets
 
-For more information, check out the following:
+- `TinyLlama-1.1B`
+- `Qwen3.5-9B-AWQ`
+- `Gemma4-26B-A4B-it-AWQ-4bit`
+- `Gemma4-31B-it-AWQ-4bit`
 
-- [vLLM announcing blog post](https://blog.vllm.ai/2023/06/20/vllm.html) (intro to PagedAttention)
-- [vLLM paper](https://arxiv.org/abs/2309.06180) (SOSP 2023)
-- [How continuous batching enables 23x throughput in LLM inference while reducing p50 latency](https://www.anyscale.com/blog/continuous-batching-llm-inference) by Cade Daniel et al.
-- [vLLM Meetups](community/meetups.md)
+Run the fast structural gate with:
+
+```bash
+bash tests/run_regression_suite.sh
+```
+
+Run model correctness gates with:
+
+```bash
+bash tests/run_inference_correctness_regression.sh
+```

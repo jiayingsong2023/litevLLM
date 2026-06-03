@@ -1,62 +1,50 @@
-# Structured Outputs (JSON & Regex Constraints)
+# Structured Outputs
 
-FastInference (vLLM Lite) includes a production-grade **StructuredOutputManager** that ensures model outputs strictly adhere to a predefined format, such as JSON or a specific Regular Expression.
+Structured output support is present in the lite runtime and is currently
+experimental. See [CAPABILITY_MATRIX.md](../CAPABILITY_MATRIX.md) for the
+support status.
 
-## 🚀 How it Works
+## Request Forms
 
-### 1. Outlines Integration
-We utilize the **Outlines** engine as our primary backend for constrained decoding. It builds a finite state machine (FSM) from your schema and maps it to the model's vocabulary.
+The OpenAI-compatible chat endpoint accepts:
 
-### 2. Triton-Aware Bitmasking
-- **Efficiency**: The `StructuredOutputManager` generates a **Bitmask** for each decoding step.
-- **Enforcement**: This bitmask is used to filter the model's logits before sampling, effectively making the probability of non-compliant tokens zero.
-- **Integration**: The bitmask generation is optimized to work seamlessly with our high-speed Triton-based sampling paths.
+- native `structured_outputs`
+- OpenAI-style `response_format.type = "json_object"`
+- OpenAI-style `response_format.type = "json_schema"`
 
-## 🛠 Usage Example
+Example:
 
-### JSON Schema Enforcement
-Ensure the model always outputs a valid JSON object matching your schema.
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "models/Qwen3.5-9B-AWQ",
+    "messages": [{"role": "user", "content": "Return {\"name\": \"Ada\"}."}],
+    "response_format": {"type": "json_object"},
+    "max_tokens": 32
+  }'
+```
 
-```python
-from vllm import LLM, SamplingParams
+Native structured-output example:
 
-llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-# Define JSON schema
-my_schema = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "age": {"type": "integer"}
-    }
+```json
+{
+  "structured_outputs": {
+    "regex": "[A-Z]{3}-[0-9]{4}"
+  }
 }
-
-# Request structured output
-params = SamplingParams(temperature=0, max_tokens=50)
-outputs = llm.generate(
-    "Generate a person record:",
-    sampling_params=params,
-    extra_kwargs={"json_schema": my_schema}
-)
-
-print(outputs[0].outputs[0].text) # Guaranteed to be valid JSON
 ```
 
-### Regular Expression Constraint
-Force the model to output data in a specific format (e.g., an IP address).
+## Maintainer Notes
 
-```python
-outputs = llm.generate(
-    "The server IP is:",
-    extra_kwargs={"regex": r"(\d{1,3}\.){3}\d{1,3}"}
-)
+- Keep grammar/request parsing at the serving boundary.
+- Keep logits filtering and sampling behavior covered by focused tests.
+- Do not claim broad upstream OpenAI compatibility without smoke and behavior
+  coverage for the exact request shape.
+
+## Verification
+
+```bash
+uv run pytest -q tests/smoke
+bash tests/run_regression_suite.sh
 ```
-
-## 📊 Comparison with vLLM standard
-
-| Feature | Standard vLLM | FastInference (vLLM Lite) |
-| :--- | :--- | :--- |
-| **Logic** | Distributed Aware | **Simplified & Decoupled** |
-| **Backend** | Multiple | **Outlines (Optimized)** |
-| **Reliability** | 100% | **100%** |
-| **Overhead** | Medium | **Low (Cached Grammars)** |

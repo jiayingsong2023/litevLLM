@@ -1,112 +1,82 @@
-# Lite-Only Architecture Status
+# Lite-Only Status
 
-## Delivery Snapshot
-As of 2026-05-29, within the current Lite runtime scope:
+This page records the current architectural boundary. For model and feature
+status, use [CAPABILITY_MATRIX.md](CAPABILITY_MATRIX.md).
 
-- `P0` delivered — Gemma4 全局状态隔离（`Gemma4LayerConfig` dataclass, 消除模块级 mutable global）
-- `P1` delivered — policy key 常量 + TypedDict + RuntimeAssemblyContext 类型强化 + StepScheduler 参数聚合
-- `P2` delivered — 工具函数去重 + 异常日志细化
-- Legacy cleanup: 删除 `vllm/worker/`、`vllm/core/`、`vllm/distributed/`、`vllm/third_party/`（~55k 行）
-- Test cleanup: 删除 `tests/reports/`（2.4MB 历史性能数据）+ DeepSeek 诊断脚本
-- Config migration: 所有运行时 tuning 参数从 `os.environ` 迁移到 TOML `[tuning_keyvals]`
-- Explicit deferred items: `speculative decoding`、模型适配器拆分、`gemma4.py` 大文件拆分
+## Current Position
 
-For an external-facing DONE/KNOWN_GAPS list, see:
-- `docs/DELIVERY_STATUS.md`
+FastInference is maintained as a lite-only, single-GPU inference runtime. The
+official path is:
 
-For the current supported / experimental / compatibility / unsupported surface,
-use `docs/CAPABILITY_MATRIX.md` as the source of truth.
+- Offline: `vllm.LLM` / `vllm.entrypoints.llm.LLM` -> `LiteEngine`
+- Async/server: `AsyncLLM` -> `LiteEngine`
+- HTTP: `vllm.entrypoints.openai.api_server`
 
-## Current Project Position
-FastInference is now a `lite-only` single-GPU inference project. The repository no longer treats `Qwen3.5-35B` as an officially supported model. The maintained support surface is the lite runtime path plus the current regression targets:
+The maintained regression targets are:
 
 - `TinyLlama-1.1B`
 - `Qwen3.5-9B-AWQ`
-- `Gemma4-26B-A4B-it-AWQ-4bit` (MoE, A-strict + A-lite + B)
-- `Gemma4-31B-it-AWQ-4bit` (Dense, A-lite + B)
+- `Gemma4-26B-A4B-it-AWQ-4bit`
+- `Gemma4-31B-it-AWQ-4bit`
 
-The project no longer contains `vllm/worker/`, `vllm/core/`, `vllm/distributed/`, or `vllm/third_party/`. These upstream vLLM subsystems were deleted as part of the lite-only cleanup.
+`Qwen3.5-35B` and the full upstream vLLM model surface are not official support
+targets.
 
-## Official Runtime Path
-The only official runtime path is:
+## Delivered Architecture Work
 
-- Offline sync: `vllm.entrypoints.llm.LLM` -> `vllm.engine.lite_engine.LiteEngine`
-- Async/server path: `vllm.engine.async_llm.AsyncLLM` -> `vllm.engine.lite_engine.LiteEngine`
+- Engine control plane is decomposed into scheduler, request lifecycle,
+  prefill/decode executors, sampling, output assembly, observer, and errors.
+- Runtime policy flows through `FastInferenceConfig`, runtime profiles, and
+  `RuntimeConfig`.
+- Model capability decisions are centralized under `vllm/adapters/`.
+- Gemma4 model code has been split from a large monolithic module into the
+  `vllm/model_executor/models/gemma4/` package.
+- `vllm/worker/`, `vllm/core/`, and `vllm/distributed/` have been removed from
+  the code tree.
 
-Internal decomposition:
+## Still Present But Not A Second Runtime
 
-- `vllm/serving/config_builder.py` — TOML config -> VllmConfig + RuntimeConfig
-- `vllm/adapters/*` — model adapter with TypedDict policy keys
-- `vllm/engine/step_scheduler.py` — step-level scheduling (Lora/MultiModal params aggregated)
-- `vllm/engine/request_scheduler.py` — request/slot lifecycle
-- `vllm/engine/prefill_executor.py` — prefill (hardware SDPA)
-- `vllm/engine/decode_executor.py` — decode (Triton PagedAttention)
-- `vllm/engine/sampling_driver.py` — sampling
-- `vllm/engine/output_pipeline.py` — output assembly
-- `vllm/engine/runtime_observer.py` — observability
-- `vllm/engine/errors.py` — error semantics
+The following code may exist for compatibility, vendored kernels, or
+experimental feature surface:
 
-## Key Architectural Changes (2026 Q2)
+- `vllm/third_party/triton_kernels/`
+- `vllm/model_executor/warmup/`
+- `vllm/spec_decode/`
+- LoRA, multimodal, pooling, and structured-output modules
 
-### Gemma4 Instance Isolation
-Module-level global mutable state (`_GEMMA4_TUNING`, `_GEMMA4_PROFILE_ENABLED`, etc.) has been replaced with per-instance `Gemma4LayerConfig`. Model layers receive their configuration via constructor injection rather than reading module-level variables.
+Their support level is defined by the capability matrix, not by upstream vLLM
+feature claims.
 
-### Policy Typing
-Policy keys (`model_policy`, `kernel_policy`) are now defined as named constants in `vllm/adapters/policy_keys.py` with `TypedDict` type constraints.
+## Configuration Boundary
 
-### StepScheduler Parameter Aggregation
-LoRA and MultiModal scheduling constraints are aggregated into `LoraSchedulingParams` and `MultiModalSchedulingParams` frozen dataclasses, reducing the `StepScheduler.__init__` signature from ~40 to ~18 parameters.
+The public production configuration entrypoint is `FASTINFERENCE_CONFIG`,
+pointing at a TOML file:
 
-### TOML Config
-All runtime tuning parameters are now configured via TOML `[tuning_keyvals]` section. Environment variables are deprecated — the config file is the sole source of truth.
+```toml
+profile = "benchmark"
+kv_type = "turbo_int4"
 
-## What Was Removed (P0 + P1 + P2)
-- `vllm/worker/` — GPU worker, model runner, CUDA graph, sampling pipeline
-- `vllm/core/` — block pool, KV cache manager, scheduler
-- `vllm/distributed/` — parallel state
-- `vllm/third_party/` — flashmla, triton_kernels
-- `vllm/model_executor/warmup/` — kernel warmup
-- `vllm/model_executor/layers/mamba/` — Mamba layers
-- `vllm/model_executor/layers/kda.py` — KDA module
-- `tests/reports/` — 33 historical perf JSON files (2.4MB)
-- DeepSeek diagnostic scripts (not a supported model)
-- `stress_test_64k.py` — unreferenced stress test
+[tuning_keyvals]
+FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
+FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
+```
 
-## Regression Status
-Validated after the current refactor set (2026-05-29):
+Supported profiles are `auto`, `benchmark`, `latency`, `throughput`, and
+`accuracy`. Deprecated or tool-only `FASTINFERENCE_*` names remain registered
+for compatibility, but new production policy should be expressed through
+config/profile fields.
 
-- `bash tests/run_regression_suite.sh` — 113 pass, 1 pre-existing failure
-- `SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh` — 4/4 models PASS
-- `uv run python tests/e2e_full_benchmark.py` — both Gemma4 models PASS
-- `uv run pytest tests/test_gemma4_global_state_isolation.py -v` — 3/3 PASS
+## Removed Upstream Runtime Scope
 
-## Adapter / Policy Onboarding Checklist
+- Worker-based GPU runtime
+- Distributed tensor/pipeline/data parallel runtime
+- Upstream block manager / scheduler core
+- Full upstream model registry compatibility promise
+- C++/CUDA extension source in the maintained path
+- Speculative decoding as a supported feature
 
-### Adapter Interfaces
-Add a model adapter module under `vllm/adapters/`, with responsibilities:
+## Onboarding Rule
 
-- expose head counts, KV head counts, head dim, layer count, and max model length
-- declare whether the model uses dense attention, hybrid attention, or MoE routing
-- define attention metadata expectations for prefill and decode
-- expose model capability flags
-
-### Policy Interfaces
-Only add model policy code if the model truly needs it. Keep it out of `LiteEngine`.
-
-Recommended interfaces:
-
-- `prompt_policy`: optional prompt wrapping or chat-template normalization
-- `logits_policy`: optional logit bias or stop-token shaping
-- `output_policy`: optional output cleanup
-- `moe_policy`: expert residency, CPU offload, FP8 enablement, packed-weight compatibility
-
-### Test Requirements
-Before claiming support, add:
-
-- load smoke test
-- one-step prefill correctness test vs reference
-- Tier-B generation smoke
-- MoE routing / expert weight correctness test if applicable
-
-### Design Rule
-New model support should be implemented by adding adapter, loader, and policy modules. It should not reintroduce model-name-based conditionals inside `LiteEngine`, `step_scheduler.py`, executor modules, or generic loader hot paths.
+New model support should be implemented through adapter, loader, model, and
+policy modules. Do not add model-name conditionals to `LiteEngine`,
+`step_scheduler.py`, executor modules, or generic hot-path loader code.

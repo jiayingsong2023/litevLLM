@@ -68,15 +68,11 @@ Every new Triton kernel needs:
 - ASCII comments documenting memory layout and block/program tiling
 - a lower-ILP fallback or pressure note if register pressure is high
 
-For Gemma4-26B MoE work, the default accepted strategy is currently
-`FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL_STRATEGY=two_stage`; other
-strategies are experimental until they beat this path in both correctness and
-end-to-end performance gates. The current grouped decode experiments include
-`batched_chunked` and `batched_grouped_streaming`, which keep compact
-intermediate chunks instead of the full `[M, top_k, I]` buffer. AWQ grouped
-prefill is enabled only when `FASTINFERENCE_GEMMA4_MOE_PREFILL_GROUPED=1`;
-the `fused` grouped prefill strategy remains experimental after the 384-token
-profile showed a large regression from repeated gate/up work.
+For Gemma4-26B MoE work, production policy should be installed through
+runtime profiles, adapter policy, or explicit config fields. Legacy
+`FASTINFERENCE_GEMMA4_*` names may remain registered for compatibility or
+benchmark tools, but new runtime behavior should not depend on direct
+environment reads in model hot paths.
 
 ## Supported Regression Surface
 

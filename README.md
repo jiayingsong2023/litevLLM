@@ -1,6 +1,6 @@
 # FastInference (vLLM Lite)
 
-`FastInference` (vLLM Lite) 是一个 `lite-only` 的单卡推理引擎。项目已完成大规模精简，从原始 ~82k 行 Python 缩减至 ~26k 行（~68%），删除了 `vllm/worker/`、`vllm/core/`、`vllm/distributed/`、`vllm/third_party/` 等上游遗留子系统。当前优先级是收敛到稳定、可维护的 **纯 Python + Triton** 主路径。
+`FastInference` (vLLM Lite) 是一个 `lite-only` 的单卡推理引擎。项目已完成大规模精简，删除了 `vllm/worker/`、`vllm/core/`、`vllm/distributed/` 等上游 worker/distributed runtime 子系统。当前优先级是收敛到稳定、可维护的 **纯 Python + Triton** 主路径。
 
 ## 核心架构与成就
 本引擎专注于 **纯 Python + Triton** 路径，实现单卡推理的高吞吐与低维护复杂度：
@@ -22,14 +22,15 @@
   - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径。
   - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`。
   - **非目标**: `Qwen3.5-35B` 不再作为正式支持模型。
-  - **已删除**: `vllm/worker/`、`vllm/core/`、`vllm/distributed/`、`vllm/third_party/` 等上游遗留子系统。
+  - **已删除**: `vllm/worker/`、`vllm/core/`、`vllm/distributed/` 等上游 runtime 子系统。
+  - **兼容/内嵌**: `vllm/third_party/triton_kernels/` 当前仍作为 vendored Triton kernel 代码存在，不代表恢复上游完整 third-party 支持面。
 
 ## 核心特性
 - **lite-only 主线**: 运行时以 `vllm/engine/lite_engine.py` 为核心，单卡执行链路。
 - **统一配置构建**: offline 与 OpenAI server 统一通过 `vllm/serving/config_builder.py` 构建 `VllmConfig + RuntimeConfig`。所有 tuning 参数通过 TOML 配置文件 `[tuning_keyvals]` 传递，不再使用 `os.environ`。
 - **分层执行架构**: `LiteEngine` 负责 orchestration，`StepScheduler` 做 step 级调度，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` / `OutputPipeline` 做采样与输出拼装。
 - **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，policy keys 有 `TypedDict` 类型约束。
-- **配置收敛**: 生产运行策略以 `Runtime Profiles -> RuntimeConfig` 为真源，TOML 配置文件为唯一配置入口。
+- **配置收敛**: 生产运行策略以 `Runtime Profiles -> RuntimeConfig` 为真源，`FASTINFERENCE_CONFIG` 指向的 TOML 配置文件是公共配置入口；旧 `FASTINFERENCE_*` 名称只作为兼容或工具级开关保留。
 - **纯净计算路径**: 主线优先维护 **Safetensors + AWQ**。
 - **混合加速 Prefill**: 预填充阶段利用硬件原生 SDPA，解码阶段全量回归手写 **Triton PagedAttention**。
 - **自动化元数据展开**: 统一的 `expand_metadata_for_paged_attention` 逻辑，支持全模型 Chunked Prefill。
@@ -110,7 +111,6 @@ uv run python -m vllm.entrypoints.openai.api_server --model models/Qwen3.5-9B-AW
 - **依赖闭包**: [docs/DEPENDENCY_CLOSURE.md](./docs/DEPENDENCY_CLOSURE.md) — lite 路径 import 边界
 - **能力矩阵**: [docs/CAPABILITY_MATRIX.md](./docs/CAPABILITY_MATRIX.md)
 - **架构解析**: [docs/ARCHITECTURE_LITE.md](./docs/ARCHITECTURE_LITE.md)
-- **交付状态**: [docs/DELIVERY_STATUS.md](./docs/DELIVERY_STATUS.md)
 - **lite-only 状态**: [docs/LITE_ONLY_STATUS.md](./docs/LITE_ONLY_STATUS.md)
 
 ---

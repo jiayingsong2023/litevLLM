@@ -20,7 +20,7 @@ or feature status lists.
 | Single-GPU lite runtime | Supported | Official path through `LiteEngine`, `RuntimeController`, and the lite backend. |
 | AMD ROCm | Supported | Primary tuning target. Current Gemma4 baselines use the default benchmark recommended profile. |
 | CUDA compatibility | Supported | Maintained where the Python + Triton path supports it. |
-| Multi-GPU distributed runtime | Unsupported | Distributed shims may remain for imports, but are not an official execution path. |
+| Multi-GPU distributed runtime | Unsupported | `vllm/distributed/` is not part of the current code tree or execution path. |
 | C++/CUDA extension source | Unsupported | Enforced by pre-commit outside allowed third-party code. |
 
 ## Model Support

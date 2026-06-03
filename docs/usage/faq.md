@@ -1,35 +1,38 @@
-# Frequently Asked Questions (FastInference)
+# Frequently Asked Questions
 
-> Q: Why is this version called "Lite" or "FastInference"?
+## Why is this project called lite-only?
 
-A: We have physically removed 70% of the original vLLM code (from 270k to 81k LOC). This includes removing all C++ extensions and distributed overhead to focus exclusively on single-GPU peak performance using OpenAI Triton.
+FastInference keeps a single-GPU pure Python + Triton runtime path and removes
+the upstream worker/distributed runtime boundary from the maintained product
+surface.
 
----
+## Does FastInference require a C++ compiler?
 
-> Q: Does FastInference require a C++ compiler?
+No project C++ build step is required. Performance-critical maintained kernels
+are Python/Triton. Use `uv sync` to install the pinned Python 3.12 environment.
 
-A: **No.** Performance-critical kernels are written in Python using Triton. Use `uv sync` to install the pinned Python 3.12 environment; no project C++ build step is required.
+## What is the supported configuration surface?
 
----
+Use `FASTINFERENCE_CONFIG` to point at a TOML file. Runtime profiles resolve
+into `RuntimeConfig`, which is then passed to the engine, scheduler, backend,
+and model metadata. Deprecated `FASTINFERENCE_*` names may still exist for
+compatibility and tools.
 
-> Q: How do I install and run FastInference locally?
+## Which models are supported?
 
-A: Use Python 3.12 and run `uv sync` from the repository root. Project commands should use `uv run ...`; the maintained workflow does not use bare `python` or `pip`.
+Use [Capability Matrix](../CAPABILITY_MATRIX.md) and
+[Supported Models](../models/supported_models.md). The maintained regression
+targets are TinyLlama-1.1B, Qwen3.5-9B-AWQ, Gemma4-26B-A4B-it-AWQ-4bit, and
+Gemma4-31B-it-AWQ-4bit.
 
----
+## Can I rely on upstream vLLM docs?
 
-> Q: What should I do if I see "Illegal Memory Access" on AMD ROCm?
+No. Upstream docs are useful background, but this repository has a narrower
+runtime, model, deployment, and kernel surface. Use the docs in this repository
+for current behavior.
 
-A: Reduce concurrency, prompt length, or KV limits first. The default large-model benchmark pins conservative single-request shapes for Gemma4 and enables per-model process isolation when benchmarking multiple large Gemma4 models in one command.
+## Must inference match Hugging Face logits exactly?
 
----
-
-> Q: Can I run multiple LoRA adapters concurrently?
-
-A: The LiteLoRA runtime exists and is treated as experimental. Validate your workload with smoke, correctness, and performance gates before treating a LoRA profile as production-ready.
-
----
-
-> Q: Must inference match Hugging Face logits exactly?
-
-A: **No** for many product use cases. You can aim for **semantically reasonable** outputs (readable, on-topic) instead of strict numerical alignment. See **[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md)** for two-tier expectations, spot-check prompts, and when garbled output still means a bug—not “lower expectations.”
+Not always. Product-quality checks and strict semantic/logit checks serve
+different purposes. See [INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md) for
+the current tiers and commands.

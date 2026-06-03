@@ -1,84 +1,70 @@
-# Troubleshooting (FastInference)
+# Troubleshooting
 
-This document outlines troubleshooting strategies for FastInference (vLLM Lite). Since we have removed distributed complexity and C++ dependencies, most issues will be related to **Triton kernel compilation**, **GPU memory**, or **Model Loading**.
+FastInference issues usually fall into one of four areas: config resolution,
+model loading, Triton kernel compilation, or GPU memory pressure.
 
-## Triton Kernel Issues
+## Config Not Taking Effect
 
-### Hangs during "Warmup"
-FastInference performs a kernel warmup phase to JIT-compile Triton kernels.
-- **Cause**: On some systems, the first compilation can take 30-60 seconds.
-- **Solution**: Wait for the process to complete. Subsequent runs will use the cached kernels in `~/.triton/cache`.
+The public config entrypoint is `FASTINFERENCE_CONFIG`:
 
-### GPU Illegal Memory Access (Error 700)
-If you see `hipErrorIllegalAddress` or `CUDA error: an illegal memory access was encountered`:
-- **Cause**: This can happen on **AMD APUs** (like Strix Point) during high-concurrency Prefill.
-- **Solution**: FastInference v2.0 includes a stability guard that automatically falls back to optimized PyTorch paths if Triton memory pressure is too high. Ensure you are using the latest `paged_attention.py` kernel.
+```bash
+FASTINFERENCE_CONFIG=configs/local.toml \
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model models/Qwen3.5-9B-AWQ
+```
 
-## System Crashes
+Minimal TOML:
 
-### Segfault (Signal 139) on AMD
-If the process crashes immediately during `torch.zeros` allocation or model loading:
-- **Cause**: Incompatibility between older ROCm versions and newer PyTorch memory allocators on `gfx1151`.
-- **Solution**: **Upgrade to ROCm 7.2**. FastInference has been fully validated on ROCm 7.2, which resolves these low-level allocation crashes.
+```toml
+profile = "benchmark"
+kv_type = "turbo_int4"
+```
 
-## Out of Memory (OOM)
+If behavior differs from expectation, check `/debug/stats` and profile metadata
+first. Avoid adding direct `os.environ` reads to engine or model hot paths.
 
-### Weights loading OOM
-- **Cause**: The model is too large for your GPU VRAM.
-- **Solution**: Use GGUF or AWQ quantization. FastInference is highly optimized for **Self-Healing Loading**, which dequantizes weights block-by-block to minimize peak memory.
-- **MoE GGUF (host RSS peak)**: Setting `FASTINFERENCE_MOE_PACKED_GGUF=1` keeps routed expert tensors (`ffn_*_exps`) as packed GGUF bytes during load instead of a full-blob `gguf.dequantize`, which lowers **CPU** peak RSS. This is incompatible with `FASTINFERENCE_MOE_FP8=1` (unset one of them). Legacy `FASTINFERENCE_QWEN35_MOE_*` names are still accepted for compatibility.
+## First Request Is Slow
 
-### KV Cache OOM
-- **Cause**: Too many concurrent requests or very long context.
-- **Solution**: Reduce `max_num_seqs` or `max_num_batched_tokens` in your engine configuration. You can also enable **FP8 KV Cache** to halve the memory usage.
+Triton kernels JIT-compile on first use. The first request or benchmark warmup
+can take longer than steady-state decode. Re-run after warmup before comparing
+performance numbers.
+
+## GPU Out Of Memory
+
+Reduce one or more of:
+
+- model size
+- `max_model_len`
+- `max_num_seqs`
+- `max_num_batched_tokens`
+- KV cache active request count in the runtime profile/config
+
+For large Gemma4 benchmarks, use the repository benchmark defaults first before
+raising concurrency.
+
+## Illegal Memory Access
+
+On ROCm/CUDA, illegal memory accesses are often shape-specific kernel issues or
+memory pressure. Capture the model, prompt length, batch size, profile, and
+kernel path, then run the smallest reproducer possible. For kernel changes,
+add or update a PyTorch reference correctness test.
 
 ## Model Loading Errors
 
-### "RuntimeError: size mismatch"
-- **Cause**: Loading a hybrid model (like Qwen3.5) with a standard Llama implementation.
-- **Solution**: FastInference automatically routes Qwen3.5 to the `Qwen3_5LinearAttentionLayer`. If you manually created the model, ensure you are using the specialized backbone.
+For AWQ models, ensure the model directory includes compatible safetensors and
+quantization metadata. For tokenizer errors, confirm `tokenizer.json` or the
+expected Hugging Face tokenizer files are present in the local model directory.
 
-### "TypeError: not a string" during Tokenization
-- **Cause**: AutoTokenizer failing to find GGUF-internal tokenizer files.
-- **Solution**: FastInference includes a `Dummy` tokenizer fallback. To fix properly, ensure `tokenizer.json` is present in the model directory.
+## Quality Or Garbled Output
 
-## Quality expectations (观感 vs strict HF alignment)
+Run the quality and semantic checks described in
+[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md). Lowering strictness is not a
+substitute for fixing unreadable, off-topic, or structurally corrupted output.
 
-For a practical bar (“outputs look reasonable” vs bit-exact alignment with Hugging Face), see **[INFERENCE_ACCURACY.md](../INFERENCE_ACCURACY.md)** — recommended spot-check prompts and when lowering the strictness is **not** enough.
-
-To run the tier-B spot-check script (Lite-only, fixed prompts): `uv run python tests/tools/quality_bar_spotcheck.py --model <path> --quant awq|gguf|none` (see INFERENCE_ACCURACY.md).
-
-## Semantic integrity (`tests/verify_semantic_integrity.py`)
-
-### Comparing Lite vs HF with the **same** checkpoint (`--hf-same-as-lite`)
-
-Use this when you want to isolate **implementation** differences (Lite vs Hugging Face) instead of mixing in a separate FP16/BF16 tree:
+## Useful Commands
 
 ```bash
-uv run python tests/verify_semantic_integrity.py \
-  --model models/Qwen3.5-9B-AWQ \
-  --preset qwen35_9b_awq \
-  --hf-same-as-lite
+bash tests/run_regression_suite.sh
+SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
+uv run pytest -q tests/smoke
 ```
-
-- If set, **`--hf-model` is ignored** and the HF reference is loaded from the same path as `--model`.
-- **AWQ / packed checkpoints**: `transformers` may print a load report with **MISSING** / **UNEXPECTED** keys (e.g. `weight_packed` vs `weight`). In that case HF is **not** applying the same tensors as Lite, and prefill CosSim vs HF is **not meaningful** until HF uses a loader that matches the checkpoint format (e.g. the same compressed-tensors / AWQ path the hub expects).
-
-### Comparing Lite vs an unquantized baseline
-
-Use a separate FP16/BF16 directory:
-
-```bash
-uv run python tests/verify_semantic_integrity.py \
-  --model models/Qwen3.5-9B-AWQ \
-  --preset qwen35_9b_awq \
-  --hf-model models/Qwen3.5-9B-FP16
-```
-
-Interpretation: low CosSim here can be **quantization + dtype** vs FP16, not only Lite bugs.
-
-## Enabling Debug Logs
-
-To see exactly what the Triton kernels and scheduler are doing:
-- `export VLLM_LOGGING_LEVEL=DEBUG`
-- `export AMD_SERIALIZE_KERNEL=3` (For AMD GPUs to catch the exact failing kernel)

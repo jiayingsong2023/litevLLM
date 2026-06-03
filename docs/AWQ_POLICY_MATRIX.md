@@ -1,33 +1,38 @@
-# AWQ Policy Matrix (9B / Gemma4)
+# AWQ Policy
 
-This project uses `FASTINFERENCE_AWQ_POLICY_MATRIX` to switch AWQ runtime defaults quickly without changing code.
+AWQ safetensors are the main optimized weight path for FastInference. Current
+runtime policy should be installed through profiles, adapter policy, and
+`RuntimeConfig`; older `FASTINFERENCE_AWQ_*` names remain registered for
+compatibility and benchmark tools.
 
-## Quick Switch
+## Maintained Models
 
-```bash
-# Balanced default
-export FASTINFERENCE_AWQ_POLICY_MATRIX=balanced
+| Model | AWQ Status | Notes |
+| :--- | :--- | :--- |
+| `Qwen3.5-9B-AWQ` | Supported | Covered by correctness regression. |
+| `Gemma4-26B-A4B-it-AWQ-4bit` | Supported | MoE path, covered by Tier-B/A-lite and default A-strict unless skipped locally. |
+| `Gemma4-31B-it-AWQ-4bit` | Supported | Dense path, covered by Tier-B/A-lite. |
 
-# Throughput-biased
-export FASTINFERENCE_AWQ_POLICY_MATRIX=throughput
+## Policy Flow
 
-# Strict fidelity
-export FASTINFERENCE_AWQ_POLICY_MATRIX=strict
-
-# Conservative safe mode
-export FASTINFERENCE_AWQ_POLICY_MATRIX=safe
+```text
+FastInferenceConfig / RuntimeProfile
+  -> RuntimeConfig
+  -> adapter policy
+  -> quantization layer and Triton kernel launch policy
 ```
 
-## Effective Defaults
+## Kernel Notes
 
-`FASTINFERENCE_AWQ_FUSED_SCOPE` can still override the matrix directly.  
-If `FASTINFERENCE_AWQ_FUSED_SCOPE` is unset, profile-aware defaults are:
+The AWQ path includes specialized Triton kernels for decode GEMV, fused QKV,
+fused gate/up, and selected Gemma4 dense/MoE shapes. Alternate kernel
+strategies should stay tool-only until they pass correctness and end-to-end
+performance gates.
 
-| Model Profile | safe | balanced | throughput | strict |
-|---|---|---|---|---|
-| `qwen35_9b_awq` | `attention_only` | `attention_only` | `all` | `off` |
-| `gemma4_31b_q4` | `attention_only` | `all` | `all` | `attention_only` |
-| `gemma4_26b_a4b` | `attention_only` | `all` | `all` | `attention_only` |
-| generic AWQ | `attention_only` | `all` | `all` | `attention_only` |
+## Verification
 
-Gemma4 fused AWQ rollout is gated by `FASTINFERENCE_GEMMA4_FUSED_STAGE` (`off` / `attention_only` / `all`), which takes precedence over the policy matrix for Gemma4 models.
+```bash
+bash tests/run_regression_suite.sh
+bash tests/run_inference_correctness_regression.sh
+uv run python tests/e2e_full_benchmark.py
+```
