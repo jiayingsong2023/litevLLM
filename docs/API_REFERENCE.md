@@ -3,6 +3,9 @@
 This page documents the maintained HTTP surface in
 `vllm.entrypoints.openai.api_server`.
 
+The server is OpenAI-compatible for the lite-supported chat subset. It is not a
+drop-in implementation of every OpenAI or upstream vLLM route.
+
 ## Start The Server
 
 ```bash
@@ -69,7 +72,6 @@ Common fields:
 | `stream` | boolean | Server-sent events when `true`. |
 | `max_tokens` | integer | Defaults to the server sampling default. |
 | `temperature` | number | Passed into `SamplingParams`. |
-| `top_p` | number | Passed into `SamplingParams`. |
 | `structured_outputs` | object | Native structured output request. |
 | `response_format` | object | OpenAI-compatible JSON object/schema mapping. |
 
@@ -132,13 +134,28 @@ before treating it as production-ready.
 
 ## Runtime Stats
 
-`GET /debug/stats` returns a compact summary of runtime observer counters,
-including prefix cache, preemption, fairness, LoRA, async driver, and
+`GET /debug/runtime_stats` returns a compact summary of runtime observer
+counters, including prefix cache, preemption, fairness, LoRA, async driver, and
 multimodal counters.
 
 ```bash
-curl -s http://127.0.0.1:8000/debug/stats
+curl -s http://127.0.0.1:8000/debug/runtime_stats
 ```
+
+`POST /debug/runtime_stats/reset` resets runtime counters. Set
+`clear_prefix_cache=true` to clear prefix-cache state as part of the reset.
+
+```bash
+curl -s -X POST \
+  'http://127.0.0.1:8000/debug/runtime_stats/reset?clear_prefix_cache=true'
+```
+
+## Compatibility Boundary
+
+Supported OpenAI-compatible routes in the standalone server are
+`GET /v1/models` and `POST /v1/chat/completions`. Unsupported routes include
+`/v1/responses`, `/v1/completions`, `/v1/embeddings`, pooling, score, and
+rerank APIs.
 
 ## Error Shape
 

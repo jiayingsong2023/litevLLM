@@ -70,6 +70,47 @@ hot paths are not part of the maintained configuration model.
 | `vllm/triton_utils/` | Approved Triton import and utility layer. |
 | `vllm/entrypoints/openai/` | Maintained HTTP server surface. |
 
+## REST And OpenAI-Compatible APIs
+
+FastInference supports a maintained REST serving path through
+`vllm.entrypoints.openai.api_server`. This surface is OpenAI-compatible for the
+lite-supported chat subset, but it is not the full upstream OpenAI or vLLM
+server API.
+
+Maintained standalone routes:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `GET /debug/runtime_stats`
+- `POST /debug/runtime_stats/reset`
+
+`/v1/chat/completions` supports non-streaming JSON responses and streaming
+server-sent events. The request parser accepts OpenAI-style `messages`,
+`stream`, `max_tokens`, `temperature`, `response_format`, and
+`structured_outputs`; text and `image_url` content blocks are accepted for the
+current experimental multimodal path.
+
+```mermaid
+flowchart TD
+    Client["HTTP client / OpenAI SDK-compatible caller"] --> FastAPI["uvicorn + FastAPI"]
+    FastAPI --> Models["GET /v1/models"]
+    FastAPI --> Chat["POST /v1/chat/completions"]
+    FastAPI --> Stats["GET /debug/runtime_stats"]
+    Chat --> Parse["OpenAI-style request parsing\nmessages, stream, response_format"]
+    Parse --> Async["AsyncLLM"]
+    Async --> Engine["LiteEngine"]
+    Engine --> Result["JSON response or SSE chunks"]
+    Result --> Client
+```
+
+Compatibility boundaries:
+
+- `POST /tokenize` and `POST /detokenize` are maintained in
+  `vllm.entrypoints.serve.tokenize` when that router is attached, but they are
+  not part of the standalone OpenAI API server contract above.
+- `/v1/responses`, `/v1/completions`, `/v1/embeddings`, pooling, score, rerank,
+  and the full upstream OpenAI CLI argument surface are unsupported.
+
 ## Scheduling Model
 
 FastInference does not maintain the upstream vLLM worker/block-manager
@@ -186,7 +227,8 @@ and Transformers modeling backend wrappers that were outside the lite closure.
 - `vllm/engine/runtime_observer.py` records runtime counters for prefix cache,
   fairness, preemption, LoRA, multimodal, and async-driver behavior.
 - `vllm/engine/errors.py` centralizes runtime error semantics.
-- `GET /debug/stats` exposes a compact API server summary.
+- `GET /debug/runtime_stats` exposes a compact API server summary, and
+  `POST /debug/runtime_stats/reset` resets those counters.
 
 ## Validation
 

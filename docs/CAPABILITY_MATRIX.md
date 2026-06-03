@@ -49,6 +49,8 @@ or feature status lists.
 | Gemma4 recommended adapter profile | Supported | Gemma4 installs AWQ decode GEMV and fused gate-up defaults through runtime profile / adapter policy; dense Gemma4 also installs group32 GEMV and dense down-proj defaults. |
 | Gemma4-26B MoE int4 decode kernel | Supported | Supported through the benchmark / latency profile family with the current default strategy; alternate decode strategies remain benchmark-tool experiments, not production runtime switches. |
 | Gemma4-26B AWQ grouped prefill MoE | Experimental | Profile-guided grouped prefill is available for the validated MoE shapes; alternate grouped / fused variants remain benchmark-tool experiments rather than production runtime controls. |
+| OpenAI-compatible REST serving | Supported | Lite subset through `vllm.entrypoints.openai.api_server`: `GET /v1/models` and `POST /v1/chat/completions` with streaming and non-streaming responses. |
+| Tokenize/detokenize REST router | Compatibility | Maintained under `vllm.entrypoints.serve.tokenize` when attached; not part of the standalone OpenAI API server contract. |
 | PagedAttention decode | Supported | Triton path with selective-attention experiments available. |
 | Prefix cache | Experimental | Minimal runtime and observability exist; defaults still need workload calibration. |
 | Structured outputs | Experimental | Grammar-backed behavior is present and tested, but broad API compatibility should stay gated. |
