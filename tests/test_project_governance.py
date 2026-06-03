@@ -128,6 +128,37 @@ def test_capability_matrix_is_documented_and_referenced() -> None:
         assert "CAPABILITY_MATRIX.md" in text, f"{doc} must reference capability matrix"
 
 
+def test_broken_upstream_residue_paths_are_absent() -> None:
+    removed_files = [
+        "vllm/assets/__init__.py",
+        "vllm/assets/audio.py",
+        "vllm/assets/base.py",
+        "vllm/assets/image.py",
+        "vllm/assets/video.py",
+        "vllm/config/device.py",
+        "vllm/config/utils.py",
+        "vllm/inputs/preprocess.py",
+        "vllm/model_executor/models/transformers/__init__.py",
+        "vllm/model_executor/models/transformers/base.py",
+        "vllm/model_executor/models/transformers/causal.py",
+        "vllm/model_executor/models/transformers/legacy.py",
+        "vllm/model_executor/models/transformers/moe.py",
+        "vllm/model_executor/models/transformers/multimodal.py",
+        "vllm/model_executor/models/transformers/pooling.py",
+        "vllm/model_executor/models/transformers/utils.py",
+        "vllm/multimodal/audio.py",
+        "vllm/multimodal/parse.py",
+        "vllm/transformers_utils/configs/qwen3_next.py",
+        "vllm/transformers_utils/model_arch_config_convertor.py",
+        "vllm/transformers_utils/processors/hunyuan_vl_image.py",
+    ]
+
+    present = [path for path in removed_files if (ROOT / path).exists()]
+    assert not present, "Broken upstream residue paths must stay removed: " + ", ".join(
+        present
+    )
+
+
 def test_readme_documents_runtime_profiles_instead_of_legacy_runtime_env_matrix() -> (
     None
 ):

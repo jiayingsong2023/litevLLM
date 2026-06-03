@@ -70,6 +70,8 @@ config/profile fields.
 - Distributed tensor/pipeline/data parallel runtime
 - Upstream block manager / scheduler core
 - Full upstream model registry compatibility promise
+- Upstream Transformers modeling backend wrappers
+- Generic upstream asset downloader and multimodal audio/parser helpers
 - C++/CUDA extension source in the maintained path
 - Speculative decoding as a supported feature
 - Upstream CLI, pooling, gRPC, executor, and vendored third-party Triton kernel

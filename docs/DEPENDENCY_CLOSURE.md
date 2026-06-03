@@ -36,9 +36,17 @@ runtime dependencies:
 - `vllm/entrypoints/cli/`
 - `vllm/entrypoints/pooling/`
 - `vllm/model_executor/layers/pooler/`
+- `vllm/model_executor/models/transformers/`
 - `vllm/sample/`
 - `vllm/structured_output/`
 - `vllm/third_party/triton_kernels/`
+- `vllm/assets/`
+- `vllm/inputs/preprocess.py`
+- `vllm/multimodal/audio.py`
+- `vllm/multimodal/parse.py`
+- `vllm/transformers_utils/configs/qwen3_next.py`
+- `vllm/transformers_utils/model_arch_config_convertor.py`
+- `vllm/transformers_utils/processors/hunyuan_vl_image.py`
 
 ## Present Compatibility Or Vendored Code
 
