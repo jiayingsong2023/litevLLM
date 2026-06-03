@@ -14,8 +14,8 @@ Always use `uv` — never bare `python`/`pip`. Python 3.12 only.
 
 ```bash
 uv sync                                              # install deps (ROCm torch/triton from repo.radeon.com)
-uv run pytest tests/test_logits_dump_stats.py         # run a single test
-bash tests/run_regression_suite.sh                    # fast unit/smoke (~17 tests, no GPU model loads)
+uv run pytest tests/test_project_governance.py        # run a single test
+bash tests/run_regression_suite.sh                    # fast unit/smoke, no GPU model loads
 bash tests/run_inference_correctness_regression.sh    # full-model correctness (TinyLlama, Qwen3.5-9B, Gemma4-31B)
 uv run ruff check . && uv run ruff format .           # lint + format
 uv run mypy vllm                                      # type-check
@@ -75,7 +75,7 @@ Key boundaries:
 
 ## Testing
 
-- All tests in `tests/` with `test_*.py` names; one-off diagnostics in `tests/tools/`.
+- Pytest tests live in `tests/` with `test_*.py` names; maintained diagnostic helpers go in `tests/tools/` only when a regression entrypoint uses them.
 - New Triton kernels require a PyTorch reference correctness test plus edge cases for 0-token and max-token prompts.
 - Before PR: run `bash tests/run_regression_suite.sh`. For kernel/KV-cache/numerics changes, also run `bash tests/run_inference_correctness_regression.sh`.
 - Correctness regression auto-detects accuracy tier by model size (`<=14B` → strict A-tier, `>14B` → lite A-tier). Skip the heavier A-tier with `SKIP_A_TIER=1`.

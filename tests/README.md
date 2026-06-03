@@ -1,6 +1,10 @@
 # 测试与回归套件
 
-本目录包含 **推理准确性回归**、**性能基准**、**专项诊断** 三类入口。当前默认回归覆盖：
+本目录只保留当前维护面需要的 **快速代码回归**、**推理准确性回归**、
+**性能基准** 和少量 Gemma4 warn-only 诊断。历史 profile、一次性矩阵、
+旧 GGUF/35B 对齐脚本不再放在 `tests/`。
+
+当前默认回归覆盖：
 
 - `TinyLlama-1.1B-Chat-v1.0`
 - `Qwen3.5-9B-AWQ`
@@ -124,12 +128,15 @@ uv run python tests/e2e_full_benchmark.py \
 
 `perf_regressions` 只记录吞吐下降或延迟上升的 warning，适合写入 PR 说明；是否阻断由人工根据改动范围判断。
 
-## Gemma4 专项工具
+## `tests/tools/` 边界
+
+`tests/tools/` 只保留被主回归入口或 warn-only 诊断测试引用的脚本：
 
 - Tier-B 门控：`tests/tools/quality_bar_spotcheck.py`
 - A-lite smoke：`tests/tools/gemma4_single_prompt_smoke.py`
 - A-strict prefill audit：`tests/tools/gemma4_prefill_strict_audit.py`
 - Layer drift / 长 decode 诊断：`tests/tools/gemma4_layer_drift_diagnostic.py`
+- 性能网格 wrapper：`tests/tools/perf_grid_search.py`
 
 本机当前验收策略：
 

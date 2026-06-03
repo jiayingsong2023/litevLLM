@@ -16,7 +16,6 @@ uv run pytest \
   tests/test_step_scheduler_single_request_fast_path.py \
   tests/test_gemma4_kv_helpers.py \
   tests/test_quality_bar_spotcheck_heuristics.py \
-  tests/test_logits_dump_stats.py \
   tests/lite_smoke_test.py \
   tests/test_gemma4_strict_audit_smoke.py \
   tests/test_gemma4_26b_strict_warn_only.py \

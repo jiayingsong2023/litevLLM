@@ -21,9 +21,8 @@ skips full greedy generation and only checks last prefill logits vs HF (CosSim +
 For **Lite GGUF or AWQ vs separate HF FP16** (``--hf-model`` pointing to a different tree), cosine uses a
 relaxed floor (``PREFILL_COSIM_MIN_*_VS_FP16``); argmax must still match.
 Same-directory Lite vs HF
-(``--hf-same-as-lite`` or no ``--hf-model``) keeps the strict ``PREFILL_COSIM_MIN``. **35B MoE GGUF** usually cannot
-load a matching HF model for logits compare; use **9B GGUF vs 9B FP16** here, or
-``tests/tools/qwen35_moe_packed_lite_logits_audit.py`` (packed vs dense) on the 35B tree.
+(``--hf-same-as-lite`` or no ``--hf-model``) keeps the strict ``PREFILL_COSIM_MIN``.
+GGUF and 35B MoE comparisons are no longer part of the default regression surface.
 """
 import json
 import torch
@@ -729,8 +728,7 @@ def run_alignment_test(
     if quant_type == "gguf" and ("35b" in mp_low or "moe" in mp_low):
         print(
             "  [Note] 35B MoE GGUF: full HF logits comparison is often infeasible on one machine; "
-            "prefer 9B GGUF vs 9B FP16 here, or tests/tools/qwen35_moe_packed_lite_logits_audit.py "
-            "(packed vs dense) on this checkpoint."
+            "this path is not part of the maintained default regression surface."
         )
     print("="*60)
 
