@@ -112,7 +112,6 @@ class OpenAIServing:
         self.model_config = models.model_config
         self.max_model_len = getattr(self.model_config, "max_model_len", 8192)
         self.renderer = _SimpleRenderer(get_tokenizer(self.model_config))
-        self.io_processor = None
 
     async def _check_model(self, request: Any) -> ErrorResponse | None:
         request_model = getattr(request, "model", None)

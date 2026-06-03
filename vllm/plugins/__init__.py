@@ -12,8 +12,6 @@ logger = logging.getLogger(__name__)
 # Default plugins group will be loaded in all processes(process0, engine core
 # process and worker processes)
 DEFAULT_PLUGINS_GROUP = "vllm.general_plugins"
-# IO processor plugins group will be loaded in process0 only
-IO_PROCESSOR_PLUGINS_GROUP = "vllm.io_processor_plugins"
 # Platform plugins group will be loaded in all processes when
 # `vllm.platforms.current_platform` is called and the value not initialized,
 PLATFORM_PLUGINS_GROUP = "vllm.platform_plugins"

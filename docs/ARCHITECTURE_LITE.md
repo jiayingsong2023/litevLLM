@@ -89,14 +89,13 @@ coverage against a PyTorch reference.
 Some upstream-derived packages remain for imports, migration, or experimental
 surface. Their existence does not make them official runtime targets:
 
-- `vllm/third_party/triton_kernels/` currently exists as vendored Triton
-  kernel code.
 - `vllm/model_executor/warmup/` may contain compatibility artifacts.
-- `vllm/spec_decode/`, pooling, multimodal, and LoRA paths are maintained only
-  to the status listed in the capability matrix.
+- Multimodal and LoRA runtime hooks are maintained only to the status listed in
+  the capability matrix.
 
 The removed upstream runtime directories are `vllm/worker/`, `vllm/core/`, and
-`vllm/distributed/`.
+`vllm/distributed/`; upstream CLI, pooling, gRPC, executor, spec decode, and
+vendored third-party Triton kernel paths have also been removed.
 
 ## Observability And Errors
 

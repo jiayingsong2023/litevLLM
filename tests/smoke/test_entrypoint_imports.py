@@ -9,7 +9,6 @@ def test_lite_serving_entrypoints_import() -> None:
         "vllm.entrypoints.api_server",
         "vllm.entrypoints.openai.api_server",
         "vllm.entrypoints.serve.tokenize.api_router",
-        "vllm.entrypoints.pooling",
     ]
 
     for module in modules:

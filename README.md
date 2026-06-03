@@ -23,7 +23,7 @@
   - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`。
   - **非目标**: `Qwen3.5-35B` 不再作为正式支持模型。
   - **已删除**: `vllm/worker/`、`vllm/core/`、`vllm/distributed/` 等上游 runtime 子系统。
-  - **兼容/内嵌**: `vllm/third_party/triton_kernels/` 当前仍作为 vendored Triton kernel 代码存在，不代表恢复上游完整 third-party 支持面。
+  - **已删除**: 上游 CLI、pooling/gRPC/executor、spec decode、Helion、vendored `third_party/triton_kernels` 等非 lite 主路径残留。
 
 ## 核心特性
 - **lite-only 主线**: 运行时以 `vllm/engine/lite_engine.py` 为核心，单卡执行链路。

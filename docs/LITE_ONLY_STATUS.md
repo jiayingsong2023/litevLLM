@@ -39,10 +39,8 @@ targets.
 The following code may exist for compatibility, vendored kernels, or
 experimental feature surface:
 
-- `vllm/third_party/triton_kernels/`
 - `vllm/model_executor/warmup/`
-- `vllm/spec_decode/`
-- LoRA, multimodal, pooling, and structured-output modules
+- LoRA and multimodal runtime hooks
 
 Their support level is defined by the capability matrix, not by upstream vLLM
 feature claims.
@@ -74,6 +72,8 @@ config/profile fields.
 - Full upstream model registry compatibility promise
 - C++/CUDA extension source in the maintained path
 - Speculative decoding as a supported feature
+- Upstream CLI, pooling, gRPC, executor, and vendored third-party Triton kernel
+  compatibility paths
 
 ## Onboarding Rule
 

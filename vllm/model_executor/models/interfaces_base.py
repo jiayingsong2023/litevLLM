@@ -12,17 +12,8 @@ class VllmModel(Protocol[T_co]):
 @runtime_checkable
 class VllmModelForTextGeneration(VllmModel[torch.Tensor], Protocol): pass
 
-@runtime_checkable
-class VllmModelForPooling(VllmModel[torch.Tensor], Protocol): pass
-
 def is_text_generation_model(model: Any) -> bool:
     return True 
 
-def is_pooling_model(model: Any) -> bool:
-    return getattr(model, "is_pooling_model", False)
-
 def get_attn_type(model: Any) -> str:
     return getattr(model, "attn_type", "decoder")
-
-def get_default_seq_pooling_type(model: Any) -> Any: return None
-def get_default_tok_pooling_type(model: Any) -> Any: return None

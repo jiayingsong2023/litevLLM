@@ -12,13 +12,15 @@ report.
 - `vllm/adapters/*` - model capability and runtime policy.
 - `vllm/model_executor/models/*` - maintained model implementations.
 - `vllm/model_executor/model_loader/*` - local model loading.
-- `vllm/model_executor/layers/*` - runtime layers and quantization helpers.
+- `vllm/model_executor/layers/*` - runtime layers and quantization helpers,
+  excluding removed upstream pooling layers.
 - `vllm/kernels/triton/*` - maintained Triton kernels.
 - `vllm/triton_utils/*` - approved Triton import and utility surface.
 - `vllm/config/*` - config dataclasses.
 - `vllm/entrypoints/openai/*` - maintained HTTP serving entrypoint.
-- `vllm/sample/*`, `vllm/inputs/*`, `vllm/transformers_utils/*`, and
-  `vllm/utils/*` - sampling, input, HF, and utility support.
+- `vllm/engine/sampling_driver.py`, `vllm/inputs/*`,
+  `vllm/transformers_utils/*`, and `vllm/utils/*` - sampling, input, HF,
+  and utility support.
 
 ## Removed Upstream Runtime Directories
 
@@ -28,17 +30,24 @@ runtime dependencies:
 - `vllm/worker/`
 - `vllm/core/`
 - `vllm/distributed/`
+- `vllm/executor/`
+- `vllm/grpc/`
+- `vllm/spec_decode/`
+- `vllm/entrypoints/cli/`
+- `vllm/entrypoints/pooling/`
+- `vllm/model_executor/layers/pooler/`
+- `vllm/sample/`
+- `vllm/structured_output/`
+- `vllm/third_party/triton_kernels/`
 
 ## Present Compatibility Or Vendored Code
 
 The following paths exist today but are not independent product targets:
 
-- `vllm/third_party/triton_kernels/` - vendored Triton kernel code.
 - `vllm/model_executor/warmup/` - compatibility or artifact path, not a
   worker-runtime warmup contract.
-- `vllm/spec_decode/` - speculative decoding is explicitly unsupported.
-- Pooling, multimodal, LoRA, and structured-output packages - support varies by
-  capability matrix status.
+- Multimodal and LoRA runtime hooks - support varies by capability matrix
+  status.
 
 ## Import Rules
 

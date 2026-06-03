@@ -14,17 +14,13 @@ from .interfaces import (
     supports_pp,
 )
 from .interfaces_base import (
-    VllmModelForPooling,
     VllmModelForTextGeneration,
-    is_pooling_model,
     is_text_generation_model,
 )
 from .registry import ModelRegistry
 
 __all__ = [
     "ModelRegistry",
-    "VllmModelForPooling",
-    "is_pooling_model",
     "VllmModelForTextGeneration",
     "is_text_generation_model",
     "HasInnerState",
