@@ -104,10 +104,44 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
+FI_CORRECTNESS_STAGE_TIMEOUT="${FI_CORRECTNESS_STAGE_TIMEOUT:-45m}"
+FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT="${FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT:-75m}"
+FI_CORRECTNESS_PERF_STAGE_TIMEOUT="${FI_CORRECTNESS_PERF_STAGE_TIMEOUT:-90m}"
+FI_CORRECTNESS_STAGE_KILL_AFTER="${FI_CORRECTNESS_STAGE_KILL_AFTER:-60s}"
 print_gemma4_profile() {
   local label="$1"
   shift
   echo "  ${label} profile: $*"
+}
+
+run_stage() {
+  local label="$1"
+  local stage_timeout="$2"
+  shift 2
+
+  local start_seconds="$SECONDS"
+  echo "[Stage] START ${label} timeout=${stage_timeout}"
+
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" || rc=$?
+  else
+    echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
+    "$@" || rc=$?
+  fi
+
+  local elapsed_seconds=$((SECONDS - start_seconds))
+  if [[ "$rc" -eq 0 ]]; then
+    echo "[Stage] OK ${label} elapsed=${elapsed_seconds}s"
+    return 0
+  fi
+  if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    echo "[ERROR] Stage timed out: ${label} timeout=${stage_timeout} elapsed=${elapsed_seconds}s rc=${rc}"
+    echo "        This usually indicates a stuck GPU/ROCm operation, model load, or kernel launch."
+  else
+    echo "[ERROR] Stage failed: ${label} elapsed=${elapsed_seconds}s rc=${rc}"
+  fi
+  return "$rc"
 }
 
 require_model_dir() {
@@ -281,10 +315,14 @@ if [[ -f "$TINYLLAMA_PROMPTS_FILE" ]]; then
 else
   echo "[Warn] TINYLLAMA_PROMPTS_FILE not found, fallback to built-in minimal set: $TINYLLAMA_PROMPTS_FILE"
 fi
-FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
+run_stage "Tier-B TinyLlama spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+  env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
+  "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
 echo "[2/2] Qwen3.5-9B AWQ"
-FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
+run_stage "Tier-B Qwen3.5-9B AWQ spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+  env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
+  "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
 GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
@@ -301,7 +339,8 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
       echo "[Warn] GEMMA4_PROMPTS_FILE not found, fallback to built-in minimal set: $GEMMA4_PROMPTS_FILE"
     fi
     print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B}"
-    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
+    run_stage "Tier-B Gemma4-31B spotcheck" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
     cleanup_after_model_step "Gemma4-31B Tier-B"
   else
@@ -320,7 +359,8 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
       GEMMA4_26B_PROMPT_ARGS=(--prompts-file "$GEMMA4_PROMPTS_FILE")
     fi
     print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B}"
-    FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
+    run_stage "Tier-B Gemma4-26B spotcheck" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
     cleanup_after_model_step "Gemma4-26B Tier-B"
   else
@@ -336,7 +376,9 @@ fi
 echo ""
 echo "=== Tier-A-strict (<=14B, HF parity) ==="
 echo "[A1] TinyLlama — Lite vs HF same tree"
-FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" uv run python tests/verify_semantic_integrity.py \
+run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+  env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
+  uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_TINYLLAMA" \
   --preset tinyllama \
   --hf-same-as-lite \
@@ -346,7 +388,9 @@ FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" uv run python tests/verify_semantic_inte
 
 echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
 require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
-FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" uv run python tests/verify_semantic_integrity.py \
+run_stage "Tier-A Qwen3.5-9B HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+  env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
+  uv run python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
   --hf-model "$HF_QWEN35_9B_FP16" \
@@ -363,7 +407,8 @@ if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_STRICT}" == "1" ]]
   if [[ -n "$HF_GEMMA4_26B" ]]; then
     GEMMA26_HF_ARGS=(--hf-model "$HF_GEMMA4_26B")
   fi
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
+  run_stage "Tier-A Gemma4-26B strict audit" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+    env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
     "${GEMMA4_26B_A_STRICT_AUDIT[@]}" --model "$MODEL_GEMMA4_26B_A4B" "${GEMMA26_HF_ARGS[@]}"
   cleanup_after_model_step "Gemma4-26B A-strict"
 fi
@@ -373,7 +418,8 @@ if [[ "${GEMMA4_AVAILABLE}" == "1" && "${RUN_GEMMA4_A_LITE}" == "1" ]]; then
   echo "=== Tier-A-lite (>14B, key-point audit) ==="
   echo "[A3-lite] Gemma4-31B Q4 multi-prompt text-only audit"
   print_gemma4_profile "Gemma4-31B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_31B_A_LITE}"
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B_A_LITE}" \
+  run_stage "Tier-A-lite Gemma4-31B audit" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+    env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B_A_LITE}" \
     FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
     FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
     FASTINFERENCE_AWQ_DECODE_GEMV=1 \
@@ -387,7 +433,8 @@ fi
 if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; then
   echo "[A-lite-26B] Gemma4-26B A4B multi-prompt text-only audit"
   print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B_A_LITE}"
-  FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B_A_LITE}" \
+  run_stage "Tier-A-lite Gemma4-26B audit" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+    env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B_A_LITE}" \
     FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
     FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
     FASTINFERENCE_AWQ_DECODE_GEMV=1 \
@@ -400,7 +447,8 @@ if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
   echo ""
   echo "=== AWQ Fused A/B (RUN_AWQ_FUSED_AB=1) ==="
   echo "[AB1] Qwen3.5-9B AWQ baseline (fused disabled)"
-  uv run python tests/verify_semantic_integrity.py \
+  run_stage "AWQ fused A/B Qwen3.5 baseline" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+    uv run python tests/verify_semantic_integrity.py \
     --model "$MODEL_QWEN35_9B_AWQ" \
     --preset qwen35_9b_awq \
     --hf-model "$HF_QWEN35_9B_FP16" \
@@ -408,7 +456,8 @@ if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
     --awq-disable-fused \
     --apply-chat-template off
   echo "[AB2] Qwen3.5-9B AWQ fused forced"
-  uv run python tests/verify_semantic_integrity.py \
+  run_stage "AWQ fused A/B Qwen3.5 forced" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+    uv run python tests/verify_semantic_integrity.py \
     --model "$MODEL_QWEN35_9B_AWQ" \
     --preset qwen35_9b_awq \
     --hf-model "$HF_QWEN35_9B_FP16" \
@@ -432,7 +481,8 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   fi
   PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
   echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
-  uv run python tests/e2e_full_benchmark.py \
+  run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
+    uv run python tests/e2e_full_benchmark.py \
     --models "${PERF_MODELS}" \
     --json-out "${PERF_JSON}"
   echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"

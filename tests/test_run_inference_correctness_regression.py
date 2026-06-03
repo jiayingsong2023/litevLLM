@@ -6,6 +6,78 @@ import subprocess
 from pathlib import Path
 
 
+def test_run_inference_correctness_regression_wraps_stages_with_timeout(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    timeout_log = tmp_path / "timeout_calls.log"
+    fake_timeout = fake_bin / "timeout"
+    fake_timeout.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'printf "%s\\n" "$*" >> "{timeout_log}"',
+                'while [[ "$1" == --* ]]; do shift; done',
+                "shift",
+                '"$@"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_timeout.chmod(0o755)
+
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                "exit 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    tiny_dir.mkdir(parents=True)
+    qwen_dir.mkdir(parents=True)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
+    env["RUN_GEMMA4_31B"] = "0"
+    env["RUN_GEMMA4_26B"] = "0"
+    env["SKIP_A_TIER"] = "1"
+    env["FI_CORRECTNESS_STAGE_TIMEOUT"] = "12s"
+    env["FI_CORRECTNESS_STAGE_KILL_AFTER"] = "3s"
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    calls = timeout_log.read_text(encoding="utf-8")
+    assert "--kill-after=3s 12s env FASTINFERENCE_CONFIG=" in calls
+    assert "uv run python tests/tools/quality_bar_spotcheck.py" in calls
+    assert "[Stage] START Tier-B TinyLlama spotcheck timeout=12s" in proc.stdout
+    assert "[Stage] OK Tier-B Qwen3.5-9B AWQ spotcheck" in proc.stdout
+
+
 def test_run_inference_correctness_regression_skips_gemma4_31b_a_strict(
     tmp_path: Path,
 ) -> None:
