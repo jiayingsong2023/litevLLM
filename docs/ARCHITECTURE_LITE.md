@@ -49,7 +49,7 @@ hot paths are not part of the maintained configuration model.
 | `vllm/engine/` | Control plane, scheduling, request lifecycle, runtime stats, errors. |
 | `vllm/serving/` | Config assembly for offline and server entrypoints. |
 | `vllm/adapters/` | Model capability and policy decisions. |
-| `vllm/model_executor/models/` | Model implementations, including the split Gemma4 package. |
+| `vllm/model_executor/models/` | Maintained lite model implementations, including the split Gemma4 package. |
 | `vllm/kernels/triton/` | Maintained hand-written Triton kernels. |
 | `vllm/triton_utils/` | Approved Triton import and utility layer. |
 | `vllm/entrypoints/openai/` | Maintained HTTP server surface. |
@@ -73,6 +73,10 @@ Gemma4 is split into focused modules under
 Model-specific policy belongs in `vllm/adapters/` and must not grow new
 model-name branches inside the generic engine.
 
+The upstream Transformers modeling backend wrappers are not part of the lite
+runtime. New model support should add a focused lite model module plus adapter
+policy and loader coverage instead of restoring generic upstream wrappers.
+
 ## Attention And Kernels
 
 The maintained decode path uses Triton PagedAttention. Prefill uses the
@@ -95,7 +99,9 @@ surface. Their existence does not make them official runtime targets:
 
 The removed upstream runtime directories are `vllm/worker/`, `vllm/core/`, and
 `vllm/distributed/`; upstream CLI, pooling, gRPC, executor, spec decode, and
-vendored third-party Triton kernel paths have also been removed.
+vendored third-party Triton kernel paths have also been removed. P2 cleanup also
+removed broken upstream asset helpers, generic multimodal audio/parser helpers,
+and Transformers modeling backend wrappers that were outside the lite closure.
 
 ## Observability And Errors
 

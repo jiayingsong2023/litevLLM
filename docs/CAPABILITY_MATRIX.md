@@ -34,6 +34,9 @@ or feature status lists.
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
 | LoRA runtime | Experimental | Runtime path and tests exist; production policy calibration is still workload dependent. |
 | Multimodal serving | Experimental | Single-image and multi-image paths exist, but require broader real-traffic hardening. |
+| Upstream Transformers modeling backend | Unsupported | The broken `vllm/model_executor/models/transformers/` wrappers were removed; maintained models live under `vllm/model_executor/models/` with adapter-owned policy. |
+| Generic upstream asset downloader | Unsupported | The `vllm/assets/` helper package was removed; tests and demos should use explicit local fixtures or model paths. |
+| Generic multimodal audio/video parser helpers | Unsupported | Lite multimodal support is image-request plumbing only unless a model-specific implementation and regression gate are added. |
 | Legacy upstream vLLM model surface | Unsupported | This project no longer aims to preserve full upstream model compatibility. |
 
 ## Feature Support

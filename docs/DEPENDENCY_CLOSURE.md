@@ -10,17 +10,19 @@ report.
   observer, errors, backend policy, and async runtime contracts.
 - `vllm/serving/config_builder.py` - config assembly.
 - `vllm/adapters/*` - model capability and runtime policy.
-- `vllm/model_executor/models/*` - maintained model implementations.
+- `vllm/model_executor/models/*` - maintained model implementations, excluding
+  removed upstream Transformers modeling backend wrappers.
 - `vllm/model_executor/model_loader/*` - local model loading.
 - `vllm/model_executor/layers/*` - runtime layers and quantization helpers,
   excluding removed upstream pooling layers.
 - `vllm/kernels/triton/*` - maintained Triton kernels.
 - `vllm/triton_utils/*` - approved Triton import and utility surface.
-- `vllm/config/*` - config dataclasses.
+- `vllm/config/{attention,cache,load,model,model_arch,multimodal,observability,scheduler,vllm}.py`
+  - maintained config dataclasses and helpers.
 - `vllm/entrypoints/openai/*` - maintained HTTP serving entrypoint.
-- `vllm/engine/sampling_driver.py`, `vllm/inputs/*`,
-  `vllm/transformers_utils/*`, and `vllm/utils/*` - sampling, input, HF,
-  and utility support.
+- `vllm/engine/sampling_driver.py`, `vllm/inputs/data.py`, selected
+  `vllm/transformers_utils/*`, and selected `vllm/utils/*` - sampling, prompt
+  input, HF config/tokenizer support, and utility support.
 
 ## Removed Upstream Runtime Directories
 
@@ -47,6 +49,10 @@ runtime dependencies:
 - `vllm/transformers_utils/configs/qwen3_next.py`
 - `vllm/transformers_utils/model_arch_config_convertor.py`
 - `vllm/transformers_utils/processors/hunyuan_vl_image.py`
+
+Removed individual files are intentional, not missing sync artifacts. Do not
+restore them from upstream unless they are brought back as compilable code with
+a lite-runtime caller and regression coverage.
 
 ## Present Compatibility Or Vendored Code
 
