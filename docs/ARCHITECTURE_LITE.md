@@ -25,6 +25,22 @@ LLM / AsyncLLM / OpenAI API Server
 use. Legacy upstream concepts such as workers, block managers, and distributed
 executors are not a second supported runtime.
 
+```mermaid
+flowchart TD
+    API["LLM / AsyncLLM / OpenAI REST"] --> Config["serving/config_builder.py"]
+    Config --> Engine["engine/lite_engine.py"]
+    Engine --> Controller["engine/runtime_controller.py"]
+    Controller --> ReqSched["engine/request_scheduler.py"]
+    Controller --> StepSched["engine/step_scheduler.py"]
+    StepSched --> Prefill["engine/prefill_executor.py"]
+    StepSched --> Decode["engine/decode_executor.py"]
+    Prefill --> Model["model_executor/models/*"]
+    Decode --> Model
+    Model --> Kernels["kernels/triton/*"]
+    Kernels --> Pipeline["engine/output_pipeline.py"]
+    Pipeline --> API
+```
+
 ## Configuration Flow
 
 `vllm/serving/config_builder.py` constructs `VllmConfig`, resolves
@@ -53,6 +69,40 @@ hot paths are not part of the maintained configuration model.
 | `vllm/kernels/triton/` | Maintained hand-written Triton kernels. |
 | `vllm/triton_utils/` | Approved Triton import and utility layer. |
 | `vllm/entrypoints/openai/` | Maintained HTTP server surface. |
+
+## Scheduling Model
+
+FastInference does not maintain the upstream vLLM worker/block-manager
+continuous batching runtime. The lite scheduler implements a smaller
+single-process model:
+
+- `RequestScheduler` owns running requests, queued requests, stream queues, and
+  fixed active slots.
+- `StepScheduler` builds one `StepPlan` per engine step. A plan may admit
+  queued requests, run chunked prefills, run decodes, or interleave prefill and
+  decode work within configured token and fairness limits.
+- `LiteSingleGPUBackend` executes the plan synchronously on one GPU and frees
+  request slots when outputs finish.
+
+This is best described as bounded step-level dynamic batching, not full
+upstream continuous batching. New docs and performance claims should avoid the
+term "continuous batching" unless the upstream-equivalent runtime contract is
+implemented and covered by regression tests.
+
+```mermaid
+flowchart LR
+    Queue["queued_ids"] --> Admit["admit_specific_requests"]
+    Admit --> Running["running_ids + slot_idx"]
+    Running --> Classify["classify_requests"]
+    Classify --> PrefillPlan["PrefillPlan\nchunked prompt tokens"]
+    Classify --> DecodePlan["DecodePlan\none token per request"]
+    PrefillPlan --> StepPlan["StepPlan"]
+    DecodePlan --> StepPlan
+    StepPlan --> Backend["LiteSingleGPUBackend"]
+    Backend --> Outputs["RequestOutput streams"]
+    Backend --> Free["free_request"]
+    Free --> Queue
+```
 
 ## Model Layer Shape
 
@@ -83,6 +133,34 @@ The maintained decode path uses Triton PagedAttention. Prefill uses the
 current hardware-backed SDPA path where appropriate. AWQ decode and Gemma4
 paths include specialized Triton kernels for fused QKV, fused gate/up, M=1
 GEMV, and selected MoE decode shapes.
+
+PagedAttention is the maintained decode attention path. The request state tracks
+logical sequence length and slot assignment; decode kernels read the KV cache
+through block tables instead of treating every request as one contiguous KV
+tensor. This keeps decode memory access bounded around physical KV blocks and
+allows active requests with different sequence lengths to share the same decode
+batch shape.
+
+```mermaid
+flowchart TD
+    Tokens["Prompt / generated tokens"] --> Planner["Request state\nseq_len + slot_idx"]
+    Planner --> KVWrite["reshape_and_cache.py\nwrite K/V into physical blocks"]
+    KVWrite --> KVCache["Paged KV cache\nblock_size default 16"]
+    Planner --> BlockTable["Per-request block table"]
+    KVCache --> PagedAttn["triton/paged_attention.py"]
+    BlockTable --> PagedAttn
+    Query["Decode query"] --> PagedAttn
+    PagedAttn --> Logits["Attention output -> logits"]
+```
+
+Important constraints:
+
+- Physical KV blocks default to 16 tokens and are controlled by runtime config.
+- KV precision is selected by runtime policy (`fp16`, `fp8`, or
+  `turbo_int4`), with model adapters allowed to guard unsafe combinations.
+- Kernel changes must preserve the block-table contract and include PyTorch
+  reference coverage for edge cases such as empty prompts and maximum prompt
+  lengths used by regression tests.
 
 Every new Triton kernel must document memory layout and program tiling in ASCII
 comments, use `vllm/triton_utils/` for Triton imports, and include correctness
