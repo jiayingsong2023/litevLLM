@@ -116,7 +116,10 @@ def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
     )
 
 
-def _read_from_view(path: Path, data: memoryview) -> DeepSeekV4FlashGGUF:
+def read_deepseek_v4_flash_gguf_from_view(
+    path: Path,
+    data: memoryview,
+) -> DeepSeekV4FlashGGUF:
     cursor = _Cursor(data)
     magic = cursor.u32()
     if magic != GGUF_MAGIC:
@@ -155,7 +158,7 @@ def read_deepseek_v4_flash_gguf(path: Path | str) -> DeepSeekV4FlashGGUF:
         mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
         view = memoryview(mm)
         try:
-            return _read_from_view(gguf_path, view)
+            return read_deepseek_v4_flash_gguf_from_view(gguf_path, view)
         finally:
             view.release()
             mm.close()

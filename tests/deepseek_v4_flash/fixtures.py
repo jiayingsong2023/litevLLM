@@ -36,7 +36,12 @@ def _write_tensor(
     buf.extend(struct.pack("<Q", offset))
 
 
-def write_minimal_deepseek_v4_flash_gguf(path: Path, *, block_count: int = 43) -> None:
+def write_minimal_deepseek_v4_flash_gguf(
+    path: Path,
+    *,
+    block_count: int = 43,
+    tensor_names: tuple[str, ...] = ("token_embd.weight",),
+) -> None:
     metadata = bytearray()
     _write_kv_string(metadata, "general.architecture", "deepseek4")
     _write_kv_string(metadata, "general.name", "DeepSeek V4 Flash Spark Q2 REAP")
@@ -54,6 +59,10 @@ def write_minimal_deepseek_v4_flash_gguf(path: Path, *, block_count: int = 43) -
     _write_kv_u32(metadata, "deepseek4.vocab_size", 129280)
 
     tensors = bytearray()
-    _write_tensor(tensors, "token_embd.weight", (4096, 129280), 8, 0)
-    header = struct.pack("<IIQQ", GGUF_MAGIC, 3, DEEPSEEK_V4_FLASH_METADATA_COUNT, 1)
+    for offset, name in enumerate(tensor_names):
+        dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
+        _write_tensor(tensors, name, dims, 8, offset * 32)
+    header = struct.pack(
+        "<IIQQ", GGUF_MAGIC, 3, DEEPSEEK_V4_FLASH_METADATA_COUNT, len(tensor_names)
+    )
     path.write_bytes(header + metadata + tensors + b"\x00" * 64)
