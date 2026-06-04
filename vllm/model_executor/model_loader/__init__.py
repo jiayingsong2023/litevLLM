@@ -1179,6 +1179,16 @@ def _maybe_init_quant_config_from_hf(vllm_config: VllmConfig) -> None:
     elif quant_method == "compressed-tensors":
         vllm_config.quant_config = CompressedTensorsConfig.from_config(quant_cfg)
 
+
+def _should_skip_safetensors_load(vllm_config: VllmConfig) -> bool:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
+    archs = getattr(hf_config, "architectures", []) or []
+    return model_type in ("deepseek_v4", "deepseek4", "deepseek_v4_flash") and any(
+        "deepseekv4flash" in str(arch).lower() for arch in archs
+    )
+
+
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
     if cfg.hf_config is None:
@@ -1208,7 +1218,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     model.to(dtype=target_dtype)
 
     # [35B OOM FIX] Atomic loading to avoid peaks.
-    _load_safetensors(model, cfg.model, target_dtype=target_dtype)
+    if not _should_skip_safetensors_load(vllm_config):
+        _load_safetensors(model, cfg.model, target_dtype=target_dtype)
     
     # [35B STABILITY] Final deterministic device and dtype sync.
     # Essential for rotary_emb caches, missed expert parameters, etc.
