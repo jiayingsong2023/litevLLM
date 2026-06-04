@@ -18,6 +18,7 @@ short model-focused view of that matrix.
 | Area | Status | Notes |
 | :--- | :--- | :--- |
 | Llama-like fallback models | Experimental | Adapter fallback exists, but support should not be claimed without model-specific load, smoke, and correctness gates. |
+| DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf | Experimental | Native DS4 GGUF bring-up target. Metadata/config detection, inspect-only weight binding, paged compressed KV contracts, model registry, loader routing, and OpenAI REST route smoke are present; full forward execution is not wired yet. |
 | LoRA runtime | Experimental | Runtime and tests exist; production policy tuning remains workload dependent. |
 | Multimodal serving | Experimental | Lite serving paths exist, but need broader real-traffic hardening. |
 | Legacy vLLM entrypoints | Compatibility | Kept for import and migration stability, not as a second runtime path. |
