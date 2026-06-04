@@ -5,7 +5,14 @@ Date: 2026-06-03
 ## Scope
 
 FastInference will add experimental native support for
-`DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf`.
+`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
+
+This target follows the DS4 `q2-imatrix` model distributed from
+`antirez/deepseek-v4-gguf`. An earlier draft named
+`DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf`, but that exact file was not present
+in the public repositories checked during bring-up. The Spark Q3 dynamic GGUF
+and ModelScope Q2_K shard set are adjacent artifacts, not this first native
+target.
 
 This is not a bridge to an external runtime. FastInference will own model
 loading, quantized kernels, compressed KV state, model execution, and REST
@@ -32,8 +39,8 @@ Out of scope for the first release:
 
 Primary references:
 
-- <https://huggingface.co/0xSero/DeepSeek-V4-Flash-Spark-GGUF>
 - <https://github.com/antirez/ds4>
+- <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
 ## Current Project Fit
@@ -321,8 +328,8 @@ correctness entry can be added.
 
 The first native release is accepted when:
 
-- `DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf` is detected and rejected/accepted
-  through explicit metadata validation.
+- the DS4 `q2-imatrix` GGUF is detected and rejected/accepted through explicit
+  metadata validation.
 - `batch=1` greedy decode runs at `context=4096`.
 - `batch=1` greedy decode runs at `context=8192`.
 - `POST /v1/chat/completions` returns a valid non-streaming response.

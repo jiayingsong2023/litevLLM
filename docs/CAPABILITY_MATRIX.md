@@ -31,7 +31,7 @@ or feature status lists.
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
 | Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf | Experimental | Native DS4 GGUF support target. Current branch has metadata/config detection, inspect-only weight binding, paged compressed KV contracts, model registry, loader routing, and OpenAI REST route smoke; full forward execution is not wired yet. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF support target. Current branch has metadata/config detection, inspect-only weight binding, paged compressed KV contracts, model registry, loader routing, and OpenAI REST route smoke; full forward execution is not wired yet. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
 | LoRA runtime | Experimental | Runtime path and tests exist; production policy calibration is still workload dependent. |
 | Multimodal serving | Experimental | Single-image and multi-image paths exist, but require broader real-traffic hardening. |

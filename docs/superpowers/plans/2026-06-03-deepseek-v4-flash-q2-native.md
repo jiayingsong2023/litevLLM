@@ -2,7 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add experimental native FastInference support for `DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf` with `batch=1`, `context=4096/8192`, greedy decode, and OpenAI-compatible REST access.
+**Goal:** Add experimental native FastInference support for `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf` with `batch=1`, `context=4096/8192`, greedy decode, and OpenAI-compatible REST access.
+
+**Target correction:** This plan originally referenced
+`DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf`. Public repository inspection showed
+that exact file was not available. The first real target is DS4's
+`q2-imatrix` GGUF from `antirez/deepseek-v4-gguf`.
 
 **Architecture:** Implement a DeepSeek V4 Flash model family as a vertical lite model package with strict DS4 GGUF parsing, mmap-backed weight descriptors, model-local paged compressed KV, and Triton quant kernels. Keep `LiteEngine`, `StepScheduler`, and `RequestScheduler` model-agnostic; DeepSeek-specific behavior belongs in `vllm/adapters/deepseek_v4_flash.py`, `vllm/model_executor/models/deepseek_v4_flash/`, and `vllm/kernels/triton/deepseek_v4_flash/`.
 
@@ -336,7 +341,7 @@ from .fixtures import write_minimal_deepseek_v4_flash_gguf
 
 
 def test_reader_accepts_minimal_target_metadata(tmp_path) -> None:
-    path = tmp_path / "DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf"
+    path = tmp_path / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
     write_minimal_deepseek_v4_flash_gguf(path)
 
     model = read_deepseek_v4_flash_gguf(path)
@@ -1817,7 +1822,7 @@ Expected: test passes.
 In `docs/CAPABILITY_MATRIX.md`, add this model-support row:
 
 ```markdown
-| DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf | Experimental | Native DS4 GGUF support target; first release is batch=1, 4K/8K context, greedy decode, and REST smoke. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF support target; first release is batch=1, 4K/8K context, greedy decode, and REST smoke. |
 ```
 
 In `docs/models/supported_models.md`, add the same experimental model row in the model table.
@@ -1892,5 +1897,5 @@ Expected: no unstaged or uncommitted changes.
 - Do not vendor DS4 C/CUDA code. Use DS4 as a behavioral and layout reference only.
 - Do not claim generic GGUF support. The reader is strict for the target DS4 GGUF family.
 - Keep every Triton import routed through `vllm/triton_utils/`.
-- Run the real `DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf` inspect command before attempting a full model load.
+- Run the real `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf` inspect command before attempting a full model load.
 - Defer 1M context, speculative decoding, distributed execution, and DeepSeek V4 Pro until the first native release is stable.

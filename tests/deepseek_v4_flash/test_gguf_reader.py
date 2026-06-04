@@ -7,7 +7,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
 
 
 def test_reader_accepts_minimal_target_metadata(tmp_path) -> None:
-    path = tmp_path / "DeepSeek-V4-Flash-Spark-Q2-REAP-ds4.gguf"
+    path = tmp_path / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
     write_minimal_deepseek_v4_flash_gguf(path)
 
     model = read_deepseek_v4_flash_gguf(path)
