@@ -1,0 +1,31 @@
+from types import SimpleNamespace
+
+import pytest
+
+from vllm.model_executor.models.deepseek_v4_flash import DeepSeekV4FlashForCausalLM
+from vllm.model_executor.models.registry import ModelRegistry
+
+
+def test_model_registry_resolves_deepseek_v4_flash() -> None:
+    cfg = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v4"))
+
+    cls, arch = ModelRegistry.resolve_model_cls(["DeepSeekV4FlashForCausalLM"], cfg)
+
+    assert cls is DeepSeekV4FlashForCausalLM
+    assert arch == "DeepSeekV4FlashForCausalLM"
+
+
+def test_model_registry_infers_deepseek_v4_flash_from_config() -> None:
+    cfg = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek4"))
+
+    cls, arch = ModelRegistry.resolve_model_cls([], cfg)
+
+    assert cls is DeepSeekV4FlashForCausalLM
+    assert arch == "DeepSeekV4FlashForCausalLM"
+
+
+def test_deepseek_v4_flash_skeleton_rejects_forward() -> None:
+    model = DeepSeekV4FlashForCausalLM()
+
+    with pytest.raises(NotImplementedError, match="forward is not wired"):
+        model()
