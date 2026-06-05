@@ -54,6 +54,7 @@ class DeepSeekV4FlashWeightStoreDiagnostics:
     bound_tensor_count: int
     missing_required_semantic_tensors: tuple[str, ...]
     tensor_type_counts: dict[int, int]
+    tensor_type_samples: dict[int, tuple[DeepSeekV4FlashTensor, ...]]
     unaligned_tensor_offsets: tuple[str, ...]
 
 
@@ -126,6 +127,22 @@ def _tensor_type_counts(model: DeepSeekV4FlashGGUF) -> dict[int, int]:
     return counts
 
 
+def _tensor_type_samples(
+    model: DeepSeekV4FlashGGUF,
+    *,
+    samples_per_type: int = 3,
+) -> dict[int, tuple[DeepSeekV4FlashTensor, ...]]:
+    samples: dict[int, list[DeepSeekV4FlashTensor]] = {}
+    for tensor in model.tensors.values():
+        type_samples = samples.setdefault(tensor.tensor_type, [])
+        if len(type_samples) < samples_per_type:
+            type_samples.append(tensor)
+    return {
+        tensor_type: tuple(type_samples)
+        for tensor_type, type_samples in samples.items()
+    }
+
+
 def _unaligned_tensor_offsets(
     model: DeepSeekV4FlashGGUF,
     *,
@@ -164,6 +181,7 @@ def open_deepseek_v4_flash_weight_store(path: Path | str) -> DeepSeekV4FlashWeig
             ),
             missing_required_semantic_tensors=missing,
             tensor_type_counts=_tensor_type_counts(model),
+            tensor_type_samples=_tensor_type_samples(model),
             unaligned_tensor_offsets=_unaligned_tensor_offsets(model),
         )
         if bindings is None:

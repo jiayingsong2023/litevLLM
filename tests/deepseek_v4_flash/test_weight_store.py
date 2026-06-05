@@ -55,6 +55,9 @@ def test_weight_store_binds_required_inspect_tensors(tmp_path):
         assert diagnostics.missing_required_semantic_tensors == ()
         assert diagnostics.tensor_type_counts == {8: 2}
         assert diagnostics.unaligned_tensor_offsets == ()
+        assert diagnostics.tensor_type_samples[8][0].name == "token_embd.weight"
+        assert diagnostics.tensor_type_samples[8][0].dims == (4096, 129280)
+        assert diagnostics.tensor_type_samples[8][0].offset == 0
         assert store.bindings.token_embedding.name == "token_embd.weight"
         assert store.bindings.representative_layer_tensor.name == "blk.0.attn_q.weight"
 

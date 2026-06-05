@@ -22,6 +22,10 @@ def test_inspect_tool_prints_shape_and_diagnostics(tmp_path) -> None:
     assert "layers: 43" in result.stdout
     assert "bound tensors: 2" in result.stdout
     assert "tensor types: 8=2" in result.stdout
+    assert (
+        "type 8 sample: token_embd.weight dims=(4096, 129280) offset=0"
+        in result.stdout
+    )
     assert "unaligned tensor offsets: none" in result.stdout
     assert "model mmap bytes:" in result.stdout
     assert "resident bytes:" in result.stdout

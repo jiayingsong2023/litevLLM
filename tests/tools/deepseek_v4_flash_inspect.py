@@ -39,6 +39,12 @@ def main() -> None:
             diagnostics.tensor_type_counts
         )
         print(f"tensor types: {tensor_type_counts}")
+        for tensor_type, samples in sorted(diagnostics.tensor_type_samples.items()):
+            for sample in samples:
+                print(
+                    f"type {tensor_type} sample: {sample.name} "
+                    f"dims={sample.dims} offset={sample.offset}"
+                )
         if diagnostics.unaligned_tensor_offsets:
             unaligned = ", ".join(diagnostics.unaligned_tensor_offsets)
         else:
