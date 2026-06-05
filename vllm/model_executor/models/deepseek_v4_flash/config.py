@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+DEEPSEEK_V4_FLASH_TARGET_GGUF_BYTES = 86_720_111_488
+DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES = 61 * 1024 * 1024 * 1024
+DEEPSEEK_V4_FLASH_MIN_SYSTEM_HEADROOM_BYTES = 1536 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class DeepSeekV4FlashShape:
@@ -39,6 +43,32 @@ class DeepSeekV4FlashContextEstimate:
         return self.raw_kv_bytes + self.compressed_kv_bytes + self.scratch_bytes
 
 
+@dataclass(frozen=True)
+class DeepSeekV4FlashRuntimeBudget:
+    context: DeepSeekV4FlashContextEstimate
+    model_mmap_bytes: int
+    resident_weight_bytes: int
+    expert_cache_bytes: int
+    uma_budget_bytes: int
+    min_system_headroom_bytes: int
+
+    @property
+    def resident_bytes(self) -> int:
+        return (
+            self.context.total_bytes
+            + self.resident_weight_bytes
+            + self.expert_cache_bytes
+        )
+
+    @property
+    def available_headroom_bytes(self) -> int:
+        return self.uma_budget_bytes - self.resident_bytes
+
+    @property
+    def has_required_headroom(self) -> bool:
+        return self.available_headroom_bytes >= self.min_system_headroom_bytes
+
+
 DEEPSEEK_V4_FLASH_SHAPE = DeepSeekV4FlashShape()
 
 
@@ -53,6 +83,31 @@ def layer_compress_ratio(layer_idx: int) -> int:
 class DeepSeekV4FlashMemoryPolicy:
     max_first_release_context: int = 8192
     default_expert_cache_bytes: int = 2 * 1024 * 1024 * 1024
+    default_uma_budget_bytes: int = DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES
+    min_system_headroom_bytes: int = DEEPSEEK_V4_FLASH_MIN_SYSTEM_HEADROOM_BYTES
+
+    def __init__(
+        self,
+        *,
+        max_first_release_context: int | None = None,
+        default_expert_cache_bytes: int | None = None,
+        default_uma_budget_bytes: int | None = None,
+        min_system_headroom_bytes: int | None = None,
+    ) -> None:
+        if max_first_release_context is not None:
+            self.max_first_release_context = max_first_release_context
+        if default_expert_cache_bytes is not None:
+            if default_expert_cache_bytes < 0:
+                raise ValueError("expert cache bytes must be non-negative")
+            self.default_expert_cache_bytes = default_expert_cache_bytes
+        if default_uma_budget_bytes is not None:
+            if default_uma_budget_bytes <= 0:
+                raise ValueError("UMA budget bytes must be positive")
+            self.default_uma_budget_bytes = default_uma_budget_bytes
+        if min_system_headroom_bytes is not None:
+            if min_system_headroom_bytes < 0:
+                raise ValueError("minimum system headroom bytes must be non-negative")
+            self.min_system_headroom_bytes = min_system_headroom_bytes
 
     def validate_context_length(self, context_length: int) -> int:
         if context_length <= 0:
@@ -72,7 +127,10 @@ class DeepSeekV4FlashMemoryPolicy:
     ) -> DeepSeekV4FlashContextEstimate:
         ctx = self.validate_context_length(context_length)
         shape = DEEPSEEK_V4_FLASH_SHAPE
-        raw_cap = min(max(shape.sliding_window + prefill_cap, shape.sliding_window), ctx)
+        raw_cap = min(
+            max(shape.sliding_window + prefill_cap, shape.sliding_window),
+            ctx,
+        )
         raw_cap = min(((raw_cap + 255) // 256) * 256, ctx)
         raw_kv = shape.num_layers * raw_cap * shape.head_dim * 4
         compressed_kv = 0
@@ -91,3 +149,48 @@ class DeepSeekV4FlashMemoryPolicy:
             compressed_kv_bytes=compressed_kv,
             scratch_bytes=scratch,
         )
+
+    def estimate_runtime_budget(
+        self,
+        context_length: int,
+        *,
+        model_mmap_bytes: int = DEEPSEEK_V4_FLASH_TARGET_GGUF_BYTES,
+        resident_weight_bytes: int = 0,
+        expert_cache_bytes: int | None = None,
+        uma_budget_bytes: int | None = None,
+    ) -> DeepSeekV4FlashRuntimeBudget:
+        if model_mmap_bytes <= 0:
+            raise ValueError("model mmap bytes must be positive")
+        if resident_weight_bytes < 0:
+            raise ValueError("resident weight bytes must be non-negative")
+        if expert_cache_bytes is None:
+            expert_cache_bytes = self.default_expert_cache_bytes
+        if expert_cache_bytes < 0:
+            raise ValueError("expert cache bytes must be non-negative")
+        if uma_budget_bytes is None:
+            uma_budget_bytes = self.default_uma_budget_bytes
+        if uma_budget_bytes <= 0:
+            raise ValueError("UMA budget bytes must be positive")
+
+        return DeepSeekV4FlashRuntimeBudget(
+            context=self.estimate_context_bytes(context_length),
+            model_mmap_bytes=model_mmap_bytes,
+            resident_weight_bytes=resident_weight_bytes,
+            expert_cache_bytes=expert_cache_bytes,
+            uma_budget_bytes=uma_budget_bytes,
+            min_system_headroom_bytes=self.min_system_headroom_bytes,
+        )
+
+    def validate_runtime_budget(
+        self,
+        budget: DeepSeekV4FlashRuntimeBudget,
+    ) -> DeepSeekV4FlashRuntimeBudget:
+        if not budget.has_required_headroom:
+            raise ValueError(
+                "insufficient DeepSeek V4 Flash UMA headroom: "
+                f"resident={budget.resident_bytes} bytes, "
+                f"budget={budget.uma_budget_bytes} bytes, "
+                f"available={budget.available_headroom_bytes} bytes, "
+                f"required={budget.min_system_headroom_bytes} bytes"
+            )
+        return budget

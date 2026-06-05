@@ -151,9 +151,24 @@ The first implementation should use:
 - optional Q8 dequant cache for attention/shared/output projections
 - routed expert cache keyed by `(layer, expert_id, projection)`
 
-The routed expert cache should be bounded by configuration. Cache misses load
-the selected expert slice from mmap backing and feed the relevant Triton kernel.
-This is expert staging, not a general disk paging system.
+The routed expert cache is part of correctness and reliability, not only
+performance. It must be bounded by configuration and expose hit, miss, loaded
+byte, and eviction counters. Cache misses load the selected expert slice from
+mmap backing and feed the relevant Triton kernel. Eviction must be deferred for
+all experts participating in the current forward pass so one decode step cannot
+evict an expert it still needs later in the same step. This is expert staging,
+not a general disk paging system.
+
+The first implementation should keep the policy simple:
+
+- dynamic LRU budget with an explicit byte cap
+- no automatic top-K expert pinning until real routing statistics are available
+- an extension point for manually pinned `(layer, expert_id)` entries
+- no asynchronous prefetch requirement in the first release
+
+Static-dynamic caching and double-buffered prefetch are valid follow-up
+optimizations. They should be enabled only after the inspect and smoke paths
+can report stable expert hit/miss behavior for the target GGUF.
 
 ## Quantized Kernels
 
@@ -169,6 +184,20 @@ Initial kernels can prioritize correctness and memory safety over peak
 throughput. Each kernel must include a PyTorch reference test and edge cases for
 empty, tiny, and shape-boundary inputs. Every Triton file must follow the
 project rule of documenting memory layout and program tiling in ASCII comments.
+
+Before binding real `IQ2_XXS` and `Q2_K` kernels, the loader must provide a
+quantization layout audit for the target GGUF:
+
+- tensor type counts
+- representative tensor names, shapes, and offsets for each quant type
+- offset alignment information
+- raw block layout notes derived from the real file, not assumed from adjacent
+  GGUF variants
+
+The first kernel path may read the raw GGUF layout directly if that is the
+fastest route to correctness. GPU-friendly transposition/repacking is a
+profile-driven optimization: add it only when raw-layout dequant is measured to
+be the bottleneck on the target ROCm machine.
 
 ## Compressed KV And Attention
 
@@ -224,6 +253,12 @@ The attention implementation should be isolated from the existing
 PagedAttention kernels. It may reuse shared utility code, but it must expose a
 separate model-local contract so standard paged-KV models are unaffected.
 
+Co-allocating ratio-4 compressed rows and ratio-4 indexer rows can reduce one
+page-table lookup, but it is not a first-release requirement. The row widths are
+different, so co-allocation may trade pointer chasing for padding waste and
+allocator complexity. Keep separate pools initially; merge them only if
+profiling shows page-table overhead matters more than memory slack.
+
 ## Model Adapter
 
 `DeepSeekV4FlashAdapter` will identify the model from GGUF metadata and return a
@@ -258,20 +293,33 @@ No DeepSeek-specific branches should be added to `LiteEngine`,
 ## Memory Policy
 
 The target machine has ROCm UMA with roughly 61GB GPU-addressable shared memory.
-The target GGUF is roughly 53.5GiB. The design must treat memory as tight.
+The target GGUF file is `86,720,111,488` bytes, roughly 80.7GiB. Therefore the
+file size must not be treated as fully resident GPU memory. The process mmap is
+the authoritative backing store, while the runtime budget tracks resident
+weights, KV, scratch, and expert cache separately. The design must treat memory
+as tight and fail before allocation-heavy load when the resident estimate leaves
+less than the required system headroom.
 
 Required safeguards:
 
 - inspect-only mode before any allocation-heavy load
 - startup memory estimate for weights, KV, scratch, and expert cache
+- separate reporting for `model_mmap_bytes` and resident runtime bytes
 - hard cap on context length for the first release
 - hard cap on expert cache size
 - maximum single KV allocation size for each page-pool chunk
 - tests that reject accidental full-context contiguous KV allocation
-- fail-fast if estimated memory exceeds configured budget
+- fail-fast if estimated resident memory leaves insufficient UMA headroom
 - runtime counters for expert cache hits, misses, loaded bytes, and evictions
 
 The first release should prefer fitting reliably over aggressive caching.
+
+Startup warmup should be limited to shapes that are actually part of the first
+release: short decode, 4K context, and 8K context. Do not compile every expert
+or every power-of-two sequence length before opening the REST port. Decode
+hot-path kernels should target no more than roughly 64 registers per thread on
+AMD, but exceeding that target is allowed only with a documented reason and a
+lower-ILP fallback or benchmark evidence.
 
 ## Validation
 
@@ -281,7 +329,9 @@ Phase gates:
    - parse target GGUF
    - print model shape
    - print tensor type counts
+   - print tensor offset alignment issues
    - estimate memory for 4K and 8K contexts
+   - distinguish mmap file bytes from resident runtime bytes
 
 2. Quant reference:
    - validate `Q8_0`, `IQ2_XXS`, and `Q2_K` reference decode against known
@@ -289,6 +339,7 @@ Phase gates:
 
 3. Triton quant:
    - compare each Triton kernel against the PyTorch reference
+   - benchmark raw GGUF layout before adding any transposed cache
 
 4. Compressed KV:
    - validate raw SWA and compressed row accounting for 4K and 8K contexts
@@ -306,6 +357,14 @@ Phase gates:
    - call `POST /v1/chat/completions`
    - verify non-streaming response
    - verify streaming response
+
+7. Memory stability:
+   - run repeated 4K and 8K requests
+   - verify resident memory and cache counters stabilize after warm cache
+
+8. Graceful degradation:
+   - reject out-of-bounds context requests with a clear REST error
+   - keep the engine process online after the rejected request
 
 The first release does not require `run_inference_correctness_regression.sh` to
 include DeepSeek V4 Flash. Once smoke is stable, a dedicated DeepSeek V4 Flash

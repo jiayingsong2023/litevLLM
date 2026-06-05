@@ -1850,6 +1850,37 @@ git commit -m "docs: mark deepseek v4 flash experimental"
 
 ## Final Verification
 
+## Review-Driven Improvement Addendum
+
+The architecture review accepted the first-release scope but tightened the
+memory and expert-cache requirements. These changes are part of the current
+bring-up plan and should be completed before full model smoke:
+
+- [x] Correct the target GGUF size to `86,720,111,488` bytes and document that
+  mmap backing bytes are separate from resident UMA budget.
+- [x] Add runtime budget estimation that tracks context KV/scratch, resident
+  weight cache, dynamic expert cache, UMA budget, and required system headroom.
+- [x] Add fail-fast validation when estimated resident bytes leave insufficient
+  UMA headroom.
+- [x] Add an explicit expert cache policy with bounded dynamic LRU capacity,
+  pinned expert extension points, and deferred eviction during a forward pass.
+- [x] Extend inspect-only diagnostics with tensor type counts and tensor offset
+  alignment checks so the real GGUF quant layout can be audited before writing
+  final `IQ2_XXS` and `Q2_K` kernels.
+
+Deferred until after real-file profiling:
+
+- [ ] Enable automatic top-K expert pinning from observed routing statistics or
+  verified imatrix metadata.
+- [ ] Add asynchronous double-buffered expert prefetch once synchronous cache
+  misses are measured and stream/event ownership is clear.
+- [ ] Repack raw GGUF quant blocks into a GPU-friendly layout only if raw-layout
+  Triton dequant is the measured bottleneck.
+- [ ] Co-allocate ratio-4 compressed rows with ratio-4 indexer rows only if page
+  table overhead is worse than the padding and allocator complexity.
+- [ ] Broaden warmup beyond short decode, 4K, and 8K only after REST startup
+  latency remains acceptable.
+
 - [ ] Run focused DeepSeek tests:
 
 ```bash

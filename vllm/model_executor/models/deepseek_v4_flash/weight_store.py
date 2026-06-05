@@ -7,6 +7,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
 
+from .config import DEEPSEEK_V4_FLASH_SHAPE
 from .gguf_reader import (
     DeepSeekV4FlashGGUF,
     DeepSeekV4FlashTensor,
@@ -25,12 +26,35 @@ class DeepSeekV4FlashSemanticBindings:
 
 
 @dataclass(frozen=True)
+class DeepSeekV4FlashExpertCachePolicy:
+    max_dynamic_bytes: int
+    pinned_experts: tuple[tuple[int, int], ...] = ()
+    defer_eviction_during_forward: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_dynamic_bytes < 0:
+            raise ValueError("expert cache bytes must be non-negative")
+        seen: set[tuple[int, int]] = set()
+        for layer_idx, expert_id in self.pinned_experts:
+            if layer_idx < 0 or layer_idx >= DEEPSEEK_V4_FLASH_SHAPE.num_layers:
+                raise ValueError(f"layer index out of range: {layer_idx}")
+            if expert_id < 0 or expert_id >= DEEPSEEK_V4_FLASH_SHAPE.num_experts:
+                raise ValueError(f"expert id out of range: {expert_id}")
+            key = (layer_idx, expert_id)
+            if key in seen:
+                raise ValueError(f"duplicate pinned experts are not allowed: {key}")
+            seen.add(key)
+
+
+@dataclass(frozen=True)
 class DeepSeekV4FlashWeightStoreDiagnostics:
     tensor_count: int
     file_size_bytes: int
     mmap_size_bytes: int
     bound_tensor_count: int
     missing_required_semantic_tensors: tuple[str, ...]
+    tensor_type_counts: dict[int, int]
+    unaligned_tensor_offsets: tuple[str, ...]
 
 
 _REQUIRED_TENSORS: tuple[tuple[str, str], ...] = (
@@ -95,6 +119,25 @@ def _bind_required_tensors(
     )
 
 
+def _tensor_type_counts(model: DeepSeekV4FlashGGUF) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for tensor in model.tensors.values():
+        counts[tensor.tensor_type] = counts.get(tensor.tensor_type, 0) + 1
+    return counts
+
+
+def _unaligned_tensor_offsets(
+    model: DeepSeekV4FlashGGUF,
+    *,
+    alignment: int = 32,
+) -> tuple[str, ...]:
+    return tuple(
+        tensor.name
+        for tensor in model.tensors.values()
+        if tensor.offset % alignment != 0
+    )
+
+
 def open_deepseek_v4_flash_weight_store(path: Path | str) -> DeepSeekV4FlashWeightStore:
     gguf_path = Path(path)
     file = gguf_path.open("rb")
@@ -120,6 +163,8 @@ def open_deepseek_v4_flash_weight_store(path: Path | str) -> DeepSeekV4FlashWeig
                 if tensor_name in model.tensors
             ),
             missing_required_semantic_tensors=missing,
+            tensor_type_counts=_tensor_type_counts(model),
+            unaligned_tensor_offsets=_unaligned_tensor_offsets(model),
         )
         if bindings is None:
             missing_list = ", ".join(
