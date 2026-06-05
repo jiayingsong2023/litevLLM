@@ -1189,6 +1189,35 @@ def _should_skip_safetensors_load(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _build_deepseek_v4_flash_inspect_model(
+    model_cls: type[nn.Module],
+    vllm_config: VllmConfig,
+) -> nn.Module:
+    from vllm.model_executor.models.deepseek_v4_flash.config import (
+        DeepSeekV4FlashMemoryPolicy,
+    )
+    from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+        open_deepseek_v4_flash_weight_store,
+    )
+
+    cfg = vllm_config.model_config
+    store = open_deepseek_v4_flash_weight_store(cfg.model)
+    try:
+        policy = DeepSeekV4FlashMemoryPolicy()
+        budget = policy.estimate_runtime_budget(
+            getattr(cfg, "max_model_len", policy.max_first_release_context),
+            model_mmap_bytes=store.diagnostics.file_size_bytes,
+        )
+        policy.validate_runtime_budget(budget)
+        model = model_cls(vllm_config)
+        model_with_store: Any = model
+        model_with_store.attach_weight_store(store, budget)
+        return model.eval()
+    except Exception:
+        store.close()
+        raise
+
+
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
     if cfg.hf_config is None:
@@ -1209,6 +1238,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         setattr(cfg.hf_config, "num_key_value_heads", getattr(cfg.hf_config, "num_attention_heads", 40))
         setattr(cfg.hf_config, "head_dim", 128)
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
+    if _should_skip_safetensors_load(vllm_config):
+        return _build_deepseek_v4_flash_inspect_model(model_cls, vllm_config)
     model = model_cls(vllm_config)
     
     # Pre-resolve target dtype

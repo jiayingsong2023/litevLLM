@@ -24,8 +24,8 @@ def test_model_registry_infers_deepseek_v4_flash_from_config() -> None:
     assert arch == "DeepSeekV4FlashForCausalLM"
 
 
-def test_deepseek_v4_flash_skeleton_rejects_forward() -> None:
+def test_deepseek_v4_flash_skeleton_requires_weight_store() -> None:
     model = DeepSeekV4FlashForCausalLM()
 
-    with pytest.raises(NotImplementedError, match="forward is not wired"):
+    with pytest.raises(RuntimeError, match="attached GGUF weight store"):
         model()
