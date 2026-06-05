@@ -23,6 +23,7 @@ class DeepSeekV4FlashWeightStoreError(ValueError):
 class DeepSeekV4FlashSemanticBindings:
     token_embedding: DeepSeekV4FlashTensor
     representative_layer_tensor: DeepSeekV4FlashTensor
+    attention_query_by_layer: dict[int, DeepSeekV4FlashTensor]
 
 
 @dataclass(frozen=True)
@@ -111,13 +112,41 @@ def _bind_required_tensors(
     if missing:
         return None, missing
 
+    attention_query_by_layer = _bind_attention_query_tensors(model)
     return (
         DeepSeekV4FlashSemanticBindings(
             token_embedding=model.tensors["token_embd.weight"],
             representative_layer_tensor=model.tensors["blk.0.attn_q.weight"],
+            attention_query_by_layer=attention_query_by_layer,
         ),
         (),
     )
+
+
+def _bind_attention_query_tensors(
+    model: DeepSeekV4FlashGGUF,
+) -> dict[int, DeepSeekV4FlashTensor]:
+    bound: dict[int, DeepSeekV4FlashTensor] = {}
+    prefix = "blk."
+    suffix = ".attn_q.weight"
+    for tensor in model.tensors.values():
+        if not tensor.name.startswith(prefix) or not tensor.name.endswith(suffix):
+            continue
+        layer_text = tensor.name[len(prefix) : -len(suffix)]
+        if not layer_text.isdigit():
+            continue
+        layer_idx = int(layer_text)
+        if 0 <= layer_idx < DEEPSEEK_V4_FLASH_SHAPE.num_layers:
+            bound[layer_idx] = tensor
+    return bound
+
+
+def _bound_tensor_count(
+    bindings: DeepSeekV4FlashSemanticBindings | None,
+) -> int:
+    if bindings is None:
+        return 0
+    return 1 + len(bindings.attention_query_by_layer)
 
 
 def _tensor_type_counts(model: DeepSeekV4FlashGGUF) -> dict[int, int]:
@@ -174,11 +203,7 @@ def open_deepseek_v4_flash_weight_store(path: Path | str) -> DeepSeekV4FlashWeig
             tensor_count=len(model.tensors),
             file_size_bytes=gguf_path.stat().st_size,
             mmap_size_bytes=mmap_obj.size(),
-            bound_tensor_count=sum(
-                1
-                for _, tensor_name in _REQUIRED_TENSORS
-                if tensor_name in model.tensors
-            ),
+            bound_tensor_count=_bound_tensor_count(bindings),
             missing_required_semantic_tensors=missing,
             tensor_type_counts=_tensor_type_counts(model),
             tensor_type_samples=_tensor_type_samples(model),

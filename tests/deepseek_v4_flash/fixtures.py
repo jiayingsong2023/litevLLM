@@ -41,6 +41,7 @@ def write_minimal_deepseek_v4_flash_gguf(
     *,
     block_count: int = 43,
     tensor_names: tuple[str, ...] = ("token_embd.weight",),
+    tensor_types: tuple[int, ...] | None = None,
 ) -> None:
     metadata = bytearray()
     _write_kv_string(metadata, "general.architecture", "deepseek4")
@@ -59,9 +60,13 @@ def write_minimal_deepseek_v4_flash_gguf(
     _write_kv_u32(metadata, "deepseek4.vocab_size", 129280)
 
     tensors = bytearray()
+    if tensor_types is None:
+        tensor_types = tuple(8 for _ in tensor_names)
+    if len(tensor_types) != len(tensor_names):
+        raise ValueError("tensor_types length must match tensor_names length")
     for offset, name in enumerate(tensor_names):
         dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
-        _write_tensor(tensors, name, dims, 8, offset * 32)
+        _write_tensor(tensors, name, dims, tensor_types[offset], offset * 32)
     header = struct.pack(
         "<IIQQ", GGUF_MAGIC, 3, DEEPSEEK_V4_FLASH_METADATA_COUNT, len(tensor_names)
     )

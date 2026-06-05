@@ -13,6 +13,12 @@ GGUF_MAGIC = 0x46554747
 GGUF_VERSION = 3
 GGUF_TYPE_UINT32 = 4
 GGUF_TYPE_STRING = 8
+GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q2_K = 10
+GGML_TYPE_IQ2_XXS = 16
+SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES = frozenset(
+    (GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS)
+)
 
 
 class GGUFParseError(ValueError):
@@ -116,6 +122,19 @@ def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
     )
 
 
+def _validate_tensor_types(tensors: dict[str, DeepSeekV4FlashTensor]) -> None:
+    for tensor in tensors.values():
+        if tensor.tensor_type not in SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES:
+            supported = ", ".join(
+                str(tensor_type)
+                for tensor_type in sorted(SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES)
+            )
+            raise GGUFParseError(
+                "unsupported DeepSeek V4 Flash tensor type "
+                f"{tensor.tensor_type} for {tensor.name}; supported: {supported}"
+            )
+
+
 def read_deepseek_v4_flash_gguf_from_view(
     path: Path,
     data: memoryview,
@@ -143,6 +162,7 @@ def read_deepseek_v4_flash_gguf_from_view(
     for _ in range(tensor_count):
         tensor = _read_tensor(cursor)
         tensors[tensor.name] = tensor
+    _validate_tensor_types(tensors)
 
     return DeepSeekV4FlashGGUF(
         path=path,
