@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import struct
+
 import torch
 
 
@@ -150,6 +152,71 @@ def q8_0_linear_reference(
 ) -> torch.Tensor:
     """Reference Q8_0 matrix-vector product used by kernel tests."""
     return q8_0_matvec(values, scales, vector, block_size=block_size)
+
+
+def decode_q8_0_gguf_blocks(
+    payload: bytes | bytearray | memoryview,
+    *,
+    block_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode raw GGUF Q8_0 blocks into separated int8 values and fp32 scales.
+
+    GGUF/GGML Q8_0 blocks are laid out as one little-endian fp16 scale followed
+    by ``block_size`` signed int8 quantized values. The default block size is 32.
+    """
+    _validate_positive_block_size(block_size)
+    block_bytes = 2 + block_size
+    if len(payload) % block_bytes != 0:
+        raise ValueError(
+            "Q8_0 payload length must be a multiple of Q8_0 block bytes; "
+            f"got {len(payload)} bytes and block_bytes={block_bytes}"
+        )
+
+    block_count = len(payload) // block_bytes
+    values: list[int] = []
+    scales: list[float] = []
+    view = memoryview(payload)
+    values_format = "<" + "b" * block_size
+    for block_idx in range(block_count):
+        offset = block_idx * block_bytes
+        scales.append(float(struct.unpack_from("<e", view, offset)[0]))
+        values.extend(struct.unpack_from(values_format, view, offset + 2))
+    return (
+        torch.tensor(values, dtype=torch.int8),
+        torch.tensor(scales, dtype=torch.float32),
+    )
+
+
+def q8_0_matrix_from_gguf_payload(
+    payload: bytes | bytearray | memoryview,
+    *,
+    rows: int,
+    columns: int,
+    block_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode raw GGUF Q8_0 matrix payload into row-major values and scales."""
+    _validate_positive_block_size(block_size)
+    if rows < 0:
+        raise ValueError(f"rows must be non-negative; got {rows}")
+    if columns <= 0:
+        raise ValueError(f"columns must be positive; got {columns}")
+    if columns % block_size != 0:
+        raise ValueError(
+            "Q8_0 matrix columns must be divisible by block_size; "
+            f"got columns={columns} and block_size={block_size}"
+        )
+    values, scales = decode_q8_0_gguf_blocks(payload, block_size=block_size)
+    expected_values = rows * columns
+    if values.numel() != expected_values:
+        raise ValueError(
+            "Q8_0 payload value count must match rows * columns; "
+            f"got {values.numel()} values for rows={rows}, columns={columns}"
+        )
+    blocks_per_row = columns // block_size
+    return (
+        values.reshape(rows, columns),
+        scales.reshape(rows, blocks_per_row),
+    )
 
 
 def _validate_two_bit_codes(name: str, codes: torch.Tensor) -> None:

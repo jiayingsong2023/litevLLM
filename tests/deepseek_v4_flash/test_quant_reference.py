@@ -1,3 +1,5 @@
+import struct
+
 import pytest
 import torch
 
@@ -5,9 +7,11 @@ from vllm.model_executor.models.deepseek_v4_flash.quant import (
     decode_iq2_xxs_synthetic,
     decode_q2_k_synthetic,
     decode_q8_0,
+    decode_q8_0_gguf_blocks,
     q8_0_dequantize_reference,
     q8_0_dot,
     q8_0_linear_reference,
+    q8_0_matrix_from_gguf_payload,
     q8_0_matvec,
 )
 
@@ -66,6 +70,63 @@ def test_q8_0_linear_reference_matches_dequantized_matmul() -> None:
     result = q8_0_linear_reference(vector, values, scales, block_size=2)
 
     torch.testing.assert_close(result, weight.matmul(vector))
+
+
+def _pack_q8_0_block(scale: float, values: tuple[int, ...]) -> bytes:
+    return struct.pack("<e", scale) + struct.pack(
+        "<" + "b" * len(values),
+        *values,
+    )
+
+
+def test_q8_0_gguf_payload_decoder_reads_scale_then_int8_values() -> None:
+    payload = _pack_q8_0_block(0.5, (1, -2, 3, -4))
+
+    values, scales = decode_q8_0_gguf_blocks(payload, block_size=4)
+
+    torch.testing.assert_close(
+        values,
+        torch.tensor([1, -2, 3, -4], dtype=torch.int8),
+    )
+    torch.testing.assert_close(scales, torch.tensor([0.5], dtype=torch.float32))
+
+
+def test_q8_0_matrix_from_gguf_payload_decodes_rows() -> None:
+    payload = b"".join(
+        (
+            _pack_q8_0_block(0.5, (1, -2, 3, -4)),
+            _pack_q8_0_block(0.25, (4, 3, 2, 1)),
+        )
+    )
+
+    values, scales = q8_0_matrix_from_gguf_payload(
+        payload,
+        rows=2,
+        columns=4,
+        block_size=4,
+    )
+
+    torch.testing.assert_close(
+        values,
+        torch.tensor([[1, -2, 3, -4], [4, 3, 2, 1]], dtype=torch.int8),
+    )
+    torch.testing.assert_close(
+        scales,
+        torch.tensor([[0.5], [0.25]], dtype=torch.float32),
+    )
+
+
+def test_q8_0_gguf_payload_decoder_rejects_malformed_payload() -> None:
+    with pytest.raises(ValueError, match="multiple of Q8_0 block bytes"):
+        decode_q8_0_gguf_blocks(b"\x00\x00\x01", block_size=4)
+
+    with pytest.raises(ValueError, match="columns"):
+        q8_0_matrix_from_gguf_payload(
+            _pack_q8_0_block(0.5, (1, -2, 3, -4)),
+            rows=1,
+            columns=3,
+            block_size=4,
+        )
 
 
 def test_q8_0_rejects_malformed_inputs() -> None:
