@@ -11,13 +11,34 @@ from .config import DEEPSEEK_V4_FLASH_SHAPE, DeepSeekV4FlashShape
 
 GGUF_MAGIC = 0x46554747
 GGUF_VERSION = 3
+GGUF_TYPE_UINT8 = 0
+GGUF_TYPE_INT8 = 1
+GGUF_TYPE_UINT16 = 2
+GGUF_TYPE_INT16 = 3
 GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_INT32 = 5
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL = 7
 GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
+GGUF_TYPE_UINT64 = 10
+GGUF_TYPE_INT64 = 11
+GGUF_TYPE_FLOAT64 = 12
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
 GGML_TYPE_Q2_K = 10
 GGML_TYPE_IQ2_XXS = 16
+GGML_TYPE_I32 = 26
 SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES = frozenset(
-    (GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XXS)
+    (
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_I32,
+    )
 )
 
 
@@ -64,6 +85,11 @@ class _Cursor:
         n = self.u64()
         return self.read(n).decode("utf-8")
 
+    def skip(self, n: int) -> None:
+        if self.pos + n > len(self.data):
+            raise GGUFParseError("truncated GGUF")
+        self.pos += n
+
 
 _EXPECTED_METADATA: dict[str, Any] = {
     "general.architecture": "deepseek4",
@@ -81,6 +107,24 @@ _EXPECTED_METADATA: dict[str, Any] = {
     "deepseek4.vocab_size": DEEPSEEK_V4_FLASH_SHAPE.vocab_size,
 }
 
+
+_STORED_METADATA_KEYS = frozenset((*_EXPECTED_METADATA, "general.name"))
+
+_PRIMITIVE_METADATA_TYPE_BYTES: dict[int, int] = {
+    GGUF_TYPE_UINT8: 1,
+    GGUF_TYPE_INT8: 1,
+    GGUF_TYPE_UINT16: 2,
+    GGUF_TYPE_INT16: 2,
+    GGUF_TYPE_UINT32: 4,
+    GGUF_TYPE_INT32: 4,
+    GGUF_TYPE_FLOAT32: 4,
+    GGUF_TYPE_BOOL: 1,
+    GGUF_TYPE_UINT64: 8,
+    GGUF_TYPE_INT64: 8,
+    GGUF_TYPE_FLOAT64: 8,
+}
+
+
 def _read_value(cursor: _Cursor, value_type: int) -> Any:
     if value_type == GGUF_TYPE_UINT32:
         return cursor.u32()
@@ -89,9 +133,36 @@ def _read_value(cursor: _Cursor, value_type: int) -> Any:
     raise GGUFParseError(f"unsupported GGUF metadata type: {value_type}")
 
 
-def _read_metadata_entry(cursor: _Cursor) -> tuple[str, Any]:
+def _skip_value(cursor: _Cursor, value_type: int) -> None:
+    if value_type == GGUF_TYPE_STRING:
+        cursor.skip(cursor.u64())
+        return
+    if value_type == GGUF_TYPE_ARRAY:
+        element_type = cursor.u32()
+        element_count = cursor.u64()
+        if element_type == GGUF_TYPE_STRING:
+            for _ in range(element_count):
+                cursor.skip(cursor.u64())
+            return
+        element_size = _PRIMITIVE_METADATA_TYPE_BYTES.get(element_type)
+        if element_size is None:
+            raise GGUFParseError(
+                f"unsupported GGUF metadata array type: {element_type}"
+            )
+        cursor.skip(element_size * element_count)
+        return
+    value_size = _PRIMITIVE_METADATA_TYPE_BYTES.get(value_type)
+    if value_size is None:
+        raise GGUFParseError(f"unsupported GGUF metadata type: {value_type}")
+    cursor.skip(value_size)
+
+
+def _read_metadata_entry(cursor: _Cursor) -> tuple[str, Any] | None:
     key = cursor.string()
     value_type = cursor.u32()
+    if key not in _STORED_METADATA_KEYS:
+        _skip_value(cursor, value_type)
+        return None
     return key, _read_value(cursor, value_type)
 
 
@@ -148,13 +219,15 @@ def read_deepseek_v4_flash_gguf_from_view(
     if version != GGUF_VERSION:
         raise GGUFParseError(f"unsupported GGUF version: {version}")
 
-    metadata_count = cursor.u64()
     tensor_count = cursor.u64()
+    metadata_count = cursor.u64()
 
     metadata: dict[str, Any] = {}
     for _ in range(metadata_count):
-        key, value = _read_metadata_entry(cursor)
-        metadata[key] = value
+        entry = _read_metadata_entry(cursor)
+        if entry is not None:
+            key, value = entry
+            metadata[key] = value
 
     _validate_metadata(metadata)
 

@@ -8,6 +8,8 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashMemoryPolicy,
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+    DeepSeekV4FlashTensor,
+    DeepSeekV4FlashWeightStore,
     open_deepseek_v4_flash_weight_store,
 )
 
@@ -18,6 +20,40 @@ def _format_tensor_type_counts(counts: dict[int, int]) -> str:
     return ", ".join(
         f"{tensor_type}={count}" for tensor_type, count in sorted(counts.items())
     )
+
+
+def _format_optional_tensor(tensor: DeepSeekV4FlashTensor | None) -> str:
+    if tensor is None:
+        return "missing"
+    return tensor.name
+
+
+def _print_semantic_binding_summary(store: DeepSeekV4FlashWeightStore) -> None:
+    bindings = store.bindings
+    print(
+        "semantic outputs: "
+        f"norm={_format_optional_tensor(bindings.output_norm)}, "
+        f"head={_format_optional_tensor(bindings.output_head)}"
+    )
+    first_layer = bindings.layers[0]
+    print(
+        "semantic layer 0 attention: "
+        f"query={_format_optional_tensor(first_layer.attention_query)}, "
+        f"query_a={_format_optional_tensor(first_layer.attention_query_a)}, "
+        f"query_b={_format_optional_tensor(first_layer.attention_query_b)}, "
+        f"key_value={_format_optional_tensor(first_layer.attention_key_value)}, "
+        f"output={_format_optional_tensor(first_layer.attention_output)}, "
+        f"output_a={_format_optional_tensor(first_layer.attention_output_a)}, "
+        f"output_b={_format_optional_tensor(first_layer.attention_output_b)}"
+    )
+    router_layers = sum(1 for layer in bindings.layers if layer.router is not None)
+    routed_expert_layers = sum(1 for layer in bindings.layers if layer.routed_experts)
+    grouped_expert_layers = sum(
+        1 for layer in bindings.layers if layer.grouped_experts is not None
+    )
+    print(f"semantic layers with router bindings: {router_layers}")
+    print(f"semantic layers with routed expert bindings: {routed_expert_layers}")
+    print(f"semantic layers with grouped expert bindings: {grouped_expert_layers}")
 
 
 def main() -> None:
@@ -35,9 +71,8 @@ def main() -> None:
         print(f"vocab: {model.shape.vocab_size}")
         print(f"tensors: {diagnostics.tensor_count}")
         print(f"bound tensors: {diagnostics.bound_tensor_count}")
-        tensor_type_counts = _format_tensor_type_counts(
-            diagnostics.tensor_type_counts
-        )
+        _print_semantic_binding_summary(store)
+        tensor_type_counts = _format_tensor_type_counts(diagnostics.tensor_type_counts)
         print(f"tensor types: {tensor_type_counts}")
         for tensor_type, samples in sorted(diagnostics.tensor_type_samples.items()):
             for sample in samples:

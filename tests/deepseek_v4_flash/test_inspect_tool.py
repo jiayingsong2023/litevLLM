@@ -21,10 +21,13 @@ def test_inspect_tool_prints_shape_and_diagnostics(tmp_path) -> None:
     assert "DeepSeek V4 Flash" in result.stdout
     assert "layers: 43" in result.stdout
     assert "bound tensors: 2" in result.stdout
+    assert "semantic outputs: norm=missing, head=missing" in result.stdout
+    assert "semantic layer 0 attention: query=blk.0.attn_q.weight" in result.stdout
+    assert "semantic layers with router bindings: 0" in result.stdout
+    assert "semantic layers with grouped expert bindings: 0" in result.stdout
     assert "tensor types: 8=2" in result.stdout
     assert (
-        "type 8 sample: token_embd.weight dims=(4096, 129280) offset=0"
-        in result.stdout
+        "type 8 sample: token_embd.weight dims=(4096, 129280) offset=0" in result.stdout
     )
     assert "unaligned tensor offsets: none" in result.stdout
     assert "model mmap bytes:" in result.stdout

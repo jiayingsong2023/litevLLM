@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from pathlib import Path
 
 GGUF_MAGIC = 0x46554747
@@ -42,6 +43,7 @@ def write_minimal_deepseek_v4_flash_gguf(
     block_count: int = 43,
     tensor_names: tuple[str, ...] = ("token_embd.weight",),
     tensor_types: tuple[int, ...] | None = None,
+    extra_metadata: Callable[[bytearray], None] | None = None,
 ) -> None:
     metadata = bytearray()
     _write_kv_string(metadata, "general.architecture", "deepseek4")
@@ -58,6 +60,8 @@ def write_minimal_deepseek_v4_flash_gguf(
     _write_kv_u32(metadata, "deepseek4.expert_used_count", 6)
     _write_kv_u32(metadata, "deepseek4.embedding_length", 4096)
     _write_kv_u32(metadata, "deepseek4.vocab_size", 129280)
+    if extra_metadata is not None:
+        extra_metadata(metadata)
 
     tensors = bytearray()
     if tensor_types is None:
@@ -68,6 +72,10 @@ def write_minimal_deepseek_v4_flash_gguf(
         dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
         _write_tensor(tensors, name, dims, tensor_types[offset], offset * 32)
     header = struct.pack(
-        "<IIQQ", GGUF_MAGIC, 3, DEEPSEEK_V4_FLASH_METADATA_COUNT, len(tensor_names)
+        "<IIQQ",
+        GGUF_MAGIC,
+        3,
+        len(tensor_names),
+        DEEPSEEK_V4_FLASH_METADATA_COUNT + (1 if extra_metadata is not None else 0),
     )
     path.write_bytes(header + metadata + tensors + b"\x00" * 64)
