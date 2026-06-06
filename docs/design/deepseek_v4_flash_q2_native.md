@@ -101,6 +101,17 @@ timeout 1200 uv run --no-sync pytest tests/deepseek_v4_flash -q
 The maintained helper `tests/run_deepseek_v4_flash_real_smoke.sh` runs the two
 bounded smoke commands and intentionally stays outside the fast regression suite.
 
+Task 8 validation results recorded from the bounded run:
+
+- `timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q`
+  reported `11 passed`.
+- `timeout 600 uv run --no-sync pytest tests/smoke/test_deepseek_v4_flash_http_smoke.py -q`
+  reported `2 passed`.
+- `timeout 1200 uv run --no-sync pytest tests/deepseek_v4_flash -q`
+  reported `106 passed`.
+- `tests/run_deepseek_v4_flash_real_smoke.sh` reported `11 passed`, then
+  `2 passed`.
+
 ## Current Project Fit
 
 The existing lite architecture has the right high-level extension points:
