@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from .config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashMemoryPolicy,
@@ -76,6 +78,126 @@ class DeepSeekV4CompressedKVLayout:
 
     def has_indexer_cache(self, layer_idx: int) -> bool:
         return layer_compress_ratio(layer_idx) == 4
+
+
+class DeepSeekV4CompressedKVCache:
+    """Correctness-first batch=1 raw SWA KV cache.
+
+    The raw path keeps only the sliding-window rows for every layer. Logical
+    token indices live beside the ring buffer so reads can return rows in token
+    order after wraparound.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_length: int,
+        hidden_size: int,
+        raw_window: int = DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+        num_layers: int = DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ) -> None:
+        DeepSeekV4FlashMemoryPolicy().validate_context_length(context_length)
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        if raw_window <= 0:
+            raise ValueError("raw_window must be positive")
+        if raw_window > DEEPSEEK_V4_FLASH_SHAPE.sliding_window:
+            raise ValueError(
+                "raw_window exceeds DeepSeek V4 Flash sliding window "
+                f"{DEEPSEEK_V4_FLASH_SHAPE.sliding_window}"
+            )
+        if num_layers <= 0 or num_layers > DEEPSEEK_V4_FLASH_SHAPE.num_layers:
+            raise ValueError(f"num_layers out of range: {num_layers}")
+
+        self.context_length = context_length
+        self.hidden_size = hidden_size
+        self.raw_window = raw_window
+        self.num_layers = num_layers
+        self.raw_keys = torch.empty(
+            (num_layers, raw_window, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        self.raw_values = torch.empty_like(self.raw_keys)
+        self.raw_token_indices = torch.full(
+            (num_layers, raw_window),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+
+    def append_raw(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        self._validate_raw_row("key", key)
+        self._validate_raw_row("value", value)
+
+        slot = token_idx % self.raw_window
+        self.raw_keys[layer_idx, slot].copy_(key)
+        self.raw_values[layer_idx, slot].copy_(value)
+        self.raw_token_indices[layer_idx, slot] = token_idx
+
+    def read_raw_window(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        window: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if window > self.raw_window:
+            raise ValueError(
+                f"window {window} exceeds raw_window {self.raw_window}"
+            )
+
+        start = max(0, token_idx - window + 1)
+        token_indices = self.raw_token_indices[layer_idx]
+        present = (token_indices >= start) & (token_indices <= token_idx)
+        slots = torch.nonzero(present, as_tuple=False).flatten()
+        if slots.numel() == 0:
+            empty = torch.empty(
+                (0, self.hidden_size),
+                dtype=self.raw_keys.dtype,
+                device=self.raw_keys.device,
+            )
+            return empty, empty.clone()
+
+        order = torch.argsort(token_indices[slots])
+        sorted_slots = slots[order]
+        return (
+            self.raw_keys[layer_idx, sorted_slots],
+            self.raw_values[layer_idx, sorted_slots],
+        )
+
+    def _validate_layer(self, layer_idx: int) -> None:
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer index out of range: {layer_idx}")
+
+    def _validate_token_idx(self, token_idx: int) -> None:
+        if token_idx < 0:
+            raise ValueError("token index must be non-negative")
+        if token_idx >= self.context_length:
+            raise ValueError(
+                f"token index {token_idx} exceeds context_length "
+                f"{self.context_length}"
+            )
+
+    def _validate_raw_row(self, name: str, row: torch.Tensor) -> None:
+        if row.shape != (self.hidden_size,):
+            raise ValueError(
+                f"{name} shape must be ({self.hidden_size},); got "
+                f"{tuple(row.shape)}"
+            )
 
 
 class DeepSeekV4KVPageAllocator:
