@@ -92,13 +92,14 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     "DeepSeekV4FlashForCausalLM first release supports context <= "
                     f"8192; got runtime context {context_length}"
                 )
-        if input_ids.numel() > 8192:
-            raise ValueError(
-                "DeepSeekV4FlashForCausalLM first release supports context <= "
-                f"8192; got {input_ids.numel()} input tokens"
-            )
         if input_ids.numel() == 0:
             return torch.empty((0, self.shape.vocab_size), dtype=torch.float32)
+        if input_ids.numel() != 1:
+            raise ValueError(
+                "DeepSeekV4FlashForCausalLM limited smoke supports one token until "
+                "full transformer forward is implemented; "
+                f"got {input_ids.numel()} input tokens"
+            )
         return self._forward_embedding_output_projection_smoke_batch_one(input_ids)
 
     def _forward_embedding_output_projection_smoke_batch_one(
