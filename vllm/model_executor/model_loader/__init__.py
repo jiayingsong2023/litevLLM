@@ -1227,6 +1227,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         with open(path, "r") as f:
             data = json.load(f)
             cfg.hf_config = build_fallback_hf_config(data)
+    elif _should_skip_safetensors_load(vllm_config):
+        pass
     elif _looks_like_hf_repo_id(cfg.model):
         try:
             hf_auto_cfg = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.model_executor.models.deepseek_v4_flash import DeepSeekV4FlashForCausalLM
 from vllm.model_executor.models.registry import ModelRegistry
@@ -28,4 +29,4 @@ def test_deepseek_v4_flash_skeleton_requires_weight_store() -> None:
     model = DeepSeekV4FlashForCausalLM()
 
     with pytest.raises(RuntimeError, match="attached GGUF weight store"):
-        model()
+        model(torch.tensor([1], dtype=torch.long))
