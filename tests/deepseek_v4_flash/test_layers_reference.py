@@ -62,6 +62,7 @@ def test_weight_store_tensor_payload_returns_exact_tensor_bytes(tmp_path) -> Non
     )
 
     with open_deepseek_v4_flash_weight_store(path) as store:
+        assert store.bindings.token_embedding.offset == 0
         view = store.tensor_payload(store.bindings.token_embedding)
         try:
             assert view.tobytes() == payload

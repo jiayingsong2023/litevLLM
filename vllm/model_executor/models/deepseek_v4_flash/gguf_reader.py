@@ -12,6 +12,7 @@ from .config import DEEPSEEK_V4_FLASH_SHAPE, DeepSeekV4FlashShape
 
 GGUF_MAGIC = 0x46554747
 GGUF_VERSION = 3
+GGUF_DEFAULT_ALIGNMENT = 32
 GGUF_TYPE_UINT8 = 0
 GGUF_TYPE_INT8 = 1
 GGUF_TYPE_UINT16 = 2
@@ -62,6 +63,7 @@ class DeepSeekV4FlashGGUF:
     name: str
     metadata: dict[str, Any]
     tensors: dict[str, DeepSeekV4FlashTensor]
+    data_offset: int
     shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE
 
 
@@ -110,7 +112,9 @@ _EXPECTED_METADATA: dict[str, Any] = {
 }
 
 
-_STORED_METADATA_KEYS = frozenset((*_EXPECTED_METADATA, "general.name"))
+_STORED_METADATA_KEYS = frozenset(
+    (*_EXPECTED_METADATA, "general.name", "general.alignment")
+)
 
 _PRIMITIVE_METADATA_TYPE_BYTES: dict[int, int] = {
     GGUF_TYPE_UINT8: 1,
@@ -180,6 +184,10 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
     if not isinstance(name, str) or not name:
         raise GGUFParseError("general.name must be a non-empty string")
 
+    alignment = metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT)
+    if not isinstance(alignment, int) or alignment <= 0:
+        raise GGUFParseError(f"general.alignment must be positive; got {alignment}")
+
 
 def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
     name = cursor.string()
@@ -244,6 +252,10 @@ def _blocked_tensor_nbytes(
     return element_count // values_per_block * block_bytes
 
 
+def _align_offset(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) // alignment * alignment
+
+
 def _validate_tensor_types(tensors: dict[str, DeepSeekV4FlashTensor]) -> None:
     for tensor in tensors.values():
         if tensor.tensor_type not in SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES:
@@ -287,12 +299,17 @@ def read_deepseek_v4_flash_gguf_from_view(
         tensor = _read_tensor(cursor)
         tensors[tensor.name] = tensor
     _validate_tensor_types(tensors)
+    data_offset = _align_offset(
+        cursor.pos,
+        metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT),
+    )
 
     return DeepSeekV4FlashGGUF(
         path=path,
         name=metadata["general.name"],
         metadata=metadata,
         tensors=tensors,
+        data_offset=data_offset,
     )
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 GGUF_MAGIC = 0x46554747
 DEEPSEEK_V4_FLASH_METADATA_COUNT = 14
+GGUF_DEFAULT_ALIGNMENT = 32
 
 
 def _write_string(buf: bytearray, value: str) -> None:
@@ -35,6 +36,10 @@ def _write_tensor(
         buf.extend(struct.pack("<Q", dim))
     buf.extend(struct.pack("<I", tensor_type))
     buf.extend(struct.pack("<Q", offset))
+
+
+def _align_offset(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) // alignment * alignment
 
 
 def write_minimal_deepseek_v4_flash_gguf(
@@ -89,14 +94,18 @@ def write_minimal_deepseek_v4_flash_gguf(
         DEEPSEEK_V4_FLASH_METADATA_COUNT + (1 if extra_metadata is not None else 0),
     )
     if tensor_payloads:
-        data_start = len(header) + len(metadata) + len(tensors)
+        data_start = _align_offset(
+            len(header) + len(metadata) + len(tensors),
+            GGUF_DEFAULT_ALIGNMENT,
+        )
         tensors = bytearray()
         data = bytearray()
         for name, dims, tensor_type, _ in tensor_specs:
-            offset = data_start + len(data)
+            offset = len(data)
             payload = tensor_payloads.get(name, b"")
             data.extend(payload)
             _write_tensor(tensors, name, dims, tensor_type, offset)
-        path.write_bytes(header + metadata + tensors + data)
+        padding = b"\x00" * (data_start - len(header) - len(metadata) - len(tensors))
+        path.write_bytes(header + metadata + tensors + padding + data)
         return
     path.write_bytes(header + metadata + tensors + b"\x00" * 64)

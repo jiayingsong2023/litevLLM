@@ -68,6 +68,38 @@ def test_weight_store_binds_required_inspect_tensors(tmp_path):
         assert store.bindings.attention_query_by_layer[1].name == "blk.1.attn_q.weight"
 
 
+def test_weight_store_close_closes_file_when_payload_view_is_leaked(tmp_path):
+    path = tmp_path / "deepseek-v4-flash.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight", "blk.0.attn_q.weight"),
+        tensor_types=(0, 0),
+        tensor_dims={
+            "token_embd.weight": (1,),
+            "blk.0.attn_q.weight": (1,),
+        },
+        tensor_payloads={
+            "token_embd.weight": b"\x01\x02\x03\x04",
+            "blk.0.attn_q.weight": b"\x05\x06\x07\x08",
+        },
+    )
+    store = open_deepseek_v4_flash_weight_store(path)
+    view = store.tensor_payload(store.bindings.token_embedding)
+
+    try:
+        try:
+            store.close()
+        except BufferError:
+            pass
+        else:
+            raise AssertionError("leaked payload view did not block mmap close")
+
+        assert store._file.closed
+    finally:
+        view.release()
+        store.close()
+
+
 def test_weight_store_rejects_missing_required_inspect_tensor(tmp_path):
     path = tmp_path / "deepseek-v4-flash.gguf"
     write_minimal_deepseek_v4_flash_gguf(path)

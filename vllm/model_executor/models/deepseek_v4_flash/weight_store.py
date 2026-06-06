@@ -135,13 +135,14 @@ class DeepSeekV4FlashWeightStore:
         The caller owns the returned memoryview and must release it before
         closing the store.
         """
-        start = tensor.offset
+        start = self.model.data_offset + tensor.offset
         end = start + tensor.nbytes
         mmap_size = self._mmap.size()
         if start < 0 or end < start or end > mmap_size:
             raise DeepSeekV4FlashWeightStoreError(
-                f"tensor {tensor.name} payload range [{start}, {end}) exceeds "
-                f"mmap size {mmap_size}"
+                f"tensor {tensor.name} payload range [{start}, {end}) "
+                f"from data offset {self.model.data_offset} exceeds mmap size "
+                f"{mmap_size}"
             )
         view = memoryview(self._mmap)
         try:
@@ -150,8 +151,10 @@ class DeepSeekV4FlashWeightStore:
             view.release()
 
     def close(self) -> None:
-        self._mmap.close()
-        self._file.close()
+        try:
+            self._mmap.close()
+        finally:
+            self._file.close()
 
     def __enter__(self) -> DeepSeekV4FlashWeightStore:
         return self
