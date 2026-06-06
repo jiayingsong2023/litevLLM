@@ -9,6 +9,8 @@ _GGUF_K_BLOCK_VALUES = 256
 _IQ2_XXS_BLOCK_BYTES = 66
 _Q2_K_BLOCK_BYTES = 84
 
+# GGML IQ2_XXS dequantization uses the ksigns_iq2xs table to expand 7-bit
+# sign indices into eight sign bits for each 8-value grid row.
 _IQ2_XXS_KSIGNS = (
     b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"
     b"\x90\x11\x12\x93\x14\x95\x96\x17\x18\x99\x9a\x1b\x9c\x1d\x1e\x9f"
@@ -20,6 +22,9 @@ _IQ2_XXS_KSIGNS = (
     b"\xf0\x71\x72\xf3\x74\xf5\xf6\x77\x78\xf9\xfa\x7b\xfc\x7d\x7e\xff"
 )
 
+# GGML stores iq2xxs_grid as 256 rows of 8 values. The upstream Python gguf
+# reference keeps the grid compact by packing each row entry into 2 bits and
+# mapping packed codes 0/1/2 back to the GGML levels 0x08/0x19/0x2B.
 _IQ2_XXS_GRID_HEX = (
     "00000200050008000a00110014002000220028002a0041004400500058006100"
     "6400800082008a00a20001010401100115014001840198010002020222028202"
@@ -402,6 +407,7 @@ def decode_q2_k_gguf_blocks_reference(
 
 def iq2_xxs_matrix_from_gguf_payload(
     payload: bytes | bytearray | memoryview,
+    *,
     rows: int,
     columns: int,
 ) -> torch.Tensor:
@@ -419,6 +425,7 @@ def iq2_xxs_matrix_from_gguf_payload(
 
 def q2_k_matrix_from_gguf_payload(
     payload: bytes | bytearray | memoryview,
+    *,
     rows: int,
     columns: int,
 ) -> torch.Tensor:
@@ -449,10 +456,10 @@ def decode_iq2_xxs_synthetic(
 ) -> torch.Tensor:
     """Decode deterministic synthetic IQ2_XXS blocks for reference tests.
 
-    This helper intentionally does not model the final GGUF IQ2_XXS bit layout yet.
-    The synthetic layout is one uint8 two-bit code per element with shape
-    ``(blocks, block_size)``. Codes map to signed levels ``[-3, -1, 1, 3]`` and
-    each block has one floating-point scale.
+    This helper keeps the older unpacked test layout separate from the raw GGUF
+    IQ2_XXS reference decoder above. The synthetic layout is one uint8 two-bit
+    code per element with shape ``(blocks, block_size)``. Codes map to signed
+    levels ``[-3, -1, 1, 3]`` and each block has one floating-point scale.
     """
     _validate_positive_block_size(block_size)
     _validate_two_bit_codes("IQ2_XXS", codes)
@@ -485,10 +492,10 @@ def decode_q2_k_synthetic(
 ) -> torch.Tensor:
     """Decode deterministic synthetic Q2_K super-block groups.
 
-    This helper intentionally uses an unpacked synthetic layout until the real
-    GGUF Q2_K packed bit layout is bound. Codes are uint8 two-bit values with
-    shape ``(super_blocks, groups, group_size)``. Every group has one scale and
-    one additive minimum with shape ``(super_blocks, groups)``.
+    This helper keeps the older unpacked test layout separate from the raw GGUF
+    Q2_K reference decoder above. Codes are uint8 two-bit values with shape
+    ``(super_blocks, groups, group_size)``. Every group has one scale and one
+    additive minimum with shape ``(super_blocks, groups)``.
     """
     _validate_positive_block_size(group_size)
     _validate_two_bit_codes("Q2_K", codes)
