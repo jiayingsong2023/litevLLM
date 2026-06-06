@@ -43,6 +43,64 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
+## Implemented State As Of Task 8
+
+The branch currently has a limited, honest bring-up state. It does not yet meet
+the first-release target described above.
+
+Current target file:
+
+```text
+models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+```
+
+Current target file size: `86,720,111,488` bytes, roughly 80.7GiB.
+
+Implemented:
+
+- GGUF parse and explicit DeepSeek V4 Flash adapter/loader routing for the
+  target file.
+- Semantic weight binding for the observed target GGUF tensor names, including
+  token embedding, output norm, output projection, attention factor tensors,
+  combined KV tensors, grouped/shared expert tensors, router tensors, and
+  expert metadata tensors.
+- Quant reference decoders and layout checks for `Q8_0`, `IQ2_XXS`, and `Q2_K`.
+- Raw KV runtime cache append/read helpers plus paged compressed-KV layout and
+  allocation contracts.
+- Attention and router reference helpers used for isolated unit coverage.
+- Direct model forward smoke only for exactly one token: token embedding,
+  `output_norm` RMSNorm, and `Q8_0` output projection to finite `[1, vocab]`
+  logits. The model marks this with `limited_forward_smoke_only=True` and
+  rejects multi-token non-empty input.
+- OpenAI route exposure and a negative REST smoke that verifies an uninitialized
+  app-import server returns HTTP 503 for chat requests.
+
+Not implemented:
+
+- Full transformer layer stack execution.
+- Factorized Q/O attention execution.
+- Combined KV tensor split and attention use.
+- Compressed attention execution.
+- Grouped expert execution.
+- Batch=1 greedy autoregressive decode.
+- Initialized OpenAI-compatible REST generation for this GGUF.
+
+The REST route is present, but initialized DeepSeek GGUF chat generation remains
+blocked because the OpenAI server uses `AsyncLLM`/`LiteEngine` full prefill and
+decode execution. That path is separate from the limited one-token direct model
+smoke.
+
+Current bounded validation commands:
+
+```bash
+timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q
+timeout 600 uv run --no-sync pytest tests/smoke/test_deepseek_v4_flash_http_smoke.py -q
+timeout 1200 uv run --no-sync pytest tests/deepseek_v4_flash -q
+```
+
+The maintained helper `tests/run_deepseek_v4_flash_real_smoke.sh` runs the two
+bounded smoke commands and intentionally stays outside the fast regression suite.
+
 ## Current Project Fit
 
 The existing lite architecture has the right high-level extension points:

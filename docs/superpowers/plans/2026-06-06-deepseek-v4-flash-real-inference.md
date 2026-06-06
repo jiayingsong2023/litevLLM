@@ -872,6 +872,22 @@ git commit -m "docs: update deepseek real inference state"
 - If the real GGUF tensor names differ from expected patterns, update Task 1 bindings first and do not patch around missing tensors inside `forward()`.
 - If IQ2_XXS/Q2_K bit layouts are not understood, stop at Task 2 and audit DS4/GGML source before connecting decoders to real execution.
 
+## Task 8 Outcome Addendum
+
+Task 6 ended with a deliberately limited direct model smoke, not full batch=1
+greedy forward. The implemented path accepts exactly one token, runs token
+embedding, `output_norm` RMSNorm, and the `Q8_0` output projection, then returns
+finite `[1, vocab]` logits. It sets `limited_forward_smoke_only=True` and rejects
+multi-token non-empty input. It does not execute transformer layers, factorized
+attention, combined KV use, compressed attention, or grouped experts.
+
+Task 7 ended with route exposure plus an honest negative REST smoke. The app
+imports, `/v1/chat/completions` and `/v1/models` are exposed, and an
+uninitialized engine returns HTTP 503 for chat requests. Initialized
+OpenAI-compatible DeepSeek GGUF generation remains blocked because that route
+uses the `AsyncLLM`/`LiteEngine` full autoregressive path, not the limited
+one-token direct model smoke.
+
 ## Self-Review
 
 - Spec coverage: The plan covers model file audit, tensor binding, quant decoding, KV runtime, attention/MoE reference execution, batch=1 forward, REST greedy smoke, and docs/validation.
