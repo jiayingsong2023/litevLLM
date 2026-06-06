@@ -4,6 +4,7 @@ from __future__ import annotations
 import mmap
 import struct
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ class DeepSeekV4FlashTensor:
     dims: tuple[int, ...]
     tensor_type: int
     offset: int
+    nbytes: int
 
 
 @dataclass(frozen=True)
@@ -190,7 +192,56 @@ def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
         dims=dims,
         tensor_type=tensor_type,
         offset=offset,
+        nbytes=_tensor_nbytes(dims, tensor_type),
     )
+
+
+def _tensor_nbytes(dims: tuple[int, ...], tensor_type: int) -> int:
+    element_count = prod(dims)
+    if tensor_type == GGML_TYPE_F32:
+        return element_count * 4
+    if tensor_type == GGML_TYPE_F16:
+        return element_count * 2
+    if tensor_type == GGML_TYPE_I32:
+        return element_count * 4
+    if tensor_type == GGML_TYPE_Q8_0:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=32,
+            block_bytes=34,
+            tensor_type=tensor_type,
+        )
+    if tensor_type == GGML_TYPE_Q2_K:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=256,
+            block_bytes=84,
+            tensor_type=tensor_type,
+        )
+    if tensor_type == GGML_TYPE_IQ2_XXS:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=256,
+            block_bytes=66,
+            tensor_type=tensor_type,
+        )
+    return 0
+
+
+def _blocked_tensor_nbytes(
+    element_count: int,
+    *,
+    values_per_block: int,
+    block_bytes: int,
+    tensor_type: int,
+) -> int:
+    if element_count % values_per_block != 0:
+        raise GGUFParseError(
+            "tensor element count must be divisible by block size for "
+            f"GGML type {tensor_type}; got {element_count} elements and "
+            f"block size {values_per_block}"
+        )
+    return element_count // values_per_block * block_bytes
 
 
 def _validate_tensor_types(tensors: dict[str, DeepSeekV4FlashTensor]) -> None:

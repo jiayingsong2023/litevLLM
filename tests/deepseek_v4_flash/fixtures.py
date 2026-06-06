@@ -43,6 +43,8 @@ def write_minimal_deepseek_v4_flash_gguf(
     block_count: int = 43,
     tensor_names: tuple[str, ...] = ("token_embd.weight",),
     tensor_types: tuple[int, ...] | None = None,
+    tensor_dims: dict[str, tuple[int, ...]] | None = None,
+    tensor_payloads: dict[str, bytes] | None = None,
     extra_metadata: Callable[[bytearray], None] | None = None,
 ) -> None:
     metadata = bytearray()
@@ -68,8 +70,16 @@ def write_minimal_deepseek_v4_flash_gguf(
         tensor_types = tuple(8 for _ in tensor_names)
     if len(tensor_types) != len(tensor_names):
         raise ValueError("tensor_types length must match tensor_names length")
+    if tensor_payloads is None:
+        tensor_payloads = {}
+
+    tensor_specs: list[tuple[str, tuple[int, ...], int, int]] = []
     for offset, name in enumerate(tensor_names):
-        dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
+        if tensor_dims is not None and name in tensor_dims:
+            dims = tensor_dims[name]
+        else:
+            dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
+        tensor_specs.append((name, dims, tensor_types[offset], offset * 32))
         _write_tensor(tensors, name, dims, tensor_types[offset], offset * 32)
     header = struct.pack(
         "<IIQQ",
@@ -78,4 +88,15 @@ def write_minimal_deepseek_v4_flash_gguf(
         len(tensor_names),
         DEEPSEEK_V4_FLASH_METADATA_COUNT + (1 if extra_metadata is not None else 0),
     )
+    if tensor_payloads:
+        data_start = len(header) + len(metadata) + len(tensors)
+        tensors = bytearray()
+        data = bytearray()
+        for name, dims, tensor_type, _ in tensor_specs:
+            offset = data_start + len(data)
+            payload = tensor_payloads.get(name, b"")
+            data.extend(payload)
+            _write_tensor(tensors, name, dims, tensor_type, offset)
+        path.write_bytes(header + metadata + tensors + data)
+        return
     path.write_bytes(header + metadata + tensors + b"\x00" * 64)
