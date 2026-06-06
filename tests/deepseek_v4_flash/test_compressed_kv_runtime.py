@@ -76,6 +76,15 @@ def test_raw_swa_cache_validation_rejects_oversized_window() -> None:
         cache.read_raw_window(layer_idx=0, token_idx=0, window=129)
 
 
+def test_raw_swa_cache_validation_rejects_non_default_raw_window() -> None:
+    with pytest.raises(ValueError, match="raw_window"):
+        DeepSeekV4CompressedKVCache(
+            context_length=256,
+            hidden_size=4,
+            raw_window=64,
+        )
+
+
 def test_raw_swa_cache_validation_rejects_shape_mismatch() -> None:
     cache = DeepSeekV4CompressedKVCache(context_length=256, hidden_size=4)
 
@@ -93,4 +102,44 @@ def test_raw_swa_cache_validation_rejects_shape_mismatch() -> None:
             token_idx=0,
             key=torch.zeros(4),
             value=torch.zeros(5),
+        )
+
+
+def test_raw_swa_cache_validation_rejects_dtype_mismatch() -> None:
+    cache = DeepSeekV4CompressedKVCache(context_length=256, hidden_size=4)
+
+    with pytest.raises(ValueError, match="key dtype"):
+        cache.append_raw(
+            layer_idx=0,
+            token_idx=0,
+            key=torch.zeros(4, dtype=torch.float64),
+            value=torch.zeros(4),
+        )
+
+    with pytest.raises(ValueError, match="value dtype"):
+        cache.append_raw(
+            layer_idx=0,
+            token_idx=0,
+            key=torch.zeros(4),
+            value=torch.zeros(4, dtype=torch.float64),
+        )
+
+
+def test_raw_swa_cache_validation_rejects_device_mismatch() -> None:
+    cache = DeepSeekV4CompressedKVCache(context_length=256, hidden_size=4)
+
+    with pytest.raises(ValueError, match="key device"):
+        cache.append_raw(
+            layer_idx=0,
+            token_idx=0,
+            key=torch.empty(4, device="meta"),
+            value=torch.zeros(4),
+        )
+
+    with pytest.raises(ValueError, match="value device"):
+        cache.append_raw(
+            layer_idx=0,
+            token_idx=0,
+            key=torch.zeros(4),
+            value=torch.empty(4, device="meta"),
         )

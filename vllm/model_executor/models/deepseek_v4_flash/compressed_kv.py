@@ -101,11 +101,9 @@ class DeepSeekV4CompressedKVCache:
         DeepSeekV4FlashMemoryPolicy().validate_context_length(context_length)
         if hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
-        if raw_window <= 0:
-            raise ValueError("raw_window must be positive")
-        if raw_window > DEEPSEEK_V4_FLASH_SHAPE.sliding_window:
+        if raw_window != DEEPSEEK_V4_FLASH_SHAPE.sliding_window:
             raise ValueError(
-                "raw_window exceeds DeepSeek V4 Flash sliding window "
+                "DeepSeek V4 Flash first release requires raw_window="
                 f"{DEEPSEEK_V4_FLASH_SHAPE.sliding_window}"
             )
         if num_layers <= 0 or num_layers > DEEPSEEK_V4_FLASH_SHAPE.num_layers:
@@ -197,6 +195,14 @@ class DeepSeekV4CompressedKVCache:
             raise ValueError(
                 f"{name} shape must be ({self.hidden_size},); got "
                 f"{tuple(row.shape)}"
+            )
+        if row.dtype != self.raw_keys.dtype:
+            raise ValueError(
+                f"{name} dtype must be {self.raw_keys.dtype}; got {row.dtype}"
+            )
+        if row.device != self.raw_keys.device:
+            raise ValueError(
+                f"{name} device must be {self.raw_keys.device}; got {row.device}"
             )
 
 
