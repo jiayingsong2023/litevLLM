@@ -545,7 +545,7 @@ git commit -m "feat: execute one deepseek grouped expert"
 - Modify: `vllm/model_executor/models/deepseek_v4_flash/model.py`
 - Test: `tests/deepseek_v4_flash/test_block_reference.py`
 
-- [ ] **Step 1: Write failing synthetic block test**
+- [x] **Step 1: Write failing synthetic block test**
 
 Create a small block test with synthetic weights:
 
@@ -564,7 +564,7 @@ def test_block_reference_preserves_hidden_shape() -> None:
     assert torch.isfinite(out).all()
 ```
 
-- [ ] **Step 2: Run test to verify failure**
+- [x] **Step 2: Run test to verify failure**
 
 Run:
 
@@ -574,7 +574,7 @@ uv run --no-sync pytest tests/deepseek_v4_flash/test_block_reference.py -q
 
 Expected: missing `block.py`.
 
-- [ ] **Step 3: Implement block skeleton**
+- [x] **Step 3: Implement block skeleton**
 
 Create `block.py`:
 
@@ -602,6 +602,12 @@ Use the real DeepSeek residual order from reference implementation. If this resi
 - [ ] **Step 4: Add real layer-0 smoke**
 
 Add a real-file test that constructs layer 0 with real tensors, executes a single token hidden vector, and returns finite hidden state. If layer 0 attention/FFN mapping is not complete, this test should be marked expected failure with a precise reason only while Task 4/5 are being completed; before moving to Task 7 it must pass.
+
+Status: `DeepSeekV4FlashBlockReference` exists and real layer-0 norm tensors
+(`blk.0.attn_norm.weight`, `blk.0.ffn_norm.weight`) are now bound through
+`DeepSeekV4FlashLayerSemanticBindings`. The real attention+MoE execution test is
+intentionally `xfail` until the `attn_kv.weight` 512-wide semantic split and
+compressed attention/indexer behavior are resolved.
 
 - [ ] **Step 5: Run tests and commit**
 

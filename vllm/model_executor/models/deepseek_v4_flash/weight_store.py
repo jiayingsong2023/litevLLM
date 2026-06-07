@@ -50,6 +50,7 @@ class DeepSeekV4FlashGroupedExpertTensors:
 @dataclass(frozen=True)
 class DeepSeekV4FlashLayerSemanticBindings:
     layer_index: int
+    attention_norm: DeepSeekV4FlashTensor | None = None
     attention_query: DeepSeekV4FlashTensor | None = None
     attention_query_a: DeepSeekV4FlashTensor | None = None
     attention_query_b: DeepSeekV4FlashTensor | None = None
@@ -57,6 +58,7 @@ class DeepSeekV4FlashLayerSemanticBindings:
     attention_output: DeepSeekV4FlashTensor | None = None
     attention_output_a: DeepSeekV4FlashTensor | None = None
     attention_output_b: DeepSeekV4FlashTensor | None = None
+    ffn_norm: DeepSeekV4FlashTensor | None = None
     router: DeepSeekV4FlashTensor | None = None
     routed_experts: dict[int, DeepSeekV4FlashExpertTensors] | None = None
     grouped_experts: DeepSeekV4FlashGroupedExpertTensors | None = None
@@ -350,6 +352,7 @@ def _bind_layers(
         layers.append(
             DeepSeekV4FlashLayerSemanticBindings(
                 layer_index=layer_idx,
+                attention_norm=_tensor(model, layer_idx, "attn_norm.weight"),
                 attention_query=attention_query or attention_query_a,
                 attention_query_a=attention_query_a,
                 attention_query_b=_tensor(model, layer_idx, "attn_q_b.weight"),
@@ -357,6 +360,7 @@ def _bind_layers(
                 attention_output=attention_output or attention_output_a,
                 attention_output_a=attention_output_a,
                 attention_output_b=_tensor(model, layer_idx, "attn_output_b.weight"),
+                ffn_norm=_tensor(model, layer_idx, "ffn_norm.weight"),
                 router=_tensor(model, layer_idx, "ffn_gate_inp.weight"),
                 routed_experts={},
                 grouped_experts=_bind_grouped_experts(
@@ -409,6 +413,7 @@ def _bound_tensor_count(
         bound_names.add(tensor.name)
     for layer in bindings.layers:
         layer_tensors = (
+            layer.attention_norm,
             layer.attention_query,
             layer.attention_query_a,
             layer.attention_query_b,
@@ -416,6 +421,7 @@ def _bound_tensor_count(
             layer.attention_output,
             layer.attention_output_a,
             layer.attention_output_b,
+            layer.ffn_norm,
             layer.router,
             layer.expert_token_to_expert_ids,
             layer.expert_probs_bias,

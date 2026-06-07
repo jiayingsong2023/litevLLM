@@ -31,6 +31,8 @@ def test_real_gguf_semantic_tensor_mapping() -> None:
         # The target stores attention Q and output projections as A/B factors,
         # and stores K/V together in the combined attn_kv tensor.
         layer_0 = bindings.layers[0]
+        assert layer_0.attention_norm is not None
+        assert layer_0.attention_norm.name == "blk.0.attn_norm.weight"
         assert layer_0.attention_query_a is not None
         assert layer_0.attention_query_a.name == "blk.0.attn_q_a.weight"
         assert layer_0.attention_query_b is not None
@@ -41,6 +43,8 @@ def test_real_gguf_semantic_tensor_mapping() -> None:
         assert layer_0.attention_output_a.name == "blk.0.attn_output_a.weight"
         assert layer_0.attention_output_b is not None
         assert layer_0.attention_output_b.name == "blk.0.attn_output_b.weight"
+        assert layer_0.ffn_norm is not None
+        assert layer_0.ffn_norm.name == "blk.0.ffn_norm.weight"
 
         grouped_expert_layers = [
             layer for layer in bindings.layers if layer.grouped_experts is not None
