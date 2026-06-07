@@ -88,11 +88,10 @@ def split_combined_kv_reference(
     key_width: int,
     value_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split an already-projected 1-D K/V vector using known semantic widths.
+    """Split an already-projected synthetic K/V vector for legacy tests.
 
-    This helper does not derive the target GGUF ``attn_kv.weight`` split. The
-    observed real tensor is 512-wide, and its key/value semantic split must be
-    resolved before real attention execution.
+    Do not use this for DeepSeek V4 Flash real attention. The target GGUF uses
+    a 512-wide shared K=V latent row from ``attn_kv.weight``.
     """
     if kv.ndim != 1:
         raise ValueError(f"kv must be 1-D; got {kv.ndim}-D")
@@ -137,3 +136,158 @@ def raw_swa_attention_reference(
     scores = scores / math.sqrt(float(query.numel()))
     probs = torch.softmax(scores, dim=0)
     return probs.matmul(values.to(torch.float32))
+
+
+def per_head_rms_norm_reference(
+    query: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if query.ndim != 2:
+        raise ValueError(f"query must be 2-D; got {query.ndim}-D")
+    variance = query.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    return query.to(torch.float32) * torch.rsqrt(variance + eps)
+
+
+def apply_rope_to_tail_reference(
+    vectors: torch.Tensor,
+    *,
+    token_idx: int,
+    rotary_dim: int = 64,
+    theta: float = 10000.0,
+) -> torch.Tensor:
+    if vectors.ndim < 1:
+        raise ValueError("vectors must have at least one dimension")
+    if token_idx < 0:
+        raise ValueError(f"token_idx must be non-negative; got {token_idx}")
+    if rotary_dim <= 0:
+        raise ValueError(f"rotary_dim must be positive; got {rotary_dim}")
+    if rotary_dim % 2 != 0:
+        raise ValueError(f"rotary_dim must be even; got {rotary_dim}")
+    if vectors.shape[-1] < rotary_dim:
+        raise ValueError(
+            "vector width must be >= rotary_dim; "
+            f"got {vectors.shape[-1]} and {rotary_dim}"
+        )
+
+    out = vectors.to(torch.float32).clone()
+    tail = out[..., -rotary_dim:]
+    pairs = tail.reshape(*tail.shape[:-1], rotary_dim // 2, 2)
+    positions = torch.arange(
+        0,
+        rotary_dim,
+        2,
+        dtype=torch.float32,
+        device=out.device,
+    )
+    inv_freq = torch.pow(
+        torch.tensor(theta, dtype=torch.float32, device=out.device),
+        -positions / float(rotary_dim),
+    )
+    angles = float(token_idx) * inv_freq
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    x0 = pairs[..., 0]
+    x1 = pairs[..., 1]
+    rotated = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
+    out[..., -rotary_dim:] = rotated.reshape_as(tail)
+    return out
+
+
+def shared_kv_swa_attention_reference(
+    queries: torch.Tensor,
+    kv_rows: torch.Tensor,
+    attn_sinks: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Sliding-window attention for DeepSeek V4 shared K=V latent rows.
+
+    ``queries`` is ``(heads, head_dim)`` and ``kv_rows`` is
+    ``(window, head_dim)``. The same KV rows are used as keys and values for
+    every query head. ``attn_sinks`` contributes one extra softmax logit per
+    head but has no value row, so it only changes the denominator.
+    """
+    if queries.ndim != 2:
+        raise ValueError(f"queries must be 2-D; got {queries.ndim}-D")
+    if kv_rows.ndim != 2:
+        raise ValueError(f"kv_rows must be 2-D; got {kv_rows.ndim}-D")
+    if kv_rows.shape[0] == 0:
+        raise ValueError("kv_rows must contain at least one row")
+    if queries.shape[1] != kv_rows.shape[1]:
+        raise ValueError(
+            "query and KV widths must match; "
+            f"got {queries.shape[1]} and {kv_rows.shape[1]}"
+        )
+    if attn_sinks.shape != (queries.shape[0],):
+        raise ValueError(
+            f"attn_sinks shape must be ({queries.shape[0]},); "
+            f"got {tuple(attn_sinks.shape)}"
+        )
+
+    scale = (
+        float(softmax_scale)
+        if softmax_scale is not None
+        else 1.0 / math.sqrt(float(queries.shape[1]))
+    )
+    scores = queries.to(torch.float32).matmul(kv_rows.to(torch.float32).T) * scale
+    sink_logits = attn_sinks.to(torch.float32).reshape(-1, 1)
+    logits = torch.cat([scores, sink_logits], dim=-1)
+    probs = torch.softmax(logits, dim=-1)
+    return probs[:, :-1].matmul(kv_rows.to(torch.float32))
+
+
+def grouped_output_projection_reference(
+    attention_output: torch.Tensor,
+    output_a_weight: torch.Tensor,
+    output_b_weight: torch.Tensor,
+    *,
+    output_groups: int,
+) -> torch.Tensor:
+    if attention_output.ndim != 2:
+        raise ValueError(
+            f"attention_output must be 2-D; got {attention_output.ndim}-D"
+        )
+    if output_a_weight.ndim != 2 or output_b_weight.ndim != 2:
+        raise ValueError("output projection weights must be 2-D")
+    if output_groups <= 0:
+        raise ValueError(f"output_groups must be positive; got {output_groups}")
+    num_heads, head_dim = attention_output.shape
+    if num_heads % output_groups != 0:
+        raise ValueError(
+            "number of heads must be divisible by output_groups; "
+            f"got {num_heads} and {output_groups}"
+        )
+    heads_per_group = num_heads // output_groups
+    group_input = heads_per_group * head_dim
+    if output_a_weight.shape[0] != group_input:
+        raise ValueError(
+            "output_a input dimension must match heads_per_group * head_dim; "
+            f"got {output_a_weight.shape[0]} and {group_input}"
+        )
+    if output_a_weight.shape[1] % output_groups != 0:
+        raise ValueError(
+            "output_a output dimension must be divisible by output_groups; "
+            f"got {output_a_weight.shape[1]} and {output_groups}"
+        )
+    rank_per_group = output_a_weight.shape[1] // output_groups
+    if output_b_weight.shape[0] != output_groups * rank_per_group:
+        raise ValueError(
+            "output_b input dimension must match grouped output rank; "
+            f"got {output_b_weight.shape[0]} and "
+            f"{output_groups * rank_per_group}"
+        )
+
+    grouped = attention_output.to(torch.float32).reshape(
+        output_groups,
+        group_input,
+    )
+    a_by_group = output_a_weight.to(torch.float32).reshape(
+        group_input,
+        output_groups,
+        rank_per_group,
+    ).permute(1, 2, 0)
+    low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
+    return output_b_weight.transpose(0, 1).to(torch.float32).matmul(
+        low_rank.reshape(-1)
+    )
