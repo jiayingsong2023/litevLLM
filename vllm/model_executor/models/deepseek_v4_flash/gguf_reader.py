@@ -200,11 +200,11 @@ def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
         dims=dims,
         tensor_type=tensor_type,
         offset=offset,
-        nbytes=_tensor_nbytes(dims, tensor_type),
+        nbytes=ggml_tensor_nbytes(dims, tensor_type),
     )
 
 
-def _tensor_nbytes(dims: tuple[int, ...], tensor_type: int) -> int:
+def ggml_tensor_nbytes(dims: tuple[int, ...], tensor_type: int) -> int:
     element_count = prod(dims)
     if tensor_type == GGML_TYPE_F32:
         return element_count * 4

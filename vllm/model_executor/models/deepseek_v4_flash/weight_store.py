@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import mmap
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
 
+import torch
+
 from .config import DEEPSEEK_V4_FLASH_SHAPE
 from .gguf_reader import (
     DeepSeekV4FlashGGUF,
     DeepSeekV4FlashTensor,
+    ggml_tensor_nbytes,
     read_deepseek_v4_flash_gguf_from_view,
 )
 
@@ -109,6 +113,28 @@ _REQUIRED_TENSORS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def grouped_expert_payload_offset(
+    *,
+    expert_id: int,
+    projection_dims: tuple[int, int, int],
+    projection_type: int,
+) -> int:
+    if len(projection_dims) != 3:
+        raise ValueError(
+            f"projection_dims must have exactly 3 dimensions; got {projection_dims}"
+        )
+    input_size, output_size, expert_count = projection_dims
+    if expert_id < 0 or expert_id >= expert_count:
+        raise ValueError(
+            f"expert id out of range: {expert_id}; expected [0, {expert_count})"
+        )
+    expert_nbytes = ggml_tensor_nbytes(
+        (input_size, output_size),
+        projection_type,
+    )
+    return expert_id * expert_nbytes
+
+
 class DeepSeekV4FlashWeightStore:
     def __init__(
         self,
@@ -149,6 +175,26 @@ class DeepSeekV4FlashWeightStore:
             return view[start:end]
         finally:
             view.release()
+
+    def tensor_to_torch(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        payload = self.tensor_payload(tensor)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="The given buffer is not writable.*",
+                    category=UserWarning,
+                )
+                data = torch.frombuffer(payload, dtype=dtype).clone()
+        finally:
+            payload.release()
+        return data.reshape(shape or tensor.dims)
 
     def close(self) -> None:
         try:
