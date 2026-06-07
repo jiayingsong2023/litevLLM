@@ -3,6 +3,9 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.models.deepseek_v4_flash.moe import (
+    combined_shared_routed_moe_reference,
+    hash_routed_expert_ids_reference,
+    hash_routed_moe_reference,
     topk_router_reference,
 )
 
@@ -163,3 +166,45 @@ def test_topk_router_reference_validates_shapes(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         topk_router_reference(hidden, router_weight, top_k=1)
+
+
+def test_hash_routed_expert_ids_reference_reads_token_column() -> None:
+    table = torch.tensor(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+        ],
+        dtype=torch.int32,
+    )
+
+    expert_ids = hash_routed_expert_ids_reference(table, token_id=1)
+
+    torch.testing.assert_close(expert_ids, torch.tensor([11, 21]))
+    assert expert_ids.dtype == torch.int64
+
+
+def test_hash_routed_moe_reference_averages_selected_experts_with_scale() -> None:
+    hidden = torch.tensor([1.0, 2.0])
+    expert_outputs = {
+        0: torch.tensor([1.0, 0.0]),
+        2: torch.tensor([0.0, 2.0]),
+    }
+
+    out = hash_routed_moe_reference(
+        hidden,
+        torch.tensor([0, 2]),
+        lambda expert_id, _hidden: expert_outputs[expert_id],
+        routed_scaling_factor=1.5,
+    )
+
+    expected = 0.75 * expert_outputs[0] + 0.75 * expert_outputs[2]
+    torch.testing.assert_close(out, expected)
+
+
+def test_combined_shared_routed_moe_reference_adds_outputs() -> None:
+    out = combined_shared_routed_moe_reference(
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([3.0, 4.0]),
+    )
+
+    torch.testing.assert_close(out, torch.tensor([4.0, 6.0]))

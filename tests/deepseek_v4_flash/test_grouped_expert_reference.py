@@ -15,6 +15,7 @@ from fixtures import (
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import ggml_tensor_nbytes
 from vllm.model_executor.models.deepseek_v4_flash.moe import (
     grouped_expert_reference,
+    hash_routed_expert_ids_reference,
     routed_moe_reference,
     topk_router_reference,
 )
@@ -86,6 +87,20 @@ def test_real_grouped_expert_decode_reads_one_expert_slice() -> None:
         )
 
     assert gate.shape == (2048, 4096)
+
+
+@pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
+def test_real_layer0_hash_routing_reads_six_experts_for_token() -> None:
+    with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
+        token_to_experts = store.bindings.layers[0].expert_token_to_expert_ids
+        assert token_to_experts is not None
+        table = store.tensor_to_torch(token_to_experts, dtype=torch.int32)
+
+    expert_ids = hash_routed_expert_ids_reference(table, token_id=1)
+
+    assert expert_ids.shape == (6,)
+    assert torch.all(expert_ids >= 0)
+    assert torch.all(expert_ids < 256)
 
 
 def test_decode_grouped_expert_matrix_rejects_invalid_expert_id(tmp_path) -> None:

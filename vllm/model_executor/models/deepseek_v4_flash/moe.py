@@ -113,6 +113,27 @@ def grouped_expert_reference(
     return down_weight.to(torch.float32).matmul(activated)
 
 
+def hash_routed_expert_ids_reference(
+    token_to_expert_ids: torch.Tensor,
+    *,
+    token_id: int,
+) -> torch.Tensor:
+    if token_to_expert_ids.ndim != 2:
+        raise ValueError(
+            "token_to_expert_ids must be 2-D; "
+            f"got {token_to_expert_ids.ndim}-D"
+        )
+    if token_id < 0 or token_id >= token_to_expert_ids.shape[1]:
+        raise ValueError(
+            f"token_id out of range: {token_id}; "
+            f"expected [0, {token_to_expert_ids.shape[1]})"
+        )
+    expert_ids = token_to_expert_ids[:, token_id].to(torch.int64)
+    if torch.any(expert_ids < 0):
+        raise ValueError("hash-routed expert ids must be non-negative")
+    return expert_ids
+
+
 def routed_moe_reference(
     hidden: torch.Tensor,
     router_weight: torch.Tensor,
@@ -144,3 +165,43 @@ def routed_moe_reference(
     if output is None:
         raise ValueError("routed MoE selected no experts")
     return output
+
+
+def hash_routed_moe_reference(
+    hidden: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_runner: Callable[[int, torch.Tensor], torch.Tensor],
+    *,
+    routed_scaling_factor: float = 1.5,
+) -> torch.Tensor:
+    if expert_ids.ndim != 1:
+        raise ValueError(f"expert_ids must be 1-D; got {expert_ids.ndim}-D")
+    if expert_ids.numel() == 0:
+        raise ValueError("hash-routed MoE selected no experts")
+    output: torch.Tensor | None = None
+    weight = float(routed_scaling_factor) / float(expert_ids.numel())
+    for expert_id in expert_ids.to(torch.int64).tolist():
+        expert_output = expert_runner(expert_id, hidden).to(torch.float32)
+        if output is None:
+            output = torch.zeros_like(expert_output, dtype=torch.float32)
+        if expert_output.shape != output.shape:
+            raise ValueError(
+                "expert outputs must share one shape; "
+                f"got {tuple(expert_output.shape)} and {tuple(output.shape)}"
+            )
+        output = output + weight * expert_output
+    if output is None:
+        raise ValueError("hash-routed MoE selected no experts")
+    return output
+
+
+def combined_shared_routed_moe_reference(
+    shared_output: torch.Tensor,
+    routed_output: torch.Tensor,
+) -> torch.Tensor:
+    if shared_output.shape != routed_output.shape:
+        raise ValueError(
+            "shared and routed MoE outputs must have the same shape; "
+            f"got {tuple(shared_output.shape)} and {tuple(routed_output.shape)}"
+        )
+    return shared_output.to(torch.float32) + routed_output.to(torch.float32)
