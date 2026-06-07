@@ -603,18 +603,19 @@ class DeepSeekV4FlashBlockReference:
 
 Use the real DeepSeek residual order from reference implementation. If this residual order is wrong after checking DS4/HF, fix this task before proceeding.
 
-- [ ] **Step 4: Add real layer-0 smoke**
+- [x] **Step 4: Add real layer-0 smoke**
 
 Add a real-file test that constructs layer 0 with real tensors, executes a single token hidden vector, and returns finite hidden state. If layer 0 attention/FFN mapping is not complete, this test should be marked expected failure with a precise reason only while Task 4/5 are being completed; before moving to Task 7 it must pass.
 
 Status: `DeepSeekV4FlashBlockReference` exists. Real layer tensors now bound
 through `DeepSeekV4FlashLayerSemanticBindings` include layer norms,
 `attn_sinks`, Q/KV latent norms, mHC tensors, attention compressor tensors, and
-indexer tensors. The real attention+MoE execution test is intentionally `xfail`
-until mHC pre/post, layer-0 raw SWA with shared K=V latent rows, grouped
-attention output projection, and shared+routed MoE are implemented.
+indexer tensors. `DeepSeekV4FlashLayer0ReferenceRunner` now executes layer 0
+with mHC pre/post, shared K=V latent raw SWA, grouped attention output
+projection, shared expert, and hash-routed experts. The dedicated layer-0 real
+smoke passes with the downloaded target GGUF.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 Run:
 

@@ -7,6 +7,7 @@ import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.block import (
     DeepSeekV4FlashBlockReference,
+    DeepSeekV4FlashLayer0ReferenceRunner,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import GGML_TYPE_F32
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
@@ -77,15 +78,15 @@ def test_real_layer0_norms_bind_to_reference_block() -> None:
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "real layer execution is blocked until attn_kv.weight 512-wide "
-        "semantic split and compressed attention/indexer behavior are resolved"
-    ),
-    strict=True,
-)
 @pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
 def test_real_layer0_executes_attention_and_moe() -> None:
-    raise NotImplementedError(
-        "wire real attention and MoE into DeepSeekV4FlashBlockReference"
-    )
+    with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
+        runner = DeepSeekV4FlashLayer0ReferenceRunner(store)
+        out = runner.forward(
+            torch.ones((4, 4096), dtype=torch.float32),
+            token_id=1,
+            token_idx=0,
+        )
+
+    assert out.shape == (4, 4096)
+    assert torch.isfinite(out).all()

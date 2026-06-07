@@ -71,6 +71,28 @@ def test_tensor_to_torch_accepts_shape_override(tmp_path) -> None:
     assert tensor.tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_decode_matrix_reads_f16_matrix_payload(tmp_path) -> None:
+    path = tmp_path / "deepseek-v4-flash.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight", "blk.0.attn_q.weight"),
+        tensor_types=(GGML_TYPE_F16, GGML_TYPE_F16),
+        tensor_dims={
+            "token_embd.weight": (2, 2),
+            "blk.0.attn_q.weight": (2,),
+        },
+        tensor_payloads={
+            "token_embd.weight": struct.pack("<eeee", 1.0, 2.0, 3.0, 4.0),
+            "blk.0.attn_q.weight": struct.pack("<ee", 5.0, 6.0),
+        },
+    )
+
+    with open_deepseek_v4_flash_weight_store(path) as store:
+        matrix = store.decode_matrix(store.bindings.token_embedding)
+
+    assert matrix.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+
 def test_grouped_expert_payload_offset_uses_expert_major_slice_size() -> None:
     offset = grouped_expert_payload_offset(
         expert_id=2,

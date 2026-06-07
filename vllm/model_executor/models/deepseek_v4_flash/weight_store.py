@@ -12,6 +12,7 @@ import torch
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE
 from .gguf_reader import (
+    GGML_TYPE_F16,
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
     GGML_TYPE_Q8_0,
@@ -288,6 +289,35 @@ class DeepSeekV4FlashWeightStore:
         raise DeepSeekV4FlashWeightStoreError(
             f"unsupported grouped expert tensor type for {tensor.name}: "
             f"{tensor.tensor_type}"
+        )
+
+    def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        if len(tensor.dims) != 2:
+            raise DeepSeekV4FlashWeightStoreError(
+                f"matrix tensor {tensor.name} must have 2 dims; got {tensor.dims}"
+            )
+        input_size, output_size = tensor.dims
+        if tensor.tensor_type == GGML_TYPE_F16:
+            return self.tensor_to_torch(
+                tensor,
+                dtype=torch.float16,
+                shape=(input_size, output_size),
+            )
+
+        payload = self.tensor_payload(tensor)
+        try:
+            tensor_bytes = payload.tobytes()
+        finally:
+            payload.release()
+        if tensor.tensor_type == GGML_TYPE_Q8_0:
+            values, scales = q8_0_matrix_from_gguf_payload(
+                tensor_bytes,
+                rows=output_size,
+                columns=input_size,
+            )
+            return q8_0_dequantize_reference(values, scales)
+        raise DeepSeekV4FlashWeightStoreError(
+            f"unsupported matrix tensor type for {tensor.name}: {tensor.tensor_type}"
         )
 
     def close(self) -> None:

@@ -155,6 +155,7 @@ def apply_rope_to_tail_reference(
     token_idx: int,
     rotary_dim: int = 64,
     theta: float = 10000.0,
+    inverse: bool = False,
 ) -> torch.Tensor:
     if vectors.ndim < 1:
         raise ValueError("vectors must have at least one dimension")
@@ -185,6 +186,8 @@ def apply_rope_to_tail_reference(
         -positions / float(rotary_dim),
     )
     angles = float(token_idx) * inv_freq
+    if inverse:
+        angles = -angles
     cos = torch.cos(angles)
     sin = torch.sin(angles)
     x0 = pairs[..., 0]
