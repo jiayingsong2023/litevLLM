@@ -5,6 +5,36 @@ import math
 
 import torch
 
+from .ops import factorized_linear_reference
+
+
+def factorized_attention_projection_reference(
+    hidden: torch.Tensor,
+    a_weight: torch.Tensor,
+    b_weight: torch.Tensor,
+) -> torch.Tensor:
+    return factorized_linear_reference(hidden, a_weight, b_weight)
+
+
+def split_combined_kv_reference(
+    kv: torch.Tensor,
+    *,
+    key_width: int,
+    value_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a 1-D combined K/V vector using caller-supplied semantic widths."""
+    if kv.ndim != 1:
+        raise ValueError(f"kv must be 1-D; got {kv.ndim}-D")
+    if key_width < 0 or value_width < 0:
+        raise ValueError("widths must be non-negative")
+    expected_width = key_width + value_width
+    if kv.numel() != expected_width:
+        raise ValueError(
+            "kv length must equal key_width + value_width; "
+            f"got {kv.numel()} and {expected_width}"
+        )
+    return kv[:key_width], kv[key_width:]
+
 
 def raw_swa_attention_reference(
     query: torch.Tensor,
