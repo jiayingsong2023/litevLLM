@@ -2,7 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the downloaded target GGUF into working batch=1, context 4K/8K, greedy DeepSeek V4 Flash inference callable through the existing OpenAI-compatible REST path.
+**Original Goal:** Turn the downloaded target GGUF into working batch=1, context
+4K/8K, greedy DeepSeek V4 Flash inference callable through the existing
+OpenAI-compatible REST path.
+
+**Task 8 Outcome:** This plan did not reach the original full greedy REST goal.
+The implemented branch is a limited bring-up: real GGUF parsing/binding,
+reference quant/KV/attention/router helpers, a direct one-token model smoke that
+returns finite logits from real embedding/norm/output tensors, and route
+exposure plus an honest uninitialized-engine REST negative smoke. Full
+transformer execution, batch=1 greedy decode, and initialized REST generation
+remain follow-up work.
 
 **Architecture:** Keep DeepSeek-specific logic inside `vllm/model_executor/models/deepseek_v4_flash/` and `vllm/kernels/triton/deepseek_v4_flash/`. The lite engine, schedulers, and REST entrypoints should remain model-family agnostic; the DeepSeek model owns GGUF weight binding, quantized matvec, compressed KV, attention, MoE routing, and logits.
 
@@ -10,7 +20,7 @@
 
 ---
 
-## Current State
+## Initial State Before Execution
 
 - Target model exists at `models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
 - `vllm/model_executor/models/deepseek_v4_flash/model.py` still raises `NotImplementedError` in `forward()`.
@@ -19,15 +29,28 @@
 - Q8_0 reference decode exists; IQ2_XXS and Q2_K are not wired.
 - REST smoke currently checks routes only, not real generation.
 
+## Current State After Execution
+
+- `DeepSeekV4FlashForCausalLM.forward()` no longer raises
+  `NotImplementedError` for an attached real weight store, but it is deliberately
+  limited to exactly one non-empty input token.
+- The direct smoke path executes token embedding, `output_norm` RMSNorm, and
+  `Q8_0` output projection only. It sets `limited_forward_smoke_only=True`.
+- Multi-token non-empty input is rejected until full transformer execution is
+  implemented.
+- REST routes are exposed, but initialized OpenAI-compatible DeepSeek GGUF chat
+  generation is not implemented. The REST smoke is a negative uninitialized
+  engine check, not generated text.
+
 ## File Structure
 
 - Modify `vllm/model_executor/models/deepseek_v4_flash/weight_store.py`: bind real tensor names into per-layer semantic tables and expose payload views.
 - Modify `vllm/model_executor/models/deepseek_v4_flash/quant.py`: add CPU reference decoders for target GGUF quant formats.
 - Create `vllm/model_executor/models/deepseek_v4_flash/layers.py`: small PyTorch reference layer components used before Triton optimization.
-- Create `vllm/model_executor/models/deepseek_v4_flash/attention.py`: batch=1 raw SWA plus compressed attention reference path.
-- Create `vllm/model_executor/models/deepseek_v4_flash/moe.py`: batch=1 top-6 routed MoE reference path with bounded expert staging.
+- Create `vllm/model_executor/models/deepseek_v4_flash/attention.py`: batch=1 raw SWA attention reference helper.
+- Create `vllm/model_executor/models/deepseek_v4_flash/moe.py`: DeepSeek-V4 router reference helper.
 - Modify `vllm/model_executor/models/deepseek_v4_flash/compressed_kv.py`: add append/read APIs used by forward.
-- Modify `vllm/model_executor/models/deepseek_v4_flash/model.py`: implement prefill/decode forward contract for batch=1 greedy.
+- Modify `vllm/model_executor/models/deepseek_v4_flash/model.py`: implement a limited one-token direct model smoke while keeping full prefill/decode as follow-up work.
 - Modify `tests/tools/deepseek_v4_flash_inspect.py`: print enough real tensor mapping to debug the target file.
 - Add tests under `tests/deepseek_v4_flash/` for semantic binding, quant references, single-layer execution, KV behavior, forward smoke, and REST smoke.
 
