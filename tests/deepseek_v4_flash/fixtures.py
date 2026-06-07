@@ -76,6 +76,7 @@ def write_minimal_deepseek_v4_flash_gguf(
     tensor_dims: dict[str, tuple[int, ...]] | None = None,
     tensor_payloads: dict[str, bytes] | None = None,
     tensor_offsets: dict[str, int] | None = None,
+    tensor_offsets_by_index: tuple[int, ...] | None = None,
     extra_metadata: Callable[[bytearray], None] | None = None,
 ) -> None:
     metadata = bytearray()
@@ -101,6 +102,12 @@ def write_minimal_deepseek_v4_flash_gguf(
         tensor_types = tuple(8 for _ in tensor_names)
     if len(tensor_types) != len(tensor_names):
         raise ValueError("tensor_types length must match tensor_names length")
+    if tensor_offsets_by_index is not None and len(tensor_offsets_by_index) != len(
+        tensor_names
+    ):
+        raise ValueError(
+            "tensor_offsets_by_index length must match tensor_names length"
+        )
     if tensor_payloads is None:
         tensor_payloads = {}
     if tensor_offsets is None:
@@ -113,7 +120,10 @@ def write_minimal_deepseek_v4_flash_gguf(
             dims = tensor_dims[name]
         else:
             dims = (4096, 129280) if name == "token_embd.weight" else (4096, 4096)
-        tensor_offset = tensor_offsets.get(name, next_tensor_offset)
+        if tensor_offsets_by_index is not None:
+            tensor_offset = tensor_offsets_by_index[offset]
+        else:
+            tensor_offset = tensor_offsets.get(name, next_tensor_offset)
         tensor_specs.append((name, dims, tensor_types[offset], tensor_offset))
         _write_tensor(tensors, name, dims, tensor_types[offset], tensor_offset)
         next_tensor_offset = _align_offset(
@@ -135,7 +145,7 @@ def write_minimal_deepseek_v4_flash_gguf(
         tensors = bytearray()
         data = bytearray()
         for name, dims, tensor_type, default_offset in tensor_specs:
-            offset = tensor_offsets.get(name, default_offset)
+            offset = default_offset
             payload = tensor_payloads.get(name, b"")
             if offset > len(data):
                 data.extend(b"\x00" * (offset - len(data)))

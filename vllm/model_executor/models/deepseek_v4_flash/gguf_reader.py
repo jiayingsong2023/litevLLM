@@ -330,6 +330,8 @@ def read_deepseek_v4_flash_gguf_from_view(
     tensors: dict[str, DeepSeekV4FlashTensor] = {}
     for _ in range(tensor_count):
         tensor = _read_tensor(cursor)
+        if tensor.name in tensors:
+            raise GGUFParseError(f"duplicate tensor name: {tensor.name}")
         tensors[tensor.name] = tensor
     _validate_tensor_types(tensors)
     data_offset = _align_offset(

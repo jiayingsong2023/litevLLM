@@ -96,6 +96,20 @@ def test_reader_rejects_overlapping_tensor_payloads(tmp_path) -> None:
         read_deepseek_v4_flash_gguf(path)
 
 
+def test_reader_rejects_duplicate_tensor_before_overwrite(tmp_path) -> None:
+    path = tmp_path / "duplicate.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight", "token_embd.weight", "blk.0.attn_q.weight"),
+        tensor_types=(0, 0, 0),
+        tensor_dims={"token_embd.weight": (1,), "blk.0.attn_q.weight": (1,)},
+        tensor_offsets_by_index=(0, 32, 0),
+    )
+
+    with pytest.raises(GGUFParseError, match="duplicate tensor"):
+        read_deepseek_v4_flash_gguf(path)
+
+
 def test_reader_rejects_out_of_file_tensor_payload(tmp_path) -> None:
     path = tmp_path / "out-of-file.gguf"
     write_minimal_deepseek_v4_flash_gguf(
