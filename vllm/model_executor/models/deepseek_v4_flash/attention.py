@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from .ops import factorized_linear_reference
+from .ops import factorized_linear_reference, rms_norm_reference
 
 
 def factorized_attention_projection_reference(
@@ -24,6 +24,62 @@ def factorized_attention_projection_reference(
         a_weight.transpose(0, 1),
         b_weight.transpose(0, 1),
     )
+
+
+def q_lora_attention_projection_reference(
+    hidden: torch.Tensor,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_b_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the DeepSeek V4 Flash Q-LoRA query projection.
+
+    Official reference order: ``q = q_norm(wq_a(x)); q = wq_b(q)``.
+    GGUF factor tensors are stored as ``(input, output)``.
+    """
+    if q_a_weight.ndim != 2 or q_b_weight.ndim != 2:
+        raise ValueError("Q-LoRA weights must be 2-D")
+    q_rank = q_a_weight.shape[1]
+    if q_norm_weight.shape != (q_rank,):
+        raise ValueError(
+            f"q_norm_weight shape must be ({q_rank},); "
+            f"got {tuple(q_norm_weight.shape)}"
+        )
+    q_latent = q_a_weight.transpose(0, 1).to(torch.float32).matmul(
+        hidden.to(torch.float32)
+    )
+    q_latent = rms_norm_reference(q_latent, q_norm_weight)
+    return q_b_weight.transpose(0, 1).to(torch.float32).matmul(q_latent)
+
+
+def latent_kv_projection_reference(
+    hidden: torch.Tensor,
+    kv_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the DeepSeek V4 Flash single-latent K/V projection.
+
+    The 512-wide ``attn_kv.weight`` is not split into separate key and value
+    vectors. It projects hidden state into one head-dim latent that serves as
+    both K and V in the reference attention path.
+    """
+    if hidden.ndim != 1:
+        raise ValueError(f"hidden must be 1-D; got {hidden.ndim}-D")
+    if kv_weight.ndim != 2:
+        raise ValueError(f"kv_weight must be 2-D; got {kv_weight.ndim}-D")
+    if kv_weight.shape[0] != hidden.numel():
+        raise ValueError(
+            "kv_weight input dimension must match hidden size; "
+            f"got {kv_weight.shape[0]} and {hidden.numel()}"
+        )
+    kv_width = kv_weight.shape[1]
+    if kv_norm_weight.shape != (kv_width,):
+        raise ValueError(
+            f"kv_norm_weight shape must be ({kv_width},); "
+            f"got {tuple(kv_norm_weight.shape)}"
+        )
+    kv = kv_weight.transpose(0, 1).to(torch.float32).matmul(hidden.to(torch.float32))
+    return rms_norm_reference(kv, kv_norm_weight)
 
 
 def split_combined_kv_reference(

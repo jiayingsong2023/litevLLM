@@ -48,16 +48,43 @@ class DeepSeekV4FlashGroupedExpertTensors:
 
 
 @dataclass(frozen=True)
+class DeepSeekV4FlashHyperConnectionTensors:
+    fn: DeepSeekV4FlashTensor
+    base: DeepSeekV4FlashTensor
+    scale: DeepSeekV4FlashTensor
+
+
+@dataclass(frozen=True)
+class DeepSeekV4FlashCompressorTensors:
+    ape: DeepSeekV4FlashTensor
+    gate: DeepSeekV4FlashTensor
+    kv: DeepSeekV4FlashTensor
+    norm: DeepSeekV4FlashTensor
+
+
+@dataclass(frozen=True)
+class DeepSeekV4FlashIndexerTensors:
+    query_b: DeepSeekV4FlashTensor
+    projection: DeepSeekV4FlashTensor
+    compressor: DeepSeekV4FlashCompressorTensors
+
+
+@dataclass(frozen=True)
 class DeepSeekV4FlashLayerSemanticBindings:
     layer_index: int
     attention_norm: DeepSeekV4FlashTensor | None = None
+    attention_sinks: DeepSeekV4FlashTensor | None = None
     attention_query: DeepSeekV4FlashTensor | None = None
     attention_query_a: DeepSeekV4FlashTensor | None = None
+    attention_query_a_norm: DeepSeekV4FlashTensor | None = None
     attention_query_b: DeepSeekV4FlashTensor | None = None
     attention_key_value: DeepSeekV4FlashTensor | None = None
+    attention_key_value_a_norm: DeepSeekV4FlashTensor | None = None
     attention_output: DeepSeekV4FlashTensor | None = None
     attention_output_a: DeepSeekV4FlashTensor | None = None
     attention_output_b: DeepSeekV4FlashTensor | None = None
+    attention_compressor: DeepSeekV4FlashCompressorTensors | None = None
+    indexer: DeepSeekV4FlashIndexerTensors | None = None
     ffn_norm: DeepSeekV4FlashTensor | None = None
     router: DeepSeekV4FlashTensor | None = None
     routed_experts: dict[int, DeepSeekV4FlashExpertTensors] | None = None
@@ -65,6 +92,8 @@ class DeepSeekV4FlashLayerSemanticBindings:
     shared_experts: DeepSeekV4FlashGroupedExpertTensors | None = None
     expert_token_to_expert_ids: DeepSeekV4FlashTensor | None = None
     expert_probs_bias: DeepSeekV4FlashTensor | None = None
+    attention_hyper_connection: DeepSeekV4FlashHyperConnectionTensors | None = None
+    ffn_hyper_connection: DeepSeekV4FlashHyperConnectionTensors | None = None
 
 
 @dataclass(frozen=True)
@@ -340,6 +369,60 @@ def _bind_grouped_experts(
     return DeepSeekV4FlashGroupedExpertTensors(gate=gate, down=down, up=up)
 
 
+def _bind_hyper_connection(
+    model: DeepSeekV4FlashGGUF,
+    layer_idx: int,
+    *,
+    prefix: str,
+) -> DeepSeekV4FlashHyperConnectionTensors | None:
+    fn = _tensor(model, layer_idx, f"{prefix}_fn.weight")
+    base = _tensor(model, layer_idx, f"{prefix}_base.weight")
+    scale = _tensor(model, layer_idx, f"{prefix}_scale.weight")
+    if fn is None or base is None or scale is None:
+        return None
+    return DeepSeekV4FlashHyperConnectionTensors(fn=fn, base=base, scale=scale)
+
+
+def _bind_compressor(
+    model: DeepSeekV4FlashGGUF,
+    layer_idx: int,
+    *,
+    prefix: str,
+) -> DeepSeekV4FlashCompressorTensors | None:
+    ape = _tensor(model, layer_idx, f"{prefix}_ape.weight")
+    gate = _tensor(model, layer_idx, f"{prefix}_gate.weight")
+    kv = _tensor(model, layer_idx, f"{prefix}_kv.weight")
+    norm = _tensor(model, layer_idx, f"{prefix}_norm.weight")
+    if ape is None or gate is None or kv is None or norm is None:
+        return None
+    return DeepSeekV4FlashCompressorTensors(
+        ape=ape,
+        gate=gate,
+        kv=kv,
+        norm=norm,
+    )
+
+
+def _bind_indexer(
+    model: DeepSeekV4FlashGGUF,
+    layer_idx: int,
+) -> DeepSeekV4FlashIndexerTensors | None:
+    query_b = _tensor(model, layer_idx, "indexer.attn_q_b.weight")
+    projection = _tensor(model, layer_idx, "indexer.proj.weight")
+    compressor = _bind_compressor(
+        model,
+        layer_idx,
+        prefix="indexer_compressor",
+    )
+    if query_b is None or projection is None or compressor is None:
+        return None
+    return DeepSeekV4FlashIndexerTensors(
+        query_b=query_b,
+        projection=projection,
+        compressor=compressor,
+    )
+
+
 def _bind_layers(
     model: DeepSeekV4FlashGGUF,
 ) -> tuple[DeepSeekV4FlashLayerSemanticBindings, ...]:
@@ -353,13 +436,30 @@ def _bind_layers(
             DeepSeekV4FlashLayerSemanticBindings(
                 layer_index=layer_idx,
                 attention_norm=_tensor(model, layer_idx, "attn_norm.weight"),
+                attention_sinks=_tensor(model, layer_idx, "attn_sinks.weight"),
                 attention_query=attention_query or attention_query_a,
                 attention_query_a=attention_query_a,
+                attention_query_a_norm=_tensor(
+                    model,
+                    layer_idx,
+                    "attn_q_a_norm.weight",
+                ),
                 attention_query_b=_tensor(model, layer_idx, "attn_q_b.weight"),
                 attention_key_value=_tensor(model, layer_idx, "attn_kv.weight"),
+                attention_key_value_a_norm=_tensor(
+                    model,
+                    layer_idx,
+                    "attn_kv_a_norm.weight",
+                ),
                 attention_output=attention_output or attention_output_a,
                 attention_output_a=attention_output_a,
                 attention_output_b=_tensor(model, layer_idx, "attn_output_b.weight"),
+                attention_compressor=_bind_compressor(
+                    model,
+                    layer_idx,
+                    prefix="attn_compressor",
+                ),
+                indexer=_bind_indexer(model, layer_idx),
                 ffn_norm=_tensor(model, layer_idx, "ffn_norm.weight"),
                 router=_tensor(model, layer_idx, "ffn_gate_inp.weight"),
                 routed_experts={},
@@ -381,6 +481,16 @@ def _bind_layers(
                     model, layer_idx, "ffn_gate_tid2eid.weight"
                 ),
                 expert_probs_bias=_tensor(model, layer_idx, "exp_probs_b.bias"),
+                attention_hyper_connection=_bind_hyper_connection(
+                    model,
+                    layer_idx,
+                    prefix="hc_attn",
+                ),
+                ffn_hyper_connection=_bind_hyper_connection(
+                    model,
+                    layer_idx,
+                    prefix="hc_ffn",
+                ),
             )
         )
     return tuple(layers)
@@ -414,10 +524,13 @@ def _bound_tensor_count(
     for layer in bindings.layers:
         layer_tensors = (
             layer.attention_norm,
+            layer.attention_sinks,
             layer.attention_query,
             layer.attention_query_a,
+            layer.attention_query_a_norm,
             layer.attention_query_b,
             layer.attention_key_value,
+            layer.attention_key_value_a_norm,
             layer.attention_output,
             layer.attention_output_a,
             layer.attention_output_b,
@@ -435,6 +548,26 @@ def _bound_tensor_count(
             bound_names.add(expert_group.gate.name)
             bound_names.add(expert_group.down.name)
             bound_names.add(expert_group.up.name)
+        for compressor in (layer.attention_compressor,):
+            if compressor is None:
+                continue
+            bound_names.add(compressor.ape.name)
+            bound_names.add(compressor.gate.name)
+            bound_names.add(compressor.kv.name)
+            bound_names.add(compressor.norm.name)
+        if layer.indexer is not None:
+            bound_names.add(layer.indexer.query_b.name)
+            bound_names.add(layer.indexer.projection.name)
+            bound_names.add(layer.indexer.compressor.ape.name)
+            bound_names.add(layer.indexer.compressor.gate.name)
+            bound_names.add(layer.indexer.compressor.kv.name)
+            bound_names.add(layer.indexer.compressor.norm.name)
+        for hc in (layer.attention_hyper_connection, layer.ffn_hyper_connection):
+            if hc is None:
+                continue
+            bound_names.add(hc.fn.name)
+            bound_names.add(hc.base.name)
+            bound_names.add(hc.scale.name)
         if layer.routed_experts is None:
             continue
         for expert in layer.routed_experts.values():

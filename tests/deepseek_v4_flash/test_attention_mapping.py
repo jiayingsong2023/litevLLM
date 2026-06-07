@@ -5,6 +5,8 @@ import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     factorized_attention_projection_reference,
+    latent_kv_projection_reference,
+    q_lora_attention_projection_reference,
     split_combined_kv_reference,
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
@@ -23,19 +25,23 @@ def test_real_attention_tensor_shape_mapping_for_layer_0() -> None:
         layer = store.bindings.layers[0]
 
         assert layer.attention_query_a is not None
+        assert layer.attention_query_a_norm is not None
         assert layer.attention_query_b is not None
         assert layer.attention_key_value is not None
+        assert layer.attention_key_value_a_norm is not None
         assert layer.attention_output_a is not None
         assert layer.attention_output_b is not None
+        assert layer.attention_sinks is not None
 
         assert layer.attention_query_a.dims == (4096, 1024)
+        assert layer.attention_query_a_norm.dims == (1024,)
         assert layer.attention_query_b.dims == (1024, 32768)
-        # The target exposes a 512-wide combined attn_kv tensor. This task
-        # records the shape only; the key/value semantic split is not derived
-        # here and must be resolved before real attention execution.
+        # DeepSeek V4 Flash uses a single 512-wide latent for both K and V.
         assert layer.attention_key_value.dims == (4096, 512)
+        assert layer.attention_key_value_a_norm.dims == (512,)
         assert layer.attention_output_a.dims == (4096, 8192)
         assert layer.attention_output_b.dims == (8192, 4096)
+        assert layer.attention_sinks.dims == (64,)
 
 
 def test_factorized_attention_projection_reference_returns_b_output_shape() -> None:
@@ -64,6 +70,33 @@ def test_factorized_attention_projection_reference_uses_gguf_orientation() -> No
 
     expected = q_b.transpose(0, 1).matmul(q_a.transpose(0, 1).matmul(hidden))
     assert out.shape == (8,)
+    torch.testing.assert_close(out, expected)
+
+
+def test_q_lora_attention_projection_reference_applies_norm_between_factors() -> None:
+    hidden = torch.tensor([3.0, 4.0])
+    q_a = torch.eye(2)
+    q_norm = torch.tensor([2.0, 1.0])
+    q_b = torch.ones((2, 3))
+
+    out = q_lora_attention_projection_reference(hidden, q_a, q_norm, q_b)
+
+    q_latent = q_a.transpose(0, 1).matmul(hidden)
+    q_latent = q_latent * torch.rsqrt(q_latent.pow(2).mean() + 1e-6) * q_norm
+    expected = q_b.transpose(0, 1).matmul(q_latent)
+    torch.testing.assert_close(out, expected)
+
+
+def test_latent_kv_projection_reference_returns_single_kv_latent() -> None:
+    hidden = torch.tensor([1.0, 2.0])
+    kv_weight = torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, 1.0]])
+    kv_norm = torch.ones(3)
+
+    out = latent_kv_projection_reference(hidden, kv_weight, kv_norm)
+
+    expected = kv_weight.transpose(0, 1).matmul(hidden)
+    expected = expected * torch.rsqrt(expected.pow(2).mean() + 1e-6)
+    assert out.shape == (3,)
     torch.testing.assert_close(out, expected)
 
 

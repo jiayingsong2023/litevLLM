@@ -25,7 +25,7 @@ Not implemented:
 
 - Real transformer block execution.
 - Factorized Q/O attention execution.
-- Combined `attn_kv.weight` split and use.
+- Shared K=V latent `attn_kv.weight` use.
 - Compressed attention / indexer execution.
 - Grouped expert execution.
 - Batch=1 greedy decode.
@@ -420,7 +420,11 @@ def split_combined_kv_reference(kv: torch.Tensor, *, key_width: int, value_width
     return kv[:key_width], kv[key_width:]
 ```
 
-Use the real observed `attn_kv.weight` dimensions to decide whether `value_width` is zero, implicit, or represented through another tensor. If the mapping cannot be derived from current references, stop and document the exact missing source.
+The real observed `attn_kv.weight` is a 512-wide shared K=V latent projection,
+not a concatenated key/value tensor. The first release attention path must use
+`attn_kv.weight` followed by `attn_kv_a_norm.weight`, then use the same row for
+key and value. This matches the public DeepSeek V4 Flash reference and DS4
+implementation.
 
 - [ ] **Step 4: Run tests and commit**
 
@@ -603,11 +607,12 @@ Use the real DeepSeek residual order from reference implementation. If this resi
 
 Add a real-file test that constructs layer 0 with real tensors, executes a single token hidden vector, and returns finite hidden state. If layer 0 attention/FFN mapping is not complete, this test should be marked expected failure with a precise reason only while Task 4/5 are being completed; before moving to Task 7 it must pass.
 
-Status: `DeepSeekV4FlashBlockReference` exists and real layer-0 norm tensors
-(`blk.0.attn_norm.weight`, `blk.0.ffn_norm.weight`) are now bound through
-`DeepSeekV4FlashLayerSemanticBindings`. The real attention+MoE execution test is
-intentionally `xfail` until the `attn_kv.weight` 512-wide semantic split and
-compressed attention/indexer behavior are resolved.
+Status: `DeepSeekV4FlashBlockReference` exists. Real layer tensors now bound
+through `DeepSeekV4FlashLayerSemanticBindings` include layer norms,
+`attn_sinks`, Q/KV latent norms, mHC tensors, attention compressor tensors, and
+indexer tensors. The real attention+MoE execution test is intentionally `xfail`
+until mHC pre/post, layer-0 raw SWA with shared K=V latent rows, grouped
+attention output projection, and shared+routed MoE are implemented.
 
 - [ ] **Step 5: Run tests and commit**
 
