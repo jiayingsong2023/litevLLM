@@ -27,6 +27,10 @@ def test_real_gguf_semantic_tensor_mapping() -> None:
         assert "output.weight" in store.model.tensors
         assert bindings.output_head is not None
         assert bindings.output_head.name == "output.weight"
+        assert bindings.output_hyper_connection is not None
+        assert bindings.output_hyper_connection.fn.name == "output_hc_fn.weight"
+        assert bindings.output_hyper_connection.base.name == "output_hc_base.weight"
+        assert bindings.output_hyper_connection.scale.name == "output_hc_scale.weight"
 
         # The target stores attention Q and output projections as A/B factors,
         # and stores K/V together in the combined attn_kv tensor.

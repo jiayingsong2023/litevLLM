@@ -7,10 +7,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from .block import (
+    DeepSeekV4FlashCompressedLayerReferenceRunner,
+    DeepSeekV4FlashSlidingLayerReferenceRunner,
+)
+from .compressed_kv import DeepSeekV4CompressedKVCache
 from .config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashRuntimeBudget,
     DeepSeekV4FlashShape,
+    layer_compress_ratio,
 )
 from .gguf_reader import GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0
 from .quant import q8_0_matvec
@@ -120,6 +126,107 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 "DeepSeekV4FlashForCausalLM requires an attached GGUF weight store"
             )
         return self.weight_store
+
+    def forward_full_reference(self, input_ids: torch.Tensor) -> torch.Tensor:
+        store = self._require_weight_store()
+        self._validate_full_reference_input(input_ids)
+        token_id = int(input_ids.detach().cpu()[0])
+        hidden = self._read_token_embedding(store, token_id)
+        streams = hidden.reshape(1, -1).repeat(4, 1)
+        cache = DeepSeekV4CompressedKVCache(
+            context_length=4096,
+            hidden_size=self.shape.head_dim,
+        )
+        for layer_idx in range(self.shape.num_layers):
+            if layer_compress_ratio(layer_idx) == 0:
+                runner = DeepSeekV4FlashSlidingLayerReferenceRunner(
+                    store,
+                    layer_idx=layer_idx,
+                    shape=self.shape,
+                )
+                streams = runner.forward(
+                    streams,
+                    token_id=token_id,
+                    token_idx=0,
+                )
+            else:
+                runner = DeepSeekV4FlashCompressedLayerReferenceRunner(
+                    store,
+                    layer_idx=layer_idx,
+                    shape=self.shape,
+                )
+                streams = runner.forward(
+                    streams,
+                    token_id=token_id,
+                    token_idx=0,
+                    cache=cache,
+                )
+        embd = self._collapse_output_hc(store, streams)
+        normalized = self._rms_norm(embd, self._read_output_norm(store))
+        self.limited_forward_smoke_only = False
+        return self._q8_0_output_projection(store, normalized).reshape(1, -1)
+
+    def generate_greedy_reference(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int = 1,
+    ) -> torch.Tensor:
+        if max_tokens != 1:
+            raise ValueError(
+                "generate_greedy_reference currently supports max_tokens=1; "
+                f"got {max_tokens}"
+            )
+        logits = self.forward_full_reference(input_ids)
+        next_token = torch.argmax(logits[0], dim=-1).to(torch.long)
+        return torch.cat([input_ids.to(torch.long), next_token.reshape(1)])
+
+    def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
+        if input_ids.ndim != 1:
+            raise ValueError(
+                "forward_full_reference supports a 1-D batch=1 token vector; "
+                f"got {input_ids.ndim}-D"
+            )
+        if input_ids.numel() != 1:
+            raise ValueError(
+                "forward_full_reference currently supports exactly one token; "
+                f"got {input_ids.numel()}"
+            )
+        if input_ids.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(f"input_ids must use an integer dtype; got {input_ids.dtype}")
+
+    def _collapse_output_hc(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        streams: torch.Tensor,
+    ) -> torch.Tensor:
+        if streams.shape != (4, self.shape.hidden_size):
+            raise ValueError(
+                f"output HC streams shape must be (4, {self.shape.hidden_size}); "
+                f"got {tuple(streams.shape)}"
+            )
+        hc = store.bindings.output_hyper_connection
+        if hc is None:
+            raise RuntimeError("DeepSeek V4 Flash full reference requires output HC")
+        flat = streams.reshape(-1).to(torch.float32)
+        flat = flat * torch.rsqrt(flat.pow(2).mean() + _RMS_NORM_EPS)
+        pre = store.decode_matrix(hc.fn).transpose(0, 1).to(torch.float32).matmul(
+            flat
+        )
+        scale = store.tensor_to_torch(hc.scale, dtype=torch.float32)
+        base = store.tensor_to_torch(hc.base, dtype=torch.float32)
+        if scale.shape != (1,) or base.shape != (4,):
+            raise RuntimeError(
+                "DeepSeek V4 Flash output HC expects scale=(1,) and base=(4,)"
+            )
+        weights = torch.sigmoid(pre * scale[0] + base) + 1e-6
+        return (weights.reshape(4, 1) * streams.to(torch.float32)).sum(dim=0)
 
     def _project_one_token_embedding_smoke(
         self,

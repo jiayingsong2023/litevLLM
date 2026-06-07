@@ -22,7 +22,11 @@ from .attention import (
     shared_kv_swa_attention_reference,
 )
 from .compressed_kv import DeepSeekV4CompressedKVCache
-from .config import DEEPSEEK_V4_FLASH_SHAPE, DeepSeekV4FlashShape
+from .config import (
+    DEEPSEEK_V4_FLASH_SHAPE,
+    DeepSeekV4FlashShape,
+    layer_compress_ratio,
+)
 from .hyper_connection import (
     hyper_connection_post_reference,
     hyper_connection_pre_reference,
@@ -32,6 +36,7 @@ from .moe import (
     grouped_expert_reference,
     hash_routed_expert_ids_reference,
     hash_routed_moe_reference,
+    routed_moe_reference,
 )
 from .ops import rms_norm_reference
 from .weight_store import (
@@ -281,25 +286,46 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
         if layer.shared_experts is None or layer.grouped_experts is None:
             raise RuntimeError("sliding layer requires shared and routed experts")
         shared = self._run_expert_group(layer.shared_experts, hidden)
-        if layer.expert_token_to_expert_ids is None:
-            raise RuntimeError("sliding layer requires hash routing tensor")
-        expert_ids = hash_routed_expert_ids_reference(
-            self.store.tensor_to_torch(
-                layer.expert_token_to_expert_ids,
-                dtype=torch.int32,
-            ),
-            token_id=token_id,
-        )
-        routed = hash_routed_moe_reference(
-            hidden,
-            expert_ids,
-            lambda expert_id, expert_hidden: self._run_expert_group(
-                layer.grouped_experts,
-                expert_hidden,
-                expert_id=expert_id,
-            ),
-            routed_scaling_factor=1.5,
-        )
+        if layer.expert_token_to_expert_ids is not None:
+            expert_ids = hash_routed_expert_ids_reference(
+                self.store.tensor_to_torch(
+                    layer.expert_token_to_expert_ids,
+                    dtype=torch.int32,
+                ),
+                token_id=token_id,
+            )
+            routed = hash_routed_moe_reference(
+                hidden,
+                expert_ids,
+                lambda expert_id, expert_hidden: self._run_expert_group(
+                    layer.grouped_experts,
+                    expert_hidden,
+                    expert_id=expert_id,
+                ),
+                routed_scaling_factor=1.5,
+            )
+        else:
+            if layer.router is None:
+                raise RuntimeError("routed layer requires router tensor")
+            correction_bias = (
+                None
+                if layer.expert_probs_bias is None
+                else self.store.tensor_to_torch(
+                    layer.expert_probs_bias,
+                    dtype=torch.float32,
+                )
+            )
+            routed = routed_moe_reference(
+                hidden,
+                self.store.decode_matrix(layer.router).transpose(0, 1),
+                lambda expert_id, expert_hidden: self._run_expert_group(
+                    layer.grouped_experts,
+                    expert_hidden,
+                    expert_id=expert_id,
+                ),
+                top_k=self.shape.num_experts_per_tok,
+                correction_bias=correction_bias,
+            )
         return combined_shared_routed_moe_reference(shared, routed)
 
     def _run_expert_group(
@@ -330,27 +356,43 @@ class DeepSeekV4FlashLayer0ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
         super().__init__(store, layer_idx=0, shape=shape)
 
 
-class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceRunner):
-    """Layer-2 ratio-4 compressed/indexer bring-up runner."""
+class DeepSeekV4FlashCompressedLayerReferenceRunner(
+    DeepSeekV4FlashSlidingLayerReferenceRunner
+):
+    """Compressed/indexer bring-up runner for layers 2 and later."""
 
     def __init__(
         self,
         store: DeepSeekV4FlashWeightStore,
         *,
+        layer_idx: int,
         shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
     ) -> None:
         super().__init__(store, layer_idx=0, shape=shape)
-        self.layer_idx = 2
-        width = 2 * shape.head_dim
-        index_width = 2 * shape.indexer_head_dim
-        self.attn_state_kv = torch.zeros((8, width), dtype=torch.float32)
-        self.attn_state_score = torch.full((8, width), -1000.0, dtype=torch.float32)
-        self.index_state_kv = torch.zeros((8, index_width), dtype=torch.float32)
-        self.index_state_score = torch.full(
-            (8, index_width),
+        ratio = layer_compress_ratio(layer_idx)
+        if ratio == 0:
+            raise ValueError(f"layer {layer_idx} is not compressed")
+        self.layer_idx = layer_idx
+        self.ratio = ratio
+        coff = 2 if ratio == 4 else 1
+        width = coff * shape.head_dim
+        self.attn_state_kv = torch.zeros((coff * ratio, width), dtype=torch.float32)
+        self.attn_state_score = torch.full(
+            (coff * ratio, width),
             -1000.0,
             dtype=torch.float32,
         )
+        if ratio == 4:
+            index_width = 2 * shape.indexer_head_dim
+            self.index_state_kv = torch.zeros((8, index_width), dtype=torch.float32)
+            self.index_state_score = torch.full(
+                (8, index_width),
+                -1000.0,
+                dtype=torch.float32,
+            )
+        else:
+            self.index_state_kv = None
+            self.index_state_score = None
 
     def forward(
         self,
@@ -366,8 +408,10 @@ class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
                 f"got {tuple(streams.shape)}"
             )
         layer = self.store.bindings.layers[self.layer_idx]
-        if layer.attention_compressor is None or layer.indexer is None:
-            raise RuntimeError("layer 2 requires compressor and indexer tensors")
+        if layer.attention_compressor is None:
+            raise RuntimeError("compressed layer requires compressor tensors")
+        if self.ratio == 4 and layer.indexer is None:
+            raise RuntimeError("ratio-4 layer requires indexer tensors")
 
         residual = streams.to(torch.float32)
         attn_pre = self._hyper_pre(layer, residual, attention=True)
@@ -383,8 +427,15 @@ class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
         compressed_rows = cache.read_compressed(self.layer_idx)
         if compressed_rows.shape[0] > 0:
             index_rows = cache.read_indexer_rows(self.layer_idx)
-            row_indices = self._select_compressed_rows(layer, attn_input, index_rows)
-            selected = cache.read_compressed(self.layer_idx, row_indices=row_indices)
+            if self.ratio == 4:
+                row_indices = self._select_compressed_rows(
+                    layer,
+                    attn_input,
+                    index_rows,
+                )
+                selected = cache.read_compressed(self.layer_idx, row_indices=row_indices)
+            else:
+                selected = compressed_rows
             kv_rows = torch.cat([kv_rows, selected], dim=0)
         attn_output = self._attention_with_kv_rows(
             layer,
@@ -416,7 +467,6 @@ class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
         token_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         assert layer.attention_compressor is not None
-        assert layer.indexer is not None
         comp = layer.attention_compressor
         kv_cur, score_cur = compressor_pair_projection_reference(
             hidden,
@@ -432,9 +482,26 @@ class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
                 self.store.decode_matrix(comp.ape),
                 token_idx=token_idx,
                 head_dim=self.shape.head_dim,
-                ratio=4,
+                ratio=self.ratio,
             )
         )
+        if self.ratio != 4:
+            if comp_row is None:
+                return None
+            comp_row = rms_norm_reference(
+                comp_row,
+                self.store.tensor_to_torch(comp.norm, dtype=torch.float32),
+            )
+            comp_row = apply_rope_to_tail_reference(
+                comp_row,
+                token_idx=token_idx + 1 - self.ratio,
+                rotary_dim=self.shape.rotary_dim,
+            )
+            return comp_row, None
+
+        assert layer.indexer is not None
+        assert self.index_state_kv is not None
+        assert self.index_state_score is not None
         index_comp = layer.indexer.compressor
         index_kv_cur, index_score_cur = compressor_pair_projection_reference(
             hidden,
@@ -499,3 +566,13 @@ class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
         scores = indexer_scores_reference(index_query, index_weights, index_rows)
         top_k = min(self.shape.indexer_top_k, scores.numel())
         return indexer_topk_reference(scores, top_k=top_k)
+
+
+class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashCompressedLayerReferenceRunner):
+    def __init__(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        *,
+        shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
+    ) -> None:
+        super().__init__(store, layer_idx=2, shape=shape)

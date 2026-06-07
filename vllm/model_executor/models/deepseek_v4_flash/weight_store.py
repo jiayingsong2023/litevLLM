@@ -103,6 +103,7 @@ class DeepSeekV4FlashSemanticBindings:
     representative_layer_tensor: DeepSeekV4FlashTensor
     attention_query_by_layer: dict[int, DeepSeekV4FlashTensor]
     layers: tuple[DeepSeekV4FlashLayerSemanticBindings, ...]
+    output_hyper_connection: DeepSeekV4FlashHyperConnectionTensors | None = None
     output_norm: DeepSeekV4FlashTensor | None = None
     output_head: DeepSeekV4FlashTensor | None = None
 
@@ -358,6 +359,7 @@ def _bind_required_tensors(
             representative_layer_tensor=representative_layer_tensor,
             attention_query_by_layer=attention_query_by_layer,
             layers=layers,
+            output_hyper_connection=_bind_output_hyper_connection(model),
             output_norm=model.tensors.get("output_norm.weight"),
             output_head=model.tensors.get("output.weight"),
         ),
@@ -408,6 +410,17 @@ def _bind_hyper_connection(
     fn = _tensor(model, layer_idx, f"{prefix}_fn.weight")
     base = _tensor(model, layer_idx, f"{prefix}_base.weight")
     scale = _tensor(model, layer_idx, f"{prefix}_scale.weight")
+    if fn is None or base is None or scale is None:
+        return None
+    return DeepSeekV4FlashHyperConnectionTensors(fn=fn, base=base, scale=scale)
+
+
+def _bind_output_hyper_connection(
+    model: DeepSeekV4FlashGGUF,
+) -> DeepSeekV4FlashHyperConnectionTensors | None:
+    fn = model.tensors.get("output_hc_fn.weight")
+    base = model.tensors.get("output_hc_base.weight")
+    scale = model.tensors.get("output_hc_scale.weight")
     if fn is None or base is None or scale is None:
         return None
     return DeepSeekV4FlashHyperConnectionTensors(fn=fn, base=base, scale=scale)
@@ -549,6 +562,10 @@ def _bound_tensor_count(
         bound_names.add(bindings.output_norm.name)
     if bindings.output_head is not None:
         bound_names.add(bindings.output_head.name)
+    if bindings.output_hyper_connection is not None:
+        bound_names.add(bindings.output_hyper_connection.fn.name)
+        bound_names.add(bindings.output_hyper_connection.base.name)
+        bound_names.add(bindings.output_hyper_connection.scale.name)
     for tensor in bindings.attention_query_by_layer.values():
         bound_names.add(tensor.name)
     for layer in bindings.layers:
