@@ -13,7 +13,17 @@ def factorized_attention_projection_reference(
     a_weight: torch.Tensor,
     b_weight: torch.Tensor,
 ) -> torch.Tensor:
-    return factorized_linear_reference(hidden, a_weight, b_weight)
+    """Apply GGUF-oriented factor weights to a hidden vector.
+
+    DeepSeek V4 Flash GGUF attention factors are stored as (input, output).
+    The shared linear reference consumes row-major (output, input), so transpose
+    both factors before delegating.
+    """
+    return factorized_linear_reference(
+        hidden,
+        a_weight.transpose(0, 1),
+        b_weight.transpose(0, 1),
+    )
 
 
 def split_combined_kv_reference(
@@ -22,11 +32,16 @@ def split_combined_kv_reference(
     key_width: int,
     value_width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a 1-D combined K/V vector using caller-supplied semantic widths."""
+    """Split an already-projected 1-D K/V vector using known semantic widths.
+
+    This helper does not derive the target GGUF ``attn_kv.weight`` split. The
+    observed real tensor is 512-wide, and its key/value semantic split must be
+    resolved before real attention execution.
+    """
     if kv.ndim != 1:
         raise ValueError(f"kv must be 1-D; got {kv.ndim}-D")
-    if key_width < 0 or value_width < 0:
-        raise ValueError("widths must be non-negative")
+    if key_width <= 0 or value_width <= 0:
+        raise ValueError("widths must be positive")
     expected_width = key_width + value_width
     if kv.numel() != expected_width:
         raise ValueError(
