@@ -269,6 +269,39 @@ def _validate_tensor_types(tensors: dict[str, DeepSeekV4FlashTensor]) -> None:
             )
 
 
+def _validate_tensor_ranges(
+    tensors: dict[str, DeepSeekV4FlashTensor],
+    *,
+    data_offset: int,
+    file_size: int,
+) -> None:
+    ranges: list[tuple[int, int, str]] = []
+    for tensor in tensors.values():
+        if tensor.nbytes <= 0:
+            raise GGUFParseError(
+                f"tensor {tensor.name} has invalid byte size {tensor.nbytes}"
+            )
+
+        start = data_offset + tensor.offset
+        end = start + tensor.nbytes
+        if start < data_offset or end < start or end > file_size:
+            raise GGUFParseError(
+                f"tensor {tensor.name} range [{start}, {end}) exceeds file "
+                f"size {file_size}"
+            )
+        ranges.append((start, end, tensor.name))
+
+    ranges.sort()
+    for (_, prev_end, prev_name), (start, _end, name) in zip(
+        ranges, ranges[1:], strict=False
+    ):
+        if start < prev_end:
+            raise GGUFParseError(
+                "tensor payload overlap: "
+                f"{prev_name} ends at {prev_end}, {name} starts at {start}"
+            )
+
+
 def read_deepseek_v4_flash_gguf_from_view(
     path: Path,
     data: memoryview,
@@ -303,6 +336,7 @@ def read_deepseek_v4_flash_gguf_from_view(
         cursor.pos,
         metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT),
     )
+    _validate_tensor_ranges(tensors, data_offset=data_offset, file_size=len(data))
 
     return DeepSeekV4FlashGGUF(
         path=path,

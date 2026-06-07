@@ -1,10 +1,17 @@
 import struct
+from pathlib import Path
 
+import pytest
 from fixtures import write_minimal_deepseek_v4_flash_gguf
 
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGUFParseError,
     read_deepseek_v4_flash_gguf,
+)
+
+TARGET_GGUF = Path(
+    "models/DeepSeek-V4-Flash-ds4/"
+    "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 )
 
 
@@ -71,6 +78,52 @@ def test_reader_accepts_real_auxiliary_tensor_types(tmp_path) -> None:
     assert model.tensors["blk.0.ffn_gate_tid2eid.weight"].tensor_type == 26
 
 
+def test_reader_rejects_overlapping_tensor_payloads(tmp_path) -> None:
+    path = tmp_path / "overlap.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight", "blk.0.attn_q.weight"),
+        tensor_types=(0, 0),
+        tensor_dims={"token_embd.weight": (1,), "blk.0.attn_q.weight": (1,)},
+        tensor_payloads={
+            "token_embd.weight": b"\x00\x00\x00\x00",
+            "blk.0.attn_q.weight": b"\x01\x00\x00\x00",
+        },
+        tensor_offsets={"token_embd.weight": 0, "blk.0.attn_q.weight": 0},
+    )
+
+    with pytest.raises(GGUFParseError, match="overlap"):
+        read_deepseek_v4_flash_gguf(path)
+
+
+def test_reader_rejects_out_of_file_tensor_payload(tmp_path) -> None:
+    path = tmp_path / "out-of-file.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight",),
+        tensor_types=(0,),
+        tensor_dims={"token_embd.weight": (1,)},
+        tensor_payloads={"token_embd.weight": b""},
+        tensor_offsets={"token_embd.weight": 128},
+    )
+
+    with pytest.raises(GGUFParseError, match="exceeds file size"):
+        read_deepseek_v4_flash_gguf(path)
+
+
+def test_reader_rejects_zero_byte_tensor_payload(tmp_path) -> None:
+    path = tmp_path / "zero-byte.gguf"
+    write_minimal_deepseek_v4_flash_gguf(
+        path,
+        tensor_names=("token_embd.weight",),
+        tensor_types=(0,),
+        tensor_dims={"token_embd.weight": (0,)},
+    )
+
+    with pytest.raises(GGUFParseError, match="invalid byte size"):
+        read_deepseek_v4_flash_gguf(path)
+
+
 def test_reader_skips_unused_array_metadata(tmp_path) -> None:
     path = tmp_path / "array-metadata.gguf"
 
@@ -92,3 +145,14 @@ def test_reader_skips_unused_array_metadata(tmp_path) -> None:
 
     assert model.tensors["token_embd.weight"].name == "token_embd.weight"
     assert "tokenizer.ggml.tokens" not in model.metadata
+
+
+@pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
+def test_real_gguf_all_tensor_ranges_are_inside_file() -> None:
+    model = read_deepseek_v4_flash_gguf(TARGET_GGUF)
+    file_size = TARGET_GGUF.stat().st_size
+
+    for tensor in model.tensors.values():
+        start = model.data_offset + tensor.offset
+        assert 0 <= start < file_size
+        assert start + tensor.nbytes <= file_size
