@@ -9,12 +9,19 @@ import torch
 
 from .attention import (
     apply_rope_to_tail_reference,
+    compressor_pair_projection_reference,
+    compressor_update_state_reference,
     grouped_output_projection_reference,
+    indexer_query_projection_reference,
+    indexer_scores_reference,
+    indexer_topk_reference,
+    indexer_weight_projection_reference,
     latent_kv_projection_reference,
     per_head_rms_norm_reference,
     q_lora_attention_projection_reference,
     shared_kv_swa_attention_reference,
 )
+from .compressed_kv import DeepSeekV4CompressedKVCache
 from .config import DEEPSEEK_V4_FLASH_SHAPE, DeepSeekV4FlashShape
 from .hyper_connection import (
     hyper_connection_post_reference,
@@ -321,3 +328,174 @@ class DeepSeekV4FlashLayer0ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceR
         shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
     ) -> None:
         super().__init__(store, layer_idx=0, shape=shape)
+
+
+class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceRunner):
+    """Layer-2 ratio-4 compressed/indexer bring-up runner."""
+
+    def __init__(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        *,
+        shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
+    ) -> None:
+        super().__init__(store, layer_idx=0, shape=shape)
+        self.layer_idx = 2
+        width = 2 * shape.head_dim
+        index_width = 2 * shape.indexer_head_dim
+        self.attn_state_kv = torch.zeros((8, width), dtype=torch.float32)
+        self.attn_state_score = torch.full((8, width), -1000.0, dtype=torch.float32)
+        self.index_state_kv = torch.zeros((8, index_width), dtype=torch.float32)
+        self.index_state_score = torch.full(
+            (8, index_width),
+            -1000.0,
+            dtype=torch.float32,
+        )
+
+    def forward(
+        self,
+        streams: torch.Tensor,
+        *,
+        token_id: int,
+        token_idx: int,
+        cache: DeepSeekV4CompressedKVCache,
+    ) -> torch.Tensor:
+        if streams.shape != (4, self.shape.hidden_size):
+            raise ValueError(
+                f"streams shape must be (4, {self.shape.hidden_size}); "
+                f"got {tuple(streams.shape)}"
+            )
+        layer = self.store.bindings.layers[self.layer_idx]
+        if layer.attention_compressor is None or layer.indexer is None:
+            raise RuntimeError("layer 2 requires compressor and indexer tensors")
+
+        residual = streams.to(torch.float32)
+        attn_pre = self._hyper_pre(layer, residual, attention=True)
+        attn_input = self._norm(attn_pre.mixed, layer.attention_norm)
+        current_kv = self._kv_latent(layer, attn_input, token_idx)
+        cache.append_raw(self.layer_idx, token_idx, current_kv, current_kv)
+        raw_keys, _raw_values = cache.read_raw_window(
+            self.layer_idx,
+            token_idx,
+            self.shape.sliding_window,
+        )
+        kv_rows = raw_keys
+        compressed_rows = cache.read_compressed(self.layer_idx)
+        if compressed_rows.shape[0] > 0:
+            index_rows = cache.read_indexer_rows(self.layer_idx)
+            row_indices = self._select_compressed_rows(layer, attn_input, index_rows)
+            selected = cache.read_compressed(self.layer_idx, row_indices=row_indices)
+            kv_rows = torch.cat([kv_rows, selected], dim=0)
+        attn_output = self._attention_with_kv_rows(
+            layer,
+            attn_input,
+            token_idx,
+            kv_rows,
+        )
+        emitted = self._update_compressors(layer, attn_input, token_idx)
+        if emitted is not None:
+            comp_row, index_row = emitted
+            cache.append_compressed(
+                self.layer_idx,
+                token_idx,
+                comp_row,
+                indexer_row=index_row,
+            )
+        streams = hyper_connection_post_reference(attn_output, residual, attn_pre)
+
+        residual = streams.to(torch.float32)
+        ffn_pre = self._hyper_pre(layer, residual, attention=False)
+        ffn_input = self._norm(ffn_pre.mixed, layer.ffn_norm)
+        ffn_output = self._moe(layer, ffn_input, token_id=token_id)
+        return hyper_connection_post_reference(ffn_output, residual, ffn_pre)
+
+    def _update_compressors(
+        self,
+        layer: DeepSeekV4FlashLayerSemanticBindings,
+        hidden: torch.Tensor,
+        token_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        assert layer.attention_compressor is not None
+        assert layer.indexer is not None
+        comp = layer.attention_compressor
+        kv_cur, score_cur = compressor_pair_projection_reference(
+            hidden,
+            self.store.decode_matrix(comp.kv),
+            self.store.decode_matrix(comp.gate),
+        )
+        self.attn_state_kv, self.attn_state_score, comp_row = (
+            compressor_update_state_reference(
+                self.attn_state_kv,
+                self.attn_state_score,
+                kv_cur,
+                score_cur,
+                self.store.decode_matrix(comp.ape),
+                token_idx=token_idx,
+                head_dim=self.shape.head_dim,
+                ratio=4,
+            )
+        )
+        index_comp = layer.indexer.compressor
+        index_kv_cur, index_score_cur = compressor_pair_projection_reference(
+            hidden,
+            self.store.decode_matrix(index_comp.kv),
+            self.store.decode_matrix(index_comp.gate),
+        )
+        self.index_state_kv, self.index_state_score, index_row = (
+            compressor_update_state_reference(
+                self.index_state_kv,
+                self.index_state_score,
+                index_kv_cur,
+                index_score_cur,
+                self.store.decode_matrix(index_comp.ape),
+                token_idx=token_idx,
+                head_dim=self.shape.indexer_head_dim,
+                ratio=4,
+            )
+        )
+        if comp_row is None or index_row is None:
+            return None
+        comp_row = rms_norm_reference(
+            comp_row,
+            self.store.tensor_to_torch(comp.norm, dtype=torch.float32),
+        )
+        comp_row = apply_rope_to_tail_reference(
+            comp_row,
+            token_idx=token_idx + 1 - 4,
+            rotary_dim=self.shape.rotary_dim,
+        )
+        index_row = rms_norm_reference(
+            index_row,
+            self.store.tensor_to_torch(index_comp.norm, dtype=torch.float32),
+        )
+        return comp_row, index_row
+
+    def _select_compressed_rows(
+        self,
+        layer: DeepSeekV4FlashLayerSemanticBindings,
+        hidden: torch.Tensor,
+        index_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        assert layer.attention_query_a is not None
+        assert layer.attention_query_a_norm is not None
+        assert layer.indexer is not None
+        qr = self.store.decode_matrix(layer.attention_query_a).transpose(0, 1).matmul(
+            hidden.to(torch.float32)
+        )
+        qr_norm = rms_norm_reference(
+            qr,
+            self.store.tensor_to_torch(layer.attention_query_a_norm, dtype=torch.float32),
+        )
+        index_query = indexer_query_projection_reference(
+            qr_norm,
+            self.store.decode_matrix(layer.indexer.query_b),
+            indexer_heads=self.shape.indexer_heads,
+            indexer_head_dim=self.shape.indexer_head_dim,
+        )
+        index_weights = indexer_weight_projection_reference(
+            hidden,
+            self.store.decode_matrix(layer.indexer.projection),
+        )
+        scores = indexer_scores_reference(index_query, index_weights, index_rows)
+        top_k = min(self.shape.indexer_top_k, scores.numel())
+        return indexer_topk_reference(scores, top_k=top_k)
