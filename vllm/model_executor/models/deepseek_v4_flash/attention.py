@@ -424,3 +424,103 @@ def indexer_topk_reference(scores: torch.Tensor, *, top_k: int) -> torch.Tensor:
             f"top_k must be in [1, {scores.numel()}]; got {top_k}"
         )
     return torch.topk(scores.to(torch.float32), k=top_k, sorted=True).indices
+
+
+def compressor_pool_state_reference(
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+    *,
+    head_dim: int,
+    ratio: int,
+) -> torch.Tensor:
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive; got {ratio}")
+    coff = 2 if ratio == 4 else 1
+    width = coff * head_dim
+    expected_shape = (coff * ratio, width)
+    if state_kv.shape != expected_shape:
+        raise ValueError(
+            f"state_kv shape must be {expected_shape}; got {tuple(state_kv.shape)}"
+        )
+    if state_score.shape != expected_shape:
+        raise ValueError(
+            "state_score shape must match state_kv; "
+            f"got {tuple(state_score.shape)}"
+        )
+
+    pooled = torch.empty(head_dim, dtype=torch.float32, device=state_kv.device)
+    kv = state_kv.to(torch.float32)
+    score = state_score.to(torch.float32)
+    if ratio == 4:
+        primary_scores = score[:ratio, :head_dim]
+        carry_scores = score[ratio : 2 * ratio, head_dim : 2 * head_dim]
+        primary_kv = kv[:ratio, :head_dim]
+        carry_kv = kv[ratio : 2 * ratio, head_dim : 2 * head_dim]
+        all_scores = torch.cat([primary_scores, carry_scores], dim=0)
+        all_kv = torch.cat([primary_kv, carry_kv], dim=0)
+    else:
+        all_scores = score[:ratio, :head_dim]
+        all_kv = kv[:ratio, :head_dim]
+
+    weights = torch.softmax(all_scores, dim=0)
+    pooled.copy_((weights * all_kv).sum(dim=0))
+    return pooled
+
+
+def compressor_update_state_reference(
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+    kv_cur: torch.Tensor,
+    score_cur: torch.Tensor,
+    ape_weight: torch.Tensor,
+    *,
+    token_idx: int,
+    head_dim: int,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if token_idx < 0:
+        raise ValueError(f"token_idx must be non-negative; got {token_idx}")
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive; got {ratio}")
+    coff = 2 if ratio == 4 else 1
+    width = coff * head_dim
+    expected_shape = (coff * ratio, width)
+    if state_kv.shape != expected_shape or state_score.shape != expected_shape:
+        raise ValueError(
+            f"compressor state shape must be {expected_shape}; "
+            f"got {tuple(state_kv.shape)} and {tuple(state_score.shape)}"
+        )
+    if kv_cur.shape != (width,) or score_cur.shape != (width,):
+        raise ValueError(
+            f"current compressor rows must have shape ({width},); "
+            f"got {tuple(kv_cur.shape)} and {tuple(score_cur.shape)}"
+        )
+    if ape_weight.shape != (width, ratio):
+        raise ValueError(
+            f"ape_weight shape must be ({width}, {ratio}); "
+            f"got {tuple(ape_weight.shape)}"
+        )
+
+    pos_mod = token_idx % ratio
+    row = ratio + pos_mod if ratio == 4 else pos_mod
+    next_kv = state_kv.to(torch.float32).clone()
+    next_score = state_score.to(torch.float32).clone()
+    next_kv[row] = kv_cur.to(torch.float32)
+    next_score[row] = score_cur.to(torch.float32) + ape_weight[:, pos_mod].to(
+        torch.float32
+    )
+
+    emitted: torch.Tensor | None = None
+    if compressor_should_emit_reference(token_idx=token_idx, ratio=ratio):
+        emitted = compressor_pool_state_reference(
+            next_kv,
+            next_score,
+            head_dim=head_dim,
+            ratio=ratio,
+        )
+        if ratio == 4:
+            next_kv[:ratio] = next_kv[ratio : 2 * ratio]
+            next_score[:ratio] = next_score[ratio : 2 * ratio]
+            next_kv[ratio : 2 * ratio] = next_kv[:ratio]
+            next_score[ratio : 2 * ratio] = next_score[:ratio]
+    return next_kv, next_score, emitted

@@ -4,7 +4,9 @@ import torch
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     apply_rope_to_tail_reference,
     compressor_pair_projection_reference,
+    compressor_pool_state_reference,
     compressor_should_emit_reference,
+    compressor_update_state_reference,
     grouped_output_projection_reference,
     indexer_query_projection_reference,
     indexer_scores_reference,
@@ -217,3 +219,43 @@ def test_indexer_scores_and_topk_reference() -> None:
 
     torch.testing.assert_close(scores, torch.tensor([1.0, 2.0, 2.0]))
     torch.testing.assert_close(topk, torch.tensor([1, 2]))
+
+
+def test_compressor_pool_state_reference_ratio4_uses_both_lanes() -> None:
+    state_kv = torch.zeros((8, 4))
+    state_score = torch.full((8, 4), -1000.0)
+    state_kv[0, 0] = 1.0
+    state_score[0, 0] = 0.0
+    state_kv[4, 3] = 5.0
+    state_score[4, 3] = 0.0
+
+    pooled = compressor_pool_state_reference(
+        state_kv,
+        state_score,
+        head_dim=2,
+        ratio=4,
+    )
+
+    torch.testing.assert_close(pooled, torch.tensor([1.0, 5.0]))
+
+
+def test_compressor_update_state_reference_emits_on_ratio_boundary() -> None:
+    state_kv = torch.zeros((8, 4))
+    state_score = torch.full((8, 4), -1000.0)
+    kv_cur = torch.tensor([4.0, 0.0, 0.0, 8.0])
+    score_cur = torch.zeros(4)
+    ape = torch.zeros((4, 4))
+
+    _next_kv, _next_score, emitted = compressor_update_state_reference(
+        state_kv,
+        state_score,
+        kv_cur,
+        score_cur,
+        ape,
+        token_idx=3,
+        head_dim=2,
+        ratio=4,
+    )
+
+    assert emitted is not None
+    torch.testing.assert_close(emitted, torch.tensor([0.0, 8.0]))

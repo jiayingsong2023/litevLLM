@@ -125,6 +125,32 @@ class DeepSeekV4CompressedKVCache:
             dtype=torch.long,
             device=device,
         )
+        max_compressed_rows = context_length // 4 + 2
+        self.compressed_rows = torch.empty(
+            (num_layers, max_compressed_rows, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        self.compressed_token_indices = torch.full(
+            (num_layers, max_compressed_rows),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        self.indexer_rows = torch.empty(
+            (
+                num_layers,
+                max_compressed_rows,
+                DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        self._compressed_counts = torch.zeros(
+            (num_layers,),
+            dtype=torch.long,
+            device=device,
+        )
 
     def append_raw(
         self,
@@ -176,6 +202,69 @@ class DeepSeekV4CompressedKVCache:
             self.raw_keys[layer_idx, sorted_slots],
             self.raw_values[layer_idx, sorted_slots],
         )
+
+    def append_compressed(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        row: torch.Tensor,
+        *,
+        indexer_row: torch.Tensor | None = None,
+    ) -> int:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        self._validate_raw_row("compressed row", row)
+        if indexer_row is not None:
+            if indexer_row.shape != (DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,):
+                raise ValueError(
+                    "indexer row shape must be "
+                    f"({DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim},); "
+                    f"got {tuple(indexer_row.shape)}"
+                )
+            if indexer_row.dtype != self.indexer_rows.dtype:
+                raise ValueError(
+                    f"indexer row dtype must be {self.indexer_rows.dtype}; "
+                    f"got {indexer_row.dtype}"
+                )
+            if indexer_row.device != self.indexer_rows.device:
+                raise ValueError(
+                    f"indexer row device must be {self.indexer_rows.device}; "
+                    f"got {indexer_row.device}"
+                )
+        slot = int(self._compressed_counts[layer_idx].item())
+        if slot >= self.compressed_rows.shape[1]:
+            raise ValueError("compressed cache capacity exceeded")
+        self.compressed_rows[layer_idx, slot].copy_(row)
+        self.compressed_token_indices[layer_idx, slot] = token_idx
+        if indexer_row is not None:
+            self.indexer_rows[layer_idx, slot].copy_(indexer_row)
+        self._compressed_counts[layer_idx] += 1
+        return slot
+
+    def read_compressed(
+        self,
+        layer_idx: int,
+        *,
+        row_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self._validate_layer(layer_idx)
+        count = int(self._compressed_counts[layer_idx].item())
+        if row_indices is None:
+            return self.compressed_rows[layer_idx, :count]
+        if row_indices.ndim != 1:
+            raise ValueError(
+                f"row_indices must be 1-D; got {row_indices.ndim}-D"
+            )
+        if row_indices.numel() == 0:
+            return self.compressed_rows[layer_idx, :0]
+        if torch.any(row_indices < 0) or torch.any(row_indices >= count):
+            raise ValueError("compressed row index out of range")
+        return self.compressed_rows[layer_idx, row_indices.to(torch.long)]
+
+    def read_indexer_rows(self, layer_idx: int) -> torch.Tensor:
+        self._validate_layer(layer_idx)
+        count = int(self._compressed_counts[layer_idx].item())
+        return self.indexer_rows[layer_idx, :count]
 
     def _validate_layer(self, layer_idx: int) -> None:
         if layer_idx < 0 or layer_idx >= self.num_layers:

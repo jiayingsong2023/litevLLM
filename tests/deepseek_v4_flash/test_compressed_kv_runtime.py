@@ -143,3 +143,28 @@ def test_raw_swa_cache_validation_rejects_device_mismatch() -> None:
             key=torch.zeros(4),
             value=torch.empty(4, device="meta"),
         )
+
+
+def test_compressed_cache_appends_and_reads_indexed_rows() -> None:
+    cache = DeepSeekV4CompressedKVCache(context_length=256, hidden_size=4)
+    first = cache.append_compressed(
+        layer_idx=2,
+        token_idx=3,
+        row=torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        indexer_row=torch.arange(128, dtype=torch.float32),
+    )
+    second = cache.append_compressed(
+        layer_idx=2,
+        token_idx=7,
+        row=torch.tensor([5.0, 6.0, 7.0, 8.0]),
+        indexer_row=torch.arange(128, dtype=torch.float32) + 10,
+    )
+
+    assert first == 0
+    assert second == 1
+    selected = cache.read_compressed(layer_idx=2, row_indices=torch.tensor([1]))
+    indexer_rows = cache.read_indexer_rows(layer_idx=2)
+
+    torch.testing.assert_close(selected, torch.tensor([[5.0, 6.0, 7.0, 8.0]]))
+    assert indexer_rows.shape == (2, 128)
+    torch.testing.assert_close(indexer_rows[0, :3], torch.tensor([0.0, 1.0, 2.0]))
