@@ -12,10 +12,19 @@ import torch
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE
 from .gguf_reader import (
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q8_0,
     DeepSeekV4FlashGGUF,
     DeepSeekV4FlashTensor,
     ggml_tensor_nbytes,
     read_deepseek_v4_flash_gguf_from_view,
+)
+from .quant import (
+    iq2_xxs_matrix_from_gguf_payload,
+    q2_k_matrix_from_gguf_payload,
+    q8_0_dequantize_reference,
+    q8_0_matrix_from_gguf_payload,
 )
 
 
@@ -195,6 +204,60 @@ class DeepSeekV4FlashWeightStore:
         finally:
             payload.release()
         return data.reshape(shape or tensor.dims)
+
+    def decode_grouped_expert_matrix(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> torch.Tensor:
+        if len(tensor.dims) != 3:
+            raise DeepSeekV4FlashWeightStoreError(
+                f"grouped expert tensor {tensor.name} must have dims "
+                f"(input, output, expert_count); got {tensor.dims}"
+            )
+        input_size, output_size, _expert_count = tensor.dims
+        expert_offset = grouped_expert_payload_offset(
+            expert_id=expert_id,
+            projection_dims=tensor.dims,
+            projection_type=tensor.tensor_type,
+        )
+        expert_nbytes = ggml_tensor_nbytes(
+            (input_size, output_size),
+            tensor.tensor_type,
+        )
+        payload = self.tensor_payload(tensor)
+        expert_payload: memoryview | None = None
+        try:
+            expert_payload = payload[expert_offset : expert_offset + expert_nbytes]
+            expert_bytes = expert_payload.tobytes()
+        finally:
+            if expert_payload is not None:
+                expert_payload.release()
+            payload.release()
+
+        if tensor.tensor_type == GGML_TYPE_IQ2_XXS:
+            return iq2_xxs_matrix_from_gguf_payload(
+                expert_bytes,
+                rows=output_size,
+                columns=input_size,
+            )
+        if tensor.tensor_type == GGML_TYPE_Q2_K:
+            return q2_k_matrix_from_gguf_payload(
+                expert_bytes,
+                rows=output_size,
+                columns=input_size,
+            )
+        if tensor.tensor_type == GGML_TYPE_Q8_0:
+            values, scales = q8_0_matrix_from_gguf_payload(
+                expert_bytes,
+                rows=output_size,
+                columns=input_size,
+            )
+            return q8_0_dequantize_reference(values, scales)
+        raise DeepSeekV4FlashWeightStoreError(
+            f"unsupported grouped expert tensor type for {tensor.name}: "
+            f"{tensor.tensor_type}"
+        )
 
     def close(self) -> None:
         try:
