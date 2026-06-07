@@ -294,3 +294,133 @@ def grouped_output_projection_reference(
     return output_b_weight.transpose(0, 1).to(torch.float32).matmul(
         low_rank.reshape(-1)
     )
+
+
+def compressor_pair_projection_reference(
+    hidden: torch.Tensor,
+    kv_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hidden.ndim != 1:
+        raise ValueError(f"hidden must be 1-D; got {hidden.ndim}-D")
+    if kv_weight.ndim != 2 or gate_weight.ndim != 2:
+        raise ValueError("compressor weights must be 2-D")
+    if kv_weight.shape != gate_weight.shape:
+        raise ValueError(
+            "compressor KV and gate weights must have matching shapes; "
+            f"got {tuple(kv_weight.shape)} and {tuple(gate_weight.shape)}"
+        )
+    if kv_weight.shape[0] != hidden.numel():
+        raise ValueError(
+            "compressor input dimension must match hidden size; "
+            f"got {kv_weight.shape[0]} and {hidden.numel()}"
+        )
+    hidden_f32 = hidden.to(torch.float32)
+    return (
+        kv_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
+        gate_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
+    )
+
+
+def compressor_should_emit_reference(*, token_idx: int, ratio: int) -> bool:
+    if token_idx < 0:
+        raise ValueError(f"token_idx must be non-negative; got {token_idx}")
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive; got {ratio}")
+    return (token_idx + 1) % ratio == 0
+
+
+def indexer_query_projection_reference(
+    qr_norm: torch.Tensor,
+    indexer_q_b_weight: torch.Tensor,
+    *,
+    indexer_heads: int = 64,
+    indexer_head_dim: int = 128,
+) -> torch.Tensor:
+    if qr_norm.ndim != 1:
+        raise ValueError(f"qr_norm must be 1-D; got {qr_norm.ndim}-D")
+    if indexer_q_b_weight.ndim != 2:
+        raise ValueError(
+            f"indexer_q_b_weight must be 2-D; got {indexer_q_b_weight.ndim}-D"
+        )
+    expected_width = indexer_heads * indexer_head_dim
+    if indexer_q_b_weight.shape[0] != qr_norm.numel():
+        raise ValueError(
+            "indexer query input dimension must match q rank; "
+            f"got {indexer_q_b_weight.shape[0]} and {qr_norm.numel()}"
+        )
+    if indexer_q_b_weight.shape[1] != expected_width:
+        raise ValueError(
+            "indexer query output dimension must match heads * head_dim; "
+            f"got {indexer_q_b_weight.shape[1]} and {expected_width}"
+        )
+    projected = indexer_q_b_weight.transpose(0, 1).to(torch.float32).matmul(
+        qr_norm.to(torch.float32)
+    )
+    return projected.reshape(indexer_heads, indexer_head_dim)
+
+
+def indexer_weight_projection_reference(
+    hidden: torch.Tensor,
+    indexer_proj_weight: torch.Tensor,
+) -> torch.Tensor:
+    if hidden.ndim != 1:
+        raise ValueError(f"hidden must be 1-D; got {hidden.ndim}-D")
+    if indexer_proj_weight.ndim != 2:
+        raise ValueError(
+            f"indexer_proj_weight must be 2-D; got {indexer_proj_weight.ndim}-D"
+        )
+    if indexer_proj_weight.shape[0] != hidden.numel():
+        raise ValueError(
+            "indexer projection input dimension must match hidden size; "
+            f"got {indexer_proj_weight.shape[0]} and {hidden.numel()}"
+        )
+    return indexer_proj_weight.transpose(0, 1).to(torch.float32).matmul(
+        hidden.to(torch.float32)
+    )
+
+
+def indexer_scores_reference(
+    indexer_query: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    compressed_rows: torch.Tensor,
+    *,
+    scale: float | None = None,
+) -> torch.Tensor:
+    if indexer_query.ndim != 2:
+        raise ValueError(f"indexer_query must be 2-D; got {indexer_query.ndim}-D")
+    if indexer_weights.shape != (indexer_query.shape[0],):
+        raise ValueError(
+            f"indexer_weights shape must be ({indexer_query.shape[0]},); "
+            f"got {tuple(indexer_weights.shape)}"
+        )
+    if compressed_rows.ndim != 2:
+        raise ValueError(
+            f"compressed_rows must be 2-D; got {compressed_rows.ndim}-D"
+        )
+    if compressed_rows.shape[1] != indexer_query.shape[1]:
+        raise ValueError(
+            "compressed row width must match indexer head dim; "
+            f"got {compressed_rows.shape[1]} and {indexer_query.shape[1]}"
+        )
+    score_scale = (
+        float(scale)
+        if scale is not None
+        else 1.0
+        / math.sqrt(float(indexer_query.shape[0] * indexer_query.shape[1]))
+    )
+    per_head_scores = indexer_query.to(torch.float32).matmul(
+        compressed_rows.to(torch.float32).T
+    )
+    weighted = indexer_weights.to(torch.float32).reshape(-1, 1) * per_head_scores
+    return weighted.sum(dim=0) * score_scale
+
+
+def indexer_topk_reference(scores: torch.Tensor, *, top_k: int) -> torch.Tensor:
+    if scores.ndim != 1:
+        raise ValueError(f"scores must be 1-D; got {scores.ndim}-D")
+    if top_k <= 0 or top_k > scores.numel():
+        raise ValueError(
+            f"top_k must be in [1, {scores.numel()}]; got {top_k}"
+        )
+    return torch.topk(scores.to(torch.float32), k=top_k, sorted=True).indices

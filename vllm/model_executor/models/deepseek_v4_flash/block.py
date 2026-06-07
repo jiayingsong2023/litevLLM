@@ -85,21 +85,28 @@ class DeepSeekV4FlashBlockReference:
         return hidden + ffn_output.to(torch.float32)
 
 
-class DeepSeekV4FlashLayer0ReferenceRunner:
-    """CPU reference runner for layer 0 one-token bring-up.
+class DeepSeekV4FlashSlidingLayerReferenceRunner:
+    """CPU reference runner for one sliding-only layer bring-up.
 
-    This is intentionally narrow: layer 0 is sliding-only and does not use the
-    compressed/indexer attention path. The runner is for correctness bring-up,
-    not for production latency.
+    Layers 0 and 1 are sliding-only and do not use the compressed/indexer
+    attention path. The runner is for correctness bring-up, not for production
+    latency.
     """
 
     def __init__(
         self,
         store: DeepSeekV4FlashWeightStore,
         *,
+        layer_idx: int,
         shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
     ) -> None:
+        if layer_idx < 0 or layer_idx >= 2:
+            raise ValueError(
+                "DeepSeekV4FlashSlidingLayerReferenceRunner supports only "
+                f"sliding-only layers 0 and 1; got {layer_idx}"
+            )
         self.store = store
+        self.layer_idx = layer_idx
         self.shape = shape
 
     def forward(
@@ -115,7 +122,7 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
                 f"streams shape must be (4, {self.shape.hidden_size}); "
                 f"got {tuple(streams.shape)}"
             )
-        layer = self.store.bindings.layers[0]
+        layer = self.store.bindings.layers[self.layer_idx]
 
         residual = streams.to(torch.float32)
         attn_pre = self._hyper_pre(layer, residual, attention=True)
@@ -149,7 +156,7 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
     ):
         hc = layer.attention_hyper_connection if attention else layer.ffn_hyper_connection
         if hc is None:
-            raise RuntimeError("layer 0 requires hyper-connection tensors")
+            raise RuntimeError("sliding layer requires hyper-connection tensors")
         return hyper_connection_pre_reference(
             streams,
             self.store.decode_matrix(hc.fn),
@@ -186,7 +193,7 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
         token_idx: int,
     ) -> torch.Tensor:
         if layer.attention_key_value is None or layer.attention_key_value_a_norm is None:
-            raise RuntimeError("layer 0 requires KV latent tensors")
+            raise RuntimeError("sliding layer requires KV latent tensors")
         kv = latent_kv_projection_reference(
             hidden,
             self.store.decode_matrix(layer.attention_key_value).transpose(0, 1),
@@ -217,7 +224,7 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
             layer.attention_output_b,
         )
         if any(tensor is None for tensor in required):
-            raise RuntimeError("layer 0 requires complete attention tensors")
+            raise RuntimeError("sliding layer requires complete attention tensors")
         assert layer.attention_query_a is not None
         assert layer.attention_query_a_norm is not None
         assert layer.attention_query_b is not None
@@ -265,10 +272,10 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
         token_id: int,
     ) -> torch.Tensor:
         if layer.shared_experts is None or layer.grouped_experts is None:
-            raise RuntimeError("layer 0 requires shared and routed experts")
+            raise RuntimeError("sliding layer requires shared and routed experts")
         shared = self._run_expert_group(layer.shared_experts, hidden)
         if layer.expert_token_to_expert_ids is None:
-            raise RuntimeError("layer 0 requires hash routing tensor")
+            raise RuntimeError("sliding layer requires hash routing tensor")
         expert_ids = hash_routed_expert_ids_reference(
             self.store.tensor_to_torch(
                 layer.expert_token_to_expert_ids,
@@ -304,3 +311,13 @@ class DeepSeekV4FlashLayer0ReferenceRunner:
             down = self.store.decode_grouped_expert_matrix(tensors.down, expert_id)
             up = self.store.decode_grouped_expert_matrix(tensors.up, expert_id)
         return grouped_expert_reference(hidden, gate, up, down)
+
+
+class DeepSeekV4FlashLayer0ReferenceRunner(DeepSeekV4FlashSlidingLayerReferenceRunner):
+    def __init__(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        *,
+        shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
+    ) -> None:
+        super().__init__(store, layer_idx=0, shape=shape)

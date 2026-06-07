@@ -8,6 +8,7 @@ import torch
 from vllm.model_executor.models.deepseek_v4_flash.block import (
     DeepSeekV4FlashBlockReference,
     DeepSeekV4FlashLayer0ReferenceRunner,
+    DeepSeekV4FlashSlidingLayerReferenceRunner,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import GGML_TYPE_F32
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
@@ -90,3 +91,22 @@ def test_real_layer0_executes_attention_and_moe() -> None:
 
     assert out.shape == (4, 4096)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
+def test_real_layer1_executes_sliding_attention_and_moe() -> None:
+    with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
+        runner = DeepSeekV4FlashSlidingLayerReferenceRunner(store, layer_idx=1)
+        out = runner.forward(
+            torch.ones((4, 4096), dtype=torch.float32),
+            token_id=1,
+            token_idx=0,
+        )
+
+    assert out.shape == (4, 4096)
+    assert torch.isfinite(out).all()
+
+
+def test_sliding_layer_runner_rejects_compressed_layers() -> None:
+    with pytest.raises(ValueError, match="supports only sliding-only layers"):
+        DeepSeekV4FlashSlidingLayerReferenceRunner(None, layer_idx=2)  # type: ignore[arg-type]

@@ -615,6 +615,16 @@ with mHC pre/post, shared K=V latent raw SWA, grouped attention output
 projection, shared expert, and hash-routed experts. The dedicated layer-0 real
 smoke passes with the downloaded target GGUF.
 
+Follow-up status: the runner has been generalized to
+`DeepSeekV4FlashSlidingLayerReferenceRunner`, and layer 1 now passes the same
+real sliding-only attention+MoE smoke. Layer 2 has entered the
+compressed/indexer phase: ratio-4 compressor and indexer tensor mappings are
+verified, and reference primitives exist for compressor KV/gate projection,
+ratio emit checks, indexer query/weight projection, indexer scoring, and top-k
+selection. Full layer-2 compressed attention is not wired yet because compressor
+frontier/state update and mixed raw+compressed attention still need to be
+implemented.
+
 - [x] **Step 5: Run tests and commit**
 
 Run:

@@ -3,7 +3,13 @@ import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     apply_rope_to_tail_reference,
+    compressor_pair_projection_reference,
+    compressor_should_emit_reference,
     grouped_output_projection_reference,
+    indexer_query_projection_reference,
+    indexer_scores_reference,
+    indexer_topk_reference,
+    indexer_weight_projection_reference,
     per_head_rms_norm_reference,
     raw_swa_attention_reference,
     shared_kv_swa_attention_reference,
@@ -159,3 +165,55 @@ def test_grouped_output_projection_reference_matches_manual_grouping() -> None:
     )
 
     torch.testing.assert_close(out, torch.tensor([1.0, 2.0, 5.0, 6.0]))
+
+
+def test_compressor_pair_projection_reference_projects_kv_and_gate() -> None:
+    hidden = torch.tensor([1.0, 2.0])
+    kv_weight = torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, 1.0]])
+    gate_weight = torch.tensor([[0.0, 1.0, 1.0], [2.0, 0.0, 1.0]])
+
+    kv, gate = compressor_pair_projection_reference(hidden, kv_weight, gate_weight)
+
+    torch.testing.assert_close(kv, torch.tensor([1.0, 2.0, 4.0]))
+    torch.testing.assert_close(gate, torch.tensor([4.0, 1.0, 3.0]))
+
+
+def test_compressor_should_emit_reference_uses_absolute_position() -> None:
+    assert compressor_should_emit_reference(token_idx=3, ratio=4) is True
+    assert compressor_should_emit_reference(token_idx=2, ratio=4) is False
+
+
+def test_indexer_query_projection_reference_returns_heads() -> None:
+    qr_norm = torch.tensor([1.0, 2.0])
+    weight = torch.ones((2, 6))
+
+    out = indexer_query_projection_reference(
+        qr_norm,
+        weight,
+        indexer_heads=3,
+        indexer_head_dim=2,
+    )
+
+    assert out.shape == (3, 2)
+    torch.testing.assert_close(out, torch.full((3, 2), 3.0))
+
+
+def test_indexer_weight_projection_reference_returns_head_weights() -> None:
+    out = indexer_weight_projection_reference(
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, 1.0]]),
+    )
+
+    torch.testing.assert_close(out, torch.tensor([1.0, 2.0, 4.0]))
+
+
+def test_indexer_scores_and_topk_reference() -> None:
+    query = torch.tensor([[1.0, 0.0], [0.0, 2.0]])
+    weights = torch.tensor([1.0, 0.5])
+    rows = torch.tensor([[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]])
+
+    scores = indexer_scores_reference(query, weights, rows, scale=1.0)
+    topk = indexer_topk_reference(scores, top_k=2)
+
+    torch.testing.assert_close(scores, torch.tensor([1.0, 2.0, 2.0]))
+    torch.testing.assert_close(topk, torch.tensor([1, 2]))

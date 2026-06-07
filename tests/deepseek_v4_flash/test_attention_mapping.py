@@ -44,6 +44,34 @@ def test_real_attention_tensor_shape_mapping_for_layer_0() -> None:
         assert layer.attention_sinks.dims == (64,)
 
 
+@pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
+def test_real_layer2_compressor_and_indexer_shape_mapping() -> None:
+    with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
+        layer = store.bindings.layers[2]
+        assert layer.attention_compressor is not None
+        assert layer.indexer is not None
+
+        assert layer.attention_compressor.kv.dims == (4096, 1024)
+        assert layer.attention_compressor.gate.dims == (4096, 1024)
+        assert layer.attention_compressor.ape.dims == (1024, 4)
+        assert layer.attention_compressor.norm.dims == (512,)
+
+        assert layer.indexer.query_b.dims == (1024, 8192)
+        assert layer.indexer.projection.dims == (4096, 64)
+        assert layer.indexer.compressor.kv.dims == (4096, 256)
+        assert layer.indexer.compressor.gate.dims == (4096, 256)
+        assert layer.indexer.compressor.ape.dims == (256, 4)
+        assert layer.indexer.compressor.norm.dims == (128,)
+
+        # Decode one representative matrix from each path to prove the real
+        # layer-2 tensors are accessible through the typed matrix accessor.
+        assert store.decode_matrix(layer.attention_compressor.kv).shape == (
+            4096,
+            1024,
+        )
+        assert store.decode_matrix(layer.indexer.projection).shape == (4096, 64)
+
+
 def test_factorized_attention_projection_reference_returns_b_output_shape() -> None:
     out = factorized_attention_projection_reference(
         torch.ones(4),
