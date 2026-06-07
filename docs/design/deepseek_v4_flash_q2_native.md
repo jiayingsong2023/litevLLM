@@ -67,28 +67,25 @@ Implemented:
 - Quant reference decoders and layout checks for `Q8_0`, `IQ2_XXS`, and `Q2_K`.
 - Raw KV runtime cache append/read helpers plus paged compressed-KV layout and
   allocation contracts.
-- Attention and router reference helpers used for isolated unit coverage.
-- Direct model forward smoke only for exactly one token: token embedding,
-  `output_norm` RMSNorm, and `Q8_0` output projection to finite `[1, vocab]`
-  logits. The model marks this with `limited_forward_smoke_only=True` and
-  rejects multi-token non-empty input.
-- OpenAI route exposure and a negative REST smoke that verifies an uninitialized
-  app-import server returns HTTP 503 for chat requests.
+- Attention, mHC, compressor/indexer, routing, and grouped expert reference
+  helpers used for isolated unit coverage.
+- Full 43-layer direct reference decode for exactly one input token through
+  real GGUF weights, returning finite `[1, vocab]` logits.
+- Direct greedy reference generation for `max_tokens=1`.
+- OpenAI route exposure, uninitialized-server HTTP 503 smoke, and a direct
+  reference REST hook for initialized engines that expose
+  `generate_greedy_reference_chat`.
 
 Not implemented:
 
-- Full transformer layer stack execution.
-- Factorized Q/O attention execution.
-- Combined KV tensor split and attention use.
-- Compressed attention execution.
-- Grouped expert execution.
-- Batch=1 greedy autoregressive decode.
-- Initialized OpenAI-compatible REST generation for this GGUF.
+- Multi-step autoregressive decode beyond `max_tokens=1`.
+- Production-speed Triton/ROCm kernels for the DeepSeek V4 Flash path.
+- Continuous batching for DeepSeek V4 Flash.
+- 4K/8K prompt prefill validation.
 
-The REST route is present, but initialized DeepSeek GGUF chat generation remains
-blocked because the OpenAI server uses `AsyncLLM`/`LiteEngine` full prefill and
-decode execution. That path is separate from the limited one-token direct model
-smoke.
+The direct reference path is correctness-first and very slow on CPU dense
+decoding: current full one-token tests take roughly eight minutes on the local
+machine. It is not a serving hot path.
 
 Current bounded validation commands:
 

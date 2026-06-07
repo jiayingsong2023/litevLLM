@@ -35,3 +35,31 @@ def test_openai_server_still_exposes_chat_route_for_deepseek_support() -> None:
     paths = {route.path for route in api_server.app.routes}
     assert "/v1/chat/completions" in paths
     assert "/v1/models" in paths
+
+
+def test_openai_server_uses_direct_reference_chat_hook() -> None:
+    class FakeDirectEngine:
+        def generate_greedy_reference_chat(self, prompt: str, *, max_tokens: int) -> str:
+            assert prompt == "x"
+            assert max_tokens == 1
+            return "ok"
+
+    previous_engine = api_server.engine
+    api_server.engine = FakeDirectEngine()  # type: ignore[assignment]
+    try:
+        response = TestClient(api_server.app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "x"}],
+                "temperature": 0,
+                "max_tokens": 1,
+            },
+        )
+    finally:
+        api_server.engine = previous_engine
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "chat.completion"
+    assert payload["choices"][0]["message"]["content"] == "ok"

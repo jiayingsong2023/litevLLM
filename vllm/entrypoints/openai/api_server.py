@@ -436,6 +436,30 @@ async def create_chat_completion(request: Request):
     )
     request_id = f"chat-{int(time.time())}"
 
+    direct_chat = getattr(runtime_engine, "generate_greedy_reference_chat", None)
+    if callable(direct_chat) and not stream:
+        if sampling_params.temperature not in (0, 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direct reference chat only supports temperature=0",
+            )
+        text = direct_chat(prompt, max_tokens=max_tokens)
+        return JSONResponse(
+            content={
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
     async def generate_stream() -> AsyncGenerator[str, None]:
         last_text = ""
         async for output in runtime_engine.generate(

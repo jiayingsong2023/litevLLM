@@ -18,18 +18,19 @@ Implemented today:
 - GGUF reader parses metadata/tensors and computes data-section offsets.
 - Weight store binds token embedding, output norm/head, factorized attention tensors, combined KV tensors, grouped expert tensors, router tensors, and metadata tensors.
 - Reference decoders exist for `Q8_0`, `IQ2_XXS`, and `Q2_K`.
-- Direct model smoke supports exactly one token through embedding, `output_norm`, and `output.weight`.
-- REST routes exist, but initialized REST generation is not implemented.
+- Direct model smoke supports exactly one token through embedding,
+  `output_norm`, and `output.weight`.
+- Full 43-layer direct reference decode now returns finite `[1, vocab]` logits
+  for one input token.
+- Direct greedy reference appends one generated token for `max_tokens=1`.
+- REST routes expose a direct reference hook when the initialized engine/model
+  supports `generate_greedy_reference_chat`.
 
 Not implemented:
 
-- Real transformer block execution.
-- Factorized Q/O attention execution.
-- Shared K=V latent `attn_kv.weight` use.
-- Compressed attention / indexer execution.
-- Grouped expert execution.
-- Batch=1 greedy decode.
-- Initialized REST generation.
+- Multi-step autoregressive decode beyond `max_tokens=1`.
+- 4K/8K prompt prefill validation.
+- Production-speed Triton/ROCm kernels for this model.
 
 ## Execution Strategy
 
