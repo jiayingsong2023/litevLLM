@@ -9,6 +9,10 @@ from vllm.kernels.triton.deepseek_v4_flash.attention import (
     DeepSeekV4AttentionKernelInputs,
     deepseek_v4_attention,
 )
+from vllm.kernels.triton.deepseek_v4_flash.moe import (
+    DeepSeekV4MoEKernelInputs,
+    deepseek_v4_moe,
+)
 from vllm.kernels.triton.deepseek_v4_flash.output import (
     DeepSeekV4OutputKernelInputs,
     deepseek_v4_output_projection,
@@ -120,5 +124,25 @@ class DeepSeekV4FlashGPUBackend:
                 kv_rows=kv_rows,
                 token_idx=token_idx,
                 attn_sinks=attn_sinks,
+            )
+        )
+
+    def routed_moe(
+        self,
+        *,
+        hidden: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expert_outputs: torch.Tensor,
+    ) -> torch.Tensor:
+        tensors = (hidden, expert_ids, expert_weights, expert_outputs)
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError("DeepSeek V4 Flash MoE inputs must be CUDA tensors")
+        return deepseek_v4_moe(
+            DeepSeekV4MoEKernelInputs(
+                hidden=hidden,
+                expert_ids=expert_ids,
+                expert_weights=expert_weights,
+                expert_outputs=expert_outputs,
             )
         )

@@ -10,7 +10,6 @@ from vllm.kernels.triton.deepseek_v4_flash import (
     DeepSeekV4MoEKernelInputs,
     DeepSeekV4OutputKernelInputs,
     deepseek_v4_cache_update,
-    deepseek_v4_moe,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
@@ -61,15 +60,6 @@ def test_deepseek_kernel_scaffolding_is_explicitly_not_implemented() -> None:
                 kv_row=torch.zeros(16),
                 cache_storage=torch.zeros(1, 1, 16),
                 logical_row=0,
-            )
-        )
-
-    with pytest.raises(NotImplementedError, match="MoE kernel"):
-        deepseek_v4_moe(
-            DeepSeekV4MoEKernelInputs(
-                hidden=torch.zeros(16),
-                expert_ids=torch.tensor([0], dtype=torch.int32),
-                expert_weights=torch.tensor([1.0], dtype=torch.float32),
             )
         )
 
