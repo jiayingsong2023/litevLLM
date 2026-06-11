@@ -43,7 +43,7 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
-## Implemented State As Of Task 8
+## Implemented State As Of GPU Migration Boundary Pass
 
 The branch currently has a limited, honest bring-up state. It does not yet meet
 the first-release target described above.
@@ -72,14 +72,26 @@ Implemented:
 - Full 43-layer direct reference decode for exactly one input token through
   real GGUF weights, returning finite `[1, vocab]` logits.
 - Direct greedy reference generation for `max_tokens=1`.
-- OpenAI route exposure, uninitialized-server HTTP 503 smoke, and a direct
-  reference REST hook for initialized engines that expose
-  `generate_greedy_reference_chat`.
+- OpenAI route exposure and smoke coverage through the normal
+  `AsyncLLM.generate()` engine path. Direct-reference REST and `AsyncLLM`
+  production hooks have been removed so the protocol layer remains a thin
+  control-plane adapter.
+- Explicit model execution boundaries:
+  `forward_full_reference()` remains the CPU correctness oracle,
+  `forward_full(..., use_kernel=True)` is an explicit future kernel dispatch
+  point, and `kernel_execution_available` remains `False` until real kernels
+  are wired.
+- Initial GPU-facing scaffolding under
+  `vllm/kernels/triton/deepseek_v4_flash/` for attention, cache updates, MoE,
+  output projection, compressed attention contracts, and Q8 linear reference
+  plumbing.
 
 Not implemented:
 
 - Multi-step autoregressive decode beyond `max_tokens=1`.
 - Production-speed Triton/ROCm kernels for the DeepSeek V4 Flash path.
+- Kernel-backed `forward()` execution; current kernel-facing functions are
+  interface contracts or explicit `NotImplementedError` stubs.
 - Continuous batching for DeepSeek V4 Flash.
 - 4K/8K prompt prefill validation.
 
@@ -108,6 +120,25 @@ Task 8 validation results recorded from the bounded run:
   reported `106 passed`.
 - `tests/run_deepseek_v4_flash_real_smoke.sh` reported `11 passed`, then
   `2 passed`.
+
+GPU migration boundary validation recorded after removing the direct-reference
+REST/AsyncLLM production hooks:
+
+- `timeout 120s uv run --no-sync pytest tests/smoke/test_deepseek_v4_flash_http_smoke.py -q`
+  reported `4 passed`.
+- `timeout 120s uv run --no-sync pytest tests/deepseek_v4_flash/test_async_llm_direct_reference.py -q`
+  reported `4 passed`.
+- `timeout 120s uv run --no-sync pytest tests/test_engine_executor_contracts.py -q`
+  reported `3 passed`.
+- `timeout 180s uv run --no-sync pytest tests/deepseek_v4_flash/test_block_reference.py tests/deepseek_v4_flash/test_model_dispatch_boundary.py -q`
+  reported `10 passed`.
+- `timeout 120s uv run --no-sync pytest tests/deepseek_v4_flash/test_kernel_scaffolding.py tests/deepseek_v4_flash/test_model_dispatch_boundary.py -q`
+  reported `5 passed`.
+- `bash tests/run_regression_suite.sh` reported
+  `123 passed, 2 skipped`.
+- `bash tests/run_inference_correctness_regression.sh` completed all requested
+  correctness regression stages successfully, including TinyLlama, Qwen3.5-9B
+  AWQ, Gemma4-31B, and Gemma4-26B checks.
 
 ## Current Project Fit
 
@@ -149,6 +180,10 @@ vllm/model_executor/models/deepseek_v4_flash/
   moe.py
   model.py
 vllm/kernels/triton/deepseek_v4_flash/
+  attention.py
+  cache.py
+  moe.py
+  output.py
   q8_linear.py
   iq2_xxs.py
   q2_k.py
@@ -157,8 +192,11 @@ vllm/kernels/triton/deepseek_v4_flash/
 ```
 
 The model package should stay vertical and explicit, but not monolithic.
-`model.py` wires layers together. Format parsing, quantized math, attention,
-and MoE execution stay in separate modules so they can be tested independently.
+`model.py` wires layers together and owns the reference/kernel dispatch
+boundary. Format parsing, quantized math, attention, and MoE execution stay in
+separate modules so they can be tested independently. The OpenAI API server,
+`AsyncLLM`, `LiteEngine`, and prefill/decode executors remain control-plane
+code and must not grow DeepSeek-specific math.
 
 ## Data Flow
 
