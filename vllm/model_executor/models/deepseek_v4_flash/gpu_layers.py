@@ -637,45 +637,76 @@ def _update_compressor_state(
         )
 
     norm = stager.stage_vector(compressor.norm)
-    if kv_cur.numel() != norm.numel():
+    row_width = norm.numel()
+    projection_width = kv_cur.numel()
+    if ratio == 4 and projection_width == 2 * row_width:
+        state_rows = 2 * ratio
+        use_ratio4_carry = True
+    elif projection_width == row_width:
+        state_rows = ratio
+        use_ratio4_carry = False
+    else:
         raise ValueError(
             "unsupported DeepSeek V4 Flash compressor projection layout: "
-            "projection width must match norm width for this GPU path; "
-            f"got {kv_cur.numel()} and {norm.numel()}"
+            "projection width must be row_width or 2 * row_width for ratio-4; "
+            f"got projection_width={projection_width}, row_width={row_width}, "
+            f"ratio={ratio}"
         )
     ape = stager.stage_matrix(compressor.ape)
     if ape.ndim != 2:
         raise ValueError(f"compressor ape must be 2-D; got {ape.ndim}-D")
-    if ape.shape != (norm.numel(), ratio):
+    if ape.shape != (projection_width, ratio):
         raise ValueError(
             "unsupported DeepSeek V4 Flash compressor APE layout: "
-            f"expected ({norm.numel()}, {ratio}), got {tuple(ape.shape)}"
+            f"expected ({projection_width}, {ratio}), got {tuple(ape.shape)}"
         )
 
     runtime_state = _get_compressor_runtime_state(
         state,
         layer_idx=layer_idx,
         state_name=state_name,
-        ratio=ratio,
-        row_width=norm.numel(),
+        state_rows=state_rows,
+        projection_width=projection_width,
         device=hidden.device,
     )
     pos_mod = token_idx % ratio
-    runtime_state.kv_rows[pos_mod].copy_(kv_cur.to(torch.float32))
-    runtime_state.score_rows[pos_mod].copy_(
+    target_row = ratio + pos_mod if use_ratio4_carry else pos_mod
+    runtime_state.kv_rows[target_row].copy_(kv_cur.to(torch.float32))
+    runtime_state.score_rows[target_row].copy_(
         score_cur.to(torch.float32) + ape[:, pos_mod].to(torch.float32)
     )
     runtime_state.count = min(runtime_state.count + 1, ratio)
 
-    candidate = deepseek_v4_flash_rms_norm(kv_cur.to(torch.float32), norm).to(
-        stager.dtype
-    )
+    candidate_source = kv_cur[row_width : 2 * row_width] if use_ratio4_carry else kv_cur
+    candidate = deepseek_v4_flash_rms_norm(
+        candidate_source.to(torch.float32),
+        norm,
+    ).to(stager.dtype)
     if (token_idx + 1) % ratio != 0 or runtime_state.count < ratio:
         return candidate, None
 
-    weights = torch.softmax(runtime_state.score_rows.to(torch.float32), dim=0)
-    pooled = (weights * runtime_state.kv_rows.to(torch.float32)).sum(dim=0)
+    if use_ratio4_carry:
+        primary_scores = runtime_state.score_rows[:ratio, :row_width]
+        carry_scores = runtime_state.score_rows[ratio : 2 * ratio, row_width:]
+        primary_kv = runtime_state.kv_rows[:ratio, :row_width]
+        carry_kv = runtime_state.kv_rows[ratio : 2 * ratio, row_width:]
+        score_rows = torch.cat([primary_scores, carry_scores], dim=0)
+        kv_rows = torch.cat([primary_kv, carry_kv], dim=0)
+    else:
+        score_rows = runtime_state.score_rows
+        kv_rows = runtime_state.kv_rows
+
+    weights = torch.softmax(score_rows.to(torch.float32), dim=0)
+    pooled = (weights * kv_rows.to(torch.float32)).sum(dim=0)
     emitted = deepseek_v4_flash_rms_norm(pooled, norm).to(stager.dtype)
+    if use_ratio4_carry:
+        carry_kv_full = runtime_state.kv_rows[ratio : 2 * ratio].clone()
+        carry_score_full = runtime_state.score_rows[ratio : 2 * ratio].clone()
+        runtime_state.kv_rows[:ratio].copy_(carry_kv_full)
+        runtime_state.score_rows[:ratio].copy_(carry_score_full)
+        runtime_state.kv_rows[ratio : 2 * ratio].copy_(carry_kv_full)
+        runtime_state.score_rows[ratio : 2 * ratio].copy_(carry_score_full)
+    runtime_state.count = 0
     return candidate, emitted
 
 
@@ -684,8 +715,8 @@ def _get_compressor_runtime_state(
     *,
     layer_idx: int,
     state_name: str,
-    ratio: int,
-    row_width: int,
+    state_rows: int,
+    projection_width: int,
     device: torch.device,
 ) -> _CompressorRuntimeState:
     attr = "_deepseek_v4_flash_compressor_states"
@@ -699,23 +730,23 @@ def _get_compressor_runtime_state(
     if runtime_state is None:
         runtime_state = _CompressorRuntimeState(
             kv_rows=torch.zeros(
-                (ratio, row_width),
+                (state_rows, projection_width),
                 dtype=torch.float32,
                 device=device,
             ),
             score_rows=torch.empty(
-                (ratio, row_width),
+                (state_rows, projection_width),
                 dtype=torch.float32,
                 device=device,
             ).fill_(-1000.0),
         )
         states[key] = runtime_state
         return runtime_state
-    if runtime_state.kv_rows.shape != (ratio, row_width):
+    if runtime_state.kv_rows.shape != (state_rows, projection_width):
         raise ValueError(
             "compressor runtime state shape changed for layer "
             f"{layer_idx} {state_name}: got {tuple(runtime_state.kv_rows.shape)}, "
-            f"expected ({ratio}, {row_width})"
+            f"expected ({state_rows}, {projection_width})"
         )
     if runtime_state.kv_rows.device != device:
         raise ValueError(

@@ -87,3 +87,10 @@ class DeepSeekV4FlashGPURequestState:
         self.raw_kv_cache.raw_token_indices.fill_(-1)
         self.raw_kv_cache.compressed_token_indices.fill_(-1)
         self.raw_kv_cache._compressed_counts.zero_()
+        compressor_states = getattr(
+            self,
+            "_deepseek_v4_flash_compressor_states",
+            None,
+        )
+        if compressor_states is not None:
+            compressor_states.clear()
