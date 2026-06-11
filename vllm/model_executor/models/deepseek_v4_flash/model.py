@@ -51,6 +51,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.weight_store = weight_store
         self.runtime_budget = runtime_budget
         self.limited_forward_smoke_only = True
+        self.reference_execution_available = True
+        self.kernel_execution_available = False
 
     def attach_weight_store(
         self,
@@ -166,6 +168,27 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.limited_forward_smoke_only = False
         return self._q8_0_output_projection(store, normalized).reshape(1, -1)
 
+    def forward_kernel(self, input_ids: torch.Tensor) -> torch.Tensor:
+        del input_ids
+        raise NotImplementedError(
+            "DeepSeek V4 Flash GPU kernel execution is not wired yet; "
+            "use forward_full_reference() for correctness bring-up."
+        )
+
+    def forward_full(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        use_kernel: bool = False,
+    ) -> torch.Tensor:
+        if use_kernel:
+            if not self.kernel_execution_available:
+                raise NotImplementedError(
+                    "DeepSeek V4 Flash kernel execution is not available"
+                )
+            return self.forward_kernel(input_ids)
+        return self.forward_full_reference(input_ids)
+
     def generate_greedy_reference(
         self,
         input_ids: torch.Tensor,
@@ -177,7 +200,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 "generate_greedy_reference currently supports max_tokens=1; "
                 f"got {max_tokens}"
             )
-        logits = self.forward_full_reference(input_ids)
+        logits = self.forward_full(input_ids, use_kernel=False)
         next_token = torch.argmax(logits[0], dim=-1).to(torch.long)
         return torch.cat([input_ids.to(torch.long), next_token.reshape(1)])
 
@@ -199,7 +222,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             torch.int64,
             torch.uint8,
         ):
-            raise ValueError(f"input_ids must use an integer dtype; got {input_ids.dtype}")
+            raise ValueError(
+                f"input_ids must use an integer dtype; got {input_ids.dtype}"
+            )
 
     def _collapse_output_hc(
         self,
