@@ -18,9 +18,23 @@ from .config import (
     DeepSeekV4FlashShape,
     layer_compress_ratio,
 )
-from .gguf_reader import GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0
+from .gguf_reader import (
+    GGML_TYPE_F16,
+    GGML_TYPE_F32,
+    GGML_TYPE_Q8_0,
+    DeepSeekV4FlashTensor,
+)
 from .gpu_backend import DeepSeekV4FlashGPUBackend
-from .quant import q8_0_matvec
+from .gpu_layers import (
+    deepseek_v4_flash_compressed_layer_forward,
+    deepseek_v4_flash_sliding_layer_forward,
+)
+from .gpu_runtime import (
+    DeepSeekV4FlashGPUCacheConfig,
+    DeepSeekV4FlashGPURequestState,
+)
+from .gpu_weight_staging import DeepSeekV4FlashGPUWeightStager
+from .quant import q8_0_matrix_from_gguf_payload, q8_0_matvec
 from .weight_store import DeepSeekV4FlashWeightStore
 
 _RMS_NORM_EPS = 1e-6
@@ -56,6 +70,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.limited_forward_smoke_only = True
         self.reference_execution_available = True
         self.kernel_execution_available = self.gpu_backend.is_ready
+        self._gpu_weight_stager: DeepSeekV4FlashGPUWeightStager | None = None
+        self._gpu_weight_stager_store_id: int | None = None
+        self._gpu_weight_stager_device: torch.device | None = None
 
     def attach_weight_store(
         self,
@@ -64,11 +81,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     ) -> None:
         self.weight_store = weight_store
         self.runtime_budget = runtime_budget
+        self._gpu_weight_stager = None
+        self._gpu_weight_stager_store_id = None
+        self._gpu_weight_stager_device = None
 
     def close(self) -> None:
         if self.weight_store is not None:
             self.weight_store.close()
             self.weight_store = None
+        self._gpu_weight_stager = None
+        self._gpu_weight_stager_store_id = None
+        self._gpu_weight_stager_device = None
 
     def forward(
         self,
@@ -172,11 +195,73 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         return self._q8_0_output_projection(store, normalized).reshape(1, -1)
 
     def forward_kernel(self, input_ids: torch.Tensor) -> torch.Tensor:
-        del input_ids
-        raise NotImplementedError(
-            "DeepSeek V4 Flash GPU kernel execution is not wired yet; "
-            "use forward_full_reference() for correctness bring-up."
+        store = self._require_weight_store()
+        token_id, device = self._validate_forward_kernel_input(input_ids)
+        self.gpu_backend.require_ready()
+
+        stager = self._get_gpu_weight_stager(device)
+        state = DeepSeekV4FlashGPURequestState(
+            DeepSeekV4FlashGPUCacheConfig(
+                context_length=self._kernel_context_length(),
+                hidden_size=self.shape.hidden_size,
+                batch_size=1,
+                kv_width=self.shape.head_dim,
+                device=device,
+            )
         )
+        hidden = self._stage_token_embedding_cuda(store, token_id, device=device)
+
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
+        for layer in layers:
+            if layer.layer_index < 2:
+                hidden = deepseek_v4_flash_sliding_layer_forward(
+                    hidden,
+                    layer=layer,
+                    stager=stager,
+                    backend=self.gpu_backend,
+                    token_idx=0,
+                    token_id=token_id,
+                )
+            else:
+                hidden = deepseek_v4_flash_compressed_layer_forward(
+                    hidden,
+                    layer=layer,
+                    stager=stager,
+                    backend=self.gpu_backend,
+                    state=state,
+                    token_idx=0,
+                    token_id=token_id,
+                )
+
+        streams = self._kernel_output_streams(hidden)
+        output_hc_weight, output_hc_scale, output_hc_base = (
+            self._stage_output_hyper_connection_cuda(
+                stager,
+                stream_elements=streams.numel(),
+            )
+        )
+        output_norm_weight = stager.stage_vector(
+            self._required_output_norm_tensor(store),
+        )
+        lm_head_values, lm_head_scales = self._stage_q8_output_head_cuda(
+            store,
+            device=device,
+        )
+        logits = self.gpu_backend.output_logits(
+            streams=streams,
+            lm_head_values=lm_head_values,
+            lm_head_scales=lm_head_scales,
+            output_hc_weight=output_hc_weight,
+            output_hc_scale=output_hc_scale,
+            output_hc_base=output_hc_base,
+            output_norm_weight=output_norm_weight,
+            block_size=_Q8_0_BLOCK_SIZE,
+        )
+        if not logits.is_cuda:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU logits")
+        return logits.reshape(1, -1)
 
     def forward_full(
         self,
@@ -229,6 +314,180 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise ValueError(
                 f"input_ids must use an integer dtype; got {input_ids.dtype}"
             )
+
+    def _validate_forward_kernel_input(
+        self,
+        input_ids: torch.Tensor,
+    ) -> tuple[int, torch.device]:
+        if input_ids.ndim != 1:
+            raise ValueError(
+                "forward_kernel supports a 1-D batch=1 token vector; "
+                f"got {input_ids.ndim}-D"
+            )
+        if input_ids.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(
+                f"input_ids must use an integer dtype; got {input_ids.dtype}"
+            )
+        if not input_ids.is_cuda:
+            raise ValueError("forward_kernel requires CUDA input_ids")
+        context_length = self._kernel_context_length()
+        if input_ids.numel() > context_length:
+            raise ValueError(
+                "forward_kernel input context exceeds configured budget: "
+                f"{input_ids.numel()} tokens > {context_length}"
+            )
+        if input_ids.numel() != 1:
+            raise ValueError(
+                "forward_kernel currently supports exactly one batch=1 token; "
+                f"got {input_ids.numel()} tokens"
+            )
+        token_id = int(input_ids.item())
+        if token_id < 0 or token_id >= self.shape.vocab_size:
+            raise ValueError(
+                f"input token id {token_id} is outside vocab range "
+                f"[0, {self.shape.vocab_size})"
+            )
+        return token_id, input_ids.device
+
+    def _kernel_context_length(self) -> int:
+        if self.runtime_budget is None:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward requires a runtime budget"
+            )
+        context_length = self.runtime_budget.context.context_length
+        if context_length <= 0:
+            raise ValueError(
+                f"runtime context length must be positive; got {context_length}"
+            )
+        return context_length
+
+    def _get_gpu_weight_stager(
+        self,
+        device: torch.device,
+    ) -> DeepSeekV4FlashGPUWeightStager:
+        store = self._require_weight_store()
+        store_id = id(store)
+        if (
+            self._gpu_weight_stager is None
+            or self._gpu_weight_stager_store_id != store_id
+            or self._gpu_weight_stager_device != device
+        ):
+            self._gpu_weight_stager = DeepSeekV4FlashGPUWeightStager(
+                store,
+                device=device,
+            )
+            self._gpu_weight_stager_store_id = store_id
+            self._gpu_weight_stager_device = device
+        return self._gpu_weight_stager
+
+    def _stage_token_embedding_cuda(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        token_id: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        hidden = self._read_token_embedding(store, token_id)
+        return hidden.to(device=device, dtype=torch.float32, non_blocking=True)
+
+    def _kernel_output_streams(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not hidden.is_cuda:
+            raise RuntimeError("DeepSeek V4 Flash GPU layer returned CPU hidden state")
+        if hidden.ndim == 1:
+            if hidden.shape != (self.shape.hidden_size,):
+                raise ValueError(
+                    "forward_kernel hidden shape must match hidden_size; "
+                    f"got {tuple(hidden.shape)}"
+                )
+            return hidden.to(torch.float32).reshape(1, -1).expand(4, -1).clone()
+        if hidden.ndim != 2:
+            raise ValueError(
+                "forward_kernel hidden must be 1-D or mHC stream-shaped 2-D; "
+                f"got {hidden.ndim}-D"
+            )
+        if hidden.shape != (4, self.shape.hidden_size):
+            raise ValueError(
+                "forward_kernel mHC streams must have shape "
+                f"(4, {self.shape.hidden_size}); got {tuple(hidden.shape)}"
+            )
+        return hidden.to(torch.float32)
+
+    def _stage_output_hyper_connection_cuda(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        *,
+        stream_elements: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_hc = self._require_weight_store().bindings.output_hyper_connection
+        if output_hc is None:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward requires output hyper-connection"
+            )
+        weight = stager.stage_matrix(output_hc.fn)
+        expected = (4, stream_elements)
+        if tuple(weight.shape) == (stream_elements, 4):
+            weight = weight.T.contiguous()
+        if tuple(weight.shape) != expected:
+            raise ValueError(
+                f"output_hc_fn staged shape must be {expected}; "
+                f"got {tuple(weight.shape)}"
+            )
+        return (
+            weight,
+            stager.stage_vector(output_hc.scale),
+            stager.stage_vector(output_hc.base),
+        )
+
+    def _required_output_norm_tensor(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+    ) -> DeepSeekV4FlashTensor:
+        tensor = store.bindings.output_norm
+        if tensor is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires output_norm")
+        return tensor
+
+    def _stage_q8_output_head_cuda(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensor = store.bindings.output_head
+        if tensor is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires output.weight")
+        if tensor.tensor_type != GGML_TYPE_Q8_0:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects Q8_0 output.weight; "
+                f"got GGML type {tensor.tensor_type}"
+            )
+        columns = self.shape.hidden_size
+        rows = self.shape.vocab_size
+        if tensor.dims != (columns, rows):
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects output.weight dims "
+                f"({columns}, {rows}); got {tensor.dims}"
+            )
+        payload = store.tensor_payload(tensor)
+        try:
+            values, scales = q8_0_matrix_from_gguf_payload(
+                payload,
+                rows=rows,
+                columns=columns,
+                block_size=_Q8_0_BLOCK_SIZE,
+            )
+        finally:
+            payload.release()
+        return (
+            values.to(device=device, non_blocking=True),
+            scales.to(device=device, dtype=torch.float32, non_blocking=True),
+        )
 
     def _collapse_output_hc(
         self,

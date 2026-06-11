@@ -386,7 +386,7 @@ def test_sliding_layer_forward_hash_routes_and_adds_shared_expert() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_sliding_layer_forward_rejects_1d_hyper_connection() -> None:
+def test_sliding_layer_forward_expands_1d_hyper_connection_streams() -> None:
     hidden_size = 4
     store = _FakeLayerStore()
     tensors = {
@@ -398,11 +398,14 @@ def test_sliding_layer_forward_rejects_1d_hyper_connection() -> None:
         "gate": _tensor("blk.0.ffn_gate_exps.weight", (hidden_size, hidden_size, 3)),
         "up": _tensor("blk.0.ffn_up_exps.weight", (hidden_size, hidden_size, 3)),
         "down": _tensor("blk.0.ffn_down_exps.weight", (hidden_size, hidden_size, 3)),
-        "hc_fn": _tensor("blk.0.hc_attn_fn.weight", (hidden_size, 1)),
-        "hc_base": _tensor("blk.0.hc_attn_base.weight", (1,)),
+        "hc_fn": _tensor("blk.0.hc_attn_fn.weight", (16, 24)),
+        "hc_base": _tensor("blk.0.hc_attn_base.weight", (24,)),
         "hc_scale": _tensor("blk.0.hc_attn_scale.weight", (3,)),
     }
     _add_identity_layer_weights(store, tensors, hidden_size=hidden_size, num_experts=3)
+    store.matrices[tensors["hc_fn"].name] = torch.zeros(24, 16)
+    store.vectors[(tensors["hc_base"].name, torch.float32)] = torch.zeros(24)
+    store.vectors[(tensors["hc_scale"].name, torch.float32)] = torch.ones(3)
     layer = DeepSeekV4FlashLayerSemanticBindings(
         layer_index=0,
         attention_norm=tensors["attn_norm"],
@@ -422,14 +425,18 @@ def test_sliding_layer_forward_rejects_1d_hyper_connection() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="1-D hyper-connection"):
-        deepseek_v4_flash_sliding_layer_forward(
-            torch.zeros(hidden_size, device="cuda"),
-            layer=layer,
-            stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
-            backend=_MarkerBackend(),
-            token_idx=3,
-        )
+    output = deepseek_v4_flash_sliding_layer_forward(
+        torch.zeros(hidden_size, device="cuda"),
+        layer=layer,
+        stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
+        backend=_MarkerBackend(),
+        token_idx=3,
+        router_top_k=1,
+    )
+
+    assert output.device.type == "cuda"
+    assert output.shape == (4, hidden_size)
+    assert torch.isfinite(output).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

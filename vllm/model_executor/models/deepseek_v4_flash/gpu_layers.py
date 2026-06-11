@@ -231,8 +231,10 @@ def deepseek_v4_flash_sliding_layer_forward(
 ) -> torch.Tensor:
     if not hidden.is_cuda:
         raise ValueError("DeepSeek V4 Flash sliding layer hidden must be CUDA")
-    if hidden.ndim != 1:
-        raise ValueError(f"hidden must be 1-D for batch=1; got {hidden.ndim}-D")
+    if hidden.ndim not in (1, 2):
+        raise ValueError(
+            f"hidden must be 1-D or mHC stream-shaped 2-D; got {hidden.ndim}-D"
+        )
 
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
@@ -263,7 +265,39 @@ def deepseek_v4_flash_sliding_layer_forward(
     ffn_norm = stager.stage_vector(_required_tensor(layer.ffn_norm, "ffn_norm"))
     grouped_experts = _required_grouped_experts(layer.grouped_experts)
 
-    attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
+    uses_hyper_connection = (
+        layer.attention_hyper_connection is not None
+        or layer.ffn_hyper_connection is not None
+    )
+    attention_residual_streams: torch.Tensor | None = None
+    attention_hc_state: _GPUHyperConnectionState | None = None
+    if uses_hyper_connection:
+        stream_hc = layer.attention_hyper_connection or layer.ffn_hyper_connection
+        if stream_hc is None:
+            raise AssertionError("hyper-connection state was not validated")
+        attention_residual_streams = _ensure_hyper_connection_streams(
+            hidden,
+            stager=stager,
+            hyper_connection=stream_hc,
+        )
+        if layer.attention_hyper_connection is None:
+            attn_source = attention_residual_streams.mean(dim=0).to(torch.float32)
+        else:
+            attention_hc_state = _hyper_connection_pre_cuda(
+                attention_residual_streams,
+                stager=stager,
+                hyper_connection=layer.attention_hyper_connection,
+            )
+            attn_source = attention_hc_state.mixed
+    else:
+        if hidden.ndim != 1:
+            raise ValueError(
+                "DeepSeek V4 Flash sliding layer accepts 2-D hidden only when "
+                "layer hyper-connection tensors are present"
+            )
+        attn_source = hidden
+
+    attn_input = deepseek_v4_flash_rms_norm(attn_source, attention_norm)
     query = deepseek_v4_flash_staged_matrix_projection(attn_input, attention_query)
     if layer.attention_query_a_norm is not None:
         query = deepseek_v4_flash_rms_norm(
@@ -296,14 +330,45 @@ def deepseek_v4_flash_sliding_layer_forward(
         attention_output_a=attention_output_a,
         attention_output_b=attention_output_b,
     )
-    hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
-        hidden,
-        attn_update,
-        stager=stager,
-        hyper_connection=layer.attention_hyper_connection,
-    )
+    if uses_hyper_connection:
+        if attention_residual_streams is None:
+            raise AssertionError("attention residual streams were not initialized")
+        if attention_hc_state is None:
+            hidden_after_attn = attention_residual_streams + attn_update.reshape(1, -1)
+        else:
+            hidden_after_attn = _hyper_connection_post_cuda(
+                attn_update,
+                attention_residual_streams,
+                attention_hc_state,
+            )
+    else:
+        hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+            attn_source,
+            attn_update,
+            stager=stager,
+            hyper_connection=None,
+        )
 
-    ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
+    if uses_hyper_connection:
+        if hidden_after_attn.ndim != 2:
+            raise ValueError("mHC sliding path must carry stream-shaped hidden")
+        ffn_residual_streams = hidden_after_attn
+        if layer.ffn_hyper_connection is None:
+            ffn_source = ffn_residual_streams.mean(dim=0).to(torch.float32)
+            ffn_hc_state = None
+        else:
+            ffn_hc_state = _hyper_connection_pre_cuda(
+                ffn_residual_streams,
+                stager=stager,
+                hyper_connection=layer.ffn_hyper_connection,
+            )
+            ffn_source = ffn_hc_state.mixed
+    else:
+        ffn_source = hidden_after_attn
+        ffn_hc_state = None
+        ffn_residual_streams = None
+
+    ffn_input = deepseek_v4_flash_rms_norm(ffn_source, ffn_norm)
     moe_update = _run_sliding_moe(
         ffn_input,
         layer=layer,
@@ -313,11 +378,21 @@ def deepseek_v4_flash_sliding_layer_forward(
         token_id=token_idx if token_id is None else token_id,
         router_top_k=router_top_k,
     )
+    if uses_hyper_connection:
+        if ffn_residual_streams is None:
+            raise AssertionError("FFN residual streams were not initialized")
+        if ffn_hc_state is None:
+            return ffn_residual_streams + moe_update.reshape(1, -1)
+        return _hyper_connection_post_cuda(
+            moe_update,
+            ffn_residual_streams,
+            ffn_hc_state,
+        )
     return deepseek_v4_flash_residual_hyper_connection(
         hidden_after_attn,
         moe_update,
         stager=stager,
-        hyper_connection=layer.ffn_hyper_connection,
+        hyper_connection=None,
     )
 
 
