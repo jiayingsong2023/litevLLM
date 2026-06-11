@@ -12,7 +12,6 @@ from vllm.kernels.triton.deepseek_v4_flash import (
     deepseek_v4_attention,
     deepseek_v4_cache_update,
     deepseek_v4_moe,
-    deepseek_v4_output_projection,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
@@ -37,8 +36,8 @@ def test_deepseek_kernel_scaffolding_exports_expected_contracts() -> None:
         expert_weights=torch.tensor([0.75, 0.25], dtype=torch.float32),
     )
     output_inputs = DeepSeekV4OutputKernelInputs(
-        streams=torch.zeros(4, 16),
-        lm_head_values=torch.zeros(8, 16),
+        streams=torch.zeros(4, 32),
+        lm_head_values=torch.zeros(8, 32),
         lm_head_scales=torch.zeros(8, 1),
     )
     compressed_inputs = DeepSeekV4CompressedAttentionInputs(
@@ -51,7 +50,7 @@ def test_deepseek_kernel_scaffolding_exports_expected_contracts() -> None:
     assert attention_inputs.token_idx == 0
     assert cache_inputs.logical_row == 0
     assert moe_inputs.expert_ids.tolist() == [0, 1]
-    assert output_inputs.streams.shape == (4, 16)
+    assert output_inputs.streams.shape == (4, 32)
     assert compressed_inputs.uses_page_tables is True
 
 
@@ -83,16 +82,6 @@ def test_deepseek_kernel_scaffolding_is_explicitly_not_implemented() -> None:
                 expert_weights=torch.tensor([1.0], dtype=torch.float32),
             )
         )
-
-    with pytest.raises(NotImplementedError, match="output kernel"):
-        deepseek_v4_output_projection(
-            DeepSeekV4OutputKernelInputs(
-                streams=torch.zeros(4, 16),
-                lm_head_values=torch.zeros(8, 16),
-                lm_head_scales=torch.zeros(8, 1),
-            )
-        )
-
 
 def test_deepseek_model_keeps_kernel_execution_disabled_until_kernels_exist() -> None:
     model = DeepSeekV4FlashForCausalLM()
