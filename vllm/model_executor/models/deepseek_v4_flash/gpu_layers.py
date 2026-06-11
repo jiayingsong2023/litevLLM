@@ -32,6 +32,13 @@ class _CompressorRuntimeState:
     count: int = 0
 
 
+@dataclass(frozen=True)
+class _GPUHyperConnectionState:
+    mixed: torch.Tensor
+    post: torch.Tensor
+    combine: torch.Tensor
+
+
 class _SlidingLayerBackend(Protocol):
     def sliding_attention(
         self,
@@ -363,8 +370,10 @@ def deepseek_v4_flash_compressed_layer_forward(
 ) -> torch.Tensor:
     if not hidden.is_cuda:
         raise ValueError("DeepSeek V4 Flash compressed layer hidden must be CUDA")
-    if hidden.ndim != 1:
-        raise ValueError(f"hidden must be 1-D for batch=1; got {hidden.ndim}-D")
+    if hidden.ndim not in (1, 2):
+        raise ValueError(
+            f"hidden must be 1-D or mHC stream-shaped 2-D; got {hidden.ndim}-D"
+        )
     ratio = layer_compress_ratio(layer.layer_index)
     if ratio == 0:
         raise ValueError(
@@ -372,15 +381,6 @@ def deepseek_v4_flash_compressed_layer_forward(
             f"layer {layer.layer_index}"
         )
     state.require_capacity(token_idx)
-    if hidden.ndim == 1 and (
-        layer.attention_hyper_connection is not None
-        or layer.ffn_hyper_connection is not None
-    ):
-        raise ValueError(
-            "DeepSeek V4 Flash 1-D hyper-connection is unsupported in the "
-            "compressed GPU layer; pass stream-shaped hidden state in a later "
-            "full-layer path"
-        )
 
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
@@ -391,7 +391,39 @@ def deepseek_v4_flash_compressed_layer_forward(
     if ratio == 4 and layer.indexer is None:
         raise ValueError("DeepSeek V4 Flash ratio-4 compressed layer missing indexer")
 
-    attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
+    uses_hyper_connection = (
+        layer.attention_hyper_connection is not None
+        or layer.ffn_hyper_connection is not None
+    )
+    attention_residual_streams: torch.Tensor | None = None
+    attention_hc_state: _GPUHyperConnectionState | None = None
+    if uses_hyper_connection:
+        stream_hc = layer.attention_hyper_connection or layer.ffn_hyper_connection
+        if stream_hc is None:
+            raise AssertionError("hyper-connection state was not validated")
+        attention_residual_streams = _ensure_hyper_connection_streams(
+            hidden,
+            stager=stager,
+            hyper_connection=stream_hc,
+        )
+        if layer.attention_hyper_connection is None:
+            attn_source = attention_residual_streams.mean(dim=0).to(torch.float32)
+        else:
+            attention_hc_state = _hyper_connection_pre_cuda(
+                attention_residual_streams,
+                stager=stager,
+                hyper_connection=layer.attention_hyper_connection,
+            )
+            attn_source = attention_hc_state.mixed
+    else:
+        if hidden.ndim != 1:
+            raise ValueError(
+                "DeepSeek V4 Flash compressed layer accepts 2-D hidden only "
+                "when layer hyper-connection tensors are present"
+            )
+        attn_source = hidden
+
+    attn_input = deepseek_v4_flash_rms_norm(attn_source, attention_norm)
     query = _compressed_attention_query(attn_input, layer=layer, stager=stager)
     candidate_row, emitted_row = _update_compressor_state(
         attn_input,
@@ -443,6 +475,11 @@ def deepseek_v4_flash_compressed_layer_forward(
         compressed_rows=attention_rows,
         selected_rows=selected_rows,
     )
+    context = _expand_shared_attention_context_for_output(
+        context,
+        layer=layer,
+        stager=stager,
+    )
     attn_update = _project_sliding_attention_output(
         context,
         None
@@ -461,12 +498,24 @@ def deepseek_v4_flash_compressed_layer_forward(
             else None
         ),
     )
-    hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
-        hidden,
-        attn_update,
-        stager=stager,
-        hyper_connection=layer.attention_hyper_connection,
-    )
+    if uses_hyper_connection:
+        if attention_residual_streams is None:
+            raise AssertionError("attention residual streams were not initialized")
+        if attention_hc_state is None:
+            hidden_after_attn = attention_residual_streams + attn_update.reshape(1, -1)
+        else:
+            hidden_after_attn = _hyper_connection_post_cuda(
+                attn_update,
+                attention_residual_streams,
+                attention_hc_state,
+            )
+    else:
+        hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+            attn_source,
+            attn_update,
+            stager=stager,
+            hyper_connection=None,
+        )
 
     if emitted_row is not None:
         if ratio == 4 and indexer_row is None:
@@ -483,7 +532,26 @@ def deepseek_v4_flash_compressed_layer_forward(
         )
     state.advance_token()
 
-    ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
+    if uses_hyper_connection:
+        if hidden_after_attn.ndim != 2:
+            raise ValueError("mHC compressed path must carry stream-shaped hidden")
+        ffn_residual_streams = hidden_after_attn
+        if layer.ffn_hyper_connection is None:
+            ffn_source = ffn_residual_streams.mean(dim=0).to(torch.float32)
+            ffn_hc_state = None
+        else:
+            ffn_hc_state = _hyper_connection_pre_cuda(
+                ffn_residual_streams,
+                stager=stager,
+                hyper_connection=layer.ffn_hyper_connection,
+            )
+            ffn_source = ffn_hc_state.mixed
+    else:
+        ffn_source = hidden_after_attn
+        ffn_hc_state = None
+        ffn_residual_streams = None
+
+    ffn_input = deepseek_v4_flash_rms_norm(ffn_source, ffn_norm)
     moe_update = _run_sliding_moe(
         ffn_input,
         layer=layer,
@@ -493,11 +561,21 @@ def deepseek_v4_flash_compressed_layer_forward(
         token_id=token_idx if token_id is None else token_id,
         router_top_k=router_top_k,
     )
+    if uses_hyper_connection:
+        if ffn_residual_streams is None:
+            raise AssertionError("FFN residual streams were not initialized")
+        if ffn_hc_state is None:
+            return ffn_residual_streams + moe_update.reshape(1, -1)
+        return _hyper_connection_post_cuda(
+            moe_update,
+            ffn_residual_streams,
+            ffn_hc_state,
+        )
     return deepseek_v4_flash_residual_hyper_connection(
         hidden_after_attn,
         moe_update,
         stager=stager,
-        hyper_connection=layer.ffn_hyper_connection,
+        hyper_connection=None,
     )
 
 
@@ -570,6 +648,156 @@ def _grouped_output_projection(
     )
     low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
     return output_b.to(torch.float32).matmul(low_rank.reshape(-1))
+
+
+def _ensure_hyper_connection_streams(
+    hidden: torch.Tensor,
+    *,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    hyper_connection: DeepSeekV4FlashHyperConnectionTensors,
+) -> torch.Tensor:
+    base = stager.stage_vector(hyper_connection.base)
+    hc_mult = _hyper_connection_stream_count(base)
+    if hidden.ndim == 2:
+        if hidden.shape[0] != hc_mult:
+            raise ValueError(
+                "mHC stream count must match hyper-connection tensors; "
+                f"got {hidden.shape[0]} and {hc_mult}"
+            )
+        return hidden.to(torch.float32)
+    if hidden.ndim != 1:
+        raise ValueError(
+            f"hidden must be 1-D or mHC stream-shaped 2-D; got {hidden.ndim}-D"
+        )
+    return hidden.to(torch.float32).reshape(1, -1).expand(hc_mult, -1).clone()
+
+
+def _hyper_connection_stream_count(base: torch.Tensor) -> int:
+    mix_count = base.numel()
+    hc_mult = 1
+    while 2 * hc_mult + hc_mult * hc_mult < mix_count:
+        hc_mult += 1
+    if 2 * hc_mult + hc_mult * hc_mult != mix_count:
+        raise ValueError(
+            f"hyper-connection base size does not match 2*h + h*h; got {mix_count}"
+        )
+    return hc_mult
+
+
+def _hyper_connection_pre_cuda(
+    streams: torch.Tensor,
+    *,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    hyper_connection: DeepSeekV4FlashHyperConnectionTensors,
+) -> _GPUHyperConnectionState:
+    if not streams.is_cuda:
+        raise ValueError("DeepSeek V4 Flash mHC streams must be CUDA tensors")
+    if streams.ndim != 2:
+        raise ValueError(f"mHC streams must be 2-D; got {streams.ndim}-D")
+
+    fn_weight = stager.stage_matrix(hyper_connection.fn)
+    base = stager.stage_vector(hyper_connection.base)
+    scale = stager.stage_vector(hyper_connection.scale)
+    hc_mult, hidden_size = streams.shape
+    mix_count = 2 * hc_mult + hc_mult * hc_mult
+    flat_size = hc_mult * hidden_size
+    if fn_weight.shape == (flat_size, mix_count):
+        projection_weight = fn_weight.to(torch.float32).T
+    elif fn_weight.shape == (mix_count, flat_size):
+        projection_weight = fn_weight.to(torch.float32)
+    else:
+        raise ValueError(
+            "hyper-connection fn tensor shape does not match streams; "
+            f"got {tuple(fn_weight.shape)}, expected ({flat_size}, {mix_count})"
+        )
+    if base.shape != (mix_count,):
+        raise ValueError(
+            f"hyper-connection base shape must be ({mix_count},); "
+            f"got {tuple(base.shape)}"
+        )
+    if scale.shape != (3,):
+        raise ValueError(
+            f"hyper-connection scale shape must be (3,); got {tuple(scale.shape)}"
+        )
+
+    flat = streams.reshape(flat_size).to(torch.float32)
+    mixes = projection_weight.matmul(flat) * torch.rsqrt(flat.pow(2).mean() + 1e-6)
+    repeat_counts = torch.tensor(
+        [hc_mult, hc_mult, hc_mult * hc_mult],
+        dtype=torch.long,
+        device=scale.device,
+    )
+    mixes = mixes * scale.to(torch.float32).repeat_interleave(repeat_counts)
+    mixes = mixes + base.to(torch.float32)
+    pre = torch.sigmoid(mixes[:hc_mult]) + 1e-6
+    post = torch.sigmoid(mixes[hc_mult : 2 * hc_mult]) + 1e-6
+    combine_scores = mixes[2 * hc_mult :].reshape(hc_mult, hc_mult)
+    combine = torch.softmax(combine_scores, dim=-1)
+    for _ in range(20):
+        combine = combine / (combine.sum(dim=-1, keepdim=True) + 1e-6)
+        combine = combine / (combine.sum(dim=0, keepdim=True) + 1e-6)
+    mixed = (pre.reshape(hc_mult, 1) * streams.to(torch.float32)).sum(dim=0)
+    return _GPUHyperConnectionState(mixed=mixed, post=post, combine=combine)
+
+
+def _hyper_connection_post_cuda(
+    output: torch.Tensor,
+    residual_streams: torch.Tensor,
+    state: _GPUHyperConnectionState,
+) -> torch.Tensor:
+    if not output.is_cuda or not residual_streams.is_cuda:
+        raise ValueError("DeepSeek V4 Flash mHC post inputs must be CUDA tensors")
+    if output.ndim != 1:
+        raise ValueError(f"mHC output must be 1-D; got {output.ndim}-D")
+    if residual_streams.ndim != 2:
+        raise ValueError(
+            f"mHC residual streams must be 2-D; got {residual_streams.ndim}-D"
+        )
+    hc_mult, hidden_size = residual_streams.shape
+    if output.shape != (hidden_size,):
+        raise ValueError(
+            f"mHC output shape must be ({hidden_size},); got {tuple(output.shape)}"
+        )
+    if state.post.shape != (hc_mult,):
+        raise ValueError(
+            f"mHC post shape must be ({hc_mult},); got {tuple(state.post.shape)}"
+        )
+    if state.combine.shape != (hc_mult, hc_mult):
+        raise ValueError(
+            "mHC combine shape must match residual streams; "
+            f"got {tuple(state.combine.shape)}"
+        )
+    residual_mix = state.combine.to(torch.float32).matmul(
+        residual_streams.to(torch.float32)
+    )
+    return state.post.reshape(hc_mult, 1) * output.to(torch.float32) + residual_mix
+
+
+def _expand_shared_attention_context_for_output(
+    context: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    stager: DeepSeekV4FlashGPUWeightStager,
+) -> torch.Tensor:
+    if context.ndim != 1:
+        raise ValueError(f"attention context must be 1-D; got {context.ndim}-D")
+    if layer.attention_output_a is None or layer.attention_output_b is None:
+        return context
+    output_a = stager.stage_matrix(layer.attention_output_a)
+    expected_context = output_a.shape[1] * DEEPSEEK_V4_FLASH_SHAPE.output_groups
+    if context.numel() == expected_context:
+        return context
+    attn_sinks = (
+        stager.stage_vector(layer.attention_sinks)
+        if layer.attention_sinks is not None
+        else None
+    )
+    if (
+        attn_sinks is not None
+        and context.numel() * attn_sinks.numel() == expected_context
+    ):
+        return context.reshape(1, -1).expand(attn_sinks.numel(), -1).reshape(-1)
+    return context
 
 
 def _compressed_attention_query(

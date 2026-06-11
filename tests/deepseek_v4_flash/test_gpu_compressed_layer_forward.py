@@ -27,6 +27,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashCompressorTensors,
     DeepSeekV4FlashGroupedExpertTensors,
+    DeepSeekV4FlashHyperConnectionTensors,
     DeepSeekV4FlashIndexerTensors,
     DeepSeekV4FlashLayerSemanticBindings,
     open_deepseek_v4_flash_weight_store,
@@ -172,6 +173,12 @@ def _compressed_layer_fixture(
         "gate": _tensor("blk.2.ffn_gate_exps.weight", (hidden_size, hidden_size, 1)),
         "up": _tensor("blk.2.ffn_up_exps.weight", (hidden_size, hidden_size, 1)),
         "down": _tensor("blk.2.ffn_down_exps.weight", (hidden_size, hidden_size, 1)),
+        "hc_attn_fn": _tensor("blk.2.hc_attn_fn.weight", (hidden_size * 2, 8)),
+        "hc_attn_base": _tensor("blk.2.hc_attn_base.weight", (8,)),
+        "hc_attn_scale": _tensor("blk.2.hc_attn_scale.weight", (3,)),
+        "hc_ffn_fn": _tensor("blk.2.hc_ffn_fn.weight", (hidden_size * 2, 8)),
+        "hc_ffn_base": _tensor("blk.2.hc_ffn_base.weight", (8,)),
+        "hc_ffn_scale": _tensor("blk.2.hc_ffn_scale.weight", (3,)),
     }
     store = _FakeLayerStore()
     for name in ("attn_norm", "comp_norm", "ffn_norm"):
@@ -209,6 +216,18 @@ def _compressed_layer_fixture(
         (indexer_compressor_width, 4)
     )
     store.matrices[tensors["router"].name] = torch.ones((1, hidden_size))
+    store.matrices[tensors["hc_attn_fn"].name] = torch.zeros((hidden_size * 2, 8))
+    store.matrices[tensors["hc_ffn_fn"].name] = torch.zeros((hidden_size * 2, 8))
+    for name in (
+        "hc_attn_base",
+        "hc_ffn_base",
+    ):
+        store.vectors[(tensors[name].name, torch.float32)] = torch.zeros(8)
+    for name in (
+        "hc_attn_scale",
+        "hc_ffn_scale",
+    ):
+        store.vectors[(tensors[name].name, torch.float32)] = torch.ones(3)
     for expert_tensor in ("gate", "up", "down"):
         store.expert_matrices[(tensors[expert_tensor].name, 0)] = torch.eye(hidden_size)
     layer = DeepSeekV4FlashLayerSemanticBindings(
@@ -238,6 +257,24 @@ def _compressed_layer_fixture(
             gate=tensors["gate"],
             up=tensors["up"],
             down=tensors["down"],
+        ),
+        attention_hyper_connection=(
+            DeepSeekV4FlashHyperConnectionTensors(
+                fn=tensors["hc_attn_fn"],
+                base=tensors["hc_attn_base"],
+                scale=tensors["hc_attn_scale"],
+            )
+            if doubled_width
+            else None
+        ),
+        ffn_hyper_connection=(
+            DeepSeekV4FlashHyperConnectionTensors(
+                fn=tensors["hc_ffn_fn"],
+                base=tensors["hc_ffn_base"],
+                scale=tensors["hc_ffn_scale"],
+            )
+            if doubled_width
+            else None
         ),
     )
     return store, layer
@@ -347,6 +384,40 @@ def test_ratio4_compressor_accepts_real_doubled_width_contract() -> None:
     assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 1
     assert state.compressed_kv_cache.compressed_rows[2, 0].shape == (4,)
     assert state.compressed_kv_cache.indexer_rows[2, 0].shape == (128,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_compressed_layer_mhc_pre_post_returns_streams() -> None:
+    store, layer = _compressed_layer_fixture(doubled_width=True)
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=16,
+            hidden_size=4,
+            kv_width=4,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    )
+    streams = torch.stack(
+        (
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda"),
+            torch.tensor([0.0, 1.0, 0.0, 0.0], device="cuda"),
+        )
+    )
+
+    output = deepseek_v4_flash_compressed_layer_forward(
+        streams,
+        layer=layer,
+        stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
+        backend=_RecordingCompressedBackend(),
+        state=state,
+        token_idx=0,
+        router_top_k=1,
+    )
+
+    assert output.device.type == "cuda"
+    assert output.shape == streams.shape
+    assert torch.isfinite(output).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -556,20 +627,15 @@ def test_real_gguf_layer2_compressed_forward_smoke() -> None:
         hidden = torch.zeros(4096, dtype=torch.float32, device="cuda")
         hidden[0] = 1.0
 
-        try:
-            output = deepseek_v4_flash_compressed_layer_forward(
-                hidden,
-                layer=layer,
-                stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
-                backend=DeepSeekV4FlashGPUBackend(),
-                state=state,
-                token_idx=3,
-            )
-        except ValueError as exc:
-            assert layer.attention_hyper_connection is not None
-            assert "1-D hyper-connection" in str(exc)
-            return
+        output = deepseek_v4_flash_compressed_layer_forward(
+            hidden,
+            layer=layer,
+            stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
+            backend=DeepSeekV4FlashGPUBackend(),
+            state=state,
+            token_idx=3,
+        )
 
     assert output.device.type == "cuda"
-    assert output.shape == hidden.shape
+    assert output.shape in (hidden.shape, (4, hidden.numel()))
     assert torch.isfinite(output).all()
