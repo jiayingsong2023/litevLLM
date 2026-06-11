@@ -19,6 +19,7 @@ from .config import (
     layer_compress_ratio,
 )
 from .gguf_reader import GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0
+from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .quant import q8_0_matvec
 from .weight_store import DeepSeekV4FlashWeightStore
 
@@ -44,15 +45,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE,
         weight_store: DeepSeekV4FlashWeightStore | None = None,
         runtime_budget: DeepSeekV4FlashRuntimeBudget | None = None,
+        gpu_backend: DeepSeekV4FlashGPUBackend | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.shape = shape
         self.weight_store = weight_store
         self.runtime_budget = runtime_budget
+        self.gpu_backend = gpu_backend or DeepSeekV4FlashGPUBackend()
         self.limited_forward_smoke_only = True
         self.reference_execution_available = True
-        self.kernel_execution_available = False
+        self.kernel_execution_available = self.gpu_backend.is_ready
 
     def attach_weight_store(
         self,
@@ -186,6 +189,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 raise NotImplementedError(
                     "DeepSeek V4 Flash kernel execution is not available"
                 )
+            self.gpu_backend.require_ready()
             return self.forward_kernel(input_ids)
         return self.forward_full_reference(input_ids)
 
