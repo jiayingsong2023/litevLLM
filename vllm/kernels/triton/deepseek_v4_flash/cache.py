@@ -37,7 +37,16 @@ class DeepSeekV4CacheUpdateInputs:
 
 
 def deepseek_v4_cache_update(inputs: DeepSeekV4CacheUpdateInputs) -> None:
-    del inputs
-    raise NotImplementedError(
-        "DeepSeek V4 Flash cache update kernel is not implemented"
-    )
+    tensors = (inputs.page_table, inputs.kv_row, inputs.cache_storage)
+    if any(not tensor.is_cuda for tensor in tensors):
+        raise ValueError("DeepSeek V4 cache update inputs must be CUDA tensors")
+    if inputs.logical_row >= inputs.page_table.numel():
+        raise ValueError("logical_row exceeds page_table length")
+    physical_page = int(inputs.page_table[inputs.logical_row].item())
+    rows_per_page = inputs.cache_storage.shape[1]
+    row_in_page = inputs.logical_row % rows_per_page
+    if physical_page < 0 or physical_page >= inputs.cache_storage.shape[0]:
+        raise ValueError("page_table resolved an invalid physical page")
+    if inputs.cache_storage.shape[-1] != inputs.kv_row.numel():
+        raise ValueError("cache row width must match kv_row width")
+    inputs.cache_storage[physical_page, row_in_page].copy_(inputs.kv_row)

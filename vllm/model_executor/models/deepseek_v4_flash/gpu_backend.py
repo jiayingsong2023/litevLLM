@@ -9,6 +9,10 @@ from vllm.kernels.triton.deepseek_v4_flash.attention import (
     DeepSeekV4AttentionKernelInputs,
     deepseek_v4_attention,
 )
+from vllm.kernels.triton.deepseek_v4_flash.compressed_attention import (
+    DeepSeekV4CompressedAttentionTensorInputs,
+    deepseek_v4_compressed_attention,
+)
 from vllm.kernels.triton.deepseek_v4_flash.moe import (
     DeepSeekV4MoEKernelInputs,
     deepseek_v4_moe,
@@ -144,5 +148,25 @@ class DeepSeekV4FlashGPUBackend:
                 expert_ids=expert_ids,
                 expert_weights=expert_weights,
                 expert_outputs=expert_outputs,
+            )
+        )
+
+    def compressed_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        compressed_rows: torch.Tensor,
+        selected_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        tensors = (query, compressed_rows, selected_rows)
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash compressed attention inputs must be CUDA tensors"
+            )
+        return deepseek_v4_compressed_attention(
+            DeepSeekV4CompressedAttentionTensorInputs(
+                query=query,
+                compressed_rows=compressed_rows,
+                selected_rows=selected_rows,
             )
         )

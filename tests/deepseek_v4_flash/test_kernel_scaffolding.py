@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 import torch
 
 from vllm.kernels.triton.deepseek_v4_flash import (
@@ -9,7 +8,6 @@ from vllm.kernels.triton.deepseek_v4_flash import (
     DeepSeekV4CompressedAttentionInputs,
     DeepSeekV4MoEKernelInputs,
     DeepSeekV4OutputKernelInputs,
-    deepseek_v4_cache_update,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
@@ -50,18 +48,6 @@ def test_deepseek_kernel_scaffolding_exports_expected_contracts() -> None:
     assert moe_inputs.expert_ids.tolist() == [0, 1]
     assert output_inputs.streams.shape == (4, 32)
     assert compressed_inputs.uses_page_tables is True
-
-
-def test_deepseek_kernel_scaffolding_is_explicitly_not_implemented() -> None:
-    with pytest.raises(NotImplementedError, match="cache update kernel"):
-        deepseek_v4_cache_update(
-            DeepSeekV4CacheUpdateInputs(
-                page_table=torch.zeros(1, dtype=torch.int32),
-                kv_row=torch.zeros(16),
-                cache_storage=torch.zeros(1, 1, 16),
-                logical_row=0,
-            )
-        )
 
 def test_deepseek_model_keeps_kernel_execution_disabled_until_kernels_exist() -> None:
     model = DeepSeekV4FlashForCausalLM()

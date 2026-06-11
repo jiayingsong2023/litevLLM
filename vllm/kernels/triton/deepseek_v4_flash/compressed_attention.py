@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+
+import torch
 
 _PAGE_TABLE_ERROR = "DeepSeek V4 compressed attention requires page table inputs"
 
@@ -50,3 +53,55 @@ class DeepSeekV4CompressedAttentionInputs:
                 self.indexer_page_table_name,
             )
         )
+
+
+@dataclass(frozen=True)
+class DeepSeekV4CompressedAttentionTensorInputs:
+    """Tensor contract for selected-row compressed attention.
+
+    Memory layout:
+    - query is [head_dim].
+    - compressed_rows is [num_compressed_rows, head_dim].
+    - selected_rows is [num_selected_rows] and indexes compressed_rows.
+
+    Tiling:
+    - Future kernels should tile over selected rows only.
+    - The caller resolves paged storage into compact selected-row tensors before
+      this boundary, so no full-context contiguous allocation is required.
+    """
+
+    query: torch.Tensor
+    compressed_rows: torch.Tensor
+    selected_rows: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.query.ndim != 1:
+            raise ValueError(f"query must be 1-D; got {self.query.ndim}-D")
+        if self.compressed_rows.ndim != 2:
+            raise ValueError(
+                f"compressed_rows must be 2-D; got {self.compressed_rows.ndim}-D"
+            )
+        if self.compressed_rows.shape[1] != self.query.numel():
+            raise ValueError("compressed_rows width must match query size")
+        if self.selected_rows.ndim != 1:
+            raise ValueError(
+                f"selected_rows must be 1-D; got {self.selected_rows.ndim}-D"
+            )
+        if self.selected_rows.numel() == 0:
+            raise ValueError("selected_rows must contain at least one row")
+
+
+def deepseek_v4_compressed_attention(
+    inputs: DeepSeekV4CompressedAttentionTensorInputs,
+) -> torch.Tensor:
+    tensors = (inputs.query, inputs.compressed_rows, inputs.selected_rows)
+    if any(not tensor.is_cuda for tensor in tensors):
+        raise ValueError("DeepSeek V4 compressed attention inputs must be CUDA tensors")
+    selected = inputs.compressed_rows.index_select(
+        0,
+        inputs.selected_rows.to(torch.long),
+    )
+    scores = selected.to(torch.float32).matmul(inputs.query.to(torch.float32))
+    scores = scores / math.sqrt(float(inputs.query.numel()))
+    probs = torch.softmax(scores, dim=0)
+    return probs.matmul(selected.to(torch.float32))
