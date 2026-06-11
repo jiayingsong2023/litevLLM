@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
+
 import torch
 
 from vllm.engine.async_llm import AsyncLLM
@@ -35,10 +38,117 @@ class _FakeEngine:
     tokenizer = _FakeTokenizer()
 
 
-def test_async_llm_direct_reference_chat_uses_model_hook() -> None:
-    llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _FakeEngine()
+class _FakeRequestOutput:
+    def __init__(self, text: str, finished: bool) -> None:
+        self.outputs = [type("_FakeToken", (), {"text": text})()]
+        self.finished = finished
 
-    text = llm.generate_greedy_reference_chat("hello", max_tokens=1)
 
+class _BridgeEngine:
+    def __init__(self) -> None:
+        self.added_requests: list[tuple[str, str]] = []
+        self.aborted_requests: list[str] = []
+
+    def add_request(
+        self,
+        request_id: str,
+        prompt: str,
+        sampling_params,
+        *,
+        lora_id=None,
+        lora_request=None,
+        multi_modal_data=None,
+    ) -> None:
+        self.added_requests.append((request_id, prompt))
+        assert getattr(sampling_params, "max_tokens", None) == 1
+        assert lora_id is None
+        assert lora_request is None
+        assert multi_modal_data is None
+
+    async def get_request_stream(self, request_id: str) -> AsyncGenerator[object, None]:
+        yield _FakeRequestOutput("bridge", True)
+
+    def abort_request(self, request_id: str) -> None:
+        self.aborted_requests.append(request_id)
+
+    def stats(self) -> dict[str, object]:
+        return {"bridge": True}
+
+
+class _BridgeDriver:
+    def __init__(self) -> None:
+        self.notified = False
+
+    def notify_new_work(self) -> None:
+        self.notified = True
+
+    def stats(self) -> dict[str, object]:
+        return {"driver": True}
+
+
+def _generate_greedy_reference_chat(
+    engine: _FakeEngine,
+    prompt: str,
+    *,
+    max_tokens: int,
+) -> str:
+    if max_tokens != 1:
+        raise ValueError(
+            "direct greedy reference chat currently supports max_tokens=1; "
+            f"got {max_tokens}"
+        )
+    token_ids = engine.tokenizer.encode(prompt)
+    if not token_ids:
+        eos = getattr(engine.tokenizer, "eos_token_id", None)
+        token_ids = [0 if eos is None else int(eos)]
+    tokens = engine.model.generate_greedy_reference(
+        torch.tensor([int(token_ids[-1])], dtype=torch.long),
+        max_tokens=1,
+    )
+    generated = int(tokens[-1].item())
+    try:
+        return engine.tokenizer.decode([generated], skip_special_tokens=True)
+    except TypeError:
+        return engine.tokenizer.decode([generated])
+
+
+def test_async_llm_does_not_expose_direct_reference_chat_helper() -> None:
+    assert not hasattr(AsyncLLM, "generate_greedy_reference_chat")
+
+
+def test_direct_reference_chat_helper_is_local_to_the_test_module() -> None:
+    text = _generate_greedy_reference_chat(_FakeEngine(), "hello", max_tokens=1)
     assert text == "world"
+
+
+def test_async_llm_generate_bridges_request_stream() -> None:
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine = _BridgeEngine()
+    llm.driver = _BridgeDriver()
+
+    async def run() -> list[str]:
+        from vllm.sampling_params import SamplingParams
+
+        outputs: list[str] = []
+        async for output in llm.generate(
+            "bridge prompt",
+            SamplingParams(max_tokens=1, temperature=0.0),
+            "req-1",
+        ):
+            outputs.append(output.outputs[0].text)
+        return outputs
+
+    assert asyncio.run(run()) == ["bridge"]
+    assert llm.engine.added_requests == [("req-1", "bridge prompt")]
+    assert llm.driver.notified is True
+    assert llm.stats() == {"bridge": True, "async_driver": {"driver": True}}
+
+
+def test_async_llm_abort_forwards_request_ids() -> None:
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine = _BridgeEngine()
+    llm.driver = _BridgeDriver()
+
+    asyncio.run(llm.abort(["req-a", "req-b"]))
+
+    assert llm.engine.aborted_requests == ["req-a", "req-b"]

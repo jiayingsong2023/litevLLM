@@ -2,8 +2,6 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-import torch
-
 from vllm.config import VllmConfig
 from vllm.engine.async_driver import AsyncDriver
 from vllm.engine.lite_engine import LiteEngine
@@ -89,27 +87,6 @@ class AsyncLLM(EngineClient):
         if hasattr(self.driver, "stats"):
             stats["async_driver"] = self.driver.stats()
         return stats
-
-    def generate_greedy_reference_chat(self, prompt: str, *, max_tokens: int) -> str:
-        model = getattr(self.engine, "model", None)
-        generate = getattr(model, "generate_greedy_reference", None)
-        if not callable(generate):
-            raise RuntimeError("model does not expose direct greedy reference generation")
-        if max_tokens != 1:
-            raise ValueError(
-                "direct greedy reference chat currently supports max_tokens=1; "
-                f"got {max_tokens}"
-            )
-        token_ids = self.engine.tokenizer.encode(prompt)
-        if not token_ids:
-            eos = getattr(self.engine.tokenizer, "eos_token_id", None)
-            token_ids = [0 if eos is None else int(eos)]
-        tokens = generate(torch.tensor([int(token_ids[-1])], dtype=torch.long), max_tokens=1)
-        generated = int(tokens[-1].item())
-        try:
-            return self.engine.tokenizer.decode([generated], skip_special_tokens=True)
-        except TypeError:
-            return self.engine.tokenizer.decode([generated])
 
     def register_lora_adapter(
         self,
