@@ -17,6 +17,15 @@ class DeepSeekV4FlashGroupedExpertStore(Protocol):
         expert_id: int,
     ) -> torch.Tensor: ...
 
+    def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor: ...
+
+    def tensor_to_torch(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor: ...
+
 
 @dataclass(frozen=True)
 class DeepSeekV4FlashStagedExpert:
@@ -40,6 +49,47 @@ class DeepSeekV4FlashGPUWeightStager:
         self.device = torch.device(device or "cuda")
         self.dtype = dtype
         self._grouped_cache: dict[tuple[str, int, str, torch.dtype], torch.Tensor] = {}
+        self._dynamic_cache: dict[
+            tuple[str, str, torch.dtype, str],
+            torch.Tensor,
+        ] = {}
+
+    def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        if self.device.type != "cuda":
+            raise ValueError("DeepSeek V4 Flash matrix staging requires a CUDA device")
+        cache_key = (tensor.name, str(self.device), self.dtype, "matrix")
+        cached = self._dynamic_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        decoded = self.store.decode_matrix(tensor)
+        if decoded.ndim != 2:
+            raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
+        staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        self._dynamic_cache[cache_key] = staged
+        return staged
+
+    def stage_vector(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        if self.device.type != "cuda":
+            raise ValueError("DeepSeek V4 Flash vector staging requires a CUDA device")
+        cache_key = (tensor.name, str(self.device), dtype, "vector")
+        cached = self._dynamic_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        decoded = self.store.tensor_to_torch(tensor, dtype=dtype)
+        if decoded.ndim != 1:
+            raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
+        staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
+        self._dynamic_cache[cache_key] = staged
+        return staged
+
+    def clear_dynamic_cache(self) -> None:
+        self._dynamic_cache.clear()
 
     def stage_grouped_expert_matrix(
         self,

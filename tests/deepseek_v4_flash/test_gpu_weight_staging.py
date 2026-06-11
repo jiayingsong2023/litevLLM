@@ -41,11 +41,44 @@ class _FakeGroupedExpertStore:
         self.decode_count += 1
         return self.matrices[(tensor.name, expert_id)].clone()
 
+    def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        raise AssertionError(f"unexpected matrix decode for {tensor.name}")
 
-def _tensor(name: str) -> DeepSeekV4FlashTensor:
+    def tensor_to_torch(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        raise AssertionError(f"unexpected vector read for {tensor.name} as {dtype}")
+
+
+class _FakeStagingStore(_FakeGroupedExpertStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.matrix_decode_count = 0
+        self.vector_read_count = 0
+        self.generic_matrices: dict[str, torch.Tensor] = {}
+        self.vectors: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+    def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        self.matrix_decode_count += 1
+        return self.generic_matrices[tensor.name].clone()
+
+    def tensor_to_torch(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        self.vector_read_count += 1
+        return self.vectors[(tensor.name, dtype)].clone()
+
+
+def _tensor(name: str, dims: tuple[int, ...] = (2, 2, 1)) -> DeepSeekV4FlashTensor:
     return DeepSeekV4FlashTensor(
         name=name,
-        dims=(2, 2, 1),
+        dims=dims,
         tensor_type=GGML_TYPE_Q8_0,
         offset=0,
         nbytes=0,
@@ -69,6 +102,97 @@ def test_gpu_weight_stager_caches_decoded_grouped_expert_matrix() -> None:
     assert first.data_ptr() == second.data_ptr()
     assert store.decode_count == 1
     torch.testing.assert_close(first.cpu(), store.matrices[(tensor.name, 0)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_caches_decoded_matrix_by_cache_key() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
+    store.generic_matrices[tensor.name] = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]],
+        dtype=torch.float32,
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    first = stager.stage_matrix(tensor)
+    second = stager.stage_matrix(tensor)
+
+    assert first.device.type == "cuda"
+    assert first.data_ptr() == second.data_ptr()
+    assert store.matrix_decode_count == 1
+    torch.testing.assert_close(first.cpu(), store.generic_matrices[tensor.name])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_caches_vector_by_cache_key() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("blk.1.attn_norm.weight", dims=(4,))
+    store.vectors[(tensor.name, torch.float32)] = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0],
+        dtype=torch.float32,
+    )
+    store.vectors[(tensor.name, torch.float16)] = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0],
+        dtype=torch.float16,
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    first = stager.stage_vector(tensor)
+    second = stager.stage_vector(tensor)
+    half = stager.stage_vector(tensor, dtype=torch.float16)
+    cached_half = stager.stage_vector(tensor, dtype=torch.float16)
+
+    assert first.device.type == "cuda"
+    assert first.data_ptr() == second.data_ptr()
+    assert half.device.type == "cuda"
+    assert half.data_ptr() == cached_half.data_ptr()
+    assert first.data_ptr() != half.data_ptr()
+    assert store.vector_read_count == 2
+    torch.testing.assert_close(first.cpu(), store.vectors[(tensor.name, torch.float32)])
+    torch.testing.assert_close(half.cpu(), store.vectors[(tensor.name, torch.float16)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_keeps_matrix_and_vector_cache_keys_distinct() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("shared.name.weight", dims=(2, 2))
+    store.generic_matrices[tensor.name] = torch.eye(2, dtype=torch.float32)
+    store.vectors[(tensor.name, torch.float32)] = torch.ones(2, dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    matrix = stager.stage_matrix(tensor)
+    vector = stager.stage_vector(tensor)
+    cached_matrix = stager.stage_matrix(tensor)
+    cached_vector = stager.stage_vector(tensor)
+
+    assert matrix.device.type == "cuda"
+    assert vector.device.type == "cuda"
+    assert matrix.data_ptr() == cached_matrix.data_ptr()
+    assert vector.data_ptr() == cached_vector.data_ptr()
+    assert matrix.data_ptr() != vector.data_ptr()
+    assert store.matrix_decode_count == 1
+    assert store.vector_read_count == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_clear_dynamic_cache_preserves_grouped_expert_cache() -> None:
+    store = _FakeStagingStore()
+    matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
+    expert_tensor = _tensor("blk.1.ffn_gate_exps.weight")
+    store.generic_matrices[matrix_tensor.name] = torch.eye(2, dtype=torch.float32)
+    store.matrices[(expert_tensor.name, 0)] = torch.eye(2, dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    first_matrix = stager.stage_matrix(matrix_tensor)
+    first_expert = stager.stage_grouped_expert_matrix(expert_tensor, 0)
+    stager.clear_dynamic_cache()
+    second_matrix = stager.stage_matrix(matrix_tensor)
+    second_expert = stager.stage_grouped_expert_matrix(expert_tensor, 0)
+
+    assert first_matrix.data_ptr() != second_matrix.data_ptr()
+    assert first_expert.data_ptr() == second_expert.data_ptr()
+    assert store.matrix_decode_count == 2
+    assert store.decode_count == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -121,11 +245,37 @@ def test_real_gguf_grouped_expert_stages_to_gpu() -> None:
             ),
             expert_id=0,
         )
+        router_layer = next(layer for layer in store.bindings.layers if layer.router)
+        assert router_layer.router is not None
+        attention_norm_layer = next(
+            layer for layer in store.bindings.layers if layer.attention_norm
+        )
+        assert attention_norm_layer.attention_norm is not None
+
+        router = stager.stage_matrix(router_layer.router)
+        attention_norm = stager.stage_vector(attention_norm_layer.attention_norm)
+        output_norm = (
+            stager.stage_vector(store.bindings.output_norm)
+            if store.bindings.output_norm is not None
+            else None
+        )
 
     assert staged.gate.device.type == "cuda"
     assert staged.up.device.type == "cuda"
     assert staged.down.device.type == "cuda"
+    assert router.device.type == "cuda"
+    assert attention_norm.device.type == "cuda"
+    if output_norm is not None:
+        assert output_norm.device.type == "cuda"
     assert staged.gate.ndim == 2
     assert staged.up.ndim == 2
     assert staged.down.ndim == 2
+    assert router.ndim == 2
+    assert attention_norm.ndim == 1
+    if output_norm is not None:
+        assert output_norm.ndim == 1
     assert torch.isfinite(staged.gate).all()
+    assert torch.isfinite(router).all()
+    assert torch.isfinite(attention_norm).all()
+    if output_norm is not None:
+        assert torch.isfinite(output_norm).all()
