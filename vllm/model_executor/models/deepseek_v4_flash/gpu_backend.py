@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from vllm.kernels.triton.deepseek_v4_flash.attention import (
     DeepSeekV4AttentionKernelInputs,
@@ -150,6 +151,24 @@ class DeepSeekV4FlashGPUBackend:
                 expert_outputs=expert_outputs,
             )
         )
+
+    def routed_expert_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        tensors = (hidden, gate_weight, up_weight, down_weight)
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash routed expert GEMM inputs must be CUDA tensors"
+            )
+        hidden_f32 = hidden.to(torch.float32)
+        gate = gate_weight.to(torch.float32).matmul(hidden_f32)
+        up = up_weight.to(torch.float32).matmul(hidden_f32)
+        return down_weight.to(torch.float32).matmul(F.silu(gate) * up)
 
     def compressed_attention(
         self,
