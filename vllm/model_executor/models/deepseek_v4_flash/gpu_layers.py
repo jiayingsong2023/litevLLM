@@ -59,6 +59,13 @@ def deepseek_v4_flash_staged_matrix_projection(
     hidden: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
+    """Project ``hidden`` with a staged matrix.
+
+    Staged decoded matrices use row-major linear layout
+    ``(out_features, in_features)``. For non-square legacy/fp16 tensors whose
+    decoded shape is still ``(in_features, out_features)``, only use the
+    transpose convention when the row-major convention is impossible.
+    """
     if not hidden.is_cuda or not weight.is_cuda:
         raise ValueError("DeepSeek V4 Flash projection inputs must be CUDA tensors")
     if hidden.ndim != 1:
@@ -108,6 +115,7 @@ def deepseek_v4_flash_router_topk(
     expert_ids = torch.topk(selection_scores, k=top_k, sorted=True).indices
     expert_weights = scores.gather(0, expert_ids)
     expert_weights = expert_weights / (expert_weights.sum() + 1e-20)
+    expert_weights = expert_weights * 1.5
     return expert_ids.to(torch.int64), expert_weights.to(torch.float32)
 
 
@@ -129,7 +137,11 @@ def deepseek_v4_flash_residual_hyper_connection(
         return residual.to(torch.float32) + update.to(torch.float32)
 
     if residual.ndim == 1:
-        return residual.to(torch.float32) + update.to(torch.float32)
+        raise ValueError(
+            "DeepSeek V4 Flash 1-D hyper-connection is unsupported in the "
+            "sliding GPU layer; pass stream-shaped hidden state in a later "
+            "full-layer path"
+        )
     if residual.ndim != 2:
         raise ValueError(
             "hyper-connection residual streams must be 1-D or 2-D; "
@@ -183,6 +195,7 @@ def deepseek_v4_flash_sliding_layer_forward(
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     token_idx: int,
+    token_id: int | None = None,
     kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
 ) -> torch.Tensor:
@@ -197,11 +210,27 @@ def deepseek_v4_flash_sliding_layer_forward(
     attention_query = stager.stage_matrix(
         _required_tensor(layer.attention_query, "attention_query")
     )
-    attention_output = stager.stage_matrix(
-        _required_tensor(layer.attention_output, "attention_output")
+    use_two_stage_output = (
+        layer.attention_output_a is not None and layer.attention_output_b is not None
+    )
+    attention_output = (
+        None
+        if use_two_stage_output
+        else stager.stage_matrix(
+            _required_tensor(layer.attention_output, "attention_output")
+        )
+    )
+    attention_output_a = (
+        stager.stage_matrix(layer.attention_output_a)
+        if layer.attention_output_a is not None
+        else None
+    )
+    attention_output_b = (
+        stager.stage_matrix(layer.attention_output_b)
+        if layer.attention_output_b is not None
+        else None
     )
     ffn_norm = stager.stage_vector(_required_tensor(layer.ffn_norm, "ffn_norm"))
-    router = stager.stage_matrix(_required_tensor(layer.router, "router"))
     grouped_experts = _required_grouped_experts(layer.grouped_experts)
 
     attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
@@ -216,11 +245,6 @@ def deepseek_v4_flash_sliding_layer_forward(
             query,
             stager.stage_matrix(layer.attention_query_b),
         )
-    query = _adapt_attention_width_for_output_projection(
-        query,
-        attention_output,
-        output_size=hidden.numel(),
-    )
     if kv_rows is None:
         kv_rows = query.reshape(1, query.numel())
     if not kv_rows.is_cuda:
@@ -236,9 +260,11 @@ def deepseek_v4_flash_sliding_layer_forward(
         attn_sinks=attn_sinks,
         token_idx=token_idx,
     )
-    attn_update = deepseek_v4_flash_staged_matrix_projection(
+    attn_update = _project_sliding_attention_output(
         attn_update,
         attention_output,
+        attention_output_a=attention_output_a,
+        attention_output_b=attention_output_b,
     )
     hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
         hidden,
@@ -248,24 +274,14 @@ def deepseek_v4_flash_sliding_layer_forward(
     )
 
     ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
-    correction_bias = (
-        stager.stage_vector(layer.expert_probs_bias)
-        if layer.expert_probs_bias is not None
-        else None
-    )
-    expert_ids, expert_weights = deepseek_v4_flash_router_topk(
+    moe_update = _run_sliding_moe(
         ffn_input,
-        router,
-        top_k=router_top_k,
-        correction_bias=correction_bias,
-    )
-    moe_update = _run_staged_routed_experts(
-        ffn_input,
-        expert_ids,
-        expert_weights,
+        layer=layer,
         grouped_experts=grouped_experts,
         stager=stager,
         backend=backend,
+        token_id=token_idx if token_id is None else token_id,
+        router_top_k=router_top_k,
     )
     return deepseek_v4_flash_residual_hyper_connection(
         hidden_after_attn,
@@ -273,6 +289,188 @@ def deepseek_v4_flash_sliding_layer_forward(
         stager=stager,
         hyper_connection=layer.ffn_hyper_connection,
     )
+
+
+def _project_sliding_attention_output(
+    context: torch.Tensor,
+    attention_output: torch.Tensor | None,
+    *,
+    attention_output_a: torch.Tensor | None,
+    attention_output_b: torch.Tensor | None,
+) -> torch.Tensor:
+    if attention_output_a is not None or attention_output_b is not None:
+        if attention_output_a is None or attention_output_b is None:
+            raise ValueError(
+                "DeepSeek V4 Flash sliding output projection requires both "
+                "attention_output_a and attention_output_b"
+            )
+        return _grouped_output_projection(
+            context,
+            attention_output_a,
+            attention_output_b,
+            output_groups=DEEPSEEK_V4_FLASH_SHAPE.output_groups,
+        )
+    if attention_output is None:
+        raise ValueError("DeepSeek V4 Flash sliding layer missing attention_output")
+    return deepseek_v4_flash_staged_matrix_projection(context, attention_output)
+
+
+def _grouped_output_projection(
+    context: torch.Tensor,
+    output_a: torch.Tensor,
+    output_b: torch.Tensor,
+    *,
+    output_groups: int,
+) -> torch.Tensor:
+    if context.ndim != 1:
+        raise ValueError(f"attention context must be 1-D; got {context.ndim}-D")
+    if output_a.ndim != 2 or output_b.ndim != 2:
+        raise ValueError("attention output projection weights must be 2-D")
+    if output_groups <= 0:
+        raise ValueError(f"output_groups must be positive; got {output_groups}")
+    if context.numel() % output_groups != 0:
+        raise ValueError(
+            "attention context width must be divisible by output_groups; "
+            f"got {context.numel()} and {output_groups}"
+        )
+
+    group_input = context.numel() // output_groups
+    if output_a.shape[1] != group_input:
+        raise ValueError(
+            "attention_output_a input width must match grouped context; "
+            f"got {output_a.shape[1]} and {group_input}"
+        )
+    if output_a.shape[0] % output_groups != 0:
+        raise ValueError(
+            "attention_output_a output width must be divisible by output_groups; "
+            f"got {output_a.shape[0]} and {output_groups}"
+        )
+    rank_per_group = output_a.shape[0] // output_groups
+    if output_b.shape[1] != output_groups * rank_per_group:
+        raise ValueError(
+            "attention_output_b input width must match grouped output rank; "
+            f"got {output_b.shape[1]} and {output_groups * rank_per_group}"
+        )
+
+    grouped = context.to(torch.float32).reshape(output_groups, group_input)
+    a_by_group = output_a.to(torch.float32).reshape(
+        output_groups,
+        rank_per_group,
+        group_input,
+    )
+    low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
+    return output_b.to(torch.float32).matmul(low_rank.reshape(-1))
+
+
+def _run_sliding_moe(
+    hidden: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    token_id: int,
+    router_top_k: int,
+) -> torch.Tensor:
+    routed = _run_hash_routed_experts(
+        hidden,
+        layer=layer,
+        grouped_experts=grouped_experts,
+        stager=stager,
+        backend=backend,
+        token_id=token_id,
+    )
+    if routed is None:
+        router = stager.stage_matrix(_required_tensor(layer.router, "router"))
+        correction_bias = (
+            stager.stage_vector(layer.expert_probs_bias)
+            if layer.expert_probs_bias is not None
+            else None
+        )
+        expert_ids, expert_weights = deepseek_v4_flash_router_topk(
+            hidden,
+            router,
+            top_k=router_top_k,
+            correction_bias=correction_bias,
+        )
+        routed = _run_staged_routed_experts(
+            hidden,
+            expert_ids,
+            expert_weights,
+            grouped_experts=grouped_experts,
+            stager=stager,
+            backend=backend,
+        )
+
+    if layer.shared_experts is None:
+        return routed
+    shared = _run_staged_shared_expert(
+        hidden,
+        layer.shared_experts,
+        stager=stager,
+        backend=backend,
+    )
+    if shared.shape != routed.shape:
+        raise ValueError(
+            "shared and routed MoE outputs must share one shape; "
+            f"got {tuple(shared.shape)} and {tuple(routed.shape)}"
+        )
+    return shared.to(torch.float32) + routed.to(torch.float32)
+
+
+def _run_hash_routed_experts(
+    hidden: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    token_id: int,
+) -> torch.Tensor | None:
+    if layer.expert_token_to_expert_ids is None:
+        return None
+    table = stager.store.tensor_to_torch(
+        layer.expert_token_to_expert_ids,
+        dtype=torch.int32,
+    ).to(device=hidden.device, non_blocking=True)
+    if table.ndim != 2:
+        raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
+    if token_id < 0 or token_id >= table.shape[1]:
+        raise ValueError(
+            f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
+        )
+    expert_ids = table[:, token_id].to(torch.int64)
+    if torch.any(expert_ids < 0):
+        raise ValueError("hash-routed expert ids must be non-negative")
+    weights = torch.full(
+        expert_ids.shape,
+        1.5 / float(expert_ids.numel()),
+        dtype=torch.float32,
+        device=hidden.device,
+    )
+    return _run_staged_routed_experts(
+        hidden,
+        expert_ids,
+        weights,
+        grouped_experts=grouped_experts,
+        stager=stager,
+        backend=backend,
+    )
+
+
+def _run_staged_shared_expert(
+    hidden: torch.Tensor,
+    tensors: DeepSeekV4FlashGroupedExpertTensors,
+    *,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+) -> torch.Tensor:
+    return backend.routed_expert_gemm(
+        hidden=hidden,
+        gate_weight=stager.stage_matrix(tensors.gate),
+        up_weight=stager.stage_matrix(tensors.up),
+        down_weight=stager.stage_matrix(tensors.down),
+    ).to(torch.float32)
 
 
 def _run_staged_routed_experts(
@@ -305,29 +503,6 @@ def _run_staged_routed_experts(
     if output is None:
         raise ValueError("DeepSeek V4 Flash routed MoE selected no experts")
     return output
-
-
-def _adapt_attention_width_for_output_projection(
-    query: torch.Tensor,
-    attention_output: torch.Tensor,
-    *,
-    output_size: int,
-) -> torch.Tensor:
-    if attention_output.shape[0] == output_size:
-        projection_input_size = attention_output.shape[1]
-    elif attention_output.shape[1] == output_size:
-        projection_input_size = attention_output.shape[0]
-    else:
-        projection_input_size = query.numel()
-
-    if query.numel() == projection_input_size:
-        return query
-    if query.numel() > projection_input_size:
-        return query[:projection_input_size]
-    raise ValueError(
-        "attention query width is smaller than output projection input; "
-        f"got query={query.numel()}, projection_input={projection_input_size}"
-    )
 
 
 def _required_tensor(
