@@ -497,3 +497,31 @@ async def create_chat_completion(request: Request):
                 ],
             }
         )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FastInference OpenAI API Server")
+    parser.add_argument("--model", type=str, required=True, help="Path to the model.")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--policy-mode",
+        type=str,
+        choices=["auto", "aggressive", "stable"],
+        default=os.getenv("FASTINF_POLICY_MODE", "auto"),
+        help="Load-time execution policy selection mode.",
+    )
+    args = parser.parse_args()
+
+    global engine
+    v_config = build_vllm_config(args.model, policy_mode=args.policy_mode)
+    engine = AsyncLLM(v_config)
+
+    logger.info(
+        "FastInference API Server starting on http://%s:%s", args.host, args.port
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
