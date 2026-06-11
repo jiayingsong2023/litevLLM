@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Protocol, cast
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,13 @@ from .weight_store import (
     DeepSeekV4FlashHyperConnectionTensors,
     DeepSeekV4FlashLayerSemanticBindings,
 )
+
+
+@dataclass
+class _CompressorRuntimeState:
+    kv_rows: torch.Tensor
+    score_rows: torch.Tensor
+    count: int = 0
 
 
 class _SlidingLayerBackend(Protocol):
@@ -385,28 +393,34 @@ def deepseek_v4_flash_compressed_layer_forward(
 
     attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
     query = _compressed_attention_query(attn_input, layer=layer, stager=stager)
-    compressed_row = _project_compressor_row(
+    candidate_row, emitted_row = _update_compressor_state(
         attn_input,
+        state=state,
+        layer_idx=layer.layer_index,
+        state_name="attention",
         compressor=compressor,
         stager=stager,
         token_idx=token_idx,
         ratio=ratio,
     )
-    indexer_row = (
-        _project_compressor_row(
+    indexer_row: torch.Tensor | None = None
+    if layer.indexer is not None:
+        _index_candidate, indexer_row = _update_compressor_state(
             attn_input,
+            state=state,
+            layer_idx=layer.layer_index,
+            state_name="indexer",
             compressor=layer.indexer.compressor,
             stager=stager,
             token_idx=token_idx,
             ratio=4,
         )
-        if layer.indexer is not None
-        else None
-    )
 
     prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
     if prior_rows.shape[0] == 0:
-        attention_rows = compressed_row.reshape(1, -1)
+        attention_rows = (
+            candidate_row if emitted_row is None else emitted_row
+        ).reshape(1, -1)
         selected_rows = torch.zeros(1, dtype=torch.int64, device=hidden.device)
     elif layer.indexer is not None:
         selected_rows = _select_compressed_rows_with_indexer(
@@ -454,13 +468,19 @@ def deepseek_v4_flash_compressed_layer_forward(
         hyper_connection=layer.attention_hyper_connection,
     )
 
-    _write_compressed_runtime_row(
-        state,
-        layer_idx=layer.layer_index,
-        token_idx=token_idx,
-        compressed_row=compressed_row,
-        indexer_row=indexer_row,
-    )
+    if emitted_row is not None:
+        if ratio == 4 and indexer_row is None:
+            raise ValueError(
+                "DeepSeek V4 Flash ratio-4 compressed layer did not emit "
+                "an indexer row with the attention row"
+            )
+        _write_compressed_runtime_row(
+            state,
+            layer_idx=layer.layer_index,
+            token_idx=token_idx,
+            compressed_row=emitted_row,
+            indexer_row=indexer_row,
+        )
     state.advance_token()
 
     ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
@@ -587,14 +607,17 @@ def _compressed_attention_query(
     return query
 
 
-def _project_compressor_row(
+def _update_compressor_state(
     hidden: torch.Tensor,
     *,
+    state: DeepSeekV4FlashGPURequestState,
+    layer_idx: int,
+    state_name: str,
     compressor: DeepSeekV4FlashCompressorTensors,
     stager: DeepSeekV4FlashGPUWeightStager,
     token_idx: int,
     ratio: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     if token_idx < 0:
         raise ValueError("token_idx must be non-negative")
     if ratio <= 0:
@@ -614,19 +637,93 @@ def _project_compressor_row(
         )
 
     norm = stager.stage_vector(compressor.norm)
-    if kv_cur.numel() < norm.numel():
+    if kv_cur.numel() != norm.numel():
         raise ValueError(
-            "compressor projection width must cover norm width; "
+            "unsupported DeepSeek V4 Flash compressor projection layout: "
+            "projection width must match norm width for this GPU path; "
             f"got {kv_cur.numel()} and {norm.numel()}"
         )
-    row = kv_cur[: norm.numel()].to(torch.float32)
     ape = stager.stage_matrix(compressor.ape)
-    pos_mod = token_idx % ratio
     if ape.ndim != 2:
         raise ValueError(f"compressor ape must be 2-D; got {ape.ndim}-D")
-    if ape.shape[0] >= norm.numel() and ape.shape[1] > pos_mod:
-        row = row + ape[: norm.numel(), pos_mod].to(torch.float32)
-    return deepseek_v4_flash_rms_norm(row, norm).to(stager.dtype)
+    if ape.shape != (norm.numel(), ratio):
+        raise ValueError(
+            "unsupported DeepSeek V4 Flash compressor APE layout: "
+            f"expected ({norm.numel()}, {ratio}), got {tuple(ape.shape)}"
+        )
+
+    runtime_state = _get_compressor_runtime_state(
+        state,
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+        row_width=norm.numel(),
+        device=hidden.device,
+    )
+    pos_mod = token_idx % ratio
+    runtime_state.kv_rows[pos_mod].copy_(kv_cur.to(torch.float32))
+    runtime_state.score_rows[pos_mod].copy_(
+        score_cur.to(torch.float32) + ape[:, pos_mod].to(torch.float32)
+    )
+    runtime_state.count = min(runtime_state.count + 1, ratio)
+
+    candidate = deepseek_v4_flash_rms_norm(kv_cur.to(torch.float32), norm).to(
+        stager.dtype
+    )
+    if (token_idx + 1) % ratio != 0 or runtime_state.count < ratio:
+        return candidate, None
+
+    weights = torch.softmax(runtime_state.score_rows.to(torch.float32), dim=0)
+    pooled = (weights * runtime_state.kv_rows.to(torch.float32)).sum(dim=0)
+    emitted = deepseek_v4_flash_rms_norm(pooled, norm).to(stager.dtype)
+    return candidate, emitted
+
+
+def _get_compressor_runtime_state(
+    state: DeepSeekV4FlashGPURequestState,
+    *,
+    layer_idx: int,
+    state_name: str,
+    ratio: int,
+    row_width: int,
+    device: torch.device,
+) -> _CompressorRuntimeState:
+    attr = "_deepseek_v4_flash_compressor_states"
+    states = getattr(state, attr, None)
+    if states is None:
+        states = {}
+        setattr(state, attr, states)
+    states = cast(dict[tuple[int, str], _CompressorRuntimeState], states)
+    key = (layer_idx, state_name)
+    runtime_state = states.get(key)
+    if runtime_state is None:
+        runtime_state = _CompressorRuntimeState(
+            kv_rows=torch.zeros(
+                (ratio, row_width),
+                dtype=torch.float32,
+                device=device,
+            ),
+            score_rows=torch.empty(
+                (ratio, row_width),
+                dtype=torch.float32,
+                device=device,
+            ).fill_(-1000.0),
+        )
+        states[key] = runtime_state
+        return runtime_state
+    if runtime_state.kv_rows.shape != (ratio, row_width):
+        raise ValueError(
+            "compressor runtime state shape changed for layer "
+            f"{layer_idx} {state_name}: got {tuple(runtime_state.kv_rows.shape)}, "
+            f"expected ({ratio}, {row_width})"
+        )
+    if runtime_state.kv_rows.device != device:
+        raise ValueError(
+            "compressor runtime state device changed for layer "
+            f"{layer_idx} {state_name}: got {runtime_state.kv_rows.device}, "
+            f"expected {device}"
+        )
+    return runtime_state
 
 
 def _select_compressed_rows_with_indexer(

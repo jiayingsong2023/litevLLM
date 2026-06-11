@@ -172,7 +172,15 @@ def _compressed_layer_fixture() -> tuple[
     store.matrices[tensors["attn_q"].name] = torch.eye(hidden_size)
     store.matrices[tensors["attn_out"].name] = torch.eye(hidden_size)
     store.matrices[tensors["comp_kv"].name] = torch.eye(hidden_size)
-    store.matrices[tensors["comp_gate"].name] = torch.eye(hidden_size)
+    store.matrices[tensors["comp_gate"].name] = torch.tensor(
+        [
+            [10.0, 0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
     store.matrices[tensors["comp_ape"].name] = torch.zeros((kv_width, 4))
     store.matrices[tensors["index_q_b"].name] = torch.cat(
         [torch.eye(hidden_size), torch.zeros(hidden_size, indexer_width - hidden_size)],
@@ -223,7 +231,59 @@ def _compressed_layer_fixture() -> tuple[
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_compressed_layer_forward_writes_rows_and_selects_bounded_rows() -> None:
+def test_compressor_state_emits_only_on_ratio_boundary_and_uses_gate_scores() -> None:
+    store, layer = _compressed_layer_fixture()
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=16,
+            hidden_size=4,
+            kv_width=4,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    backend = _RecordingCompressedBackend()
+    hidden_by_token = (
+        torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda"),
+        torch.tensor([0.0, 1.0, 0.0, 0.0], device="cuda"),
+        torch.tensor([0.0, 0.0, 1.0, 0.0], device="cuda"),
+        torch.tensor([0.0, 0.0, 0.0, 1.0], device="cuda"),
+    )
+
+    for token_idx, hidden in enumerate(hidden_by_token[:3]):
+        output = deepseek_v4_flash_compressed_layer_forward(
+            hidden,
+            layer=layer,
+            stager=stager,
+            backend=backend,
+            state=state,
+            token_idx=token_idx,
+            router_top_k=1,
+        )
+        assert output.device.type == "cuda"
+        assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 0
+
+    output = deepseek_v4_flash_compressed_layer_forward(
+        hidden_by_token[3],
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state,
+        token_idx=3,
+        router_top_k=1,
+    )
+
+    assert output.device.type == "cuda"
+    assert state.token_position == 4
+    assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 1
+    emitted = state.compressed_kv_cache.compressed_rows[2, 0]
+    assert emitted[0] > emitted[3]
+    assert emitted[0] > 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_boundary_rows_are_written_and_selected_rows_are_bounded() -> None:
     store, layer = _compressed_layer_fixture()
     state = DeepSeekV4FlashGPURequestState(
         DeepSeekV4FlashGPUCacheConfig(
@@ -245,24 +305,35 @@ def test_compressed_layer_forward_writes_rows_and_selects_bounded_rows() -> None
     )
     backend = _RecordingCompressedBackend()
 
-    output = deepseek_v4_flash_compressed_layer_forward(
-        torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda"),
-        layer=layer,
-        stager=DeepSeekV4FlashGPUWeightStager(store, device="cuda"),
-        backend=backend,
-        state=state,
-        token_idx=3,
-        router_top_k=1,
-    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    for token_idx, hidden in enumerate(
+        (
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda"),
+            torch.tensor([0.0, 1.0, 0.0, 0.0], device="cuda"),
+            torch.tensor([0.0, 0.0, 1.0, 0.0], device="cuda"),
+            torch.tensor([0.0, 0.0, 0.0, 1.0], device="cuda"),
+        )
+    ):
+        output = deepseek_v4_flash_compressed_layer_forward(
+            hidden,
+            layer=layer,
+            stager=stager,
+            backend=backend,
+            state=state,
+            token_idx=token_idx,
+            router_top_k=1,
+        )
 
     assert output.device.type == "cuda"
-    assert state.token_position == 1
+    assert state.token_position == 4
     assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 2
     expected_row = torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda")
     expected_row = expected_row * torch.rsqrt(expected_row.pow(2).mean() + 1e-6)
     torch.testing.assert_close(
         state.compressed_kv_cache.compressed_rows[2, 1],
         expected_row,
+        rtol=5e-4,
+        atol=5e-4,
     )
     assert backend.compressed_selected_rows is not None
     assert backend.compressed_selected_rows.device.type == "cuda"
@@ -303,8 +374,9 @@ def test_layer_dispatch_only_falls_back_to_sliding_for_sliding_layers() -> None:
     os.environ.get("RUN_DEEPSEEK_REAL_GGUF_LAYER") != "1",
     reason="real GGUF layer smoke is opt-in",
 )
-@pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target GGUF not downloaded")
 def test_real_gguf_layer2_compressed_forward_smoke() -> None:
+    if not TARGET_GGUF.exists():
+        pytest.fail(f"target GGUF not downloaded: {TARGET_GGUF}")
     with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
         layer = store.bindings.layers[2]
         state = DeepSeekV4FlashGPURequestState(
