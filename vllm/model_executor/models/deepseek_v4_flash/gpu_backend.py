@@ -5,6 +5,10 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.kernels.triton.deepseek_v4_flash.attention import (
+    DeepSeekV4AttentionKernelInputs,
+    deepseek_v4_attention,
+)
 from vllm.kernels.triton.deepseek_v4_flash.output import (
     DeepSeekV4OutputKernelInputs,
     deepseek_v4_output_projection,
@@ -94,5 +98,27 @@ class DeepSeekV4FlashGPUBackend:
                 output_hc_base=output_hc_base,
                 output_norm_weight=output_norm_weight,
                 block_size=block_size,
+            )
+        )
+
+    def sliding_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        attn_sinks: torch.Tensor | None,
+        token_idx: int,
+    ) -> torch.Tensor:
+        tensors = (query, kv_rows, attn_sinks)
+        if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash sliding attention inputs must be CUDA tensors"
+            )
+        return deepseek_v4_attention(
+            DeepSeekV4AttentionKernelInputs(
+                hidden=query,
+                kv_rows=kv_rows,
+                token_idx=token_idx,
+                attn_sinks=attn_sinks,
             )
         )

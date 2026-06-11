@@ -9,7 +9,6 @@ from vllm.kernels.triton.deepseek_v4_flash import (
     DeepSeekV4CompressedAttentionInputs,
     DeepSeekV4MoEKernelInputs,
     DeepSeekV4OutputKernelInputs,
-    deepseek_v4_attention,
     deepseek_v4_cache_update,
     deepseek_v4_moe,
 )
@@ -55,15 +54,6 @@ def test_deepseek_kernel_scaffolding_exports_expected_contracts() -> None:
 
 
 def test_deepseek_kernel_scaffolding_is_explicitly_not_implemented() -> None:
-    with pytest.raises(NotImplementedError, match="attention kernel"):
-        deepseek_v4_attention(
-            DeepSeekV4AttentionKernelInputs(
-                hidden=torch.zeros(16),
-                kv_rows=torch.zeros(1, 16),
-                token_idx=0,
-            )
-        )
-
     with pytest.raises(NotImplementedError, match="cache update kernel"):
         deepseek_v4_cache_update(
             DeepSeekV4CacheUpdateInputs(
