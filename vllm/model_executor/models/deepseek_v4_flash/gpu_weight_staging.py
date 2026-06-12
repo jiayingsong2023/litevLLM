@@ -167,6 +167,147 @@ class DeepSeekV4FlashGPUWeightStager:
         self._dynamic_cache[cache_key] = staged
         return staged
 
+    @staticmethod
+    def _validate_output_q8_row_range(
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        row_start: int,
+        row_end: int,
+    ) -> None:
+        if row_start < 0 or row_end <= row_start:
+            raise ValueError(
+                "output Q8 chunk row range must satisfy "
+                f"row_start >= 0 and row_end > row_start; "
+                f"got row_start={row_start}, row_end={row_end}"
+            )
+        if len(tensor.dims) >= 2:
+            rows = tensor.dims[1]
+            if row_end > rows:
+                raise ValueError(
+                    "output Q8 chunk row range exceeds tensor rows; "
+                    f"got row_start={row_start}, row_end={row_end}, rows={rows}"
+                )
+
+    def _output_q8_chunk_cache_keys(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        row_start: int,
+        row_end: int,
+        values_dtype: torch.dtype = torch.int8,
+    ) -> tuple[
+        tuple[str, str, torch.dtype, str],
+        tuple[str, str, torch.dtype, str],
+    ]:
+        row_range = f"output_q8:{row_start}:{row_end}"
+        values_key = (
+            tensor.name,
+            str(self.device),
+            values_dtype,
+            f"{row_range}:values",
+        )
+        scales_key = (
+            tensor.name,
+            str(self.device),
+            torch.float32,
+            f"{row_range}:scales",
+        )
+        return values_key, scales_key
+
+    def get_output_q8_chunk(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        row_start: int,
+        row_end: int,
+        record_hit: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.device.type != "cuda":
+            raise ValueError(
+                "DeepSeek V4 Flash output Q8 staging requires a CUDA device"
+            )
+        self._validate_output_q8_row_range(
+            tensor,
+            row_start=row_start,
+            row_end=row_end,
+        )
+        values_key, scales_key = self._output_q8_chunk_cache_keys(
+            tensor,
+            row_start=row_start,
+            row_end=row_end,
+        )
+        cached_values = self._dynamic_cache.get(values_key)
+        cached_scales = self._dynamic_cache.get(scales_key)
+        if cached_values is None or cached_scales is None:
+            return None
+        if record_hit:
+            self.record_cache_hit("dynamic", tensor_name=tensor.name)
+        return cached_values, cached_scales
+
+    def stage_output_q8_chunk(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        *,
+        row_start: int,
+        row_end: int,
+        values: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device.type != "cuda":
+            raise ValueError(
+                "DeepSeek V4 Flash output Q8 staging requires a CUDA device"
+            )
+        self._validate_output_q8_row_range(
+            tensor,
+            row_start=row_start,
+            row_end=row_end,
+        )
+
+        values_key, scales_key = self._output_q8_chunk_cache_keys(
+            tensor,
+            row_start=row_start,
+            row_end=row_end,
+            values_dtype=values.dtype,
+        )
+        cached_values = self._dynamic_cache.get(values_key)
+        cached_scales = self._dynamic_cache.get(scales_key)
+        if cached_values is not None and cached_scales is not None:
+            self.record_cache_hit("dynamic", tensor_name=tensor.name)
+            return cached_values, cached_scales
+
+        partial_cached_bytes = 0
+        if cached_values is not None:
+            partial_cached_bytes += cached_values.nbytes
+            del self._dynamic_cache[values_key]
+        if cached_scales is not None:
+            partial_cached_bytes += cached_scales.nbytes
+            del self._dynamic_cache[scales_key]
+        self._staged_bytes -= partial_cached_bytes
+
+        nbytes = values.numel() * values.element_size()
+        nbytes += scales.numel() * self._dtype_nbytes(torch.float32)
+        try:
+            self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        except RuntimeError:
+            return (
+                values.to(device=self.device, non_blocking=True),
+                scales.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                ),
+            )
+        staged_values = values.to(device=self.device, non_blocking=True)
+        staged_scales = scales.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        self._dynamic_cache[values_key] = staged_values
+        self._dynamic_cache[scales_key] = staged_scales
+        self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
+        return staged_values, staged_scales
+
     def clear_dynamic_cache(self) -> None:
         self._staged_bytes -= sum(
             tensor.nbytes for tensor in self._dynamic_cache.values()

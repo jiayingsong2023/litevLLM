@@ -702,31 +702,44 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         blocks_per_row = columns // _Q8_0_BLOCK_SIZE
         row_bytes = blocks_per_row * _Q8_0_BLOCK_BYTES
         logits_chunks: list[torch.Tensor] = []
-        payload = store.tensor_payload(tensor)
+        payload: memoryview | None = None
         try:
             for row_start in range(0, rows, _OUTPUT_PROJECTION_CHUNK_ROWS):
                 row_end = min(row_start + _OUTPUT_PROJECTION_CHUNK_ROWS, rows)
-                chunk_rows = row_end - row_start
-                byte_start = row_start * row_bytes
-                byte_end = row_end * row_bytes
-                chunk_view = payload[byte_start:byte_end]
-                try:
-                    values, scales = q8_0_matrix_from_gguf_payload(
-                        chunk_view,
-                        rows=chunk_rows,
-                        columns=columns,
-                        block_size=_Q8_0_BLOCK_SIZE,
+                cached = stager.get_output_q8_chunk(
+                    tensor,
+                    row_start=row_start,
+                    row_end=row_end,
+                )
+                if cached is None:
+                    if payload is None:
+                        payload = store.tensor_payload(tensor)
+                    chunk_rows = row_end - row_start
+                    byte_start = row_start * row_bytes
+                    byte_end = row_end * row_bytes
+                    chunk_view = payload[byte_start:byte_end]
+                    try:
+                        values, scales = q8_0_matrix_from_gguf_payload(
+                            chunk_view,
+                            rows=chunk_rows,
+                            columns=columns,
+                            block_size=_Q8_0_BLOCK_SIZE,
+                        )
+                    finally:
+                        chunk_view.release()
+                    lm_head_values, lm_head_scales = stager.stage_output_q8_chunk(
+                        tensor,
+                        row_start=row_start,
+                        row_end=row_end,
+                        values=values,
+                        scales=scales,
                     )
-                finally:
-                    chunk_view.release()
+                else:
+                    lm_head_values, lm_head_scales = cached
                 chunk_logits = self.gpu_backend.output_logits(
                     streams=streams,
-                    lm_head_values=values.to(device=device, non_blocking=True),
-                    lm_head_scales=scales.to(
-                        device=device,
-                        dtype=torch.float32,
-                        non_blocking=True,
-                    ),
+                    lm_head_values=lm_head_values,
+                    lm_head_scales=lm_head_scales,
                     output_hc_weight=output_hc_weight,
                     output_hc_scale=output_hc_scale,
                     output_hc_base=output_hc_base,
@@ -739,7 +752,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     )
                 logits_chunks.append(chunk_logits.reshape(-1))
         finally:
-            payload.release()
+            if payload is not None:
+                payload.release()
         if not logits_chunks:
             raise RuntimeError("DeepSeek V4 Flash GPU output produced no chunks")
         return torch.cat(logits_chunks, dim=0).reshape(1, -1)

@@ -244,6 +244,84 @@ def test_gpu_weight_stager_caches_vector_by_cache_key() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_caches_output_q8_chunks_by_row_range() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("output.weight", dims=(4, 4))
+    values = torch.arange(16, dtype=torch.int8).reshape(4, 4)
+    scales = torch.ones((4, 1), dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    first_values, first_scales = stager.stage_output_q8_chunk(
+        tensor,
+        row_start=0,
+        row_end=4,
+        values=values,
+        scales=scales,
+    )
+    second_values, second_scales = stager.stage_output_q8_chunk(
+        tensor,
+        row_start=0,
+        row_end=4,
+        values=values,
+        scales=scales,
+    )
+
+    assert first_values.device.type == "cuda"
+    assert first_scales.device.type == "cuda"
+    assert first_values.data_ptr() == second_values.data_ptr()
+    assert first_scales.data_ptr() == second_scales.data_ptr()
+    stats = stager.cache_stats()
+    assert stats["dynamic_misses"] == 1
+    assert stats["dynamic_hits"] == 1
+
+
+def test_gpu_weight_stager_rejects_output_q8_row_end_past_tensor_rows() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("output.weight", dims=(128, 4))
+    values = torch.arange(128, dtype=torch.int8).reshape(1, 128)
+    scales = torch.ones((1, 4), dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    with pytest.raises(ValueError, match="row range"):
+        stager.stage_output_q8_chunk(
+            tensor,
+            row_start=3,
+            row_end=5,
+            values=values,
+            scales=scales,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_streams_output_q8_when_budget_is_exceeded() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("output.weight", dims=(4, 4))
+    values = torch.arange(16, dtype=torch.int8).reshape(4, 4)
+    scales = torch.ones((4, 1), dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=1,
+    )
+
+    staged_values, staged_scales = stager.stage_output_q8_chunk(
+        tensor,
+        row_start=0,
+        row_end=4,
+        values=values,
+        scales=scales,
+    )
+
+    assert staged_values.device.type == "cuda"
+    assert staged_scales.device.type == "cuda"
+    assert stager.get_output_q8_chunk(tensor, row_start=0, row_end=4) is None
+    assert stager.staged_bytes == 0
+    stats = stager.cache_stats()
+    assert stats["dynamic_misses"] == 0
+    assert stats["loaded_bytes"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_gpu_weight_stager_keeps_matrix_and_vector_cache_keys_distinct() -> None:
     store = _FakeStagingStore()
     tensor = _tensor("shared.name.weight", dims=(2, 2))
