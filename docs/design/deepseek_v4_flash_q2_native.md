@@ -43,10 +43,11 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
-## Implemented State As Of GPU Migration Boundary Pass
+## Implemented State As Of End-To-End GPU Smoke Pass
 
-The branch currently has a limited, honest bring-up state. It does not yet meet
-the first-release target described above.
+The branch currently has an experimental batch=1 greedy GPU direct path for the
+target GGUF. It is a correctness-first bring-up path, not a tuned production
+serving path.
 
 Current target file:
 
@@ -69,13 +70,13 @@ Implemented:
   allocation contracts.
 - Attention, mHC, compressor/indexer, routing, and grouped expert reference
   helpers used for isolated unit coverage.
-- Full 43-layer direct reference decode for exactly one input token through
-  real GGUF weights, returning finite `[1, vocab]` logits.
-- Direct greedy reference generation for `max_tokens=1`.
-- OpenAI route exposure and smoke coverage through the normal
-  `AsyncLLM.generate()` engine path. Direct-reference REST and `AsyncLLM`
-  production hooks have been removed so the protocol layer remains a thin
-  control-plane adapter.
+- Full 43-layer GPU direct decode for batch=1 through real GGUF weights,
+  returning finite `[1, vocab]` logits.
+- Greedy GPU generation through `generate_greedy_kernel()`.
+- LiteEngine direct runtime for the target DeepSeek model, with
+  `AsyncLLM.generate()` and OpenAI-compatible REST using the same engine-facing
+  boundary.
+- GPU staging memory accounting and budget guardrails for decoded GGUF tensors.
 - Explicit model execution boundaries:
   `forward_full_reference()` remains the CPU correctness oracle,
   `forward_full(..., use_kernel=True)` is an explicit future kernel dispatch
@@ -88,16 +89,13 @@ Implemented:
 
 Not implemented:
 
-- Multi-step autoregressive decode beyond `max_tokens=1`.
-- Production-speed Triton/ROCm kernels for the DeepSeek V4 Flash path.
-- Kernel-backed `forward()` execution; current kernel-facing functions are
-  interface contracts or explicit `NotImplementedError` stubs.
+- Production-speed Triton/ROCm kernels for every DeepSeek V4 Flash hot path.
 - Continuous batching for DeepSeek V4 Flash.
 - 4K/8K prompt prefill validation.
 
-The direct reference path is correctness-first and very slow on CPU dense
-decoding: current full one-token tests take roughly eight minutes on the local
-machine. It is not a serving hot path.
+The GPU direct path still uses correctness-first PyTorch/Triton wrapper
+fallbacks for some operators. It should be treated as an experimental
+bring-up path until 4K/8K quality and performance validation are complete.
 
 Current bounded validation commands:
 
@@ -105,6 +103,7 @@ Current bounded validation commands:
 timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q
 timeout 600 uv run --no-sync pytest tests/smoke/test_deepseek_v4_flash_http_smoke.py -q
 timeout 1200 uv run --no-sync pytest tests/deepseek_v4_flash -q
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 ```
 
 The maintained helper `tests/run_deepseek_v4_flash_real_smoke.sh` runs the two

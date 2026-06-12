@@ -64,5 +64,7 @@ def test_get_model_constructs_deepseek_inspect_model_from_gguf(
         assert model.weight_store.diagnostics.tensor_count == 2
         assert model.runtime_budget is not None
         assert model.runtime_budget.context.context_length == 4096
+        assert model.kernel_execution_available is True
+        assert model.gpu_backend.is_ready is True
     finally:
         model.close()

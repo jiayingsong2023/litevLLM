@@ -40,7 +40,12 @@ SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 RUN_GEMMA4_31B=0 bash tests/run_inference_correctness_regression.sh
 RUN_GEMMA4_26B=0 bash tests/run_inference_correctness_regression.sh
 RUN_GEMMA4_26B_A_STRICT=0 bash tests/run_inference_correctness_regression.sh
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 ```
+
+DeepSeek V4 Flash is opt-in because the target GGUF is roughly 80.7GiB and the
+path is still experimental. Override the path with `MODEL_DEEPSEEK_V4_FLASH_GGUF`
+when the model lives outside `models/DeepSeek-V4-Flash-ds4/`.
 
 ## Tier-B Spotcheck
 

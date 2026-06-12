@@ -21,6 +21,7 @@
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
 #   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
+#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 enables the opt-in real GGUF DeepSeek smoke.
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,6 +90,7 @@ MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-models/gemma-4-31B-it-AWQ-4bit}"
 MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-models/gemma-4-26B-A4B-it-AWQ-4bit}"
+MODEL_DEEPSEEK_V4_FLASH_GGUF="${MODEL_DEEPSEEK_V4_FLASH_GGUF:-models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
 TINYLLAMA_PROMPTS_FILE="${TINYLLAMA_PROMPTS_FILE:-tests/tools/fixtures/tinyllama_correctness_prompts_default.json}"
 GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
 
@@ -104,8 +106,10 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE="${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE:-0}"
 FI_CORRECTNESS_STAGE_TIMEOUT="${FI_CORRECTNESS_STAGE_TIMEOUT:-45m}"
 FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT="${FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT:-75m}"
+FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT="${FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT:-45m}"
 FI_CORRECTNESS_PERF_STAGE_TIMEOUT="${FI_CORRECTNESS_PERF_STAGE_TIMEOUT:-90m}"
 FI_CORRECTNESS_STAGE_KILL_AFTER="${FI_CORRECTNESS_STAGE_KILL_AFTER:-60s}"
 print_gemma4_profile() {
@@ -366,6 +370,22 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
   else
     echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
   fi
+fi
+
+if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" ]]; then
+  echo ""
+  echo "=== DeepSeek V4 Flash GPU smoke (opt-in) ==="
+  if [[ ! -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
+    echo "[ERROR] Missing DeepSeek V4 Flash GGUF: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
+    echo "        Override with MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf"
+    exit 1
+  fi
+  run_stage "DeepSeek V4 Flash real GGUF GPU smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
+    uv run python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+    --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
+    --context-length 4096 \
+    --max-tokens 1
+  cleanup_after_model_step "DeepSeek V4 Flash GPU smoke"
 fi
 
 if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then

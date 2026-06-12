@@ -1196,6 +1196,10 @@ def _build_deepseek_v4_flash_inspect_model(
     from vllm.model_executor.models.deepseek_v4_flash.config import (
         DeepSeekV4FlashMemoryPolicy,
     )
+    from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
+        DeepSeekV4FlashGPUBackend,
+        DeepSeekV4FlashGPUCapabilities,
+    )
     from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
         open_deepseek_v4_flash_weight_store,
     )
@@ -1209,7 +1213,17 @@ def _build_deepseek_v4_flash_inspect_model(
             model_mmap_bytes=store.diagnostics.file_size_bytes,
         )
         policy.validate_runtime_budget(budget)
-        model = model_cls(vllm_config)
+        backend = DeepSeekV4FlashGPUBackend(
+            capabilities=DeepSeekV4FlashGPUCapabilities(
+                q8_linear=True,
+                attention=True,
+                compressed_attention=True,
+                cache_update=True,
+                moe=True,
+                output=True,
+            )
+        )
+        model = model_cls(vllm_config, gpu_backend=backend)
         model_with_store: Any = model
         model_with_store.attach_weight_store(store, budget)
         return model.eval()
