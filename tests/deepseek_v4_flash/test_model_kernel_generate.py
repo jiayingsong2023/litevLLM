@@ -148,6 +148,35 @@ def test_model_profile_summary_reports_disabled_profiler_by_default() -> None:
     }
 
 
+def test_prepare_for_serving_sets_context_and_preserves_stager() -> None:
+    model = _fake_model(context_length=4)
+
+    model.prepare_for_serving(
+        context_length=4,
+        device=torch.device("cuda"),
+    )
+    first_stager = model._gpu_weight_stager
+    stats = model.prepare_for_serving(
+        context_length=4,
+        device=torch.device("cuda"),
+    )
+
+    assert model._gpu_weight_stager is first_stager
+    assert model._get_gpu_weight_stager(torch.device("cuda:0")) is first_stager
+    assert stats == model.gpu_staging_memory_stats()
+    assert model.gpu_staging_memory_stats()["max_staged_bytes"] is not None
+
+
+def test_prepare_for_serving_rejects_context_mismatch() -> None:
+    model = _fake_model(context_length=4)
+
+    with pytest.raises(ValueError, match="context_length"):
+        model.prepare_for_serving(
+            context_length=8,
+            device=torch.device("cuda"),
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_model_enable_deepseek_profile_records_generate_section(
     monkeypatch: pytest.MonkeyPatch,

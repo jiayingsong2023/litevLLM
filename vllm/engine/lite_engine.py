@@ -843,6 +843,9 @@ class LiteEngine:
             getattr(self.runtime_config, "queue_timeout_s", 30.0)
         )
         self.runtime_controller = None
+        prepare = getattr(self.model, "prepare_for_serving", None)
+        if prepare is not None and self.device.type == "cuda":
+            prepare(context_length=self.max_model_len, device=self.device)
 
     def generate_deepseek_v4_flash_greedy(
         self,

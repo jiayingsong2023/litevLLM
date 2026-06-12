@@ -29,6 +29,16 @@ class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[list[int], int, str]] = []
+        self.prepared: tuple[int, str] | None = None
+
+    def prepare_for_serving(
+        self,
+        *,
+        context_length: int,
+        device: torch.device,
+    ) -> dict[str, int | None]:
+        self.prepared = (context_length, device.type)
+        return {}
 
     def generate_greedy_kernel(
         self,
@@ -147,3 +157,4 @@ def test_lite_engine_marks_deepseek_direct_runtime_without_kv_allocation(
     assert engine.model is fake_model
     assert engine._deepseek_v4_flash_direct is True
     assert engine.max_active_requests == 1
+    assert engine.model.prepared == (engine.max_model_len, "cuda")

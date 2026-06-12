@@ -513,6 +513,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         device: torch.device,
     ) -> DeepSeekV4FlashGPUWeightStager:
         store = self._require_weight_store()
+        device = self._canonical_gpu_staging_device(device)
         store_id = id(store)
         if (
             self._gpu_weight_stager is None
@@ -527,6 +528,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
         return self._gpu_weight_stager
+
+    @staticmethod
+    def _canonical_gpu_staging_device(device: torch.device) -> torch.device:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return device
+        if device.index is not None:
+            return device
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cuda", 0)
 
     def _gpu_staging_budget_bytes(self) -> int | None:
         if self.runtime_budget is None:
@@ -546,6 +558,40 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 "dynamic_entries": 0,
                 "grouped_entries": 0,
             }
+        return stager.memory_stats()
+
+    def prepare_for_serving(
+        self,
+        *,
+        context_length: int,
+        device: torch.device,
+    ) -> dict[str, int | None]:
+        kernel_context_length = self._kernel_context_length()
+        if context_length != kernel_context_length:
+            raise ValueError(
+                "prepare_for_serving context_length must match runtime budget: "
+                f"requested context_length={context_length}, "
+                f"runtime context_length={kernel_context_length}"
+            )
+        store = self._require_weight_store()
+        stager = self._get_gpu_weight_stager(device)
+        bindings = store.bindings
+
+        output_hyper_connection = getattr(
+            bindings,
+            "output_hyper_connection",
+            None,
+        )
+        if output_hyper_connection is not None:
+            self._stage_output_hyper_connection_cuda(
+                stager,
+                stream_elements=4 * self.shape.hidden_size,
+            )
+
+        output_norm = getattr(bindings, "output_norm", None)
+        if output_norm is not None:
+            stager.stage_vector(output_norm)
+
         return stager.memory_stats()
 
     def _stage_token_embedding_cuda(
