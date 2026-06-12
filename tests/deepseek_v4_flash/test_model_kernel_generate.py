@@ -180,6 +180,7 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     model = _fake_model(context_length=12)
     seen_state_ids: list[int] = []
     seen_positions: list[int] = []
+    seen_token_ids: list[int] = []
     sampled: list[int] = []
 
     def fake_token_step(
@@ -189,7 +190,7 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
-        del token_id
+        seen_token_ids.append(token_id)
         seen_state_ids.append(id(state))
         seen_positions.append(token_idx)
         next_token = (token_idx + 1) % model.shape.vocab_size
@@ -210,6 +211,7 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     assert output.dtype == torch.long
     assert output.tolist() == [4, 5, *sampled[1:]]
     assert seen_positions == list(range(9))
+    assert seen_token_ids == [4, 5, *sampled[1:-1]]
     assert len(set(seen_state_ids)) == 1
 
 
@@ -256,7 +258,9 @@ def test_generate_greedy_kernel_rejects_non_integer_input_ids() -> None:
         )
 
 
-def test_real_gguf_generate_smoke_is_opt_in() -> None:
+def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if os.environ.get("RUN_DEEPSEEK_REAL_GGUF_GENERATE") != "1":
         pytest.skip("set RUN_DEEPSEEK_REAL_GGUF_GENERATE=1 to run real GGUF smoke")
     if not TARGET_GGUF.exists():
@@ -271,6 +275,39 @@ def test_real_gguf_generate_smoke_is_opt_in() -> None:
             gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
         )
         prompt = torch.tensor([1], dtype=torch.long, device="cuda")
+        original_token_step = model._forward_kernel_token_step
+        real_step_count = 0
+        fake_step_positions: list[int] = []
+        fake_step_state_ids: list[int] = []
+
+        def one_real_step_then_fake_decode(
+            *,
+            token_id: int,
+            state: DeepSeekV4FlashGPURequestState,
+            token_idx: int,
+            device: torch.device,
+        ) -> torch.Tensor:
+            nonlocal real_step_count
+            if real_step_count == 0:
+                real_step_count += 1
+                return original_token_step(
+                    token_id=token_id,
+                    state=state,
+                    token_idx=token_idx,
+                    device=device,
+                )
+            fake_step_positions.append(token_idx)
+            fake_step_state_ids.append(id(state))
+            logits = torch.zeros((1, model.shape.vocab_size), device=device)
+            logits[0, (token_idx + 1) % model.shape.vocab_size] = 1.0
+            state.advance_token()
+            return logits
+
+        monkeypatch.setattr(
+            model,
+            "_forward_kernel_token_step",
+            one_real_step_then_fake_decode,
+        )
 
         one_token = model.generate_greedy_kernel(prompt, max_tokens=1)
         eight_tokens = model.generate_greedy_kernel(prompt, max_tokens=8)
@@ -279,3 +316,32 @@ def test_real_gguf_generate_smoke_is_opt_in() -> None:
     assert eight_tokens.device == prompt.device
     assert one_token.shape == (prompt.numel() + 1,)
     assert eight_tokens.shape == (prompt.numel() + 8,)
+    assert real_step_count == 1
+    assert fake_step_positions == list(range(8))
+    assert len(set(fake_step_state_ids)) == 1
+
+
+def test_real_gguf_generate_full_decode_smoke_is_slow_opt_in() -> None:
+    if os.environ.get("RUN_DEEPSEEK_REAL_GGUF_GENERATE_FULL") != "1":
+        pytest.skip(
+            "set RUN_DEEPSEEK_REAL_GGUF_GENERATE_FULL=1 to run full real GGUF decode"
+        )
+    if not TARGET_GGUF.exists():
+        pytest.fail(
+            f"RUN_DEEPSEEK_REAL_GGUF_GENERATE_FULL=1 but {TARGET_GGUF} is missing"
+        )
+    if not torch.cuda.is_available():
+        pytest.fail("RUN_DEEPSEEK_REAL_GGUF_GENERATE_FULL=1 but CUDA is unavailable")
+
+    with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:
+        model = DeepSeekV4FlashForCausalLM(
+            weight_store=store,
+            runtime_budget=_runtime_budget(4096),
+            gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
+        )
+        prompt = torch.tensor([1], dtype=torch.long, device="cuda")
+
+        output = model.generate_greedy_kernel(prompt, max_tokens=8)
+
+    assert output.device == prompt.device
+    assert output.shape == (prompt.numel() + 8,)
