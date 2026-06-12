@@ -305,6 +305,56 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         next_token = torch.argmax(logits[0], dim=-1).to(torch.long)
         return torch.cat([input_ids.to(torch.long), next_token.reshape(1)])
 
+    def generate_greedy_kernel(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int = 1,
+    ) -> torch.Tensor:
+        self._require_weight_store()
+        device = self._validate_generate_greedy_kernel_input(
+            input_ids,
+            max_tokens=max_tokens,
+        )
+        self.gpu_backend.require_ready()
+        state = DeepSeekV4FlashGPURequestState(
+            DeepSeekV4FlashGPUCacheConfig(
+                context_length=self._kernel_context_length(),
+                hidden_size=self.shape.hidden_size,
+                batch_size=1,
+                kv_width=self.shape.head_dim,
+                device=device,
+            )
+        )
+
+        output_ids = input_ids.to(device=device, dtype=torch.long).clone()
+        prompt_token_ids = output_ids.detach().cpu().tolist()
+        logits: torch.Tensor | None = None
+        for token_id in prompt_token_ids:
+            logits = self._forward_kernel_token_step(
+                token_id=int(token_id),
+                state=state,
+                token_idx=state.token_position,
+                device=device,
+            )
+
+        if logits is None:
+            raise ValueError("generate_greedy_kernel requires at least one input token")
+
+        for generated_idx in range(max_tokens):
+            next_token_tensor = torch.argmax(logits[0], dim=-1).to(torch.long)
+            output_ids = torch.cat([output_ids, next_token_tensor.reshape(1)])
+            if generated_idx == max_tokens - 1:
+                break
+            logits = self._forward_kernel_token_step(
+                token_id=int(next_token_tensor.item()),
+                state=state,
+                token_idx=state.token_position,
+                device=device,
+            )
+
+        return output_ids
+
     def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
         if input_ids.ndim != 1:
             raise ValueError(
@@ -366,6 +416,49 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 f"[0, {self.shape.vocab_size})"
             )
         return token_id, input_ids.device
+
+    def _validate_generate_greedy_kernel_input(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+    ) -> torch.device:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive; got {max_tokens}")
+        if input_ids.ndim != 1:
+            raise ValueError(
+                "generate_greedy_kernel supports a 1-D batch=1 token vector; "
+                f"got {input_ids.ndim}-D"
+            )
+        if input_ids.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(
+                f"input_ids must use an integer dtype; got {input_ids.dtype}"
+            )
+        if not input_ids.is_cuda:
+            raise ValueError("generate_greedy_kernel requires CUDA input_ids")
+        if input_ids.numel() == 0:
+            raise ValueError("generate_greedy_kernel requires at least one input token")
+        context_length = self._kernel_context_length()
+        total_tokens = input_ids.numel() + max_tokens
+        if total_tokens > context_length:
+            raise ValueError(
+                "generate_greedy_kernel input plus generated tokens exceeds "
+                f"configured budget: {total_tokens} tokens > {context_length}"
+            )
+        for token_id in input_ids.detach().cpu().tolist():
+            token_id_int = int(token_id)
+            if token_id_int < 0 or token_id_int >= self.shape.vocab_size:
+                raise ValueError(
+                    f"input token id {token_id_int} is outside vocab range "
+                    f"[0, {self.shape.vocab_size})"
+                )
+        return input_ids.device
 
     def _kernel_context_length(self) -> int:
         if self.runtime_budget is None:
