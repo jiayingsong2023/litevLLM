@@ -354,7 +354,7 @@ def test_compressor_state_emits_only_on_ratio_boundary_and_uses_gate_scores() ->
     )
 
     assert output.device.type == "cuda"
-    assert state.token_position == 4
+    assert state.token_position == 0
     assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 1
     emitted = state.compressed_kv_cache.compressed_rows[2, 0]
     assert emitted[0] > emitted[3]
@@ -502,7 +502,7 @@ def test_runtime_reset_clears_compressor_state() -> None:
         router_top_k=1,
     )
 
-    assert state.token_position == 1
+    assert state.token_position == 0
     assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 0
 
     state.reset()
@@ -562,7 +562,7 @@ def test_boundary_rows_are_written_and_selected_rows_are_bounded() -> None:
         )
 
     assert output.device.type == "cuda"
-    assert state.token_position == 4
+    assert state.token_position == 0
     assert int(state.compressed_kv_cache._compressed_counts[2].item()) == 2
     expected_row = torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda")
     expected_row = expected_row * torch.rsqrt(expected_row.pow(2).mean() + 1e-6)

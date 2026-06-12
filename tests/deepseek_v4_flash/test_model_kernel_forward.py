@@ -21,6 +21,14 @@ from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_Q8_0,
     DeepSeekV4FlashTensor,
 )
+from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
+    DeepSeekV4FlashGPUBackend,
+    DeepSeekV4FlashGPUCapabilities,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gpu_runtime import (
+    DeepSeekV4FlashGPUCacheConfig,
+    DeepSeekV4FlashGPURequestState,
+)
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
@@ -282,6 +290,81 @@ def test_forward_kernel_rejects_context_beyond_budget() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_forward_kernel_token_step_reuses_supplied_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shape = DeepSeekV4FlashShape(
+        num_layers=3,
+        hidden_size=32,
+        vocab_size=5,
+        head_dim=32,
+    )
+    model = DeepSeekV4FlashForCausalLM(
+        shape=shape,
+        weight_store=_FakeStore(shape=shape),  # type: ignore[arg-type]
+        runtime_budget=_runtime_budget(4),
+        gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
+    )
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=4,
+            hidden_size=shape.hidden_size,
+            kv_width=shape.head_dim,
+            device="cuda",
+        )
+    )
+    seen: list[tuple[int, int]] = []
+
+    def fake_sliding(hidden: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        seen.append((kwargs["layer"].layer_index, kwargs["token_idx"]))
+        return hidden
+
+    def fake_compressed(hidden: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        assert kwargs["state"] is state
+        assert state.token_position == kwargs["token_idx"]
+        seen.append((kwargs["layer"].layer_index, kwargs["token_idx"]))
+        return hidden.reshape(1, -1).expand(4, -1).clone()
+
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_sliding_layer_forward",
+        fake_sliding,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_compressed_layer_forward",
+        fake_compressed,
+        raising=False,
+    )
+
+    logits0 = model._forward_kernel_token_step(
+        token_id=1,
+        state=state,
+        token_idx=0,
+        device=torch.device("cuda"),
+    )
+    logits1 = model._forward_kernel_token_step(
+        token_id=2,
+        state=state,
+        token_idx=1,
+        device=torch.device("cuda"),
+    )
+
+    assert logits0.shape == (1, shape.vocab_size)
+    assert logits1.shape == (1, shape.vocab_size)
+    assert state.token_position == 2
+    assert seen == [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_forward_kernel_runs_multiple_fake_layers_and_returns_cuda_logits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,6 +419,77 @@ def test_forward_kernel_runs_multiple_fake_layers_and_returns_cuda_logits(
     assert backend.output_calls == 1
     assert logits.device.type == "cuda"
     assert logits.shape == (1, shape.vocab_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_forward_kernel_projects_output_logits_in_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shape = DeepSeekV4FlashShape(
+        num_layers=1,
+        hidden_size=32,
+        vocab_size=2050,
+        head_dim=32,
+    )
+    backend = _ReadyBackend()
+    model = DeepSeekV4FlashForCausalLM(
+        shape=shape,
+        weight_store=_FakeStore(shape=shape, layer_count=1),  # type: ignore[arg-type]
+        runtime_budget=_runtime_budget(4),
+        gpu_backend=backend,  # type: ignore[arg-type]
+    )
+    chunk_rows: list[int] = []
+
+    def output_logits(**kwargs: torch.Tensor | int) -> torch.Tensor:
+        rows = kwargs["lm_head_values"]
+        assert isinstance(rows, torch.Tensor)
+        chunk_rows.append(rows.shape[0])
+        return torch.ones(rows.shape[0], dtype=torch.float32, device=rows.device)
+
+    backend.output_logits = output_logits  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_sliding_layer_forward",
+        lambda hidden, **kwargs: hidden,
+        raising=False,
+    )
+
+    logits = model.forward_kernel(torch.tensor([1], dtype=torch.long, device="cuda"))
+
+    assert logits.shape == (1, shape.vocab_size)
+    assert chunk_rows == [1024, 1024, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_forward_kernel_small_fake_model_uses_real_backend_output() -> None:
+    shape = DeepSeekV4FlashShape(
+        num_layers=0,
+        hidden_size=32,
+        vocab_size=7,
+        head_dim=32,
+    )
+    backend = DeepSeekV4FlashGPUBackend(
+        capabilities=DeepSeekV4FlashGPUCapabilities(
+            q8_linear=True,
+            attention=True,
+            compressed_attention=True,
+            cache_update=True,
+            moe=True,
+            output=True,
+        )
+    )
+    model = DeepSeekV4FlashForCausalLM(
+        shape=shape,
+        weight_store=_FakeStore(shape=shape, layer_count=0),  # type: ignore[arg-type]
+        runtime_budget=_runtime_budget(4),
+        gpu_backend=backend,
+    )
+
+    logits = model.forward_kernel(torch.tensor([1], dtype=torch.long, device="cuda"))
+
+    assert logits.device.type == "cuda"
+    assert logits.shape == (1, shape.vocab_size)
+    assert torch.isfinite(logits).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

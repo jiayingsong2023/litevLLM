@@ -195,11 +195,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         return self._q8_0_output_projection(store, normalized).reshape(1, -1)
 
     def forward_kernel(self, input_ids: torch.Tensor) -> torch.Tensor:
-        store = self._require_weight_store()
+        self._require_weight_store()
         token_id, device = self._validate_forward_kernel_input(input_ids)
         self.gpu_backend.require_ready()
-
-        stager = self._get_gpu_weight_stager(device)
         state = DeepSeekV4FlashGPURequestState(
             DeepSeekV4FlashGPUCacheConfig(
                 context_length=self._kernel_context_length(),
@@ -209,6 +207,36 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 device=device,
             )
         )
+        return self._forward_kernel_token_step(
+            token_id=token_id,
+            state=state,
+            token_idx=state.token_position,
+            device=device,
+        )
+
+    def _forward_kernel_token_step(
+        self,
+        *,
+        token_id: int,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        store = self._require_weight_store()
+        self.gpu_backend.require_ready()
+        state.require_capacity(token_idx)
+        if token_idx != state.token_position:
+            raise ValueError(
+                "forward kernel token_idx must match request state token_position; "
+                f"got token_idx={token_idx}, token_position={state.token_position}"
+            )
+        if token_id < 0 or token_id >= self.shape.vocab_size:
+            raise ValueError(
+                f"input token id {token_id} is outside vocab range "
+                f"[0, {self.shape.vocab_size})"
+            )
+
+        stager = self._get_gpu_weight_stager(device)
         hidden = self._stage_token_embedding_cuda(store, token_id, device=device)
 
         layers = getattr(store.bindings, "layers", None)
@@ -221,7 +249,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     layer=layer,
                     stager=stager,
                     backend=self.gpu_backend,
-                    token_idx=0,
+                    token_idx=token_idx,
                     token_id=token_id,
                 )
             else:
@@ -231,37 +259,21 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     stager=stager,
                     backend=self.gpu_backend,
                     state=state,
-                    token_idx=0,
+                    token_idx=token_idx,
                     token_id=token_id,
                 )
 
         streams = self._kernel_output_streams(hidden)
-        output_hc_weight, output_hc_scale, output_hc_base = (
-            self._stage_output_hyper_connection_cuda(
-                stager,
-                stream_elements=streams.numel(),
-            )
-        )
-        output_norm_weight = stager.stage_vector(
-            self._required_output_norm_tensor(store),
-        )
-        lm_head_values, lm_head_scales = self._stage_q8_output_head_cuda(
+        logits = self._output_logits_chunked_cuda(
             store,
-            device=device,
-        )
-        logits = self.gpu_backend.output_logits(
+            stager=stager,
             streams=streams,
-            lm_head_values=lm_head_values,
-            lm_head_scales=lm_head_scales,
-            output_hc_weight=output_hc_weight,
-            output_hc_scale=output_hc_scale,
-            output_hc_base=output_hc_base,
-            output_norm_weight=output_norm_weight,
-            block_size=_Q8_0_BLOCK_SIZE,
+            device=device,
         )
         if not logits.is_cuda:
             raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU logits")
-        return logits.reshape(1, -1)
+        state.advance_token()
+        return logits
 
     def forward_full(
         self,
@@ -453,12 +465,14 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires output_norm")
         return tensor
 
-    def _stage_q8_output_head_cuda(
+    def _output_logits_chunked_cuda(
         self,
         store: DeepSeekV4FlashWeightStore,
         *,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        streams: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         tensor = store.bindings.output_head
         if tensor is None:
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires output.weight")
@@ -474,20 +488,65 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 "DeepSeek V4 Flash GPU forward expects output.weight dims "
                 f"({columns}, {rows}); got {tensor.dims}"
             )
+        if columns % _Q8_0_BLOCK_SIZE != 0:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward requires hidden size divisible by "
+                f"{_Q8_0_BLOCK_SIZE}; got {columns}"
+            )
+
+        output_hc_weight, output_hc_scale, output_hc_base = (
+            self._stage_output_hyper_connection_cuda(
+                stager,
+                stream_elements=streams.numel(),
+            )
+        )
+        output_norm_weight = stager.stage_vector(
+            self._required_output_norm_tensor(store),
+        )
+        blocks_per_row = columns // _Q8_0_BLOCK_SIZE
+        row_bytes = blocks_per_row * _Q8_0_BLOCK_BYTES
+        logits_chunks: list[torch.Tensor] = []
         payload = store.tensor_payload(tensor)
         try:
-            values, scales = q8_0_matrix_from_gguf_payload(
-                payload,
-                rows=rows,
-                columns=columns,
-                block_size=_Q8_0_BLOCK_SIZE,
-            )
+            for row_start in range(0, rows, _OUTPUT_PROJECTION_CHUNK_ROWS):
+                row_end = min(row_start + _OUTPUT_PROJECTION_CHUNK_ROWS, rows)
+                chunk_rows = row_end - row_start
+                byte_start = row_start * row_bytes
+                byte_end = row_end * row_bytes
+                chunk_view = payload[byte_start:byte_end]
+                try:
+                    values, scales = q8_0_matrix_from_gguf_payload(
+                        chunk_view,
+                        rows=chunk_rows,
+                        columns=columns,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    )
+                finally:
+                    chunk_view.release()
+                chunk_logits = self.gpu_backend.output_logits(
+                    streams=streams,
+                    lm_head_values=values.to(device=device, non_blocking=True),
+                    lm_head_scales=scales.to(
+                        device=device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                    ),
+                    output_hc_weight=output_hc_weight,
+                    output_hc_scale=output_hc_scale,
+                    output_hc_base=output_hc_base,
+                    output_norm_weight=output_norm_weight,
+                    block_size=_Q8_0_BLOCK_SIZE,
+                )
+                if not chunk_logits.is_cuda:
+                    raise RuntimeError(
+                        "DeepSeek V4 Flash GPU output chunk returned CPU logits"
+                    )
+                logits_chunks.append(chunk_logits.reshape(-1))
         finally:
             payload.release()
-        return (
-            values.to(device=device, non_blocking=True),
-            scales.to(device=device, dtype=torch.float32, non_blocking=True),
-        )
+        if not logits_chunks:
+            raise RuntimeError("DeepSeek V4 Flash GPU output produced no chunks")
+        return torch.cat(logits_chunks, dim=0).reshape(1, -1)
 
     def _collapse_output_hc(
         self,

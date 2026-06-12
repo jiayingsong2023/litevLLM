@@ -605,7 +605,6 @@ def deepseek_v4_flash_compressed_layer_forward(
             compressed_row=emitted_row,
             indexer_row=indexer_row,
         )
-    state.advance_token()
 
     if uses_hyper_connection:
         if hidden_after_attn.ndim != 2:
