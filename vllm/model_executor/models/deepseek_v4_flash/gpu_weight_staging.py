@@ -58,6 +58,13 @@ class DeepSeekV4FlashGPUWeightStager:
             tuple[str, str, torch.dtype, str],
             torch.Tensor,
         ] = {}
+        self._cache_stats = {
+            "dynamic_hits": 0,
+            "dynamic_misses": 0,
+            "grouped_hits": 0,
+            "grouped_misses": 0,
+            "loaded_bytes": 0,
+        }
 
     @property
     def staged_bytes(self) -> int:
@@ -69,7 +76,34 @@ class DeepSeekV4FlashGPUWeightStager:
             "max_staged_bytes": self.max_staged_bytes,
             "dynamic_entries": len(self._dynamic_cache),
             "grouped_entries": len(self._grouped_cache),
+            **self.cache_stats(),
         }
+
+    def record_cache_hit(self, cache_name: str, *, tensor_name: str) -> None:
+        del tensor_name
+        key = f"{cache_name}_hits"
+        if key not in self._cache_stats:
+            raise ValueError(f"unknown cache stats bucket: {cache_name}")
+        self._cache_stats[key] += 1
+
+    def record_cache_miss(
+        self,
+        cache_name: str,
+        loaded_bytes: int,
+        *,
+        tensor_name: str,
+    ) -> None:
+        del tensor_name
+        if loaded_bytes < 0:
+            raise ValueError("loaded bytes must be non-negative")
+        key = f"{cache_name}_misses"
+        if key not in self._cache_stats:
+            raise ValueError(f"unknown cache stats bucket: {cache_name}")
+        self._cache_stats[key] += 1
+        self._cache_stats["loaded_bytes"] += int(loaded_bytes)
+
+    def cache_stats(self) -> dict[str, int]:
+        return dict(self._cache_stats)
 
     @staticmethod
     def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -97,6 +131,7 @@ class DeepSeekV4FlashGPUWeightStager:
         cache_key = (tensor.name, str(self.device), self.dtype, "matrix")
         cached = self._dynamic_cache.get(cache_key)
         if cached is not None:
+            self.record_cache_hit("dynamic", tensor_name=tensor.name)
             return cached
 
         decoded = self.store.decode_matrix(tensor)
@@ -104,6 +139,7 @@ class DeepSeekV4FlashGPUWeightStager:
             raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
         nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
         self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
         return staged
@@ -118,6 +154,7 @@ class DeepSeekV4FlashGPUWeightStager:
         cache_key = (tensor.name, str(self.device), dtype, "vector")
         cached = self._dynamic_cache.get(cache_key)
         if cached is not None:
+            self.record_cache_hit("dynamic", tensor_name=tensor.name)
             return cached
 
         decoded = self.store.tensor_to_torch(tensor, dtype=dtype)
@@ -125,6 +162,7 @@ class DeepSeekV4FlashGPUWeightStager:
             raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
         nbytes = decoded.numel() * self._dtype_nbytes(dtype)
         self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
         return staged
@@ -145,6 +183,7 @@ class DeepSeekV4FlashGPUWeightStager:
         cache_key = (tensor.name, expert_id, str(self.device), self.dtype)
         cached = self._grouped_cache.get(cache_key)
         if cached is not None:
+            self.record_cache_hit("grouped", tensor_name=tensor.name)
             return cached
 
         decoded = self.store.decode_grouped_expert_matrix(tensor, expert_id)
@@ -154,6 +193,7 @@ class DeepSeekV4FlashGPUWeightStager:
             )
         nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
         self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._grouped_cache[cache_key] = staged
         return staged

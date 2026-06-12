@@ -96,6 +96,35 @@ def test_gpu_weight_stager_rejects_negative_staging_budget() -> None:
         )
 
 
+def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
+    store = _FakeStagingStore()
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.record_cache_miss("dynamic", 16, tensor_name="a")
+    stager.record_cache_hit("dynamic", tensor_name="a")
+    stager.record_cache_miss("grouped", 32, tensor_name="b")
+
+    assert stager.cache_stats() == {
+        "dynamic_hits": 1,
+        "dynamic_misses": 1,
+        "grouped_hits": 0,
+        "grouped_misses": 1,
+        "loaded_bytes": 48,
+    }
+
+
+def test_gpu_weight_stager_memory_stats_include_cache_stats() -> None:
+    store = _FakeStagingStore()
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.record_cache_miss("dynamic", 8, tensor_name="a")
+
+    stats = stager.memory_stats()
+
+    assert stats["loaded_bytes"] == 8
+    assert stats["dynamic_misses"] == 1
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_gpu_weight_stager_caches_decoded_grouped_expert_matrix() -> None:
     store = _FakeGroupedExpertStore()
@@ -138,6 +167,11 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "max_staged_bytes": None,
         "dynamic_entries": 2,
         "grouped_entries": 0,
+        "dynamic_hits": 2,
+        "dynamic_misses": 2,
+        "grouped_hits": 0,
+        "grouped_misses": 0,
+        "loaded_bytes": 24,
     }
 
 
@@ -156,6 +190,9 @@ def test_gpu_weight_stager_rejects_new_tensor_when_staging_budget_is_exceeded() 
         stager.stage_matrix(matrix_tensor)
 
     assert stager.staged_bytes == 0
+    stats = stager.cache_stats()
+    assert stats["dynamic_misses"] == 0
+    assert stats["loaded_bytes"] == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
