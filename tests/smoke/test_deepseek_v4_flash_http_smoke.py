@@ -14,7 +14,9 @@ class _FakeEngine:
         self.payload_text = payload_text
 
     def generate_greedy_reference_chat(self, prompt: str, *, max_tokens: int) -> str:
-        raise AssertionError("production chat route must not call direct-reference helper")
+        raise AssertionError(
+            "production chat route must not call direct-reference helper"
+        )
 
     async def generate(
         self,

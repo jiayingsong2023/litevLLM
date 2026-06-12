@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
+import pytest
 import torch
 
 from vllm.engine.async_llm import AsyncLLM
+from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.sampling_params import SamplingParams
 
 
 class _FakeModel:
@@ -86,6 +89,36 @@ class _BridgeDriver:
         return {"driver": True}
 
 
+class _DirectDeepSeekEngine:
+    _deepseek_v4_flash_direct = True
+
+    def __init__(self) -> None:
+        self.generated: list[tuple[str, str, int]] = []
+
+    def generate_deepseek_v4_flash_greedy(
+        self,
+        *,
+        request_id: str,
+        prompt: str,
+        sampling_params: SamplingParams,
+    ) -> RequestOutput:
+        self.generated.append((request_id, prompt, int(sampling_params.max_tokens)))
+        return RequestOutput(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_token_ids=[7],
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="direct",
+                    token_ids=[42],
+                    cumulative_logprob=0.0,
+                )
+            ],
+            finished=True,
+        )
+
+
 def _generate_greedy_reference_chat(
     engine: _FakeEngine,
     prompt: str,
@@ -142,6 +175,44 @@ def test_async_llm_generate_bridges_request_stream() -> None:
     assert llm.engine.added_requests == [("req-1", "bridge prompt")]
     assert llm.driver.notified is True
     assert llm.stats() == {"bridge": True, "async_driver": {"driver": True}}
+
+
+def test_async_llm_generate_uses_deepseek_direct_runtime_without_driver() -> None:
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine = _DirectDeepSeekEngine()
+    llm.driver = _BridgeDriver()
+
+    async def run() -> list[str]:
+        outputs: list[str] = []
+        async for output in llm.generate(
+            "direct prompt",
+            SamplingParams(max_tokens=1, temperature=0.0),
+            "req-direct",
+        ):
+            outputs.append(output.outputs[0].text)
+        return outputs
+
+    assert asyncio.run(run()) == ["direct"]
+    assert llm.engine.generated == [("req-direct", "direct prompt", 1)]
+    assert llm.driver.notified is False
+
+
+def test_async_llm_deepseek_direct_rejects_multimodal_input() -> None:
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine = _DirectDeepSeekEngine()
+    llm.driver = _BridgeDriver()
+
+    async def run() -> None:
+        async for _ in llm.generate(
+            "direct prompt",
+            SamplingParams(max_tokens=1, temperature=0.0),
+            "req-direct",
+            multi_modal_data={"image": object()},
+        ):
+            pass
+
+    with pytest.raises(ValueError, match="multimodal"):
+        asyncio.run(run())
 
 
 def test_async_llm_abort_forwards_request_ids() -> None:

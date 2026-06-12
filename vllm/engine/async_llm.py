@@ -48,6 +48,22 @@ class AsyncLLM(EngineClient):
         multi_modal_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
+        if getattr(self.engine, "_deepseek_v4_flash_direct", False):
+            if lora_request is not None:
+                raise ValueError(
+                    "DeepSeek V4 Flash direct runtime does not support LoRA"
+                )
+            if multi_modal_data is not None:
+                raise ValueError(
+                    "DeepSeek V4 Flash direct runtime does not support multimodal input"
+                )
+            yield self.engine.generate_deepseek_v4_flash_greedy(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=sampling_params,
+            )
+            return
+
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
         try:
             self.engine.add_request(
