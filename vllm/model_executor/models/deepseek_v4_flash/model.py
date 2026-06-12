@@ -34,6 +34,7 @@ from .gpu_runtime import (
     DeepSeekV4FlashGPURequestState,
 )
 from .gpu_weight_staging import DeepSeekV4FlashGPUWeightStager
+from .profiler import DeepSeekV4FlashProfiler
 from .quant import q8_0_matrix_from_gguf_payload, q8_0_matvec
 from .weight_store import DeepSeekV4FlashWeightStore
 
@@ -73,6 +74,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager: DeepSeekV4FlashGPUWeightStager | None = None
         self._gpu_weight_stager_store_id: int | None = None
         self._gpu_weight_stager_device: torch.device | None = None
+        self._deepseek_profiler = DeepSeekV4FlashProfiler(
+            enabled=False,
+            sync_fn=self._sync_deepseek_profile_device,
+        )
 
     def attach_weight_store(
         self,
@@ -92,6 +97,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager = None
         self._gpu_weight_stager_store_id = None
         self._gpu_weight_stager_device = None
+
+    def enable_deepseek_profile(self, enabled: bool = True) -> None:
+        self._deepseek_profiler.enabled = enabled
+
+    def deepseek_profile(self) -> dict[str, object]:
+        return self._deepseek_profiler.to_dict()
+
+    def _sync_deepseek_profile_device(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def forward(
         self,
@@ -244,32 +259,46 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
         for layer in layers:
             if layer.layer_index < 2:
-                hidden = deepseek_v4_flash_sliding_layer_forward(
-                    hidden,
-                    layer=layer,
-                    stager=stager,
-                    backend=self.gpu_backend,
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_sliding",
+                    layer_idx=layer.layer_index,
                     token_idx=token_idx,
-                    token_id=token_id,
-                )
+                ):
+                    hidden = deepseek_v4_flash_sliding_layer_forward(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        token_idx=token_idx,
+                        token_id=token_id,
+                    )
             else:
-                hidden = deepseek_v4_flash_compressed_layer_forward(
-                    hidden,
-                    layer=layer,
-                    stager=stager,
-                    backend=self.gpu_backend,
-                    state=state,
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_compressed",
+                    layer_idx=layer.layer_index,
                     token_idx=token_idx,
-                    token_id=token_id,
-                )
+                ):
+                    hidden = deepseek_v4_flash_compressed_layer_forward(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        state=state,
+                        token_idx=token_idx,
+                        token_id=token_id,
+                    )
 
-        streams = self._kernel_output_streams(hidden)
-        logits = self._output_logits_chunked_cuda(
-            store,
-            stager=stager,
-            streams=streams,
-            device=device,
-        )
+        with self._deepseek_profiler.section(
+            "output_projection",
+            token_idx=token_idx,
+        ):
+            streams = self._kernel_output_streams(hidden)
+            logits = self._output_logits_chunked_cuda(
+                store,
+                stager=stager,
+                streams=streams,
+                device=device,
+            )
         if not logits.is_cuda:
             raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU logits")
         state.advance_token()
@@ -311,49 +340,56 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         max_tokens: int = 1,
     ) -> torch.Tensor:
-        self._require_weight_store()
-        device = self._validate_generate_greedy_kernel_input(
-            input_ids,
+        with self._deepseek_profiler.section(
+            "generate_greedy_kernel",
+            input_tokens=int(input_ids.numel()),
             max_tokens=max_tokens,
-        )
-        self.gpu_backend.require_ready()
-        state = DeepSeekV4FlashGPURequestState(
-            DeepSeekV4FlashGPUCacheConfig(
-                context_length=self._kernel_context_length(),
-                hidden_size=self.shape.hidden_size,
-                batch_size=1,
-                kv_width=self.shape.head_dim,
-                device=device,
+        ):
+            self._require_weight_store()
+            device = self._validate_generate_greedy_kernel_input(
+                input_ids,
+                max_tokens=max_tokens,
             )
-        )
-
-        output_ids = input_ids.to(device=device, dtype=torch.long).clone()
-        prompt_token_ids = output_ids.detach().cpu().tolist()
-        logits: torch.Tensor | None = None
-        for token_id in prompt_token_ids:
-            logits = self._forward_kernel_token_step(
-                token_id=int(token_id),
-                state=state,
-                token_idx=state.token_position,
-                device=device,
+            self.gpu_backend.require_ready()
+            state = DeepSeekV4FlashGPURequestState(
+                DeepSeekV4FlashGPUCacheConfig(
+                    context_length=self._kernel_context_length(),
+                    hidden_size=self.shape.hidden_size,
+                    batch_size=1,
+                    kv_width=self.shape.head_dim,
+                    device=device,
+                )
             )
 
-        if logits is None:
-            raise ValueError("generate_greedy_kernel requires at least one input token")
+            output_ids = input_ids.to(device=device, dtype=torch.long).clone()
+            prompt_token_ids = output_ids.detach().cpu().tolist()
+            logits: torch.Tensor | None = None
+            for token_id in prompt_token_ids:
+                logits = self._forward_kernel_token_step(
+                    token_id=int(token_id),
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
 
-        for generated_idx in range(max_tokens):
-            next_token_tensor = torch.argmax(logits[0], dim=-1).to(torch.long)
-            output_ids = torch.cat([output_ids, next_token_tensor.reshape(1)])
-            if generated_idx == max_tokens - 1:
-                break
-            logits = self._forward_kernel_token_step(
-                token_id=int(next_token_tensor.item()),
-                state=state,
-                token_idx=state.token_position,
-                device=device,
-            )
+            if logits is None:
+                raise ValueError(
+                    "generate_greedy_kernel requires at least one input token"
+                )
 
-        return output_ids
+            for generated_idx in range(max_tokens):
+                next_token_tensor = torch.argmax(logits[0], dim=-1).to(torch.long)
+                output_ids = torch.cat([output_ids, next_token_tensor.reshape(1)])
+                if generated_idx == max_tokens - 1:
+                    break
+                logits = self._forward_kernel_token_step(
+                    token_id=int(next_token_tensor.item()),
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
+
+            return output_ids
 
     def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
         if input_ids.ndim != 1:

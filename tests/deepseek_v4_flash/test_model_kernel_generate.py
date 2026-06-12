@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import vllm.model_executor.models.deepseek_v4_flash.model as model_module
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashContextEstimate,
     DeepSeekV4FlashRuntimeBudget,
@@ -16,6 +17,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     DeepSeekV4FlashTensor,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_runtime import (
+    DeepSeekV4FlashGPUCacheConfig,
     DeepSeekV4FlashGPURequestState,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
@@ -134,6 +136,130 @@ def _fake_model(
         runtime_budget=_runtime_budget(context_length),
         gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
     )
+
+
+def test_model_profile_summary_reports_disabled_profiler_by_default() -> None:
+    model = _fake_model()
+
+    assert model.deepseek_profile() == {
+        "enabled": False,
+        "events": [],
+        "counters": {},
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_model_enable_deepseek_profile_records_generate_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model()
+    model.enable_deepseek_profile()
+
+    def fake_token_step(
+        *,
+        token_id: int,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del token_id, token_idx
+        logits = torch.zeros((1, model.shape.vocab_size), device=device)
+        logits[0, 2] = 1.0
+        state.advance_token()
+        return logits
+
+    monkeypatch.setattr(
+        model,
+        "_validate_generate_greedy_kernel_input",
+        lambda input_ids, *, max_tokens: input_ids.device,
+    )
+    monkeypatch.setattr(model.gpu_backend, "require_ready", lambda: None)
+    monkeypatch.setattr(model, "_forward_kernel_token_step", fake_token_step)
+
+    output = model.generate_greedy_kernel(
+        torch.tensor([1], dtype=torch.long, device="cuda"),
+        max_tokens=1,
+    )
+
+    profile = model.deepseek_profile()
+    event_names = [event["name"] for event in profile["events"]]
+
+    assert output.tolist() == [1, 2]
+    assert "generate_greedy_kernel" in event_names
+
+
+def test_model_profile_records_layer_output_sections_and_syncs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model()
+    sync_calls = 0
+
+    class FakeLayer:
+        def __init__(self, layer_index: int) -> None:
+            self.layer_index = layer_index
+
+    class FakeLogits:
+        is_cuda = True
+
+    def fake_sync() -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    assert model.weight_store is not None
+    model.weight_store.bindings.layers = [FakeLayer(0), FakeLayer(2)]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", fake_sync)
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: object())
+    monkeypatch.setattr(
+        model,
+        "_stage_token_embedding_cuda",
+        lambda store, token_id, *, device: object(),
+    )
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_sliding_layer_forward",
+        lambda hidden, **kwargs: hidden,
+    )
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_compressed_layer_forward",
+        lambda hidden, **kwargs: hidden,
+    )
+    monkeypatch.setattr(model, "_kernel_output_streams", lambda hidden: object())
+    monkeypatch.setattr(
+        model,
+        "_output_logits_chunked_cuda",
+        lambda store, *, stager, streams, device: FakeLogits(),
+    )
+
+    model.enable_deepseek_profile()
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=4,
+            hidden_size=model.shape.hidden_size,
+            kv_width=model.shape.head_dim,
+            device="cpu",
+        )
+    )
+
+    logits = model._forward_kernel_token_step(
+        token_id=1,
+        state=state,
+        token_idx=0,
+        device=torch.device("cpu"),
+    )
+
+    profile = model.deepseek_profile()
+    event_names = [event["name"] for event in profile["events"]]
+
+    assert logits.is_cuda
+    assert state.token_position == 1
+    assert event_names == [
+        "layer_0_sliding",
+        "layer_2_compressed",
+        "output_projection",
+    ]
+    assert sync_calls >= 2 * len(event_names)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
