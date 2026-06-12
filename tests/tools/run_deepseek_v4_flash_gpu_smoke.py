@@ -36,7 +36,7 @@ def _build_ready_backend() -> DeepSeekV4FlashGPUBackend:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run an opt-in DeepSeek V4 Flash real GGUF GPU smoke."
     )
@@ -52,11 +52,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--prompt-token-id", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=1)
-    return parser.parse_args()
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--profile-json", type=Path, default=None)
+    return parser.parse_args(argv)
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
     args = parse_args()
+    if args.repeat <= 0:
+        raise SystemExit("--repeat must be positive")
     if not args.model.is_file():
         raise SystemExit(f"DeepSeek V4 Flash GGUF file not found: {args.model}")
     if not torch.cuda.is_available():
@@ -74,26 +86,52 @@ def main() -> int:
             runtime_budget=budget,
             gpu_backend=_build_ready_backend(),
         )
+        model.enable_deepseek_profile(args.profile_json is not None)
         input_ids = torch.tensor(
             [args.prompt_token_id],
             dtype=torch.long,
             device="cuda",
         )
-        output_ids = model.generate_greedy_kernel(
-            input_ids,
-            max_tokens=args.max_tokens,
-        )
-        output_cpu = [int(token) for token in output_ids.detach().cpu().tolist()]
-        if len(output_cpu) != 1 + args.max_tokens:
-            raise RuntimeError(
-                "DeepSeek V4 Flash smoke returned unexpected token count: "
-                f"got {len(output_cpu)}, expected {1 + args.max_tokens}"
+        runs: list[dict[str, object]] = []
+        output_cpu: list[int] = []
+        for run_idx in range(args.repeat):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            output_ids = model.generate_greedy_kernel(
+                input_ids,
+                max_tokens=args.max_tokens,
+            )
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed_ms = float(start_event.elapsed_time(end_event))
+            output_cpu = [
+                int(token) for token in output_ids.detach().cpu().tolist()
+            ]
+            if len(output_cpu) != 1 + args.max_tokens:
+                raise RuntimeError(
+                    "DeepSeek V4 Flash smoke returned unexpected token count: "
+                    f"got {len(output_cpu)}, expected {1 + args.max_tokens}"
+                )
+            tokens_per_second = (
+                args.max_tokens * 1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0
+            )
+            runs.append(
+                {
+                    "run_idx": run_idx,
+                    "elapsed_ms": elapsed_ms,
+                    "output_token_ids": output_cpu,
+                    "tokens_per_second": tokens_per_second,
+                }
             )
         summary = {
             "model": str(args.model),
             "context_length": args.context_length,
             "max_tokens": args.max_tokens,
             "output_token_ids": output_cpu,
+            "repeat": args.repeat,
+            "runs": runs,
+            "profile": model.deepseek_profile(),
             "gpu_staging": model.gpu_staging_memory_stats(),
             "runtime_budget": {
                 "resident_bytes": budget.resident_bytes,
@@ -101,6 +139,8 @@ def main() -> int:
                 "min_system_headroom_bytes": budget.min_system_headroom_bytes,
             },
         }
+    if args.profile_json is not None:
+        write_json(args.profile_json, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
