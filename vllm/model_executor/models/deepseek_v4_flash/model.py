@@ -486,10 +486,31 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self._gpu_weight_stager = DeepSeekV4FlashGPUWeightStager(
                 store,
                 device=device,
+                max_staged_bytes=self._gpu_staging_budget_bytes(),
             )
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
         return self._gpu_weight_stager
+
+    def _gpu_staging_budget_bytes(self) -> int | None:
+        if self.runtime_budget is None:
+            return None
+        return max(
+            0,
+            self.runtime_budget.available_headroom_bytes
+            - self.runtime_budget.min_system_headroom_bytes,
+        )
+
+    def gpu_staging_memory_stats(self) -> dict[str, int | None]:
+        stager = self._gpu_weight_stager
+        if stager is None:
+            return {
+                "staged_bytes": 0,
+                "max_staged_bytes": self._gpu_staging_budget_bytes(),
+                "dynamic_entries": 0,
+                "grouped_entries": 0,
+            }
+        return stager.memory_stats()
 
     def _stage_token_embedding_cuda(
         self,

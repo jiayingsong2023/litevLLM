@@ -44,15 +44,52 @@ class DeepSeekV4FlashGPUWeightStager:
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
+        max_staged_bytes: int | None = None,
     ) -> None:
         self.store = store
         self.device = torch.device(device or "cuda")
         self.dtype = dtype
+        if max_staged_bytes is not None and max_staged_bytes < 0:
+            raise ValueError("max staged bytes must be non-negative")
+        self.max_staged_bytes = max_staged_bytes
+        self._staged_bytes = 0
         self._grouped_cache: dict[tuple[str, int, str, torch.dtype], torch.Tensor] = {}
         self._dynamic_cache: dict[
             tuple[str, str, torch.dtype, str],
             torch.Tensor,
         ] = {}
+
+    @property
+    def staged_bytes(self) -> int:
+        return self._staged_bytes
+
+    def memory_stats(self) -> dict[str, int | None]:
+        return {
+            "staged_bytes": self._staged_bytes,
+            "max_staged_bytes": self.max_staged_bytes,
+            "dynamic_entries": len(self._dynamic_cache),
+            "grouped_entries": len(self._grouped_cache),
+        }
+
+    @staticmethod
+    def _dtype_nbytes(dtype: torch.dtype) -> int:
+        return torch.empty((), dtype=dtype).element_size()
+
+    def _reserve_staged_bytes(self, nbytes: int, *, tensor_name: str) -> None:
+        if nbytes < 0:
+            raise ValueError("staged byte reservation must be non-negative")
+        if self.max_staged_bytes is None:
+            self._staged_bytes += nbytes
+            return
+        next_bytes = self._staged_bytes + nbytes
+        if next_bytes > self.max_staged_bytes:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU staging cache exceeds memory budget: "
+                f"tensor={tensor_name}, requested={nbytes} bytes, "
+                f"resident={self._staged_bytes} bytes, "
+                f"budget={self.max_staged_bytes} bytes"
+            )
+        self._staged_bytes = next_bytes
 
     def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
         if self.device.type != "cuda":
@@ -65,6 +102,8 @@ class DeepSeekV4FlashGPUWeightStager:
         decoded = self.store.decode_matrix(tensor)
         if decoded.ndim != 2:
             raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
+        nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
+        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
         return staged
@@ -84,11 +123,16 @@ class DeepSeekV4FlashGPUWeightStager:
         decoded = self.store.tensor_to_torch(tensor, dtype=dtype)
         if decoded.ndim != 1:
             raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
+        nbytes = decoded.numel() * self._dtype_nbytes(dtype)
+        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
         return staged
 
     def clear_dynamic_cache(self) -> None:
+        self._staged_bytes -= sum(
+            tensor.nbytes for tensor in self._dynamic_cache.values()
+        )
         self._dynamic_cache.clear()
 
     def stage_grouped_expert_matrix(
@@ -108,6 +152,8 @@ class DeepSeekV4FlashGPUWeightStager:
             raise ValueError(
                 f"grouped expert matrix must be 2-D; got {decoded.ndim}-D"
             )
+        nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
+        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._grouped_cache[cache_key] = staged
         return staged

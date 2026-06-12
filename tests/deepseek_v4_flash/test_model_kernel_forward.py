@@ -221,9 +221,33 @@ def _runtime_budget(context_length: int) -> DeepSeekV4FlashRuntimeBudget:
         model_mmap_bytes=1,
         resident_weight_bytes=0,
         expert_cache_bytes=0,
-        uma_budget_bytes=1,
+        uma_budget_bytes=64 * 1024 * 1024,
         min_system_headroom_bytes=0,
     )
+
+
+def test_model_gpu_staging_budget_preserves_required_headroom() -> None:
+    budget = DeepSeekV4FlashRuntimeBudget(
+        context=DeepSeekV4FlashContextEstimate(
+            context_length=4,
+            raw_kv_bytes=10,
+            compressed_kv_bytes=20,
+            scratch_bytes=30,
+        ),
+        model_mmap_bytes=1,
+        resident_weight_bytes=100,
+        expert_cache_bytes=200,
+        uma_budget_bytes=1000,
+        min_system_headroom_bytes=300,
+    )
+    model = DeepSeekV4FlashForCausalLM(runtime_budget=budget)
+
+    assert model.gpu_staging_memory_stats() == {
+        "staged_bytes": 0,
+        "max_staged_bytes": 340,
+        "dynamic_entries": 0,
+        "grouped_entries": 0,
+    }
 
 
 def test_forward_full_kernel_rejects_no_weight_store_with_clear_error() -> None:

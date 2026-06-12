@@ -85,6 +85,17 @@ def _tensor(name: str, dims: tuple[int, ...] = (2, 2, 1)) -> DeepSeekV4FlashTens
     )
 
 
+def test_gpu_weight_stager_rejects_negative_staging_budget() -> None:
+    store = _FakeStagingStore()
+
+    with pytest.raises(ValueError, match="max staged bytes"):
+        DeepSeekV4FlashGPUWeightStager(
+            store,
+            device="cuda",
+            max_staged_bytes=-1,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_gpu_weight_stager_caches_decoded_grouped_expert_matrix() -> None:
     store = _FakeGroupedExpertStore()
@@ -102,6 +113,49 @@ def test_gpu_weight_stager_caches_decoded_grouped_expert_matrix() -> None:
     assert first.data_ptr() == second.data_ptr()
     assert store.decode_count == 1
     torch.testing.assert_close(first.cpu(), store.matrices[(tensor.name, 0)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
+    store = _FakeStagingStore()
+    matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
+    vector_tensor = _tensor("blk.1.attn_norm.weight", dims=(4,))
+    store.generic_matrices[matrix_tensor.name] = torch.eye(2, dtype=torch.float32)
+    store.vectors[(vector_tensor.name, torch.float16)] = torch.ones(
+        4,
+        dtype=torch.float16,
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.stage_matrix(matrix_tensor)
+    stager.stage_matrix(matrix_tensor)
+    stager.stage_vector(vector_tensor, dtype=torch.float16)
+    stager.stage_vector(vector_tensor, dtype=torch.float16)
+
+    assert stager.staged_bytes == 24
+    assert stager.memory_stats() == {
+        "staged_bytes": 24,
+        "max_staged_bytes": None,
+        "dynamic_entries": 2,
+        "grouped_entries": 0,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_rejects_new_tensor_when_staging_budget_is_exceeded() -> None:
+    store = _FakeStagingStore()
+    matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
+    store.generic_matrices[matrix_tensor.name] = torch.eye(2, dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=15,
+    )
+
+    with pytest.raises(RuntimeError, match="staging cache exceeds memory budget"):
+        stager.stage_matrix(matrix_tensor)
+
+    assert stager.staged_bytes == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -185,7 +239,9 @@ def test_gpu_weight_stager_clear_dynamic_cache_preserves_grouped_expert_cache() 
 
     first_matrix = stager.stage_matrix(matrix_tensor)
     first_expert = stager.stage_grouped_expert_matrix(expert_tensor, 0)
+    assert stager.staged_bytes == 32
     stager.clear_dynamic_cache()
+    assert stager.staged_bytes == 16
     second_matrix = stager.stage_matrix(matrix_tensor)
     second_expert = stager.stage_grouped_expert_matrix(expert_tensor, 0)
 
