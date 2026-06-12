@@ -181,7 +181,6 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     seen_state_ids: list[int] = []
     seen_positions: list[int] = []
     seen_token_ids: list[int] = []
-    sampled: list[int] = []
 
     def fake_token_step(
         *,
@@ -194,7 +193,6 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
         seen_state_ids.append(id(state))
         seen_positions.append(token_idx)
         next_token = (token_idx + 1) % model.shape.vocab_size
-        sampled.append(next_token)
         logits = torch.zeros((1, model.shape.vocab_size), device=device)
         logits[0, next_token] = 1.0
         state.advance_token()
@@ -209,9 +207,9 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
 
     assert output.device.type == "cuda"
     assert output.dtype == torch.long
-    assert output.tolist() == [4, 5, *sampled[1:]]
+    assert output.tolist() == [4, 5, 2, 3, 4, 5, 6, 7, 8, 9]
     assert seen_positions == list(range(9))
-    assert seen_token_ids == [4, 5, *sampled[1:-1]]
+    assert seen_token_ids == [4, 5, 2, 3, 4, 5, 6, 7, 8]
     assert len(set(seen_state_ids)) == 1
 
 
@@ -276,49 +274,64 @@ def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_
         )
         prompt = torch.tensor([1], dtype=torch.long, device="cuda")
         original_token_step = model._forward_kernel_token_step
-        real_step_count = 0
-        fake_step_positions: list[int] = []
-        fake_step_state_ids: list[int] = []
+        real_step_positions: list[int] = []
+        one_token_fake_positions: list[int] = []
+        eight_token_fake_positions: list[int] = []
+        eight_token_fake_state_ids: list[int] = []
 
-        def one_real_step_then_fake_decode(
-            *,
-            token_id: int,
-            state: DeepSeekV4FlashGPURequestState,
-            token_idx: int,
-            device: torch.device,
-        ) -> torch.Tensor:
-            nonlocal real_step_count
-            if real_step_count == 0:
-                real_step_count += 1
-                return original_token_step(
-                    token_id=token_id,
-                    state=state,
-                    token_idx=token_idx,
-                    device=device,
-                )
-            fake_step_positions.append(token_idx)
-            fake_step_state_ids.append(id(state))
-            logits = torch.zeros((1, model.shape.vocab_size), device=device)
-            logits[0, (token_idx + 1) % model.shape.vocab_size] = 1.0
-            state.advance_token()
-            return logits
+        def install_one_real_step_wrapper(
+            fake_positions: list[int],
+            fake_state_ids: list[int] | None = None,
+        ) -> None:
+            real_steps_remaining = 1
 
-        monkeypatch.setattr(
-            model,
-            "_forward_kernel_token_step",
-            one_real_step_then_fake_decode,
-        )
+            def one_real_step_then_fake_decode(
+                *,
+                token_id: int,
+                state: DeepSeekV4FlashGPURequestState,
+                token_idx: int,
+                device: torch.device,
+            ) -> torch.Tensor:
+                nonlocal real_steps_remaining
+                if real_steps_remaining > 0:
+                    real_steps_remaining -= 1
+                    real_step_positions.append(token_idx)
+                    return original_token_step(
+                        token_id=token_id,
+                        state=state,
+                        token_idx=token_idx,
+                        device=device,
+                    )
+                fake_positions.append(token_idx)
+                if fake_state_ids is not None:
+                    fake_state_ids.append(id(state))
+                logits = torch.zeros((1, model.shape.vocab_size), device=device)
+                logits[0, (token_idx + 1) % model.shape.vocab_size] = 1.0
+                state.advance_token()
+                return logits
 
+            monkeypatch.setattr(
+                model,
+                "_forward_kernel_token_step",
+                one_real_step_then_fake_decode,
+            )
+
+        install_one_real_step_wrapper(one_token_fake_positions)
         one_token = model.generate_greedy_kernel(prompt, max_tokens=1)
+        install_one_real_step_wrapper(
+            eight_token_fake_positions,
+            eight_token_fake_state_ids,
+        )
         eight_tokens = model.generate_greedy_kernel(prompt, max_tokens=8)
 
     assert one_token.device.type == "cuda"
     assert eight_tokens.device == prompt.device
     assert one_token.shape == (prompt.numel() + 1,)
     assert eight_tokens.shape == (prompt.numel() + 8,)
-    assert real_step_count == 1
-    assert fake_step_positions == list(range(8))
-    assert len(set(fake_step_state_ids)) == 1
+    assert real_step_positions == [0, 0]
+    assert one_token_fake_positions == []
+    assert eight_token_fake_positions == list(range(1, 8))
+    assert len(set(eight_token_fake_state_ids)) == 1
 
 
 def test_real_gguf_generate_full_decode_smoke_is_slow_opt_in() -> None:
