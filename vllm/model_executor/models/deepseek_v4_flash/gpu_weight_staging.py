@@ -138,7 +138,10 @@ class DeepSeekV4FlashGPUWeightStager:
         if decoded.ndim != 2:
             raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
         nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
-        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        try:
+            self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        except RuntimeError:
+            return decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
@@ -161,7 +164,10 @@ class DeepSeekV4FlashGPUWeightStager:
         if decoded.ndim != 1:
             raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
         nbytes = decoded.numel() * self._dtype_nbytes(dtype)
-        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        try:
+            self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        except RuntimeError:
+            return decoded.to(device=self.device, dtype=dtype, non_blocking=True)
         self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
         self._dynamic_cache[cache_key] = staged
@@ -333,7 +339,10 @@ class DeepSeekV4FlashGPUWeightStager:
                 f"grouped expert matrix must be 2-D; got {decoded.ndim}-D"
             )
         nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
-        self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        try:
+            self._reserve_staged_bytes(nbytes, tensor_name=tensor.name)
+        except RuntimeError:
+            return decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
         staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self._grouped_cache[cache_key] = staged

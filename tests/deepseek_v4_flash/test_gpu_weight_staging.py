@@ -145,6 +145,26 @@ def test_gpu_weight_stager_caches_decoded_grouped_expert_matrix() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_streams_grouped_expert_when_budget_is_exceeded() -> None:
+    store = _FakeGroupedExpertStore()
+    tensor = _tensor("blk.1.ffn_down_exps.weight")
+    store.matrices[(tensor.name, 0)] = torch.eye(2, dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=1,
+    )
+
+    staged = stager.stage_grouped_expert_matrix(tensor, 0)
+
+    assert staged.device.type == "cuda"
+    assert stager.staged_bytes == 0
+    stats = stager.cache_stats()
+    assert stats["grouped_misses"] == 0
+    assert stats["loaded_bytes"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
     store = _FakeStagingStore()
     matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
@@ -176,7 +196,7 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_gpu_weight_stager_rejects_new_tensor_when_staging_budget_is_exceeded() -> None:
+def test_gpu_weight_stager_streams_new_tensor_when_staging_budget_is_exceeded() -> None:
     store = _FakeStagingStore()
     matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
     store.generic_matrices[matrix_tensor.name] = torch.eye(2, dtype=torch.float32)
@@ -186,9 +206,9 @@ def test_gpu_weight_stager_rejects_new_tensor_when_staging_budget_is_exceeded() 
         max_staged_bytes=15,
     )
 
-    with pytest.raises(RuntimeError, match="staging cache exceeds memory budget"):
-        stager.stage_matrix(matrix_tensor)
+    staged = stager.stage_matrix(matrix_tensor)
 
+    assert staged.device.type == "cuda"
     assert stager.staged_bytes == 0
     stats = stager.cache_stats()
     assert stats["dynamic_misses"] == 0
