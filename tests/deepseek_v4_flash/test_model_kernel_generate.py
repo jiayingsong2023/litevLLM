@@ -14,6 +14,7 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_F16,
+    GGML_TYPE_Q8_0,
     DeepSeekV4FlashTensor,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_runtime import (
@@ -184,7 +185,7 @@ def test_model_enable_deepseek_profile_records_generate_section(
     model = _fake_model()
     model.enable_deepseek_profile()
 
-    def fake_token_step(
+    def fake_token_step_token_id(
         *,
         token_id: int,
         state: DeepSeekV4FlashGPURequestState,
@@ -192,10 +193,8 @@ def test_model_enable_deepseek_profile_records_generate_section(
         device: torch.device,
     ) -> torch.Tensor:
         del token_id, token_idx
-        logits = torch.zeros((1, model.shape.vocab_size), device=device)
-        logits[0, 2] = 1.0
         state.advance_token()
-        return logits
+        return torch.tensor(2, dtype=torch.long, device=device)
 
     monkeypatch.setattr(
         model,
@@ -203,7 +202,11 @@ def test_model_enable_deepseek_profile_records_generate_section(
         lambda input_ids, *, max_tokens: input_ids.device,
     )
     monkeypatch.setattr(model.gpu_backend, "require_ready", lambda: None)
-    monkeypatch.setattr(model, "_forward_kernel_token_step", fake_token_step)
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fake_token_step_token_id,
+    )
 
     output = model.generate_greedy_kernel(
         torch.tensor([1], dtype=torch.long, device="cuda"),
@@ -292,6 +295,60 @@ def test_model_profile_records_layer_output_sections_and_syncs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_uses_output_argmax_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model()
+    calls = {"argmax": 0}
+
+    assert model.weight_store is not None
+    model.weight_store.bindings.layers = []
+
+    def fake_output_argmax(
+        store: object,
+        *,
+        stager: object,
+        streams: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del store, stager
+        assert streams.is_cuda
+        calls["argmax"] += 1
+        return torch.tensor(2, dtype=torch.long, device=device)
+
+    def fail_logits_step(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("generate_greedy_kernel used logits path")
+
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: object())
+    monkeypatch.setattr(
+        model,
+        "_stage_token_embedding_cuda",
+        lambda store, token_id, *, device: torch.ones(
+            (model.shape.hidden_size,),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    monkeypatch.setattr(model, "_kernel_output_streams", lambda hidden: hidden)
+    monkeypatch.setattr(
+        model,
+        "_output_token_argmax_chunked_cuda",
+        fake_output_argmax,
+    )
+    monkeypatch.setattr(model, "_forward_kernel_token_step", fail_logits_step)
+    monkeypatch.setattr(model, "_output_logits_chunked_cuda", fail_logits_step)
+
+    output = model.generate_greedy_kernel(
+        torch.tensor([1], dtype=torch.long, device="cuda"),
+        max_tokens=1,
+    )
+
+    assert output.tolist() == [1, 2]
+    assert calls == {"argmax": 1}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_generate_greedy_kernel_appends_one_token_and_advances_shared_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -299,7 +356,7 @@ def test_generate_greedy_kernel_appends_one_token_and_advances_shared_state(
     seen_state_ids: list[int] = []
     seen_positions: list[int] = []
 
-    def fake_token_step(
+    def fake_token_step_token_id(
         *,
         token_id: int,
         state: DeepSeekV4FlashGPURequestState,
@@ -309,12 +366,14 @@ def test_generate_greedy_kernel_appends_one_token_and_advances_shared_state(
         del token_id
         seen_state_ids.append(id(state))
         seen_positions.append(token_idx)
-        logits = torch.zeros((1, model.shape.vocab_size), device=device)
-        logits[0, 7] = 1.0
         state.advance_token()
-        return logits
+        return torch.tensor(7, dtype=torch.long, device=device)
 
-    monkeypatch.setattr(model, "_forward_kernel_token_step", fake_token_step)
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fake_token_step_token_id,
+    )
 
     output = model.generate_greedy_kernel(
         torch.tensor([2, 3], dtype=torch.long, device="cuda"),
@@ -337,7 +396,7 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     seen_positions: list[int] = []
     seen_token_ids: list[int] = []
 
-    def fake_token_step(
+    def fake_token_step_token_id(
         *,
         token_id: int,
         state: DeepSeekV4FlashGPURequestState,
@@ -348,12 +407,14 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
         seen_state_ids.append(id(state))
         seen_positions.append(token_idx)
         next_token = (token_idx + 1) % model.shape.vocab_size
-        logits = torch.zeros((1, model.shape.vocab_size), device=device)
-        logits[0, next_token] = 1.0
         state.advance_token()
-        return logits
+        return torch.tensor(next_token, dtype=torch.long, device=device)
 
-    monkeypatch.setattr(model, "_forward_kernel_token_step", fake_token_step)
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fake_token_step_token_id,
+    )
 
     output = model.generate_greedy_kernel(
         torch.tensor([4, 5], dtype=torch.int32, device="cuda"),
@@ -411,6 +472,103 @@ def test_generate_greedy_kernel_rejects_non_integer_input_ids() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_output_token_argmax_chunked_cuda_uses_argmax_for_each_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunk_rows = model_module._OUTPUT_PROJECTION_CHUNK_ROWS
+    vocab_size = chunk_rows + 17
+    model = _fake_model(vocab_size=vocab_size)
+    assert model.weight_store is not None
+    output_head = DeepSeekV4FlashTensor(
+        "output.weight",
+        (model.shape.hidden_size, model.shape.vocab_size),
+        GGML_TYPE_Q8_0,
+        0,
+        model.shape.vocab_size * (2 + model.shape.hidden_size),
+    )
+    output_norm = DeepSeekV4FlashTensor(
+        "output_norm.weight",
+        (model.shape.hidden_size,),
+        GGML_TYPE_F16,
+        0,
+        model.shape.hidden_size * 2,
+    )
+    model.weight_store.bindings.output_head = output_head
+    model.weight_store.bindings.output_norm = output_norm
+
+    class FakeStager:
+        def stage_vector(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            del tensor
+            return torch.ones(
+                (model.shape.hidden_size,),
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        def get_output_q8_chunk(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            row_start: int,
+            row_end: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del tensor
+            rows = row_end - row_start
+            values = torch.zeros((rows, 1), dtype=torch.int8, device="cuda")
+            scales = torch.ones((rows, 1), dtype=torch.float32, device="cuda")
+            return values, scales
+
+    class FakeBackend(_ReadyBackend):
+        def __init__(self) -> None:
+            self.argmax_offsets: list[int] = []
+            self.logit_offsets: list[int] = []
+
+        def output_argmax(self, **kwargs: torch.Tensor | int) -> torch.Tensor:
+            row_offset = kwargs["row_offset"]
+            assert isinstance(row_offset, int)
+            self.argmax_offsets.append(row_offset)
+            token = row_offset + (3 if row_offset == 0 else 5)
+            return torch.tensor(token, dtype=torch.long, device="cuda")
+
+        def output_logits(self, **kwargs: torch.Tensor | int) -> torch.Tensor:
+            rows = kwargs["lm_head_values"]
+            assert isinstance(rows, torch.Tensor)
+            row_offset = (
+                self.argmax_offsets[-1]
+                if self.argmax_offsets
+                else len(self.logit_offsets) * chunk_rows
+            )
+            self.logit_offsets.append(row_offset)
+            logits = torch.zeros((rows.shape[0],), dtype=torch.float32, device="cuda")
+            candidate = 3 if row_offset == 0 else 5
+            logits[candidate] = 1.0 if row_offset == 0 else 7.0
+            return logits
+
+    backend = FakeBackend()
+    model.gpu_backend = backend  # type: ignore[assignment]
+    monkeypatch.setattr(
+        model,
+        "_stage_output_hyper_connection_cuda",
+        lambda stager, *, stream_elements: (
+            torch.zeros((4, stream_elements), dtype=torch.float32, device="cuda"),
+            torch.ones((1,), dtype=torch.float32, device="cuda"),
+            torch.zeros((4,), dtype=torch.float32, device="cuda"),
+        ),
+    )
+
+    token = model._output_token_argmax_chunked_cuda(
+        model.weight_store,
+        stager=FakeStager(),  # type: ignore[arg-type]
+        streams=torch.ones((4, 8), dtype=torch.float32, device="cuda"),
+        device=torch.device("cuda"),
+    )
+
+    assert token.item() == chunk_rows + 5
+    assert backend.argmax_offsets == [0, chunk_rows]
+    assert backend.logit_offsets == [0, chunk_rows]
+
+
 def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -428,7 +586,7 @@ def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_
             gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
         )
         prompt = torch.tensor([1], dtype=torch.long, device="cuda")
-        original_token_step = model._forward_kernel_token_step
+        original_token_step_token_id = model._forward_kernel_token_step_token_id
         real_step_positions: list[int] = []
         one_token_fake_positions: list[int] = []
         eight_token_fake_positions: list[int] = []
@@ -451,7 +609,7 @@ def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_
                 if real_steps_remaining > 0:
                     real_steps_remaining -= 1
                     real_step_positions.append(token_idx)
-                    return original_token_step(
+                    return original_token_step_token_id(
                         token_id=token_id,
                         state=state,
                         token_idx=token_idx,
@@ -460,14 +618,13 @@ def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_
                 fake_positions.append(token_idx)
                 if fake_state_ids is not None:
                     fake_state_ids.append(id(state))
-                logits = torch.zeros((1, model.shape.vocab_size), device=device)
-                logits[0, (token_idx + 1) % model.shape.vocab_size] = 1.0
                 state.advance_token()
-                return logits
+                next_token = (token_idx + 1) % model.shape.vocab_size
+                return torch.tensor(next_token, dtype=torch.long, device=device)
 
             monkeypatch.setattr(
                 model,
-                "_forward_kernel_token_step",
+                "_forward_kernel_token_step_token_id",
                 one_real_step_then_fake_decode,
             )
 
