@@ -127,3 +127,12 @@ def deepseek_v4_output_projection(inputs: DeepSeekV4OutputKernelInputs) -> torch
     scales = inputs.lm_head_scales.to(torch.float32).reshape(rows, blocks_per_row, 1)
     matrix = (decoded * scales).reshape(rows, columns)
     return matrix.matmul(hidden.to(torch.float32))
+
+
+def deepseek_v4_output_argmax(
+    inputs: DeepSeekV4OutputKernelInputs,
+    *,
+    row_offset: int,
+) -> torch.Tensor:
+    logits = deepseek_v4_output_projection(inputs)
+    return (torch.argmax(logits).to(torch.long) + int(row_offset)).reshape(())

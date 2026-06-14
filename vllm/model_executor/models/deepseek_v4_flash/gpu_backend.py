@@ -20,6 +20,7 @@ from vllm.kernels.triton.deepseek_v4_flash.moe import (
 )
 from vllm.kernels.triton.deepseek_v4_flash.output import (
     DeepSeekV4OutputKernelInputs,
+    deepseek_v4_output_argmax,
     deepseek_v4_output_projection,
 )
 
@@ -108,6 +109,44 @@ class DeepSeekV4FlashGPUBackend:
                 output_norm_weight=output_norm_weight,
                 block_size=block_size,
             )
+        )
+
+    def output_argmax(
+        self,
+        *,
+        streams: torch.Tensor,
+        lm_head_values: torch.Tensor,
+        lm_head_scales: torch.Tensor,
+        output_hc_weight: torch.Tensor,
+        output_hc_scale: torch.Tensor,
+        output_hc_base: torch.Tensor,
+        output_norm_weight: torch.Tensor,
+        block_size: int = 32,
+        row_offset: int = 0,
+    ) -> torch.Tensor:
+        tensors = (
+            streams,
+            lm_head_values,
+            lm_head_scales,
+            output_hc_weight,
+            output_hc_scale,
+            output_hc_base,
+            output_norm_weight,
+        )
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError("DeepSeek V4 Flash output inputs must be CUDA tensors")
+        return deepseek_v4_output_argmax(
+            DeepSeekV4OutputKernelInputs(
+                streams=streams,
+                lm_head_values=lm_head_values,
+                lm_head_scales=lm_head_scales,
+                output_hc_weight=output_hc_weight,
+                output_hc_scale=output_hc_scale,
+                output_hc_base=output_hc_base,
+                output_norm_weight=output_norm_weight,
+                block_size=block_size,
+            ),
+            row_offset=row_offset,
         )
 
     def sliding_attention(

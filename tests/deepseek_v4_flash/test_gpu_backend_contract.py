@@ -51,6 +51,56 @@ def test_gpu_backend_can_report_ready_when_all_kernels_are_enabled() -> None:
     backend.require_ready()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_output_argmax_matches_output_logits() -> None:
+    caps = DeepSeekV4FlashGPUCapabilities(
+        q8_linear=True,
+        attention=True,
+        compressed_attention=True,
+        cache_update=True,
+        moe=True,
+        output=True,
+    )
+    backend = DeepSeekV4FlashGPUBackend(capabilities=caps)
+    streams = torch.ones((4, 4), dtype=torch.float32, device="cuda")
+    values = torch.tensor(
+        [[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]],
+        dtype=torch.int8,
+        device="cuda",
+    )
+    scales = torch.ones((3, 1), dtype=torch.float32, device="cuda")
+    hc_weight = torch.zeros((4, 16), dtype=torch.float32, device="cuda")
+    hc_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+    hc_base = torch.zeros((4,), dtype=torch.float32, device="cuda")
+    norm = torch.ones((4,), dtype=torch.float32, device="cuda")
+
+    row_offset = 7
+    actual = backend.output_argmax(
+        streams=streams,
+        lm_head_values=values,
+        lm_head_scales=scales,
+        output_hc_weight=hc_weight,
+        output_hc_scale=hc_scale,
+        output_hc_base=hc_base,
+        output_norm_weight=norm,
+        block_size=4,
+        row_offset=row_offset,
+    )
+    logits = backend.output_logits(
+        streams=streams,
+        lm_head_values=values,
+        lm_head_scales=scales,
+        output_hc_weight=hc_weight,
+        output_hc_scale=hc_scale,
+        output_hc_base=hc_base,
+        output_norm_weight=norm,
+        block_size=4,
+    )
+
+    assert actual.shape == ()
+    torch.testing.assert_close(actual, torch.argmax(logits) + row_offset)
+
+
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:
     model = DeepSeekV4FlashForCausalLM(gpu_backend=DeepSeekV4FlashGPUBackend())
 
