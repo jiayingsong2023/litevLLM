@@ -97,6 +97,39 @@ The GPU direct path still uses correctness-first PyTorch/Triton wrapper
 fallbacks for some operators. It should be treated as an experimental
 bring-up path until 4K/8K quality and performance validation are complete.
 
+### Phase 0/1/2 Performance Notes
+
+The first performance pass added DeepSeek-local profiling, staging cache
+hit/miss accounting, warm serving preparation, output Q8 chunk caching, chunked
+greedy token-id selection, and staging-budget streaming fallback for decoded
+weights that do not fit in the resident cache.
+
+Measured on the local Ryzen AI Max+ 395 / Radeon 8060S UMA machine with:
+
+```bash
+uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096
+```
+
+| Command suffix | Result |
+| :--- | :--- |
+| `--max-tokens 1 --repeat 1 --profile-json /tmp/deepseek-v4-flash-cold-profile.json` | `runs[0].elapsed_ms=410319.65625`, `tokens_per_second=0.002437124287778987`, output token ids `[1, 32974]`. |
+| `--max-tokens 1 --repeat 2 --profile-json /tmp/deepseek-v4-flash-warm-profile.json` | run 0: `409545.5 ms`, `0.002441731138542604 tok/s`; run 1: `640.6128540039062 ms`, `1.5610052057961084 tok/s`. Staging cache after the run: `dynamic_hits=1317`, `dynamic_misses=1149`, `grouped_hits=774`, `grouped_misses=774`, `staged_bytes=44611017052`. |
+| `--max-tokens 8 --repeat 1 --profile-json /tmp/deepseek-v4-flash-max8-profile.json` | `runs[0].elapsed_ms=877174.5`, `tokens_per_second=0.009120192162448863`, output token ids `[1, 32974, 40359, 81258, 860, 860, 860, 860, 860]`. Staging cache ended nearly full: `staged_bytes=61311773020` of `max_staged_bytes=61312033792`. |
+
+The warm same-process one-token path demonstrates that resident staging cache
+hits can reduce a repeated request from roughly 409 seconds to roughly
+641 milliseconds. The max-8 run also shows the remaining bottleneck: after the
+cache approaches the configured UMA budget, long-tail experts and dynamic
+matrices fall back to streaming transfers. This preserves correctness and
+avoids OOM, but it is not yet interactive for multi-token decode.
+
+During max-8 validation, resident caching first failed on a new grouped expert
+and then on a new indexer matrix after the cache reached the 61.3GB staging
+budget. The implementation now streams budget-overflow expert, matrix, vector,
+and output chunks without adding them to resident cache counters.
+
 Current bounded validation commands:
 
 ```bash
