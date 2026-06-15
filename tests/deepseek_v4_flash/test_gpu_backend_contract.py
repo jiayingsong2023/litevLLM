@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import struct
+from collections.abc import Callable
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_Q2_K,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
     DeepSeekV4FlashGPUCapabilities,
@@ -10,6 +18,39 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
+from vllm.model_executor.models.deepseek_v4_flash.quant import (
+    iq2_xxs_matrix_from_gguf_payload,
+    q2_k_matrix_from_gguf_payload,
+)
+
+
+def _iq2_xxs_unit_block_payload() -> bytes:
+    return struct.pack("<e", 1.0) + (b"\x00" * 64)
+
+
+def _q2_k_repeating_codes_payload() -> bytes:
+    scales = b"\x11" * 16
+    qs = b"\xe4" * 64
+    return scales + qs + struct.pack("<e", 1.0) + struct.pack("<e", 0.5)
+
+
+def _cuda_payload(payload: bytes) -> torch.Tensor:
+    return torch.tensor(tuple(payload), dtype=torch.uint8, device="cuda")
+
+
+def _staged_payload(
+    *,
+    ggml_type: int,
+    rows: int,
+    columns: int,
+    payload: bytes,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        ggml_type=ggml_type,
+        rows=rows,
+        columns=columns,
+        payload=_cuda_payload(payload),
+    )
 
 
 def test_gpu_backend_reports_missing_required_kernels() -> None:
@@ -99,6 +140,65 @@ def test_output_argmax_matches_output_logits() -> None:
 
     assert actual.shape == ()
     torch.testing.assert_close(actual, torch.argmax(logits) + row_offset)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("ggml_type", "block_payload", "decoder"),
+    (
+        (
+            GGML_TYPE_Q2_K,
+            _q2_k_repeating_codes_payload(),
+            q2_k_matrix_from_gguf_payload,
+        ),
+        (
+            GGML_TYPE_IQ2_XXS,
+            _iq2_xxs_unit_block_payload(),
+            iq2_xxs_matrix_from_gguf_payload,
+        ),
+    ),
+)
+def test_quantized_expert_gemm_matches_reference_decode(
+    ggml_type: int,
+    block_payload: bytes,
+    decoder: Callable[..., torch.Tensor],
+) -> None:
+    backend = DeepSeekV4FlashGPUBackend()
+    hidden = torch.linspace(-0.5, 0.5, 256, dtype=torch.float32, device="cuda")
+    gate_payload = block_payload * 256
+    up_payload = block_payload * 256
+    down_payload = block_payload * 256
+
+    actual = backend.quantized_expert_gemm(
+        hidden=hidden,
+        gate_payload=_staged_payload(
+            ggml_type=ggml_type,
+            rows=256,
+            columns=256,
+            payload=gate_payload,
+        ),
+        up_payload=_staged_payload(
+            ggml_type=ggml_type,
+            rows=256,
+            columns=256,
+            payload=up_payload,
+        ),
+        down_payload=_staged_payload(
+            ggml_type=ggml_type,
+            rows=256,
+            columns=256,
+            payload=down_payload,
+        ),
+    )
+
+    gate = decoder(gate_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
+    up = decoder(up_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
+    down = decoder(down_payload, rows=256, columns=256).to(device="cuda")
+    expected = down.matmul(torch.nn.functional.silu(gate) * up)
+
+    assert actual.shape == (256,)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:

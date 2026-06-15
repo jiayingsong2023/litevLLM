@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,21 @@ from vllm.kernels.triton.deepseek_v4_flash.output import (
     deepseek_v4_output_argmax,
     deepseek_v4_output_projection,
 )
+from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
+    deepseek_v4_iq2_xxs_matvec,
+    deepseek_v4_q2_k_matvec,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_Q2_K,
+)
+
+
+class DeepSeekV4FlashQuantizedExpertPayloadLike(Protocol):
+    ggml_type: int
+    rows: int
+    columns: int
+    payload: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -208,6 +224,42 @@ class DeepSeekV4FlashGPUBackend:
         gate = gate_weight.to(torch.float32).matmul(hidden_f32)
         up = up_weight.to(torch.float32).matmul(hidden_f32)
         return down_weight.to(torch.float32).matmul(F.silu(gate) * up)
+
+    def quantized_expert_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        gate_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+        up_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+        down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+    ) -> torch.Tensor:
+        gate = self._quantized_expert_matvec(gate_payload, hidden)
+        up = self._quantized_expert_matvec(up_payload, hidden)
+        return self._quantized_expert_matvec(down_payload, F.silu(gate) * up)
+
+    def _quantized_expert_matvec(
+        self,
+        staged: DeepSeekV4FlashQuantizedExpertPayloadLike,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        if staged.ggml_type == GGML_TYPE_Q2_K:
+            return deepseek_v4_q2_k_matvec(
+                staged.payload,
+                hidden,
+                rows=staged.rows,
+                columns=staged.columns,
+            )
+        if staged.ggml_type == GGML_TYPE_IQ2_XXS:
+            return deepseek_v4_iq2_xxs_matvec(
+                staged.payload,
+                hidden,
+                rows=staged.rows,
+                columns=staged.columns,
+            )
+        raise NotImplementedError(
+            "DeepSeek V4 Flash quantized expert GEMM does not support "
+            f"GGML type {staged.ggml_type}"
+        )
 
     def compressed_attention(
         self,
