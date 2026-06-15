@@ -23,7 +23,10 @@ from vllm.kernels.triton.deepseek_v4_flash.output import (
     DeepSeekV4OutputKernelInputs,
     deepseek_v4_output_argmax,
     deepseek_v4_output_argmax_with_value,
+    deepseek_v4_output_hidden,
     deepseek_v4_output_projection,
+    deepseek_v4_q8_0_output_argmax_with_value,
+    deepseek_v4_q8_0_output_logits,
 )
 from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
@@ -138,6 +141,82 @@ class DeepSeekV4FlashGPUBackend:
                 output_norm_weight=output_norm_weight,
                 block_size=block_size,
             )
+        )
+
+    def output_hidden(
+        self,
+        *,
+        streams: torch.Tensor,
+        output_hc_weight: torch.Tensor,
+        output_hc_scale: torch.Tensor,
+        output_hc_base: torch.Tensor,
+        output_norm_weight: torch.Tensor,
+        lm_head_values: torch.Tensor,
+        lm_head_scales: torch.Tensor,
+        block_size: int = 32,
+    ) -> torch.Tensor:
+        tensors = (
+            streams,
+            output_hc_weight,
+            output_hc_scale,
+            output_hc_base,
+            output_norm_weight,
+            lm_head_values,
+            lm_head_scales,
+        )
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash output hidden inputs must be CUDA tensors"
+            )
+        return deepseek_v4_output_hidden(
+            DeepSeekV4OutputKernelInputs(
+                streams=streams,
+                lm_head_values=lm_head_values,
+                lm_head_scales=lm_head_scales,
+                output_hc_weight=output_hc_weight,
+                output_hc_scale=output_hc_scale,
+                output_hc_base=output_hc_base,
+                output_norm_weight=output_norm_weight,
+                block_size=block_size,
+            )
+        )
+
+    def output_logits_from_hidden(
+        self,
+        *,
+        hidden: torch.Tensor,
+        lm_head_values: torch.Tensor,
+        lm_head_scales: torch.Tensor,
+        block_size: int = 32,
+    ) -> torch.Tensor:
+        tensors = (hidden, lm_head_values, lm_head_scales)
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError("DeepSeek V4 Flash output inputs must be CUDA tensors")
+        return deepseek_v4_q8_0_output_logits(
+            hidden=hidden,
+            lm_head_values=lm_head_values,
+            lm_head_scales=lm_head_scales,
+            block_size=block_size,
+        )
+
+    def output_argmax_from_hidden(
+        self,
+        *,
+        hidden: torch.Tensor,
+        lm_head_values: torch.Tensor,
+        lm_head_scales: torch.Tensor,
+        block_size: int = 32,
+        row_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (hidden, lm_head_values, lm_head_scales)
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise ValueError("DeepSeek V4 Flash output inputs must be CUDA tensors")
+        return deepseek_v4_q8_0_output_argmax_with_value(
+            hidden=hidden,
+            lm_head_values=lm_head_values,
+            lm_head_scales=lm_head_scales,
+            block_size=block_size,
+            row_offset=row_offset,
         )
 
     def output_argmax(

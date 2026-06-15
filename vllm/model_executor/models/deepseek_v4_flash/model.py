@@ -45,7 +45,7 @@ from .weight_store import (
 _RMS_NORM_EPS = 1e-6
 _Q8_0_BLOCK_SIZE = 32
 _Q8_0_BLOCK_BYTES = 2 + _Q8_0_BLOCK_SIZE
-_OUTPUT_PROJECTION_CHUNK_ROWS = 1024
+_OUTPUT_PROJECTION_CHUNK_ROWS = 8192
 _READONLY_BUFFER_WARNING = "The given buffer is not writable"
 
 
@@ -1213,6 +1213,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         payload: memoryview | None = None
         best_value: torch.Tensor | None = None
         best_token: torch.Tensor | None = None
+        output_hidden: torch.Tensor | None = None
         try:
             for row_start in range(0, rows, _OUTPUT_PROJECTION_CHUNK_ROWS):
                 row_end = min(row_start + _OUTPUT_PROJECTION_CHUNK_ROWS, rows)
@@ -1249,7 +1250,45 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
                 chunk_token: torch.Tensor | None = None
                 chunk_value: torch.Tensor | None = None
-                if hasattr(self.gpu_backend, "output_argmax_with_value"):
+                if (
+                    output_hidden is None
+                    and hasattr(self.gpu_backend, "output_hidden")
+                ):
+                    output_hidden = self.gpu_backend.output_hidden(
+                        streams=streams,
+                        lm_head_values=lm_head_values,
+                        lm_head_scales=lm_head_scales,
+                        output_hc_weight=output_hc_weight,
+                        output_hc_scale=output_hc_scale,
+                        output_hc_base=output_hc_base,
+                        output_norm_weight=output_norm_weight,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    )
+                    if not output_hidden.is_cuda:
+                        raise RuntimeError(
+                            "DeepSeek V4 Flash GPU output hidden returned CPU tensor"
+                        )
+
+                if (
+                    output_hidden is not None
+                    and hasattr(self.gpu_backend, "output_argmax_from_hidden")
+                ):
+                    token, value = self.gpu_backend.output_argmax_from_hidden(
+                        hidden=output_hidden,
+                        lm_head_values=lm_head_values,
+                        lm_head_scales=lm_head_scales,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                        row_offset=row_start,
+                    )
+                    if not token.is_cuda or not value.is_cuda:
+                        raise RuntimeError(
+                            "DeepSeek V4 Flash GPU output chunk returned CPU argmax"
+                        )
+                    chunk_token = token.to(device=device, dtype=torch.long).reshape(())
+                    chunk_value = value.to(device=device, dtype=torch.float32).reshape(
+                        ()
+                    )
+                elif hasattr(self.gpu_backend, "output_argmax_with_value"):
                     token, value = self.gpu_backend.output_argmax_with_value(
                         streams=streams,
                         lm_head_values=lm_head_values,

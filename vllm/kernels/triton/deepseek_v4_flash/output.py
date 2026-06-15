@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.triton_utils import tl, triton
+
 
 @dataclass(frozen=True)
 class DeepSeekV4OutputKernelInputs:
@@ -80,6 +82,154 @@ class DeepSeekV4OutputKernelInputs:
                 )
 
 
+def deepseek_v4_output_hidden(inputs: DeepSeekV4OutputKernelInputs) -> torch.Tensor:
+    tensors = [
+        inputs.streams,
+        inputs.output_hc_weight,
+        inputs.output_hc_scale,
+        inputs.output_hc_base,
+        inputs.output_norm_weight,
+    ]
+    if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
+        raise ValueError("DeepSeek V4 output hidden inputs must be CUDA tensors")
+
+    streams = inputs.streams.to(torch.float32)
+    if inputs.output_hc_weight is not None:
+        if inputs.output_hc_scale is None or inputs.output_hc_base is None:
+            raise ValueError(
+                "output_hc_scale and output_hc_base are required with output_hc_weight"
+            )
+        flat = streams.reshape(-1)
+        flat = flat * torch.rsqrt(flat.pow(2).mean() + 1e-6)
+        pre = inputs.output_hc_weight.to(torch.float32).matmul(flat)
+        weights = (
+            torch.sigmoid(
+                pre * inputs.output_hc_scale.to(torch.float32)[0]
+                + inputs.output_hc_base.to(torch.float32)
+            )
+            + 1e-6
+        )
+        hidden = (weights.reshape(4, 1) * streams).sum(dim=0)
+    else:
+        hidden = streams.mean(dim=0)
+
+    if inputs.output_norm_weight is not None:
+        hidden = hidden * torch.rsqrt(hidden.pow(2).mean() + 1e-6)
+        hidden = hidden * inputs.output_norm_weight.to(torch.float32)
+    return hidden.to(torch.float32)
+
+
+# Q8_0 output row layout after staging:
+# - lm_head_values is row-major int8 [vocab_rows, hidden_size].
+# - lm_head_scales is row-major fp32 [vocab_rows, hidden_size / 32].
+# One Triton program handles one vocab row. It loops over 32-value Q8_0
+# blocks, multiplies dequantized int8 values by the dense hidden vector, and
+# stores a single fp32 logit. This avoids materializing the decoded matrix.
+@triton.jit
+def _q8_0_output_matvec_kernel(
+    values_ptr,
+    scales_ptr,
+    hidden_ptr,
+    logits_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_ROW: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    total = tl.full((), 0.0, tl.float32)
+    for block_idx in tl.static_range(0, BLOCKS_PER_ROW):
+        value_offsets = row * BLOCKS_PER_ROW * BLOCK_SIZE + block_idx * BLOCK_SIZE
+        values = tl.load(values_ptr + value_offsets + offsets).to(tl.float32)
+        scale = tl.load(scales_ptr + row * BLOCKS_PER_ROW + block_idx).to(tl.float32)
+        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
+            tl.float32
+        )
+        total += tl.sum(values * scale * hidden, axis=0)
+    tl.store(logits_ptr + row, total)
+
+
+def _q8_0_output_matvec_triton_cuda(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    if block_size != 32:
+        raise ValueError("DeepSeek V4 Q8_0 output kernel requires block_size=32")
+    rows, columns = values.shape
+    blocks_per_row = columns // block_size
+    logits = torch.empty((rows,), dtype=torch.float32, device=hidden.device)
+    _q8_0_output_matvec_kernel[(rows,)](
+        values.contiguous(),
+        scales.contiguous(),
+        hidden.contiguous(),
+        logits,
+        BLOCK_SIZE=block_size,
+        BLOCKS_PER_ROW=blocks_per_row,
+        num_warps=1,
+    )
+    return logits
+
+
+def _q8_0_output_matvec(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    if block_size == 32:
+        return _q8_0_output_matvec_triton_cuda(
+            values,
+            scales,
+            hidden,
+            block_size=block_size,
+        )
+    rows, columns = values.shape
+    blocks_per_row = columns // block_size
+    decoded = values.to(torch.float32).reshape(rows, blocks_per_row, block_size)
+    row_scales = scales.to(torch.float32).reshape(rows, blocks_per_row, 1)
+    decoded_matrix = (decoded * row_scales).reshape(rows, columns)
+    return decoded_matrix.matmul(hidden.to(torch.float32))
+
+
+def deepseek_v4_q8_0_output_logits(
+    *,
+    hidden: torch.Tensor,
+    lm_head_values: torch.Tensor,
+    lm_head_scales: torch.Tensor,
+    block_size: int = 32,
+) -> torch.Tensor:
+    if not hidden.is_cuda or not lm_head_values.is_cuda or not lm_head_scales.is_cuda:
+        raise ValueError("DeepSeek V4 Q8_0 output inputs must be CUDA tensors")
+    return _q8_0_output_matvec(
+        lm_head_values,
+        lm_head_scales,
+        hidden.to(torch.float32),
+        block_size=block_size,
+    )
+
+
+def deepseek_v4_q8_0_output_argmax_with_value(
+    *,
+    hidden: torch.Tensor,
+    lm_head_values: torch.Tensor,
+    lm_head_scales: torch.Tensor,
+    block_size: int = 32,
+    row_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = deepseek_v4_q8_0_output_logits(
+        hidden=hidden,
+        lm_head_values=lm_head_values,
+        lm_head_scales=lm_head_scales,
+        block_size=block_size,
+    )
+    value, index = torch.max(logits, dim=0)
+    token = index.to(torch.long) + int(row_offset)
+    return token.reshape(()), value.to(torch.float32).reshape(())
+
+
 def deepseek_v4_output_projection(inputs: DeepSeekV4OutputKernelInputs) -> torch.Tensor:
     tensors = [
         inputs.streams,
@@ -93,40 +243,12 @@ def deepseek_v4_output_projection(inputs: DeepSeekV4OutputKernelInputs) -> torch
     if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
         raise ValueError("DeepSeek V4 output inputs must be CUDA tensors")
 
-    hidden = inputs.streams.to(torch.float32)
-    if inputs.output_hc_weight is not None:
-        if inputs.output_hc_scale is None or inputs.output_hc_base is None:
-            raise ValueError(
-                "output_hc_scale and output_hc_base are required with output_hc_weight"
-            )
-        flat = hidden.reshape(-1)
-        flat = flat * torch.rsqrt(flat.pow(2).mean() + 1e-6)
-        pre = inputs.output_hc_weight.to(torch.float32).matmul(flat)
-        weights = (
-            torch.sigmoid(
-                pre * inputs.output_hc_scale.to(torch.float32)[0]
-                + inputs.output_hc_base.to(torch.float32)
-            )
-            + 1e-6
-        )
-        hidden = (weights.reshape(4, 1) * hidden).sum(dim=0)
-    else:
-        hidden = hidden.mean(dim=0)
-
-    if inputs.output_norm_weight is not None:
-        hidden = hidden * torch.rsqrt(hidden.pow(2).mean() + 1e-6)
-        hidden = hidden * inputs.output_norm_weight.to(torch.float32)
-
-    rows, columns = inputs.lm_head_values.shape
-    blocks_per_row = columns // inputs.block_size
-    decoded = inputs.lm_head_values.to(torch.float32).reshape(
-        rows,
-        blocks_per_row,
-        inputs.block_size,
+    return _q8_0_output_matvec(
+        inputs.lm_head_values,
+        inputs.lm_head_scales,
+        deepseek_v4_output_hidden(inputs),
+        block_size=inputs.block_size,
     )
-    scales = inputs.lm_head_scales.to(torch.float32).reshape(rows, blocks_per_row, 1)
-    matrix = (decoded * scales).reshape(rows, columns)
-    return matrix.matmul(hidden.to(torch.float32))
 
 
 def deepseek_v4_output_argmax(
@@ -146,7 +268,24 @@ def deepseek_v4_output_argmax_with_value(
     *,
     row_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    logits = deepseek_v4_output_projection(inputs)
+    tensors = [
+        inputs.streams,
+        inputs.lm_head_values,
+        inputs.lm_head_scales,
+        inputs.output_hc_weight,
+        inputs.output_hc_scale,
+        inputs.output_hc_base,
+        inputs.output_norm_weight,
+    ]
+    if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
+        raise ValueError("DeepSeek V4 output inputs must be CUDA tensors")
+
+    logits = _q8_0_output_matvec(
+        inputs.lm_head_values,
+        inputs.lm_head_scales,
+        deepseek_v4_output_hidden(inputs),
+        block_size=inputs.block_size,
+    )
     value, index = torch.max(logits, dim=0)
     token = index.to(torch.long) + int(row_offset)
     return token.reshape(()), value.to(torch.float32).reshape(())

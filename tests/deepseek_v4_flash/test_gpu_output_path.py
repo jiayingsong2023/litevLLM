@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import vllm.kernels.triton.deepseek_v4_flash.output as output_module
 from vllm.kernels.triton.deepseek_v4_flash.output import (
     DeepSeekV4OutputKernelInputs,
     deepseek_v4_output_argmax_with_value,
@@ -79,6 +80,49 @@ def test_deepseek_gpu_output_argmax_with_value_matches_projection() -> None:
     assert value.device.type == "cuda"
     torch.testing.assert_close(token, expected_index.to(torch.long) + 1024)
     torch.testing.assert_close(value, logits[expected_index])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_deepseek_gpu_output_argmax_does_not_call_full_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    streams = torch.arange(128, dtype=torch.float32, device=device).reshape(4, 32)
+    output_hc_weight = torch.zeros((4, 128), dtype=torch.float32, device=device)
+    output_hc_scale = torch.ones(1, dtype=torch.float32, device=device)
+    output_hc_base = torch.zeros(4, dtype=torch.float32, device=device)
+    output_norm_weight = torch.ones(32, dtype=torch.float32, device=device)
+    lm_head_values = torch.arange(128, dtype=torch.int8, device=device).reshape(4, 32)
+    lm_head_scales = torch.full((4, 1), 0.25, dtype=torch.float32, device=device)
+    inputs = DeepSeekV4OutputKernelInputs(
+        streams=streams,
+        lm_head_values=lm_head_values,
+        lm_head_scales=lm_head_scales,
+        output_hc_weight=output_hc_weight,
+        output_hc_scale=output_hc_scale,
+        output_hc_base=output_hc_base,
+        output_norm_weight=output_norm_weight,
+        block_size=32,
+    )
+    expected_logits = deepseek_v4_output_projection(inputs)
+    expected_index = torch.argmax(expected_logits)
+
+    def _fail_projection(_inputs: DeepSeekV4OutputKernelInputs) -> torch.Tensor:
+        raise AssertionError("argmax path must not materialize full projection")
+
+    monkeypatch.setattr(
+        output_module,
+        "deepseek_v4_output_projection",
+        _fail_projection,
+    )
+
+    token, value = output_module.deepseek_v4_output_argmax_with_value(
+        inputs,
+        row_offset=1024,
+    )
+
+    torch.testing.assert_close(token, expected_index.to(torch.long) + 1024)
+    torch.testing.assert_close(value, expected_logits[expected_index])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
