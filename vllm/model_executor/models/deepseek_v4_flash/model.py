@@ -731,6 +731,100 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             }
         return stager.memory_stats()
 
+    def prepare_deepseek_hot_experts(
+        self,
+        *,
+        device: torch.device,
+        max_layers: int = 4,
+        experts_per_layer: int = 2,
+    ) -> dict[str, int | None]:
+        store = self._require_weight_store()
+        stager = self._get_gpu_weight_stager(device)
+        if max_layers <= 0 or experts_per_layer <= 0:
+            return stager.memory_stats()
+
+        stage_payload = getattr(stager, "stage_grouped_expert_payload", None)
+        if stage_payload is None:
+            return stager.memory_stats()
+
+        layers = sorted(
+            (
+                layer
+                for layer in getattr(store.bindings, "layers", ())
+                if getattr(layer, "grouped_experts", None) is not None
+            ),
+            key=lambda layer: layer.layer_index,
+        )
+        pinned_experts = self._discover_stager_pinned_experts(stager)
+        pinned_by_layer: dict[int, list[int]] = {}
+        for layer_idx, expert_id in pinned_experts:
+            pinned_by_layer.setdefault(layer_idx, []).append(expert_id)
+        for expert_ids in pinned_by_layer.values():
+            expert_ids.sort()
+
+        prepared_layers = 0
+        for layer in layers:
+            grouped_experts = layer.grouped_experts
+            if grouped_experts is None:
+                continue
+            if pinned_by_layer:
+                expert_ids = pinned_by_layer.get(layer.layer_index, [])
+                if not expert_ids:
+                    continue
+                expert_ids = expert_ids[:experts_per_layer]
+            else:
+                expert_count = self._grouped_expert_count(grouped_experts)
+                expert_ids = list(range(min(experts_per_layer, expert_count)))
+            if not expert_ids:
+                continue
+
+            for expert_id in expert_ids:
+                for tensor in (
+                    getattr(grouped_experts, "gate", None),
+                    getattr(grouped_experts, "up", None),
+                    getattr(grouped_experts, "down", None),
+                ):
+                    if tensor is None:
+                        continue
+                    try:
+                        stage_payload(
+                            tensor,
+                            expert_id,
+                            layer_idx=layer.layer_index,
+                        )
+                    except (AttributeError, KeyError, NotImplementedError):
+                        continue
+            prepared_layers += 1
+            if prepared_layers >= max_layers:
+                break
+
+        return stager.memory_stats()
+
+    @staticmethod
+    def _discover_stager_pinned_experts(
+        stager: DeepSeekV4FlashGPUWeightStager,
+    ) -> tuple[tuple[int, int], ...]:
+        pinned_experts: set[tuple[int, int]] = set()
+        hot_policy = getattr(stager, "hot_expert_policy", None)
+        pinned_experts.update(getattr(hot_policy, "pinned_experts", frozenset()))
+        pinned_experts.update(getattr(stager, "_manual_pinned_experts", frozenset()))
+        return tuple(sorted(pinned_experts))
+
+    @staticmethod
+    def _grouped_expert_count(
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+    ) -> int:
+        counts = [
+            tensor.dims[2]
+            for tensor in (
+                grouped_experts.gate,
+                grouped_experts.up,
+                grouped_experts.down,
+            )
+            if len(tensor.dims) == 3
+        ]
+        return min(counts, default=0)
+
     def prepare_for_serving(
         self,
         *,

@@ -20,6 +20,9 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
 )
+from vllm.model_executor.models.deepseek_v4_flash.model import (
+    DeepSeekV4FlashForCausalLM,
+)
 from vllm.model_executor.models.deepseek_v4_flash.moe import grouped_expert_reference
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
@@ -109,6 +112,40 @@ def _tensor(name: str, dims: tuple[int, ...] = (2, 2, 1)) -> DeepSeekV4FlashTens
     )
 
 
+class _FakeHotLayer:
+    def __init__(
+        self,
+        layer_index: int,
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors | None,
+    ) -> None:
+        self.layer_index = layer_index
+        self.grouped_experts = grouped_experts
+
+
+class _FakeHotBindings:
+    def __init__(self) -> None:
+        self.token_embedding = _tensor("token_embd.weight", dims=(2, 8))
+        self.layers = (
+            _FakeHotLayer(0, _hot_grouped_experts(0)),
+            _FakeHotLayer(1, _hot_grouped_experts(1)),
+            _FakeHotLayer(3, _hot_grouped_experts(3)),
+        )
+
+
+class _FakeHotStore(_FakeStagingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bindings = _FakeHotBindings()
+
+
+def _hot_grouped_experts(layer_idx: int) -> DeepSeekV4FlashGroupedExpertTensors:
+    return DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor(f"blk.{layer_idx}.ffn_gate_exps.weight", dims=(2, 2, 4)),
+        up=_tensor(f"blk.{layer_idx}.ffn_up_exps.weight", dims=(2, 2, 4)),
+        down=_tensor(f"blk.{layer_idx}.ffn_down_exps.weight", dims=(2, 2, 4)),
+    )
+
+
 def test_gpu_weight_stager_rejects_negative_staging_budget() -> None:
     store = _FakeStagingStore()
 
@@ -155,6 +192,54 @@ def test_gpu_weight_stager_memory_stats_include_cache_stats() -> None:
     assert "lru_evictions" in stats
     assert "pinned_entries" in stats
     assert "streamed_bytes" in stats
+
+
+def test_model_hot_expert_preparation_prefers_pinned_experts_and_skips_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _FakeHotStore()
+    model = DeepSeekV4FlashForCausalLM(weight_store=store)
+
+    class FakeStager:
+        hot_expert_policy = DeepSeekV4FlashHotExpertPolicy(
+            pinned_experts=frozenset({(3, 2), (1, 3), (1, 1)})
+        )
+
+        def __init__(self) -> None:
+            self.payload_calls: list[tuple[str, int, int | None]] = []
+
+        def stage_grouped_expert_payload(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            expert_id: int,
+            *,
+            layer_idx: int | None = None,
+        ) -> object:
+            if tensor.name == "blk.1.ffn_up_exps.weight" and expert_id == 3:
+                raise KeyError(tensor.name)
+            self.payload_calls.append((tensor.name, expert_id, layer_idx))
+            return object()
+
+        def memory_stats(self) -> dict[str, int | None]:
+            return {"grouped_entries": len(self.payload_calls)}
+
+    stager = FakeStager()
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: stager)
+
+    stats = model.prepare_deepseek_hot_experts(
+        device=torch.device("cuda"),
+        max_layers=1,
+        experts_per_layer=2,
+    )
+
+    assert stats == {"grouped_entries": 5}
+    assert stager.payload_calls == [
+        ("blk.1.ffn_gate_exps.weight", 1, 1),
+        ("blk.1.ffn_up_exps.weight", 1, 1),
+        ("blk.1.ffn_down_exps.weight", 1, 1),
+        ("blk.1.ffn_gate_exps.weight", 3, 1),
+        ("blk.1.ffn_down_exps.weight", 3, 1),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

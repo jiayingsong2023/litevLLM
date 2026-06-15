@@ -25,6 +25,7 @@ from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+    DeepSeekV4FlashGroupedExpertTensors,
     open_deepseek_v4_flash_weight_store,
 )
 
@@ -104,6 +105,46 @@ class _FakeStore:
         )()
 
 
+class _FakeLayer:
+    def __init__(
+        self,
+        layer_index: int,
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors | None,
+    ) -> None:
+        self.layer_index = layer_index
+        self.grouped_experts = grouped_experts
+
+
+def _grouped_experts(
+    layer_idx: int,
+    *,
+    expert_count: int = 4,
+) -> DeepSeekV4FlashGroupedExpertTensors:
+    return DeepSeekV4FlashGroupedExpertTensors(
+        gate=DeepSeekV4FlashTensor(
+            f"blk.{layer_idx}.ffn_gate_exps.weight",
+            (2, 2, expert_count),
+            GGML_TYPE_Q8_0,
+            0,
+            0,
+        ),
+        up=DeepSeekV4FlashTensor(
+            f"blk.{layer_idx}.ffn_up_exps.weight",
+            (2, 2, expert_count),
+            GGML_TYPE_Q8_0,
+            0,
+            0,
+        ),
+        down=DeepSeekV4FlashTensor(
+            f"blk.{layer_idx}.ffn_down_exps.weight",
+            (2, 2, expert_count),
+            GGML_TYPE_Q8_0,
+            0,
+            0,
+        ),
+    )
+
+
 def _runtime_budget(context_length: int) -> DeepSeekV4FlashRuntimeBudget:
     return DeepSeekV4FlashRuntimeBudget(
         context=DeepSeekV4FlashContextEstimate(
@@ -166,6 +207,75 @@ def test_prepare_for_serving_sets_context_and_preserves_stager() -> None:
     assert model._get_gpu_weight_stager(torch.device("cuda:0")) is first_stager
     assert stats == model.gpu_staging_memory_stats()
     assert model.gpu_staging_memory_stats()["max_staged_bytes"] is not None
+
+
+def test_prepare_deepseek_hot_experts_reuses_stager_and_stages_bounded_raw_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model(context_length=4)
+    assert model.weight_store is not None
+    model.weight_store.bindings.layers = [
+        _FakeLayer(0, _grouped_experts(0)),
+        _FakeLayer(1, None),
+        _FakeLayer(2, _grouped_experts(2)),
+    ]
+    created_stagers = 0
+
+    class FakeStager:
+        hot_expert_policy = type("Policy", (), {"pinned_experts": frozenset()})()
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal created_stagers
+            del args, kwargs
+            created_stagers += 1
+            self.payload_calls: list[tuple[str, int, int | None]] = []
+
+        def stage_grouped_expert_payload(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            expert_id: int,
+            *,
+            layer_idx: int | None = None,
+        ) -> object:
+            self.payload_calls.append((tensor.name, expert_id, layer_idx))
+            return object()
+
+        def memory_stats(self) -> dict[str, int | None]:
+            return {
+                "staged_bytes": len(self.payload_calls),
+                "max_staged_bytes": 99,
+            }
+
+    monkeypatch.setattr(model_module, "DeepSeekV4FlashGPUWeightStager", FakeStager)
+
+    model.prepare_for_serving(context_length=4, device=torch.device("cuda"))
+    first_stager = model._gpu_weight_stager
+    stats = model.prepare_deepseek_hot_experts(
+        device=torch.device("cuda"),
+        max_layers=1,
+        experts_per_layer=2,
+    )
+    second_stats = model.prepare_deepseek_hot_experts(
+        device=torch.device("cuda:0"),
+        max_layers=1,
+        experts_per_layer=2,
+    )
+
+    assert model.runtime_budget is not None
+    assert model.runtime_budget.context.context_length == 4
+    assert created_stagers == 1
+    assert model._gpu_weight_stager is first_stager
+    assert isinstance(first_stager, FakeStager)
+    assert stats == {"staged_bytes": 6, "max_staged_bytes": 99}
+    assert second_stats == {"staged_bytes": 12, "max_staged_bytes": 99}
+    assert first_stager.payload_calls[:6] == [
+        ("blk.0.ffn_gate_exps.weight", 0, 0),
+        ("blk.0.ffn_up_exps.weight", 0, 0),
+        ("blk.0.ffn_down_exps.weight", 0, 0),
+        ("blk.0.ffn_gate_exps.weight", 1, 0),
+        ("blk.0.ffn_up_exps.weight", 1, 0),
+        ("blk.0.ffn_down_exps.weight", 1, 0),
+    ]
 
 
 def test_prepare_for_serving_rejects_context_mismatch() -> None:
