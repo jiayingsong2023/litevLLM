@@ -1261,10 +1261,11 @@ def _run_hash_routed_experts(
 ) -> torch.Tensor | None:
     if layer.expert_token_to_expert_ids is None:
         return None
-    table = stager.store.tensor_to_torch(
+    table = _stage_expert_token_table(
+        stager,
         layer.expert_token_to_expert_ids,
-        dtype=torch.int32,
-    ).to(device=hidden.device, non_blocking=True)
+        device=hidden.device,
+    )
     if table.ndim != 2:
         raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
     if token_id_tensor is None:
@@ -1282,7 +1283,12 @@ def _run_hash_routed_experts(
         )
         expert_ids = table.index_select(1, token_id_tensor.reshape(1)).reshape(-1)
         expert_ids = expert_ids.to(torch.int64)
-    if torch.any(expert_ids < 0):
+    if expert_ids.is_cuda:
+        torch._assert_async(
+            torch.all(expert_ids >= 0),
+            "hash-routed expert ids must be non-negative",
+        )
+    elif torch.any(expert_ids < 0):
         raise ValueError("hash-routed expert ids must be non-negative")
     weights = torch.full(
         expert_ids.shape,
@@ -1327,9 +1333,11 @@ def _run_staged_routed_experts(
     layer_idx: int | None = None,
 ) -> torch.Tensor:
     output: torch.Tensor | None = None
-    selected_expert_ids = [
-        int(expert_id) for expert_id in expert_ids.detach().cpu().tolist()
-    ]
+    selected_expert_ids = _materialize_selected_expert_ids(
+        expert_ids,
+        max_experts=expert_weights.numel(),
+        stager=stager,
+    )
     for expert_id, expert_weight in zip(
         selected_expert_ids,
         expert_weights,
@@ -1382,6 +1390,84 @@ def _run_staged_routed_experts(
     if output is None:
         raise ValueError("DeepSeek V4 Flash routed MoE selected no experts")
     return output
+
+
+def _stage_expert_token_table(
+    stager: DeepSeekV4FlashGPUWeightStager,
+    tensor: DeepSeekV4FlashTensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    cache = getattr(stager, "_dynamic_cache", None)
+    cache_key_fn = getattr(stager, "_dynamic_cache_key", None)
+    if not isinstance(cache, dict) or not callable(cache_key_fn):
+        return stager.store.tensor_to_torch(tensor, dtype=torch.int32).to(
+            device=device,
+            dtype=torch.int32,
+            non_blocking=True,
+        )
+
+    cache_key = cache_key_fn(
+        tensor,
+        dtype=torch.int32,
+        extra=("expert_token_table",),
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        record_lru_hit = getattr(stager, "_record_lru_hit", None)
+        if callable(record_lru_hit):
+            record_lru_hit(cache_key)
+        stager.record_cache_hit("dynamic", tensor_name=tensor.name)
+        return cached
+
+    decoded = stager.store.tensor_to_torch(tensor, dtype=torch.int32)
+    nbytes = decoded.numel() * decoded.element_size()
+    prepare_insert = getattr(stager, "_prepare_cache_insert", None)
+    if callable(prepare_insert) and not prepare_insert(nbytes):
+        record_streamed_bytes = getattr(stager, "_record_streamed_bytes", None)
+        if callable(record_streamed_bytes):
+            record_streamed_bytes(nbytes)
+        return decoded.to(device=device, dtype=torch.int32, non_blocking=True)
+
+    stager.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
+    staged = decoded.to(device=device, dtype=torch.int32, non_blocking=True)
+    register_cached_entry = getattr(stager, "_register_cached_entry", None)
+    if callable(register_cached_entry):
+        register_cached_entry(cache_key, staged, nbytes)
+    else:
+        cache[cache_key] = staged
+    return staged
+
+
+def _materialize_selected_expert_ids(
+    expert_ids: torch.Tensor,
+    *,
+    max_experts: int,
+    stager: DeepSeekV4FlashGPUWeightStager,
+) -> list[int]:
+    if max_experts <= 0:
+        raise ValueError("routed expert materialization requires at least one expert")
+    flattened = expert_ids.detach().reshape(-1)
+    if flattened.numel() > max_experts:
+        raise ValueError(
+            "routed expert id tensor exceeds bounded top-k materialization; "
+            f"got {flattened.numel()} ids for max_experts={max_experts}"
+        )
+    if flattened.is_cuda:
+        _increment_stager_counter(stager, "routed_expert_id_materializations")
+        flattened = flattened.to(device="cpu", dtype=torch.int64)
+    else:
+        flattened = flattened.to(dtype=torch.int64)
+    return [int(expert_id) for expert_id in flattened.tolist()]
+
+
+def _increment_stager_counter(
+    stager: DeepSeekV4FlashGPUWeightStager,
+    counter_name: str,
+) -> None:
+    stats = getattr(stager, "_cache_stats", None)
+    if isinstance(stats, dict):
+        stats[counter_name] = int(stats.get(counter_name, 0)) + 1
 
 
 def _required_tensor(
