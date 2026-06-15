@@ -290,7 +290,7 @@ class DeepSeekV4FlashGPUBackend:
             and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
             and gate_payload.rows == up_payload.rows
             and gate_payload.columns == up_payload.columns
-            and gate_payload.columns == 256
+            and gate_payload.columns % 256 == 0
         ):
             self._stats["iq2_xxs_gate_up_fused_calls"] += 1
             activated = deepseek_v4_iq2_xxs_gate_up_activation(

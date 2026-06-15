@@ -62,6 +62,43 @@ def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
     return b"".join(blocks)
 
 
+def _iq2_xxs_deterministic_payload_blocks(rows: int, blocks_per_row: int) -> bytes:
+    blocks: list[bytes] = []
+    for row in range(rows):
+        for block_idx in range(blocks_per_row):
+            synthetic_row = row * 17 + block_idx
+            groups = bytearray()
+            for group in range(8):
+                grid_bytes = bytes(
+                    (
+                        synthetic_row * 19
+                        + group * 29
+                        + idx * 37
+                        + 0x17
+                    )
+                    & 0xFF
+                    for idx in range(4)
+                )
+                sign_indices = [
+                    (synthetic_row * 11 + group * 7 + idx * 23 + 0x05)
+                    & 0x7F
+                    for idx in range(4)
+                ]
+                scale_code = (synthetic_row + group * 3) & 0x0F
+                q_sign_scale = (
+                    sign_indices[0]
+                    | (sign_indices[1] << 7)
+                    | (sign_indices[2] << 14)
+                    | (sign_indices[3] << 21)
+                    | (scale_code << 28)
+                )
+                groups.extend(grid_bytes)
+                groups.extend(struct.pack("<I", q_sign_scale))
+            d = 0.03125 * (synthetic_row % 7 + 1)
+            blocks.append(struct.pack("<e", d) + bytes(groups))
+    return b"".join(blocks)
+
+
 def _q2_k_deterministic_payload(rows: int) -> bytes:
     blocks: list[bytes] = []
     for row in range(rows):
@@ -309,6 +346,78 @@ def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down(
 
     assert actual.shape == (rows,)
     assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
+    assert backend.stats() == {
+        "quantized_expert_calls": 1,
+        "q2_k_triton_calls": 1,
+        "iq2_xxs_triton_calls": 0,
+        "iq2_xxs_gate_up_fused_calls": 1,
+        "q2_iq2_reference_fallback_calls": 0,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_quantized_expert_gemm_uses_fused_iq2_gate_up_for_multiblock_columns(
+) -> None:
+    backend = DeepSeekV4FlashGPUBackend()
+    rows = 256
+    gate_columns = 512
+    down_columns = rows
+    hidden = torch.linspace(
+        -0.5,
+        0.5,
+        gate_columns,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    gate_payload = _iq2_xxs_deterministic_payload_blocks(
+        rows,
+        gate_columns // 256,
+    )
+    up_payload = _iq2_xxs_deterministic_payload_blocks(
+        rows,
+        gate_columns // 256,
+    )
+    down_payload = _q2_k_deterministic_payload(rows)
+
+    actual = backend.quantized_expert_gemm(
+        hidden=hidden,
+        gate_payload=_staged_payload(
+            ggml_type=GGML_TYPE_IQ2_XXS,
+            rows=rows,
+            columns=gate_columns,
+            payload=gate_payload,
+        ),
+        up_payload=_staged_payload(
+            ggml_type=GGML_TYPE_IQ2_XXS,
+            rows=rows,
+            columns=gate_columns,
+            payload=up_payload,
+        ),
+        down_payload=_staged_payload(
+            ggml_type=GGML_TYPE_Q2_K,
+            rows=rows,
+            columns=down_columns,
+            payload=down_payload,
+        ),
+    )
+    gate = iq2_xxs_matrix_from_gguf_payload(
+        gate_payload,
+        rows=rows,
+        columns=gate_columns,
+    ).to(device="cuda").matmul(hidden)
+    up = iq2_xxs_matrix_from_gguf_payload(
+        up_payload,
+        rows=rows,
+        columns=gate_columns,
+    ).to(device="cuda").matmul(hidden)
+    expected = q2_k_matrix_from_gguf_payload(
+        down_payload,
+        rows=rows,
+        columns=down_columns,
+    ).to(device="cuda").matmul(F.silu(gate) * up)
+
+    assert actual.shape == (rows,)
     torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
     assert backend.stats() == {
         "quantized_expert_calls": 1,
