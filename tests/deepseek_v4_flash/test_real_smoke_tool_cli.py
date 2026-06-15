@@ -78,3 +78,31 @@ def test_phase3_metrics_schema_is_stable() -> None:
         "quantized_expert_calls": 7,
         "streamed_bytes": 3,
     }
+
+
+def test_phase4_metrics_schema_is_stable() -> None:
+    metrics = smoke.phase4_metrics(
+        profile={},
+        gpu_staging={},
+        gpu_backend={
+            "q2_k_triton_calls": 2,
+            "iq2_xxs_triton_calls": 3,
+            "q2_iq2_reference_fallback_calls": 4,
+        },
+    )
+
+    assert metrics == {
+        "iq2_xxs_triton_calls": 3,
+        "q2_iq2_reference_fallback_calls": 4,
+        "q2_k_triton_calls": 2,
+    }
+
+
+def test_phase4_metrics_defaults_missing_backend_counters_to_zero() -> None:
+    metrics = smoke.phase4_metrics(profile={}, gpu_staging={}, gpu_backend={})
+
+    assert metrics == {
+        "iq2_xxs_triton_calls": 0,
+        "q2_iq2_reference_fallback_calls": 0,
+        "q2_k_triton_calls": 0,
+    }

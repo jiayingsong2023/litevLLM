@@ -86,6 +86,21 @@ def phase3_metrics(
     }
 
 
+def phase4_metrics(
+    *,
+    profile: dict[str, object],
+    gpu_staging: dict[str, object],
+    gpu_backend: dict[str, object],
+) -> dict[str, int]:
+    return {
+        "q2_k_triton_calls": int(gpu_backend.get("q2_k_triton_calls", 0)),
+        "iq2_xxs_triton_calls": int(gpu_backend.get("iq2_xxs_triton_calls", 0)),
+        "q2_iq2_reference_fallback_calls": int(
+            gpu_backend.get("q2_iq2_reference_fallback_calls", 0)
+        ),
+    }
+
+
 def main() -> int:
     args = parse_args()
     if args.repeat <= 0:
@@ -159,6 +174,11 @@ def main() -> int:
             "gpu_staging": gpu_staging,
             "gpu_backend": gpu_backend,
             "phase3_metrics": phase3_metrics(
+                profile=profile,
+                gpu_staging=gpu_staging,
+                gpu_backend=gpu_backend,
+            ),
+            "phase4_metrics": phase4_metrics(
                 profile=profile,
                 gpu_staging=gpu_staging,
                 gpu_backend=gpu_backend,
