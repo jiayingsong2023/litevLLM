@@ -134,5 +134,19 @@ def deepseek_v4_output_argmax(
     *,
     row_offset: int,
 ) -> torch.Tensor:
+    token, _value = deepseek_v4_output_argmax_with_value(
+        inputs,
+        row_offset=row_offset,
+    )
+    return token
+
+
+def deepseek_v4_output_argmax_with_value(
+    inputs: DeepSeekV4OutputKernelInputs,
+    *,
+    row_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits = deepseek_v4_output_projection(inputs)
-    return (torch.argmax(logits).to(torch.long) + int(row_offset)).reshape(())
+    value, index = torch.max(logits, dim=0)
+    token = index.to(torch.long) + int(row_offset)
+    return token.reshape(()), value.to(torch.float32).reshape(())

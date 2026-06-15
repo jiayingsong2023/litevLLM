@@ -1248,7 +1248,28 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     lm_head_values, lm_head_scales = cached
 
                 chunk_token: torch.Tensor | None = None
-                if hasattr(self.gpu_backend, "output_argmax"):
+                chunk_value: torch.Tensor | None = None
+                if hasattr(self.gpu_backend, "output_argmax_with_value"):
+                    token, value = self.gpu_backend.output_argmax_with_value(
+                        streams=streams,
+                        lm_head_values=lm_head_values,
+                        lm_head_scales=lm_head_scales,
+                        output_hc_weight=output_hc_weight,
+                        output_hc_scale=output_hc_scale,
+                        output_hc_base=output_hc_base,
+                        output_norm_weight=output_norm_weight,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                        row_offset=row_start,
+                    )
+                    if not token.is_cuda or not value.is_cuda:
+                        raise RuntimeError(
+                            "DeepSeek V4 Flash GPU output chunk returned CPU argmax"
+                        )
+                    chunk_token = token.to(device=device, dtype=torch.long).reshape(())
+                    chunk_value = value.to(device=device, dtype=torch.float32).reshape(
+                        ()
+                    )
+                elif hasattr(self.gpu_backend, "output_argmax"):
                     token = self.gpu_backend.output_argmax(
                         streams=streams,
                         lm_head_values=lm_head_values,
@@ -1266,26 +1287,29 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         )
                     chunk_token = token.to(device=device, dtype=torch.long).reshape(())
 
-                chunk_logits = self.gpu_backend.output_logits(
-                    streams=streams,
-                    lm_head_values=lm_head_values,
-                    lm_head_scales=lm_head_scales,
-                    output_hc_weight=output_hc_weight,
-                    output_hc_scale=output_hc_scale,
-                    output_hc_base=output_hc_base,
-                    output_norm_weight=output_norm_weight,
-                    block_size=_Q8_0_BLOCK_SIZE,
-                ).reshape(-1)
-                if not chunk_logits.is_cuda:
-                    raise RuntimeError(
-                        "DeepSeek V4 Flash GPU output chunk returned CPU logits"
-                    )
-                if chunk_token is None:
-                    chunk_value, chunk_index = torch.max(chunk_logits, dim=0)
-                    chunk_token = chunk_index.to(torch.long) + row_start
-                else:
-                    chunk_index = chunk_token - row_start
-                    chunk_value = chunk_logits[chunk_index]
+                if chunk_value is None:
+                    chunk_logits = self.gpu_backend.output_logits(
+                        streams=streams,
+                        lm_head_values=lm_head_values,
+                        lm_head_scales=lm_head_scales,
+                        output_hc_weight=output_hc_weight,
+                        output_hc_scale=output_hc_scale,
+                        output_hc_base=output_hc_base,
+                        output_norm_weight=output_norm_weight,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    ).reshape(-1)
+                    if not chunk_logits.is_cuda:
+                        raise RuntimeError(
+                            "DeepSeek V4 Flash GPU output chunk returned CPU logits"
+                        )
+                    if chunk_token is None:
+                        chunk_value, chunk_index = torch.max(chunk_logits, dim=0)
+                        chunk_token = chunk_index.to(torch.long) + row_start
+                    else:
+                        chunk_index = chunk_token - row_start
+                        chunk_value = chunk_logits[chunk_index]
+                if chunk_value is None or chunk_token is None:
+                    raise RuntimeError("DeepSeek V4 Flash output argmax failed")
                 if best_value is None or best_token is None:
                     best_value = chunk_value
                     best_token = chunk_token

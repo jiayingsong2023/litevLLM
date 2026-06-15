@@ -812,28 +812,24 @@ def test_output_token_argmax_chunked_cuda_uses_argmax_for_each_chunk(
     class FakeBackend(_ReadyBackend):
         def __init__(self) -> None:
             self.argmax_offsets: list[int] = []
-            self.logit_offsets: list[int] = []
 
-        def output_argmax(self, **kwargs: torch.Tensor | int) -> torch.Tensor:
+        def output_argmax_with_value(
+            self,
+            **kwargs: torch.Tensor | int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             row_offset = kwargs["row_offset"]
             assert isinstance(row_offset, int)
             self.argmax_offsets.append(row_offset)
             token = row_offset + (3 if row_offset == 0 else 5)
-            return torch.tensor(token, dtype=torch.long, device="cuda")
+            value = 1.0 if row_offset == 0 else 7.0
+            return (
+                torch.tensor(token, dtype=torch.long, device="cuda"),
+                torch.tensor(value, dtype=torch.float32, device="cuda"),
+            )
 
         def output_logits(self, **kwargs: torch.Tensor | int) -> torch.Tensor:
-            rows = kwargs["lm_head_values"]
-            assert isinstance(rows, torch.Tensor)
-            row_offset = (
-                self.argmax_offsets[-1]
-                if self.argmax_offsets
-                else len(self.logit_offsets) * chunk_rows
-            )
-            self.logit_offsets.append(row_offset)
-            logits = torch.zeros((rows.shape[0],), dtype=torch.float32, device="cuda")
-            candidate = 3 if row_offset == 0 else 5
-            logits[candidate] = 1.0 if row_offset == 0 else 7.0
-            return logits
+            del kwargs
+            raise AssertionError("greedy output argmax path materialized logits")
 
     backend = FakeBackend()
     model.gpu_backend = backend  # type: ignore[assignment]
@@ -856,7 +852,6 @@ def test_output_token_argmax_chunked_cuda_uses_argmax_for_each_chunk(
 
     assert token.item() == chunk_rows + 5
     assert backend.argmax_offsets == [0, chunk_rows]
-    assert backend.logit_offsets == [0, chunk_rows]
 
 
 def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_opt_in(
