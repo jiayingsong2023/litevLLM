@@ -49,6 +49,16 @@ class DeepSeekV4FlashGroupedExpertTensors:
 
 
 @dataclass(frozen=True)
+class DeepSeekV4FlashQuantizedExpertPayload:
+    tensor_name: str
+    expert_id: int
+    ggml_type: int
+    rows: int
+    columns: int
+    payload: memoryview
+
+
+@dataclass(frozen=True)
 class DeepSeekV4FlashHyperConnectionTensors:
     fn: DeepSeekV4FlashTensor
     base: DeepSeekV4FlashTensor
@@ -290,6 +300,45 @@ class DeepSeekV4FlashWeightStore:
         raise DeepSeekV4FlashWeightStoreError(
             f"unsupported grouped expert tensor type for {tensor.name}: "
             f"{tensor.tensor_type}"
+        )
+
+    def raw_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashQuantizedExpertPayload:
+        """Return a view over one grouped expert's raw quantized GGUF bytes.
+
+        The caller owns ``payload`` and must release the memoryview before
+        closing the store.
+        """
+        if len(tensor.dims) != 3:
+            raise DeepSeekV4FlashWeightStoreError(
+                f"grouped expert tensor {tensor.name} must have dims "
+                f"(input, output, expert_count); got {tensor.dims}"
+            )
+        input_size, output_size, _expert_count = tensor.dims
+        expert_offset = grouped_expert_payload_offset(
+            expert_id=expert_id,
+            projection_dims=tensor.dims,
+            projection_type=tensor.tensor_type,
+        )
+        expert_nbytes = ggml_tensor_nbytes(
+            (input_size, output_size),
+            tensor.tensor_type,
+        )
+        payload = self.tensor_payload(tensor)
+        try:
+            expert_payload = payload[expert_offset : expert_offset + expert_nbytes]
+        finally:
+            payload.release()
+        return DeepSeekV4FlashQuantizedExpertPayload(
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=tensor.tensor_type,
+            rows=output_size,
+            columns=input_size,
+            payload=expert_payload,
         )
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:

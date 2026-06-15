@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Protocol
@@ -9,7 +10,10 @@ import torch
 
 from .expert_cache import DeepSeekV4FlashCacheKey, DeepSeekV4FlashHotExpertPolicy
 from .gguf_reader import DeepSeekV4FlashTensor
-from .weight_store import DeepSeekV4FlashGroupedExpertTensors
+from .weight_store import (
+    DeepSeekV4FlashGroupedExpertTensors,
+    DeepSeekV4FlashQuantizedExpertPayload,
+)
 
 
 class DeepSeekV4FlashGroupedExpertStore(Protocol):
@@ -18,6 +22,12 @@ class DeepSeekV4FlashGroupedExpertStore(Protocol):
         tensor: DeepSeekV4FlashTensor,
         expert_id: int,
     ) -> torch.Tensor: ...
+
+    def raw_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashQuantizedExpertPayload: ...
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor: ...
 
@@ -35,6 +45,16 @@ class DeepSeekV4FlashStagedExpert:
     gate: torch.Tensor
     up: torch.Tensor
     down: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DeepSeekV4FlashStagedQuantizedExpertPayload:
+    tensor_name: str
+    expert_id: int
+    ggml_type: int
+    rows: int
+    columns: int
+    payload: torch.Tensor
 
 
 class DeepSeekV4FlashGPUWeightStager:
@@ -147,6 +167,19 @@ class DeepSeekV4FlashGPUWeightStager:
             device=str(self.device),
             dtype=str(self.dtype),
             extra=(expert_id,),
+        )
+
+    def _grouped_payload_cache_key(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashCacheKey:
+        return DeepSeekV4FlashCacheKey(
+            namespace="grouped",
+            name=tensor.name,
+            device=str(self.device),
+            dtype=str(torch.uint8),
+            extra=("raw_payload", expert_id),
         )
 
     def _record_lru_hit(self, cache_key: DeepSeekV4FlashCacheKey) -> None:
@@ -450,6 +483,71 @@ class DeepSeekV4FlashGPUWeightStager:
         self._register_cached_entry(cache_key, staged, nbytes, pinned=pinned)
         self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
         return staged
+
+    def stage_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+        *,
+        layer_idx: int | None = None,
+    ) -> DeepSeekV4FlashStagedQuantizedExpertPayload:
+        if self.device.type != "cuda":
+            raise ValueError("DeepSeek V4 Flash expert staging requires a CUDA device")
+        cache_key = self._grouped_payload_cache_key(tensor, expert_id)
+        cached = self._grouped_cache.get(cache_key)
+        if cached is not None:
+            if layer_idx is not None:
+                self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
+            if self._is_pinned_grouped_expert(layer_idx, expert_id):
+                self._pinned_cache_keys.add(cache_key)
+            self._record_lru_hit(cache_key)
+            self.record_cache_hit("grouped", tensor_name=tensor.name)
+            input_size, output_size, _expert_count = tensor.dims
+            return DeepSeekV4FlashStagedQuantizedExpertPayload(
+                tensor_name=tensor.name,
+                expert_id=expert_id,
+                ggml_type=tensor.tensor_type,
+                rows=output_size,
+                columns=input_size,
+                payload=cached,
+            )
+
+        raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="The given buffer is not writable.*",
+                    category=UserWarning,
+                )
+                cpu_payload = torch.frombuffer(raw.payload, dtype=torch.uint8).clone()
+        finally:
+            raw.payload.release()
+        nbytes = cpu_payload.numel() * cpu_payload.element_size()
+        if not self._prepare_cache_insert(nbytes):
+            self._record_streamed_bytes(nbytes)
+            staged = cpu_payload.to(device=self.device, non_blocking=True)
+            return DeepSeekV4FlashStagedQuantizedExpertPayload(
+                tensor_name=raw.tensor_name,
+                expert_id=raw.expert_id,
+                ggml_type=raw.ggml_type,
+                rows=raw.rows,
+                columns=raw.columns,
+                payload=staged,
+            )
+        self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
+        staged = cpu_payload.to(device=self.device, non_blocking=True)
+        pinned = self._is_pinned_grouped_expert(layer_idx, expert_id)
+        self._register_cached_entry(cache_key, staged, nbytes, pinned=pinned)
+        self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
+        return DeepSeekV4FlashStagedQuantizedExpertPayload(
+            tensor_name=raw.tensor_name,
+            expert_id=raw.expert_id,
+            ggml_type=raw.ggml_type,
+            rows=raw.rows,
+            columns=raw.columns,
+            payload=staged,
+        )
 
     def stage_grouped_expert(
         self,
