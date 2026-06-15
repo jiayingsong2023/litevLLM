@@ -238,6 +238,7 @@ def deepseek_v4_flash_sliding_layer_forward(
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     token_idx: int,
     token_id: int | None = None,
+    token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
 ) -> torch.Tensor:
@@ -388,6 +389,7 @@ def deepseek_v4_flash_sliding_layer_forward(
         stager=stager,
         backend=backend,
         token_id=token_idx if token_id is None else token_id,
+        token_id_tensor=token_id_tensor,
         router_top_k=router_top_k,
     )
     if uses_hyper_connection:
@@ -417,6 +419,7 @@ def deepseek_v4_flash_layer_forward(
     state: DeepSeekV4FlashGPURequestState,
     token_idx: int,
     token_id: int | None = None,
+    token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
 ) -> torch.Tensor:
@@ -429,6 +432,7 @@ def deepseek_v4_flash_layer_forward(
             backend=backend,
             token_idx=token_idx,
             token_id=token_id,
+            token_id_tensor=token_id_tensor,
             kv_rows=kv_rows,
             router_top_k=router_top_k,
         )
@@ -440,6 +444,7 @@ def deepseek_v4_flash_layer_forward(
         state=state,
         token_idx=token_idx,
         token_id=token_id,
+        token_id_tensor=token_id_tensor,
         router_top_k=router_top_k,
     )
 
@@ -453,6 +458,7 @@ def deepseek_v4_flash_compressed_layer_forward(
     state: DeepSeekV4FlashGPURequestState,
     token_idx: int,
     token_id: int | None = None,
+    token_id_tensor: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
@@ -645,6 +651,7 @@ def deepseek_v4_flash_compressed_layer_forward(
         stager=stager,
         backend=backend,
         token_id=token_idx if token_id is None else token_id,
+        token_id_tensor=token_id_tensor,
         router_top_k=router_top_k,
     )
     if uses_hyper_connection:
@@ -1191,6 +1198,7 @@ def _run_sliding_moe(
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     token_id: int,
+    token_id_tensor: torch.Tensor | None = None,
     router_top_k: int,
 ) -> torch.Tensor:
     routed = _run_hash_routed_experts(
@@ -1200,6 +1208,7 @@ def _run_sliding_moe(
         stager=stager,
         backend=backend,
         token_id=token_id,
+        token_id_tensor=token_id_tensor,
     )
     if routed is None:
         router = stager.stage_matrix(_required_tensor(layer.router, "router"))
@@ -1248,6 +1257,7 @@ def _run_hash_routed_experts(
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     token_id: int,
+    token_id_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if layer.expert_token_to_expert_ids is None:
         return None
@@ -1257,11 +1267,21 @@ def _run_hash_routed_experts(
     ).to(device=hidden.device, non_blocking=True)
     if table.ndim != 2:
         raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
-    if token_id < 0 or token_id >= table.shape[1]:
-        raise ValueError(
-            f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
+    if token_id_tensor is None:
+        if token_id < 0 or token_id >= table.shape[1]:
+            raise ValueError(
+                f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
+            )
+        expert_ids = table[:, token_id].to(torch.int64)
+    else:
+        token_id_tensor = token_id_tensor.to(device=hidden.device, dtype=torch.long)
+        token_id_tensor = token_id_tensor.reshape(())
+        torch._assert_async(
+            (token_id_tensor >= 0) & (token_id_tensor < table.shape[1]),
+            f"token_id out of range; expected [0, {table.shape[1]})",
         )
-    expert_ids = table[:, token_id].to(torch.int64)
+        expert_ids = table.index_select(1, token_id_tensor.reshape(1)).reshape(-1)
+        expert_ids = expert_ids.to(torch.int64)
     if torch.any(expert_ids < 0):
         raise ValueError("hash-routed expert ids must be non-negative")
     weights = torch.full(

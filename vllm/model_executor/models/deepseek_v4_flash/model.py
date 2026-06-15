@@ -312,6 +312,36 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state.advance_token()
         return next_token.to(device=device, dtype=torch.long).reshape(())
 
+    def _forward_kernel_token_step_token_tensor(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        store, stager, hidden = self._forward_kernel_token_hidden_token_tensor(
+            token_id_tensor=token_id_tensor,
+            state=state,
+            token_idx=token_idx,
+            device=device,
+        )
+        with self._deepseek_profiler.section(
+            "output_projection",
+            token_idx=token_idx,
+        ):
+            streams = self._kernel_output_streams(hidden)
+            next_token = self._output_token_argmax_chunked_cuda(
+                store,
+                stager=stager,
+                streams=streams,
+                device=device,
+            )
+        if not next_token.is_cuda:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU token id")
+        state.advance_token()
+        return next_token.to(device=device, dtype=torch.long).reshape(())
+
     def _forward_kernel_token_hidden(
         self,
         *,
@@ -373,6 +403,75 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id=token_id,
+                    )
+
+        return store, stager, hidden
+
+    def _forward_kernel_token_hidden_token_tensor(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> tuple[
+        DeepSeekV4FlashWeightStore,
+        DeepSeekV4FlashGPUWeightStager,
+        torch.Tensor,
+    ]:
+        store = self._require_weight_store()
+        self.gpu_backend.require_ready()
+        state.require_capacity(token_idx)
+        if token_idx != state.token_position:
+            raise ValueError(
+                "forward kernel token_idx must match request state token_position; "
+                f"got token_idx={token_idx}, token_position={state.token_position}"
+            )
+
+        token_id_tensor = self._validate_cuda_scalar_token_id_tensor(
+            token_id_tensor,
+            device=device,
+        )
+        stager = self._get_gpu_weight_stager(device)
+        hidden = self._stage_token_embedding_tensor_cuda(
+            store,
+            stager,
+            token_id_tensor,
+            device=device,
+        )
+
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
+        for layer in layers:
+            if layer.layer_index < 2:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_sliding",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_idx,
+                ):
+                    hidden = deepseek_v4_flash_sliding_layer_forward(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        token_idx=token_idx,
+                        token_id_tensor=token_id_tensor,
+                    )
+            else:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_compressed",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_idx,
+                ):
+                    hidden = deepseek_v4_flash_compressed_layer_forward(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        state=state,
+                        token_idx=token_idx,
+                        token_id_tensor=token_id_tensor,
                     )
 
         return store, stager, hidden
@@ -454,8 +553,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 output_ids = torch.cat([output_ids, next_token_tensor.reshape(1)])
                 if generated_idx == max_tokens - 1:
                     break
-                next_token_tensor = self._forward_kernel_token_step_token_id(
-                    token_id=int(next_token_tensor.item()),
+                next_token_tensor = self._forward_kernel_token_step_token_tensor(
+                    token_id_tensor=next_token_tensor,
                     state=state,
                     token_idx=state.token_position,
                     device=device,
@@ -675,6 +774,75 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden = self._read_token_embedding(store, token_id)
         return hidden.to(device=device, dtype=torch.float32, non_blocking=True)
+
+    def _stage_token_embedding_tensor_cuda(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        token_id_tensor: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        tensor = store.bindings.token_embedding
+        if tensor.tensor_type != GGML_TYPE_F16:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects F16 token_embd.weight; "
+                f"got GGML type {tensor.tensor_type}"
+            )
+        hidden_size = self.shape.hidden_size
+        vocab_size = self.shape.vocab_size
+        if tensor.dims != (hidden_size, vocab_size):
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects token_embd.weight dims "
+                f"({hidden_size}, {vocab_size}); got {tensor.dims}"
+            )
+
+        token_id_tensor = self._validate_cuda_scalar_token_id_tensor(
+            token_id_tensor,
+            device=device,
+        )
+        embedding_matrix = stager.stage_matrix(tensor).reshape(vocab_size, hidden_size)
+        hidden = torch.index_select(
+            embedding_matrix,
+            0,
+            token_id_tensor.reshape(1),
+        ).reshape(hidden_size)
+        return hidden.to(dtype=torch.float32)
+
+    def _validate_cuda_scalar_token_id_tensor(
+        self,
+        token_id_tensor: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if token_id_tensor.ndim != 0:
+            raise ValueError(
+                "generated token id tensor must be scalar; "
+                f"got {token_id_tensor.ndim}-D"
+            )
+        if not token_id_tensor.is_cuda:
+            raise ValueError("generated token id tensor must be CUDA")
+        if token_id_tensor.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(
+                "generated token id tensor must use an integer dtype; "
+                f"got {token_id_tensor.dtype}"
+            )
+
+        token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
+        token_id_tensor = token_id_tensor.reshape(())
+        # Generated ids normally come from CUDA argmax. Keep range validation on
+        # device so the decode carry path does not synchronize back to CPU.
+        torch._assert_async(
+            (token_id_tensor >= 0) & (token_id_tensor < self.shape.vocab_size),
+            f"generated token id is outside vocab range [0, {self.shape.vocab_size})",
+        )
+        return token_id_tensor
 
     def _kernel_output_streams(self, hidden: torch.Tensor) -> torch.Tensor:
         if not hidden.is_cuda:
