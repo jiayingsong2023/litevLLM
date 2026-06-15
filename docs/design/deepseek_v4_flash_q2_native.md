@@ -364,6 +364,61 @@ usable pass:
 - Re-run max-8 only after one-token cold path improves, because the current
   one-token timing predicts another very long max-8 run.
 
+### Real Expert Shape Fused Path Notes
+
+The follow-up fused-path pass first inspected the target GGUF grouped expert
+metadata without decoding weights. The observed routed expert shapes are:
+
+| Projection | GGML type | Rows | Columns | Column blocks |
+| :--- | :--- | ---: | ---: | ---: |
+| gate | `IQ2_XXS` (`16`) | `4096` | `2048` | `8` |
+| up | `IQ2_XXS` (`16`) | `4096` | `2048` | `8` |
+| down | `Q2_K` (`10`) | `2048` | `4096` | `16` |
+
+This confirmed why the original fused gate/up prototype did not execute: it
+only accepted `columns==256`, while real gate/up tensors use eight 256-column
+GGUF blocks per row.
+
+The fused IQ2 gate/up activation helper now supports `columns == 256 * N` and
+the backend dispatch accepts matching IQ2 gate/up payloads when
+`columns % 256 == 0`.
+
+Recorded real-shape fused one-token smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 2400s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 1 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-real-fused-one.json
+```
+
+Result:
+
+- `runs[0].elapsed_ms=433336.40625`
+- `tokens_per_second=0.0023076759431633837`
+- output token ids `[1, 32974]`
+- `gpu_backend.quantized_expert_calls=258`
+- `phase4_metrics.iq2_xxs_gate_up_fused_calls=258`
+- `phase4_metrics.iq2_xxs_triton_calls=0`
+- `phase4_metrics.q2_k_triton_calls=258`
+- `phase4_metrics.q2_iq2_reference_fallback_calls=0`
+- `gpu_staging.loaded_bytes=46446420316`
+- `gpu_staging.prefetch_hits=0`
+- `gpu_staging.prefetch_misses=36`
+- `gpu_staging.routed_expert_id_materializations=43`
+- `output_projection` event was roughly `43936 ms`
+- `generate_greedy_kernel` elapsed roughly `433223 ms`
+
+The primary gate for this pass was met: the real GGUF path now hits fused IQ2
+gate/up for every routed expert call, and the previous 516 separate IQ2
+gate/up matvec calls disappear. Throughput did not improve because the cold
+path remains dominated by staging, Q2_K down projection, per-layer overhead,
+and output projection. The next narrow kernel target should be the real down
+projection shape: `Q2_K rows=2048, columns=4096`.
+
 Task 8 validation results recorded from the bounded run:
 
 - `timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q`
