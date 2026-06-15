@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
+    DeepSeekV4FlashHotExpertPolicy,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_Q8_0,
     DeepSeekV4FlashTensor,
@@ -110,6 +113,8 @@ def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
         "grouped_hits": 0,
         "grouped_misses": 1,
         "loaded_bytes": 48,
+        "lru_evictions": 0,
+        "streamed_bytes": 0,
     }
 
 
@@ -123,6 +128,9 @@ def test_gpu_weight_stager_memory_stats_include_cache_stats() -> None:
 
     assert stats["loaded_bytes"] == 8
     assert stats["dynamic_misses"] == 1
+    assert "lru_evictions" in stats
+    assert "pinned_entries" in stats
+    assert "streamed_bytes" in stats
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -192,7 +200,124 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "grouped_hits": 0,
         "grouped_misses": 0,
         "loaded_bytes": 24,
+        "lru_evictions": 0,
+        "pinned_entries": 0,
+        "streamed_bytes": 0,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_lru_eviction_removes_oldest_non_pinned_entry() -> None:
+    store = _FakeStagingStore()
+    first_tensor = _tensor("blk.1.first.weight", dims=(2, 2))
+    second_tensor = _tensor("blk.1.second.weight", dims=(2, 2))
+    third_tensor = _tensor("blk.1.third.weight", dims=(2, 2))
+    store.generic_matrices[first_tensor.name] = torch.eye(2, dtype=torch.float32)
+    store.generic_matrices[second_tensor.name] = torch.ones((2, 2), dtype=torch.float32)
+    store.generic_matrices[third_tensor.name] = torch.full((2, 2), 3.0)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=32,
+    )
+
+    first = stager.stage_matrix(first_tensor)
+    stager.stage_matrix(second_tensor)
+    stager.stage_matrix(third_tensor)
+    reloaded_first = stager.stage_matrix(first_tensor)
+
+    assert first.data_ptr() != reloaded_first.data_ptr()
+    assert store.matrix_decode_count == 4
+    assert stager.memory_stats()["lru_evictions"] == 2
+    assert stager.staged_bytes == 32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_pinned_grouped_entries_survive_lru_eviction() -> None:
+    store = _FakeStagingStore()
+    expert_tensor = _tensor("blk.2.ffn_gate_exps.weight")
+    matrix_tensor = _tensor("blk.2.router.weight", dims=(2, 2))
+    new_tensor = _tensor("blk.2.output.weight", dims=(2, 2))
+    store.matrices[(expert_tensor.name, 7)] = torch.eye(2, dtype=torch.float32)
+    store.generic_matrices[matrix_tensor.name] = torch.ones((2, 2), dtype=torch.float32)
+    store.generic_matrices[new_tensor.name] = torch.full((2, 2), 2.0)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=32,
+        hot_expert_policy=DeepSeekV4FlashHotExpertPolicy(
+            pinned_experts=frozenset({(2, 7)})
+        ),
+    )
+
+    pinned = stager.stage_grouped_expert_matrix(expert_tensor, 7, layer_idx=2)
+    stager.stage_matrix(matrix_tensor)
+    stager.stage_matrix(new_tensor)
+    cached_pinned = stager.stage_grouped_expert_matrix(expert_tensor, 7, layer_idx=2)
+
+    assert pinned.data_ptr() == cached_pinned.data_ptr()
+    assert store.decode_count == 1
+    assert stager.memory_stats()["pinned_entries"] == 1
+    assert stager.memory_stats()["lru_evictions"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_manual_pinned_grouped_entry_survives_eviction() -> None:
+    store = _FakeStagingStore()
+    expert_tensor = _tensor("blk.4.ffn_gate_exps.weight")
+    first_tensor = _tensor("blk.4.router.weight", dims=(2, 2))
+    second_tensor = _tensor("blk.4.output.weight", dims=(2, 2))
+    store.matrices[(expert_tensor.name, 5)] = torch.eye(2, dtype=torch.float32)
+    store.generic_matrices[first_tensor.name] = torch.ones((2, 2), dtype=torch.float32)
+    store.generic_matrices[second_tensor.name] = torch.full((2, 2), 2.0)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=32,
+    )
+
+    pinned = stager.stage_grouped_expert_matrix(expert_tensor, 5, layer_idx=4)
+    stager.pin_grouped_expert(4, 5)
+    stager.stage_matrix(first_tensor)
+    stager.stage_matrix(second_tensor)
+    cached_pinned = stager.stage_grouped_expert_matrix(expert_tensor, 5, layer_idx=4)
+
+    assert pinned.data_ptr() == cached_pinned.data_ptr()
+    assert stager.memory_stats()["pinned_entries"] == 1
+    assert stager.memory_stats()["lru_evictions"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_all_pinned_overflow_streams_new_tensor() -> None:
+    store = _FakeStagingStore()
+    first_expert = _tensor("blk.3.ffn_gate_exps.weight")
+    second_expert = _tensor("blk.3.ffn_up_exps.weight")
+    new_tensor = _tensor("blk.3.router.weight", dims=(2, 2))
+    store.matrices[(first_expert.name, 1)] = torch.eye(2, dtype=torch.float32)
+    store.matrices[(second_expert.name, 2)] = torch.ones((2, 2), dtype=torch.float32)
+    store.generic_matrices[new_tensor.name] = torch.full((2, 2), 4.0)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=32,
+        hot_expert_policy=DeepSeekV4FlashHotExpertPolicy(
+            pinned_experts=frozenset({(3, 1), (3, 2)})
+        ),
+    )
+
+    first = stager.stage_grouped_expert_matrix(first_expert, 1, layer_idx=3)
+    second = stager.stage_grouped_expert_matrix(second_expert, 2, layer_idx=3)
+    streamed = stager.stage_matrix(new_tensor)
+    cached_first = stager.stage_grouped_expert_matrix(first_expert, 1, layer_idx=3)
+    cached_second = stager.stage_grouped_expert_matrix(second_expert, 2, layer_idx=3)
+
+    assert streamed.device.type == "cuda"
+    assert first.data_ptr() == cached_first.data_ptr()
+    assert second.data_ptr() == cached_second.data_ptr()
+    stats = stager.memory_stats()
+    assert stats["streamed_bytes"] == 16
+    assert stats["lru_evictions"] == 0
+    assert stats["pinned_entries"] == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
