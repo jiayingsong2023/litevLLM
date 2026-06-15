@@ -15,12 +15,14 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
+    _run_staged_routed_experts,
     deepseek_v4_flash_router_topk,
     deepseek_v4_flash_sliding_layer_forward,
     deepseek_v4_flash_staged_matrix_projection,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
+    DeepSeekV4FlashStagedQuantizedExpertPayload,
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
@@ -124,6 +126,87 @@ class _MarkerBackend(_RecordingBackend):
         return torch.full_like(hidden, marker, dtype=torch.float32)
 
 
+class _RoutedExpertTestStager:
+    def __init__(self, *, raw_available: bool = True) -> None:
+        self.raw_available = raw_available
+        self.raw_calls: list[tuple[str, int, int | None]] = []
+        self.dense_calls: list[tuple[int, int | None]] = []
+
+    def stage_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+        *,
+        layer_idx: int | None = None,
+    ) -> DeepSeekV4FlashStagedQuantizedExpertPayload:
+        if not self.raw_available:
+            raise AttributeError("raw grouped expert payload unavailable")
+        self.raw_calls.append((tensor.name, expert_id, layer_idx))
+        return DeepSeekV4FlashStagedQuantizedExpertPayload(
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=tensor.tensor_type,
+            rows=tensor.dims[1],
+            columns=tensor.dims[0],
+            payload=torch.tensor([expert_id], dtype=torch.uint8),
+        )
+
+    def stage_grouped_expert(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        expert_id: int,
+        *,
+        layer_idx: int | None = None,
+    ):
+        del tensors
+        self.dense_calls.append((expert_id, layer_idx))
+        marker = torch.full((2, 2), float(expert_id))
+        return type(
+            "_StagedExpert",
+            (),
+            {
+                "expert_id": expert_id,
+                "gate": marker,
+                "up": marker,
+                "down": marker,
+            },
+        )()
+
+
+class _QuantizedRecordingBackend:
+    def __init__(self, *, quantized_available: bool = True) -> None:
+        self.quantized_available = quantized_available
+        self.quantized_expert_ids: list[int] = []
+        self.dense_expert_ids: list[int] = []
+
+    def quantized_expert_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        gate_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
+        up_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
+        down_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
+    ) -> torch.Tensor:
+        del up_payload, down_payload
+        if not self.quantized_available:
+            raise NotImplementedError("quantized expert path unavailable")
+        self.quantized_expert_ids.append(gate_payload.expert_id)
+        return torch.full_like(hidden, float(gate_payload.expert_id))
+
+    def routed_expert_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        del up_weight, down_weight
+        expert_id = int(gate_weight[0, 0])
+        self.dense_expert_ids.append(expert_id)
+        return torch.full_like(hidden, float(expert_id))
+
+
 def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
     return DeepSeekV4FlashTensor(
         name=name,
@@ -161,6 +244,95 @@ def _add_identity_layer_weights(
         store.expert_matrices[(tensors["down"].name, expert_id)] = torch.eye(
             hidden_size
         )
+
+
+def test_staged_routed_experts_prefers_quantized_payload_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_item(_tensor: torch.Tensor) -> int:
+        raise AssertionError("expert routing must not call Tensor.item() per expert")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 4)),
+        up=_tensor("up", (2, 2, 4)),
+        down=_tensor("down", (2, 2, 4)),
+    )
+    stager = _RoutedExpertTestStager()
+    backend = _QuantizedRecordingBackend()
+
+    output = _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([3, 1], dtype=torch.int64),
+        torch.tensor([0.25, 0.75], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=7,
+    )
+
+    assert backend.quantized_expert_ids == [3, 1]
+    assert backend.dense_expert_ids == []
+    assert stager.dense_calls == []
+    assert stager.raw_calls == [
+        ("gate", 3, 7),
+        ("up", 3, 7),
+        ("down", 3, 7),
+        ("gate", 1, 7),
+        ("up", 1, 7),
+        ("down", 1, 7),
+    ]
+    torch.testing.assert_close(output, torch.full((2,), 1.5))
+
+
+def test_staged_routed_experts_falls_back_to_dense_when_raw_unavailable() -> None:
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 2)),
+        up=_tensor("up", (2, 2, 2)),
+        down=_tensor("down", (2, 2, 2)),
+    )
+    stager = _RoutedExpertTestStager(raw_available=False)
+    backend = _QuantizedRecordingBackend()
+
+    output = _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([0.5, 0.5], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=11,
+    )
+
+    assert backend.quantized_expert_ids == []
+    assert backend.dense_expert_ids == [0, 1]
+    assert stager.dense_calls == [(0, 11), (1, 11)]
+    torch.testing.assert_close(output, torch.full((2,), 0.5))
+
+
+def test_staged_routed_experts_falls_back_when_quantized_backend_missing() -> None:
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 2)),
+        up=_tensor("up", (2, 2, 2)),
+        down=_tensor("down", (2, 2, 2)),
+    )
+    stager = _RoutedExpertTestStager()
+    backend = _QuantizedRecordingBackend(quantized_available=False)
+
+    output = _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([0.25, 0.75], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=13,
+    )
+
+    assert backend.quantized_expert_ids == []
+    assert backend.dense_expert_ids == [0, 1]
+    assert stager.dense_calls == [(0, 13), (1, 13)]
+    torch.testing.assert_close(output, torch.full((2,), 0.75))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

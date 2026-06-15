@@ -16,7 +16,10 @@ from .config import DEEPSEEK_V4_FLASH_SHAPE, layer_compress_ratio
 from .gguf_reader import DeepSeekV4FlashTensor
 from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_runtime import DeepSeekV4FlashGPURequestState
-from .gpu_weight_staging import DeepSeekV4FlashGPUWeightStager
+from .gpu_weight_staging import (
+    DeepSeekV4FlashGPUWeightStager,
+    DeepSeekV4FlashStagedQuantizedExpertPayload,
+)
 from .weight_store import (
     DeepSeekV4FlashCompressorTensors,
     DeepSeekV4FlashGroupedExpertTensors,
@@ -56,6 +59,15 @@ class _SlidingLayerBackend(Protocol):
         gate_weight: torch.Tensor,
         up_weight: torch.Tensor,
         down_weight: torch.Tensor,
+    ) -> torch.Tensor: ...
+
+    def quantized_expert_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        gate_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
+        up_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
+        down_payload: DeepSeekV4FlashStagedQuantizedExpertPayload,
     ) -> torch.Tensor: ...
 
     def compressed_attention(
@@ -1209,6 +1221,7 @@ def _run_sliding_moe(
             grouped_experts=grouped_experts,
             stager=stager,
             backend=backend,
+            layer_idx=layer.layer_index,
         )
 
     if layer.shared_experts is None:
@@ -1264,6 +1277,7 @@ def _run_hash_routed_experts(
         grouped_experts=grouped_experts,
         stager=stager,
         backend=backend,
+        layer_idx=layer.layer_index,
     )
 
 
@@ -1290,17 +1304,51 @@ def _run_staged_routed_experts(
     grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    layer_idx: int | None = None,
 ) -> torch.Tensor:
     output: torch.Tensor | None = None
-    for expert_id_tensor, expert_weight in zip(expert_ids, expert_weights, strict=True):
-        expert_id = int(expert_id_tensor.item())
-        staged = stager.stage_grouped_expert(grouped_experts, expert_id)
-        expert_output = backend.routed_expert_gemm(
-            hidden=hidden,
-            gate_weight=staged.gate,
-            up_weight=staged.up,
-            down_weight=staged.down,
-        ).to(torch.float32)
+    selected_expert_ids = [
+        int(expert_id) for expert_id in expert_ids.detach().cpu().tolist()
+    ]
+    for expert_id, expert_weight in zip(
+        selected_expert_ids,
+        expert_weights,
+        strict=True,
+    ):
+        try:
+            gate_payload = stager.stage_grouped_expert_payload(
+                grouped_experts.gate,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            up_payload = stager.stage_grouped_expert_payload(
+                grouped_experts.up,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            down_payload = stager.stage_grouped_expert_payload(
+                grouped_experts.down,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            expert_output = backend.quantized_expert_gemm(
+                hidden=hidden,
+                gate_payload=gate_payload,
+                up_payload=up_payload,
+                down_payload=down_payload,
+            ).to(torch.float32)
+        except (AttributeError, NotImplementedError):
+            staged = stager.stage_grouped_expert(
+                grouped_experts,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            expert_output = backend.routed_expert_gemm(
+                hidden=hidden,
+                gate_weight=staged.gate,
+                up_weight=staged.up,
+                down_weight=staged.down,
+            ).to(torch.float32)
         if output is None:
             output = torch.zeros_like(expert_output, dtype=torch.float32)
         if output.shape != expert_output.shape:
@@ -1308,7 +1356,9 @@ def _run_staged_routed_experts(
                 "routed expert outputs must share one shape; "
                 f"got {tuple(output.shape)} and {tuple(expert_output.shape)}"
             )
-        output = output + expert_weight.to(torch.float32) * expert_output
+        output = output + expert_weight.to(torch.float32) * expert_output.to(
+            torch.float32
+        )
     if output is None:
         raise ValueError("DeepSeek V4 Flash routed MoE selected no experts")
     return output
