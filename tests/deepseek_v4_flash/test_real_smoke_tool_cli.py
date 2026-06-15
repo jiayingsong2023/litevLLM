@@ -6,6 +6,10 @@ import json
 from pathlib import Path
 from types import ModuleType
 
+from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_IQ2_XXS,
+)
+
 
 def _load_smoke_tool() -> ModuleType:
     path = Path(__file__).parents[1] / "tools" / "run_deepseek_v4_flash_gpu_smoke.py"
@@ -20,7 +24,25 @@ def _load_smoke_tool() -> ModuleType:
     return module
 
 
+def _load_shape_tool() -> ModuleType:
+    path = (
+        Path(__file__).parents[1]
+        / "tools"
+        / "inspect_deepseek_v4_flash_expert_shapes.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "inspect_deepseek_v4_flash_expert_shapes",
+        path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 smoke = _load_smoke_tool()
+shape_tool = _load_shape_tool()
 
 
 def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
@@ -46,6 +68,53 @@ def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
     assert args.max_tokens == 8
     assert args.repeat == 2
     assert args.profile_json == profile_path
+
+
+def test_shape_inspector_parser_accepts_limit_and_json_args(tmp_path: Path) -> None:
+    json_path = tmp_path / "shapes.json"
+
+    args = shape_tool.parse_args(
+        [
+            "--model",
+            "model.gguf",
+            "--limit",
+            "12",
+            "--json",
+            str(json_path),
+        ]
+    )
+
+    assert args.model == Path("model.gguf")
+    assert args.limit == 12
+    assert args.json == json_path
+
+
+def test_shape_inspector_schema_uses_grouped_expert_dims() -> None:
+    tensor = shape_tool.DeepSeekV4FlashTensor(
+        name="blk.2.ffn_gate_exps.weight",
+        dims=(2048, 512, 256),
+        tensor_type=GGML_TYPE_IQ2_XXS,
+        offset=0,
+        nbytes=0,
+    )
+
+    record = shape_tool.expert_shape_record(
+        layer_idx=2,
+        projection="gate",
+        tensor=tensor,
+    )
+
+    assert record == {
+        "layer_idx": 2,
+        "projection": "gate",
+        "tensor_name": "blk.2.ffn_gate_exps.weight",
+        "ggml_type": GGML_TYPE_IQ2_XXS,
+        "rows": 2048,
+        "columns": 512,
+        "expert_count": 256,
+        "columns_blocks": 2,
+        "nbytes_per_expert": 2048 * 2 * 66,
+    }
 
 
 def test_write_json_creates_parent_directory(tmp_path: Path) -> None:
