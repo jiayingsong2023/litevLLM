@@ -120,16 +120,80 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         layer_idx: int,
     ) -> None:
+        cache_admission_policy = getattr(stager, "cache_admission_policy", None)
+        cacheable_expert_ids = tuple(
+            expert_id
+            for expert_id in dict.fromkeys(expert_ids)
+            if cache_admission_policy is None
+            or cache_admission_policy.should_cache_grouped_expert(
+                layer_idx=layer_idx,
+                expert_id=expert_id,
+            )
+        )
+        if not cacheable_expert_ids:
+            return
         try:
             stager.prefetch_grouped_experts(
                 layer,
                 DeepSeekV4FlashExpertPrefetchRequest(
                     layer_idx=layer_idx,
-                    expert_ids=expert_ids,
+                    expert_ids=cacheable_expert_ids,
                 ),
             )
         except Exception:
             self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
+
+    def _likely_hash_routed_expert_ids_for_token(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        layer: Any,
+        *,
+        token_id: int | None,
+    ) -> tuple[int, ...]:
+        if token_id is None:
+            return ()
+        expert_token_table = getattr(layer, "expert_token_to_expert_ids", None)
+        if expert_token_table is None:
+            return ()
+        table = stager.store.tensor_to_torch(expert_token_table, dtype=torch.int32)
+        if table.ndim != 2:
+            raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
+        if table.is_cuda:
+            return ()
+        if token_id < 0 or token_id >= table.shape[1]:
+            raise ValueError(
+                f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
+            )
+        expert_ids = {
+            int(expert_id)
+            for expert_id in table[:, token_id].tolist()
+            if int(expert_id) >= 0
+        }
+        return tuple(sorted(expert_ids))
+
+    def _schedule_next_layer_expert_prefetch(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        next_layer: Any,
+        *,
+        token_id: int | None,
+    ) -> None:
+        grouped_experts = getattr(next_layer, "grouped_experts", None)
+        if grouped_experts is None:
+            return
+        expert_ids = self._likely_hash_routed_expert_ids_for_token(
+            stager,
+            next_layer,
+            token_id=token_id,
+        )
+        if not expert_ids:
+            return
+        self._prefetch_grouped_experts_best_effort(
+            stager,
+            grouped_experts,
+            expert_ids,
+            layer_idx=next_layer.layer_index,
+        )
 
     def forward(
         self,
@@ -374,7 +438,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         layers = getattr(store.bindings, "layers", None)
         if layers is None:
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
-        for layer in layers:
+        layers = list(layers)
+        for layer_offset, layer in enumerate(layers):
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -404,6 +469,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         token_idx=token_idx,
                         token_id=token_id,
                     )
+            if layer_offset + 1 < len(layers):
+                self._schedule_next_layer_expert_prefetch(
+                    stager,
+                    layers[layer_offset + 1],
+                    token_id=token_id,
+                )
 
         return store, stager, hidden
 
@@ -443,7 +514,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         layers = getattr(store.bindings, "layers", None)
         if layers is None:
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
-        for layer in layers:
+        layers = list(layers)
+        for layer_offset, layer in enumerate(layers):
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -473,6 +545,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         token_idx=token_idx,
                         token_id_tensor=token_id_tensor,
                     )
+            if layer_offset + 1 < len(layers):
+                self._schedule_next_layer_expert_prefetch(
+                    stager,
+                    layers[layer_offset + 1],
+                    token_id=None,
+                )
 
         return store, stager, hidden
 

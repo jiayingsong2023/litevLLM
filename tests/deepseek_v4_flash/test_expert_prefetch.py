@@ -5,6 +5,7 @@ import torch
 from fixtures import GGML_TYPE_Q2_K
 
 from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
+    DeepSeekV4FlashCacheAdmissionPolicy,
     DeepSeekV4FlashExpertPrefetchRequest,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
@@ -125,6 +126,22 @@ class _FailingPrefetchStager:
         raise RuntimeError("prefetch failed")
 
 
+class _RecordingPrefetchStager:
+    def __init__(self) -> None:
+        self.cache_admission_policy = DeepSeekV4FlashCacheAdmissionPolicy(
+            stream_experts=frozenset({(3, 1)})
+        )
+        self.requests: list[DeepSeekV4FlashExpertPrefetchRequest] = []
+
+    def prefetch_grouped_experts(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        request: DeepSeekV4FlashExpertPrefetchRequest,
+    ) -> None:
+        del tensors
+        self.requests.append(request)
+
+
 def test_expert_prefetch_request_rejects_negative_values() -> None:
     request = DeepSeekV4FlashExpertPrefetchRequest(layer_idx=2, expert_ids=(0, 1))
 
@@ -156,6 +173,29 @@ def test_prefetch_stages_raw_payloads_and_repeated_prefetch_records_hits() -> No
     assert stats["prefetch_misses"] == 3
     assert stats["prefetch_hits"] == 3
     assert stats["prefetch_failures"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_demand_staging_reuses_payloads_loaded_by_prefetch() -> None:
+    tensors = _grouped_expert_tensors()
+    store = _FakeRawPayloadStore()
+    payload = bytes(range(ggml_tensor_nbytes((256, 1), GGML_TYPE_Q2_K)))
+    for tensor in (tensors.gate, tensors.up, tensors.down):
+        store.payloads[(tensor.name, 0)] = payload
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.prefetch_grouped_experts(
+        tensors,
+        DeepSeekV4FlashExpertPrefetchRequest(layer_idx=3, expert_ids=(0,)),
+    )
+    for tensor in (tensors.gate, tensors.up, tensors.down):
+        stager.stage_grouped_expert_payload(tensor, 0, layer_idx=3)
+
+    stats = stager.cache_stats()
+    assert store.raw_reads == 3
+    assert stats["grouped_misses"] == 3
+    assert stats["grouped_hits"] == 3
+    assert stats["prefetch_misses"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -210,3 +250,25 @@ def test_model_best_effort_prefetch_records_failures() -> None:
 
     profile = model.deepseek_profile()
     assert profile["counters"]["deepseek_prefetch_failures"] == 1
+
+
+def test_model_best_effort_prefetch_skips_stream_only_experts() -> None:
+    model = DeepSeekV4FlashForCausalLM()
+    stager = _RecordingPrefetchStager()
+
+    model._prefetch_grouped_experts_best_effort(
+        stager,
+        _grouped_expert_tensors(),
+        (0, 1),
+        layer_idx=3,
+    )
+    model._prefetch_grouped_experts_best_effort(
+        stager,
+        _grouped_expert_tensors(),
+        (1,),
+        layer_idx=3,
+    )
+
+    assert stager.requests == [
+        DeepSeekV4FlashExpertPrefetchRequest(layer_idx=3, expert_ids=(0,))
+    ]

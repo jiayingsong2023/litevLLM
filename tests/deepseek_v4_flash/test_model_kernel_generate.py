@@ -12,6 +12,9 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashRuntimeBudget,
     DeepSeekV4FlashShape,
 )
+from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
+    DeepSeekV4FlashExpertPrefetchRequest,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_F16,
     GGML_TYPE_Q8_0,
@@ -110,9 +113,11 @@ class _FakeLayer:
         self,
         layer_index: int,
         grouped_experts: DeepSeekV4FlashGroupedExpertTensors | None,
+        expert_token_to_expert_ids: DeepSeekV4FlashTensor | None = None,
     ) -> None:
         self.layer_index = layer_index
         self.grouped_experts = grouped_experts
+        self.expert_token_to_expert_ids = expert_token_to_expert_ids
 
 
 def _grouped_experts(
@@ -142,6 +147,16 @@ def _grouped_experts(
             0,
             0,
         ),
+    )
+
+
+def _expert_token_table(layer_idx: int) -> DeepSeekV4FlashTensor:
+    return DeepSeekV4FlashTensor(
+        f"blk.{layer_idx}.ffn_expert_token_map.weight",
+        (2, 16),
+        GGML_TYPE_Q8_0,
+        0,
+        0,
     )
 
 
@@ -402,6 +417,84 @@ def test_model_profile_records_layer_output_sections_and_syncs(
         "output_projection",
     ]
     assert sync_calls >= 2 * len(event_names)
+
+
+def test_forward_kernel_schedules_next_layer_prefetch_before_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model()
+    assert model.weight_store is not None
+    token_table = _expert_token_table(1)
+    model.weight_store.bindings.layers = [
+        _FakeLayer(0, _grouped_experts(0)),
+        _FakeLayer(1, _grouped_experts(1), token_table),
+    ]
+    events: list[tuple[str, int, tuple[int, ...] | None]] = []
+
+    class FakeStager:
+        def __init__(self) -> None:
+            self.store = self
+
+        def tensor_to_torch(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            assert tensor is token_table
+            assert dtype is torch.int32
+            table = torch.full((2, 16), -1, dtype=torch.int32)
+            table[:, 5] = torch.tensor([2, 0], dtype=torch.int32)
+            return table
+
+        def prefetch_grouped_experts(
+            self,
+            tensors: DeepSeekV4FlashGroupedExpertTensors,
+            request: DeepSeekV4FlashExpertPrefetchRequest,
+        ) -> None:
+            assert tensors is model.weight_store.bindings.layers[1].grouped_experts
+            events.append(("prefetch", request.layer_idx, request.expert_ids))
+
+    def fake_sliding(hidden: object, **kwargs: object) -> object:
+        layer = kwargs["layer"]
+        assert isinstance(layer, _FakeLayer)
+        events.append(("demand", layer.layer_index, None))
+        return hidden
+
+    monkeypatch.setattr(model.gpu_backend, "require_ready", lambda: None)
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: FakeStager())
+    monkeypatch.setattr(
+        model,
+        "_stage_token_embedding_cuda",
+        lambda store, token_id, *, device: object(),
+    )
+    monkeypatch.setattr(
+        model_module,
+        "deepseek_v4_flash_sliding_layer_forward",
+        fake_sliding,
+    )
+
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=4,
+            hidden_size=model.shape.hidden_size,
+            kv_width=model.shape.head_dim,
+            device="cpu",
+        )
+    )
+
+    model._forward_kernel_token_hidden(
+        token_id=5,
+        state=state,
+        token_idx=0,
+        device=torch.device("cpu"),
+    )
+
+    assert events == [
+        ("demand", 0, None),
+        ("prefetch", 1, (0, 2)),
+        ("demand", 1, None),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
