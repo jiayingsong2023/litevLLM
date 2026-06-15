@@ -7,6 +7,7 @@ from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
     q2_k_matrix_from_gguf_payload,
 )
+from vllm.triton_utils import tl, triton
 
 _Q2_K_BLOCK_BYTES = 84
 _IQ2_XXS_BLOCK_BYTES = 66
@@ -68,6 +69,69 @@ def _q2_iq2_matvec_triton_placeholder_cuda(
     rows: int,
 ) -> torch.Tensor:
     return torch.zeros((rows,), dtype=torch.float32, device=hidden.device)
+
+
+# GGUF Q2_K row layout: each 84-byte block stores one 256-value row here.
+# Bytes 0..15 are packed scale/min nibbles, bytes 16..79 are 64 quant bytes,
+# byte pairs 80..81 and 82..83 are fp16 d and dmin. One Triton program handles
+# one matrix row and uses 256 lanes to decode all values, multiply by the
+# contiguous hidden vector, reduce to fp32, and store one output element.
+@triton.jit
+def _q2_k_matvec_kernel(
+    payload_ptr,
+    payload_half_ptr,
+    hidden_ptr,
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 16
+    q_half = offsets // 128
+    rem = offsets - q_half * 128
+    shift = (rem // 32) * 2
+    q_byte_index = q_half * 32 + (rem - (rem // 32) * 32)
+
+    payload_base = row * BLOCK_BYTES
+    scale_bytes = tl.load(payload_ptr + payload_base + group).to(tl.uint32)
+    q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(tl.uint32)
+    codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
+
+    scale_lows = (scale_bytes & 0x0F).to(tl.float32)
+    scale_highs = (scale_bytes >> 4).to(tl.float32)
+    d = tl.load(payload_half_ptr + row * HALF_WORDS_PER_BLOCK + 40).to(tl.float32)
+    dmin = tl.load(payload_half_ptr + row * HALF_WORDS_PER_BLOCK + 41).to(
+        tl.float32
+    )
+
+    decoded = d * scale_lows * codes - dmin * scale_highs
+    hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
+    total = tl.sum(decoded * hidden, axis=0)
+    tl.store(output_ptr + row, total)
+
+
+def _q2_k_matvec_triton_cuda(
+    payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+) -> torch.Tensor:
+    output = torch.empty((rows,), dtype=torch.float32, device=hidden.device)
+    payload_contiguous = payload.contiguous()
+    hidden_contiguous = hidden.contiguous()
+    _q2_k_matvec_kernel[(rows,)](
+        payload_contiguous,
+        payload_contiguous.view(torch.float16),
+        hidden_contiguous,
+        output,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
+        num_warps=8,
+    )
+    return output
 
 
 def _q2_k_matvec_reference_cuda(
@@ -132,7 +196,7 @@ def deepseek_v4_q2_k_matvec(
         columns=columns,
         block_bytes=_Q2_K_BLOCK_BYTES,
     )
-    _validate_hidden(hidden, columns=columns)
+    hidden_f32 = _validate_hidden(hidden, columns=columns)
     if not use_triton:
         return _q2_k_matvec_reference_cuda(
             payload,
@@ -140,7 +204,14 @@ def deepseek_v4_q2_k_matvec(
             rows=rows,
             columns=columns,
         )
-    return _q2_iq2_matvec_triton_placeholder_cuda(hidden, rows=rows)
+    if columns != _GGUF_BLOCK_COLUMNS:
+        return _q2_k_matvec_reference_cuda(
+            payload,
+            hidden,
+            rows=rows,
+            columns=columns,
+        )
+    return _q2_k_matvec_triton_cuda(payload, hidden_f32, rows=rows)
 
 
 def deepseek_v4_iq2_xxs_matvec(

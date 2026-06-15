@@ -27,6 +27,17 @@ def _q2_k_repeating_codes_payload() -> bytes:
     return scales + qs + struct.pack("<e", 1.0) + struct.pack("<e", 0.5)
 
 
+def _q2_k_deterministic_payload(rows: int) -> bytes:
+    blocks: list[bytes] = []
+    for row in range(rows):
+        scales = bytes(((row * 5 + idx * 7 + 0x21) & 0xFF) for idx in range(16))
+        qs = bytes(((row * 13 + idx * 11 + 0x35) & 0xFF) for idx in range(64))
+        d = 0.125 * (row % 5 + 1)
+        dmin = -0.0625 * (row % 7 + 1)
+        blocks.append(scales + qs + struct.pack("<e", d) + struct.pack("<e", dmin))
+    return b"".join(blocks)
+
+
 def _cuda_payload(payload: bytes) -> torch.Tensor:
     return torch.tensor(tuple(payload), dtype=torch.uint8, device="cuda")
 
@@ -113,6 +124,38 @@ def test_q2_iq2_matvec_matches_reference_decoded_matrix(
     assert actual.device.type == "cuda"
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 2, 17, 64])
+@pytest.mark.parametrize("hidden_scale", [0.25, 1.0])
+def test_q2_k_default_triton_matvec_matches_reference_decoded_matrix(
+    rows: int,
+    hidden_scale: float,
+) -> None:
+    columns = 256
+    payload = _q2_k_deterministic_payload(rows)
+    hidden = (
+        torch.linspace(-1.0, 1.0, columns, dtype=torch.float32, device="cuda")
+        * hidden_scale
+    )
+
+    actual = deepseek_v4_q2_k_matvec(
+        _cuda_payload(payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    expected = q2_k_matrix_from_gguf_payload(
+        payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
