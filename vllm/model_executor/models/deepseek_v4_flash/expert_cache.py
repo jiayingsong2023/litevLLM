@@ -26,6 +26,22 @@ class DeepSeekV4FlashExpertPrefetchRequest:
 
 
 @dataclass(frozen=True)
+class DeepSeekV4FlashCacheAdmissionPolicy:
+    min_reuse_score: int = 1
+    stream_experts: frozenset[tuple[int, int]] = frozenset()
+
+    def should_cache_grouped_expert(
+        self,
+        *,
+        layer_idx: int | None,
+        expert_id: int,
+    ) -> bool:
+        if layer_idx is not None and (layer_idx, expert_id) in self.stream_experts:
+            return False
+        return self.min_reuse_score <= 1
+
+
+@dataclass(frozen=True)
 class DeepSeekV4FlashHotExpertPolicy:
     pinned_experts: frozenset[tuple[int, int]] = frozenset()
 

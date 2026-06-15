@@ -9,6 +9,7 @@ from typing import Protocol
 import torch
 
 from .expert_cache import (
+    DeepSeekV4FlashCacheAdmissionPolicy,
     DeepSeekV4FlashCacheKey,
     DeepSeekV4FlashExpertPrefetchRequest,
     DeepSeekV4FlashHotExpertPolicy,
@@ -72,11 +73,15 @@ class DeepSeekV4FlashGPUWeightStager:
         dtype: torch.dtype = torch.float32,
         max_staged_bytes: int | None = None,
         hot_expert_policy: DeepSeekV4FlashHotExpertPolicy | None = None,
+        cache_admission_policy: DeepSeekV4FlashCacheAdmissionPolicy | None = None,
     ) -> None:
         self.store = store
         self.device = torch.device(device or "cuda")
         self.dtype = dtype
         self.hot_expert_policy = hot_expert_policy or DeepSeekV4FlashHotExpertPolicy()
+        self.cache_admission_policy = (
+            cache_admission_policy or DeepSeekV4FlashCacheAdmissionPolicy()
+        )
         if max_staged_bytes is not None and max_staged_bytes < 0:
             raise ValueError("max staged bytes must be non-negative")
         self.max_staged_bytes = max_staged_bytes
@@ -270,6 +275,16 @@ class DeepSeekV4FlashGPUWeightStager:
         return (
             self.hot_expert_policy.is_pinned_expert(layer_idx, expert_id)
             or (layer_idx, expert_id) in self._manual_pinned_experts
+        )
+
+    def _should_cache_grouped_expert(
+        self,
+        layer_idx: int | None,
+        expert_id: int,
+    ) -> bool:
+        return self.cache_admission_policy.should_cache_grouped_expert(
+            layer_idx=layer_idx,
+            expert_id=expert_id,
         )
 
     def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
@@ -475,8 +490,9 @@ class DeepSeekV4FlashGPUWeightStager:
     ) -> torch.Tensor:
         if self.device.type != "cuda":
             raise ValueError("DeepSeek V4 Flash expert staging requires a CUDA device")
+        should_cache = self._should_cache_grouped_expert(layer_idx, expert_id)
         cache_key = self._grouped_cache_key(tensor, expert_id)
-        cached = self._grouped_cache.get(cache_key)
+        cached = self._grouped_cache.get(cache_key) if should_cache else None
         if cached is not None:
             if layer_idx is not None:
                 self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
@@ -490,7 +506,7 @@ class DeepSeekV4FlashGPUWeightStager:
         if decoded.ndim != 2:
             raise ValueError(f"grouped expert matrix must be 2-D; got {decoded.ndim}-D")
         nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
-        if not self._prepare_cache_insert(nbytes):
+        if not should_cache or not self._prepare_cache_insert(nbytes):
             self._record_streamed_bytes(nbytes)
             return decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
         self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
@@ -509,8 +525,9 @@ class DeepSeekV4FlashGPUWeightStager:
     ) -> DeepSeekV4FlashStagedQuantizedExpertPayload:
         if self.device.type != "cuda":
             raise ValueError("DeepSeek V4 Flash expert staging requires a CUDA device")
+        should_cache = self._should_cache_grouped_expert(layer_idx, expert_id)
         cache_key = self._grouped_payload_cache_key(tensor, expert_id)
-        cached = self._grouped_cache.get(cache_key)
+        cached = self._grouped_cache.get(cache_key) if should_cache else None
         if cached is not None:
             if layer_idx is not None:
                 self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
@@ -540,7 +557,7 @@ class DeepSeekV4FlashGPUWeightStager:
         finally:
             raw.payload.release()
         nbytes = cpu_payload.numel() * cpu_payload.element_size()
-        if not self._prepare_cache_insert(nbytes):
+        if not should_cache or not self._prepare_cache_insert(nbytes):
             self._record_streamed_bytes(nbytes)
             staged = cpu_payload.to(device=self.device, non_blocking=True)
             return DeepSeekV4FlashStagedQuantizedExpertPayload(

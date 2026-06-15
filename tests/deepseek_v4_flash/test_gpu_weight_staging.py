@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
+    DeepSeekV4FlashCacheAdmissionPolicy,
     DeepSeekV4FlashHotExpertPolicy,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
@@ -22,6 +23,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
 from vllm.model_executor.models.deepseek_v4_flash.moe import grouped_expert_reference
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
+    DeepSeekV4FlashQuantizedExpertPayload,
     open_deepseek_v4_flash_weight_store,
 )
 
@@ -34,7 +36,9 @@ TARGET_GGUF = Path(
 class _FakeGroupedExpertStore:
     def __init__(self) -> None:
         self.decode_count = 0
+        self.raw_payload_read_count = 0
         self.matrices: dict[tuple[str, int], torch.Tensor] = {}
+        self.raw_payloads: dict[tuple[str, int], bytes] = {}
 
     def decode_grouped_expert_matrix(
         self,
@@ -43,6 +47,23 @@ class _FakeGroupedExpertStore:
     ) -> torch.Tensor:
         self.decode_count += 1
         return self.matrices[(tensor.name, expert_id)].clone()
+
+    def raw_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashQuantizedExpertPayload:
+        self.raw_payload_read_count += 1
+        input_size, output_size, _expert_count = tensor.dims
+        payload = self.raw_payloads[(tensor.name, expert_id)]
+        return DeepSeekV4FlashQuantizedExpertPayload(
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=tensor.tensor_type,
+            rows=output_size,
+            columns=input_size,
+            payload=memoryview(bytearray(payload)),
+        )
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
         raise AssertionError(f"unexpected matrix decode for {tensor.name}")
@@ -176,6 +197,62 @@ def test_gpu_weight_stager_streams_grouped_expert_when_budget_is_exceeded() -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_streams_grouped_expert_refused_by_admission() -> None:
+    store = _FakeGroupedExpertStore()
+    tensor = _tensor("blk.1.ffn_down_exps.weight")
+    store.matrices[(tensor.name, 2)] = torch.eye(2, dtype=torch.float32)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        cache_admission_policy=DeepSeekV4FlashCacheAdmissionPolicy(
+            stream_experts=frozenset({(1, 2)}),
+        ),
+    )
+
+    first = stager.stage_grouped_expert_matrix(tensor, 2, layer_idx=1)
+    second = stager.stage_grouped_expert_matrix(tensor, 2, layer_idx=1)
+
+    assert first.device.type == "cuda"
+    assert second.device.type == "cuda"
+    assert first.data_ptr() != second.data_ptr()
+    assert store.decode_count == 2
+    assert stager.staged_bytes == 0
+    stats = stager.memory_stats()
+    assert stats["streamed_bytes"] == 32
+    assert stats["grouped_misses"] == 0
+    assert stats["loaded_bytes"] == 0
+    assert stats["grouped_entries"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_streams_raw_payload_refused_by_admission() -> None:
+    store = _FakeGroupedExpertStore()
+    tensor = _tensor("blk.1.ffn_gate_exps.weight")
+    store.raw_payloads[(tensor.name, 2)] = b"\x01\x02\x03\x04"
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        cache_admission_policy=DeepSeekV4FlashCacheAdmissionPolicy(
+            stream_experts=frozenset({(1, 2)}),
+        ),
+    )
+
+    first = stager.stage_grouped_expert_payload(tensor, 2, layer_idx=1)
+    second = stager.stage_grouped_expert_payload(tensor, 2, layer_idx=1)
+
+    assert first.payload.device.type == "cuda"
+    assert second.payload.device.type == "cuda"
+    assert first.payload.data_ptr() != second.payload.data_ptr()
+    assert store.raw_payload_read_count == 2
+    assert stager.staged_bytes == 0
+    stats = stager.memory_stats()
+    assert stats["streamed_bytes"] == 8
+    assert stats["grouped_misses"] == 0
+    assert stats["loaded_bytes"] == 0
+    assert stats["grouped_entries"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
     store = _FakeStagingStore()
     matrix_tensor = _tensor("blk.1.ffn_gate_inp.weight", dims=(2, 2))
@@ -265,6 +342,47 @@ def test_gpu_weight_stager_pinned_grouped_entries_survive_lru_eviction() -> None
     assert store.decode_count == 1
     assert stager.memory_stats()["pinned_entries"] == 1
     assert stager.memory_stats()["lru_evictions"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_pinned_raw_payload_entries_survive_lru_eviction() -> None:
+    store = _FakeStagingStore()
+    gate_tensor = _tensor("blk.2.ffn_gate_exps.weight")
+    up_tensor = _tensor("blk.2.ffn_up_exps.weight")
+    down_tensor = _tensor("blk.2.ffn_down_exps.weight")
+    matrix_tensor = _tensor("blk.2.router.weight", dims=(2, 2))
+    new_tensor = _tensor("blk.2.output.weight", dims=(2, 2))
+    store.raw_payloads[(gate_tensor.name, 7)] = b"\x01\x02\x03\x04"
+    store.raw_payloads[(up_tensor.name, 7)] = b"\x05\x06\x07\x08"
+    store.raw_payloads[(down_tensor.name, 7)] = b"\x09\x0a\x0b\x0c"
+    store.generic_matrices[matrix_tensor.name] = torch.ones((2, 2), dtype=torch.float32)
+    store.generic_matrices[new_tensor.name] = torch.full((2, 2), 2.0)
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=43,
+        hot_expert_policy=DeepSeekV4FlashHotExpertPolicy(
+            pinned_experts=frozenset({(2, 7)})
+        ),
+    )
+
+    first_gate = stager.stage_grouped_expert_payload(gate_tensor, 7, layer_idx=2)
+    first_up = stager.stage_grouped_expert_payload(up_tensor, 7, layer_idx=2)
+    first_down = stager.stage_grouped_expert_payload(down_tensor, 7, layer_idx=2)
+    stager.stage_matrix(matrix_tensor)
+    stager.stage_matrix(new_tensor)
+    cached_gate = stager.stage_grouped_expert_payload(gate_tensor, 7, layer_idx=2)
+    cached_up = stager.stage_grouped_expert_payload(up_tensor, 7, layer_idx=2)
+    cached_down = stager.stage_grouped_expert_payload(down_tensor, 7, layer_idx=2)
+
+    assert first_gate.payload.data_ptr() == cached_gate.payload.data_ptr()
+    assert first_up.payload.data_ptr() == cached_up.payload.data_ptr()
+    assert first_down.payload.data_ptr() == cached_down.payload.data_ptr()
+    assert store.raw_payload_read_count == 3
+    stats = stager.memory_stats()
+    assert stats["pinned_entries"] == 3
+    assert stats["grouped_hits"] == 3
+    assert stats["lru_evictions"] == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
