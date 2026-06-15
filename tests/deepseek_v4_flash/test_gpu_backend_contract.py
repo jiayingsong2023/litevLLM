@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
@@ -17,6 +18,10 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
+from vllm.model_executor.models.deepseek_v4_flash.quant import (
+    iq2_xxs_matrix_from_gguf_payload,
+    q2_k_matrix_from_gguf_payload,
+)
 
 
 def _iq2_xxs_unit_block_payload() -> bytes:
@@ -27,6 +32,45 @@ def _q2_k_repeating_codes_payload() -> bytes:
     scales = b"\x11" * 16
     qs = b"\xe4" * 64
     return scales + qs + struct.pack("<e", 1.0) + struct.pack("<e", 0.5)
+
+
+def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
+    blocks: list[bytes] = []
+    for row in range(rows):
+        groups = bytearray()
+        for group in range(8):
+            grid_bytes = bytes(
+                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF)
+                for idx in range(4)
+            )
+            sign_indices = [
+                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F
+                for idx in range(4)
+            ]
+            scale_code = (row + group * 3) & 0x0F
+            q_sign_scale = (
+                sign_indices[0]
+                | (sign_indices[1] << 7)
+                | (sign_indices[2] << 14)
+                | (sign_indices[3] << 21)
+                | (scale_code << 28)
+            )
+            groups.extend(grid_bytes)
+            groups.extend(struct.pack("<I", q_sign_scale))
+        d = 0.03125 * (row % 7 + 1)
+        blocks.append(struct.pack("<e", d) + bytes(groups))
+    return b"".join(blocks)
+
+
+def _q2_k_deterministic_payload(rows: int) -> bytes:
+    blocks: list[bytes] = []
+    for row in range(rows):
+        scales = bytes(((row * 5 + idx * 7 + 0x21) & 0xFF) for idx in range(16))
+        qs = bytes(((row * 13 + idx * 11 + 0x35) & 0xFF) for idx in range(64))
+        d = 0.125 * (row % 5 + 1)
+        dmin = -0.0625 * (row % 7 + 1)
+        blocks.append(scales + qs + struct.pack("<e", d) + struct.pack("<e", dmin))
+    return b"".join(blocks)
 
 
 def _cuda_payload(payload: bytes) -> torch.Tensor:
@@ -198,8 +242,78 @@ def test_quantized_expert_gemm_uses_default_triton_dispatch(
 
     assert actual.shape == (256,)
     assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    if ggml_type == GGML_TYPE_Q2_K:
+        decoder = q2_k_matrix_from_gguf_payload
+    else:
+        decoder = iq2_xxs_matrix_from_gguf_payload
+    gate = decoder(gate_payload, rows=256, columns=256).to(device="cuda").matmul(
+        hidden
+    )
+    up = decoder(up_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
+    expected = decoder(down_payload, rows=256, columns=256).to(device="cuda").matmul(
+        F.silu(gate) * up
+    )
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
     assert backend.stats() == expected_stats
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down(
+) -> None:
+    backend = DeepSeekV4FlashGPUBackend()
+    rows = 256
+    columns = 256
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    gate_payload = _iq2_xxs_deterministic_payload(rows)
+    up_payload = _iq2_xxs_deterministic_payload(rows)
+    down_payload = _q2_k_deterministic_payload(rows)
+
+    actual = backend.quantized_expert_gemm(
+        hidden=hidden,
+        gate_payload=_staged_payload(
+            ggml_type=GGML_TYPE_IQ2_XXS,
+            rows=rows,
+            columns=columns,
+            payload=gate_payload,
+        ),
+        up_payload=_staged_payload(
+            ggml_type=GGML_TYPE_IQ2_XXS,
+            rows=rows,
+            columns=columns,
+            payload=up_payload,
+        ),
+        down_payload=_staged_payload(
+            ggml_type=GGML_TYPE_Q2_K,
+            rows=rows,
+            columns=columns,
+            payload=down_payload,
+        ),
+    )
+    gate = iq2_xxs_matrix_from_gguf_payload(
+        gate_payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+    up = iq2_xxs_matrix_from_gguf_payload(
+        up_payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+    expected = q2_k_matrix_from_gguf_payload(
+        down_payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(F.silu(gate) * up)
+
+    assert actual.shape == (rows,)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=8e-2)
+    assert backend.stats() == {
+        "quantized_expert_calls": 1,
+        "q2_k_triton_calls": 1,
+        "iq2_xxs_triton_calls": 2,
+        "q2_iq2_reference_fallback_calls": 0,
+    }
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:

@@ -347,3 +347,50 @@ def deepseek_v4_iq2_xxs_matvec(
             columns=columns,
         )
     return _iq2_xxs_matvec_triton_cuda(payload, hidden_f32, rows=rows)
+
+
+def deepseek_v4_iq2_xxs_gate_up(
+    gate_payload: torch.Tensor,
+    up_payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """IQ2_XXS gate/up expert matvec pair.
+
+    This helper keeps the routed expert gate/up contract explicit while the
+    current implementation uses two default IQ2_XXS matvec launches.
+    """
+    _validate_payload(
+        gate_payload,
+        rows=rows,
+        columns=columns,
+        block_bytes=_IQ2_XXS_BLOCK_BYTES,
+    )
+    _validate_payload(
+        up_payload,
+        rows=rows,
+        columns=columns,
+        block_bytes=_IQ2_XXS_BLOCK_BYTES,
+    )
+    hidden_f32 = _validate_hidden(hidden, columns=columns)
+    if columns != _GGUF_BLOCK_COLUMNS:
+        return (
+            _iq2_xxs_matvec_reference_cuda(
+                gate_payload,
+                hidden,
+                rows=rows,
+                columns=columns,
+            ),
+            _iq2_xxs_matvec_reference_cuda(
+                up_payload,
+                hidden,
+                rows=rows,
+                columns=columns,
+            ),
+        )
+    return (
+        _iq2_xxs_matvec_triton_cuda(gate_payload, hidden_f32, rows=rows),
+        _iq2_xxs_matvec_triton_cuda(up_payload, hidden_f32, rows=rows),
+    )

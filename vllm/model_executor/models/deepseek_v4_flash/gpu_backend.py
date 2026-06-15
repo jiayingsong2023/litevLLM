@@ -25,6 +25,7 @@ from vllm.kernels.triton.deepseek_v4_flash.output import (
     deepseek_v4_output_projection,
 )
 from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
+    deepseek_v4_iq2_xxs_gate_up,
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_q2_k_matvec,
 )
@@ -243,8 +244,23 @@ class DeepSeekV4FlashGPUBackend:
         down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
     ) -> torch.Tensor:
         self._stats["quantized_expert_calls"] += 1
-        gate = self._quantized_expert_matvec(gate_payload, hidden)
-        up = self._quantized_expert_matvec(up_payload, hidden)
+        if (
+            gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
+            and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
+            and gate_payload.rows == up_payload.rows
+            and gate_payload.columns == up_payload.columns
+        ):
+            self._stats["iq2_xxs_triton_calls"] += 2
+            gate, up = deepseek_v4_iq2_xxs_gate_up(
+                gate_payload.payload,
+                up_payload.payload,
+                hidden,
+                rows=gate_payload.rows,
+                columns=gate_payload.columns,
+            )
+        else:
+            gate = self._quantized_expert_matvec(gate_payload, hidden)
+            up = self._quantized_expert_matvec(up_payload, hidden)
         return self._quantized_expert_matvec(down_payload, F.silu(gate) * up)
 
     def _quantized_expert_matvec(
