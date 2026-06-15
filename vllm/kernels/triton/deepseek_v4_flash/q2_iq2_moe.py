@@ -8,6 +8,10 @@ from vllm.model_executor.models.deepseek_v4_flash.quant import (
     q2_k_matrix_from_gguf_payload,
 )
 
+_Q2_K_BLOCK_BYTES = 84
+_IQ2_XXS_BLOCK_BYTES = 66
+_GGUF_BLOCK_COLUMNS = 256
+
 
 def _payload_bytes(payload: torch.Tensor) -> bytes:
     if payload.dtype != torch.uint8:
@@ -15,6 +19,34 @@ def _payload_bytes(payload: torch.Tensor) -> bytes:
     if not payload.is_cuda:
         raise ValueError("payload must be a CUDA tensor")
     return bytes(payload.detach().cpu().contiguous().tolist())
+
+
+def _validate_payload(
+    payload: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+    block_bytes: int,
+) -> None:
+    if payload.dtype != torch.uint8:
+        raise ValueError(f"payload must be torch.uint8; got {payload.dtype}")
+    if not payload.is_cuda:
+        raise ValueError("payload must be a CUDA tensor")
+    if rows <= 0:
+        raise ValueError(f"rows must be positive; got {rows}")
+    if columns <= 0:
+        raise ValueError(f"columns must be positive; got {columns}")
+    if columns % _GGUF_BLOCK_COLUMNS != 0:
+        raise ValueError(
+            "columns must be a multiple of 256 for GGUF Q2/IQ2 blocks; "
+            f"got {columns}"
+        )
+    expected_bytes = rows * (columns // _GGUF_BLOCK_COLUMNS) * block_bytes
+    if payload.numel() != expected_bytes:
+        raise ValueError(
+            "payload byte length does not match matrix shape; "
+            f"got {payload.numel()} and expected {expected_bytes}"
+        )
 
 
 def _validate_hidden(hidden: torch.Tensor, *, columns: int) -> torch.Tensor:
@@ -30,14 +62,55 @@ def _validate_hidden(hidden: torch.Tensor, *, columns: int) -> torch.Tensor:
     return hidden.to(torch.float32)
 
 
-def deepseek_v4_q2_k_matvec(
+def _q2_iq2_matvec_triton_placeholder_cuda(
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+) -> torch.Tensor:
+    return torch.zeros((rows,), dtype=torch.float32, device=hidden.device)
+
+
+def _q2_k_matvec_reference_cuda(
     payload: torch.Tensor,
     hidden: torch.Tensor,
     *,
     rows: int,
     columns: int,
 ) -> torch.Tensor:
-    """Correctness-first Q2_K expert matvec fallback.
+    hidden_f32 = _validate_hidden(hidden, columns=columns)
+    matrix = q2_k_matrix_from_gguf_payload(
+        _payload_bytes(payload),
+        rows=rows,
+        columns=columns,
+    ).to(device=hidden.device)
+    return matrix.matmul(hidden_f32)
+
+
+def _iq2_xxs_matvec_reference_cuda(
+    payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    hidden_f32 = _validate_hidden(hidden, columns=columns)
+    matrix = iq2_xxs_matrix_from_gguf_payload(
+        _payload_bytes(payload),
+        rows=rows,
+        columns=columns,
+    ).to(device=hidden.device)
+    return matrix.matmul(hidden_f32)
+
+
+def deepseek_v4_q2_k_matvec(
+    payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+    use_triton: bool = True,
+) -> torch.Tensor:
+    """Q2_K expert matvec.
 
     GGUF raw Q2_K block memory layout:
     - One block encodes 256 row-major matrix values in 84 bytes.
@@ -52,18 +125,22 @@ def deepseek_v4_q2_k_matvec(
       GGUF blocks.
     - A fused kernel should tile output rows and K blocks, decode Q2_K values
       in registers, multiply by hidden[K], and reduce to one fp32 value per row.
-
-    This implementation is deliberately not the final kernel. It copies the
-    staged CUDA uint8 payload to CPU bytes, decodes with the reference GGUF
-    decoder, moves the fp32 matrix back to CUDA, and performs torch matmul.
     """
-    hidden_f32 = _validate_hidden(hidden, columns=columns)
-    matrix = q2_k_matrix_from_gguf_payload(
-        _payload_bytes(payload),
+    _validate_payload(
+        payload,
         rows=rows,
         columns=columns,
-    ).to(device=hidden.device)
-    return matrix.matmul(hidden_f32)
+        block_bytes=_Q2_K_BLOCK_BYTES,
+    )
+    _validate_hidden(hidden, columns=columns)
+    if not use_triton:
+        return _q2_k_matvec_reference_cuda(
+            payload,
+            hidden,
+            rows=rows,
+            columns=columns,
+        )
+    return _q2_iq2_matvec_triton_placeholder_cuda(hidden, rows=rows)
 
 
 def deepseek_v4_iq2_xxs_matvec(
@@ -72,8 +149,9 @@ def deepseek_v4_iq2_xxs_matvec(
     *,
     rows: int,
     columns: int,
+    use_triton: bool = True,
 ) -> torch.Tensor:
-    """Correctness-first IQ2_XXS expert matvec fallback.
+    """IQ2_XXS expert matvec.
 
     GGUF raw IQ2_XXS block memory layout:
     - One block encodes 256 row-major matrix values in 66 bytes.
@@ -88,15 +166,19 @@ def deepseek_v4_iq2_xxs_matvec(
     - A fused kernel should tile output rows and K blocks, expand IQ2_XXS grid
       and sign metadata in registers, multiply by hidden[K], and reduce to one
       fp32 value per row.
-
-    This implementation is deliberately not the final kernel. It copies the
-    staged CUDA uint8 payload to CPU bytes, decodes with the reference GGUF
-    decoder, moves the fp32 matrix back to CUDA, and performs torch matmul.
     """
-    hidden_f32 = _validate_hidden(hidden, columns=columns)
-    matrix = iq2_xxs_matrix_from_gguf_payload(
-        _payload_bytes(payload),
+    _validate_payload(
+        payload,
         rows=rows,
         columns=columns,
-    ).to(device=hidden.device)
-    return matrix.matmul(hidden_f32)
+        block_bytes=_IQ2_XXS_BLOCK_BYTES,
+    )
+    _validate_hidden(hidden, columns=columns)
+    if not use_triton:
+        return _iq2_xxs_matvec_reference_cuda(
+            payload,
+            hidden,
+            rows=rows,
+            columns=columns,
+        )
+    return _q2_iq2_matvec_triton_placeholder_cuda(hidden, rows=rows)

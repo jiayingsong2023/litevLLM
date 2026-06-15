@@ -6,6 +6,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
+from vllm.kernels.triton.deepseek_v4_flash import q2_iq2_moe
 from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_q2_k_matvec,
@@ -28,6 +29,48 @@ def _q2_k_repeating_codes_payload() -> bytes:
 
 def _cuda_payload(payload: bytes) -> torch.Tensor:
     return torch.tensor(tuple(payload), dtype=torch.uint8, device="cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_q2_k_default_path_does_not_copy_payload_to_cpu(monkeypatch) -> None:
+    def fail_payload_bytes(_payload: torch.Tensor) -> bytes:
+        raise AssertionError("CPU fallback used")
+
+    monkeypatch.setattr(q2_iq2_moe, "_payload_bytes", fail_payload_bytes)
+    payload = torch.zeros(84, dtype=torch.uint8, device="cuda")
+    hidden = torch.ones(256, dtype=torch.float32, device="cuda")
+
+    out = q2_iq2_moe.deepseek_v4_q2_k_matvec(
+        payload,
+        hidden,
+        rows=1,
+        columns=256,
+    )
+
+    assert out.shape == (1,)
+    assert out.is_cuda
+    assert out.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_iq2_xxs_default_path_does_not_copy_payload_to_cpu(monkeypatch) -> None:
+    def fail_payload_bytes(_payload: torch.Tensor) -> bytes:
+        raise AssertionError("CPU fallback used")
+
+    monkeypatch.setattr(q2_iq2_moe, "_payload_bytes", fail_payload_bytes)
+    payload = torch.zeros(66, dtype=torch.uint8, device="cuda")
+    hidden = torch.ones(256, dtype=torch.float32, device="cuda")
+
+    out = q2_iq2_moe.deepseek_v4_iq2_xxs_matvec(
+        payload,
+        hidden,
+        rows=1,
+        columns=256,
+    )
+
+    assert out.shape == (1,)
+    assert out.is_cuda
+    assert out.dtype == torch.float32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -56,7 +99,13 @@ def test_q2_iq2_matvec_matches_reference_decoded_matrix(
     payload = block_payload * rows
     hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
 
-    actual = matvec(_cuda_payload(payload), hidden, rows=rows, columns=columns)
+    actual = matvec(
+        _cuda_payload(payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+        use_triton=False,
+    )
     matrix = decoder(payload, rows=rows, columns=columns).to(device="cuda")
     expected = matrix.matmul(hidden)
 

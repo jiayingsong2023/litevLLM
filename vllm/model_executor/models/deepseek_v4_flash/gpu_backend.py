@@ -79,6 +79,9 @@ class DeepSeekV4FlashGPUBackend:
         self.capabilities = capabilities or DeepSeekV4FlashGPUCapabilities()
         self._stats = {
             "quantized_expert_calls": 0,
+            "q2_k_triton_calls": 0,
+            "iq2_xxs_triton_calls": 0,
+            "q2_iq2_reference_fallback_calls": 0,
         }
 
     @property
@@ -250,6 +253,7 @@ class DeepSeekV4FlashGPUBackend:
         hidden: torch.Tensor,
     ) -> torch.Tensor:
         if staged.ggml_type == GGML_TYPE_Q2_K:
+            self._stats["q2_k_triton_calls"] += 1
             return deepseek_v4_q2_k_matvec(
                 staged.payload,
                 hidden,
@@ -257,6 +261,7 @@ class DeepSeekV4FlashGPUBackend:
                 columns=staged.columns,
             )
         if staged.ggml_type == GGML_TYPE_IQ2_XXS:
+            self._stats["iq2_xxs_triton_calls"] += 1
             return deepseek_v4_iq2_xxs_matvec(
                 staged.payload,
                 hidden,

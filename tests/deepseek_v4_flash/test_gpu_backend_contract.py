@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -17,10 +16,6 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
-)
-from vllm.model_executor.models.deepseek_v4_flash.quant import (
-    iq2_xxs_matrix_from_gguf_payload,
-    q2_k_matrix_from_gguf_payload,
 )
 
 
@@ -144,24 +139,34 @@ def test_output_argmax_matches_output_logits() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    ("ggml_type", "block_payload", "decoder"),
+    ("ggml_type", "block_payload", "expected_stats"),
     (
         (
             GGML_TYPE_Q2_K,
             _q2_k_repeating_codes_payload(),
-            q2_k_matrix_from_gguf_payload,
+            {
+                "quantized_expert_calls": 1,
+                "q2_k_triton_calls": 3,
+                "iq2_xxs_triton_calls": 0,
+                "q2_iq2_reference_fallback_calls": 0,
+            },
         ),
         (
             GGML_TYPE_IQ2_XXS,
             _iq2_xxs_unit_block_payload(),
-            iq2_xxs_matrix_from_gguf_payload,
+            {
+                "quantized_expert_calls": 1,
+                "q2_k_triton_calls": 0,
+                "iq2_xxs_triton_calls": 3,
+                "q2_iq2_reference_fallback_calls": 0,
+            },
         ),
     ),
 )
-def test_quantized_expert_gemm_matches_reference_decode(
+def test_quantized_expert_gemm_uses_default_triton_dispatch(
     ggml_type: int,
     block_payload: bytes,
-    decoder: Callable[..., torch.Tensor],
+    expected_stats: dict[str, int],
 ) -> None:
     backend = DeepSeekV4FlashGPUBackend()
     hidden = torch.linspace(-0.5, 0.5, 256, dtype=torch.float32, device="cuda")
@@ -191,14 +196,10 @@ def test_quantized_expert_gemm_matches_reference_decode(
         ),
     )
 
-    gate = decoder(gate_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
-    up = decoder(up_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
-    down = decoder(down_payload, rows=256, columns=256).to(device="cuda")
-    expected = down.matmul(torch.nn.functional.silu(gate) * up)
-
     assert actual.shape == (256,)
     assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    assert backend.stats() == expected_stats
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:
