@@ -87,11 +87,13 @@ def test_phase4_metrics_schema_is_stable() -> None:
         gpu_backend={
             "q2_k_triton_calls": 2,
             "iq2_xxs_triton_calls": 3,
+            "iq2_xxs_gate_up_fused_calls": 5,
             "q2_iq2_reference_fallback_calls": 4,
         },
     )
 
     assert metrics == {
+        "iq2_xxs_gate_up_fused_calls": 5,
         "iq2_xxs_triton_calls": 3,
         "q2_iq2_reference_fallback_calls": 4,
         "q2_k_triton_calls": 2,
@@ -102,7 +104,39 @@ def test_phase4_metrics_defaults_missing_backend_counters_to_zero() -> None:
     metrics = smoke.phase4_metrics(profile={}, gpu_staging={}, gpu_backend={})
 
     assert metrics == {
+        "iq2_xxs_gate_up_fused_calls": 0,
         "iq2_xxs_triton_calls": 0,
         "q2_iq2_reference_fallback_calls": 0,
         "q2_k_triton_calls": 0,
+    }
+
+
+def test_usable_inference_metrics_schema_is_stable() -> None:
+    metrics = smoke.usable_inference_metrics(
+        profile={"counters": {"deepseek_prefetch_failures": 2}},
+        gpu_staging={
+            "lru_evictions": 3,
+            "pinned_entries": 4,
+            "prefetch_failures": 5,
+            "prefetch_hits": 6,
+            "prefetch_misses": 7,
+            "routed_expert_id_materializations": 8,
+            "streamed_bytes": 9,
+        },
+        gpu_backend={
+            "iq2_xxs_gate_up_fused_calls": 10,
+            "q2_iq2_reference_fallback_calls": 11,
+        },
+    )
+
+    assert metrics == {
+        "iq2_xxs_gate_up_fused_calls": 10,
+        "lru_evictions": 3,
+        "pinned_entries": 4,
+        "prefetch_failures": 7,
+        "prefetch_hits": 6,
+        "prefetch_misses": 7,
+        "q2_iq2_reference_fallback_calls": 11,
+        "routed_expert_id_materializations": 8,
+        "streamed_bytes": 9,
     }

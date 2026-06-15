@@ -95,9 +95,41 @@ def phase4_metrics(
     return {
         "q2_k_triton_calls": int(gpu_backend.get("q2_k_triton_calls", 0)),
         "iq2_xxs_triton_calls": int(gpu_backend.get("iq2_xxs_triton_calls", 0)),
+        "iq2_xxs_gate_up_fused_calls": int(
+            gpu_backend.get("iq2_xxs_gate_up_fused_calls", 0)
+        ),
         "q2_iq2_reference_fallback_calls": int(
             gpu_backend.get("q2_iq2_reference_fallback_calls", 0)
         ),
+    }
+
+
+def usable_inference_metrics(
+    *,
+    profile: dict[str, object],
+    gpu_staging: dict[str, object],
+    gpu_backend: dict[str, object],
+) -> dict[str, int]:
+    counters = profile.get("counters", {})
+    if not isinstance(counters, dict):
+        counters = {}
+    return {
+        "iq2_xxs_gate_up_fused_calls": int(
+            gpu_backend.get("iq2_xxs_gate_up_fused_calls", 0)
+        ),
+        "lru_evictions": int(gpu_staging.get("lru_evictions", 0)),
+        "pinned_entries": int(gpu_staging.get("pinned_entries", 0)),
+        "prefetch_failures": int(gpu_staging.get("prefetch_failures", 0))
+        + int(counters.get("deepseek_prefetch_failures", 0)),
+        "prefetch_hits": int(gpu_staging.get("prefetch_hits", 0)),
+        "prefetch_misses": int(gpu_staging.get("prefetch_misses", 0)),
+        "q2_iq2_reference_fallback_calls": int(
+            gpu_backend.get("q2_iq2_reference_fallback_calls", 0)
+        ),
+        "routed_expert_id_materializations": int(
+            gpu_staging.get("routed_expert_id_materializations", 0)
+        ),
+        "streamed_bytes": int(gpu_staging.get("streamed_bytes", 0)),
     }
 
 
@@ -179,6 +211,11 @@ def main() -> int:
                 gpu_backend=gpu_backend,
             ),
             "phase4_metrics": phase4_metrics(
+                profile=profile,
+                gpu_staging=gpu_staging,
+                gpu_backend=gpu_backend,
+            ),
+            "usable_inference_metrics": usable_inference_metrics(
                 profile=profile,
                 gpu_staging=gpu_staging,
                 gpu_backend=gpu_backend,

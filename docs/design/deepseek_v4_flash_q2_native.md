@@ -290,6 +290,80 @@ path is still not production speed. Remaining hot spots are now more explicit:
   cross-layer prefetch, lower-churn LRU admission, output projection
   optimization, and a true single-launch gate/up fused kernel.
 
+### Usable Inference Optimization Pass Notes
+
+The usable-inference pass after Phase 4 added several performance facilities:
+
+- Cache admission policy for stream-only grouped experts, so low-reuse entries
+  can avoid polluting the resident cache.
+- Bounded hot expert warmup via `prepare_deepseek_hot_experts()`.
+- Next-layer expert prefetch scheduling for predictable hash-routed integer
+  token steps.
+- Cached expert-token routing tables and explicit
+  `routed_expert_id_materializations` accounting for the remaining bounded
+  top-k CPU materialization.
+- Greedy output path support for returning `(token, value)` per output chunk,
+  avoiding full chunk logits materialization when the backend provides
+  `output_argmax_with_value()`.
+- A single-launch IQ2 gate/up/SILU prototype for `columns==256`, with
+  `iq2_xxs_gate_up_fused_calls` exposed in backend stats.
+- Smoke-tool `usable_inference_metrics` covering pinned entries, stream bytes,
+  prefetch counters, routed expert id materialization, fused IQ2 calls, and
+  Q2/IQ2 fallback calls.
+
+Recorded usable-pass one-token smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 2400s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 1 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-usable-one.json
+```
+
+Result:
+
+- `runs[0].elapsed_ms=432429.125`
+- `tokens_per_second=0.0023125176871469978`
+- output token ids `[1, 32974]`
+- `gpu_backend.quantized_expert_calls=258`
+- `phase4_metrics.iq2_xxs_triton_calls=516`
+- `phase4_metrics.iq2_xxs_gate_up_fused_calls=0`
+- `phase4_metrics.q2_iq2_reference_fallback_calls=0`
+- `gpu_staging.loaded_bytes=46446420316`
+- `gpu_staging.prefetch_misses=36`
+- `gpu_staging.prefetch_hits=0`
+- `gpu_staging.routed_expert_id_materializations=43`
+- `gpu_staging.lru_evictions=0`
+- `usable_inference_metrics.streamed_bytes=0`
+- `output_projection` event was roughly `44767 ms`
+- `generate_greedy_kernel` elapsed roughly `432423 ms`
+
+This pass did not reach the local usability target. The one-token result is
+slower than the recorded Phase 4 one-token run, and the fused IQ2 gate/up
+prototype did not execute on the target GGUF path. The likely reason is that
+the observed real expert shapes do not match the prototype's current
+`columns==256` dispatch condition, so backend execution still reports the same
+516 IQ2 matvec calls as Phase 4.
+
+The next required performance work is therefore narrower than the original
+usable pass:
+
+- Inspect real routed expert payload shapes from the target GGUF and extend the
+  fused IQ2 gate/up activation kernel to the actual hidden/intermediate shape.
+- Make prefetch useful for tensor-token continuation without introducing a
+  device-to-host token sync, or keep a small GPU-resident routing prediction
+  cache.
+- Reduce the first output projection cost beyond the Python-level
+  `(token, value)` interface; the current helper still computes projection
+  through the existing PyTorch path inside each chunk.
+- Apply a real hot-expert policy before smoke runs so `pinned_entries` is
+  non-zero and repeated decode avoids long-tail cache churn.
+- Re-run max-8 only after one-token cold path improves, because the current
+  one-token timing predicts another very long max-8 run.
+
 Task 8 validation results recorded from the bounded run:
 
 - `timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q`
