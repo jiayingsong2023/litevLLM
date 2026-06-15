@@ -54,3 +54,27 @@ def test_write_json_creates_parent_directory(tmp_path: Path) -> None:
     smoke.write_json(output_path, {"ok": True})
 
     assert json.loads(output_path.read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_phase3_metrics_schema_is_stable() -> None:
+    metrics = smoke.phase3_metrics(
+        profile={"counters": {"deepseek_prefetch_failures": 1}},
+        gpu_staging={
+            "lru_evictions": 2,
+            "streamed_bytes": 3,
+            "prefetch_hits": 4,
+            "prefetch_misses": 5,
+            "prefetch_failures": 6,
+        },
+        gpu_backend={"quantized_expert_calls": 7},
+    )
+
+    assert metrics == {
+        "cpu_sync_points": 0,
+        "lru_evictions": 2,
+        "prefetch_failures": 7,
+        "prefetch_hits": 4,
+        "prefetch_misses": 5,
+        "quantized_expert_calls": 7,
+        "streamed_bytes": 3,
+    }

@@ -77,6 +77,9 @@ class DeepSeekV4FlashGPUBackend:
         capabilities: DeepSeekV4FlashGPUCapabilities | None = None,
     ) -> None:
         self.capabilities = capabilities or DeepSeekV4FlashGPUCapabilities()
+        self._stats = {
+            "quantized_expert_calls": 0,
+        }
 
     @property
     def is_ready(self) -> bool:
@@ -90,6 +93,9 @@ class DeepSeekV4FlashGPUBackend:
         if not self.is_ready:
             missing = ", ".join(self.missing_kernels)
             raise RuntimeError(f"DeepSeek V4 Flash missing GPU kernels: {missing}")
+
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
 
     def output_logits(
         self,
@@ -233,6 +239,7 @@ class DeepSeekV4FlashGPUBackend:
         up_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
         down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
     ) -> torch.Tensor:
+        self._stats["quantized_expert_calls"] += 1
         gate = self._quantized_expert_matvec(gate_payload, hidden)
         up = self._quantized_expert_matvec(up_payload, hidden)
         return self._quantized_expert_matvec(down_payload, F.silu(gate) * up)

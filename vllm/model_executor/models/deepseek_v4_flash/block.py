@@ -166,7 +166,11 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
         *,
         attention: bool,
     ):
-        hc = layer.attention_hyper_connection if attention else layer.ffn_hyper_connection
+        hc = (
+            layer.attention_hyper_connection
+            if attention
+            else layer.ffn_hyper_connection
+        )
         if hc is None:
             raise RuntimeError("sliding layer requires hyper-connection tensors")
         return hyper_connection_pre_reference(
@@ -204,7 +208,10 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
         hidden: torch.Tensor,
         token_idx: int,
     ) -> torch.Tensor:
-        if layer.attention_key_value is None or layer.attention_key_value_a_norm is None:
+        if (
+            layer.attention_key_value is None
+            or layer.attention_key_value_a_norm is None
+        ):
             raise RuntimeError("sliding layer requires KV latent tensors")
         kv = latent_kv_projection_reference(
             hidden,
@@ -433,7 +440,10 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
                     attn_input,
                     index_rows,
                 )
-                selected = cache.read_compressed(self.layer_idx, row_indices=row_indices)
+                selected = cache.read_compressed(
+                    self.layer_idx,
+                    row_indices=row_indices,
+                )
             else:
                 selected = compressed_rows
             kv_rows = torch.cat([kv_rows, selected], dim=0)
@@ -551,7 +561,10 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
         )
         qr_norm = rms_norm_reference(
             qr,
-            self.store.tensor_to_torch(layer.attention_query_a_norm, dtype=torch.float32),
+            self.store.tensor_to_torch(
+                layer.attention_query_a_norm,
+                dtype=torch.float32,
+            ),
         )
         index_query = indexer_query_projection_reference(
             qr_norm,
@@ -568,7 +581,9 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
         return indexer_topk_reference(scores, top_k=top_k)
 
 
-class DeepSeekV4FlashLayer2ReferenceRunner(DeepSeekV4FlashCompressedLayerReferenceRunner):
+class DeepSeekV4FlashLayer2ReferenceRunner(
+    DeepSeekV4FlashCompressedLayerReferenceRunner
+):
     def __init__(
         self,
         store: DeepSeekV4FlashWeightStore,

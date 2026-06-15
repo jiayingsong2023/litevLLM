@@ -142,6 +142,64 @@ RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correct
 The maintained helper `tests/run_deepseek_v4_flash_real_smoke.sh` runs the two
 bounded smoke commands and intentionally stays outside the fast regression suite.
 
+### Phase 3 Performance Notes
+
+The Phase 3 implementation adds the next layer of performance plumbing without
+claiming final kernel speed:
+
+- `DeepSeekV4FlashGPUWeightStager` now uses deterministic LRU accounting,
+  tracks `lru_evictions` and `streamed_bytes`, and supports pinned hot expert
+  entries through `DeepSeekV4FlashHotExpertPolicy`.
+- Grouped expert tensors can expose raw GGUF expert payload slices without first
+  CPU-decoding the full matrix. The stager can cache those raw `uint8` payloads
+  on CUDA and reuse them by cache key.
+- Routed MoE now prefers the raw quantized expert backend path and falls back to
+  decoded dense expert GEMM only when the raw path is unavailable.
+- `DeepSeekV4FlashExpertPrefetchRequest` and
+  `prefetch_grouped_experts()` provide async-prefetch scaffolding with injectable
+  CUDA streams and prefetch hit/miss/failure counters.
+- Greedy decode keeps generated-token carry on GPU by passing the scalar token
+  tensor into the next decode step instead of calling `next_token_tensor.item()`.
+- The real smoke tool now reports stable `phase3_metrics`, including
+  `lru_evictions`, `streamed_bytes`, `prefetch_hits`, `prefetch_misses`,
+  `prefetch_failures`, `quantized_expert_calls`, and `cpu_sync_points`.
+
+Important limitation: the `Q2_K` and `IQ2_XXS` expert matvec functions are
+currently GPU-facing correctness contracts, not final fused Triton kernels.
+They accept CUDA raw payload tensors, but the fallback implementation copies
+payload bytes to CPU, uses the reference GGUF decoder, moves the decoded matrix
+back to CUDA, and then runs the matvec. This validates layout, routing, and
+backend contracts, but it can be slower than the Phase 2 decoded-cache path for
+some runs. Phase 4 must replace these fallbacks with real Triton dequant-matvec
+kernels before claiming production-speed Q2/IQ2 execution.
+
+Recorded Phase 3 real-smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 2400s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 1 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-phase3-smoke-profile.json
+```
+
+Result:
+
+- `runs[0].elapsed_ms=424678.46875`
+- `tokens_per_second=0.00235472262802351`
+- output token ids `[1, 32974]`
+- `phase3_metrics.quantized_expert_calls=258`
+- `phase3_metrics.cpu_sync_points=0`
+- `gpu_staging.staged_bytes=20465981788`
+- `gpu_staging.streamed_bytes=0`
+
+The `max_tokens=8` real smoke was not repeated in this pass because the Phase 3
+Q2/IQ2 fallback decodes raw payloads through the CPU reference path per token.
+At the one-token timing above, a max-8 run is expected to take close to an hour
+until Phase 4 replaces the fallback with true fused Triton kernels.
+
 Task 8 validation results recorded from the bounded run:
 
 - `timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q`
@@ -300,11 +358,11 @@ The first implementation should keep the policy simple:
 - dynamic LRU budget with an explicit byte cap
 - no automatic top-K expert pinning until real routing statistics are available
 - an extension point for manually pinned `(layer, expert_id)` entries
-- no asynchronous prefetch requirement in the first release
+- async prefetch scaffolding that can be driven by explicit expert-id requests
 
-Static-dynamic caching and double-buffered prefetch are valid follow-up
-optimizations. They should be enabled only after the inspect and smoke paths
-can report stable expert hit/miss behavior for the target GGUF.
+Static-dynamic caching and automatic next-layer double-buffered prefetch remain
+follow-up optimizations. They should be enabled only after the inspect and smoke
+paths can report stable expert hit/miss behavior for the target GGUF.
 
 ## Quantized Kernels
 

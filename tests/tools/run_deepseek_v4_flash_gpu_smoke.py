@@ -65,6 +65,27 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     )
 
 
+def phase3_metrics(
+    *,
+    profile: dict[str, object],
+    gpu_staging: dict[str, object],
+    gpu_backend: dict[str, object],
+) -> dict[str, int]:
+    counters = profile.get("counters", {})
+    if not isinstance(counters, dict):
+        counters = {}
+    return {
+        "lru_evictions": int(gpu_staging.get("lru_evictions", 0)),
+        "streamed_bytes": int(gpu_staging.get("streamed_bytes", 0)),
+        "prefetch_hits": int(gpu_staging.get("prefetch_hits", 0)),
+        "prefetch_misses": int(gpu_staging.get("prefetch_misses", 0)),
+        "prefetch_failures": int(gpu_staging.get("prefetch_failures", 0))
+        + int(counters.get("deepseek_prefetch_failures", 0)),
+        "quantized_expert_calls": int(gpu_backend.get("quantized_expert_calls", 0)),
+        "cpu_sync_points": int(counters.get("cpu_sync_points", 0)),
+    }
+
+
 def main() -> int:
     args = parse_args()
     if args.repeat <= 0:
@@ -124,6 +145,9 @@ def main() -> int:
                     "tokens_per_second": tokens_per_second,
                 }
             )
+        profile = model.deepseek_profile()
+        gpu_staging = model.gpu_staging_memory_stats()
+        gpu_backend = model.gpu_backend.stats()
         summary = {
             "model": str(args.model),
             "context_length": args.context_length,
@@ -131,8 +155,14 @@ def main() -> int:
             "output_token_ids": output_cpu,
             "repeat": args.repeat,
             "runs": runs,
-            "profile": model.deepseek_profile(),
-            "gpu_staging": model.gpu_staging_memory_stats(),
+            "profile": profile,
+            "gpu_staging": gpu_staging,
+            "gpu_backend": gpu_backend,
+            "phase3_metrics": phase3_metrics(
+                profile=profile,
+                gpu_staging=gpu_staging,
+                gpu_backend=gpu_backend,
+            ),
             "runtime_budget": {
                 "resident_bytes": budget.resident_bytes,
                 "available_headroom_bytes": budget.available_headroom_bytes,

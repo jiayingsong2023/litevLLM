@@ -39,7 +39,9 @@ def test_deepseek_context_validator_ignores_other_models() -> None:
 
 
 def test_config_builder_detects_deepseek_v4_flash_gguf_metadata(tmp_path) -> None:
-    path = tmp_path / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+    path = tmp_path / (
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+    )
     write_minimal_deepseek_v4_flash_gguf(
         path,
         tensor_names=("token_embd.weight", "blk.0.attn_q.weight"),
@@ -49,7 +51,9 @@ def test_config_builder_detects_deepseek_v4_flash_gguf_metadata(tmp_path) -> Non
 
 
 def test_build_vllm_config_caps_deepseek_v4_flash_gguf_context(tmp_path) -> None:
-    path = tmp_path / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+    path = tmp_path / (
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+    )
     write_minimal_deepseek_v4_flash_gguf(
         path,
         tensor_names=("token_embd.weight", "blk.0.attn_q.weight"),
