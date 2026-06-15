@@ -200,6 +200,96 @@ Q2/IQ2 fallback decodes raw payloads through the CPU reference path per token.
 At the one-token timing above, a max-8 run is expected to take close to an hour
 until Phase 4 replaces the fallback with true fused Triton kernels.
 
+### Phase 4 Performance Notes
+
+Phase 4 replaces the Phase 3 CPU decode fallback for the observed
+`columns==256` Q2/IQ2 expert matvec path:
+
+- `Q2_K` raw expert payloads now have a real Triton dequant-matvec kernel for
+  the supported block shape.
+- `IQ2_XXS` raw expert payloads now have a real Triton dequant-matvec kernel
+  for the supported block shape, backed by GPU lookup tensors derived from the
+  GGUF reference tables.
+- Routed experts use the Triton path by default. Unsupported shapes now fail
+  explicitly instead of silently falling back to CPU reference decode.
+- `use_triton=False` remains available for deterministic unit/reference tests.
+- The current `deepseek_v4_iq2_xxs_gate_up()` helper launches two IQ2 matvec
+  kernels for gate and up. It is a GPU dequant-matvec path, but not yet a
+  single fused gate-up kernel.
+
+Recorded Phase 4 one-token smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 2400s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 1 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-phase4-smoke-profile.json
+```
+
+Result:
+
+- `runs[0].elapsed_ms=404740.25`
+- `tokens_per_second=0.0024707204188365254`
+- output token ids `[1, 32974]`
+- `phase4_metrics.iq2_xxs_triton_calls=516`
+- `phase4_metrics.q2_k_triton_calls=0`
+- `phase4_metrics.q2_iq2_reference_fallback_calls=0`
+- `gpu_backend.quantized_expert_calls=258`
+- `gpu_staging.loaded_bytes=46437112156`
+- `gpu_staging.lru_evictions=0`
+- first `output_projection` event was roughly `40062 ms`
+- `generate_greedy_kernel` elapsed roughly `404719 ms`
+
+Recorded Phase 4 max-8 smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 7200s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 8 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-phase4-max8-profile.json
+```
+
+Result:
+
+- `runs[0].elapsed_ms=670454.0`
+- `tokens_per_second=0.011932213097393706`
+- output token ids `[1, 32974, 40359, 81258, 860, 860, 860, 860, 860]`
+- `phase4_metrics.iq2_xxs_triton_calls=4128`
+- `phase4_metrics.q2_k_triton_calls=0`
+- `phase4_metrics.q2_iq2_reference_fallback_calls=0`
+- `gpu_backend.quantized_expert_calls=2064`
+- `gpu_staging.loaded_bytes=137982077276`
+- `gpu_staging.lru_evictions=4271`
+- `gpu_staging.staged_bytes=61303908700`
+- `gpu_staging.max_staged_bytes=61312033792`
+- `generate_greedy_kernel` elapsed roughly `670429 ms`
+
+The target GGUF real-smoke path exercised IQ2 expert matvec calls and no
+reference fallback calls. `Q2_K` is covered by synthetic kernel correctness
+tests, but the recorded target smoke did not route through a `Q2_K` expert
+matvec path.
+
+Phase 4 removes the largest correctness-only CPU quantization fallback, but the
+path is still not production speed. Remaining hot spots are now more explicit:
+
+- Cold one-token execution still spends minutes staging roughly 46GB of decoded
+  or raw payload state.
+- Max-8 decode reaches the 61.3GB staging budget and triggers thousands of LRU
+  evictions, loading roughly 138GB cumulatively for one request.
+- The first output projection still costs tens of seconds; later output
+  projection events are roughly 90ms after chunk caches are warm.
+- Early layer events are dominated by staging, JIT, and cache warming; warm
+  per-layer events become much smaller after resident state is available.
+- Next performance work should prioritize hot-expert pinning, useful
+  cross-layer prefetch, lower-churn LRU admission, output projection
+  optimization, and a true single-launch gate/up fused kernel.
+
 Task 8 validation results recorded from the bounded run:
 
 - `timeout 600 uv run --no-sync pytest tests/deepseek_v4_flash/test_model_forward_real_smoke.py tests/deepseek_v4_flash/test_model_smoke_no_weights.py tests/deepseek_v4_flash/test_model_loader_route.py -q`
