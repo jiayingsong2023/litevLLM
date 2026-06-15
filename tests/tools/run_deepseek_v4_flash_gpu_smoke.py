@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from time import perf_counter
 
 import torch
 
@@ -165,6 +166,7 @@ def main() -> int:
         for run_idx in range(args.repeat):
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
+            start_wall = perf_counter()
             start_event.record()
             output_ids = model.generate_greedy_kernel(
                 input_ids,
@@ -172,7 +174,13 @@ def main() -> int:
             )
             end_event.record()
             torch.cuda.synchronize()
-            elapsed_ms = float(start_event.elapsed_time(end_event))
+            wall_elapsed_ms = (perf_counter() - start_wall) * 1000.0
+            cuda_elapsed_ms = float(start_event.elapsed_time(end_event))
+            elapsed_ms = (
+                cuda_elapsed_ms
+                if cuda_elapsed_ms > 0.0
+                else wall_elapsed_ms
+            )
             output_cpu = [
                 int(token) for token in output_ids.detach().cpu().tolist()
             ]
@@ -187,9 +195,11 @@ def main() -> int:
             runs.append(
                 {
                     "run_idx": run_idx,
+                    "cuda_elapsed_ms": cuda_elapsed_ms,
                     "elapsed_ms": elapsed_ms,
                     "output_token_ids": output_cpu,
                     "tokens_per_second": tokens_per_second,
+                    "wall_elapsed_ms": wall_elapsed_ms,
                 }
             )
         profile = model.deepseek_profile()

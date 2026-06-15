@@ -371,12 +371,12 @@ metadata without decoding weights. The observed routed expert shapes are:
 
 | Projection | GGML type | Rows | Columns | Column blocks |
 | :--- | :--- | ---: | ---: | ---: |
-| gate | `IQ2_XXS` (`16`) | `4096` | `2048` | `8` |
-| up | `IQ2_XXS` (`16`) | `4096` | `2048` | `8` |
-| down | `Q2_K` (`10`) | `2048` | `4096` | `16` |
+| gate | `IQ2_XXS` (`16`) | `2048` | `4096` | `16` |
+| up | `IQ2_XXS` (`16`) | `2048` | `4096` | `16` |
+| down | `Q2_K` (`10`) | `4096` | `2048` | `8` |
 
 This confirmed why the original fused gate/up prototype did not execute: it
-only accepted `columns==256`, while real gate/up tensors use eight 256-column
+only accepted `columns==256`, while real gate/up tensors use sixteen 256-column
 GGUF blocks per row.
 
 The fused IQ2 gate/up activation helper now supports `columns == 256 * N` and
@@ -417,7 +417,52 @@ gate/up for every routed expert call, and the previous 516 separate IQ2
 gate/up matvec calls disappear. Throughput did not improve because the cold
 path remains dominated by staging, Q2_K down projection, per-layer overhead,
 and output projection. The next narrow kernel target should be the real down
-projection shape: `Q2_K rows=2048, columns=4096`.
+projection shape: `Q2_K rows=4096, columns=2048`.
+
+### Real Q2_K Down Multi-Block Notes
+
+The follow-up down-projection pass extended the `Q2_K` Triton matvec path from
+single-block rows to `columns == 256 * N`. This matches the routed expert down
+projection payloads observed in the target GGUF file:
+`Q2_K rows=4096, columns=2048, column_blocks=8`.
+
+Recorded real Q2 down one-token smoke command:
+
+```bash
+timeout --foreground --kill-after=60s 2400s \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  --context-length 4096 \
+  --max-tokens 1 \
+  --repeat 1 \
+  --profile-json /tmp/deepseek-v4-flash-q2-down-one.json
+```
+
+Result:
+
+- output token ids `[1, 32974]`
+- `gpu_backend.quantized_expert_calls=258`
+- `phase4_metrics.iq2_xxs_gate_up_fused_calls=258`
+- `phase4_metrics.iq2_xxs_triton_calls=0`
+- `phase4_metrics.q2_k_triton_calls=258`
+- `phase4_metrics.q2_iq2_reference_fallback_calls=0`
+- `gpu_staging.loaded_bytes=20475289948`
+- `gpu_staging.staged_bytes=20475289948`
+- `gpu_staging.grouped_entries=774`
+- `gpu_staging.prefetch_hits=0`
+- `gpu_staging.prefetch_misses=36`
+- `gpu_staging.routed_expert_id_materializations=43`
+- `output_projection` event was roughly `49693 ms`
+- `generate_greedy_kernel` elapsed roughly `357631 ms`
+
+This pass met the narrow kernel target: real GGUF gate/up and down expert
+payloads now all enter Triton-backed quantized expert paths with zero
+`q2_iq2_reference_fallback_calls`. The profile improved from roughly
+`433223 ms` to `357631 ms` for the same one-token cold smoke, and staged bytes
+dropped from roughly `46.4 GB` to `20.5 GB`. The path is still not usable for
+interactive serving. The next bottlenecks are the full-vocab output projection
+at roughly `50 s`, remaining per-layer overhead, and the fact that expert
+prefetch still records zero hits on the cold smoke.
 
 Task 8 validation results recorded from the bounded run:
 
