@@ -292,11 +292,9 @@ def deepseek_v4_q2_k_matvec(
             columns=columns,
         )
     if columns != _GGUF_BLOCK_COLUMNS:
-        return _q2_k_matvec_reference_cuda(
-            payload,
-            hidden,
-            rows=rows,
-            columns=columns,
+        raise NotImplementedError(
+            "DeepSeek V4 Q2_K Triton matvec currently supports columns=256; "
+            f"got {columns}. Pass use_triton=False for the reference fallback."
         )
     return _q2_k_matvec_triton_cuda(payload, hidden_f32, rows=rows)
 
@@ -340,11 +338,9 @@ def deepseek_v4_iq2_xxs_matvec(
             columns=columns,
         )
     if columns != _GGUF_BLOCK_COLUMNS:
-        return _iq2_xxs_matvec_reference_cuda(
-            payload,
-            hidden,
-            rows=rows,
-            columns=columns,
+        raise NotImplementedError(
+            "DeepSeek V4 IQ2_XXS Triton matvec currently supports columns=256; "
+            f"got {columns}. Pass use_triton=False for the reference fallback."
         )
     return _iq2_xxs_matvec_triton_cuda(payload, hidden_f32, rows=rows)
 
@@ -376,19 +372,9 @@ def deepseek_v4_iq2_xxs_gate_up(
     )
     hidden_f32 = _validate_hidden(hidden, columns=columns)
     if columns != _GGUF_BLOCK_COLUMNS:
-        return (
-            _iq2_xxs_matvec_reference_cuda(
-                gate_payload,
-                hidden,
-                rows=rows,
-                columns=columns,
-            ),
-            _iq2_xxs_matvec_reference_cuda(
-                up_payload,
-                hidden,
-                rows=rows,
-                columns=columns,
-            ),
+        raise NotImplementedError(
+            "DeepSeek V4 IQ2_XXS gate/up Triton helper currently supports "
+            f"columns=256; got {columns}"
         )
     return (
         _iq2_xxs_matvec_triton_cuda(gate_payload, hidden_f32, rows=rows),

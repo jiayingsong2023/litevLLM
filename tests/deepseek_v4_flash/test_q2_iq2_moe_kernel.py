@@ -257,3 +257,15 @@ def test_q2_matvec_requires_cuda_payload() -> None:
 
     with pytest.raises(ValueError, match="payload must be a CUDA tensor"):
         deepseek_v4_q2_k_matvec(payload, hidden, rows=1, columns=256)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_q2_iq2_default_triton_path_rejects_multi_block_columns() -> None:
+    q2_payload = _cuda_payload(_q2_k_repeating_codes_payload() * 2)
+    iq2_payload = _cuda_payload(_iq2_xxs_unit_block_payload() * 2)
+    hidden = torch.ones((512,), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(NotImplementedError, match="Q2_K Triton matvec"):
+        deepseek_v4_q2_k_matvec(q2_payload, hidden, rows=1, columns=512)
+    with pytest.raises(NotImplementedError, match="IQ2_XXS Triton matvec"):
+        deepseek_v4_iq2_xxs_matvec(iq2_payload, hidden, rows=1, columns=512)
