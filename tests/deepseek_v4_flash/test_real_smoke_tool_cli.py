@@ -109,10 +109,10 @@ def test_shape_inspector_schema_uses_grouped_expert_dims() -> None:
         "projection": "gate",
         "tensor_name": "blk.2.ffn_gate_exps.weight",
         "ggml_type": GGML_TYPE_IQ2_XXS,
-        "rows": 2048,
-        "columns": 512,
+        "rows": 512,
+        "columns": 2048,
         "expert_count": 256,
-        "columns_blocks": 2,
+        "columns_blocks": 8,
         "nbytes_per_expert": 2048 * 2 * 66,
     }
 

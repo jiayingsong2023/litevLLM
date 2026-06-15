@@ -62,10 +62,10 @@ def expert_shape_record(
         "projection": projection,
         "tensor_name": tensor.name,
         "ggml_type": tensor.tensor_type,
-        "rows": input_size,
-        "columns": output_size,
+        "rows": output_size,
+        "columns": input_size,
         "expert_count": expert_count,
-        "columns_blocks": output_size // _GGUF_BLOCK_COLUMNS,
+        "columns_blocks": input_size // _GGUF_BLOCK_COLUMNS,
         "nbytes_per_expert": ggml_tensor_nbytes(
             (input_size, output_size),
             tensor.tensor_type,
