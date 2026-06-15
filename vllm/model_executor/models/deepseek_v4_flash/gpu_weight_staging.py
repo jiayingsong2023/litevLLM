@@ -8,7 +8,11 @@ from typing import Protocol
 
 import torch
 
-from .expert_cache import DeepSeekV4FlashCacheKey, DeepSeekV4FlashHotExpertPolicy
+from .expert_cache import (
+    DeepSeekV4FlashCacheKey,
+    DeepSeekV4FlashExpertPrefetchRequest,
+    DeepSeekV4FlashHotExpertPolicy,
+)
 from .gguf_reader import DeepSeekV4FlashTensor
 from .weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
@@ -94,6 +98,9 @@ class DeepSeekV4FlashGPUWeightStager:
             "grouped_misses": 0,
             "loaded_bytes": 0,
             "lru_evictions": 0,
+            "prefetch_failures": 0,
+            "prefetch_hits": 0,
+            "prefetch_misses": 0,
             "streamed_bytes": 0,
         }
 
@@ -136,6 +143,15 @@ class DeepSeekV4FlashGPUWeightStager:
 
     def cache_stats(self) -> dict[str, int]:
         return dict(self._cache_stats)
+
+    def _record_prefetch_delta(self, before_stats: dict[str, int]) -> None:
+        after_stats = self._cache_stats
+        self._cache_stats["prefetch_hits"] += (
+            after_stats["grouped_hits"] - before_stats["grouped_hits"]
+        )
+        self._cache_stats["prefetch_misses"] += (
+            after_stats["grouped_misses"] - before_stats["grouped_misses"]
+        )
 
     @staticmethod
     def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -548,6 +564,55 @@ class DeepSeekV4FlashGPUWeightStager:
             columns=raw.columns,
             payload=staged,
         )
+
+    def prefetch_grouped_experts(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        request: DeepSeekV4FlashExpertPrefetchRequest,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        if stream is None:
+            self._prefetch_grouped_experts(tensors, request)
+            return
+        with torch.cuda.stream(stream):
+            self._prefetch_grouped_experts(tensors, request)
+
+    def _prefetch_grouped_experts(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        request: DeepSeekV4FlashExpertPrefetchRequest,
+    ) -> None:
+        try:
+            for expert_id in request.expert_ids:
+                before_stats = self.cache_stats()
+                try:
+                    self.stage_grouped_expert_payload(
+                        tensors.gate,
+                        expert_id,
+                        layer_idx=request.layer_idx,
+                    )
+                    self.stage_grouped_expert_payload(
+                        tensors.up,
+                        expert_id,
+                        layer_idx=request.layer_idx,
+                    )
+                    self.stage_grouped_expert_payload(
+                        tensors.down,
+                        expert_id,
+                        layer_idx=request.layer_idx,
+                    )
+                except (AttributeError, NotImplementedError):
+                    self.stage_grouped_expert(
+                        tensors,
+                        expert_id,
+                        layer_idx=request.layer_idx,
+                    )
+                finally:
+                    self._record_prefetch_delta(before_stats)
+        except Exception:
+            self._cache_stats["prefetch_failures"] += 1
+            raise
 
     def stage_grouped_expert(
         self,

@@ -18,6 +18,7 @@ from .config import (
     DeepSeekV4FlashShape,
     layer_compress_ratio,
 )
+from .expert_cache import DeepSeekV4FlashExpertPrefetchRequest
 from .gguf_reader import (
     GGML_TYPE_F16,
     GGML_TYPE_F32,
@@ -36,7 +37,10 @@ from .gpu_runtime import (
 from .gpu_weight_staging import DeepSeekV4FlashGPUWeightStager
 from .profiler import DeepSeekV4FlashProfiler
 from .quant import q8_0_matrix_from_gguf_payload, q8_0_matvec
-from .weight_store import DeepSeekV4FlashWeightStore
+from .weight_store import (
+    DeepSeekV4FlashGroupedExpertTensors,
+    DeepSeekV4FlashWeightStore,
+)
 
 _RMS_NORM_EPS = 1e-6
 _Q8_0_BLOCK_SIZE = 32
@@ -107,6 +111,25 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     def _sync_deepseek_profile_device(self) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
+    def _prefetch_grouped_experts_best_effort(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        layer: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: tuple[int, ...],
+        *,
+        layer_idx: int,
+    ) -> None:
+        try:
+            stager.prefetch_grouped_experts(
+                layer,
+                DeepSeekV4FlashExpertPrefetchRequest(
+                    layer_idx=layer_idx,
+                    expert_ids=expert_ids,
+                ),
+            )
+        except Exception:
+            self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
 
     def forward(
         self,

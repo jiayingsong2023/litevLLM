@@ -114,6 +114,9 @@ def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
         "grouped_misses": 1,
         "loaded_bytes": 48,
         "lru_evictions": 0,
+        "prefetch_failures": 0,
+        "prefetch_hits": 0,
+        "prefetch_misses": 0,
         "streamed_bytes": 0,
     }
 
@@ -202,6 +205,9 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "loaded_bytes": 24,
         "lru_evictions": 0,
         "pinned_entries": 0,
+        "prefetch_failures": 0,
+        "prefetch_hits": 0,
+        "prefetch_misses": 0,
         "streamed_bytes": 0,
     }
 
