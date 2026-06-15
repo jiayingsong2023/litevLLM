@@ -192,6 +192,7 @@ def test_output_argmax_matches_output_logits() -> None:
                 "quantized_expert_calls": 1,
                 "q2_k_triton_calls": 3,
                 "iq2_xxs_triton_calls": 0,
+                "iq2_xxs_gate_up_fused_calls": 0,
                 "q2_iq2_reference_fallback_calls": 0,
             },
         ),
@@ -201,7 +202,8 @@ def test_output_argmax_matches_output_logits() -> None:
             {
                 "quantized_expert_calls": 1,
                 "q2_k_triton_calls": 0,
-                "iq2_xxs_triton_calls": 3,
+                "iq2_xxs_triton_calls": 1,
+                "iq2_xxs_gate_up_fused_calls": 1,
                 "q2_iq2_reference_fallback_calls": 0,
             },
         ),
@@ -311,7 +313,8 @@ def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down(
     assert backend.stats() == {
         "quantized_expert_calls": 1,
         "q2_k_triton_calls": 1,
-        "iq2_xxs_triton_calls": 2,
+        "iq2_xxs_triton_calls": 0,
+        "iq2_xxs_gate_up_fused_calls": 1,
         "q2_iq2_reference_fallback_calls": 0,
     }
 

@@ -9,6 +9,7 @@ import torch
 from vllm.kernels.triton.deepseek_v4_flash import q2_iq2_moe
 from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
+    deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_q2_k_matvec,
 )
@@ -248,6 +249,36 @@ def test_iq2_xxs_gate_up_default_triton_matches_reference_decoded_matrix() -> No
     assert up.dtype == torch.float32
     torch.testing.assert_close(gate, expected_gate, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(up, expected_up, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_iq2_xxs_gate_up_activation_matches_two_matvec_reference() -> None:
+    rows = 4
+    columns = 256
+    gate_payload = _iq2_xxs_deterministic_payload(rows)
+    up_payload = _iq2_xxs_deterministic_payload(rows)
+    hidden = torch.linspace(-0.75, 0.9, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_iq2_xxs_gate_up_activation(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    gate, up = deepseek_v4_iq2_xxs_gate_up(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    expected = torch.nn.functional.silu(gate) * up
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

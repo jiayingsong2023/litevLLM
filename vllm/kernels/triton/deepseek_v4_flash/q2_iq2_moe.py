@@ -181,6 +181,94 @@ def _iq2_xxs_matvec_kernel(
     tl.store(output_ptr + row, total)
 
 
+# GGUF IQ2_XXS fused gate/up row layout: gate and up each use the 66-byte
+# one-row block described above. One Triton program handles one output row,
+# decodes both payload rows against the same contiguous 256-lane hidden vector,
+# reduces two fp32 dot products, applies SiLU to the gate dot, multiplies by
+# the up dot, and stores one activated intermediate value.
+@triton.jit
+def _iq2_xxs_gate_up_activation_kernel(
+    gate_payload_ptr,
+    gate_payload_half_ptr,
+    up_payload_ptr,
+    up_payload_half_ptr,
+    hidden_ptr,
+    ksigns_ptr,
+    grid_ptr,
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 32
+    group_lane = offsets - group * 32
+    grid_byte_slot = group_lane // 8
+    grid_lane = group_lane - grid_byte_slot * 8
+
+    payload_base = row * BLOCK_BYTES
+    group_offset = 2 + group * 8
+    metadata_offset = payload_base + group_offset
+
+    gate_grid_bytes = tl.load(
+        gate_payload_ptr + metadata_offset + grid_byte_slot
+    ).to(tl.uint32)
+    up_grid_bytes = tl.load(up_payload_ptr + metadata_offset + grid_byte_slot).to(
+        tl.uint32
+    )
+
+    gate_word_byte0 = tl.load(gate_payload_ptr + metadata_offset + 4).to(tl.uint32)
+    gate_word_byte1 = tl.load(gate_payload_ptr + metadata_offset + 5).to(tl.uint32)
+    gate_word_byte2 = tl.load(gate_payload_ptr + metadata_offset + 6).to(tl.uint32)
+    gate_word_byte3 = tl.load(gate_payload_ptr + metadata_offset + 7).to(tl.uint32)
+    gate_sign_scale = (
+        gate_word_byte0
+        | (gate_word_byte1 << 8)
+        | (gate_word_byte2 << 16)
+        | (gate_word_byte3 << 24)
+    )
+
+    up_word_byte0 = tl.load(up_payload_ptr + metadata_offset + 4).to(tl.uint32)
+    up_word_byte1 = tl.load(up_payload_ptr + metadata_offset + 5).to(tl.uint32)
+    up_word_byte2 = tl.load(up_payload_ptr + metadata_offset + 6).to(tl.uint32)
+    up_word_byte3 = tl.load(up_payload_ptr + metadata_offset + 7).to(tl.uint32)
+    up_sign_scale = (
+        up_word_byte0
+        | (up_word_byte1 << 8)
+        | (up_word_byte2 << 16)
+        | (up_word_byte3 << 24)
+    )
+
+    sign_shift = grid_byte_slot * 7
+    gate_sign_index = (gate_sign_scale >> sign_shift) & 0x7F
+    gate_packed_signs = tl.load(ksigns_ptr + gate_sign_index).to(tl.uint32)
+    gate_sign_bits = (gate_packed_signs >> grid_lane) & 0x01
+    gate_signs = 1.0 - gate_sign_bits.to(tl.float32) * 2.0
+
+    up_sign_index = (up_sign_scale >> sign_shift) & 0x7F
+    up_packed_signs = tl.load(ksigns_ptr + up_sign_index).to(tl.uint32)
+    up_sign_bits = (up_packed_signs >> grid_lane) & 0x01
+    up_signs = 1.0 - up_sign_bits.to(tl.float32) * 2.0
+
+    gate_scale_code = (gate_sign_scale >> 28).to(tl.float32)
+    up_scale_code = (up_sign_scale >> 28).to(tl.float32)
+    gate_d = tl.load(gate_payload_half_ptr + row * HALF_WORDS_PER_BLOCK).to(
+        tl.float32
+    )
+    up_d = tl.load(up_payload_half_ptr + row * HALF_WORDS_PER_BLOCK).to(tl.float32)
+    gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
+    up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
+
+    gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(tl.float32)
+    up_grid = tl.load(grid_ptr + up_grid_bytes * 8 + grid_lane).to(tl.float32)
+    hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
+    gate_total = tl.sum(gate_block_scales * gate_grid * gate_signs * hidden, axis=0)
+    up_total = tl.sum(up_block_scales * up_grid * up_signs * hidden, axis=0)
+    activated = gate_total / (1.0 + tl.exp(-gate_total)) * up_total
+    tl.store(output_ptr + row, activated)
+
+
 def _iq2_xxs_lookup_tensors_cuda(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -209,6 +297,35 @@ def _iq2_xxs_matvec_triton_cuda(
     _iq2_xxs_matvec_kernel[(rows,)](
         payload_contiguous,
         payload_contiguous.view(torch.float16),
+        hidden_contiguous,
+        ksigns,
+        grid,
+        output,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_IQ2_XXS_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_IQ2_XXS_BLOCK_BYTES // 2,
+        num_warps=8,
+    )
+    return output
+
+
+def _iq2_xxs_gate_up_activation_triton_cuda(
+    gate_payload: torch.Tensor,
+    up_payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+) -> torch.Tensor:
+    output = torch.empty((rows,), dtype=torch.float32, device=hidden.device)
+    gate_payload_contiguous = gate_payload.contiguous()
+    up_payload_contiguous = up_payload.contiguous()
+    hidden_contiguous = hidden.contiguous()
+    ksigns, grid = _iq2_xxs_lookup_tensors_cuda(hidden.device)
+    _iq2_xxs_gate_up_activation_kernel[(rows,)](
+        gate_payload_contiguous,
+        gate_payload_contiguous.view(torch.float16),
+        up_payload_contiguous,
+        up_payload_contiguous.view(torch.float16),
         hidden_contiguous,
         ksigns,
         grid,
@@ -379,4 +496,45 @@ def deepseek_v4_iq2_xxs_gate_up(
     return (
         _iq2_xxs_matvec_triton_cuda(gate_payload, hidden_f32, rows=rows),
         _iq2_xxs_matvec_triton_cuda(up_payload, hidden_f32, rows=rows),
+    )
+
+
+def deepseek_v4_iq2_xxs_gate_up_activation(
+    gate_payload: torch.Tensor,
+    up_payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    """IQ2_XXS fused gate/up activation.
+
+    The fused helper decodes matching gate and up IQ2_XXS rows in one Triton
+    program per output row, computes both dot products, and returns the
+    activated intermediate consumed by the down projection:
+    ``silu(gate @ hidden) * (up @ hidden)``.
+    """
+    _validate_payload(
+        gate_payload,
+        rows=rows,
+        columns=columns,
+        block_bytes=_IQ2_XXS_BLOCK_BYTES,
+    )
+    _validate_payload(
+        up_payload,
+        rows=rows,
+        columns=columns,
+        block_bytes=_IQ2_XXS_BLOCK_BYTES,
+    )
+    hidden_f32 = _validate_hidden(hidden, columns=columns)
+    if columns != _GGUF_BLOCK_COLUMNS:
+        raise NotImplementedError(
+            "DeepSeek V4 IQ2_XXS gate/up activation Triton helper currently "
+            f"supports columns=256; got {columns}"
+        )
+    return _iq2_xxs_gate_up_activation_triton_cuda(
+        gate_payload,
+        up_payload,
+        hidden_f32,
+        rows=rows,
     )
