@@ -106,6 +106,53 @@ def _q2_k_matvec_kernel(
     tl.store(output_ptr + row, total)
 
 
+# GGUF Q2_K multi-block row layout: each matrix row stores COLUMNS_BLOCKS
+# consecutive 84-byte Q2_K blocks. One Triton program handles one output row,
+# loops over 256-value K blocks, accumulates fp32 dot products, and stores one
+# output element. This preserves the same per-block decode as the single-block
+# kernel while supporting real DeepSeek down projections such as columns=2048.
+@triton.jit
+def _q2_k_matvec_multiblock_kernel(
+    payload_ptr,
+    payload_half_ptr,
+    hidden_ptr,
+    output_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+    COLUMNS_BLOCKS: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 16
+    q_half = offsets // 128
+    rem = offsets - q_half * 128
+    shift = (rem // 32) * 2
+    q_byte_index = q_half * 32 + (rem - (rem // 32) * 32)
+
+    total = tl.full((), 0.0, tl.float32)
+    for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+        payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+        scale_bytes = tl.load(payload_ptr + payload_base + group).to(tl.uint32)
+        q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(
+            tl.uint32
+        )
+        codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
+
+        scale_lows = (scale_bytes & 0x0F).to(tl.float32)
+        scale_highs = (scale_bytes >> 4).to(tl.float32)
+        half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
+        d = tl.load(payload_half_ptr + half_base + 40).to(tl.float32)
+        dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
+
+        decoded = d * scale_lows * codes - dmin * scale_highs
+        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
+            tl.float32
+        )
+        total += tl.sum(decoded * hidden, axis=0)
+    tl.store(output_ptr + row, total)
+
+
 def _q2_k_matvec_triton_cuda(
     payload: torch.Tensor,
     hidden: torch.Tensor,
@@ -123,6 +170,30 @@ def _q2_k_matvec_triton_cuda(
         BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
         BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
         HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
+        num_warps=8,
+    )
+    return output
+
+
+def _q2_k_matvec_multiblock_triton_cuda(
+    payload: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    rows: int,
+    columns_blocks: int,
+) -> torch.Tensor:
+    output = torch.empty((rows,), dtype=torch.float32, device=hidden.device)
+    payload_contiguous = payload.contiguous()
+    hidden_contiguous = hidden.contiguous()
+    _q2_k_matvec_multiblock_kernel[(rows,)](
+        payload_contiguous,
+        payload_contiguous.view(torch.float16),
+        hidden_contiguous,
+        output,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
+        COLUMNS_BLOCKS=columns_blocks,
         num_warps=8,
     )
     return output
@@ -546,10 +617,13 @@ def deepseek_v4_q2_k_matvec(
             rows=rows,
             columns=columns,
         )
-    if columns != _GGUF_BLOCK_COLUMNS:
-        raise NotImplementedError(
-            "DeepSeek V4 Q2_K Triton matvec currently supports columns=256; "
-            f"got {columns}. Pass use_triton=False for the reference fallback."
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
+    if columns_blocks != 1:
+        return _q2_k_matvec_multiblock_triton_cuda(
+            payload,
+            hidden_f32,
+            rows=rows,
+            columns_blocks=columns_blocks,
         )
     return _q2_k_matvec_triton_cuda(payload, hidden_f32, rows=rows)
 
