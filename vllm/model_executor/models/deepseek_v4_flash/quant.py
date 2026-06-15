@@ -45,6 +45,7 @@ _IQ2_XXS_GRID_HEX = (
 )
 
 _iq2_xxs_grid_cache: torch.Tensor | None = None
+_iq2_xxs_ksigns_cache: torch.Tensor | None = None
 
 
 def _validate_positive_block_size(block_size: int) -> None:
@@ -322,6 +323,17 @@ def _iq2_xxs_grid() -> torch.Tensor:
     return _iq2_xxs_grid_cache
 
 
+def iq2_xxs_lookup_tensors() -> tuple[torch.Tensor, torch.Tensor]:
+    """Return CPU lookup tensors used by the GGUF IQ2_XXS decoder."""
+    global _iq2_xxs_ksigns_cache
+    if _iq2_xxs_ksigns_cache is None:
+        _iq2_xxs_ksigns_cache = torch.tensor(
+            list(_IQ2_XXS_KSIGNS),
+            dtype=torch.uint8,
+        )
+    return _iq2_xxs_ksigns_cache, _iq2_xxs_grid()
+
+
 def decode_iq2_xxs_gguf_blocks_reference(
     payload: bytes | bytearray | memoryview,
     values_per_block: int = _GGUF_K_BLOCK_VALUES,
@@ -355,14 +367,14 @@ def decode_iq2_xxs_gguf_blocks_reference(
 
     sign_shifts = torch.tensor([0, 7, 14, 21], dtype=torch.int64)
     sign_indices = ((q_sign_scale.unsqueeze(-1) >> sign_shifts) & 0x7F).to(torch.long)
-    ksigns = torch.tensor(list(_IQ2_XXS_KSIGNS), dtype=torch.uint8)
+    ksigns, iq2_grid = iq2_xxs_lookup_tensors()
     packed_signs = ksigns[sign_indices]
     bit_shifts = torch.arange(8, dtype=torch.uint8)
     sign_bits = (packed_signs.unsqueeze(-1) >> bit_shifts) & 0x01
     signs = torch.where(sign_bits == 0, 1.0, -1.0).to(torch.float32)
 
     q_grid_bytes = qs.reshape(block_count, 8, 2, 4)[:, :, 0, :]
-    grid = _iq2_xxs_grid()[q_grid_bytes.to(torch.long)]
+    grid = iq2_grid[q_grid_bytes.to(torch.long)]
 
     return (block_scales * grid * signs).reshape(-1)
 

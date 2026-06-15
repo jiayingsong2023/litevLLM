@@ -21,6 +21,34 @@ def _iq2_xxs_unit_block_payload() -> bytes:
     return struct.pack("<e", 1.0) + (b"\x00" * 64)
 
 
+def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
+    blocks: list[bytes] = []
+    for row in range(rows):
+        groups = bytearray()
+        for group in range(8):
+            grid_bytes = bytes(
+                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF)
+                for idx in range(4)
+            )
+            sign_indices = [
+                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F
+                for idx in range(4)
+            ]
+            scale_code = (row + group * 3) & 0x0F
+            q_sign_scale = (
+                sign_indices[0]
+                | (sign_indices[1] << 7)
+                | (sign_indices[2] << 14)
+                | (sign_indices[3] << 21)
+                | (scale_code << 28)
+            )
+            groups.extend(grid_bytes)
+            groups.extend(struct.pack("<I", q_sign_scale))
+        d = 0.03125 * (row % 7 + 1)
+        blocks.append(struct.pack("<e", d) + bytes(groups))
+    return b"".join(blocks)
+
+
 def _q2_k_repeating_codes_payload() -> bytes:
     scales = b"\x11" * 16
     qs = b"\xe4" * 64
@@ -156,6 +184,33 @@ def test_q2_k_default_triton_matvec_matches_reference_decoded_matrix(
     assert actual.device.type == "cuda"
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 2, 17, 64])
+def test_iq2_xxs_default_triton_matvec_matches_reference_decoded_matrix(
+    rows: int,
+) -> None:
+    columns = 256
+    payload = _iq2_xxs_deterministic_payload(rows)
+    hidden = torch.linspace(-0.75, 0.9, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_iq2_xxs_matvec(
+        _cuda_payload(payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    expected = iq2_xxs_matrix_from_gguf_payload(
+        payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
