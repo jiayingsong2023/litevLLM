@@ -51,6 +51,45 @@ def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
     return b"".join(blocks)
 
 
+def _iq2_xxs_deterministic_payload_blocks(rows: int, blocks_per_row: int) -> bytes:
+    if blocks_per_row <= 0:
+        raise ValueError("blocks_per_row must be positive")
+    blocks: list[bytes] = []
+    for row in range(rows):
+        for block_idx in range(blocks_per_row):
+            groups = bytearray()
+            synthetic_row = row * 17 + block_idx
+            for group in range(8):
+                grid_bytes = bytes(
+                    (
+                        synthetic_row * 19
+                        + group * 29
+                        + idx * 37
+                        + 0x17
+                    )
+                    & 0xFF
+                    for idx in range(4)
+                )
+                sign_indices = [
+                    (synthetic_row * 11 + group * 7 + idx * 23 + 0x05)
+                    & 0x7F
+                    for idx in range(4)
+                ]
+                scale_code = (synthetic_row + group * 3) & 0x0F
+                q_sign_scale = (
+                    sign_indices[0]
+                    | (sign_indices[1] << 7)
+                    | (sign_indices[2] << 14)
+                    | (sign_indices[3] << 21)
+                    | (scale_code << 28)
+                )
+                groups.extend(grid_bytes)
+                groups.extend(struct.pack("<I", q_sign_scale))
+            d = 0.03125 * (synthetic_row % 7 + 1)
+            blocks.append(struct.pack("<e", d) + bytes(groups))
+    return b"".join(blocks)
+
+
 def _q2_k_repeating_codes_payload() -> bytes:
     scales = b"\x11" * 16
     qs = b"\xe4" * 64
@@ -279,6 +318,42 @@ def test_iq2_xxs_gate_up_activation_matches_two_matvec_reference() -> None:
     assert actual.device.type == "cuda"
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("columns", [512, 1024, 2048])
+def test_iq2_xxs_gate_up_activation_matches_reference_multi_block(
+    columns: int,
+) -> None:
+    rows = 4
+    blocks_per_row = columns // 256
+    gate_payload = _iq2_xxs_deterministic_payload_blocks(rows, blocks_per_row)
+    up_payload = _iq2_xxs_deterministic_payload_blocks(rows, blocks_per_row)
+    hidden = torch.linspace(-0.75, 0.9, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_iq2_xxs_gate_up_activation(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    gate = iq2_xxs_matrix_from_gguf_payload(
+        gate_payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+    up = iq2_xxs_matrix_from_gguf_payload(
+        up_payload,
+        rows=rows,
+        columns=columns,
+    ).to(device="cuda").matmul(hidden)
+    expected = torch.nn.functional.silu(gate) * up
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=4e-2, atol=4e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
