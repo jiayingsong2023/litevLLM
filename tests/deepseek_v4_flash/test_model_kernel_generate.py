@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,12 @@ def _fake_model(
         runtime_budget=_runtime_budget(context_length),
         gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
     )
+
+
+def _pack_q8_0_block(scale: float, values: tuple[int, ...]) -> bytes:
+    if len(values) != 32:
+        raise ValueError("Q8_0 test block must contain 32 values")
+    return struct.pack("<e", scale) + struct.pack("<" + "b" * 32, *values)
 
 
 def test_model_profile_summary_reports_disabled_profiler_by_default() -> None:
@@ -852,6 +859,104 @@ def test_output_token_argmax_chunked_cuda_uses_argmax_for_each_chunk(
 
     assert token.item() == chunk_rows + 5
     assert backend.argmax_offsets == [0, chunk_rows]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_output_token_argmax_chunked_cuda_uses_raw_q8_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_python_unpack(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("output argmax must not split Q8 payload in Python")
+
+    monkeypatch.setattr(
+        model_module,
+        "q8_0_matrix_from_gguf_payload",
+        fail_python_unpack,
+    )
+    chunk_rows = model_module._OUTPUT_PROJECTION_CHUNK_ROWS
+    vocab_size = chunk_rows + 17
+    model = _fake_model(vocab_size=vocab_size)
+    assert model.weight_store is not None
+    output_head = DeepSeekV4FlashTensor(
+        "output.weight",
+        (model.shape.hidden_size, model.shape.vocab_size),
+        GGML_TYPE_Q8_0,
+        0,
+        model.shape.vocab_size * (2 + model.shape.hidden_size),
+    )
+    output_norm = DeepSeekV4FlashTensor(
+        "output_norm.weight",
+        (model.shape.hidden_size,),
+        GGML_TYPE_F16,
+        0,
+        model.shape.hidden_size * 2,
+    )
+    model.weight_store.bindings.output_head = output_head
+    model.weight_store.bindings.output_norm = output_norm
+    rows = []
+    for row in range(vocab_size):
+        value = 10 if row == chunk_rows + 5 else 0
+        rows.append(_pack_q8_0_block(1.0, tuple([value] + [0] * 31)))
+    raw_payload = torch.tensor(
+        tuple(b"".join(rows)),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    class FakeRawStager:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+
+        def stage_vector(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            del tensor
+            return torch.ones(
+                (model.shape.hidden_size,),
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        def stage_q8_raw_payload(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            del tensor
+            self.raw_calls += 1
+            return raw_payload
+
+    class RawOnlyBackend(_ReadyBackend):
+        def output_logits(self, **kwargs: torch.Tensor | int) -> torch.Tensor:
+            del kwargs
+            raise AssertionError("raw output argmax must not use split output logits")
+
+        def output_argmax_with_value(
+            self,
+            **kwargs: torch.Tensor | int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del kwargs
+            raise AssertionError("raw output argmax must not use split argmax")
+
+    model.gpu_backend = RawOnlyBackend()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        model,
+        "_stage_output_hyper_connection_cuda",
+        lambda stager, *, stream_elements: (
+            torch.zeros((4, stream_elements), dtype=torch.float32, device="cuda"),
+            torch.ones((1,), dtype=torch.float32, device="cuda"),
+            torch.zeros((4,), dtype=torch.float32, device="cuda"),
+        ),
+    )
+    stager = FakeRawStager()
+
+    token = model._output_token_argmax_chunked_cuda(
+        model.weight_store,
+        stager=stager,  # type: ignore[arg-type]
+        streams=torch.ones(
+            (4, model.shape.hidden_size),
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        device=torch.device("cuda"),
+    )
+
+    assert token.item() == chunk_rows + 5
+    assert stager.raw_calls == 1
 
 
 def test_real_gguf_generate_one_real_step_then_state_preserving_decode_smoke_is_opt_in(

@@ -13,9 +13,7 @@ from vllm.kernels.triton.deepseek_v4_flash.cache import (
     DeepSeekV4CacheUpdateInputs,
     deepseek_v4_cache_update,
 )
-from vllm.kernels.triton.deepseek_v4_flash.output import (
-    deepseek_v4_q8_0_output_logits,
-)
+from vllm.kernels.triton.deepseek_v4_flash.q8_linear import q8_0_raw_linear
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE, layer_compress_ratio
 from .gguf_reader import GGML_TYPE_Q8_0, DeepSeekV4FlashTensor
@@ -25,7 +23,6 @@ from .gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
     DeepSeekV4FlashStagedQuantizedExpertPayload,
 )
-from .quant import q8_0_matrix_from_gguf_payload
 from .weight_store import (
     DeepSeekV4FlashCompressorTensors,
     DeepSeekV4FlashGroupedExpertTensors,
@@ -163,31 +160,33 @@ def deepseek_v4_flash_q8_0_tensor_projection(
             "DeepSeek V4 Flash Q8 projection expects GGML_TYPE_Q8_0; "
             f"got {tensor.tensor_type}"
         )
-    q8_values, q8_scales = _stage_q8_0_tensor(tensor, stager)
     columns, rows = tensor.dims
     if hidden.numel() != columns:
         raise ValueError(
             "Q8 projection hidden width must match tensor input columns; "
             f"got hidden={hidden.numel()} and columns={columns}"
         )
-    if q8_values.shape != (rows, columns):
+    raw_payload = _stage_q8_0_raw_tensor(tensor, stager)
+    expected_bytes = rows * (columns // _Q8_0_BLOCK_SIZE) * _Q8_0_BLOCK_BYTES
+    if raw_payload.numel() != expected_bytes:
         raise ValueError(
-            "staged Q8 values shape must match tensor dims; "
-            f"got {tuple(q8_values.shape)}, expected {(rows, columns)}"
+            "staged raw Q8 payload size must match tensor dims; "
+            f"got {raw_payload.numel()} bytes, expected {expected_bytes}"
         )
 
-    return deepseek_v4_q8_0_output_logits(
-        hidden=hidden,
-        lm_head_values=q8_values,
-        lm_head_scales=q8_scales,
+    return q8_0_raw_linear(
+        raw_payload,
+        hidden,
+        rows=rows,
+        columns=columns,
         block_size=_Q8_0_BLOCK_SIZE,
     )
 
 
-def _stage_q8_0_tensor(
+def _stage_q8_0_raw_tensor(
     tensor: DeepSeekV4FlashTensor,
     stager: DeepSeekV4FlashGPUWeightStager,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     if tensor.tensor_type != GGML_TYPE_Q8_0:
         raise ValueError(
             "DeepSeek V4 Flash Q8 staging expects GGML_TYPE_Q8_0; "
@@ -200,53 +199,7 @@ def _stage_q8_0_tensor(
         raise ValueError(
             f"Q8 tensor columns must be divisible by 32; got columns={columns}"
         )
-    with _stager_profile_section(
-        stager,
-        "stage_q8_matrix",
-        tensor=tensor.name,
-        cache="lookup",
-    ):
-        cached = stager.get_output_q8_chunk(tensor, row_start=0, row_end=rows)
-    if cached is None:
-        blocks_per_row = columns // _Q8_0_BLOCK_SIZE
-        expected_nbytes = rows * blocks_per_row * _Q8_0_BLOCK_BYTES
-        payload = stager.store.tensor_payload(tensor)
-        try:
-            if len(payload) != expected_nbytes:
-                raise ValueError(
-                    "Q8 projection payload byte size does not match tensor shape; "
-                    f"got {len(payload)} bytes, expected {expected_nbytes}"
-                )
-            with _stager_profile_section(
-                stager,
-                "stage_q8_matrix",
-                tensor=tensor.name,
-                cache="miss",
-            ):
-                values, scales = q8_0_matrix_from_gguf_payload(
-                    payload,
-                    rows=rows,
-                    columns=columns,
-                    block_size=_Q8_0_BLOCK_SIZE,
-                )
-                q8_values, q8_scales = stager.stage_output_q8_chunk(
-                    tensor,
-                    row_start=0,
-                    row_end=rows,
-                    values=values,
-                    scales=scales,
-                )
-        finally:
-            payload.release()
-    else:
-        with _stager_profile_section(
-            stager,
-            "stage_q8_matrix",
-            tensor=tensor.name,
-            cache="hit",
-        ):
-            q8_values, q8_scales = cached
-    return q8_values, q8_scales
+    return stager.stage_q8_raw_payload(tensor)
 
 
 def _project_tensor(
@@ -877,16 +830,20 @@ def _grouped_output_projection(
         output_a.tensor_type == GGML_TYPE_Q8_0
         and output_a.dims[0] % _Q8_0_BLOCK_SIZE == 0
     ):
-        values, scales = _stage_q8_0_tensor(output_a, stager)
+        raw_payload = _stage_q8_0_raw_tensor(output_a, stager)
+        row_bytes = (output_a.dims[0] // _Q8_0_BLOCK_SIZE) * _Q8_0_BLOCK_BYTES
         low_rank_rows = []
         for group_idx in range(output_groups):
             row_start = group_idx * rank_per_group
             row_end = row_start + rank_per_group
+            byte_start = row_start * row_bytes
+            byte_end = row_end * row_bytes
             low_rank_rows.append(
-                deepseek_v4_q8_0_output_logits(
-                    hidden=grouped[group_idx],
-                    lm_head_values=values[row_start:row_end],
-                    lm_head_scales=scales[row_start:row_end],
+                q8_0_raw_linear(
+                    raw_payload[byte_start:byte_end],
+                    grouped[group_idx],
+                    rows=rank_per_group,
+                    columns=group_input,
                     block_size=_Q8_0_BLOCK_SIZE,
                 )
             )

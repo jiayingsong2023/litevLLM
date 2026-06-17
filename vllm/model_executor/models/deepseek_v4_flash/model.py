@@ -7,6 +7,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.kernels.triton.deepseek_v4_flash.q8_linear import q8_0_raw_linear
+
 from .block import (
     DeepSeekV4FlashCompressedLayerReferenceRunner,
     DeepSeekV4FlashSlidingLayerReferenceRunner,
@@ -1074,6 +1076,56 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires output_norm")
         return tensor
 
+    @staticmethod
+    def _output_hidden_cuda(
+        *,
+        streams: torch.Tensor,
+        output_hc_weight: torch.Tensor,
+        output_hc_scale: torch.Tensor,
+        output_hc_base: torch.Tensor,
+        output_norm_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        tensors = (
+            streams,
+            output_hc_weight,
+            output_hc_scale,
+            output_hc_base,
+            output_norm_weight,
+        )
+        if any(not tensor.is_cuda for tensor in tensors):
+            raise RuntimeError("DeepSeek V4 Flash output hidden inputs must be CUDA")
+        streams_f32 = streams.to(torch.float32)
+        flat = streams_f32.reshape(-1)
+        flat = flat * torch.rsqrt(flat.pow(2).mean() + _RMS_NORM_EPS)
+        pre = output_hc_weight.to(torch.float32).matmul(flat)
+        weights = (
+            torch.sigmoid(
+                pre * output_hc_scale.to(torch.float32)[0]
+                + output_hc_base.to(torch.float32)
+            )
+            + 1e-6
+        )
+        hidden = (weights.reshape(4, 1) * streams_f32).sum(dim=0)
+        hidden = hidden * torch.rsqrt(hidden.pow(2).mean() + _RMS_NORM_EPS)
+        return hidden * output_norm_weight.to(torch.float32)
+
+    @staticmethod
+    def _raw_q8_chunk(
+        raw_payload: torch.Tensor,
+        *,
+        row_start: int,
+        row_end: int,
+        row_bytes: int,
+    ) -> torch.Tensor:
+        byte_start = row_start * row_bytes
+        byte_end = row_end * row_bytes
+        if byte_start < 0 or byte_end <= byte_start or byte_end > raw_payload.numel():
+            raise RuntimeError(
+                "DeepSeek V4 Flash raw output chunk range is invalid: "
+                f"[{byte_start}, {byte_end}) for payload {raw_payload.numel()}"
+            )
+        return raw_payload[byte_start:byte_end]
+
     def _output_logits_chunked_cuda(
         self,
         store: DeepSeekV4FlashWeightStore,
@@ -1114,6 +1166,42 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         blocks_per_row = columns // _Q8_0_BLOCK_SIZE
         row_bytes = blocks_per_row * _Q8_0_BLOCK_BYTES
+        stage_raw_payload = getattr(stager, "stage_q8_raw_payload", None)
+        if callable(stage_raw_payload):
+            output_hidden = self._output_hidden_cuda(
+                streams=streams,
+                output_hc_weight=output_hc_weight,
+                output_hc_scale=output_hc_scale,
+                output_hc_base=output_hc_base,
+                output_norm_weight=output_norm_weight,
+            )
+            raw_payload = stage_raw_payload(tensor)
+            logits_chunks: list[torch.Tensor] = []
+            for row_start in range(0, rows, _OUTPUT_PROJECTION_CHUNK_ROWS):
+                row_end = min(row_start + _OUTPUT_PROJECTION_CHUNK_ROWS, rows)
+                chunk_rows = row_end - row_start
+                chunk_raw = self._raw_q8_chunk(
+                    raw_payload,
+                    row_start=row_start,
+                    row_end=row_end,
+                    row_bytes=row_bytes,
+                )
+                chunk_logits = q8_0_raw_linear(
+                    chunk_raw,
+                    output_hidden,
+                    rows=chunk_rows,
+                    columns=columns,
+                    block_size=_Q8_0_BLOCK_SIZE,
+                )
+                if not chunk_logits.is_cuda:
+                    raise RuntimeError(
+                        "DeepSeek V4 Flash raw output chunk returned CPU logits"
+                    )
+                logits_chunks.append(chunk_logits.reshape(-1))
+            if not logits_chunks:
+                raise RuntimeError("DeepSeek V4 Flash GPU output produced no chunks")
+            return torch.cat(logits_chunks, dim=0).reshape(1, -1)
+
         logits_chunks: list[torch.Tensor] = []
         payload: memoryview | None = None
         try:
@@ -1211,6 +1299,51 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         blocks_per_row = columns // _Q8_0_BLOCK_SIZE
         row_bytes = blocks_per_row * _Q8_0_BLOCK_BYTES
+        stage_raw_payload = getattr(stager, "stage_q8_raw_payload", None)
+        if callable(stage_raw_payload):
+            output_hidden = self._output_hidden_cuda(
+                streams=streams,
+                output_hc_weight=output_hc_weight,
+                output_hc_scale=output_hc_scale,
+                output_hc_base=output_hc_base,
+                output_norm_weight=output_norm_weight,
+            )
+            raw_payload = stage_raw_payload(tensor)
+            best_value: torch.Tensor | None = None
+            best_token: torch.Tensor | None = None
+            for row_start in range(0, rows, _OUTPUT_PROJECTION_CHUNK_ROWS):
+                row_end = min(row_start + _OUTPUT_PROJECTION_CHUNK_ROWS, rows)
+                chunk_rows = row_end - row_start
+                chunk_raw = self._raw_q8_chunk(
+                    raw_payload,
+                    row_start=row_start,
+                    row_end=row_end,
+                    row_bytes=row_bytes,
+                )
+                chunk_logits = q8_0_raw_linear(
+                    chunk_raw,
+                    output_hidden,
+                    rows=chunk_rows,
+                    columns=columns,
+                    block_size=_Q8_0_BLOCK_SIZE,
+                ).reshape(-1)
+                if not chunk_logits.is_cuda:
+                    raise RuntimeError(
+                        "DeepSeek V4 Flash raw output chunk returned CPU logits"
+                    )
+                chunk_value, chunk_index = torch.max(chunk_logits, dim=0)
+                chunk_token = chunk_index.to(torch.long) + row_start
+                if best_value is None or best_token is None:
+                    best_value = chunk_value
+                    best_token = chunk_token
+                else:
+                    take_chunk = chunk_value > best_value
+                    best_value = torch.where(take_chunk, chunk_value, best_value)
+                    best_token = torch.where(take_chunk, chunk_token, best_token)
+            if best_token is None:
+                raise RuntimeError("DeepSeek V4 Flash GPU output produced no chunks")
+            return best_token.to(device=device, dtype=torch.long).reshape(())
+
         payload: memoryview | None = None
         best_value: torch.Tensor | None = None
         best_token: torch.Tensor | None = None

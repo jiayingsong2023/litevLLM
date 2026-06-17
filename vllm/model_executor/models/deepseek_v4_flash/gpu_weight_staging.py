@@ -403,6 +403,54 @@ class DeepSeekV4FlashGPUWeightStager:
         )
         return values_key, scales_key
 
+    def _output_q8_raw_cache_key(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+    ) -> DeepSeekV4FlashCacheKey:
+        return self._dynamic_cache_key(
+            tensor,
+            dtype=torch.uint8,
+            extra=("output_q8_raw", "payload"),
+        )
+
+    def stage_q8_raw_payload(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        if self.device.type != "cuda":
+            raise ValueError(
+                "DeepSeek V4 Flash raw Q8 staging requires a CUDA device"
+            )
+        cache_key = self._output_q8_raw_cache_key(tensor)
+        cached = self._dynamic_cache.get(cache_key)
+        if cached is not None:
+            with self._profile_section(
+                "stage_q8_raw",
+                tensor=tensor.name,
+                cache="hit",
+            ):
+                self._record_lru_hit(cache_key)
+                self.record_cache_hit("dynamic", tensor_name=tensor.name)
+                return cached
+
+        with self._profile_section("stage_q8_raw", tensor=tensor.name, cache="miss"):
+            payload = self.store.tensor_payload(tensor)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="The given buffer is not writable.*",
+                        category=UserWarning,
+                    )
+                    raw = torch.frombuffer(payload, dtype=torch.uint8).clone()
+            finally:
+                payload.release()
+            nbytes = raw.numel() * raw.element_size()
+            if not self._prepare_cache_insert(nbytes):
+                self._record_streamed_bytes(nbytes)
+                return raw.to(device=self.device, non_blocking=True)
+            staged = raw.to(device=self.device, non_blocking=True)
+            self._register_cached_entry(cache_key, staged, nbytes)
+            self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
+            return staged
+
     def get_output_q8_chunk(
         self,
         tensor: DeepSeekV4FlashTensor,

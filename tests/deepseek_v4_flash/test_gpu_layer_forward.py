@@ -280,6 +280,7 @@ def test_q8_tensor_projection_uses_raw_payload_without_stage_matrix() -> None:
         ]
     )
     stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    stager.profiler = DeepSeekV4FlashProfiler(enabled=True)
     hidden = torch.zeros((32,), dtype=torch.float32, device="cuda")
     hidden[0] = 3.0
     hidden[1] = 5.0
@@ -290,6 +291,10 @@ def test_q8_tensor_projection_uses_raw_payload_without_stage_matrix() -> None:
     assert store.decode_count == 0
     assert stager.cache_stats()["dynamic_misses"] == 1
     assert stager.cache_stats()["dynamic_hits"] == 1
+    assert [event["name"] for event in stager.profiler.to_dict()["events"]] == [
+        "stage_q8_raw",
+        "stage_q8_raw",
+    ]
     torch.testing.assert_close(
         first,
         torch.tensor([3.0, 5.0], dtype=torch.float32, device="cuda"),

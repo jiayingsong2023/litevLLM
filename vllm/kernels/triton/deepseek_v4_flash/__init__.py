@@ -15,7 +15,7 @@ from .q2_iq2_moe import (
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_q2_k_matvec,
 )
-from .q8_linear import q8_0_linear
+from .q8_linear import q8_0_linear, q8_0_raw_linear
 
 __all__ = [
     "DeepSeekV4AttentionKernelInputs",
@@ -33,4 +33,5 @@ __all__ = [
     "deepseek_v4_output_projection",
     "deepseek_v4_q2_k_matvec",
     "q8_0_linear",
+    "q8_0_raw_linear",
 ]
