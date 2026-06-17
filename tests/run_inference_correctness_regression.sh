@@ -388,6 +388,28 @@ if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" ]]; then
   cleanup_after_model_step "DeepSeek V4 Flash GPU smoke"
 fi
 
+if [[ "$RUN_PERF_DIAG" == "1" ]]; then
+  echo ""
+  echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
+  PERF_MODELS="tinyllama,qwen35_9b_awq"
+  if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
+  fi
+  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b"
+  fi
+  if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" && -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
+    PERF_MODELS="${PERF_MODELS},deepseek_v4_flash_q2_gguf"
+  fi
+  PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
+  echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
+  run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
+    uv run python tests/e2e_full_benchmark.py \
+    --models "${PERF_MODELS}" \
+    --json-out "${PERF_JSON}"
+  echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
+fi
+
 if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then
   echo "SKIP_A_TIER=1 — done after Tier-B."
   exit 0
@@ -488,22 +510,3 @@ fi
 
 echo ""
 echo "=== All requested correctness regression steps completed OK ==="
-
-if [[ "$RUN_PERF_DIAG" == "1" ]]; then
-  echo ""
-  echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
-  PERF_MODELS="tinyllama,qwen35_9b_awq"
-  if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
-  fi
-  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b"
-  fi
-  PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
-  echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
-  run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
-    uv run python tests/e2e_full_benchmark.py \
-    --models "${PERF_MODELS}" \
-    --json-out "${PERF_JSON}"
-  echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
-fi

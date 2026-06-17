@@ -116,6 +116,11 @@ _GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
     "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
 }
 
+_DEEPSEEK_V4_FLASH_GGUF_PATH = (
+    "models/DeepSeek-V4-Flash-ds4/"
+    "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+)
+
 
 # KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
 MODEL_SPECS: Dict[str, ModelSpec] = {
@@ -181,6 +186,22 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         max_model_len=512,
         max_run_seconds=1200,
         stable_env=dict(_GEMMA4_26B_RECOMMENDED_ENV),
+    ),
+    "deepseek_v4_flash_q2_gguf": ModelSpec(
+        key="deepseek_v4_flash_q2_gguf",
+        model_path=os.environ.get(
+            "MODEL_DEEPSEEK_V4_FLASH_GGUF",
+            _DEEPSEEK_V4_FLASH_GGUF_PATH,
+        ),
+        display_name="DeepSeek V4 Flash Q2 GGUF",
+        quant="deepseek-v4-flash-gguf",
+        concurrent_reqs=1,
+        prompt_tokens_target=4096,
+        max_new_tokens=1,
+        gpu_memory_utilization=0.90,
+        max_model_len=4096,
+        max_run_seconds=1200,
+        stable_env={},
     ),
 }
 
@@ -365,7 +386,11 @@ def _should_use_model_process_isolation(
         return False
     if len(model_keys) < 2:
         return False
-    large_gemma = {"gemma4_31b_q4", "gemma4_26b_a4b"}
+    large_gemma = {
+        "gemma4_31b_q4",
+        "gemma4_26b_a4b",
+        "deepseek_v4_flash_q2_gguf",
+    }
     return any(key in large_gemma for key in model_keys)
 
 
@@ -2249,6 +2274,9 @@ async def run_benchmark(
         )
     print(f"{'=' * 72}")
 
+    if spec.quant == "deepseek-v4-flash-gguf":
+        return _run_deepseek_v4_flash_direct_benchmark(spec)
+
     if not os.path.isdir(spec.model_path) and not _is_hf_repo_id(spec.model_path):
         print("  [Skip] Model directory not found.")
         return {"skipped": 1.0}
@@ -2584,6 +2612,180 @@ def _safe_metric(value: object) -> float | None:
     return None
 
 
+def _deepseek_smoke_payload_to_benchmark_result(
+    spec: ModelSpec,
+    payload: dict[str, Any],
+    *,
+    wall_sec: float,
+) -> dict[str, Any]:
+    runs = payload.get("runs", [])
+    if not isinstance(runs, list):
+        runs = []
+    elapsed_ms_values = _finite_values(
+        [float(run.get("elapsed_ms", 0.0)) for run in runs if isinstance(run, dict)]
+    )
+    tps_values = _finite_values(
+        [
+            float(run.get("tokens_per_second", 0.0))
+            for run in runs
+            if isinstance(run, dict)
+        ]
+    )
+    max_tokens = float(payload.get("max_tokens", spec.max_new_tokens) or 0.0)
+    repeat = float(payload.get("repeat", len(runs) or 1) or 1.0)
+    decode_tokens_total = max_tokens * repeat
+    decode_ms_total = float(sum(elapsed_ms_values)) if elapsed_ms_values else 0.0
+    decode_tps_aggregate = (
+        decode_tokens_total * 1000.0 / decode_ms_total
+        if decode_tokens_total > 0.0 and decode_ms_total > 0.0
+        else 0.0
+    )
+    aggregate_tps = (
+        decode_tokens_total / wall_sec
+        if decode_tokens_total > 0.0 and wall_sec > 0.0
+        else 0.0
+    )
+    gpu_backend = payload.get("gpu_backend", {})
+    gpu_staging = payload.get("gpu_staging", {})
+    runtime_budget = payload.get("runtime_budget", {})
+    return {
+        "skipped": 0.0,
+        "timed_out": 0.0,
+        "total_tokens": decode_tokens_total,
+        "wall_time_sec": wall_sec,
+        "aggregate_tps": aggregate_tps,
+        "ttft_p50_ms": (
+            median(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "ttft_p95_ms": (
+            _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "e2e_p50_ms": (
+            median(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "e2e_p95_ms": (
+            _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "prefill_p50_ms": float("nan"),
+        "prefill_p95_ms": float("nan"),
+        "decode_p50_ms": (
+            median(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "decode_p95_ms": (
+            _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        ),
+        "prompt_tokens_total": 1.0,
+        "prefill_tps_aggregate": 0.0,
+        "prefill_tps_p50": float("nan"),
+        "prefill_tps_p95": float("nan"),
+        "decode_ms_total": decode_ms_total,
+        "decode_tokens_total": decode_tokens_total,
+        "decode_tps_aggregate": decode_tps_aggregate,
+        "decode_tps_p50": median(tps_values) if tps_values else float("nan"),
+        "decode_tps_p95": _p95(tps_values) if tps_values else float("nan"),
+        "stream_output_events_total": 0.0,
+        "stream_progressive_token_events_total": 0.0,
+        "stream_token_events_total": 0.0,
+        "stream_progressive_visible_ratio": 0.0,
+        "awq_runtime_stats": {},
+        "awq_metrics": {},
+        "workload": {
+            "kind": "deepseek_v4_flash_direct_gguf",
+            "context_length": int(
+                payload.get("context_length", spec.max_model_len)
+            ),
+            "max_tokens": int(max_tokens),
+        },
+        "stable_env": dict(spec.stable_env),
+        "profile": payload.get("profile", {}),
+        "runtime_stats": {
+            "deepseek_v4_flash": {
+                "gpu_backend": gpu_backend if isinstance(gpu_backend, dict) else {},
+                "gpu_staging": gpu_staging if isinstance(gpu_staging, dict) else {},
+                "runtime_budget": (
+                    runtime_budget if isinstance(runtime_budget, dict) else {}
+                ),
+                "phase3_metrics": payload.get("phase3_metrics", {}),
+                "phase4_metrics": payload.get("phase4_metrics", {}),
+                "usable_inference_metrics": payload.get(
+                    "usable_inference_metrics", {}
+                ),
+            }
+        },
+        "warmup_trace": [],
+    }
+
+
+def _run_deepseek_v4_flash_direct_benchmark(spec: ModelSpec) -> dict[str, Any]:
+    print("  [DeepSeek] Running direct GGUF GPU smoke benchmark.")
+    if not os.path.isfile(spec.model_path):
+        print("  [Skip] DeepSeek V4 Flash GGUF file not found.")
+        return {"skipped": 1.0, "skip_reason": "model_file_not_found"}
+    with tempfile.NamedTemporaryFile(
+        prefix="fastinference_deepseek_v4_flash_",
+        suffix=".json",
+        delete=False,
+    ) as tmp:
+        profile_json = tmp.name
+    command = [
+        sys.executable,
+        "tests/tools/run_deepseek_v4_flash_gpu_smoke.py",
+        "--model",
+        spec.model_path,
+        "--context-length",
+        str(spec.max_model_len),
+        "--max-tokens",
+        str(spec.max_new_tokens),
+        "--repeat",
+        "1",
+        "--profile-json",
+        profile_json,
+    ]
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=spec.max_run_seconds,
+        )
+        wall_sec = max(1e-6, time.perf_counter() - start)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GGUF benchmark failed with "
+                f"rc={proc.returncode}: {proc.stderr}"
+            )
+        with open(profile_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        result = _deepseek_smoke_payload_to_benchmark_result(
+            spec,
+            payload,
+            wall_sec=wall_sec,
+        )
+        print(
+            "  RESULT: "
+            f"tokens/s={_fmt_float(result['aggregate_tps'], '.2f')}, "
+            f"decode={_fmt_float(result['decode_p50_ms'], '.1f')} ms, "
+            f"decode_tps={_fmt_float(result['decode_tps_aggregate'], '.2f')}"
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        return {
+            "skipped": 0.0,
+            "timed_out": 1.0,
+            "total_tokens": 0.0,
+            "wall_time_sec": float(spec.max_run_seconds),
+            "aggregate_tps": 0.0,
+        }
+    finally:
+        try:
+            os.unlink(profile_json)
+        except OSError:
+            pass
+
+
 def _load_perf_baseline(path: str) -> dict[str, Any]:
     if not path.strip():
         return {}
@@ -2680,7 +2882,8 @@ def _parse_args() -> argparse.Namespace:
         default="gemma4_26b_a4b,gemma4_31b_q4",
         help=(
             "Comma-separated model keys. Default: gemma4_26b_a4b,gemma4_31b_q4. "
-            "Available: tinyllama,qwen35_9b_awq,gemma4_31b_q4,gemma4_26b_a4b"
+            "Available: tinyllama,qwen35_9b_awq,gemma4_31b_q4,"
+            "gemma4_26b_a4b,deepseek_v4_flash_q2_gguf"
         ),
     )
     parser.add_argument(
