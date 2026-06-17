@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import warnings
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -42,6 +44,8 @@ class DeepSeekV4FlashGroupedExpertStore(Protocol):
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor: ...
+
+    def tensor_payload(self, tensor: DeepSeekV4FlashTensor) -> memoryview: ...
 
 
 @dataclass(frozen=True)
@@ -265,6 +269,13 @@ class DeepSeekV4FlashGPUWeightStager:
     def _record_streamed_bytes(self, nbytes: int) -> None:
         self._cache_stats["streamed_bytes"] += int(nbytes)
 
+    def _profile_section(self, name: str, **metadata: object) -> Iterator[None]:
+        profiler = getattr(self, "profiler", None)
+        section = getattr(profiler, "section", None)
+        if not callable(section):
+            return nullcontext()
+        return section(name, **metadata)
+
     def _is_pinned_grouped_expert(
         self,
         layer_idx: int | None,
@@ -293,21 +304,31 @@ class DeepSeekV4FlashGPUWeightStager:
         cache_key = self._dynamic_cache_key(tensor, dtype=self.dtype, extra=("matrix",))
         cached = self._dynamic_cache.get(cache_key)
         if cached is not None:
-            self._record_lru_hit(cache_key)
-            self.record_cache_hit("dynamic", tensor_name=tensor.name)
-            return cached
+            with self._profile_section(
+                "stage_matrix",
+                tensor=tensor.name,
+                cache="hit",
+            ):
+                self._record_lru_hit(cache_key)
+                self.record_cache_hit("dynamic", tensor_name=tensor.name)
+                return cached
 
-        decoded = self.store.decode_matrix(tensor)
-        if decoded.ndim != 2:
-            raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
-        nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
-        if not self._prepare_cache_insert(nbytes):
-            self._record_streamed_bytes(nbytes)
-            return decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
-        self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
-        staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
-        self._register_cached_entry(cache_key, staged, nbytes)
-        return staged
+        with self._profile_section("stage_matrix", tensor=tensor.name, cache="miss"):
+            decoded = self.store.decode_matrix(tensor)
+            if decoded.ndim != 2:
+                raise ValueError(f"matrix tensor must be 2-D; got {decoded.ndim}-D")
+            nbytes = decoded.numel() * self._dtype_nbytes(self.dtype)
+            if not self._prepare_cache_insert(nbytes):
+                self._record_streamed_bytes(nbytes)
+                return decoded.to(
+                    device=self.device,
+                    dtype=self.dtype,
+                    non_blocking=True,
+                )
+            self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
+            staged = decoded.to(device=self.device, dtype=self.dtype, non_blocking=True)
+            self._register_cached_entry(cache_key, staged, nbytes)
+            return staged
 
     def stage_vector(
         self,
@@ -319,21 +340,27 @@ class DeepSeekV4FlashGPUWeightStager:
         cache_key = self._dynamic_cache_key(tensor, dtype=dtype, extra=("vector",))
         cached = self._dynamic_cache.get(cache_key)
         if cached is not None:
-            self._record_lru_hit(cache_key)
-            self.record_cache_hit("dynamic", tensor_name=tensor.name)
-            return cached
+            with self._profile_section(
+                "stage_vector",
+                tensor=tensor.name,
+                cache="hit",
+            ):
+                self._record_lru_hit(cache_key)
+                self.record_cache_hit("dynamic", tensor_name=tensor.name)
+                return cached
 
-        decoded = self.store.tensor_to_torch(tensor, dtype=dtype)
-        if decoded.ndim != 1:
-            raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
-        nbytes = decoded.numel() * self._dtype_nbytes(dtype)
-        if not self._prepare_cache_insert(nbytes):
-            self._record_streamed_bytes(nbytes)
-            return decoded.to(device=self.device, dtype=dtype, non_blocking=True)
-        self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
-        staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
-        self._register_cached_entry(cache_key, staged, nbytes)
-        return staged
+        with self._profile_section("stage_vector", tensor=tensor.name, cache="miss"):
+            decoded = self.store.tensor_to_torch(tensor, dtype=dtype)
+            if decoded.ndim != 1:
+                raise ValueError(f"vector tensor must be 1-D; got {decoded.ndim}-D")
+            nbytes = decoded.numel() * self._dtype_nbytes(dtype)
+            if not self._prepare_cache_insert(nbytes):
+                self._record_streamed_bytes(nbytes)
+                return decoded.to(device=self.device, dtype=dtype, non_blocking=True)
+            self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
+            staged = decoded.to(device=self.device, dtype=dtype, non_blocking=True)
+            self._register_cached_entry(cache_key, staged, nbytes)
+            return staged
 
     @staticmethod
     def _validate_output_q8_row_range(

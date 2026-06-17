@@ -24,6 +24,9 @@ from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
 from vllm.model_executor.models.deepseek_v4_flash.moe import grouped_expert_reference
+from vllm.model_executor.models.deepseek_v4_flash.profiler import (
+    DeepSeekV4FlashProfiler,
+)
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
     DeepSeekV4FlashQuantizedExpertPayload,
@@ -595,6 +598,33 @@ def test_gpu_weight_stager_caches_vector_by_cache_key() -> None:
     assert store.vector_read_count == 2
     torch.testing.assert_close(first.cpu(), store.vectors[(tensor.name, torch.float32)])
     torch.testing.assert_close(half.cpu(), store.vectors[(tensor.name, torch.float16)])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_profiles_matrix_and_vector_stage() -> None:
+    store = _FakeStagingStore()
+    matrix_tensor = _tensor("blk.1.attn_q.weight", dims=(2, 2))
+    vector_tensor = _tensor("blk.1.attn_norm.weight", dims=(2,))
+    store.generic_matrices[matrix_tensor.name] = torch.eye(2, dtype=torch.float32)
+    store.vectors[(vector_tensor.name, torch.float32)] = torch.ones(
+        2,
+        dtype=torch.float32,
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    stager.profiler = DeepSeekV4FlashProfiler(enabled=True)
+
+    stager.stage_matrix(matrix_tensor)
+    stager.stage_vector(vector_tensor)
+
+    events = stager.profiler.to_dict()["events"]
+    assert [event["name"] for event in events] == [
+        "stage_matrix",
+        "stage_vector",
+    ]
+    assert events[0]["metadata"]["tensor"] == matrix_tensor.name
+    assert events[0]["metadata"]["cache"] == "miss"
+    assert events[1]["metadata"]["tensor"] == vector_tensor.name
+    assert events[1]["metadata"]["cache"] == "miss"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

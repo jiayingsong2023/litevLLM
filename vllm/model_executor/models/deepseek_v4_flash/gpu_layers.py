@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -11,21 +13,28 @@ from vllm.kernels.triton.deepseek_v4_flash.cache import (
     DeepSeekV4CacheUpdateInputs,
     deepseek_v4_cache_update,
 )
+from vllm.kernels.triton.deepseek_v4_flash.output import (
+    deepseek_v4_q8_0_output_logits,
+)
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE, layer_compress_ratio
-from .gguf_reader import DeepSeekV4FlashTensor
+from .gguf_reader import GGML_TYPE_Q8_0, DeepSeekV4FlashTensor
 from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_runtime import DeepSeekV4FlashGPURequestState
 from .gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
     DeepSeekV4FlashStagedQuantizedExpertPayload,
 )
+from .quant import q8_0_matrix_from_gguf_payload
 from .weight_store import (
     DeepSeekV4FlashCompressorTensors,
     DeepSeekV4FlashGroupedExpertTensors,
     DeepSeekV4FlashHyperConnectionTensors,
     DeepSeekV4FlashLayerSemanticBindings,
 )
+
+_Q8_0_BLOCK_SIZE = 32
+_Q8_0_BLOCK_BYTES = 2 + _Q8_0_BLOCK_SIZE
 
 
 @dataclass
@@ -79,6 +88,18 @@ class _SlidingLayerBackend(Protocol):
     ) -> torch.Tensor: ...
 
 
+def _stager_profile_section(
+    stager: DeepSeekV4FlashGPUWeightStager,
+    name: str,
+    **metadata: object,
+) -> Iterator[None]:
+    profiler = getattr(stager, "profiler", None)
+    section = getattr(profiler, "section", None)
+    if not callable(section):
+        return nullcontext()
+    return section(name, **metadata)
+
+
 def deepseek_v4_flash_rms_norm(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -127,6 +148,130 @@ def deepseek_v4_flash_staged_matrix_projection(
     )
 
 
+def deepseek_v4_flash_q8_0_tensor_projection(
+    hidden: torch.Tensor,
+    tensor: DeepSeekV4FlashTensor,
+    stager: DeepSeekV4FlashGPUWeightStager,
+) -> torch.Tensor:
+    """Project a vector with a raw GGUF Q8_0 tensor without fp32 matrix decode."""
+    if not hidden.is_cuda:
+        raise ValueError("DeepSeek V4 Flash Q8 projection hidden must be CUDA")
+    if hidden.ndim != 1:
+        raise ValueError(f"hidden must be 1-D for Q8 projection; got {hidden.ndim}-D")
+    if tensor.tensor_type != GGML_TYPE_Q8_0:
+        raise ValueError(
+            "DeepSeek V4 Flash Q8 projection expects GGML_TYPE_Q8_0; "
+            f"got {tensor.tensor_type}"
+        )
+    q8_values, q8_scales = _stage_q8_0_tensor(tensor, stager)
+    columns, rows = tensor.dims
+    if hidden.numel() != columns:
+        raise ValueError(
+            "Q8 projection hidden width must match tensor input columns; "
+            f"got hidden={hidden.numel()} and columns={columns}"
+        )
+    if q8_values.shape != (rows, columns):
+        raise ValueError(
+            "staged Q8 values shape must match tensor dims; "
+            f"got {tuple(q8_values.shape)}, expected {(rows, columns)}"
+        )
+
+    return deepseek_v4_q8_0_output_logits(
+        hidden=hidden,
+        lm_head_values=q8_values,
+        lm_head_scales=q8_scales,
+        block_size=_Q8_0_BLOCK_SIZE,
+    )
+
+
+def _stage_q8_0_tensor(
+    tensor: DeepSeekV4FlashTensor,
+    stager: DeepSeekV4FlashGPUWeightStager,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tensor.tensor_type != GGML_TYPE_Q8_0:
+        raise ValueError(
+            "DeepSeek V4 Flash Q8 staging expects GGML_TYPE_Q8_0; "
+            f"got {tensor.tensor_type}"
+        )
+    if len(tensor.dims) != 2:
+        raise ValueError(f"Q8 tensor must be 2-D; got {tensor.dims}")
+    columns, rows = tensor.dims
+    if columns % _Q8_0_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Q8 tensor columns must be divisible by 32; got columns={columns}"
+        )
+    with _stager_profile_section(
+        stager,
+        "stage_q8_matrix",
+        tensor=tensor.name,
+        cache="lookup",
+    ):
+        cached = stager.get_output_q8_chunk(tensor, row_start=0, row_end=rows)
+    if cached is None:
+        blocks_per_row = columns // _Q8_0_BLOCK_SIZE
+        expected_nbytes = rows * blocks_per_row * _Q8_0_BLOCK_BYTES
+        payload = stager.store.tensor_payload(tensor)
+        try:
+            if len(payload) != expected_nbytes:
+                raise ValueError(
+                    "Q8 projection payload byte size does not match tensor shape; "
+                    f"got {len(payload)} bytes, expected {expected_nbytes}"
+                )
+            with _stager_profile_section(
+                stager,
+                "stage_q8_matrix",
+                tensor=tensor.name,
+                cache="miss",
+            ):
+                values, scales = q8_0_matrix_from_gguf_payload(
+                    payload,
+                    rows=rows,
+                    columns=columns,
+                    block_size=_Q8_0_BLOCK_SIZE,
+                )
+                q8_values, q8_scales = stager.stage_output_q8_chunk(
+                    tensor,
+                    row_start=0,
+                    row_end=rows,
+                    values=values,
+                    scales=scales,
+                )
+        finally:
+            payload.release()
+    else:
+        with _stager_profile_section(
+            stager,
+            "stage_q8_matrix",
+            tensor=tensor.name,
+            cache="hit",
+        ):
+            q8_values, q8_scales = cached
+    return q8_values, q8_scales
+
+
+def _project_tensor(
+    hidden: torch.Tensor,
+    tensor: DeepSeekV4FlashTensor,
+    stager: DeepSeekV4FlashGPUWeightStager,
+) -> torch.Tensor:
+    if _can_project_q8_0(hidden, tensor):
+        return deepseek_v4_flash_q8_0_tensor_projection(hidden, tensor, stager)
+    return deepseek_v4_flash_staged_matrix_projection(
+        hidden,
+        stager.stage_matrix(tensor),
+    )
+
+
+def _can_project_q8_0(hidden: torch.Tensor, tensor: DeepSeekV4FlashTensor) -> bool:
+    return (
+        tensor.tensor_type == GGML_TYPE_Q8_0
+        and len(tensor.dims) == 2
+        and hidden.ndim == 1
+        and hidden.numel() == tensor.dims[0]
+        and tensor.dims[0] % _Q8_0_BLOCK_SIZE == 0
+    )
+
+
 def deepseek_v4_flash_router_topk(
     hidden: torch.Tensor,
     router_weight: torch.Tensor,
@@ -135,6 +280,19 @@ def deepseek_v4_flash_router_topk(
     correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = deepseek_v4_flash_staged_matrix_projection(hidden, router_weight)
+    return _router_topk_from_logits(
+        logits,
+        top_k=top_k,
+        correction_bias=correction_bias,
+    )
+
+
+def _router_topk_from_logits(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if logits.ndim != 1:
         raise ValueError(f"router logits must be 1-D; got {logits.ndim}-D")
     if top_k <= 0 or top_k > logits.numel():
@@ -252,28 +410,13 @@ def deepseek_v4_flash_sliding_layer_forward(
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
     )
-    attention_query = stager.stage_matrix(
-        _required_tensor(layer.attention_query, "attention_query")
-    )
     use_two_stage_output = (
         layer.attention_output_a is not None and layer.attention_output_b is not None
     )
     attention_output = (
         None
         if use_two_stage_output
-        else stager.stage_matrix(
-            _required_tensor(layer.attention_output, "attention_output")
-        )
-    )
-    attention_output_a = (
-        stager.stage_matrix(layer.attention_output_a)
-        if layer.attention_output_a is not None
-        else None
-    )
-    attention_output_b = (
-        stager.stage_matrix(layer.attention_output_b)
-        if layer.attention_output_b is not None
-        else None
+        else _required_tensor(layer.attention_output, "attention_output")
     )
     ffn_norm = stager.stage_vector(_required_tensor(layer.ffn_norm, "ffn_norm"))
     grouped_experts = _required_grouped_experts(layer.grouped_experts)
@@ -311,17 +454,18 @@ def deepseek_v4_flash_sliding_layer_forward(
         attn_source = hidden
 
     attn_input = deepseek_v4_flash_rms_norm(attn_source, attention_norm)
-    query = deepseek_v4_flash_staged_matrix_projection(attn_input, attention_query)
+    query = _project_tensor(
+        attn_input,
+        _required_tensor(layer.attention_query, "attention_query"),
+        stager,
+    )
     if layer.attention_query_a_norm is not None:
         query = deepseek_v4_flash_rms_norm(
             query,
             stager.stage_vector(layer.attention_query_a_norm),
         )
     if layer.attention_query_b is not None:
-        query = deepseek_v4_flash_staged_matrix_projection(
-            query,
-            stager.stage_matrix(layer.attention_query_b),
-        )
+        query = _project_tensor(query, layer.attention_query_b, stager)
     if kv_rows is None:
         kv_rows = query.reshape(1, query.numel())
     if not kv_rows.is_cuda:
@@ -340,8 +484,9 @@ def deepseek_v4_flash_sliding_layer_forward(
     attn_update = _project_sliding_attention_output(
         attn_update,
         attention_output,
-        attention_output_a=attention_output_a,
-        attention_output_b=attention_output_b,
+        attention_output_a=layer.attention_output_a,
+        attention_output_b=layer.attention_output_b,
+        stager=stager,
     )
     if uses_hyper_connection:
         if attention_residual_streams is None:
@@ -577,19 +722,10 @@ def deepseek_v4_flash_compressed_layer_forward(
         context,
         None
         if layer.attention_output_a is not None and layer.attention_output_b is not None
-        else stager.stage_matrix(
-            _required_tensor(layer.attention_output, "attention_output")
-        ),
-        attention_output_a=(
-            stager.stage_matrix(layer.attention_output_a)
-            if layer.attention_output_a is not None
-            else None
-        ),
-        attention_output_b=(
-            stager.stage_matrix(layer.attention_output_b)
-            if layer.attention_output_b is not None
-            else None
-        ),
+        else _required_tensor(layer.attention_output, "attention_output"),
+        attention_output_a=layer.attention_output_a,
+        attention_output_b=layer.attention_output_b,
+        stager=stager,
     )
     if uses_hyper_connection:
         if attention_residual_streams is None:
@@ -674,10 +810,11 @@ def deepseek_v4_flash_compressed_layer_forward(
 
 def _project_sliding_attention_output(
     context: torch.Tensor,
-    attention_output: torch.Tensor | None,
+    attention_output: DeepSeekV4FlashTensor | None,
     *,
-    attention_output_a: torch.Tensor | None,
-    attention_output_b: torch.Tensor | None,
+    attention_output_a: DeepSeekV4FlashTensor | None,
+    attention_output_b: DeepSeekV4FlashTensor | None,
+    stager: DeepSeekV4FlashGPUWeightStager,
 ) -> torch.Tensor:
     if attention_output_a is not None or attention_output_b is not None:
         if attention_output_a is None or attention_output_b is None:
@@ -690,23 +827,25 @@ def _project_sliding_attention_output(
             attention_output_a,
             attention_output_b,
             output_groups=DEEPSEEK_V4_FLASH_SHAPE.output_groups,
+            stager=stager,
         )
     if attention_output is None:
         raise ValueError("DeepSeek V4 Flash sliding layer missing attention_output")
-    return deepseek_v4_flash_staged_matrix_projection(context, attention_output)
+    return _project_tensor(context, attention_output, stager)
 
 
 def _grouped_output_projection(
     context: torch.Tensor,
-    output_a: torch.Tensor,
-    output_b: torch.Tensor,
+    output_a: DeepSeekV4FlashTensor,
+    output_b: DeepSeekV4FlashTensor,
     *,
     output_groups: int,
+    stager: DeepSeekV4FlashGPUWeightStager,
 ) -> torch.Tensor:
     if context.ndim != 1:
         raise ValueError(f"attention context must be 1-D; got {context.ndim}-D")
-    if output_a.ndim != 2 or output_b.ndim != 2:
-        raise ValueError("attention output projection weights must be 2-D")
+    if len(output_a.dims) != 2 or len(output_b.dims) != 2:
+        raise ValueError("attention output projection tensors must be 2-D")
     if output_groups <= 0:
         raise ValueError(f"output_groups must be positive; got {output_groups}")
     if context.numel() % output_groups != 0:
@@ -716,31 +855,51 @@ def _grouped_output_projection(
         )
 
     group_input = context.numel() // output_groups
-    if output_a.shape[1] != group_input:
+    if output_a.dims[0] != group_input:
         raise ValueError(
             "attention_output_a input width must match grouped context; "
-            f"got {output_a.shape[1]} and {group_input}"
+            f"got {output_a.dims[0]} and {group_input}"
         )
-    if output_a.shape[0] % output_groups != 0:
+    if output_a.dims[1] % output_groups != 0:
         raise ValueError(
             "attention_output_a output width must be divisible by output_groups; "
-            f"got {output_a.shape[0]} and {output_groups}"
+            f"got {output_a.dims[1]} and {output_groups}"
         )
-    rank_per_group = output_a.shape[0] // output_groups
-    if output_b.shape[1] != output_groups * rank_per_group:
+    rank_per_group = output_a.dims[1] // output_groups
+    if output_b.dims[0] != output_groups * rank_per_group:
         raise ValueError(
             "attention_output_b input width must match grouped output rank; "
-            f"got {output_b.shape[1]} and {output_groups * rank_per_group}"
+            f"got {output_b.dims[0]} and {output_groups * rank_per_group}"
         )
 
     grouped = context.to(torch.float32).reshape(output_groups, group_input)
-    a_by_group = output_a.to(torch.float32).reshape(
-        output_groups,
-        rank_per_group,
-        group_input,
-    )
-    low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
-    return output_b.to(torch.float32).matmul(low_rank.reshape(-1))
+    if (
+        output_a.tensor_type == GGML_TYPE_Q8_0
+        and output_a.dims[0] % _Q8_0_BLOCK_SIZE == 0
+    ):
+        values, scales = _stage_q8_0_tensor(output_a, stager)
+        low_rank_rows = []
+        for group_idx in range(output_groups):
+            row_start = group_idx * rank_per_group
+            row_end = row_start + rank_per_group
+            low_rank_rows.append(
+                deepseek_v4_q8_0_output_logits(
+                    hidden=grouped[group_idx],
+                    lm_head_values=values[row_start:row_end],
+                    lm_head_scales=scales[row_start:row_end],
+                    block_size=_Q8_0_BLOCK_SIZE,
+                )
+            )
+        low_rank = torch.stack(low_rank_rows, dim=0)
+    else:
+        output_a_weight = stager.stage_matrix(output_a)
+        a_by_group = output_a_weight.to(torch.float32).reshape(
+            output_groups,
+            rank_per_group,
+            group_input,
+        )
+        low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
+    return _project_tensor(low_rank.reshape(-1), output_b, stager)
 
 
 def _ensure_hyper_connection_streams(
@@ -876,8 +1035,9 @@ def _expand_shared_attention_context_for_output(
         raise ValueError(f"attention context must be 1-D; got {context.ndim}-D")
     if layer.attention_output_a is None or layer.attention_output_b is None:
         return context
-    output_a = stager.stage_matrix(layer.attention_output_a)
-    expected_context = output_a.shape[1] * DEEPSEEK_V4_FLASH_SHAPE.output_groups
+    expected_context = (
+        layer.attention_output_a.dims[0] * DEEPSEEK_V4_FLASH_SHAPE.output_groups
+    )
     if context.numel() == expected_context:
         return context
     attn_sinks = (
@@ -900,10 +1060,7 @@ def _compressed_attention_query(
     stager: DeepSeekV4FlashGPUWeightStager,
 ) -> torch.Tensor:
     if layer.attention_key_value is not None:
-        query = deepseek_v4_flash_staged_matrix_projection(
-            hidden,
-            stager.stage_matrix(layer.attention_key_value),
-        )
+        query = _project_tensor(hidden, layer.attention_key_value, stager)
         if layer.attention_key_value_a_norm is not None:
             query = deepseek_v4_flash_rms_norm(
                 query,
@@ -911,9 +1068,10 @@ def _compressed_attention_query(
             )
         return query
 
-    query = deepseek_v4_flash_staged_matrix_projection(
+    query = _project_tensor(
         hidden,
-        stager.stage_matrix(_required_tensor(layer.attention_query, "attention_query")),
+        _required_tensor(layer.attention_query, "attention_query"),
+        stager,
     )
     if layer.attention_query_a_norm is not None:
         query = deepseek_v4_flash_rms_norm(
@@ -921,10 +1079,7 @@ def _compressed_attention_query(
             stager.stage_vector(layer.attention_query_a_norm),
         )
     if layer.attention_query_b is not None:
-        query = deepseek_v4_flash_staged_matrix_projection(
-            query,
-            stager.stage_matrix(layer.attention_query_b),
-        )
+        query = _project_tensor(query, layer.attention_query_b, stager)
     return query
 
 
@@ -943,14 +1098,8 @@ def _update_compressor_state(
         raise ValueError("token_idx must be non-negative")
     if ratio <= 0:
         raise ValueError(f"compressor ratio must be positive; got {ratio}")
-    kv_cur = deepseek_v4_flash_staged_matrix_projection(
-        hidden,
-        stager.stage_matrix(compressor.kv),
-    )
-    score_cur = deepseek_v4_flash_staged_matrix_projection(
-        hidden,
-        stager.stage_matrix(compressor.gate),
-    )
+    kv_cur = _project_tensor(hidden, compressor.kv, stager)
+    score_cur = _project_tensor(hidden, compressor.gate, stager)
     if kv_cur.shape != score_cur.shape:
         raise ValueError(
             "compressor KV and gate projections must share one shape; "
@@ -1094,28 +1243,19 @@ def _select_compressed_rows_with_indexer(
     if not indexer_rows.is_cuda:
         raise ValueError("indexer_rows must be CUDA")
 
-    index_weights = deepseek_v4_flash_staged_matrix_projection(
-        hidden,
-        stager.stage_matrix(layer.indexer.projection),
-    )
+    index_weights = _project_tensor(hidden, layer.indexer.projection, stager)
     if index_weights.ndim != 1:
         raise ValueError(f"indexer weights must be 1-D; got {index_weights.ndim}-D")
 
     query_source = hidden
     if layer.attention_query_a is not None:
-        query_source = deepseek_v4_flash_staged_matrix_projection(
-            hidden,
-            stager.stage_matrix(layer.attention_query_a),
-        )
+        query_source = _project_tensor(hidden, layer.attention_query_a, stager)
         if layer.attention_query_a_norm is not None:
             query_source = deepseek_v4_flash_rms_norm(
                 query_source,
                 stager.stage_vector(layer.attention_query_a_norm),
             )
-    query_flat = deepseek_v4_flash_staged_matrix_projection(
-        query_source,
-        stager.stage_matrix(layer.indexer.query_b),
-    )
+    query_flat = _project_tensor(query_source, layer.indexer.query_b, stager)
     row_width = indexer_rows.shape[1]
     if query_flat.numel() % row_width != 0:
         raise ValueError(
@@ -1211,15 +1351,15 @@ def _run_sliding_moe(
         token_id_tensor=token_id_tensor,
     )
     if routed is None:
-        router = stager.stage_matrix(_required_tensor(layer.router, "router"))
+        router = _required_tensor(layer.router, "router")
         correction_bias = (
             stager.stage_vector(layer.expert_probs_bias)
             if layer.expert_probs_bias is not None
             else None
         )
-        expert_ids, expert_weights = deepseek_v4_flash_router_topk(
-            hidden,
-            router,
+        logits = _project_tensor(hidden, router, stager)
+        expert_ids, expert_weights = _router_topk_from_logits(
+            logits,
             top_k=router_top_k,
             correction_bias=correction_bias,
         )
@@ -1314,6 +1454,18 @@ def _run_staged_shared_expert(
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
 ) -> torch.Tensor:
+    if (
+        _can_project_q8_0(hidden, tensors.gate)
+        and _can_project_q8_0(hidden, tensors.up)
+        and tensors.down.tensor_type == GGML_TYPE_Q8_0
+        and len(tensors.down.dims) == 2
+    ):
+        gate = _project_tensor(hidden, tensors.gate, stager)
+        up = _project_tensor(hidden, tensors.up, stager)
+        activated = F.silu(gate.to(torch.float32)) * up.to(torch.float32)
+        if _can_project_q8_0(activated, tensors.down):
+            return _project_tensor(activated, tensors.down, stager).to(torch.float32)
+
     return backend.routed_expert_gemm(
         hidden=hidden,
         gate_weight=stager.stage_matrix(tensors.gate),
@@ -1344,39 +1496,63 @@ def _run_staged_routed_experts(
         strict=True,
     ):
         try:
-            gate_payload = stager.stage_grouped_expert_payload(
-                grouped_experts.gate,
-                expert_id,
+            with _stager_profile_section(
+                stager,
+                "router_expert_stage",
                 layer_idx=layer_idx,
-            )
-            up_payload = stager.stage_grouped_expert_payload(
-                grouped_experts.up,
-                expert_id,
+                expert_id=expert_id,
+            ):
+                gate_payload = stager.stage_grouped_expert_payload(
+                    grouped_experts.gate,
+                    expert_id,
+                    layer_idx=layer_idx,
+                )
+                up_payload = stager.stage_grouped_expert_payload(
+                    grouped_experts.up,
+                    expert_id,
+                    layer_idx=layer_idx,
+                )
+                down_payload = stager.stage_grouped_expert_payload(
+                    grouped_experts.down,
+                    expert_id,
+                    layer_idx=layer_idx,
+                )
+            with _stager_profile_section(
+                stager,
+                "router_expert_kernel",
                 layer_idx=layer_idx,
-            )
-            down_payload = stager.stage_grouped_expert_payload(
-                grouped_experts.down,
-                expert_id,
-                layer_idx=layer_idx,
-            )
-            expert_output = backend.quantized_expert_gemm(
-                hidden=hidden,
-                gate_payload=gate_payload,
-                up_payload=up_payload,
-                down_payload=down_payload,
-            ).to(torch.float32)
+                expert_id=expert_id,
+            ):
+                expert_output = backend.quantized_expert_gemm(
+                    hidden=hidden,
+                    gate_payload=gate_payload,
+                    up_payload=up_payload,
+                    down_payload=down_payload,
+                ).to(torch.float32)
         except (AttributeError, NotImplementedError):
-            staged = stager.stage_grouped_expert(
-                grouped_experts,
-                expert_id,
+            with _stager_profile_section(
+                stager,
+                "router_expert_stage",
                 layer_idx=layer_idx,
-            )
-            expert_output = backend.routed_expert_gemm(
-                hidden=hidden,
-                gate_weight=staged.gate,
-                up_weight=staged.up,
-                down_weight=staged.down,
-            ).to(torch.float32)
+                expert_id=expert_id,
+            ):
+                staged = stager.stage_grouped_expert(
+                    grouped_experts,
+                    expert_id,
+                    layer_idx=layer_idx,
+                )
+            with _stager_profile_section(
+                stager,
+                "router_expert_kernel",
+                layer_idx=layer_idx,
+                expert_id=expert_id,
+            ):
+                expert_output = backend.routed_expert_gemm(
+                    hidden=hidden,
+                    gate_weight=staged.gate,
+                    up_weight=staged.up,
+                    down_weight=staged.down,
+                ).to(torch.float32)
         if output is None:
             output = torch.zeros_like(expert_output, dtype=torch.float32)
         if output.shape != expert_output.shape:
@@ -1498,6 +1674,7 @@ def _required_compressor(
 __all__ = [
     "deepseek_v4_flash_compressed_layer_forward",
     "deepseek_v4_flash_layer_forward",
+    "deepseek_v4_flash_q8_0_tensor_projection",
     "deepseek_v4_flash_residual_hyper_connection",
     "deepseek_v4_flash_rms_norm",
     "deepseek_v4_flash_router_topk",

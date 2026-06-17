@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
     _run_hash_routed_experts,
     _run_staged_routed_experts,
+    deepseek_v4_flash_q8_0_tensor_projection,
     deepseek_v4_flash_router_topk,
     deepseek_v4_flash_sliding_layer_forward,
     deepseek_v4_flash_staged_matrix_projection,
@@ -24,6 +26,9 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
 from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
     DeepSeekV4FlashStagedQuantizedExpertPayload,
+)
+from vllm.model_executor.models.deepseek_v4_flash.profiler import (
+    DeepSeekV4FlashProfiler,
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
@@ -40,12 +45,18 @@ TARGET_GGUF = Path(
 
 class _FakeLayerStore:
     def __init__(self) -> None:
+        self.decode_count = 0
         self.matrices: dict[str, torch.Tensor] = {}
         self.vectors: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self.expert_matrices: dict[tuple[str, int], torch.Tensor] = {}
+        self.payloads: dict[str, bytes] = {}
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+        self.decode_count += 1
         return self.matrices[tensor.name].clone()
+
+    def tensor_payload(self, tensor: DeepSeekV4FlashTensor) -> memoryview:
+        return memoryview(bytearray(self.payloads[tensor.name]))
 
     def tensor_to_torch(
         self,
@@ -219,6 +230,16 @@ def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
     )
 
 
+def _q8_payload(rows: list[tuple[float, tuple[int, ...]]]) -> bytes:
+    payload = bytearray()
+    for scale, values in rows:
+        if len(values) != 32:
+            raise ValueError("test Q8 rows must contain one 32-value block")
+        payload.extend(struct.pack("<e", scale))
+        payload.extend(struct.pack("<" + "b" * 32, *values))
+    return bytes(payload)
+
+
 def _add_identity_layer_weights(
     store: _FakeLayerStore,
     tensors: dict[str, DeepSeekV4FlashTensor],
@@ -246,6 +267,34 @@ def _add_identity_layer_weights(
         store.expert_matrices[(tensors["down"].name, expert_id)] = torch.eye(
             hidden_size
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_q8_tensor_projection_uses_raw_payload_without_stage_matrix() -> None:
+    store = _FakeLayerStore()
+    tensor = _tensor("blk.0.attn_output_a.weight", (32, 2))
+    store.payloads[tensor.name] = _q8_payload(
+        [
+            (0.5, tuple([2] + [0] * 31)),
+            (0.25, tuple([0, 4] + [0] * 30)),
+        ]
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    hidden = torch.zeros((32,), dtype=torch.float32, device="cuda")
+    hidden[0] = 3.0
+    hidden[1] = 5.0
+
+    first = deepseek_v4_flash_q8_0_tensor_projection(hidden, tensor, stager)
+    second = deepseek_v4_flash_q8_0_tensor_projection(hidden, tensor, stager)
+
+    assert store.decode_count == 0
+    assert stager.cache_stats()["dynamic_misses"] == 1
+    assert stager.cache_stats()["dynamic_hits"] == 1
+    torch.testing.assert_close(
+        first,
+        torch.tensor([3.0, 5.0], dtype=torch.float32, device="cuda"),
+    )
+    torch.testing.assert_close(second, first)
 
 
 def test_staged_routed_experts_prefers_quantized_payload_path(
@@ -285,6 +334,39 @@ def test_staged_routed_experts_prefers_quantized_payload_path(
         ("down", 1, 7),
     ]
     torch.testing.assert_close(output, torch.full((2,), 1.5))
+
+
+def test_staged_routed_experts_profiles_stage_and_kernel_sections() -> None:
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 4)),
+        up=_tensor("up", (2, 2, 4)),
+        down=_tensor("down", (2, 2, 4)),
+    )
+    stager = _RoutedExpertTestStager()
+    stager.profiler = DeepSeekV4FlashProfiler(enabled=True)
+    backend = _QuantizedRecordingBackend()
+
+    _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([3, 1], dtype=torch.int64),
+        torch.tensor([0.25, 0.75], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=7,
+    )
+
+    events = stager.profiler.to_dict()["events"]
+    event_names = [event["name"] for event in events]
+
+    assert event_names == [
+        "router_expert_stage",
+        "router_expert_kernel",
+        "router_expert_stage",
+        "router_expert_kernel",
+    ]
+    assert events[0]["metadata"] == {"layer_idx": 7, "expert_id": 3}
+    assert events[2]["metadata"] == {"layer_idx": 7, "expert_id": 1}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

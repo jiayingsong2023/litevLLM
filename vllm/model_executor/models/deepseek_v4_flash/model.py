@@ -776,6 +776,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             )
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
+        self._gpu_weight_stager.profiler = self._deepseek_profiler
         return self._gpu_weight_stager
 
     @staticmethod
