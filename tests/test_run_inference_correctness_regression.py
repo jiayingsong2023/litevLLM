@@ -190,9 +190,9 @@ def test_run_inference_correctness_regression_runs_opt_in_deepseek_gpu_smoke(
 
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     calls = log_path.read_text(encoding="utf-8")
-    assert "run python tests/tools/run_deepseek_v4_flash_gpu_smoke.py" in calls
+    assert "run python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
     assert f"--model {deepseek_path}" in calls
-    assert "DeepSeek V4 Flash GPU smoke" in proc.stdout
+    assert "DeepSeek V4 Flash Tier-B quality smoke" in proc.stdout
 
 
 def test_run_inference_correctness_regression_perf_diag_includes_deepseek(

@@ -41,8 +41,26 @@ def _load_shape_tool() -> ModuleType:
     return module
 
 
+def _load_quality_tool() -> ModuleType:
+    path = (
+        Path(__file__).parents[1]
+        / "tools"
+        / "deepseek_v4_flash_quality_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "deepseek_v4_flash_quality_smoke",
+        path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 smoke = _load_smoke_tool()
 shape_tool = _load_shape_tool()
+quality = _load_quality_tool()
 
 
 def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
@@ -68,6 +86,82 @@ def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
     assert args.max_tokens == 8
     assert args.repeat == 2
     assert args.profile_json == profile_path
+
+
+def test_quality_parser_accepts_readability_args(tmp_path: Path) -> None:
+    json_path = tmp_path / "quality.json"
+
+    args = quality.parse_args(
+        [
+            "--model",
+            "model.gguf",
+            "--prompt-text",
+            "What is the capital of France?",
+            "--max-tokens",
+            "8",
+            "--min-output-chars",
+            "12",
+            "--json-out",
+            str(json_path),
+        ]
+    )
+
+    assert args.model == Path("model.gguf")
+    assert args.prompt_text == "What is the capital of France?"
+    assert args.max_tokens == 8
+    assert args.min_output_chars == 12
+    assert args.json_out == json_path
+
+
+def test_quality_readability_rejects_repeated_token_garbage() -> None:
+    verdict = quality.evaluate_readability(
+        text="aaaaaa",
+        generated_token_ids=[7, 7, 7, 7, 7, 7],
+        min_output_chars=3,
+    )
+
+    assert verdict["passed"] is False
+    assert "token_repeat" in verdict["reasons"]
+
+
+def test_quality_readability_rejects_fragmented_word_repetition() -> None:
+    verdict = quality.evaluate_readability(
+        text="/gen/genazzo/genazzo/gen(The disposed",
+        generated_token_ids=[80566, 80566, 62594, 80566, 62594, 80566, 96093],
+        min_output_chars=8,
+    )
+
+    assert verdict["passed"] is False
+    assert "word_repeat" in verdict["reasons"]
+
+
+def test_quality_readability_accepts_short_coherent_text() -> None:
+    verdict = quality.evaluate_readability(
+        text="Paris is the capital of France.",
+        generated_token_ids=[100, 42, 51, 79, 12, 9],
+        min_output_chars=8,
+    )
+
+    assert verdict["passed"] is True
+    assert verdict["reasons"] == []
+
+
+def test_quality_decodes_token_ids_with_gguf_tokens() -> None:
+    text = quality.decode_generated_tokens(
+        [0, 1, 2],
+        gguf_tokens=["<s>", "Paris", " is"],
+    )
+
+    assert text == "Paris is"
+
+
+def test_quality_simple_prompt_encoder_uses_longest_gguf_pieces() -> None:
+    token_ids = quality.encode_prompt_text(
+        "What is?",
+        gguf_tokens=["<s>", "What", " is", "?", "What is"],
+    )
+
+    assert token_ids == [4, 3]
 
 
 def test_shape_inspector_parser_accepts_limit_and_json_args(tmp_path: Path) -> None:

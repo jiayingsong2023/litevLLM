@@ -21,7 +21,7 @@
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
 #   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
-#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 enables the opt-in real GGUF DeepSeek smoke.
+#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 enables the opt-in real GGUF DeepSeek Tier-B quality smoke.
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -374,18 +374,19 @@ fi
 
 if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" ]]; then
   echo ""
-  echo "=== DeepSeek V4 Flash GPU smoke (opt-in) ==="
+  echo "=== DeepSeek V4 Flash Tier-B quality smoke (opt-in) ==="
   if [[ ! -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
     echo "[ERROR] Missing DeepSeek V4 Flash GGUF: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
     echo "        Override with MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf"
     exit 1
   fi
-  run_stage "DeepSeek V4 Flash real GGUF GPU smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
-    uv run python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+  run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
+    uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
     --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
     --context-length 4096 \
-    --max-tokens 1
-  cleanup_after_model_step "DeepSeek V4 Flash GPU smoke"
+    --max-tokens 8 \
+    --min-output-chars 8
+  cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
 fi
 
 if [[ "$RUN_PERF_DIAG" == "1" ]]; then
