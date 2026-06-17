@@ -473,9 +473,9 @@ steps:
 - collapse output hyper-connection streams and output RMS norm once per token;
 - run Q8_0 chunk logits/argmax from the collapsed hidden state.
 
-The retained chunk size was also increased from `1024` vocab rows to `8192`
+The retained chunk size was also increased from `1024` vocab rows to `16384`
 rows. The target GGUF has roughly 129k vocab rows, so this reduces output
-projection chunks from roughly 127 to roughly 16 per generated token.
+projection chunks from roughly 127 to roughly 8 per generated token.
 
 Recorded one-token smoke command:
 
@@ -486,7 +486,7 @@ timeout --foreground --kill-after=60s 2400s \
   --context-length 4096 \
   --max-tokens 1 \
   --repeat 1 \
-  --profile-json /tmp/deepseek-v4-flash-output-chunk8192-one.json
+  --profile-json /tmp/deepseek-v4-flash-output-chunk16384-clone-one.json
 ```
 
 Result:
@@ -495,8 +495,8 @@ Result:
 - `phase4_metrics.iq2_xxs_gate_up_fused_calls=258`
 - `phase4_metrics.q2_k_triton_calls=258`
 - `phase4_metrics.q2_iq2_reference_fallback_calls=0`
-- `output_projection` event was roughly `36000 ms`
-- `generate_greedy_kernel` elapsed roughly `330093 ms`
+- `output_projection` event was roughly `35186 ms`
+- `generate_greedy_kernel` elapsed roughly `328741 ms`
 
 The single-row Q8_0 Triton matvec plus larger output chunks is the retained
 path. A 16-row tiled Q8_0 prototype was measured and rejected because it raised
