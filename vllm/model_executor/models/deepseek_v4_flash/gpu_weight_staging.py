@@ -74,6 +74,9 @@ DeepSeekV4FlashSelectedExpertPayloads = tuple[
 ]
 
 
+_SELECTED_PAYLOAD_CACHE_MAX_ENTRIES = 32
+
+
 class DeepSeekV4FlashGPUWeightStager:
     """Stage decoded GGUF expert matrices into a per-device GPU cache."""
 
@@ -108,6 +111,10 @@ class DeepSeekV4FlashGPUWeightStager:
         self._lru_cache_keys: OrderedDict[DeepSeekV4FlashCacheKey, None] = OrderedDict()
         self._pinned_cache_keys: set[DeepSeekV4FlashCacheKey] = set()
         self._manual_pinned_experts: set[tuple[int, int]] = set()
+        self._selected_payload_cache: OrderedDict[
+            tuple[int | None, str, str, str, tuple[int, ...], str, str],
+            list[DeepSeekV4FlashSelectedExpertPayloads],
+        ] = OrderedDict()
         self._cache_stats = {
             "dynamic_hits": 0,
             "dynamic_misses": 0,
@@ -123,6 +130,8 @@ class DeepSeekV4FlashGPUWeightStager:
             "prefetch_payload_streamed_bytes": 0,
             "streamed_bytes": 0,
             "batched_payload_stage_calls": 0,
+            "selected_payload_cache_hits": 0,
+            "selected_payload_cache_misses": 0,
         }
 
     @property
@@ -234,6 +243,7 @@ class DeepSeekV4FlashGPUWeightStager:
         if cache_key.namespace == "grouped":
             self._grouped_cache.pop(cache_key, None)
             self._grouped_cache_experts.pop(cache_key, None)
+            self.clear_selected_expert_payload_cache()
         else:
             self._dynamic_cache.pop(cache_key, None)
         self._lru_cache_keys.pop(cache_key, None)
@@ -429,9 +439,7 @@ class DeepSeekV4FlashGPUWeightStager:
 
     def stage_q8_raw_payload(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
         if self.device.type != "cuda":
-            raise ValueError(
-                "DeepSeek V4 Flash raw Q8 staging requires a CUDA device"
-            )
+            raise ValueError("DeepSeek V4 Flash raw Q8 staging requires a CUDA device")
         cache_key = self._output_q8_raw_cache_key(tensor)
         cached = self._dynamic_cache.get(cache_key)
         if cached is not None:
@@ -571,6 +579,9 @@ class DeepSeekV4FlashGPUWeightStager:
         for cache_key in list(self._dynamic_cache):
             self._drop_cached_entry(cache_key, count_eviction=False)
 
+    def clear_selected_expert_payload_cache(self) -> None:
+        self._selected_payload_cache.clear()
+
     def pin_grouped_expert(self, layer_idx: int, expert_id: int) -> None:
         self._manual_pinned_experts.add((layer_idx, expert_id))
         for cache_key in list(self._grouped_cache):
@@ -690,28 +701,65 @@ class DeepSeekV4FlashGPUWeightStager:
             int(expert_id)
             for expert_id in flattened.to(device="cpu", dtype=torch.int64).tolist()
         ]
+        cache_key = (
+            layer_idx,
+            tensors.gate.name,
+            tensors.up.name,
+            tensors.down.name,
+            tuple(expert_id_values),
+            str(self.device),
+            str(self.dtype),
+        )
+        cached = self._selected_payload_cache.get(cache_key)
+        if cached is not None:
+            self._selected_payload_cache.move_to_end(cache_key)
+            for expert_id in expert_id_values:
+                for tensor in (tensors.gate, tensors.up, tensors.down):
+                    self._record_lru_hit(
+                        self._grouped_payload_cache_key(tensor, expert_id)
+                    )
+            self._cache_stats["selected_payload_cache_hits"] += 1
+            return cached
+        self._cache_stats["selected_payload_cache_misses"] += 1
         self._cache_stats["batched_payload_stage_calls"] += 1
-        return [
-            (
+        staged_payloads: list[DeepSeekV4FlashSelectedExpertPayloads] = []
+        for expert_id in expert_id_values:
+            gate_payload = self.stage_grouped_expert_payload(
+                tensors.gate,
                 expert_id,
-                self.stage_grouped_expert_payload(
-                    tensors.gate,
-                    expert_id,
-                    layer_idx=layer_idx,
-                ),
-                self.stage_grouped_expert_payload(
-                    tensors.up,
-                    expert_id,
-                    layer_idx=layer_idx,
-                ),
-                self.stage_grouped_expert_payload(
-                    tensors.down,
-                    expert_id,
-                    layer_idx=layer_idx,
-                ),
+                layer_idx=layer_idx,
             )
+            up_payload = self.stage_grouped_expert_payload(
+                tensors.up,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            down_payload = self.stage_grouped_expert_payload(
+                tensors.down,
+                expert_id,
+                layer_idx=layer_idx,
+            )
+            staged_payloads.append(
+                (
+                    expert_id,
+                    gate_payload,
+                    up_payload,
+                    down_payload,
+                )
+            )
+        all_payloads_cache_resident = all(
+            self._grouped_payload_cache_key(tensor, expert_id) in self._grouped_cache
             for expert_id in expert_id_values
-        ]
+            for tensor in (tensors.gate, tensors.up, tensors.down)
+        )
+        if all_payloads_cache_resident:
+            self._selected_payload_cache[cache_key] = staged_payloads
+            self._selected_payload_cache.move_to_end(cache_key)
+            while (
+                len(self._selected_payload_cache) > _SELECTED_PAYLOAD_CACHE_MAX_ENTRIES
+            ):
+                self._selected_payload_cache.popitem(last=False)
+        return staged_payloads
 
     def prefetch_grouped_experts(
         self,

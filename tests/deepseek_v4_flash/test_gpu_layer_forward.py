@@ -35,6 +35,7 @@ from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
     DeepSeekV4FlashHyperConnectionTensors,
     DeepSeekV4FlashLayerSemanticBindings,
+    DeepSeekV4FlashQuantizedExpertPayload,
     open_deepseek_v4_flash_weight_store,
 )
 
@@ -50,6 +51,8 @@ class _FakeLayerStore:
         self.matrices: dict[str, torch.Tensor] = {}
         self.vectors: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self.expert_matrices: dict[tuple[str, int], torch.Tensor] = {}
+        self.raw_payload_read_count = 0
+        self.raw_payloads: dict[tuple[str, int], bytes] = {}
         self.payloads: dict[str, bytes] = {}
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
@@ -73,6 +76,24 @@ class _FakeLayerStore:
         expert_id: int,
     ) -> torch.Tensor:
         return self.expert_matrices[(tensor.name, expert_id)].clone()
+
+    def raw_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashQuantizedExpertPayload:
+        if (tensor.name, expert_id) not in self.raw_payloads:
+            raise AttributeError("raw grouped expert payload unavailable")
+        self.raw_payload_read_count += 1
+        input_size, output_size, _expert_count = tensor.dims
+        return DeepSeekV4FlashQuantizedExpertPayload(
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=tensor.tensor_type,
+            rows=output_size,
+            columns=input_size,
+            payload=memoryview(bytearray(self.raw_payloads[(tensor.name, expert_id)])),
+        )
 
 
 class _RecordingBackend:
@@ -418,6 +439,72 @@ def test_staged_routed_experts_prefers_quantized_payload_path(
         ("down", 1, 7),
     ]
     torch.testing.assert_close(output, torch.full((2,), 1.5))
+
+
+def test_staged_routed_experts_reuses_selected_payload_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_to = torch.Tensor.to
+
+    def fake_cuda_to(
+        tensor: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        device = kwargs.get("device")
+        if device is None and args and isinstance(args[0], torch.device | str):
+            device = args[0]
+        is_cuda_target = device is not None and torch.device(device).type == "cuda"
+        if is_cuda_target:
+            filtered_kwargs = dict(kwargs)
+            filtered_kwargs.pop("device", None)
+            filtered_args = args[1:] if args and device == args[0] else args
+            return original_to(tensor, *filtered_args, **filtered_kwargs).clone()
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_cuda_to)
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 4)),
+        up=_tensor("up", (2, 2, 4)),
+        down=_tensor("down", (2, 2, 4)),
+    )
+    store = _FakeLayerStore()
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in (3, 1):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=1 << 20,
+    )
+    backend = _QuantizedRecordingBackend()
+    expert_ids = torch.tensor([3, 1], dtype=torch.int64)
+    expert_weights = torch.tensor([0.25, 0.75], dtype=torch.float32)
+
+    first = _run_staged_routed_experts(
+        torch.ones(2),
+        expert_ids,
+        expert_weights,
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=7,
+    )
+    second = _run_staged_routed_experts(
+        torch.ones(2),
+        expert_ids,
+        expert_weights,
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=7,
+    )
+
+    assert stager.cache_stats().get("batched_payload_stage_calls", 0) == 1
+    assert stager.cache_stats().get("selected_payload_cache_hits", 0) == 1
+    assert store.raw_payload_read_count == 6
+    torch.testing.assert_close(first, torch.full((2,), 1.5))
+    torch.testing.assert_close(second, first)
 
 
 def test_staged_routed_experts_profiles_stage_and_kernel_sections() -> None:

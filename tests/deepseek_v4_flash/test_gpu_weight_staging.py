@@ -122,6 +122,25 @@ def _tensor(name: str, dims: tuple[int, ...] = (2, 2, 1)) -> DeepSeekV4FlashTens
     )
 
 
+def _patch_fake_cuda_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_to = torch.Tensor.to
+
+    def fake_cuda_to(
+        tensor: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        device = kwargs.get("device")
+        if device is None and args and isinstance(args[0], torch.device | str):
+            device = args[0]
+        if torch.device(device).type == "cuda" if device is not None else False:
+            filtered_kwargs = dict(kwargs)
+            filtered_kwargs.pop("device", None)
+            filtered_args = args[1:] if args and device == args[0] else args
+            return original_to(tensor, *filtered_args, **filtered_kwargs).clone()
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_cuda_to)
+
+
 class _FakeHotLayer:
     def __init__(
         self,
@@ -190,6 +209,8 @@ def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
         "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
         "batched_payload_stage_calls": 0,
+        "selected_payload_cache_hits": 0,
+        "selected_payload_cache_misses": 0,
     }
 
 
@@ -206,6 +227,197 @@ def test_gpu_weight_stager_memory_stats_include_cache_stats() -> None:
     assert "lru_evictions" in stats
     assert "pinned_entries" in stats
     assert "streamed_bytes" in stats
+
+
+def test_selected_expert_payload_stage_reuses_same_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 8)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 8)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 8)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in (1, 3):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=1 << 20,
+    )
+    expert_ids = torch.tensor([1, 3], dtype=torch.int64)
+
+    first = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+    second = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+
+    assert second is first
+    assert store.raw_payload_read_count == 6
+    stats = stager.cache_stats()
+    assert stats["batched_payload_stage_calls"] == 1
+    assert stats["selected_payload_cache_hits"] == 1
+
+
+def test_selected_expert_payload_stage_does_not_reuse_streamed_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 8)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 8)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 8)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        store.raw_payloads[(tensor.name, 3)] = bytes([3, len(tensor.name) % 251])
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        cache_admission_policy=DeepSeekV4FlashCacheAdmissionPolicy(
+            stream_experts=frozenset({(2, 3)}),
+        ),
+    )
+    expert_ids = torch.tensor([3], dtype=torch.int64)
+
+    first = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+    second = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+
+    assert second is not first
+    assert store.raw_payload_read_count == 6
+    assert stager.staged_bytes == 0
+    assert first[0][1].payload.data_ptr() != second[0][1].payload.data_ptr()
+    stats = stager.cache_stats()
+    assert stats["batched_payload_stage_calls"] == 2
+    assert stats["selected_payload_cache_hits"] == 0
+    assert stats["selected_payload_cache_misses"] == 2
+    assert stats["streamed_bytes"] == 12
+
+
+def test_selected_expert_payload_stage_does_not_cache_evicted_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 8)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 8)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 8)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in (1, 3):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=6,
+    )
+    expert_ids = torch.tensor([1, 3], dtype=torch.int64)
+
+    first = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+    second = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        expert_ids,
+        layer_idx=2,
+    )
+
+    assert second is not first
+    assert store.raw_payload_read_count == 12
+    assert stager.cache_stats()["selected_payload_cache_hits"] == 0
+
+
+def test_selected_expert_payload_cache_evicts_oldest_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 64)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 64)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 64)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in range(33):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    first = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        torch.tensor([0], dtype=torch.int64),
+        layer_idx=2,
+    )
+    for expert_id in range(1, 33):
+        stager.stage_grouped_expert_payloads_for_ids(
+            grouped,
+            torch.tensor([expert_id], dtype=torch.int64),
+            layer_idx=2,
+        )
+    reloaded = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        torch.tensor([0], dtype=torch.int64),
+        layer_idx=2,
+    )
+
+    assert reloaded is not first
+    assert len(stager._selected_payload_cache) == 32
+    assert stager.cache_stats()["selected_payload_cache_hits"] == 0
+
+
+def test_selected_expert_payload_cache_hit_refreshes_grouped_lru_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 8)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 8)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 8)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in (1, 2, 3):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=12,
+    )
+
+    for expert_id in (1, 2, 1, 3, 1):
+        stager.stage_grouped_expert_payloads_for_ids(
+            grouped,
+            torch.tensor([expert_id], dtype=torch.int64),
+            layer_idx=2,
+        )
+
+    assert store.raw_payload_read_count == 9
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -437,6 +649,8 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
         "batched_payload_stage_calls": 0,
+        "selected_payload_cache_hits": 0,
+        "selected_payload_cache_misses": 0,
     }
 
 
