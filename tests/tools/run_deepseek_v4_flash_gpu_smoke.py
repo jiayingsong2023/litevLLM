@@ -57,6 +57,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--min-steady-decode-tps", type=float, default=0.0)
     parser.add_argument("--profile-json", type=Path, default=None)
+    parser.add_argument(
+        "--profile-events",
+        action="store_true",
+        help="Include full profiler event records in the profile payload.",
+    )
     return parser.parse_args(argv)
 
 
@@ -106,6 +111,34 @@ def validate_steady_decode_tps(
         "steady-state decode TPS below threshold: "
         f"{decode_tps_steady_state:.2f} < {min_steady_decode_tps:.2f}"
     )
+
+
+def profile_payload(
+    profile: dict[str, object],
+    *,
+    include_events: bool,
+) -> dict[str, object]:
+    payload = {
+        "enabled": bool(profile.get("enabled", False)),
+        "counters": profile.get("counters", {}),
+        "aggregate_by_name": profile.get("aggregate_by_name", {}),
+    }
+    if include_events:
+        payload["events"] = profile.get("events", [])
+    return payload
+
+
+def profile_summary_payload(model: DeepSeekV4FlashForCausalLM) -> dict[str, object]:
+    profiler = getattr(model, "_deepseek_profiler", None)
+    compact_summary = getattr(profiler, "compact_summary", None)
+    if callable(compact_summary):
+        summary = compact_summary()
+        if isinstance(summary, dict):
+            return summary
+    return {
+        "top_events": [],
+        "phase_totals_ms": {},
+    }
 
 
 def generate_greedy_with_token_timings(
@@ -290,7 +323,9 @@ def main() -> int:
                     **decode_metrics,
                 }
             )
-        profile = model.deepseek_profile()
+        full_profile = model.deepseek_profile()
+        profile = profile_payload(full_profile, include_events=args.profile_events)
+        profile_summary = profile_summary_payload(model)
         gpu_staging = model.gpu_staging_memory_stats()
         gpu_backend = model.gpu_backend.stats()
         summary = {
@@ -302,6 +337,7 @@ def main() -> int:
             "repeat": args.repeat,
             "runs": runs,
             "profile": profile,
+            "profile_summary": profile_summary,
             "gpu_staging": gpu_staging,
             "gpu_backend": gpu_backend,
             "phase3_metrics": phase3_metrics(

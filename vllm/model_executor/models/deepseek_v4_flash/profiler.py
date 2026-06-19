@@ -7,6 +7,16 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
+_COMPACT_PHASE_NAMES = (
+    "layer_attention",
+    "layer_moe",
+    "router_selected_experts_kernel",
+    "router_expert_stage",
+    "compressed_kv_update",
+    "compressed_indexer_update",
+    "output_projection",
+)
+
 
 @dataclass(frozen=True)
 class DeepSeekV4FlashProfileEvent:
@@ -56,6 +66,22 @@ class DeepSeekV4FlashProfiler:
                 )
             )
 
+    def record(
+        self,
+        name: str,
+        elapsed_ms: float,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        self._events.append(
+            DeepSeekV4FlashProfileEvent(
+                name=name,
+                elapsed_ms=float(elapsed_ms),
+                metadata=dict(metadata or {}),
+            )
+        )
+
     def add_counter(self, name: str, value: int = 1) -> None:
         if not self.enabled:
             return
@@ -84,6 +110,30 @@ class DeepSeekV4FlashProfiler:
             aggregate["avg_ms"] = total_ms / count
             aggregate["max_ms"] = max(float(aggregate["max_ms"]), event.elapsed_ms)
         return aggregates
+
+    def compact_summary(self, top_k: int = 10) -> dict[str, Any]:
+        aggregates = self._aggregate_by_name()
+        sorted_events = sorted(
+            aggregates.items(),
+            key=lambda item: (-float(item[1]["total_ms"]), item[0]),
+        )
+        top_events = [
+            {
+                "name": name,
+                "total_ms": float(aggregate["total_ms"]),
+                "avg_ms": float(aggregate["avg_ms"]),
+                "count": int(aggregate["count"]),
+            }
+            for name, aggregate in sorted_events[: max(top_k, 0)]
+        ]
+        phase_totals_ms = {
+            phase_name: float(aggregates.get(phase_name, {}).get("total_ms", 0.0))
+            for phase_name in _COMPACT_PHASE_NAMES
+        }
+        return {
+            "top_events": top_events,
+            "phase_totals_ms": phase_totals_ms,
+        }
 
     def snapshot(self, reset: bool = False) -> dict[str, Any]:
         data = {

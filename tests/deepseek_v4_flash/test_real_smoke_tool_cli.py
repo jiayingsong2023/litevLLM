@@ -106,6 +106,23 @@ def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
     assert args.repeat == 2
     assert args.min_steady_decode_tps == 1.25
     assert args.profile_json == profile_path
+    assert args.profile_events is False
+
+
+def test_smoke_parser_accepts_profile_events_flag(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profiles" / "smoke.json"
+
+    args = smoke.parse_args(
+        [
+            "--model",
+            "model.gguf",
+            "--profile-json",
+            str(profile_path),
+            "--profile-events",
+        ]
+    )
+
+    assert args.profile_events is True
 
 
 def test_smoke_ready_backend_enables_required_kernels() -> None:
@@ -691,6 +708,82 @@ def test_write_json_creates_parent_directory(tmp_path: Path) -> None:
     smoke.write_json(output_path, {"ok": True})
 
     assert json.loads(output_path.read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_smoke_profile_payload_omits_events_by_default() -> None:
+    profile = {
+        "enabled": True,
+        "events": [
+            {
+                "name": "layer_moe",
+                "elapsed_ms": 10.0,
+                "metadata": {},
+            }
+        ],
+        "counters": {"cpu_sync_points": 0},
+        "aggregate_by_name": {
+            "layer_moe": {
+                "count": 1,
+                "total_ms": 10.0,
+                "avg_ms": 10.0,
+                "max_ms": 10.0,
+            }
+        },
+    }
+
+    assert smoke.profile_payload(profile, include_events=False) == {
+        "enabled": True,
+        "counters": {"cpu_sync_points": 0},
+        "aggregate_by_name": profile["aggregate_by_name"],
+    }
+
+
+def test_smoke_profile_payload_keeps_events_when_requested() -> None:
+    profile = {
+        "enabled": True,
+        "events": [
+            {
+                "name": "layer_moe",
+                "elapsed_ms": 10.0,
+                "metadata": {},
+            }
+        ],
+        "counters": {},
+        "aggregate_by_name": {},
+    }
+
+    assert smoke.profile_payload(profile, include_events=True) == profile
+
+
+def test_smoke_profile_summary_payload_uses_model_profiler() -> None:
+    class FakeProfiler:
+        def compact_summary(self) -> dict[str, object]:
+            return {
+                "top_events": [
+                    {
+                        "name": "layer_moe",
+                        "total_ms": 10.0,
+                        "avg_ms": 10.0,
+                        "count": 1,
+                    }
+                ],
+                "phase_totals_ms": {"layer_moe": 10.0},
+            }
+
+    class FakeModel:
+        _deepseek_profiler = FakeProfiler()
+
+    assert smoke.profile_summary_payload(FakeModel()) == {
+        "top_events": [
+            {
+                "name": "layer_moe",
+                "total_ms": 10.0,
+                "avg_ms": 10.0,
+                "count": 1,
+            }
+        ],
+        "phase_totals_ms": {"layer_moe": 10.0},
+    }
 
 
 def test_phase3_metrics_schema_is_stable() -> None:
