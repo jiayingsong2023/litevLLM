@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    apply_deepseek_layer_rope_to_tail_reference,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_F32,
     GGML_TYPE_Q8_0,
     DeepSeekV4FlashTensor,
 )
@@ -14,6 +18,8 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
+    _select_compressed_rows_with_indexer,
+    _update_compressor_state,
     deepseek_v4_flash_compressed_layer_forward,
     deepseek_v4_flash_layer_forward,
 )
@@ -387,6 +393,31 @@ def test_ratio4_compressor_accepts_real_doubled_width_contract() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_indexer_selection_skips_projection_when_under_top_k() -> None:
+    store, layer = _compressed_layer_fixture(doubled_width=True)
+
+    class FailingStager(DeepSeekV4FlashGPUWeightStager):
+        def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            raise AssertionError(f"unexpected projection for {tensor.name}")
+
+        def stage_vector(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            raise AssertionError(f"unexpected vector staging for {tensor.name}")
+
+    selected = _select_compressed_rows_with_indexer(
+        torch.ones((4,), dtype=torch.float32, device="cuda"),
+        layer=layer,
+        stager=FailingStager(store, device="cuda"),
+        indexer_rows=torch.ones((2, 128), dtype=torch.float32, device="cuda"),
+        token_idx=3,
+    )
+
+    torch.testing.assert_close(
+        selected,
+        torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_compressed_layer_mhc_pre_post_returns_streams() -> None:
     store, layer = _compressed_layer_fixture(doubled_width=True)
     state = DeepSeekV4FlashGPURequestState(
@@ -575,9 +606,70 @@ def test_boundary_rows_are_written_and_selected_rows_are_bounded() -> None:
     assert backend.compressed_selected_rows is not None
     assert backend.compressed_selected_rows.device.type == "cuda"
     assert torch.all(backend.compressed_selected_rows >= 0)
-    assert torch.all(backend.compressed_selected_rows < 1)
-    assert backend.compressed_rows_shape == (1, 4)
+    assert torch.all(backend.compressed_selected_rows < 2)
+    assert backend.compressed_rows_shape == (2, 4)
     assert backend.sliding_attention_calls == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_compressor_emitted_row_uses_boundary_rope_position() -> None:
+    hidden_size = 64
+    store = _FakeLayerStore()
+    kv = DeepSeekV4FlashTensor(
+        "compressor.kv",
+        (hidden_size, hidden_size),
+        GGML_TYPE_F32,
+        0,
+        0,
+    )
+    gate = DeepSeekV4FlashTensor(
+        "compressor.gate", (hidden_size, hidden_size), GGML_TYPE_F32, 0, 0
+    )
+    ape = DeepSeekV4FlashTensor("compressor.ape", (hidden_size, 4), GGML_TYPE_F32, 0, 0)
+    norm = DeepSeekV4FlashTensor("compressor.norm", (hidden_size,), GGML_TYPE_F32, 0, 0)
+    compressor = DeepSeekV4FlashCompressorTensors(
+        kv=kv,
+        gate=gate,
+        ape=ape,
+        norm=norm,
+    )
+    store.matrices[compressor.kv.name] = torch.eye(hidden_size)
+    store.matrices[compressor.gate.name] = torch.zeros(hidden_size, hidden_size)
+    store.matrices[compressor.ape.name] = torch.zeros(hidden_size, 4)
+    store.vectors[(compressor.norm.name, torch.float32)] = torch.ones(hidden_size)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=16,
+            hidden_size=hidden_size,
+            kv_width=hidden_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    )
+    hidden = torch.linspace(-1.0, 1.0, hidden_size, device="cuda")
+
+    emitted = None
+    for token_idx in range(8):
+        _candidate, emitted = _update_compressor_state(
+            hidden,
+            state=state,
+            layer_idx=2,
+            state_name="attention",
+            compressor=compressor,
+            stager=stager,
+            token_idx=token_idx,
+            ratio=4,
+        )
+
+    assert emitted is not None
+    unrotated = hidden * torch.rsqrt(hidden.pow(2).mean() + 1e-6)
+    expected = apply_deepseek_layer_rope_to_tail_reference(
+        unrotated,
+        token_idx=4,
+        layer_idx=2,
+    )
+    torch.testing.assert_close(emitted, expected, rtol=5e-4, atol=5e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

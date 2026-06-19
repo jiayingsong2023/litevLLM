@@ -13,6 +13,7 @@ from vllm.triton_utils import tl, triton
 _Q2_K_BLOCK_BYTES = 84
 _IQ2_XXS_BLOCK_BYTES = 66
 _GGUF_BLOCK_COLUMNS = 256
+_DS4_SWIGLU_CLAMP = 10.0
 _IQ2_XXS_LOOKUP_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -41,8 +42,7 @@ def _validate_payload(
         raise ValueError(f"columns must be positive; got {columns}")
     if columns % _GGUF_BLOCK_COLUMNS != 0:
         raise ValueError(
-            "columns must be a multiple of 256 for GGUF Q2/IQ2 blocks; "
-            f"got {columns}"
+            f"columns must be a multiple of 256 for GGUF Q2/IQ2 blocks; got {columns}"
         )
     expected_bytes = rows * (columns // _GGUF_BLOCK_COLUMNS) * block_bytes
     if payload.numel() != expected_bytes:
@@ -63,6 +63,54 @@ def _validate_hidden(hidden: torch.Tensor, *, columns: int) -> torch.Tensor:
             f"got hidden={hidden.numel()} and columns={columns}"
         )
     return hidden.to(torch.float32)
+
+
+def _q8_k_roundtrip_cuda(row: torch.Tensor, *, block_size: int = 256) -> torch.Tensor:
+    if row.ndim != 1:
+        raise ValueError(f"Q8_K row must be 1-D; got {row.ndim}-D")
+    if row.numel() % block_size != 0:
+        raise ValueError(
+            "Q8_K row length must be divisible by block_size; "
+            f"got {row.numel()} and {block_size}"
+        )
+    blocks = row.to(torch.float32).reshape(-1, block_size)
+    max_indices = torch.argmax(blocks.abs(), dim=1)
+    signed_max = blocks.gather(1, max_indices.reshape(-1, 1)).reshape(-1, 1)
+    nonzero = signed_max.abs() > 0.0
+    iscale = torch.where(
+        nonzero,
+        torch.full_like(signed_max, -127.0) / signed_max,
+        torch.zeros_like(signed_max),
+    )
+    quantized = torch.round(blocks * iscale).clamp(min=-128, max=127)
+    scale = torch.where(nonzero, 1.0 / iscale, torch.zeros_like(iscale))
+    return (quantized * scale).reshape_as(row).to(torch.float32)
+
+
+def _q8_k_roundtrip_rows_cuda(
+    rows: torch.Tensor,
+    *,
+    block_size: int = 256,
+) -> torch.Tensor:
+    if rows.ndim != 2:
+        raise ValueError(f"Q8_K rows must be 2-D; got {rows.ndim}-D")
+    if rows.shape[1] % block_size != 0:
+        raise ValueError(
+            "Q8_K row width must be divisible by block_size; "
+            f"got {rows.shape[1]} and {block_size}"
+        )
+    blocks = rows.to(torch.float32).reshape(-1, block_size)
+    max_indices = torch.argmax(blocks.abs(), dim=1)
+    signed_max = blocks.gather(1, max_indices.reshape(-1, 1))
+    nonzero = signed_max.abs() > 0.0
+    iscale = torch.where(
+        nonzero,
+        torch.full_like(signed_max, -127.0) / signed_max,
+        torch.zeros_like(signed_max),
+    )
+    quantized = torch.round(blocks * iscale).clamp(min=-128, max=127)
+    scale = torch.where(nonzero, 1.0 / iscale, torch.zeros_like(iscale))
+    return (quantized * scale).reshape_as(rows).to(torch.float32)
 
 
 # GGUF Q2_K row layout: each 84-byte block stores one 256-value row here.
@@ -96,9 +144,7 @@ def _q2_k_matvec_kernel(
     scale_lows = (scale_bytes & 0x0F).to(tl.float32)
     scale_highs = (scale_bytes >> 4).to(tl.float32)
     d = tl.load(payload_half_ptr + row * HALF_WORDS_PER_BLOCK + 40).to(tl.float32)
-    dmin = tl.load(payload_half_ptr + row * HALF_WORDS_PER_BLOCK + 41).to(
-        tl.float32
-    )
+    dmin = tl.load(payload_half_ptr + row * HALF_WORDS_PER_BLOCK + 41).to(tl.float32)
 
     decoded = d * scale_lows * codes - dmin * scale_highs
     hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
@@ -134,9 +180,7 @@ def _q2_k_matvec_multiblock_kernel(
     for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
         payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
         scale_bytes = tl.load(payload_ptr + payload_base + group).to(tl.uint32)
-        q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(
-            tl.uint32
-        )
+        q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(tl.uint32)
         codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
 
         scale_lows = (scale_bytes & 0x0F).to(tl.float32)
@@ -146,9 +190,7 @@ def _q2_k_matvec_multiblock_kernel(
         dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
 
         decoded = d * scale_lows * codes - dmin * scale_highs
-        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
-            tl.float32
-        )
+        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(tl.float32)
         total += tl.sum(decoded * hidden, axis=0)
     tl.store(output_ptr + row, total)
 
@@ -282,9 +324,9 @@ def _iq2_xxs_gate_up_activation_kernel(
     group_offset = 2 + group * 8
     metadata_offset = payload_base + group_offset
 
-    gate_grid_bytes = tl.load(
-        gate_payload_ptr + metadata_offset + grid_byte_slot
-    ).to(tl.uint32)
+    gate_grid_bytes = tl.load(gate_payload_ptr + metadata_offset + grid_byte_slot).to(
+        tl.uint32
+    )
     up_grid_bytes = tl.load(up_payload_ptr + metadata_offset + grid_byte_slot).to(
         tl.uint32
     )
@@ -324,9 +366,7 @@ def _iq2_xxs_gate_up_activation_kernel(
 
     gate_scale_code = (gate_sign_scale >> 28).to(tl.float32)
     up_scale_code = (up_sign_scale >> 28).to(tl.float32)
-    gate_d = tl.load(gate_payload_half_ptr + row * HALF_WORDS_PER_BLOCK).to(
-        tl.float32
-    )
+    gate_d = tl.load(gate_payload_half_ptr + row * HALF_WORDS_PER_BLOCK).to(tl.float32)
     up_d = tl.load(up_payload_half_ptr + row * HALF_WORDS_PER_BLOCK).to(tl.float32)
     gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
     up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
@@ -336,7 +376,9 @@ def _iq2_xxs_gate_up_activation_kernel(
     hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
     gate_total = tl.sum(gate_block_scales * gate_grid * gate_signs * hidden, axis=0)
     up_total = tl.sum(up_block_scales * up_grid * up_signs * hidden, axis=0)
-    activated = gate_total / (1.0 + tl.exp(-gate_total)) * up_total
+    gate_clamped = tl.minimum(gate_total, 10.0)
+    up_clamped = tl.minimum(tl.maximum(up_total, -10.0), 10.0)
+    activated = gate_clamped / (1.0 + tl.exp(-gate_clamped)) * up_clamped
     tl.store(output_ptr + row, activated)
 
 
@@ -376,22 +418,14 @@ def _iq2_xxs_gate_up_activation_multiblock_kernel(
         gate_grid_bytes = tl.load(
             gate_payload_ptr + metadata_offset + grid_byte_slot
         ).to(tl.uint32)
-        up_grid_bytes = tl.load(
-            up_payload_ptr + metadata_offset + grid_byte_slot
-        ).to(tl.uint32)
+        up_grid_bytes = tl.load(up_payload_ptr + metadata_offset + grid_byte_slot).to(
+            tl.uint32
+        )
 
-        gate_word_byte0 = tl.load(gate_payload_ptr + metadata_offset + 4).to(
-            tl.uint32
-        )
-        gate_word_byte1 = tl.load(gate_payload_ptr + metadata_offset + 5).to(
-            tl.uint32
-        )
-        gate_word_byte2 = tl.load(gate_payload_ptr + metadata_offset + 6).to(
-            tl.uint32
-        )
-        gate_word_byte3 = tl.load(gate_payload_ptr + metadata_offset + 7).to(
-            tl.uint32
-        )
+        gate_word_byte0 = tl.load(gate_payload_ptr + metadata_offset + 4).to(tl.uint32)
+        gate_word_byte1 = tl.load(gate_payload_ptr + metadata_offset + 5).to(tl.uint32)
+        gate_word_byte2 = tl.load(gate_payload_ptr + metadata_offset + 6).to(tl.uint32)
+        gate_word_byte3 = tl.load(gate_payload_ptr + metadata_offset + 7).to(tl.uint32)
         gate_sign_scale = (
             gate_word_byte0
             | (gate_word_byte1 << 8)
@@ -429,9 +463,7 @@ def _iq2_xxs_gate_up_activation_multiblock_kernel(
         gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
         up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
 
-        gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(
-            tl.float32
-        )
+        gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(tl.float32)
         up_grid = tl.load(grid_ptr + up_grid_bytes * 8 + grid_lane).to(tl.float32)
         hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(tl.float32)
         gate_total += tl.sum(
@@ -443,7 +475,9 @@ def _iq2_xxs_gate_up_activation_multiblock_kernel(
             axis=0,
         )
 
-    activated = gate_total / (1.0 + tl.exp(-gate_total)) * up_total
+    gate_clamped = tl.minimum(gate_total, 10.0)
+    up_clamped = tl.minimum(tl.maximum(up_total, -10.0), 10.0)
+    activated = gate_clamped / (1.0 + tl.exp(-gate_clamped)) * up_clamped
     tl.store(output_ptr + row, activated)
 
 

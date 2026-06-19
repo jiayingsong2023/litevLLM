@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from .attention import (
-    apply_rope_to_tail_reference,
+    apply_deepseek_layer_rope_to_tail_reference,
     compressor_pair_projection_reference,
     compressor_update_state_reference,
     grouped_output_projection_reference,
@@ -38,7 +38,7 @@ from .moe import (
     hash_routed_moe_reference,
     routed_moe_reference,
 )
-from .ops import rms_norm_reference
+from .ops import deepseek_indexer_qat_reference, rms_norm_reference
 from .weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
     DeepSeekV4FlashLayerSemanticBindings,
@@ -221,9 +221,10 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
                 dtype=torch.float32,
             ),
         )
-        return apply_rope_to_tail_reference(
+        return apply_deepseek_layer_rope_to_tail_reference(
             kv,
             token_idx=token_idx,
+            layer_idx=self.layer_idx,
             rotary_dim=self.shape.rotary_dim,
         )
 
@@ -260,9 +261,10 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
             self.store.decode_matrix(layer.attention_query_b).transpose(0, 1),
         ).reshape(self.shape.num_attention_heads, self.shape.head_dim)
         q = per_head_rms_norm_reference(q)
-        q = apply_rope_to_tail_reference(
+        q = apply_deepseek_layer_rope_to_tail_reference(
             q,
             token_idx=token_idx,
+            layer_idx=self.layer_idx,
             rotary_dim=self.shape.rotary_dim,
         )
         context = shared_kv_swa_attention_reference(
@@ -270,9 +272,10 @@ class DeepSeekV4FlashSlidingLayerReferenceRunner:
             kv_rows,
             self.store.tensor_to_torch(layer.attention_sinks, dtype=torch.float32),
         )
-        context = apply_rope_to_tail_reference(
+        context = apply_deepseek_layer_rope_to_tail_reference(
             context,
             token_idx=token_idx,
+            layer_idx=self.layer_idx,
             rotary_dim=self.shape.rotary_dim,
             inverse=True,
         )
@@ -439,6 +442,7 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
                     layer,
                     attn_input,
                     index_rows,
+                    token_idx=token_idx,
                 )
                 selected = cache.read_compressed(
                     self.layer_idx,
@@ -502,9 +506,10 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
                 comp_row,
                 self.store.tensor_to_torch(comp.norm, dtype=torch.float32),
             )
-            comp_row = apply_rope_to_tail_reference(
+            comp_row = apply_deepseek_layer_rope_to_tail_reference(
                 comp_row,
                 token_idx=token_idx + 1 - self.ratio,
+                layer_idx=self.layer_idx,
                 rotary_dim=self.shape.rotary_dim,
             )
             return comp_row, None
@@ -536,9 +541,10 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
             comp_row,
             self.store.tensor_to_torch(comp.norm, dtype=torch.float32),
         )
-        comp_row = apply_rope_to_tail_reference(
+        comp_row = apply_deepseek_layer_rope_to_tail_reference(
             comp_row,
             token_idx=token_idx + 1 - 4,
+            layer_idx=self.layer_idx,
             rotary_dim=self.shape.rotary_dim,
         )
         index_row = rms_norm_reference(
@@ -552,6 +558,8 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
         layer: DeepSeekV4FlashLayerSemanticBindings,
         hidden: torch.Tensor,
         index_rows: torch.Tensor,
+        *,
+        token_idx: int,
     ) -> torch.Tensor:
         assert layer.attention_query_a is not None
         assert layer.attention_query_a_norm is not None
@@ -571,6 +579,16 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
             self.store.decode_matrix(layer.indexer.query_b),
             indexer_heads=self.shape.indexer_heads,
             indexer_head_dim=self.shape.indexer_head_dim,
+        )
+        index_query = apply_deepseek_layer_rope_to_tail_reference(
+            index_query,
+            token_idx=token_idx,
+            layer_idx=self.layer_idx,
+            rotary_dim=self.shape.rotary_dim,
+        )
+        index_query = torch.stack(
+            [deepseek_indexer_qat_reference(row) for row in index_query],
+            dim=0,
         )
         index_weights = indexer_weight_projection_reference(
             hidden,

@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
     DeepSeekV4FlashCacheAdmissionPolicy,
+    DeepSeekV4FlashExpertPrefetchRequest,
     DeepSeekV4FlashHotExpertPolicy,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
@@ -43,8 +44,10 @@ class _FakeGroupedExpertStore:
     def __init__(self) -> None:
         self.decode_count = 0
         self.raw_payload_read_count = 0
+        self.tensor_payload_read_count = 0
         self.matrices: dict[tuple[str, int], torch.Tensor] = {}
         self.raw_payloads: dict[tuple[str, int], bytes] = {}
+        self.tensor_payloads: dict[str, bytes] = {}
 
     def decode_grouped_expert_matrix(
         self,
@@ -81,6 +84,10 @@ class _FakeGroupedExpertStore:
         dtype: torch.dtype,
     ) -> torch.Tensor:
         raise AssertionError(f"unexpected vector read for {tensor.name} as {dtype}")
+
+    def tensor_payload(self, tensor: DeepSeekV4FlashTensor) -> memoryview:
+        self.tensor_payload_read_count += 1
+        return memoryview(bytearray(self.tensor_payloads[tensor.name]))
 
 
 class _FakeStagingStore(_FakeGroupedExpertStore):
@@ -178,7 +185,11 @@ def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
         "prefetch_failures": 0,
         "prefetch_hits": 0,
         "prefetch_misses": 0,
+        "prefetch_payload_hits": 0,
+        "prefetch_payload_misses": 0,
+        "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
+        "batched_payload_stage_calls": 0,
     }
 
 
@@ -195,6 +206,54 @@ def test_gpu_weight_stager_memory_stats_include_cache_stats() -> None:
     assert "lru_evictions" in stats
     assert "pinned_entries" in stats
     assert "streamed_bytes" in stats
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_warm_static_decode_weights_makes_output_q8_payload_resident() -> None:
+    store = _FakeStagingStore()
+    tensor = _tensor("output.weight", dims=(4, 4))
+    store.tensor_payloads[tensor.name] = b"\x01\x02\x03\x04"
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.warm_static_decode_weights(output_weight=tensor)
+    before = stager.memory_stats()
+    staged = stager.stage_q8_raw_payload(tensor)
+    after = stager.memory_stats()
+
+    assert staged.device.type == "cuda"
+    assert after["dynamic_hits"] == before["dynamic_hits"] + 1
+    assert store.tensor_payload_read_count == 1
+
+
+def test_model_warm_decode_static_weights_uses_output_head_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_head = _tensor("output.weight", dims=(4, 4))
+    model = DeepSeekV4FlashForCausalLM(
+        weight_store=type(
+            "FakeStore",
+            (),
+            {"bindings": type("FakeBindings", (), {"output_head": output_head})()},
+        )()
+    )
+
+    class FakeStager:
+        def __init__(self) -> None:
+            self.output_weights: list[DeepSeekV4FlashTensor] = []
+
+        def warm_static_decode_weights(
+            self,
+            *,
+            output_weight: DeepSeekV4FlashTensor,
+        ) -> None:
+            self.output_weights.append(output_weight)
+
+    stager = FakeStager()
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: stager)
+
+    model.warm_decode_static_weights(torch.device("cuda"))
+
+    assert stager.output_weights == [output_head]
 
 
 def test_model_hot_expert_preparation_prefers_pinned_experts_and_skips_missing(
@@ -373,7 +432,11 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "prefetch_failures": 0,
         "prefetch_hits": 0,
         "prefetch_misses": 0,
+        "prefetch_payload_hits": 0,
+        "prefetch_payload_misses": 0,
+        "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
+        "batched_payload_stage_calls": 0,
     }
 
 
@@ -497,6 +560,37 @@ def test_gpu_weight_stager_manual_pinned_grouped_entry_survives_eviction() -> No
     assert pinned.data_ptr() == cached_pinned.data_ptr()
     assert stager.memory_stats()["pinned_entries"] == 1
     assert stager.memory_stats()["lru_evictions"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_gpu_weight_stager_prefetch_keeps_pinned_hash_routed_payloads() -> None:
+    store = _FakeGroupedExpertStore()
+    grouped_experts = _hot_grouped_experts(6)
+    for tensor in (
+        grouped_experts.gate,
+        grouped_experts.up,
+        grouped_experts.down,
+    ):
+        for expert_id in (1, 3):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, expert_id + 1, expert_id + 2, expert_id + 3]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    stager.pin_grouped_expert(6, 1)
+    stager.pin_grouped_expert(6, 3)
+    stager.prefetch_grouped_experts(
+        grouped_experts,
+        DeepSeekV4FlashExpertPrefetchRequest(
+            layer_idx=6,
+            expert_ids=(1, 3),
+        ),
+    )
+
+    stats = stager.memory_stats()
+    assert stats["pinned_entries"] == 6
+    assert stats["grouped_entries"] == 6
+    assert stats["prefetch_payload_misses"] == 6
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

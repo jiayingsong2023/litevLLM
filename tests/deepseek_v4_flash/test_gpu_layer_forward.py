@@ -18,6 +18,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
     _run_hash_routed_experts,
     _run_staged_routed_experts,
+    _run_staged_shared_expert,
     deepseek_v4_flash_q8_0_tensor_projection,
     deepseek_v4_flash_router_topk,
     deepseek_v4_flash_sliding_layer_forward,
@@ -164,6 +165,52 @@ class _RoutedExpertTestStager:
             payload=torch.tensor([expert_id], dtype=torch.uint8),
         )
 
+    def stage_grouped_expert_payloads_for_ids(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: torch.Tensor,
+        *,
+        layer_idx: int | None = None,
+    ) -> list[
+        tuple[
+            int,
+            DeepSeekV4FlashStagedQuantizedExpertPayload,
+            DeepSeekV4FlashStagedQuantizedExpertPayload,
+            DeepSeekV4FlashStagedQuantizedExpertPayload,
+        ]
+    ]:
+        self._cache_stats["batched_payload_stage_calls"] = (
+            self._cache_stats.get("batched_payload_stage_calls", 0) + 1
+        )
+        selected_ids = [
+            int(expert_id)
+            for expert_id in expert_ids.detach().reshape(-1).to("cpu").tolist()
+        ]
+        return [
+            (
+                expert_id,
+                self.stage_grouped_expert_payload(
+                    tensors.gate,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+                self.stage_grouped_expert_payload(
+                    tensors.up,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+                self.stage_grouped_expert_payload(
+                    tensors.down,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+            )
+            for expert_id in selected_ids
+        ]
+
+    def cache_stats(self) -> dict[str, int]:
+        return dict(self._cache_stats)
+
     def stage_grouped_expert(
         self,
         tensors: DeepSeekV4FlashGroupedExpertTensors,
@@ -302,6 +349,38 @@ def test_q8_tensor_projection_uses_raw_payload_without_stage_matrix() -> None:
     torch.testing.assert_close(second, first)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_staged_shared_expert_raw_q8_path_applies_deepseek_clamp() -> None:
+    store = _FakeLayerStore()
+    gate = _tensor("shared.gate", (32, 32))
+    up = _tensor("shared.up", (32, 32))
+    down = _tensor("shared.down", (32, 32))
+    store.payloads[gate.name] = _q8_payload(
+        [(0.5, tuple([40] + [0] * 31))] + [(1.0, tuple([0] * 32))] * 31
+    )
+    store.payloads[up.name] = _q8_payload(
+        [(0.5, tuple([40] + [0] * 31))] + [(1.0, tuple([0] * 32))] * 31
+    )
+    store.payloads[down.name] = _q8_payload(
+        [(1.0, tuple([1] + [0] * 31))] + [(1.0, tuple([0] * 32))] * 31
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    hidden = torch.zeros((32,), dtype=torch.float32, device="cuda")
+    hidden[0] = 1.0
+    grouped = DeepSeekV4FlashGroupedExpertTensors(gate=gate, up=up, down=down)
+
+    output = _run_staged_shared_expert(
+        hidden,
+        grouped,
+        stager=stager,
+        backend=_RecordingBackend(),
+    )
+
+    expected = torch.zeros_like(output)
+    expected[0] = torch.nn.functional.silu(torch.tensor(10.0, device="cuda")) * 10.0
+    torch.testing.assert_close(output, expected, rtol=1.0e-4, atol=1.0e-4)
+
+
 def test_staged_routed_experts_prefers_quantized_payload_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -367,10 +446,10 @@ def test_staged_routed_experts_profiles_stage_and_kernel_sections() -> None:
     assert event_names == [
         "router_expert_stage",
         "router_expert_kernel",
-        "router_expert_stage",
         "router_expert_kernel",
     ]
-    assert events[0]["metadata"] == {"layer_idx": 7, "expert_id": 3}
+    assert events[0]["metadata"] == {"layer_idx": 7, "expert_id": -1}
+    assert events[1]["metadata"] == {"layer_idx": 7, "expert_id": 3}
     assert events[2]["metadata"] == {"layer_idx": 7, "expert_id": 1}
 
 
@@ -401,7 +480,8 @@ def test_staged_routed_experts_materializes_only_bounded_cuda_expert_ids(
     )
 
     assert backend.quantized_expert_ids == [3, 1]
-    assert stager._cache_stats["routed_expert_id_materializations"] == 1
+    assert stager.cache_stats().get("batched_payload_stage_calls", 0) == 1
+    assert stager.cache_stats().get("routed_expert_id_materializations", 0) == 0
     torch.testing.assert_close(output.to("cpu"), torch.full((2,), 1.5))
 
 
@@ -412,8 +492,10 @@ def test_hash_routed_experts_reuses_staged_token_table() -> None:
         up=_tensor("up", (2, 2, 4)),
         down=_tensor("down", (2, 2, 4)),
     )
+    router = _tensor("router", (2, 4))
     layer = DeepSeekV4FlashLayerSemanticBindings(
         layer_index=5,
+        router=router,
         grouped_experts=grouped,
         expert_token_to_expert_ids=token_table,
     )
@@ -421,6 +503,7 @@ def test_hash_routed_experts_reuses_staged_token_table() -> None:
     class FakeStore:
         def __init__(self) -> None:
             self.tensor_reads = 0
+            self.matrices = {router.name: torch.zeros(4, 2)}
 
         def tensor_to_torch(
             self,
@@ -484,6 +567,9 @@ def test_hash_routed_experts_reuses_staged_token_table() -> None:
             self._cache_entry_bytes[cache_key] = nbytes
             self._staged_bytes += nbytes
 
+        def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            return self.store.matrices[tensor.name]
+
     stager = FakeStager()
     backend = _QuantizedRecordingBackend()
 
@@ -509,6 +595,201 @@ def test_hash_routed_experts_reuses_staged_token_table() -> None:
     assert stager._cache_stats["dynamic_hits"] == 1
     torch.testing.assert_close(first, torch.full((2,), 1.5))
     torch.testing.assert_close(second, torch.full((2,), 1.5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_hash_routed_experts_keeps_batch_one_token_table_on_cpu() -> None:
+    token_table = _tensor("token_to_experts", (2, 8))
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 4)),
+        up=_tensor("up", (2, 2, 4)),
+        down=_tensor("down", (2, 2, 4)),
+    )
+    layer = DeepSeekV4FlashLayerSemanticBindings(
+        layer_index=5,
+        grouped_experts=grouped,
+        expert_token_to_expert_ids=token_table,
+    )
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.tensor_reads = 0
+
+        def tensor_to_torch(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            assert tensor is token_table
+            assert dtype is torch.int32
+            self.tensor_reads += 1
+            table = torch.full((2, 8), -1, dtype=torch.int32)
+            table[:, 3] = torch.tensor([2, 0], dtype=torch.int32)
+            return table
+
+    class FakeStager(_RoutedExpertTestStager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.store = FakeStore()
+            self.device = torch.device("cuda")
+            self._dynamic_cache: dict[object, torch.Tensor] = {}
+            self._cache_entry_bytes: dict[object, int] = {}
+            self._staged_bytes = 0
+
+        def _dynamic_cache_key(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+            extra: tuple[int | str, ...],
+        ) -> tuple[str, torch.dtype, tuple[int | str, ...]]:
+            return tensor.name, dtype, extra
+
+        def _prepare_cache_insert(self, nbytes: int) -> bool:
+            assert nbytes > 0
+            return True
+
+        def record_cache_hit(self, cache_name: str, *, tensor_name: str) -> None:
+            self._cache_stats[f"{cache_name}_hits"] = (
+                self._cache_stats.get(f"{cache_name}_hits", 0) + 1
+            )
+
+        def record_cache_miss(
+            self,
+            cache_name: str,
+            loaded_bytes: int,
+            *,
+            tensor_name: str,
+        ) -> None:
+            assert loaded_bytes > 0
+            self._cache_stats[f"{cache_name}_misses"] = (
+                self._cache_stats.get(f"{cache_name}_misses", 0) + 1
+            )
+
+        def _register_cached_entry(
+            self,
+            cache_key: object,
+            tensor: torch.Tensor,
+            nbytes: int,
+        ) -> None:
+            self._dynamic_cache[cache_key] = tensor
+            self._cache_entry_bytes[cache_key] = nbytes
+            self._staged_bytes += nbytes
+
+    stager = FakeStager()
+    output = _run_hash_routed_experts(
+        torch.ones(2, device="cuda"),
+        layer=layer,
+        grouped_experts=grouped,
+        stager=stager,
+        backend=_QuantizedRecordingBackend(),
+        token_id=3,
+    )
+
+    cached_tables = list(stager._dynamic_cache.values())
+    assert stager.store.tensor_reads == 1
+    assert cached_tables
+    assert all(table.device.type == "cpu" for table in cached_tables)
+    torch.testing.assert_close(output.to("cpu"), torch.full((2,), 1.5))
+
+
+def test_hash_routed_experts_uses_router_weights_for_selected_experts() -> None:
+    token_table = _tensor("token_to_experts", (2, 8))
+    router = _tensor("router", (2, 4))
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("gate", (2, 2, 4)),
+        up=_tensor("up", (2, 2, 4)),
+        down=_tensor("down", (2, 2, 4)),
+    )
+    layer = DeepSeekV4FlashLayerSemanticBindings(
+        layer_index=5,
+        router=router,
+        grouped_experts=grouped,
+        expert_token_to_expert_ids=token_table,
+    )
+
+    class FakeStore:
+        def tensor_to_torch(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            del tensor
+            assert dtype is torch.int32
+            table = torch.full((2, 8), -1, dtype=torch.int32)
+            table[:, 3] = torch.tensor([2, 0], dtype=torch.int32)
+            return table
+
+    class FakeStager(_RoutedExpertTestStager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.store = FakeStore()
+            self.device = torch.device("cpu")
+            self._dynamic_cache: dict[object, torch.Tensor] = {}
+            self._cache_entry_bytes: dict[object, int] = {}
+            self._staged_bytes = 0
+
+        def _dynamic_cache_key(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+            extra: tuple[int | str, ...],
+        ) -> tuple[str, torch.dtype, tuple[int | str, ...]]:
+            return tensor.name, dtype, extra
+
+        def _prepare_cache_insert(self, nbytes: int) -> bool:
+            del nbytes
+            return True
+
+        def record_cache_hit(self, cache_name: str, *, tensor_name: str) -> None:
+            del cache_name, tensor_name
+
+        def record_cache_miss(
+            self,
+            cache_name: str,
+            loaded_bytes: int,
+            *,
+            tensor_name: str,
+        ) -> None:
+            del cache_name, loaded_bytes, tensor_name
+
+        def _register_cached_entry(
+            self,
+            cache_key: object,
+            tensor: torch.Tensor,
+            nbytes: int,
+        ) -> None:
+            del nbytes
+            self._dynamic_cache[cache_key] = tensor
+
+        def stage_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            assert tensor is router
+            return torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                    [4.0, 0.0],
+                    [0.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+
+    hidden = torch.tensor([1.0, 0.0])
+    output = _run_hash_routed_experts(
+        hidden,
+        layer=layer,
+        grouped_experts=grouped,
+        stager=FakeStager(),
+        backend=_QuantizedRecordingBackend(),
+        token_id=3,
+    )
+
+    scores = torch.nn.functional.softplus(torch.tensor([4.0, 0.0])).sqrt()
+    expected_expert_2_weight = scores[0] / scores.sum() * 1.5
+    torch.testing.assert_close(output, torch.full((2,), 2.0 * expected_expert_2_weight))
 
 
 def test_staged_routed_experts_falls_back_to_dense_when_raw_unavailable() -> None:

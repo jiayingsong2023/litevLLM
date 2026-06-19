@@ -66,6 +66,14 @@ class DeepSeekV4FlashStagedQuantizedExpertPayload:
     payload: torch.Tensor
 
 
+DeepSeekV4FlashSelectedExpertPayloads = tuple[
+    int,
+    DeepSeekV4FlashStagedQuantizedExpertPayload,
+    DeepSeekV4FlashStagedQuantizedExpertPayload,
+    DeepSeekV4FlashStagedQuantizedExpertPayload,
+]
+
+
 class DeepSeekV4FlashGPUWeightStager:
     """Stage decoded GGUF expert matrices into a per-device GPU cache."""
 
@@ -110,7 +118,11 @@ class DeepSeekV4FlashGPUWeightStager:
             "prefetch_failures": 0,
             "prefetch_hits": 0,
             "prefetch_misses": 0,
+            "prefetch_payload_hits": 0,
+            "prefetch_payload_misses": 0,
+            "prefetch_payload_streamed_bytes": 0,
             "streamed_bytes": 0,
+            "batched_payload_stage_calls": 0,
         }
 
     @property
@@ -155,12 +167,14 @@ class DeepSeekV4FlashGPUWeightStager:
 
     def _record_prefetch_delta(self, before_stats: dict[str, int]) -> None:
         after_stats = self._cache_stats
-        self._cache_stats["prefetch_hits"] += (
-            after_stats["grouped_hits"] - before_stats["grouped_hits"]
-        )
-        self._cache_stats["prefetch_misses"] += (
-            after_stats["grouped_misses"] - before_stats["grouped_misses"]
-        )
+        grouped_hits = after_stats["grouped_hits"] - before_stats["grouped_hits"]
+        grouped_misses = after_stats["grouped_misses"] - before_stats["grouped_misses"]
+        streamed_bytes = after_stats["streamed_bytes"] - before_stats["streamed_bytes"]
+        self._cache_stats["prefetch_hits"] += grouped_hits
+        self._cache_stats["prefetch_misses"] += grouped_misses
+        self._cache_stats["prefetch_payload_hits"] += grouped_hits
+        self._cache_stats["prefetch_payload_misses"] += grouped_misses
+        self._cache_stats["prefetch_payload_streamed_bytes"] += streamed_bytes
 
     @staticmethod
     def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -451,6 +465,13 @@ class DeepSeekV4FlashGPUWeightStager:
             self.record_cache_miss("dynamic", nbytes, tensor_name=tensor.name)
             return staged
 
+    def warm_static_decode_weights(
+        self,
+        *,
+        output_weight: DeepSeekV4FlashTensor,
+    ) -> None:
+        self.stage_q8_raw_payload(output_weight)
+
     def get_output_q8_chunk(
         self,
         tensor: DeepSeekV4FlashTensor,
@@ -656,6 +677,41 @@ class DeepSeekV4FlashGPUWeightStager:
             columns=raw.columns,
             payload=staged,
         )
+
+    def stage_grouped_expert_payloads_for_ids(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: torch.Tensor,
+        *,
+        layer_idx: int | None = None,
+    ) -> list[DeepSeekV4FlashSelectedExpertPayloads]:
+        flattened = expert_ids.detach().reshape(-1)
+        expert_id_values = [
+            int(expert_id)
+            for expert_id in flattened.to(device="cpu", dtype=torch.int64).tolist()
+        ]
+        self._cache_stats["batched_payload_stage_calls"] += 1
+        return [
+            (
+                expert_id,
+                self.stage_grouped_expert_payload(
+                    tensors.gate,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+                self.stage_grouped_expert_payload(
+                    tensors.up,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+                self.stage_grouped_expert_payload(
+                    tensors.down,
+                    expert_id,
+                    layer_idx=layer_idx,
+                ),
+            )
+            for expert_id in expert_id_values
+        ]
 
     def prefetch_grouped_experts(
         self,

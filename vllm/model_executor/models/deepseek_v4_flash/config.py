@@ -25,10 +25,17 @@ class DeepSeekV4FlashShape:
     num_experts_per_tok: int = 6
     num_shared_experts: int = 1
     expert_intermediate_size: int = 2048
+    swiglu_clamp: float = 10.0
     sliding_window: int = 128
     indexer_heads: int = 64
     indexer_head_dim: int = 128
     indexer_top_k: int = 512
+    rope_freq_base: float = 10000.0
+    rope_scale_factor: float = 16.0
+    rope_yarn_beta_fast: float = 32.0
+    rope_yarn_beta_slow: float = 1.0
+    compressed_rope_freq_base: float = 160000.0
+    rope_original_context: int = 65536
 
 
 @dataclass(frozen=True)

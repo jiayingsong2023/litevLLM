@@ -197,7 +197,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         quant="deepseek-v4-flash-gguf",
         concurrent_reqs=1,
         prompt_tokens_target=4096,
-        max_new_tokens=1,
+        max_new_tokens=16,
         gpu_memory_utilization=0.90,
         max_model_len=4096,
         max_run_seconds=1200,
@@ -2626,15 +2626,44 @@ def _deepseek_smoke_payload_to_benchmark_result(
     )
     tps_values = _finite_values(
         [
-            float(run.get("tokens_per_second", 0.0))
+            float(
+                run.get(
+                    "decode_tps_steady_state",
+                    run.get("tokens_per_second", 0.0),
+                )
+            )
             for run in runs
             if isinstance(run, dict)
         ]
     )
+    explicit_decode_tokens = _finite_values(
+        [
+            float(run.get("decode_tokens_total", 0.0))
+            for run in runs
+            if isinstance(run, dict) and "decode_tokens_total" in run
+        ]
+    )
+    explicit_decode_ms = _finite_values(
+        [
+            float(run.get("decode_ms_total", 0.0))
+            for run in runs
+            if isinstance(run, dict) and "decode_ms_total" in run
+        ]
+    )
     max_tokens = float(payload.get("max_tokens", spec.max_new_tokens) or 0.0)
     repeat = float(payload.get("repeat", len(runs) or 1) or 1.0)
-    decode_tokens_total = max_tokens * repeat
-    decode_ms_total = float(sum(elapsed_ms_values)) if elapsed_ms_values else 0.0
+    decode_tokens_total = (
+        float(sum(explicit_decode_tokens))
+        if explicit_decode_tokens
+        else max_tokens * repeat
+    )
+    decode_ms_total = (
+        float(sum(explicit_decode_ms))
+        if explicit_decode_ms
+        else float(sum(elapsed_ms_values))
+        if elapsed_ms_values
+        else 0.0
+    )
     decode_tps_aggregate = (
         decode_tokens_total * 1000.0 / decode_ms_total
         if decode_tokens_total > 0.0 and decode_ms_total > 0.0
@@ -2879,9 +2908,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         type=str,
-        default="gemma4_26b_a4b,gemma4_31b_q4",
+        default="gemma4_26b_a4b,gemma4_31b_q4,deepseek_v4_flash_q2_gguf",
         help=(
-            "Comma-separated model keys. Default: gemma4_26b_a4b,gemma4_31b_q4. "
+            "Comma-separated model keys. Default: "
+            "gemma4_26b_a4b,gemma4_31b_q4,deepseek_v4_flash_q2_gguf. "
             "Available: tinyllama,qwen35_9b_awq,gemma4_31b_q4,"
             "gemma4_26b_a4b,deepseek_v4_flash_q2_gguf"
         ),

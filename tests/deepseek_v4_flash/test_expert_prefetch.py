@@ -172,6 +172,9 @@ def test_prefetch_stages_raw_payloads_and_repeated_prefetch_records_hits() -> No
     assert stats["grouped_hits"] == 3
     assert stats["prefetch_misses"] == 3
     assert stats["prefetch_hits"] == 3
+    assert stats["prefetch_payload_misses"] == 3
+    assert stats["prefetch_payload_hits"] == 3
+    assert stats["prefetch_payload_streamed_bytes"] == 0
     assert stats["prefetch_failures"] == 0
 
 
@@ -196,6 +199,8 @@ def test_demand_staging_reuses_payloads_loaded_by_prefetch() -> None:
     assert stats["grouped_misses"] == 3
     assert stats["grouped_hits"] == 3
     assert stats["prefetch_misses"] == 3
+    assert stats["prefetch_payload_misses"] == 3
+    assert stats["prefetch_payload_hits"] == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -215,7 +220,9 @@ def test_prefetch_uses_injected_cuda_stream() -> None:
     )
     stream.synchronize()
 
-    assert stager.cache_stats()["prefetch_misses"] == 3
+    stats = stager.cache_stats()
+    assert stats["prefetch_misses"] == 3
+    assert stats["prefetch_payload_misses"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -235,6 +242,7 @@ def test_prefetch_falls_back_to_decoded_staging_without_raw_payload() -> None:
     assert store.decode_reads == 3
     assert stats["grouped_misses"] == 3
     assert stats["prefetch_misses"] == 3
+    assert stats["prefetch_payload_misses"] == 3
 
 
 def test_model_best_effort_prefetch_records_failures() -> None:

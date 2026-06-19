@@ -5,6 +5,7 @@ import math
 
 import torch
 
+from .config import DEEPSEEK_V4_FLASH_SHAPE, layer_compress_ratio
 from .ops import factorized_linear_reference, rms_norm_reference
 
 
@@ -197,6 +198,118 @@ def apply_rope_to_tail_reference(
     return out
 
 
+def _rope_yarn_ramp(low: float, high: float, i0: torch.Tensor) -> torch.Tensor:
+    y = ((i0 // 2).to(torch.float32) - low) / max(0.001, high - low)
+    return 1.0 - torch.minimum(
+        torch.tensor(1.0, dtype=torch.float32, device=i0.device),
+        torch.maximum(torch.tensor(0.0, dtype=torch.float32, device=i0.device), y),
+    )
+
+
+def _rope_yarn_corr_dim(
+    *,
+    n_dims: int,
+    n_ctx_orig: int,
+    n_rot: float,
+    base: float,
+) -> float:
+    return float(n_dims) * math.log(
+        float(n_ctx_orig) / (n_rot * 2.0 * math.pi)
+    ) / (2.0 * math.log(base))
+
+
+def _rope_yarn_corr_dims(
+    *,
+    n_dims: int,
+    n_ctx_orig: int,
+    freq_base: float,
+    beta_fast: float,
+    beta_slow: float,
+) -> tuple[float, float]:
+    start = math.floor(
+        _rope_yarn_corr_dim(
+            n_dims=n_dims,
+            n_ctx_orig=n_ctx_orig,
+            n_rot=beta_fast,
+            base=freq_base,
+        )
+    )
+    end = math.ceil(
+        _rope_yarn_corr_dim(
+            n_dims=n_dims,
+            n_ctx_orig=n_ctx_orig,
+            n_rot=beta_slow,
+            base=freq_base,
+        )
+    )
+    return max(0.0, float(start)), min(float(n_dims - 1), float(end))
+
+
+def apply_deepseek_layer_rope_to_tail_reference(
+    vectors: torch.Tensor,
+    *,
+    token_idx: int,
+    layer_idx: int,
+    rotary_dim: int = DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply DS4 layer-aware RoPE to the tail of each attention vector.
+
+    Dense layers use the default 10k base. Compressed layers use the DS4
+    long-context base and interpolation schedule from the reference runtime.
+    """
+    ratio = layer_compress_ratio(layer_idx)
+    if ratio == 0:
+        return apply_rope_to_tail_reference(
+            vectors,
+            token_idx=token_idx,
+            rotary_dim=rotary_dim,
+            theta=DEEPSEEK_V4_FLASH_SHAPE.rope_freq_base,
+            inverse=inverse,
+        )
+    if vectors.ndim < 1:
+        raise ValueError("vectors must have at least one dimension")
+    if token_idx < 0:
+        raise ValueError(f"token_idx must be non-negative; got {token_idx}")
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError(
+            "rotary_dim must be a positive even integer; "
+            f"got {rotary_dim}"
+        )
+    if vectors.shape[-1] < rotary_dim:
+        raise ValueError(
+            "vector width must be >= rotary_dim; "
+            f"got {vectors.shape[-1]} and {rotary_dim}"
+        )
+
+    shape = DEEPSEEK_V4_FLASH_SHAPE
+    out = vectors.to(torch.float32).clone()
+    tail = out[..., -rotary_dim:]
+    pairs = tail.reshape(*tail.shape[:-1], rotary_dim // 2, 2)
+    i0 = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=out.device)
+    theta_scale = shape.compressed_rope_freq_base ** (-2.0 / float(rotary_dim))
+    theta_extrap = float(token_idx) * torch.pow(theta_scale, i0 / 2.0)
+    theta_interp = (1.0 / shape.rope_scale_factor) * theta_extrap
+    corr_low, corr_high = _rope_yarn_corr_dims(
+        n_dims=rotary_dim,
+        n_ctx_orig=shape.rope_original_context,
+        freq_base=shape.compressed_rope_freq_base,
+        beta_fast=shape.rope_yarn_beta_fast,
+        beta_slow=shape.rope_yarn_beta_slow,
+    )
+    ramp_mix = _rope_yarn_ramp(corr_low, corr_high, i0)
+    angles = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix
+    if inverse:
+        angles = -angles
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    x0 = pairs[..., 0]
+    x1 = pairs[..., 1]
+    rotated = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
+    out[..., -rotary_dim:] = rotated.reshape_as(tail)
+    return out
+
+
 def shared_kv_swa_attention_reference(
     queries: torch.Tensor,
     kv_rows: torch.Tensor,
@@ -310,15 +423,20 @@ def compressor_pair_projection_reference(
             "compressor KV and gate weights must have matching shapes; "
             f"got {tuple(kv_weight.shape)} and {tuple(gate_weight.shape)}"
         )
-    if kv_weight.shape[0] != hidden.numel():
-        raise ValueError(
-            "compressor input dimension must match hidden size; "
-            f"got {kv_weight.shape[0]} and {hidden.numel()}"
-        )
     hidden_f32 = hidden.to(torch.float32)
-    return (
-        kv_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
-        gate_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
+    if kv_weight.shape[1] == hidden.numel():
+        return (
+            kv_weight.to(torch.float32).matmul(hidden_f32),
+            gate_weight.to(torch.float32).matmul(hidden_f32),
+        )
+    if kv_weight.shape[0] == hidden.numel():
+        return (
+            kv_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
+            gate_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32),
+        )
+    raise ValueError(
+        "compressor input dimension must match hidden size; "
+        f"got {tuple(kv_weight.shape)} and {hidden.numel()}"
     )
 
 
@@ -412,6 +530,7 @@ def indexer_scores_reference(
     per_head_scores = indexer_query.to(torch.float32).matmul(
         compressed_rows.to(torch.float32).T
     )
+    per_head_scores = torch.clamp_min(per_head_scores, 0.0)
     weighted = indexer_weights.to(torch.float32).reshape(-1, 1) * per_head_scores
     return weighted.sum(dim=0) * score_scale
 
@@ -495,20 +614,22 @@ def compressor_update_state_reference(
             f"current compressor rows must have shape ({width},); "
             f"got {tuple(kv_cur.shape)} and {tuple(score_cur.shape)}"
         )
-    if ape_weight.shape != (width, ratio):
+    pos_mod = token_idx % ratio
+    if ape_weight.shape == (width, ratio):
+        ape_pos = ape_weight[:, pos_mod]
+    elif ape_weight.shape == (ratio, width):
+        ape_pos = ape_weight[pos_mod, :]
+    else:
         raise ValueError(
-            f"ape_weight shape must be ({width}, {ratio}); "
+            f"ape_weight shape must be ({width}, {ratio}) or ({ratio}, {width}); "
             f"got {tuple(ape_weight.shape)}"
         )
 
-    pos_mod = token_idx % ratio
     row = ratio + pos_mod if ratio == 4 else pos_mod
     next_kv = state_kv.to(torch.float32).clone()
     next_score = state_score.to(torch.float32).clone()
     next_kv[row] = kv_cur.to(torch.float32)
-    next_score[row] = score_cur.to(torch.float32) + ape_weight[:, pos_mod].to(
-        torch.float32
-    )
+    next_score[row] = score_cur.to(torch.float32) + ape_pos.to(torch.float32)
 
     emitted: torch.Tensor | None = None
     if compressor_should_emit_reference(token_idx=token_idx, ratio=ratio):

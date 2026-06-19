@@ -38,6 +38,11 @@ from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
 )
+from vllm.model_executor.models.deepseek_v4_flash.ops import (
+    deepseek_q8_k_roundtrip_reference,
+)
+
+from .config import DEEPSEEK_V4_FLASH_SHAPE
 
 
 class DeepSeekV4FlashQuantizedExpertPayloadLike(Protocol):
@@ -89,6 +94,7 @@ class DeepSeekV4FlashGPUBackend:
             "iq2_xxs_triton_calls": 0,
             "iq2_xxs_gate_up_fused_calls": 0,
             "q2_iq2_reference_fallback_calls": 0,
+            "cpu_token_sync_points": 0,
         }
 
     @property
@@ -353,6 +359,10 @@ class DeepSeekV4FlashGPUBackend:
         hidden_f32 = hidden.to(torch.float32)
         gate = gate_weight.to(torch.float32).matmul(hidden_f32)
         up = up_weight.to(torch.float32).matmul(hidden_f32)
+        clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
+        if clamp > 1.0e-6:
+            gate = torch.clamp(gate, max=clamp)
+            up = torch.clamp(up, min=-clamp, max=clamp)
         return down_weight.to(torch.float32).matmul(F.silu(gate) * up)
 
     def quantized_expert_gemm(
@@ -364,6 +374,7 @@ class DeepSeekV4FlashGPUBackend:
         down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
     ) -> torch.Tensor:
         self._stats["quantized_expert_calls"] += 1
+        expert_input = deepseek_q8_k_roundtrip_reference(hidden)
         if (
             gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
             and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
@@ -375,10 +386,11 @@ class DeepSeekV4FlashGPUBackend:
             activated = deepseek_v4_iq2_xxs_gate_up_activation(
                 gate_payload.payload,
                 up_payload.payload,
-                hidden,
+                expert_input,
                 rows=gate_payload.rows,
                 columns=gate_payload.columns,
             )
+            activated = deepseek_q8_k_roundtrip_reference(activated)
             return self._quantized_expert_matvec(down_payload, activated)
         if (
             gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
@@ -390,14 +402,20 @@ class DeepSeekV4FlashGPUBackend:
             gate, up = deepseek_v4_iq2_xxs_gate_up(
                 gate_payload.payload,
                 up_payload.payload,
-                hidden,
+                expert_input,
                 rows=gate_payload.rows,
                 columns=gate_payload.columns,
             )
         else:
-            gate = self._quantized_expert_matvec(gate_payload, hidden)
-            up = self._quantized_expert_matvec(up_payload, hidden)
-        return self._quantized_expert_matvec(down_payload, F.silu(gate) * up)
+            gate = self._quantized_expert_matvec(gate_payload, expert_input)
+            up = self._quantized_expert_matvec(up_payload, expert_input)
+        clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
+        if clamp > 1.0e-6:
+            gate = torch.clamp(gate, max=clamp)
+            up = torch.clamp(up, min=-clamp, max=clamp)
+        activated = F.silu(gate) * up
+        activated = deepseek_q8_k_roundtrip_reference(activated)
+        return self._quantized_expert_matvec(down_payload, activated)
 
     def _quantized_expert_matvec(
         self,
@@ -424,6 +442,48 @@ class DeepSeekV4FlashGPUBackend:
             "DeepSeek V4 Flash quantized expert GEMM does not support "
             f"GGML type {staged.ggml_type}"
         )
+
+    def quantized_selected_experts_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        expert_weights: torch.Tensor,
+        payloads: list[
+            tuple[
+                int,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+            ]
+        ],
+    ) -> torch.Tensor:
+        if not hidden.is_cuda or not expert_weights.is_cuda:
+            raise ValueError(
+                "DeepSeek V4 Flash selected expert GEMM inputs must be CUDA tensors"
+            )
+        self._stats["selected_expert_fused_api_calls"] = (
+            self._stats.get("selected_expert_fused_api_calls", 0) + 1
+        )
+        output: torch.Tensor | None = None
+        weights = expert_weights.reshape(-1)
+        for payload_index, (
+            _expert_id,
+            gate_payload,
+            up_payload,
+            down_payload,
+        ) in enumerate(payloads):
+            expert_output = self.quantized_expert_gemm(
+                hidden=hidden,
+                gate_payload=gate_payload,
+                up_payload=up_payload,
+                down_payload=down_payload,
+            ).to(torch.float32)
+            if output is None:
+                output = torch.zeros_like(expert_output, dtype=torch.float32)
+            output = output + weights[payload_index].to(torch.float32) * expert_output
+        if output is None:
+            raise ValueError("DeepSeek V4 Flash selected expert GEMM got no payloads")
+        return output
 
     def compressed_attention(
         self,

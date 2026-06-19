@@ -53,7 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--prompt-token-id", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument("--warmup-tokens", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--min-steady-decode-tps", type=float, default=0.0)
     parser.add_argument("--profile-json", type=Path, default=None)
     return parser.parse_args(argv)
 
@@ -64,6 +66,73 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def decode_metrics_from_token_times(token_elapsed_ms: list[float]) -> dict[str, float]:
+    if not token_elapsed_ms:
+        return {
+            "decode_tokens_total": 0.0,
+            "decode_ms_total": 0.0,
+            "decode_tps_agg": 0.0,
+            "decode_tps_steady_state": 0.0,
+        }
+    total_ms = float(sum(token_elapsed_ms))
+    steady_ms = (
+        float(sum(token_elapsed_ms[1:])) if len(token_elapsed_ms) > 1 else total_ms
+    )
+    steady_tokens = max(len(token_elapsed_ms) - 1, 1)
+    return {
+        "decode_tokens_total": float(len(token_elapsed_ms)),
+        "decode_ms_total": total_ms,
+        "decode_tps_agg": (
+            len(token_elapsed_ms) * 1000.0 / total_ms if total_ms > 0.0 else 0.0
+        ),
+        "decode_tps_steady_state": (
+            steady_tokens * 1000.0 / steady_ms if steady_ms > 0.0 else 0.0
+        ),
+    }
+
+
+def validate_steady_decode_tps(
+    *,
+    decode_tps_steady_state: float,
+    min_steady_decode_tps: float,
+) -> None:
+    if min_steady_decode_tps <= 0.0:
+        return
+    if decode_tps_steady_state >= min_steady_decode_tps:
+        return
+    raise SystemExit(
+        "steady-state decode TPS below threshold: "
+        f"{decode_tps_steady_state:.2f} < {min_steady_decode_tps:.2f}"
+    )
+
+
+def generate_greedy_with_token_timings(
+    model: DeepSeekV4FlashForCausalLM,
+    input_ids: torch.Tensor,
+    *,
+    max_tokens: int,
+) -> tuple[torch.Tensor, list[float]]:
+    timed_generate = getattr(model, "generate_greedy_kernel_timed", None)
+    if timed_generate is not None:
+        output_ids, token_elapsed_ms = timed_generate(
+            input_ids,
+            max_tokens=max_tokens,
+        )
+        return output_ids, [float(ms) for ms in token_elapsed_ms]
+
+    output_ids = input_ids
+    token_elapsed_ms: list[float] = []
+    for _token_idx in range(max_tokens):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        output_ids = model.generate_greedy_kernel(output_ids, max_tokens=1)
+        end_event.record()
+        torch.cuda.synchronize()
+        token_elapsed_ms.append(float(start_event.elapsed_time(end_event)))
+    return output_ids, token_elapsed_ms
 
 
 def phase3_metrics(
@@ -138,6 +207,8 @@ def main() -> int:
     args = parse_args()
     if args.repeat <= 0:
         raise SystemExit("--repeat must be positive")
+    if args.warmup_tokens < 0:
+        raise SystemExit("--warmup-tokens must be non-negative")
     if not args.model.is_file():
         raise SystemExit(f"DeepSeek V4 Flash GGUF file not found: {args.model}")
     if not torch.cuda.is_available():
@@ -155,12 +226,20 @@ def main() -> int:
             runtime_budget=budget,
             gpu_backend=_build_ready_backend(),
         )
-        model.enable_deepseek_profile(args.profile_json is not None)
         input_ids = torch.tensor(
             [args.prompt_token_id],
             dtype=torch.long,
             device="cuda",
         )
+        model.warm_decode_static_weights(input_ids.device)
+        model.warm_decode_token_experts(input_ids)
+        if args.warmup_tokens > 0:
+            model.generate_greedy_kernel(
+                input_ids,
+                max_tokens=args.warmup_tokens,
+            )
+        torch.cuda.synchronize()
+        model.enable_deepseek_profile(args.profile_json is not None)
         runs: list[dict[str, object]] = []
         output_cpu: list[int] = []
         for run_idx in range(args.repeat):
@@ -168,7 +247,8 @@ def main() -> int:
             end_event = torch.cuda.Event(enable_timing=True)
             start_wall = perf_counter()
             start_event.record()
-            output_ids = model.generate_greedy_kernel(
+            output_ids, token_elapsed_ms = generate_greedy_with_token_timings(
+                model,
                 input_ids,
                 max_tokens=args.max_tokens,
             )
@@ -176,19 +256,24 @@ def main() -> int:
             torch.cuda.synchronize()
             wall_elapsed_ms = (perf_counter() - start_wall) * 1000.0
             cuda_elapsed_ms = float(start_event.elapsed_time(end_event))
-            elapsed_ms = (
-                cuda_elapsed_ms
-                if cuda_elapsed_ms > 0.0
-                else wall_elapsed_ms
-            )
-            output_cpu = [
-                int(token) for token in output_ids.detach().cpu().tolist()
-            ]
+            elapsed_ms = cuda_elapsed_ms if cuda_elapsed_ms > 0.0 else wall_elapsed_ms
+            output_cpu = [int(token) for token in output_ids.detach().cpu().tolist()]
             if len(output_cpu) != 1 + args.max_tokens:
                 raise RuntimeError(
                     "DeepSeek V4 Flash smoke returned unexpected token count: "
                     f"got {len(output_cpu)}, expected {1 + args.max_tokens}"
                 )
+            generated_token_count = len(token_elapsed_ms)
+            if generated_token_count != args.max_tokens:
+                raise RuntimeError(
+                    "DeepSeek V4 Flash smoke returned unexpected timing count: "
+                    f"got {generated_token_count}, expected {args.max_tokens}"
+                )
+            decode_metrics = decode_metrics_from_token_times(token_elapsed_ms)
+            validate_steady_decode_tps(
+                decode_tps_steady_state=decode_metrics["decode_tps_steady_state"],
+                min_steady_decode_tps=args.min_steady_decode_tps,
+            )
             tokens_per_second = (
                 args.max_tokens * 1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0
             )
@@ -197,9 +282,12 @@ def main() -> int:
                     "run_idx": run_idx,
                     "cuda_elapsed_ms": cuda_elapsed_ms,
                     "elapsed_ms": elapsed_ms,
+                    "generated_token_count": generated_token_count,
                     "output_token_ids": output_cpu,
+                    "token_elapsed_ms": token_elapsed_ms,
                     "tokens_per_second": tokens_per_second,
                     "wall_elapsed_ms": wall_elapsed_ms,
+                    **decode_metrics,
                 }
             )
         profile = model.deepseek_profile()
@@ -209,6 +297,7 @@ def main() -> int:
             "model": str(args.model),
             "context_length": args.context_length,
             "max_tokens": args.max_tokens,
+            "warmup_tokens": args.warmup_tokens,
             "output_token_ids": output_cpu,
             "repeat": args.repeat,
             "runs": runs,

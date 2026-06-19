@@ -42,9 +42,13 @@ TARGET_GGUF = Path(
 class _ReadyBackend:
     is_ready = True
     missing_kernels: tuple[str, ...] = ()
+    _stats = {"cpu_token_sync_points": 0}
 
     def require_ready(self) -> None:
         return None
+
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
 
     def sliding_attention(
         self,
@@ -317,14 +321,14 @@ def test_model_enable_deepseek_profile_records_generate_section(
     model = _fake_model()
     model.enable_deepseek_profile()
 
-    def fake_token_step_token_id(
+    def fake_token_step_token_tensor(
         *,
-        token_id: int,
+        token_id_tensor: torch.Tensor,
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
-        del token_id, token_idx
+        del token_id_tensor, token_idx
         state.advance_token()
         return torch.tensor(2, dtype=torch.long, device=device)
 
@@ -336,8 +340,8 @@ def test_model_enable_deepseek_profile_records_generate_section(
     monkeypatch.setattr(model.gpu_backend, "require_ready", lambda: None)
     monkeypatch.setattr(
         model,
-        "_forward_kernel_token_step_token_id",
-        fake_token_step_token_id,
+        "_forward_kernel_token_step_token_tensor",
+        fake_token_step_token_tensor,
     )
 
     output = model.generate_greedy_kernel(
@@ -350,6 +354,102 @@ def test_model_enable_deepseek_profile_records_generate_section(
 
     assert output.tolist() == [1, 2]
     assert "generate_greedy_kernel" in event_names
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_timed_keeps_generated_tokens_on_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model(context_length=8)
+    seen_state_ids: list[int] = []
+    seen_positions: list[int] = []
+    seen_input_tensors: list[torch.Tensor] = []
+
+    def fake_token_step_token_tensor(
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert token_id_tensor.is_cuda
+        assert token_id_tensor.ndim == 0
+        seen_input_tensors.append(token_id_tensor.clone())
+        seen_state_ids.append(id(state))
+        seen_positions.append(token_idx)
+        state.advance_token()
+        return token_id_tensor.to(device=device, dtype=torch.long).reshape(()) + 1
+
+    def fail_token_id_path(**kwargs: object) -> torch.Tensor:
+        del kwargs
+        raise AssertionError("single-token timed decode should use tensor path")
+
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_tensor",
+        fake_token_step_token_tensor,
+    )
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fail_token_id_path,
+    )
+
+    output_ids, token_elapsed_ms = model.generate_greedy_kernel_timed(
+        torch.tensor([1], dtype=torch.long, device="cuda"),
+        max_tokens=4,
+    )
+
+    assert output_ids.is_cuda
+    assert output_ids.tolist() == [1, 2, 3, 4, 5]
+    assert len(token_elapsed_ms) == 4
+    assert all(elapsed_ms >= 0.0 for elapsed_ms in token_elapsed_ms)
+    assert torch.stack(seen_input_tensors).cpu().tolist() == [1, 2, 3, 4]
+    assert seen_positions == [0, 1, 2, 3]
+    assert len(set(seen_state_ids)) == 1
+    assert model.gpu_backend.stats()["cpu_token_sync_points"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_does_not_time_or_synchronize_per_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model(context_length=8)
+
+    def fake_token_step_token_tensor(
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del token_idx
+        assert token_id_tensor.is_cuda
+        state.advance_token()
+        return token_id_tensor.to(device=device, dtype=torch.long).reshape(()) + 1
+
+    def fail_cuda_event(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("non-timed greedy decode created a CUDA timing event")
+
+    def fail_synchronize(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("non-timed greedy decode synchronized per token")
+
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_tensor",
+        fake_token_step_token_tensor,
+    )
+    monkeypatch.setattr(torch.cuda, "Event", fail_cuda_event)
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_synchronize)
+
+    output_ids = model.generate_greedy_kernel(
+        torch.tensor([1], dtype=torch.long, device="cuda"),
+        max_tokens=4,
+    )
+
+    assert output_ids.tolist() == [1, 2, 3, 4, 5]
 
 
 def test_model_profile_records_layer_output_sections_and_syncs(
@@ -504,6 +604,60 @@ def test_forward_kernel_schedules_next_layer_prefetch_before_demand(
     ]
 
 
+def test_warm_decode_token_experts_pins_and_prefetches_hash_routed_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model()
+    assert model.weight_store is not None
+    token_table = _expert_token_table(1)
+    grouped_experts = _grouped_experts(1)
+    model.weight_store.bindings.layers = [
+        _FakeLayer(0, None),
+        _FakeLayer(1, grouped_experts, token_table),
+    ]
+
+    class FakeStager:
+        def __init__(self) -> None:
+            self.store = self
+            self.pinned: list[tuple[int, int]] = []
+            self.prefetches: list[tuple[int, tuple[int, ...]]] = []
+
+        def tensor_to_torch(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            assert tensor is token_table
+            assert dtype is torch.int32
+            table = torch.full((2, 16), -1, dtype=torch.int32)
+            table[:, 5] = torch.tensor([3, 1], dtype=torch.int32)
+            return table
+
+        def pin_grouped_expert(self, layer_idx: int, expert_id: int) -> None:
+            self.pinned.append((layer_idx, expert_id))
+
+        def prefetch_grouped_experts(
+            self,
+            tensors: DeepSeekV4FlashGroupedExpertTensors,
+            request: DeepSeekV4FlashExpertPrefetchRequest,
+        ) -> None:
+            assert tensors is grouped_experts
+            self.prefetches.append((request.layer_idx, request.expert_ids))
+
+        def memory_stats(self) -> dict[str, int | None]:
+            return {"pinned_entries": len(self.pinned) * 3}
+
+    stager = FakeStager()
+    monkeypatch.setattr(model, "_get_gpu_weight_stager", lambda device: stager)
+
+    model.warm_decode_token_experts(torch.tensor([2, 5], dtype=torch.long))
+
+    assert stager.pinned == [(1, 1), (1, 3)]
+    assert stager.prefetches == [(1, (1, 3))]
+    assert stager.memory_stats()["pinned_entries"] == 6
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_generate_greedy_kernel_uses_output_argmax_when_available(
     monkeypatch: pytest.MonkeyPatch,
@@ -535,6 +689,15 @@ def test_generate_greedy_kernel_uses_output_argmax_when_available(
         model,
         "_stage_token_embedding_cuda",
         lambda store, token_id, *, device: torch.ones(
+            (model.shape.hidden_size,),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    monkeypatch.setattr(
+        model,
+        "_stage_token_embedding_tensor_cuda",
+        lambda store, stager, token_id_tensor, *, device: torch.ones(
             (model.shape.hidden_size,),
             dtype=torch.float32,
             device=device,
@@ -579,10 +742,28 @@ def test_generate_greedy_kernel_appends_one_token_and_advances_shared_state(
         state.advance_token()
         return torch.tensor(7, dtype=torch.long, device=device)
 
+    def fake_token_step_token_tensor(
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del token_id_tensor
+        seen_state_ids.append(id(state))
+        seen_positions.append(token_idx)
+        state.advance_token()
+        return torch.tensor(7, dtype=torch.long, device=device)
+
     monkeypatch.setattr(
         model,
         "_forward_kernel_token_step_token_id",
         fake_token_step_token_id,
+    )
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_tensor",
+        fake_token_step_token_tensor,
     )
 
     output = model.generate_greedy_kernel(
@@ -605,8 +786,7 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     seen_state_ids: list[int] = []
     seen_positions: list[int] = []
     seen_token_ids: list[int] = []
-    seen_tensor_positions: list[int] = []
-    seen_tensor_state_ids: list[int] = []
+    seen_token_id_tensors: list[torch.Tensor] = []
 
     def fake_token_step_token_id(
         *,
@@ -631,8 +811,9 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     ) -> torch.Tensor:
         assert token_id_tensor.is_cuda
         assert token_id_tensor.ndim == 0
-        seen_tensor_positions.append(token_idx)
-        seen_tensor_state_ids.append(id(state))
+        seen_token_id_tensors.append(token_id_tensor)
+        seen_state_ids.append(id(state))
+        seen_positions.append(token_idx)
         next_token = (token_idx + 1) % model.shape.vocab_size
         state.advance_token()
         return torch.tensor(next_token, dtype=torch.long, device=device)
@@ -656,20 +837,30 @@ def test_generate_greedy_kernel_appends_eight_tokens_and_reuses_state(
     assert output.device.type == "cuda"
     assert output.dtype == torch.long
     assert output.tolist() == [4, 5, 2, 3, 4, 5, 6, 7, 8, 9]
-    assert seen_positions == [0, 1]
-    assert seen_token_ids == [4, 5]
-    assert seen_tensor_positions == list(range(2, 9))
-    assert len(set(seen_state_ids + seen_tensor_state_ids)) == 1
+    assert seen_positions == list(range(9))
+    assert seen_token_ids == [4]
+    assert [int(tensor.item()) for tensor in seen_token_id_tensors] == [
+        5,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    ]
+    assert len(set(seen_state_ids)) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_generate_greedy_kernel_uses_tensor_token_path_for_continuation(
+def test_generate_greedy_kernel_uses_token_tensor_path_for_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _fake_model(context_length=8)
-    prompt_token_ids: list[int] = []
-    tensor_positions: list[int] = []
-    tensor_state_ids: list[int] = []
+    token_ids: list[int] = []
+    token_id_tensors: list[torch.Tensor] = []
+    positions: list[int] = []
+    state_ids: list[int] = []
 
     def fake_token_step_token_id(
         *,
@@ -678,7 +869,9 @@ def test_generate_greedy_kernel_uses_tensor_token_path_for_continuation(
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
-        prompt_token_ids.append(token_id)
+        token_ids.append(token_id)
+        positions.append(token_idx)
+        state_ids.append(id(state))
         state.advance_token()
         return torch.tensor((token_idx + 1) % model.shape.vocab_size, device=device)
 
@@ -689,17 +882,18 @@ def test_generate_greedy_kernel_uses_tensor_token_path_for_continuation(
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
+        del device
         assert token_id_tensor.is_cuda
         assert token_id_tensor.ndim == 0
-        assert token_id_tensor.dtype == torch.long
-        torch.testing.assert_close(
-            token_id_tensor,
-            torch.tensor(token_idx, dtype=torch.long, device=device),
-        )
-        tensor_positions.append(token_idx)
-        tensor_state_ids.append(id(state))
+        token_id_tensors.append(token_id_tensor)
+        positions.append(token_idx)
+        state_ids.append(id(state))
         state.advance_token()
-        return torch.tensor((token_idx + 1) % model.shape.vocab_size, device=device)
+        return torch.tensor(
+            (token_idx + 1) % model.shape.vocab_size,
+            dtype=torch.long,
+            device=token_id_tensor.device,
+        )
 
     monkeypatch.setattr(
         model,
@@ -721,9 +915,10 @@ def test_generate_greedy_kernel_uses_tensor_token_path_for_continuation(
     assert output.device.type == "cuda"
     assert output.dtype == torch.long
     assert output.tolist() == [4, 5, 2, 3, 4]
-    assert prompt_token_ids == [4, 5]
-    assert tensor_positions == [2, 3]
-    assert len(set(tensor_state_ids)) == 1
+    assert token_ids == [4]
+    assert [int(tensor.item()) for tensor in token_id_tensors] == [5, 2, 3]
+    assert positions == [0, 1, 2, 3]
+    assert len(set(state_ids)) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

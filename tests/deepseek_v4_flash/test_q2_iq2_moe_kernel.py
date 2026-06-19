@@ -29,12 +29,10 @@ def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
         groups = bytearray()
         for group in range(8):
             grid_bytes = bytes(
-                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF)
-                for idx in range(4)
+                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF) for idx in range(4)
             )
             sign_indices = [
-                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F
-                for idx in range(4)
+                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F for idx in range(4)
             ]
             scale_code = (row + group * 3) & 0x0F
             q_sign_scale = (
@@ -61,18 +59,11 @@ def _iq2_xxs_deterministic_payload_blocks(rows: int, blocks_per_row: int) -> byt
             synthetic_row = row * 17 + block_idx
             for group in range(8):
                 grid_bytes = bytes(
-                    (
-                        synthetic_row * 19
-                        + group * 29
-                        + idx * 37
-                        + 0x17
-                    )
-                    & 0xFF
+                    (synthetic_row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF
                     for idx in range(4)
                 )
                 sign_indices = [
-                    (synthetic_row * 11 + group * 7 + idx * 23 + 0x05)
-                    & 0x7F
+                    (synthetic_row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F
                     for idx in range(4)
                 ]
                 scale_code = (synthetic_row + group * 3) & 0x0F
@@ -115,12 +106,10 @@ def _q2_k_deterministic_payload_blocks(rows: int, blocks_per_row: int) -> bytes:
         for block_idx in range(blocks_per_row):
             synthetic_row = row * 17 + block_idx
             scales = bytes(
-                ((synthetic_row * 5 + idx * 7 + 0x21) & 0xFF)
-                for idx in range(16)
+                ((synthetic_row * 5 + idx * 7 + 0x21) & 0xFF) for idx in range(16)
             )
             qs = bytes(
-                ((synthetic_row * 13 + idx * 11 + 0x35) & 0xFF)
-                for idx in range(64)
+                ((synthetic_row * 13 + idx * 11 + 0x35) & 0xFF) for idx in range(64)
             )
             d = 0.125 * (synthetic_row % 5 + 1)
             dmin = -0.0625 * (synthetic_row % 7 + 1)
@@ -236,11 +225,15 @@ def test_q2_k_default_triton_matvec_matches_reference_decoded_matrix(
         rows=rows,
         columns=columns,
     )
-    expected = q2_k_matrix_from_gguf_payload(
-        payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
+    expected = (
+        q2_k_matrix_from_gguf_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
 
     assert actual.shape == (rows,)
     assert actual.device.type == "cuda"
@@ -263,11 +256,15 @@ def test_q2_k_default_triton_matvec_matches_reference_multi_block(
         rows=rows,
         columns=columns,
     )
-    expected = q2_k_matrix_from_gguf_payload(
-        payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
+    expected = (
+        q2_k_matrix_from_gguf_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
 
     assert actual.shape == (rows,)
     assert actual.device.type == "cuda"
@@ -290,11 +287,15 @@ def test_iq2_xxs_default_triton_matvec_matches_reference_decoded_matrix(
         rows=rows,
         columns=columns,
     )
-    expected = iq2_xxs_matrix_from_gguf_payload(
-        payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
+    expected = (
+        iq2_xxs_matrix_from_gguf_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
 
     assert actual.shape == (rows,)
     assert actual.device.type == "cuda"
@@ -317,16 +318,24 @@ def test_iq2_xxs_gate_up_default_triton_matches_reference_decoded_matrix() -> No
         rows=rows,
         columns=columns,
     )
-    expected_gate = iq2_xxs_matrix_from_gguf_payload(
-        gate_payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
-    expected_up = iq2_xxs_matrix_from_gguf_payload(
-        up_payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
+    expected_gate = (
+        iq2_xxs_matrix_from_gguf_payload(
+            gate_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+    expected_up = (
+        iq2_xxs_matrix_from_gguf_payload(
+            up_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
 
     assert gate.shape == (rows,)
     assert up.shape == (rows,)
@@ -360,11 +369,47 @@ def test_iq2_xxs_gate_up_activation_matches_two_matvec_reference() -> None:
         rows=rows,
         columns=columns,
     )
-    expected = torch.nn.functional.silu(gate) * up
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
 
     assert actual.shape == (rows,)
     assert actual.device.type == "cuda"
     assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_iq2_xxs_gate_up_activation_applies_deepseek_clamp() -> None:
+    rows = 4
+    columns = 256
+    gate_payload = _iq2_xxs_deterministic_payload(rows)
+    up_payload = _iq2_xxs_deterministic_payload(rows)
+    hidden = torch.linspace(-75.0, 90.0, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_iq2_xxs_gate_up_activation(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    gate, up = deepseek_v4_iq2_xxs_gate_up(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
+
+    assert torch.any(torch.abs(up) > 10.0) or torch.any(gate > 10.0)
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
@@ -386,17 +431,29 @@ def test_iq2_xxs_gate_up_activation_matches_reference_multi_block(
         rows=rows,
         columns=columns,
     )
-    gate = iq2_xxs_matrix_from_gguf_payload(
-        gate_payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
-    up = iq2_xxs_matrix_from_gguf_payload(
-        up_payload,
-        rows=rows,
-        columns=columns,
-    ).to(device="cuda").matmul(hidden)
-    expected = torch.nn.functional.silu(gate) * up
+    gate = (
+        iq2_xxs_matrix_from_gguf_payload(
+            gate_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+    up = (
+        iq2_xxs_matrix_from_gguf_payload(
+            up_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
 
     assert actual.shape == (rows,)
     assert actual.device.type == "cuda"

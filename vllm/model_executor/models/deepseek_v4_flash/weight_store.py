@@ -351,7 +351,7 @@ class DeepSeekV4FlashWeightStore:
             return self.tensor_to_torch(
                 tensor,
                 dtype=torch.float16,
-                shape=(input_size, output_size),
+                shape=(output_size, input_size),
             )
 
         payload = self.tensor_payload(tensor)

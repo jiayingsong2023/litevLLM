@@ -66,10 +66,10 @@ def test_real_layer2_compressor_and_indexer_shape_mapping() -> None:
         # Decode one representative matrix from each path to prove the real
         # layer-2 tensors are accessible through the typed matrix accessor.
         assert store.decode_matrix(layer.attention_compressor.kv).shape == (
-            4096,
             1024,
+            4096,
         )
-        assert store.decode_matrix(layer.indexer.projection).shape == (4096, 64)
+        assert store.decode_matrix(layer.indexer.projection).shape == (64, 4096)
 
 
 def test_factorized_attention_projection_reference_returns_b_output_shape() -> None:

@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from .config import DEEPSEEK_V4_FLASH_SHAPE
 from .ops import silu_gate_reference
 
 
@@ -37,12 +38,18 @@ def topk_router_reference(
         )
     if hidden.numel() == 0:
         raise ValueError("hidden must contain at least one element")
-    if router_weight.shape[1] != hidden.numel():
+    hidden_f32 = hidden.to(torch.float32)
+    if router_weight.shape[1] == hidden.numel():
+        logits = router_weight.to(torch.float32).matmul(hidden_f32)
+        num_experts = router_weight.shape[0]
+    elif router_weight.shape[0] == hidden.numel():
+        logits = router_weight.transpose(0, 1).to(torch.float32).matmul(hidden_f32)
+        num_experts = router_weight.shape[1]
+    else:
         raise ValueError(
             "router_weight columns must match hidden size; "
-            f"got {router_weight.shape[1]} and {hidden.numel()}"
+            f"got {tuple(router_weight.shape)} and {hidden.numel()}"
         )
-    num_experts = router_weight.shape[0]
     if num_experts == 0:
         raise ValueError("router_weight must contain at least one expert row")
     if top_k <= 0 or top_k > num_experts:
@@ -61,8 +68,6 @@ def topk_router_reference(
                 "correction_bias size must match number of experts; "
                 f"got {correction_bias.numel()} and {num_experts}"
             )
-
-    logits = router_weight.to(torch.float32).matmul(hidden.to(torch.float32))
     scores = _router_scores(logits, scoring_func)
     selection_scores = scores
     if correction_bias is not None:
@@ -79,6 +84,8 @@ def grouped_expert_reference(
     gate_weight: torch.Tensor,
     up_weight: torch.Tensor,
     down_weight: torch.Tensor,
+    *,
+    swiglu_clamp: float = DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp,
 ) -> torch.Tensor:
     if hidden.ndim != 1:
         raise ValueError(f"hidden must be 1-D; got {hidden.ndim}-D")
@@ -109,7 +116,7 @@ def grouped_expert_reference(
     hidden_f32 = hidden.to(torch.float32)
     gate = gate_weight.to(torch.float32).matmul(hidden_f32)
     up = up_weight.to(torch.float32).matmul(hidden_f32)
-    activated = silu_gate_reference(gate, up)
+    activated = silu_gate_reference(gate, up, clamp=swiglu_clamp)
     return down_weight.to(torch.float32).matmul(activated)
 
 

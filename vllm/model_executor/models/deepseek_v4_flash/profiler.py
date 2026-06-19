@@ -65,12 +65,34 @@ class DeepSeekV4FlashProfiler:
         self._events.clear()
         self._counters.clear()
 
+    def _aggregate_by_name(self) -> dict[str, dict[str, float | int]]:
+        aggregates: dict[str, dict[str, float | int]] = {}
+        for event in self._events:
+            aggregate = aggregates.setdefault(
+                event.name,
+                {
+                    "count": 0,
+                    "total_ms": 0.0,
+                    "avg_ms": 0.0,
+                    "max_ms": 0.0,
+                },
+            )
+            count = int(aggregate["count"]) + 1
+            total_ms = float(aggregate["total_ms"]) + event.elapsed_ms
+            aggregate["count"] = count
+            aggregate["total_ms"] = total_ms
+            aggregate["avg_ms"] = total_ms / count
+            aggregate["max_ms"] = max(float(aggregate["max_ms"]), event.elapsed_ms)
+        return aggregates
+
     def snapshot(self, reset: bool = False) -> dict[str, Any]:
         data = {
             "enabled": self.enabled,
             "events": [event.to_dict() for event in self._events],
             "counters": dict(self._counters),
         }
+        if self.enabled:
+            data["aggregate_by_name"] = self._aggregate_by_name()
         if reset:
             self.reset()
         return data

@@ -195,6 +195,117 @@ def test_run_inference_correctness_regression_runs_opt_in_deepseek_gpu_smoke(
     assert "DeepSeek V4 Flash Tier-B quality smoke" in proc.stdout
 
 
+def test_run_inference_correctness_regression_runs_deepseek_gpu_smoke_by_default(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    log_path = tmp_path / "uv_calls.log"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'printf "%s\\n" "$*" >> "{log_path}"',
+                "exit 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    deepseek_path = tmp_path / "models" / "deepseek-v4-flash.gguf"
+    tiny_dir.mkdir(parents=True)
+    qwen_dir.mkdir(parents=True)
+    deepseek_path.parent.mkdir(parents=True, exist_ok=True)
+    deepseek_path.write_bytes(b"gguf")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
+    env["MODEL_DEEPSEEK_V4_FLASH_GGUF"] = str(deepseek_path)
+    env["RUN_GEMMA4_31B"] = "0"
+    env["RUN_GEMMA4_26B"] = "0"
+    env["SKIP_A_TIER"] = "1"
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    calls = log_path.read_text(encoding="utf-8")
+    assert "run python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
+    assert f"--model {deepseek_path}" in calls
+
+
+def test_run_inference_correctness_regression_skips_deepseek_when_model_missing(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    log_path = tmp_path / "uv_calls.log"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'printf "%s\\n" "$*" >> "{log_path}"',
+                "exit 0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    tiny_dir.mkdir(parents=True)
+    qwen_dir.mkdir(parents=True)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
+    env["MODEL_DEEPSEEK_V4_FLASH_GGUF"] = str(
+        tmp_path / "models" / "missing-deepseek.gguf"
+    )
+    env["RUN_GEMMA4_31B"] = "0"
+    env["RUN_GEMMA4_26B"] = "0"
+    env["SKIP_A_TIER"] = "1"
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    calls = log_path.read_text(encoding="utf-8")
+    assert "deepseek_v4_flash_quality_smoke.py" not in calls
+    assert "DeepSeek V4 Flash GGUF not found, skipping" in proc.stdout
+
+
 def test_run_inference_correctness_regression_perf_diag_includes_deepseek(
     tmp_path: Path,
 ) -> None:

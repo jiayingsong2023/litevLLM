@@ -98,7 +98,17 @@ def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     assert spec.quant == "deepseek-v4-flash-gguf"
     assert spec.concurrent_reqs == 1
     assert spec.prompt_tokens_target == 4096
-    assert spec.max_new_tokens == 1
+    assert spec.max_new_tokens == 16
+
+
+def test_deepseek_v4_flash_gguf_is_in_default_e2e_models(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["e2e_full_benchmark.py"])
+
+    args = bench._parse_args()
+
+    assert "deepseek_v4_flash_q2_gguf" in {
+        key.strip() for key in args.models.split(",")
+    }
 
 
 def test_runtime_metrics_include_async_driver_snapshot() -> None:

@@ -28,8 +28,9 @@ def sinkhorn_reference(
     if eps <= 0:
         raise ValueError("eps must be positive")
 
-    out = torch.softmax(scores.to(torch.float32), dim=-1)
-    for _ in range(iterations):
+    out = torch.softmax(scores.to(torch.float32), dim=-1) + eps
+    out = out / (out.sum(dim=0, keepdim=True) + eps)
+    for _ in range(1, iterations):
         out = out / (out.sum(dim=-1, keepdim=True) + eps)
         out = out / (out.sum(dim=0, keepdim=True) + eps)
     return out
@@ -54,9 +55,14 @@ def hyper_connection_pre_reference(
     hc_mult, hidden_size = streams.shape
     mix_count = 2 * hc_mult + hc_mult * hc_mult
     flat_size = hc_mult * hidden_size
-    if fn_weight.shape != (flat_size, mix_count):
+    if fn_weight.shape == (flat_size, mix_count):
+        projection_weight = fn_weight.transpose(0, 1).to(torch.float32)
+    elif fn_weight.shape == (mix_count, flat_size):
+        projection_weight = fn_weight.to(torch.float32)
+    else:
         raise ValueError(
-            f"fn_weight shape must be ({flat_size}, {mix_count}); "
+            f"fn_weight shape must be ({flat_size}, {mix_count}) or "
+            f"({mix_count}, {flat_size}); "
             f"got {tuple(fn_weight.shape)}"
         )
     if base.shape != (mix_count,):
@@ -70,14 +76,14 @@ def hyper_connection_pre_reference(
 
     flat = streams.reshape(flat_size).to(torch.float32)
     rsqrt = torch.rsqrt(flat.pow(2).mean() + eps)
-    mixes = fn_weight.transpose(0, 1).to(torch.float32).matmul(flat) * rsqrt
+    mixes = projection_weight.matmul(flat) * rsqrt
     mixes = mixes * scale.to(torch.float32).repeat_interleave(
         torch.tensor([hc_mult, hc_mult, hc_mult * hc_mult])
     )
     mixes = mixes + base.to(torch.float32)
 
     pre = torch.sigmoid(mixes[:hc_mult]) + eps
-    post = torch.sigmoid(mixes[hc_mult : 2 * hc_mult]) + eps
+    post = 2.0 * torch.sigmoid(mixes[hc_mult : 2 * hc_mult])
     combine_scores = mixes[2 * hc_mult :].reshape(hc_mult, hc_mult)
     combine = sinkhorn_reference(
         combine_scores,
@@ -118,7 +124,7 @@ def hyper_connection_post_reference(
             f"got {tuple(state.combine.shape)}"
         )
 
-    residual_mix = state.combine.to(torch.float32).matmul(
+    residual_mix = state.combine.to(torch.float32).T.matmul(
         residual_streams.to(torch.float32)
     )
     return state.post.reshape(hc_mult, 1).to(torch.float32) * output.to(

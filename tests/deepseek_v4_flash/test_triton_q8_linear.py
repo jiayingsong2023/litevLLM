@@ -6,6 +6,7 @@ import torch
 from vllm.kernels.triton.deepseek_v4_flash import q8_linear
 from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
     q8_0_linear,
+    q8_0_raw_gate_up_activation,
     q8_0_raw_linear,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
@@ -79,5 +80,47 @@ def test_q8_0_raw_linear_matches_reference_without_split_payload(
         columns=columns,
     )
     expected = q8_0_linear_reference(hidden.cpu(), values, scales).to("cuda")
+
+    torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_q8_0_raw_gate_up_activation_matches_raw_linear_composition() -> None:
+    rows = 4
+    columns = 64
+    gate_payload = b"".join(
+        _pack_q8_0_block(
+            0.125 * (row + block_idx + 1),
+            tuple(((row * 13 + block_idx * 7 + col) % 17) - 8 for col in range(32)),
+        )
+        for row in range(rows)
+        for block_idx in range(columns // 32)
+    )
+    up_payload = b"".join(
+        _pack_q8_0_block(
+            0.0625 * (row + block_idx + 1),
+            tuple(((row * 5 + block_idx * 11 + col) % 19) - 9 for col in range(32)),
+        )
+        for row in range(rows)
+        for block_idx in range(columns // 32)
+    )
+    gate_raw = torch.tensor(tuple(gate_payload), dtype=torch.uint8, device="cuda")
+    up_raw = torch.tensor(tuple(up_payload), dtype=torch.uint8, device="cuda")
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+
+    got = q8_0_raw_gate_up_activation(
+        gate_raw,
+        up_raw,
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    gate = q8_0_raw_linear(gate_raw, hidden, rows=rows, columns=columns)
+    up = q8_0_raw_linear(up_raw, hidden, rows=rows, columns=columns)
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
 
     torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)

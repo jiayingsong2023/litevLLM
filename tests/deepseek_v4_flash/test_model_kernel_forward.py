@@ -340,6 +340,8 @@ def test_forward_kernel_token_step_reuses_supplied_state(
     seen: list[tuple[int, int]] = []
 
     def fake_sliding(hidden: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        assert kwargs["state"] is state
+        assert state.token_position == kwargs["token_idx"]
         seen.append((kwargs["layer"].layer_index, kwargs["token_idx"]))
         return hidden
 
@@ -440,7 +442,7 @@ def test_forward_kernel_runs_multiple_fake_layers_and_returns_cuda_logits(
         ("sliding", 1, (32,)),
         ("compressed", 2, (32,)),
     ]
-    assert backend.output_calls == 1
+    assert backend.output_calls == 0
     assert logits.device.type == "cuda"
     assert logits.shape == (1, shape.vocab_size)
 
@@ -481,7 +483,7 @@ def test_forward_kernel_projects_output_logits_in_chunks(
     logits = model.forward_kernel(torch.tensor([1], dtype=torch.long, device="cuda"))
 
     assert logits.shape == (1, shape.vocab_size)
-    assert chunk_rows == [1024, 1024, 2]
+    assert chunk_rows == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

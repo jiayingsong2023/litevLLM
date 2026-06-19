@@ -21,7 +21,8 @@
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
 #   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
-#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 enables the opt-in real GGUF DeepSeek Tier-B quality smoke.
+#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=auto runs the real GGUF DeepSeek Tier-B quality smoke when the model exists.
+#     Set 0 to disable, or 1 to require the model file and fail if it is missing.
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -106,7 +107,7 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
-RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE="${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE:-0}"
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE="${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE:-auto}"
 FI_CORRECTNESS_STAGE_TIMEOUT="${FI_CORRECTNESS_STAGE_TIMEOUT:-45m}"
 FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT="${FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT:-75m}"
 FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT="${FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT:-45m}"
@@ -372,21 +373,28 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
   fi
 fi
 
-if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" ]]; then
+if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
   echo ""
-  echo "=== DeepSeek V4 Flash Tier-B quality smoke (opt-in) ==="
+  echo "=== DeepSeek V4 Flash Tier-B quality smoke ==="
   if [[ ! -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
-    echo "[ERROR] Missing DeepSeek V4 Flash GGUF: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
-    echo "        Override with MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf"
-    exit 1
+    if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "auto" ]]; then
+      echo "[Warn] DeepSeek V4 Flash GGUF not found, skipping: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
+      echo "       Set MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf to enable this Tier-B check."
+      echo "       Set RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=0 to suppress this message."
+    else
+      echo "[ERROR] Missing DeepSeek V4 Flash GGUF: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
+      echo "        Override with MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf"
+      exit 1
+    fi
+  else
+    run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
+      uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
+      --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
+      --context-length 4096 \
+      --max-tokens 8 \
+      --min-output-chars 8
+    cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
   fi
-  run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
-    uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
-    --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
-    --context-length 4096 \
-    --max-tokens 8 \
-    --min-output-chars 8
-  cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
 fi
 
 if [[ "$RUN_PERF_DIAG" == "1" ]]; then

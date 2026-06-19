@@ -47,6 +47,36 @@ def test_hyper_connection_pre_post_reference_shapes() -> None:
     assert torch.isfinite(out_streams).all()
 
 
+def test_hyper_connection_pre_uses_ds4_post_gate_scale() -> None:
+    streams = torch.arange(1.0, 7.0).reshape(2, 3)
+    fn_weight = torch.zeros((6, 8))
+    base = torch.zeros(8)
+    scale = torch.ones(3)
+
+    state = hyper_connection_pre_reference(streams, fn_weight, base, scale)
+
+    torch.testing.assert_close(state.post, torch.ones(2))
+
+
+def test_hyper_connection_post_uses_ds4_combine_layout() -> None:
+    streams = torch.tensor([[10.0], [100.0]])
+    state = hyper_connection_pre_reference(
+        torch.ones((2, 1)),
+        torch.zeros((2, 8)),
+        torch.zeros(8),
+        torch.ones(3),
+    )
+    state = type(state)(
+        mixed=state.mixed,
+        post=torch.zeros(2),
+        combine=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+
+    actual = hyper_connection_post_reference(torch.zeros(1), streams, state)
+
+    torch.testing.assert_close(actual, torch.tensor([[310.0], [420.0]]))
+
+
 @pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
 def test_real_layer0_hyper_connection_tensor_shapes() -> None:
     with open_deepseek_v4_flash_weight_store(TARGET_GGUF) as store:

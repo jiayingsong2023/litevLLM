@@ -3,6 +3,17 @@ import struct
 import pytest
 import torch
 
+from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    apply_deepseek_layer_rope_to_tail_reference,
+    apply_rope_to_tail_reference,
+)
+from vllm.model_executor.models.deepseek_v4_flash.ops import (
+    deepseek_fp8_kv_qat_reference,
+    deepseek_indexer_qat_reference,
+    deepseek_q8_k_roundtrip_reference,
+    e4m3fn_dequant_reference,
+    silu_gate_reference,
+)
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     decode_iq2_xxs_synthetic,
     decode_q2_k_synthetic,
@@ -70,6 +81,87 @@ def test_q8_0_linear_reference_matches_dequantized_matmul() -> None:
     result = q8_0_linear_reference(vector, values, scales, block_size=2)
 
     torch.testing.assert_close(result, weight.matmul(vector))
+
+
+def test_silu_gate_reference_applies_deepseek_clamp() -> None:
+    gate = torch.tensor([-20.0, -2.0, 2.0, 20.0])
+    up = torch.tensor([-20.0, -2.0, 2.0, 20.0])
+
+    actual = silu_gate_reference(gate, up, clamp=10.0)
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert actual[-1] < torch.nn.functional.silu(gate[-1]) * up[-1]
+
+
+def test_e4m3fn_dequant_reference_matches_ds4_saturation() -> None:
+    values = torch.tensor([0.0, 0.002, 1.1, 500.0, -500.0])
+
+    actual = e4m3fn_dequant_reference(values)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([0.0, 0.001953125, 1.125, 448.0, -448.0]),
+    )
+
+
+def test_deepseek_fp8_kv_qat_quantizes_only_non_rope_blocks() -> None:
+    row = torch.cat(
+        [
+            torch.linspace(-2.0, 2.0, 64),
+            torch.linspace(100.0, 200.0, 64),
+        ]
+    )
+
+    actual = deepseek_fp8_kv_qat_reference(row, head_dim=128, rotary_dim=64)
+
+    assert not torch.allclose(actual[:64], row[:64])
+    torch.testing.assert_close(actual[64:], row[64:])
+
+
+def test_deepseek_indexer_qat_reference_runs_hadamard_fp4_roundtrip() -> None:
+    row = torch.zeros(128)
+    row[0] = 1.0
+
+    actual = deepseek_indexer_qat_reference(row)
+
+    assert actual.shape == (128,)
+    assert torch.count_nonzero(actual).item() == 128
+    assert torch.all(torch.abs(actual) <= 0.125)
+
+
+def test_deepseek_layer_rope_keeps_dense_layers_on_default_base() -> None:
+    vector = torch.arange(512, dtype=torch.float32)
+
+    actual = apply_deepseek_layer_rope_to_tail_reference(
+        vector,
+        token_idx=7,
+        layer_idx=1,
+    )
+    expected = apply_rope_to_tail_reference(vector, token_idx=7)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_deepseek_layer_rope_uses_compressed_layer_scaling() -> None:
+    vector = torch.arange(512, dtype=torch.float32)
+
+    dense = apply_deepseek_layer_rope_to_tail_reference(
+        vector,
+        token_idx=7,
+        layer_idx=1,
+    )
+    compressed = apply_deepseek_layer_rope_to_tail_reference(
+        vector,
+        token_idx=7,
+        layer_idx=2,
+    )
+
+    assert not torch.allclose(compressed[-64:], dense[-64:])
 
 
 def _pack_q8_0_block(scale: float, values: tuple[int, ...]) -> bytes:
@@ -241,3 +333,22 @@ def test_q2_k_synthetic_rejects_malformed_inputs() -> None:
             torch.zeros((1, 1)),
             group_size=4,
         )
+
+
+def test_deepseek_q8_k_roundtrip_quantizes_256_value_blocks() -> None:
+    row = torch.linspace(-1.0, 2.0, 256, dtype=torch.float32)
+
+    actual = deepseek_q8_k_roundtrip_reference(row)
+
+    signed_max = row[row.abs().argmax()]
+    iscale = -127.0 / signed_max
+    expected = torch.round(row * iscale).clamp(min=-128, max=127) / iscale
+    torch.testing.assert_close(actual, expected)
+
+
+def test_deepseek_q8_k_roundtrip_preserves_zero_blocks() -> None:
+    row = torch.zeros(512, dtype=torch.float32)
+
+    actual = deepseek_q8_k_roundtrip_reference(row)
+
+    torch.testing.assert_close(actual, row)

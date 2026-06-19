@@ -38,6 +38,36 @@ def test_profiler_counter_accumulates_values() -> None:
     assert profiler.to_dict()["counters"]["staging_cache_hit"] == 3
 
 
+def test_profiler_snapshot_aggregates_events_by_name(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    times = iter([1.0, 1.125, 2.0, 2.25, 3.0, 3.375])
+    monkeypatch.setattr(profiler_module, "perf_counter", _next_time(times))
+    profiler = DeepSeekV4FlashProfiler(enabled=True)
+
+    with profiler.section("prefill"):
+        pass
+    with profiler.section("decode"):
+        pass
+    with profiler.section("prefill"):
+        pass
+
+    assert profiler.to_dict()["aggregate_by_name"] == {
+        "decode": {
+            "count": 1,
+            "total_ms": 250.0,
+            "avg_ms": 250.0,
+            "max_ms": 250.0,
+        },
+        "prefill": {
+            "count": 2,
+            "total_ms": 500.0,
+            "avg_ms": 250.0,
+            "max_ms": 375.0,
+        },
+    }
+
+
 def test_disabled_profiler_has_no_events_but_accepts_calls() -> None:
     sync_calls = 0
 
@@ -93,11 +123,20 @@ def test_snapshot_can_drain_events_and_counters(monkeypatch: MonkeyPatch) -> Non
             }
         ],
         "counters": {"layers": 2},
+        "aggregate_by_name": {
+            "forward": {
+                "count": 1,
+                "total_ms": 250.0,
+                "avg_ms": 250.0,
+                "max_ms": 250.0,
+            }
+        },
     }
     assert profiler.to_dict() == {
         "enabled": True,
         "events": [],
         "counters": {},
+        "aggregate_by_name": {},
     }
 
 
