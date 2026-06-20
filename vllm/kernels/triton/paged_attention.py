@@ -147,14 +147,18 @@ def _select_paged_attention_launch_config(
     if override is not None:
         return override
 
-    # Decode-heavy Gemma4-31B path: head_size=256, block_size=16.
+    # Decode-heavy Gemma4 path: head_size is 256 for 26B and 512 for 31B.
     # Scope-aware bucket:
-    # - global/full attention: low concurrency often benefits from leaner launch (2/2),
-    #   while >=3 concurrency is more stable with 4/2.
+    # - Gemma4-31B C1 global decode benefits from stage depth 1, avoiding
+    #   excess scheduling overhead on the very wide head_size=512 kernel.
+    # - Other global/full attention: low concurrency often benefits from
+    #   leaner launch (2/2), while >=3 concurrency is more stable with 4/2.
     # - local/sliding attention: use lighter c1 stage depth, 4/2 otherwise.
     # Fallback keeps stable default and env override remains available.
     if head_size >= 256:
         if scope == "global":
+            if head_size >= 512 and num_seqs <= 1 and block_size <= 16:
+                return 4, 1
             if num_seqs <= 2:
                 return 2, 2
             return 4, 2
@@ -342,18 +346,16 @@ def _paged_attention_kernel(
                 # Manual sign-extension for 4-bit signed
                 k_l = ((k_packed << 28) >> 28).to(tl.float32) * k_scale
                 k_h = ((k_packed << 24) >> 28).to(tl.float32) * k_scale
-                qk = tl.sum(
-                    q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1
-                ) * scale
+                qk = (
+                    tl.sum(q_low[None, :] * k_l + q_high[None, :] * k_h, axis=1) * scale
+                )
             else:
                 off_kv = (
                     offs_n[:, None] * stride_k_token
                     + kv_head_idx * stride_k_head
                     + offs_d_2d * stride_k_dim
                 )
-                k = tl.load(
-                    k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0
-                )
+                k = tl.load(k_base_ptr + off_kv, mask=block_mask[:, None], other=0.0)
                 if IS_FP8:
                     k = k.to(tl.float32) * k_scale
                 qk = tl.sum(q[None, :] * k, axis=1) * scale
