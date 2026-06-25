@@ -5,6 +5,8 @@ import json
 import os
 import struct
 from collections.abc import Callable
+from pathlib import Path
+from statistics import median
 
 import pytest
 import torch
@@ -13,6 +15,12 @@ _ROWS = 1024
 _COLUMNS = 256
 _WARMUP = 3
 _REPEAT = 10
+_SELECTED_REPEAT = 50
+_SELECTED_EXPERTS = 6
+_DEFAULT_GGUF = Path(
+    "models/DeepSeek-V4-Flash-ds4/"
+    "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+)
 
 
 def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
@@ -97,6 +105,96 @@ def _measure_matvec(
     return elapsed_ms / _REPEAT, output
 
 
+def _measure(
+    run: Callable[[], torch.Tensor],
+) -> tuple[list[float], torch.Tensor]:
+    output = run()
+    for _ in range(_WARMUP):
+        output = run()
+    torch.cuda.synchronize()
+
+    events = [
+        (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for _ in range(_SELECTED_REPEAT)
+    ]
+    for start_event, end_event in events:
+        start_event.record()
+        output = run()
+        end_event.record()
+    torch.cuda.synchronize()
+    return (
+        [float(start.elapsed_time(end)) for start, end in events],
+        output,
+    )
+
+
+def _p95(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    return ordered[int(0.95 * (len(ordered) - 1))]
+
+
+def _measure_selected_wrapper(
+    *,
+    model_path: Path,
+) -> tuple[list[float], torch.Tensor, dict[str, int], dict[str, int]]:
+    from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
+        DeepSeekV4FlashGPUBackend,
+    )
+    from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
+        DeepSeekV4FlashGPUWeightStager,
+    )
+    from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+        open_deepseek_v4_flash_weight_store,
+    )
+
+    with open_deepseek_v4_flash_weight_store(model_path) as store:
+        grouped = store.bindings.layers[0].grouped_experts
+        if grouped is None:
+            raise ValueError("DeepSeek V4 Flash layer 0 has no grouped experts")
+        stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+        payloads = stager.stage_grouped_expert_payloads_for_ids(
+            grouped,
+            torch.arange(_SELECTED_EXPERTS, dtype=torch.int64),
+            layer_idx=0,
+        )
+    gate = payloads[0][1]
+    down = payloads[0][3]
+    shape = {
+        "down_columns": down.columns,
+        "down_rows": down.rows,
+        "experts": len(payloads),
+        "gate_columns": gate.columns,
+        "gate_rows": gate.rows,
+    }
+    hidden = torch.linspace(
+        -1.0,
+        1.0,
+        gate.columns,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    weights = torch.full(
+        (len(payloads),),
+        1.0 / len(payloads),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    backend = DeepSeekV4FlashGPUBackend()
+
+    def run() -> torch.Tensor:
+        return backend.quantized_selected_experts_gemm(
+            hidden=hidden,
+            expert_weights=weights,
+            payloads=payloads,
+        )
+
+    samples, output = _measure(run)
+    return samples, output, backend.stats(), shape
+
+
 def test_deepseek_q2_iq2_kernel_profile() -> None:
     if os.environ.get("RUN_DEEPSEEK_Q2_IQ2_PROFILE") != "1":
         pytest.skip("set RUN_DEEPSEEK_Q2_IQ2_PROFILE=1 to profile Q2/IQ2 kernels")
@@ -122,6 +220,10 @@ def test_deepseek_q2_iq2_kernel_profile() -> None:
         iq2_payload,
         hidden,
     )
+    model_path = Path(os.environ.get("DEEPSEEK_V4_FLASH_GGUF", str(_DEFAULT_GGUF)))
+    selected_samples, selected_output, backend_stats, selected_shape = (
+        _measure_selected_wrapper(model_path=model_path)
+    )
 
     metrics = {
         "iq2_xxs_effective_gbps": _effective_gbps(
@@ -131,6 +233,7 @@ def test_deepseek_q2_iq2_kernel_profile() -> None:
             elapsed_ms=iq2_ms,
         ),
         "iq2_xxs_ms": iq2_ms,
+        "path": "wrapper",
         "q2_k_effective_gbps": _effective_gbps(
             payload=q2_payload,
             hidden=hidden,
@@ -138,10 +241,17 @@ def test_deepseek_q2_iq2_kernel_profile() -> None:
             elapsed_ms=q2_ms,
         ),
         "q2_k_ms": q2_ms,
+        "fallbacks": backend_stats["q2_iq2_reference_fallback_calls"],
+        "median_ms": median(selected_samples),
+        "p95_ms": _p95(selected_samples),
+        "samples": len(selected_samples),
+        "shape": selected_shape,
     }
     print(json.dumps(metrics, sort_keys=True))
 
     assert q2_output.shape == (_ROWS,)
     assert iq2_output.shape == (_ROWS,)
+    assert selected_output.shape == (selected_shape["down_rows"],)
     assert metrics["q2_k_ms"] >= 0.0
     assert metrics["iq2_xxs_ms"] >= 0.0
+    assert metrics["fallbacks"] == 0
