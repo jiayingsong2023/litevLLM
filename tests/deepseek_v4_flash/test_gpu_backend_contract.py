@@ -387,10 +387,10 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
     rows = 256
     columns = 256
     hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
-    expert_weights = torch.tensor([0.25, 0.75], dtype=torch.float32, device="cuda")
+    expert_weights = torch.full((6,), 1.0 / 6.0, dtype=torch.float32, device="cuda")
     payloads = [
         (
-            0,
+            expert_id,
             _staged_payload(
                 ggml_type=GGML_TYPE_IQ2_XXS,
                 rows=rows,
@@ -409,28 +409,8 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
                 columns=columns,
                 payload=_q2_k_deterministic_payload(rows),
             ),
-        ),
-        (
-            1,
-            _staged_payload(
-                ggml_type=GGML_TYPE_IQ2_XXS,
-                rows=rows,
-                columns=columns,
-                payload=_iq2_xxs_deterministic_payload(rows),
-            ),
-            _staged_payload(
-                ggml_type=GGML_TYPE_IQ2_XXS,
-                rows=rows,
-                columns=columns,
-                payload=_iq2_xxs_deterministic_payload(rows),
-            ),
-            _staged_payload(
-                ggml_type=GGML_TYPE_Q2_K,
-                rows=rows,
-                columns=columns,
-                payload=_q2_k_deterministic_payload(rows),
-            ),
-        ),
+        )
+        for expert_id in range(6)
     ]
     reference_backend = DeepSeekV4FlashGPUBackend()
     expected = sum(
@@ -458,10 +438,10 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
 
     torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
     assert backend.stats() == {
-        "quantized_expert_calls": 2,
-        "q2_k_triton_calls": 2,
+        "quantized_expert_calls": 6,
+        "q2_k_triton_calls": 6,
         "iq2_xxs_triton_calls": 0,
-        "iq2_xxs_gate_up_fused_calls": 2,
+        "iq2_xxs_gate_up_fused_calls": 6,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
         "selected_expert_fused_api_calls": 1,
