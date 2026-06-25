@@ -111,6 +111,64 @@ def test_deepseek_v4_flash_gguf_is_in_default_e2e_models(monkeypatch) -> None:
     }
 
 
+def test_deepseek_v4_flash_decode_p50_target_warning_output() -> None:
+    warning = bench._deepseek_v4_flash_decode_target_warning(
+        {
+            "deepseek_v4_flash_q2_gguf": {
+                "decode_tps_aggregate": 1.2,
+                "decode_tps_p50": 0.83,
+            }
+        }
+    )
+
+    assert warning == {
+        "model": "deepseek_v4_flash_q2_gguf",
+        "metric": "decode_tps_p50",
+        "kind": "throughput_target",
+        "current": 0.83,
+        "baseline": 1.0,
+        "ratio": 0.83,
+        "threshold": 1.0,
+    }
+    assert bench._format_perf_regression_warnings([warning]) == [
+        "PERF WARNING: model=deepseek_v4_flash_q2_gguf "
+        "metric=decode_tps_p50 kind=throughput_target current=0.830 "
+        "baseline=1.000 ratio=0.830 threshold=1.000"
+    ]
+
+
+def test_deepseek_v4_flash_missing_decode_p50_warning_output() -> None:
+    for result in (
+        {"decode_tps_aggregate": 1.2},
+        {"decode_tps_aggregate": 1.2, "decode_tps_p50": float("nan")},
+    ):
+        warning = bench._deepseek_v4_flash_decode_target_warning(
+            {"deepseek_v4_flash_q2_gguf": result}
+        )
+
+        assert warning is not None
+        assert warning["kind"] == "throughput_target_missing"
+        assert bench._format_perf_regression_warnings([warning]) == [
+            "PERF WARNING: model=deepseek_v4_flash_q2_gguf "
+            "metric=decode_tps_p50 kind=throughput_target_missing current=n/a "
+            "baseline=1.000 ratio=n/a threshold=1.000"
+        ]
+
+
+def test_deepseek_v4_flash_decode_p50_target_accepts_threshold() -> None:
+    assert (
+        bench._deepseek_v4_flash_decode_target_warning(
+            {
+                "deepseek_v4_flash_q2_gguf": {
+                    "decode_tps_p50": 1.0,
+                },
+                "tinyllama": {"decode_tps_p50": 0.1},
+            }
+        )
+        is None
+    )
+
+
 def test_runtime_metrics_include_async_driver_snapshot() -> None:
     metrics = bench._derive_runtime_metrics(
         {

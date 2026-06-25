@@ -2612,6 +2612,32 @@ def _safe_metric(value: object) -> float | None:
     return None
 
 
+def _deepseek_v4_flash_decode_target_warning(
+    summary: dict[str, dict[str, Any]],
+) -> dict[str, object] | None:
+    model_key = "deepseek_v4_flash_q2_gguf"
+    result = summary.get(model_key)
+    if not isinstance(result, dict):
+        return None
+    if result.get("skipped", 0.0) == 1.0 or result.get("timed_out", 0.0) == 1.0:
+        return None
+    target = 1.0
+    current = _safe_metric(result.get("decode_tps_p50"))
+    if current is not None and current >= target:
+        return None
+    return {
+        "model": model_key,
+        "metric": "decode_tps_p50",
+        "kind": (
+            "throughput_target" if current is not None else "throughput_target_missing"
+        ),
+        "current": current if current is not None else float("nan"),
+        "baseline": target,
+        "ratio": current / target if current is not None else float("nan"),
+        "threshold": target,
+    }
+
+
 def _deepseek_smoke_payload_to_benchmark_result(
     spec: ModelSpec,
     payload: dict[str, Any],
@@ -3442,6 +3468,12 @@ async def main() -> None:
     )
     for line in _format_perf_regression_warnings(perf_regression_warnings):
         print(line)
+    perf_target_warnings: list[dict[str, object]] = []
+    deepseek_target_warning = _deepseek_v4_flash_decode_target_warning(summary)
+    if deepseek_target_warning is not None:
+        perf_target_warnings.append(deepseek_target_warning)
+    for line in _format_perf_regression_warnings(perf_target_warnings):
+        print(line)
 
     if compile_cache_meta.get("enabled"):
         print(
@@ -3480,6 +3512,7 @@ async def main() -> None:
             "summary": summary,
             "runtime_stats": runtime_stats_summary,
             "perf_regressions": perf_regression_warnings,
+            "perf_target_warnings": perf_target_warnings,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -3515,6 +3548,7 @@ async def main() -> None:
             "resolved_scheduler_policy": resolved_scheduler_policy,
             "runtime_stats": runtime_stats_summary,
             "perf_regressions": perf_regression_warnings,
+            "perf_target_warnings": perf_target_warnings,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(args.runtime_stats_out, "w", encoding="utf-8") as f:
