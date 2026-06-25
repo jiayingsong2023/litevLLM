@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,8 @@ class _FakeLayerStore:
         self.matrices: dict[str, torch.Tensor] = {}
         self.vectors: dict[tuple[str, torch.dtype], torch.Tensor] = {}
         self.expert_matrices: dict[tuple[str, int], torch.Tensor] = {}
+        self.payloads: dict[str, bytes] = {}
+        self.payload_read_count = 0
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
         return self.matrices[tensor.name].clone()
@@ -68,6 +71,10 @@ class _FakeLayerStore:
         expert_id: int,
     ) -> torch.Tensor:
         return self.expert_matrices[(tensor.name, expert_id)].clone()
+
+    def tensor_payload(self, tensor: DeepSeekV4FlashTensor) -> memoryview:
+        self.payload_read_count += 1
+        return memoryview(self.payloads[tensor.name])
 
 
 class _RecordingCompressedBackend:
@@ -127,19 +134,24 @@ def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
 def _compressed_layer_fixture(
     *,
     doubled_width: bool = False,
+    q8_attention_output: bool = False,
 ) -> tuple[
     _FakeLayerStore,
     DeepSeekV4FlashLayerSemanticBindings,
 ]:
     hidden_size = 4
     kv_width = 4
+    attention_width = 32 if q8_attention_output else kv_width
     compressor_width = 8 if doubled_width else kv_width
     indexer_width = 128
     indexer_compressor_width = 256 if doubled_width else indexer_width
     tensors = {
         "attn_norm": _tensor("blk.2.attn_norm.weight", (hidden_size,)),
-        "attn_q": _tensor("blk.2.attn_q.weight", (hidden_size, kv_width)),
-        "attn_out": _tensor("blk.2.attn_output.weight", (kv_width, hidden_size)),
+        "attn_q": _tensor("blk.2.attn_q.weight", (hidden_size, attention_width)),
+        "attn_out": _tensor(
+            "blk.2.attn_output.weight",
+            (attention_width, hidden_size),
+        ),
         "comp_kv": _tensor(
             "blk.2.attn_compressor_kv.weight",
             (hidden_size, compressor_width),
@@ -202,8 +214,17 @@ def _compressed_layer_fixture(
         dtype=torch.float32,
     )
     index_identity[:hidden_size] = torch.eye(hidden_size)
-    store.matrices[tensors["attn_q"].name] = torch.eye(hidden_size)
-    store.matrices[tensors["attn_out"].name] = torch.eye(hidden_size)
+    attention_query = torch.zeros((attention_width, hidden_size))
+    attention_query[:hidden_size] = torch.eye(hidden_size)
+    store.matrices[tensors["attn_q"].name] = attention_query
+    if q8_attention_output:
+        store.payloads[tensors["attn_out"].name] = b"".join(
+            struct.pack("<e", 1.0)
+            + bytes(1 if column == row else 0 for column in range(attention_width))
+            for row in range(hidden_size)
+        )
+    else:
+        store.matrices[tensors["attn_out"].name] = torch.eye(hidden_size)
     store.matrices[tensors["comp_kv"].name] = comp_identity
     comp_gate = torch.zeros((compressor_width, hidden_size), dtype=torch.float32)
     comp_gate[:, 0] = 10.0
@@ -284,6 +305,56 @@ def _compressed_layer_fixture(
         ),
     )
     return store, layer
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_attention_decode_reuses_static_q8_projection_payload() -> None:
+    store, layer = _compressed_layer_fixture(q8_attention_output=True)
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=16,
+            hidden_size=4,
+            kv_width=4,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    )
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    backend = _RecordingCompressedBackend()
+    hidden = torch.ones((4,), dtype=torch.float32, device="cuda")
+
+    first_output = deepseek_v4_flash_compressed_layer_forward(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state,
+        token_idx=0,
+        router_top_k=1,
+    )
+    first_read_count = store.payload_read_count
+
+    second_hidden = torch.tensor([0.0, 1.0, 0.0, 0.0], device="cuda")
+    second_output = deepseek_v4_flash_compressed_layer_forward(
+        second_hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state,
+        token_idx=1,
+        router_top_k=1,
+    )
+
+    assert first_read_count == 1
+    assert store.payload_read_count == first_read_count
+    torch.testing.assert_close(
+        first_output,
+        torch.tensor([2.0, 2.0, 2.0, 2.0], device="cuda"),
+    )
+    torch.testing.assert_close(
+        second_output,
+        torch.tensor([0.0, 3.0, 0.0, 0.0], device="cuda"),
+    )
 
 
 def _run_four_ratio4_tokens(
