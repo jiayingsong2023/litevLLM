@@ -37,7 +37,25 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
+                'if [[ "$1" == "run" && "$2" == "python" && "$3" == "-" ]]; then',
+                "  shift 3",
+                '  python3 - "$@"',
+                "  exit 0",
+                "fi",
                 "echo DEBUG_NOISE_FROM_FAKE_UV",
+                'if [[ "$*" == *"quality_bar_spotcheck.py"* ]]; then',
+                "  printf '%s\\n' "
+                "'{\"id\":\"en_capital\","
+                "\"prompt_preview\":\"What is the capital of France?\","
+                "\"text\":\"Paris.\","
+                "\"heuristic_warn\":[],"
+                "\"heuristic_severe\":false,"
+                "\"tier_b_detail\":{\"tier_b_alignment\":{"
+                "\"readability_ok\":true,"
+                "\"coherence_ok\":true,"
+                "\"first_token_ok\":true,"
+                "\"substance_ok\":true}}}'",
+                "fi",
                 "exit 0",
             ]
         )
@@ -76,8 +94,12 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
     calls = timeout_log.read_text(encoding="utf-8")
     assert "--kill-after=3s 12s env FASTINFERENCE_CONFIG=" in calls
     assert "uv run python tests/tools/quality_bar_spotcheck.py" in calls
+    assert "--json" in calls
     assert "[Stage] START Tier-B TinyLlama spotcheck timeout=12s" in proc.stdout
     assert "[Stage] OK Tier-B Qwen3.5-9B AWQ spotcheck" in proc.stdout
+    assert "[Tier-B] prompt/output summary" in proc.stdout
+    assert "prompt: What is the capital of France?" in proc.stdout
+    assert "output: Paris." in proc.stdout
     assert "DEBUG_NOISE_FROM_FAKE_UV" not in proc.stdout
 
 

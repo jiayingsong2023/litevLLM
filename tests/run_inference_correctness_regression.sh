@@ -127,6 +127,39 @@ print_model_separator() {
   echo "========================================================================"
 }
 
+print_spotcheck_summary() {
+  local output_log="$1"
+  if ! grep -q '"prompt_preview"' "$output_log"; then
+    return 0
+  fi
+  uv run python - "$output_log" <<'PY_SPOTCHECK_SUMMARY'
+import json
+import sys
+from pathlib import Path
+
+print("[Tier-B] prompt/output summary")
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    line = line.strip()
+    if not line.startswith("{") or '"prompt_preview"' not in line:
+        continue
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    detail = row.get("tier_b_detail", {}).get("tier_b_alignment", {})
+    passed = all(
+        detail.get(k, True)
+        for k in ("readability_ok", "coherence_ok", "first_token_ok", "substance_ok")
+    ) and not row.get("heuristic_severe", False)
+    print(f"  [{row.get('id', 'unknown')}] {'PASS' if passed else 'FAIL'}")
+    print(f"    prompt: {row.get('prompt_preview', '')}")
+    print(f"    output: {str(row.get('text', '')).strip()}")
+    notes = row.get("heuristic_warn") or []
+    if notes:
+        print(f"    notes: {notes}")
+PY_SPOTCHECK_SUMMARY
+}
+
 run_stage() {
   local label="$1"
   local stage_timeout="$2"
@@ -157,7 +190,10 @@ run_stage() {
   local elapsed_seconds=$((SECONDS - start_seconds))
   if [[ "$rc" -eq 0 ]]; then
     echo "[Stage] OK ${label} elapsed=${elapsed_seconds}s"
-    [[ -z "$output_log" ]] || rm -f "$output_log"
+    if [[ -n "$output_log" ]]; then
+      print_spotcheck_summary "$output_log"
+      rm -f "$output_log"
+    fi
     return 0
   fi
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
@@ -338,9 +374,9 @@ resolve_gemma4_26b_model_ref() {
 }
 
 SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
-  --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
+  --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal --json)
 GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
-  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal
+  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal --json
   --max-model-len 512)
 GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
   --max-new-tokens 32
