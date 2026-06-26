@@ -2791,6 +2791,8 @@ def _run_deepseek_v4_flash_direct_benchmark(spec: ModelSpec) -> dict[str, Any]:
         str(spec.max_model_len),
         "--max-tokens",
         str(spec.max_new_tokens),
+        "--warmup-tokens",
+        str(spec.max_new_tokens),
         "--repeat",
         "1",
         "--profile-json",
