@@ -441,7 +441,7 @@ def test_staged_routed_experts_prefers_quantized_payload_path(
     torch.testing.assert_close(output, torch.full((2,), 1.5))
 
 
-def test_staged_routed_experts_reuses_selected_payload_selection(
+def test_staged_routed_experts_reuses_grouped_payload_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_to = torch.Tensor.to
@@ -500,8 +500,11 @@ def test_staged_routed_experts_reuses_selected_payload_selection(
         layer_idx=7,
     )
 
-    assert stager.cache_stats().get("batched_payload_stage_calls", 0) == 1
-    assert stager.cache_stats().get("selected_payload_cache_hits", 0) == 1
+    stats = stager.cache_stats()
+    assert stats.get("batched_payload_stage_calls", 0) == 2
+    assert stats.get("grouped_misses", 0) == 6
+    assert stats.get("grouped_hits", 0) == 6
+    assert "selected_payload_cache_hits" not in stats
     assert store.raw_payload_read_count == 6
     torch.testing.assert_close(first, torch.full((2,), 1.5))
     torch.testing.assert_close(second, first)
