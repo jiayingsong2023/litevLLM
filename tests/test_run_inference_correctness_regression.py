@@ -195,6 +195,98 @@ def test_run_inference_correctness_regression_runs_opt_in_deepseek_gpu_smoke(
     assert "DeepSeek V4 Flash Tier-B quality smoke" in proc.stdout
 
 
+def test_run_inference_correctness_regression_prints_deepseek_summary(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    log_path = tmp_path / "uv_calls.log"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        f'''#!/usr/bin/env bash
+set -euo pipefail
+printf "%s\n" "$*" >> "{log_path}"
+if [[ "$1" == "run" && "$2" == "python" && "$3" == "-" ]]; then
+  shift 3
+  python3 - "$@"
+  exit 0
+fi
+if [[ "$*" == *"deepseek_v4_flash_quality_smoke.py"* ]]; then
+  json_out=""
+  while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "--json-out" ]]; then
+      json_out="$2"
+      break
+    fi
+    shift
+  done
+  [[ -n "$json_out" ]] || exit 2
+  python3 - "$json_out" <<'PY_JSON'
+import json
+import sys
+payload = {{
+    "readability": {{
+        "passed": True,
+        "text": "The capital of France is Paris.",
+        "reasons": [],
+    }},
+    "performance": {{"decode_tokens_per_second": 0.75}},
+    "performance_summary": {{
+        "decode_tps_min": 0.70,
+        "decode_tps_median": 0.75,
+    }},
+    "generated_token_ids": [671, 6102, 294, 8760, 344, 11111, 16, 1],
+}}
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(payload))
+PY_JSON
+fi
+exit 0
+''',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    tiny_dir = tmp_path / "models" / "TinyLlama-1.1B-Chat-v1.0"
+    qwen_dir = tmp_path / "models" / "Qwen3.5-9B-AWQ"
+    deepseek_path = tmp_path / "models" / "deepseek-v4-flash.gguf"
+    tiny_dir.mkdir(parents=True)
+    qwen_dir.mkdir(parents=True)
+    deepseek_path.parent.mkdir(parents=True, exist_ok=True)
+    deepseek_path.write_bytes(b"gguf")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["MODEL_TINYLLAMA"] = str(tiny_dir)
+    env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
+    env["MODEL_DEEPSEEK_V4_FLASH_GGUF"] = str(deepseek_path)
+    env["RUN_GEMMA4_31B"] = "0"
+    env["RUN_GEMMA4_26B"] = "0"
+    env["RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE"] = "1"
+    env["SKIP_A_TIER"] = "1"
+    env["PYTHONPATH"] = env.get("PYTHONPATH", ".")
+
+    proc = subprocess.run(
+        ["bash", "tests/run_inference_correctness_regression.sh"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    assert "[DeepSeek V4 Flash] Tier-B quality smoke" in proc.stdout
+    assert "readability: PASS" in proc.stdout
+    assert "output: The capital of France is Paris." in proc.stdout
+    assert (
+        "generated_token_ids: [671, 6102, 294, 8760, 344, 11111, 16, 1]"
+        in proc.stdout
+    )
+    assert "decode_tps: 0.75 (min=0.70, median=0.75)" in proc.stdout
+
+
 def test_run_inference_correctness_regression_runs_deepseek_gpu_smoke_by_default(
     tmp_path: Path,
 ) -> None:

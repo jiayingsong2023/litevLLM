@@ -193,6 +193,34 @@ if torch.cuda.is_available():
         ipc_collect()' >/dev/null 2>&1 || true
 }
 
+print_deepseek_quality_summary() {
+  local json_path="$1"
+  uv run python - "$json_path" <<'PY_SUMMARY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+readability = payload.get("readability", {})
+performance = payload.get("performance", {})
+summary = payload.get("performance_summary", {})
+text = str(readability.get("text", "")).strip()
+reasons = readability.get("reasons", [])
+generated = payload.get("generated_token_ids", [])
+print("[DeepSeek V4 Flash] Tier-B quality smoke")
+print(f"  readability: {'PASS' if readability.get('passed') else 'FAIL'}")
+print(f"  output: {text}")
+print(f"  generated_token_ids: {generated}")
+print(f"  reasons: {reasons}")
+print(
+    "  decode_tps: "
+    f"{float(performance.get('decode_tokens_per_second', 0.0)):.2f} "
+    f"(min={float(summary.get('decode_tps_min', 0.0)):.2f}, "
+    f"median={float(summary.get('decode_tps_median', 0.0)):.2f})"
+)
+PY_SUMMARY
+}
+
 require_model_ref() {
   local model_ref="$1"
   local label="$2"
@@ -387,12 +415,17 @@ if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
       exit 1
     fi
   else
+    DEEPSEEK_QUALITY_JSON="$(mktemp "${TMPDIR:-/tmp}/fastinference-deepseek-quality.XXXXXX.json")"
     run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
-      uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
-      --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
-      --context-length 4096 \
-      --max-tokens 8 \
-      --min-output-chars 8
+      bash -c 'uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
+        --model "$1" \
+        --context-length 4096 \
+        --max-tokens 8 \
+        --min-output-chars 8 \
+        --json-out "$2" >/dev/null' \
+      _ "$MODEL_DEEPSEEK_V4_FLASH_GGUF" "$DEEPSEEK_QUALITY_JSON"
+    print_deepseek_quality_summary "$DEEPSEEK_QUALITY_JSON"
+    rm -f "$DEEPSEEK_QUALITY_JSON"
     cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
   fi
 fi
