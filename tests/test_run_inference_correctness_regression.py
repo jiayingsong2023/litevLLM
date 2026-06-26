@@ -37,6 +37,7 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
+                "echo DEBUG_NOISE_FROM_FAKE_UV",
                 "exit 0",
             ]
         )
@@ -56,6 +57,7 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
     env["MODEL_QWEN35_9B_AWQ"] = str(qwen_dir)
     env["RUN_GEMMA4_31B"] = "0"
     env["RUN_GEMMA4_26B"] = "0"
+    env["RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE"] = "0"
     env["SKIP_A_TIER"] = "1"
     env["FI_CORRECTNESS_STAGE_TIMEOUT"] = "12s"
     env["FI_CORRECTNESS_STAGE_KILL_AFTER"] = "3s"
@@ -76,6 +78,7 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
     assert "uv run python tests/tools/quality_bar_spotcheck.py" in calls
     assert "[Stage] START Tier-B TinyLlama spotcheck timeout=12s" in proc.stdout
     assert "[Stage] OK Tier-B Qwen3.5-9B AWQ spotcheck" in proc.stdout
+    assert "DEBUG_NOISE_FROM_FAKE_UV" not in proc.stdout
 
 
 def test_run_inference_correctness_regression_skips_gemma4_31b_a_strict(
@@ -192,7 +195,7 @@ def test_run_inference_correctness_regression_runs_opt_in_deepseek_gpu_smoke(
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
     assert f"--model {deepseek_path}" in calls
-    assert "DeepSeek V4 Flash Tier-B quality smoke" in proc.stdout
+    assert "MODEL: DeepSeek V4 Flash Tier-B" in proc.stdout
 
 
 def test_run_inference_correctness_regression_prints_deepseek_summary(

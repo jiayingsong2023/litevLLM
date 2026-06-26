@@ -119,25 +119,45 @@ print_gemma4_profile() {
   echo "  ${label} profile: $*"
 }
 
+print_model_separator() {
+  local label="$1"
+  echo ""
+  echo "========================================================================"
+  echo "MODEL: ${label}"
+  echo "========================================================================"
+}
+
 run_stage() {
   local label="$1"
   local stage_timeout="$2"
   shift 2
 
   local start_seconds="$SECONDS"
+  local output_log=""
+  local rc=0
   echo "[Stage] START ${label} timeout=${stage_timeout}"
 
-  local rc=0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" || rc=$?
+  if [[ "${FI_CORRECTNESS_VERBOSE:-0}" == "1" ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" || rc=$?
+    else
+      echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
+      "$@" || rc=$?
+    fi
   else
-    echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
-    "$@" || rc=$?
+    output_log="$(mktemp "${TMPDIR:-/tmp}/fastinference-correctness-stage.XXXXXX.log")"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" >"$output_log" 2>&1 || rc=$?
+    else
+      echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
+      "$@" >"$output_log" 2>&1 || rc=$?
+    fi
   fi
 
   local elapsed_seconds=$((SECONDS - start_seconds))
   if [[ "$rc" -eq 0 ]]; then
     echo "[Stage] OK ${label} elapsed=${elapsed_seconds}s"
+    [[ -z "$output_log" ]] || rm -f "$output_log"
     return 0
   fi
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
@@ -145,6 +165,13 @@ run_stage() {
     echo "        This usually indicates a stuck GPU/ROCm operation, model load, or kernel launch."
   else
     echo "[ERROR] Stage failed: ${label} elapsed=${elapsed_seconds}s rc=${rc}"
+  fi
+  if [[ -n "$output_log" ]]; then
+    if [[ -s "$output_log" ]]; then
+      echo "[Stage] Captured output for failed stage:"
+      cat "$output_log"
+    fi
+    rm -f "$output_log"
   fi
   return "$rc"
 }
@@ -341,7 +368,7 @@ MODEL_GEMMA4_26B_A4B="$(resolve_gemma4_26b_model_ref)"
 warn_if_repo_id_proxy_is_unsupported "$MODEL_GEMMA4_31B_Q4"
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
-echo "[1/2] TinyLlama"
+print_model_separator "TinyLlama Tier-B"
 TINYLLAMA_PROMPT_ARGS=(--prompt-subset minimal)
 if [[ -f "$TINYLLAMA_PROMPTS_FILE" ]]; then
   TINYLLAMA_PROMPT_ARGS=(--prompts-file "$TINYLLAMA_PROMPTS_FILE")
@@ -352,7 +379,7 @@ run_stage "Tier-B TinyLlama spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
   "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
-echo "[2/2] Qwen3.5-9B AWQ"
+print_model_separator "Qwen3.5-9B AWQ Tier-B"
 run_stage "Tier-B Qwen3.5-9B AWQ spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
   "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
@@ -361,7 +388,7 @@ GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
   if [[ -d "$MODEL_GEMMA4_31B_Q4" ]] || is_hf_repo_id "$MODEL_GEMMA4_31B_Q4"; then
     GEMMA4_AVAILABLE=1
-    echo "[3/3] Gemma4-31B Q4 (text-only)"
+    print_model_separator "Gemma4-31B Q4 Tier-B"
     require_model_ref "$MODEL_GEMMA4_31B_Q4" "Gemma4-31B-Q4"
     GEMMA4_PROMPT_ARGS=(--prompt-subset minimal)
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
@@ -385,7 +412,7 @@ GEMMA4_26B_AVAILABLE=0
 if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
   if [[ -d "$MODEL_GEMMA4_26B_A4B" ]] || is_hf_repo_id "$MODEL_GEMMA4_26B_A4B"; then
     GEMMA4_26B_AVAILABLE=1
-    echo "[Gemma4-26B] Q4/A4B (text-only)"
+    print_model_separator "Gemma4-26B A4B Tier-B"
     require_model_ref "$MODEL_GEMMA4_26B_A4B" "Gemma4-26B-A4B"
     GEMMA4_26B_PROMPT_ARGS=(--prompt-subset minimal)
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
@@ -403,7 +430,7 @@ fi
 
 if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
   echo ""
-  echo "=== DeepSeek V4 Flash Tier-B quality smoke ==="
+  print_model_separator "DeepSeek V4 Flash Tier-B"
   if [[ ! -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
     if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "auto" ]]; then
       echo "[Warn] DeepSeek V4 Flash GGUF not found, skipping: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
@@ -459,7 +486,7 @@ fi
 
 echo ""
 echo "=== Tier-A-strict (<=14B, HF parity) ==="
-echo "[A1] TinyLlama — Lite vs HF same tree"
+print_model_separator "TinyLlama Tier-A strict"
 run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
   uv run python tests/verify_semantic_integrity.py \
@@ -470,7 +497,7 @@ run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   --prefill-only \
   --apply-chat-template off
 
-echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
+print_model_separator "Qwen3.5-9B AWQ Tier-A strict"
 require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
 run_stage "Tier-A Qwen3.5-9B HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
