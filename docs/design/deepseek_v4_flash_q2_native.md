@@ -43,11 +43,13 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
-## Implemented State As Of End-To-End GPU Smoke Pass
+## Implemented State As Of 2026-06-26
 
 The branch currently has an experimental batch=1 greedy GPU direct path for the
-target GGUF. It is a correctness-first bring-up path, not a tuned production
-serving path.
+target GGUF. It is REST-callable through the lite OpenAI-compatible chat path
+and is included in the correctness and performance entrypoints when the local
+GGUF file is present. It is still an experimental model-specific path, not a
+generic GGUF loader or tuned production serving path.
 
 Current target file:
 
@@ -56,6 +58,32 @@ models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8
 ```
 
 Current target file size: `86,720,111,488` bytes, roughly 80.7GiB.
+
+Current code path summary:
+
+```text
+OpenAI REST / AsyncLLM
+  -> LiteEngine.generate_deepseek_v4_flash_greedy()
+  -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
+  -> gpu_runtime.py + compressed_kv.py
+  -> gpu_layers.py / gpu_backend.py
+  -> kernels/triton/deepseek_v4_flash/*
+```
+
+CPU/GPU split for one request:
+
+| Side | Current responsibility |
+| :--- | :--- |
+| CPU | HTTP parsing, tokenizer encode/decode, LiteEngine validation, GGUF mmap metadata, request control, summary/report formatting. |
+| GPU/ROCm | token embedding, RMSNorm/mHC, Q8 projections, raw and compressed attention, router top-k, selected IQ2 gate/up, Q2 down, shared expert paths, output projection/argmax. |
+
+The main performance bottlenecks observed in this session are `layer_moe`,
+`layer_attention`/compressed-indexer attention, selected expert staging and
+execution, and Python launch/synchronization overhead around many small kernels.
+Performance work already moved raw Q8 staging and Q2/IQ2 expert math toward
+Triton/GPU paths, but the model is still much harder than Gemma/Qwen because it
+combines an 80.7GiB GGUF, 43 layers, top-6 routed MoE, 256 routed experts, and
+DeepSeek-specific compressed attention.
 
 Implemented:
 
@@ -77,25 +105,34 @@ Implemented:
   `AsyncLLM.generate()` and OpenAI-compatible REST using the same engine-facing
   boundary.
 - GPU staging memory accounting and budget guardrails for decoded GGUF tensors.
-- Explicit model execution boundaries:
-  `forward_full_reference()` remains the CPU correctness oracle,
-  `forward_full(..., use_kernel=True)` is an explicit future kernel dispatch
-  point, and `kernel_execution_available` remains `False` until real kernels
-  are wired.
-- Initial GPU-facing scaffolding under
-  `vllm/kernels/triton/deepseek_v4_flash/` for attention, cache updates, MoE,
-  output projection, compressed attention contracts, and Q8 linear reference
-  plumbing.
+- Current model execution boundaries:
+  `forward_full_reference()` remains the CPU correctness oracle, while
+  `forward_full(..., use_kernel=True)` uses the `DeepSeekV4FlashGPUBackend`
+  when Triton kernels are importable.
+- GPU-facing modules under `vllm/kernels/triton/deepseek_v4_flash/` for cache
+  updates, Q8 linear, attention/compressed attention, MoE, Q2/IQ2 expert
+  matvec, and output projection.
+- `tests/run_inference_correctness_regression.sh` runs the DeepSeek Tier-B
+  quality smoke automatically when the target GGUF exists, and skips it with a
+  warning when the file is absent.
+- `tests/e2e_full_benchmark.py` includes `deepseek_v4_flash_q2_gguf` in the
+  default model list and reports a warning when `decode_tps_p50 < 1.0`.
 
-Not implemented:
+Not implemented or not claimed:
 
-- Production-speed Triton/ROCm kernels for every DeepSeek V4 Flash hot path.
 - Continuous batching for DeepSeek V4 Flash.
-- 4K/8K prompt prefill validation.
+- Generic GGUF or arbitrary DeepSeek GGUF support.
+- Non-greedy sampling, structured outputs, speculative decoding, or distributed
+  execution for this direct path.
+- Full production-speed parity with DS4/C++ runtimes. The active target is
+  warm-cache decode above 1 token/s on the local ROCm UMA machine.
+- Default 8K correctness/benchmark regression. The first-release code cap is
+  8192, while default automated DeepSeek runs use 4096 context.
 
-The GPU direct path still uses correctness-first PyTorch/Triton wrapper
-fallbacks for some operators. It should be treated as an experimental
-bring-up path until 4K/8K quality and performance validation are complete.
+The GPU direct path still uses correctness-first Python/Triton orchestration for
+some operators. It should be treated as an experimental bring-up path until the
+remaining MoE, compressed attention, staging, and launch-overhead bottlenecks
+are reduced further.
 
 ### Phase 0/1/2 Performance Notes
 

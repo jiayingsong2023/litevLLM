@@ -207,6 +207,52 @@ Every new Triton kernel must document memory layout and program tiling in ASCII
 comments, use `vllm/triton_utils/` for Triton imports, and include correctness
 coverage against a PyTorch reference.
 
+## DeepSeek V4 Flash Direct GGUF Path
+
+DeepSeek V4 Flash is an experimental exception to the standard paged-KV model
+path. It still enters through `AsyncLLM` and the OpenAI-compatible REST server,
+but `LiteEngine` detects `DeepSeekV4FlashForCausalLM` and installs a direct
+batch=1 greedy runtime instead of the generic step scheduler.
+
+```text
+OpenAI REST / AsyncLLM
+  -> LiteEngine.generate_deepseek_v4_flash_greedy()
+  -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
+  -> deepseek_v4_flash/gpu_layers.py
+  -> kernels/triton/deepseek_v4_flash/*
+```
+
+Current limits are explicit in code and docs:
+
+- batch size is 1; `n > 1` is rejected.
+- sampling is greedy only; non-zero temperature, top-p, top-k, and structured
+  outputs are rejected for this direct path.
+- first-release context is capped at 8192, with default benchmark/correctness
+  coverage at 4096.
+- this is target-file support for the DS4 Q2/IQ2 GGUF, not generic GGUF model
+  loading.
+
+The model-local package owns the heavy work:
+
+| Module | Role |
+| :--- | :--- |
+| `gguf_reader.py` / `weight_store.py` | Strict mmap reader, semantic tensor binding, raw quantized payload access. |
+| `gpu_weight_staging.py` | Bounded UMA/GPU staging, raw Q8 payload staging, expert cache accounting. |
+| `gpu_runtime.py` / `compressed_kv.py` | Request-local batch=1 runtime state, raw SWA rows, compressed/indexer KV state. |
+| `gpu_layers.py` / `model.py` | Layer orchestration, sliding/compressed attention, MoE routing, output projection. |
+| `kernels/triton/deepseek_v4_flash/` | Q8 linear, Q2/IQ2 MoE matvec, attention/cache/output kernels. |
+
+Architecturally, DeepSeek does not use the generic PagedAttention algorithm, but
+it keeps the same important memory rule: growing context must not require one
+large contiguous KV allocation. Its raw sliding-window rows, compressed rows,
+and ratio-4 indexer rows are owned by DeepSeek-specific paged/cache structures.
+
+The current performance work moved the hot path from CPU reference decoding to
+GPU execution for Q8 projections, selected IQ2 gate/up, Q2 down experts,
+compressed attention, and chunked output projection. Remaining bottlenecks are
+model-local: layer MoE, compressed attention/indexer overhead, expert staging
+misses, and Python launch/synchronization cost.
+
 ## Compatibility Code
 
 Some upstream-derived packages remain for imports, migration, or experimental

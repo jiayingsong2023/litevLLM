@@ -68,6 +68,7 @@ configuration surface.
 - `Qwen3.5-9B-AWQ`
 - `Gemma4-26B-A4B-it-AWQ-4bit`
 - `Gemma4-31B-it-AWQ-4bit`
+- `DeepSeek-V4-Flash` target GGUF, experimental and opt-in for correctness
 
 Run the fast structural gate with:
 
@@ -79,4 +80,16 @@ Run model correctness gates with:
 
 ```bash
 bash tests/run_inference_correctness_regression.sh
+```
+
+When the target GGUF exists at `MODEL_DEEPSEEK_V4_FLASH_GGUF` or the default
+`models/DeepSeek-V4-Flash-ds4/...imatrix.gguf` path, the script runs the
+experimental DeepSeek Tier-B smoke by default. Set
+`RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=0` to skip it.
+
+Run the default end-to-end benchmark set, including the DeepSeek direct-GGUF
+smoke when the model file is present, with:
+
+```bash
+uv run python tests/e2e_full_benchmark.py
 ```

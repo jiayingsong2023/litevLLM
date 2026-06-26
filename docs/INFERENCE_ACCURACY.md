@@ -9,9 +9,12 @@ tracks only the maintained lite runtime support surface.
 - `Qwen3.5-9B-AWQ`
 - `Gemma4-26B-A4B-it-AWQ-4bit`
 - `Gemma4-31B-it-AWQ-4bit`
+- `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
+  when the target GGUF file is present
 
-`Qwen3.5-35B`, GGUF-specific alignment audits, and DeepSeek diagnostics are not
-part of the default regression surface.
+`Qwen3.5-35B` and generic GGUF alignment audits are not part of the default
+regression surface. DeepSeek is a model-specific experimental Tier-B smoke, not
+a generic GGUF correctness claim.
 
 ## Accuracy Tiers
 
@@ -43,9 +46,15 @@ RUN_GEMMA4_26B_A_STRICT=0 bash tests/run_inference_correctness_regression.sh
 RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 ```
 
-DeepSeek V4 Flash is opt-in because the target GGUF is roughly 80.7GiB and the
-path is still experimental. Override the path with `MODEL_DEEPSEEK_V4_FLASH_GGUF`
-when the model lives outside `models/DeepSeek-V4-Flash-ds4/`.
+DeepSeek V4 Flash runs automatically when the target GGUF exists and
+`RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE` is `auto` or `1`; it skips with a warning when
+the file is missing. The target GGUF is roughly 80.7GiB and the path is still
+experimental. Override the path with `MODEL_DEEPSEEK_V4_FLASH_GGUF` when the
+model lives outside `models/DeepSeek-V4-Flash-ds4/`.
+
+The script suppresses tool debug logs by default, prints a compact
+prompt/output summary for Tier-B spotchecks, and prints full captured output
+only on failure. Set `FI_CORRECTNESS_VERBOSE=1` to restore full stage output.
 
 ## Tier-B Spotcheck
 

@@ -18,7 +18,7 @@ short model-focused view of that matrix.
 | Area | Status | Notes |
 | :--- | :--- | :--- |
 | Llama-like fallback models | Experimental | Adapter fallback exists, but support should not be claimed without model-specific load, smoke, and correctness gates. |
-| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target. Batch=1 greedy GPU direct path, LiteEngine/AsyncLLM routing, OpenAI REST smoke, paged compressed KV contracts, and opt-in real GGUF smoke are present. 4K/8K quality validation and performance tuning are still pending. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target. Batch=1 greedy GPU direct path, LiteEngine/AsyncLLM routing, OpenAI REST smoke, compressed-paged KV contracts, automatic Tier-B smoke when the local GGUF exists, and e2e direct benchmark coverage are present. Default validation uses 4K context; 8K is a code cap, not a default regression promise. |
 | LoRA runtime | Experimental | Runtime and tests exist; production policy tuning remains workload dependent. |
 | Multimodal serving | Experimental | Lite serving paths exist, but need broader real-traffic hardening. |
 | Legacy vLLM entrypoints | Compatibility | Kept for import and migration stability, not as a second runtime path. |
