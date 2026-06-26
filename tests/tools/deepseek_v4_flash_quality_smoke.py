@@ -541,6 +541,7 @@ def evaluate_readability(
     text: str,
     generated_token_ids: list[int],
     min_output_chars: int,
+    eos_token_id: int | None = 1,
 ) -> dict[str, object]:
     reasons: list[str] = []
     stripped = text.strip()
@@ -557,6 +558,11 @@ def evaluate_readability(
         top_ratio = max(counts.values()) / len(generated_token_ids)
         if top_ratio > _MAX_TOKEN_REPEAT_RATIO:
             reasons.append("token_repeat")
+        if (
+            eos_token_id is not None
+            and eos_token_id in generated_token_ids[:-1]
+        ):
+            reasons.append("tokens_after_eos")
     return {
         "passed": not reasons,
         "reasons": reasons,
@@ -592,6 +598,7 @@ def _run_direct_generate(
     *,
     prompt_token_ids: list[int],
     gguf_tokens: list[str],
+    eos_token_id: int | None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA/ROCm torch backend is not available")
@@ -655,7 +662,7 @@ def _run_direct_generate(
         for generated_idx in range(args.max_tokens):
             selected_id = int(next_token_tensor.item())
             output_ids.append(selected_id)
-            if generated_idx + 1 >= args.max_tokens:
+            if selected_id == eos_token_id or generated_idx + 1 >= args.max_tokens:
                 break
             logits = model._forward_kernel_token_step(
                 token_id=selected_id,
@@ -768,6 +775,7 @@ def main() -> int:
             _args_with_max_tokens(args, warmup_tokens),
             prompt_token_ids=prompt_token_ids,
             gguf_tokens=gguf_tokens,
+            eos_token_id=tokenizer_metadata.eos_token_id,
         )
     measured_payloads: list[dict[str, Any]] = []
     performance_values: list[dict[str, float | int | str]] = []
@@ -777,6 +785,7 @@ def main() -> int:
             args,
             prompt_token_ids=prompt_token_ids,
             gguf_tokens=gguf_tokens,
+            eos_token_id=tokenizer_metadata.eos_token_id,
         )
         total_elapsed_ms = (perf_counter() - generation_start) * 1000.0
         measured_payloads.append(measured_payload)
@@ -817,6 +826,7 @@ def main() -> int:
         text=text,
         generated_token_ids=generated_ids,
         min_output_chars=args.min_output_chars,
+        eos_token_id=tokenizer_metadata.eos_token_id,
     )
     payload: dict[str, object] = {
         "model": str(args.model),

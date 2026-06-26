@@ -664,6 +664,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             )
 
         token_id_tensor = output_ids[input_token_count - 1].reshape(())
+        eos_token_id = self._eos_token_id()
+        token_id = (
+            int(token_id_tensor.item()) if eos_token_id is not None else None
+        )
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
             start_event: torch.cuda.Event | None = None
@@ -672,12 +676,20 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            token_id_tensor = self._forward_kernel_token_step_token_tensor(
-                token_id_tensor=token_id_tensor,
-                state=state,
-                token_idx=state.token_position,
-                device=device,
-            )
+            if token_id is None:
+                token_id_tensor = self._forward_kernel_token_step_token_tensor(
+                    token_id_tensor=token_id_tensor,
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
+            else:
+                token_id_tensor = self._forward_kernel_token_step_token_id(
+                    token_id=token_id,
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
             if record_token_times:
                 if start_event is None or end_event is None:
                     raise AssertionError("CUDA timing events were not initialized")
@@ -685,8 +697,22 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 torch.cuda.synchronize()
                 token_elapsed_ms.append(float(start_event.elapsed_time(end_event)))
             output_ids[input_token_count + generated_idx] = token_id_tensor
+            if eos_token_id is not None:
+                token_id = int(token_id_tensor.item())
+                if token_id == eos_token_id:
+                    return (
+                        output_ids[: input_token_count + generated_idx + 1],
+                        token_elapsed_ms,
+                    )
 
         return output_ids, token_elapsed_ms
+
+    def _eos_token_id(self) -> int | None:
+        store = self._require_weight_store()
+        model = getattr(store, "model", None)
+        metadata = getattr(model, "metadata", {})
+        eos_token_id = metadata.get("tokenizer.ggml.eos_token_id")
+        return None if eos_token_id is None else int(eos_token_id)
 
     def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
         if input_ids.ndim != 1:

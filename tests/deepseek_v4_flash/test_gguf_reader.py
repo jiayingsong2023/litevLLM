@@ -161,6 +161,23 @@ def test_reader_skips_unused_array_metadata(tmp_path) -> None:
     assert "tokenizer.ggml.tokens" not in model.metadata
 
 
+def test_reader_preserves_tokenizer_eos_id(tmp_path) -> None:
+    path = tmp_path / "eos-metadata.gguf"
+
+    def add_eos_metadata(metadata: bytearray) -> None:
+        encoded_key = b"tokenizer.ggml.eos_token_id"
+        metadata.extend(struct.pack("<Q", len(encoded_key)))
+        metadata.extend(encoded_key)
+        metadata.extend(struct.pack("<I", 4))
+        metadata.extend(struct.pack("<I", 1))
+
+    write_minimal_deepseek_v4_flash_gguf(path, extra_metadata=add_eos_metadata)
+
+    model = read_deepseek_v4_flash_gguf(path)
+
+    assert model.metadata["tokenizer.ggml.eos_token_id"] == 1
+
+
 @pytest.mark.skipif(not TARGET_GGUF.exists(), reason="target DeepSeek V4 GGUF absent")
 def test_real_gguf_all_tensor_ranges_are_inside_file() -> None:
     model = read_deepseek_v4_flash_gguf(TARGET_GGUF)

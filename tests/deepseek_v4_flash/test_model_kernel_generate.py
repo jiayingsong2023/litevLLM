@@ -97,7 +97,23 @@ class _ReadyBackend:
 
 
 class _FakeStore:
-    def __init__(self, shape: DeepSeekV4FlashShape) -> None:
+    def __init__(
+        self,
+        shape: DeepSeekV4FlashShape,
+        *,
+        eos_token_id: int | None = None,
+    ) -> None:
+        self.model = type(
+            "GGUF",
+            (),
+            {
+                "metadata": (
+                    {}
+                    if eos_token_id is None
+                    else {"tokenizer.ggml.eos_token_id": eos_token_id}
+                )
+            },
+        )()
         self.bindings = type(
             "Bindings",
             (),
@@ -185,6 +201,7 @@ def _fake_model(
     *,
     context_length: int = 16,
     vocab_size: int = 11,
+    eos_token_id: int | None = None,
 ) -> DeepSeekV4FlashForCausalLM:
     shape = DeepSeekV4FlashShape(
         num_layers=0,
@@ -194,7 +211,10 @@ def _fake_model(
     )
     return DeepSeekV4FlashForCausalLM(
         shape=shape,
-        weight_store=_FakeStore(shape),  # type: ignore[arg-type]
+        weight_store=_FakeStore(  # type: ignore[arg-type]
+            shape,
+            eos_token_id=eos_token_id,
+        ),
         runtime_budget=_runtime_budget(context_length),
         gpu_backend=_ReadyBackend(),  # type: ignore[arg-type]
     )
@@ -450,6 +470,50 @@ def test_generate_greedy_kernel_does_not_time_or_synchronize_per_token(
     )
 
     assert output_ids.tolist() == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_stops_on_deepseek_eos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model(context_length=8, eos_token_id=1)
+    next_tokens = iter([7, 1, 9])
+    seen_inputs: list[int] = []
+
+    def fake_token_step_token_id(
+        *,
+        token_id: int,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del token_idx
+        seen_inputs.append(token_id)
+        state.advance_token()
+        return torch.tensor(next(next_tokens), dtype=torch.long, device=device)
+
+    def fail_token_tensor_path(**kwargs: object) -> torch.Tensor:
+        del kwargs
+        raise AssertionError("EOS-aware generation used the GPU token-tensor path")
+
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fake_token_step_token_id,
+    )
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_tensor",
+        fail_token_tensor_path,
+    )
+
+    output_ids = model.generate_greedy_kernel(
+        torch.tensor([4], dtype=torch.long, device="cuda"),
+        max_tokens=3,
+    )
+
+    assert output_ids.tolist() == [4, 7, 1]
+    assert seen_inputs == [4, 7]
 
 
 def test_model_profile_records_layer_output_sections_and_syncs(

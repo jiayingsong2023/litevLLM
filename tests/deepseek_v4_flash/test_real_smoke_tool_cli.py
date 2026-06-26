@@ -348,6 +348,17 @@ def test_quality_readability_accepts_short_coherent_text() -> None:
     assert verdict["reasons"] == []
 
 
+def test_quality_readability_rejects_tokens_after_eos() -> None:
+    verdict = quality.evaluate_readability(
+        text="The capital of France is Paris. post-eos text",
+        generated_token_ids=[671, 6102, 51119, 1, 7041, 572, 21094, 978],
+        min_output_chars=8,
+    )
+
+    assert verdict["passed"] is False
+    assert "tokens_after_eos" in verdict["reasons"]
+
+
 def test_quality_decodes_token_ids_with_gguf_tokens() -> None:
     text = quality.decode_generated_tokens(
         [0, 1, 2],

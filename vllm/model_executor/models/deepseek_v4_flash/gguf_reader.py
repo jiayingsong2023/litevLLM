@@ -113,7 +113,12 @@ _EXPECTED_METADATA: dict[str, Any] = {
 
 
 _STORED_METADATA_KEYS = frozenset(
-    (*_EXPECTED_METADATA, "general.name", "general.alignment")
+    (
+        *_EXPECTED_METADATA,
+        "general.name",
+        "general.alignment",
+        "tokenizer.ggml.eos_token_id",
+    )
 )
 
 _PRIMITIVE_METADATA_TYPE_BYTES: dict[int, int] = {
