@@ -374,7 +374,21 @@ class DeepSeekV4FlashGPUBackend:
         down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
     ) -> torch.Tensor:
         self._stats["quantized_expert_calls"] += 1
-        expert_input = deepseek_q8_k_roundtrip_reference(hidden)
+        return self._quantized_expert_gemm_from_q8_input(
+            expert_input=deepseek_q8_k_roundtrip_reference(hidden),
+            gate_payload=gate_payload,
+            up_payload=up_payload,
+            down_payload=down_payload,
+        )
+
+    def _quantized_expert_gemm_from_q8_input(
+        self,
+        *,
+        expert_input: torch.Tensor,
+        gate_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+        up_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+        down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
+    ) -> torch.Tensor:
         if (
             gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
             and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
@@ -464,16 +478,20 @@ class DeepSeekV4FlashGPUBackend:
         self._stats["selected_expert_fused_api_calls"] = (
             self._stats.get("selected_expert_fused_api_calls", 0) + 1
         )
+        if not payloads:
+            raise ValueError("DeepSeek V4 Flash selected expert GEMM got no payloads")
         output: torch.Tensor | None = None
         weights = expert_weights.reshape(-1)
+        expert_input = deepseek_q8_k_roundtrip_reference(hidden)
         for payload_index, (
             _expert_id,
             gate_payload,
             up_payload,
             down_payload,
         ) in enumerate(payloads):
-            expert_output = self.quantized_expert_gemm(
-                hidden=hidden,
+            self._stats["quantized_expert_calls"] += 1
+            expert_output = self._quantized_expert_gemm_from_q8_input(
+                expert_input=expert_input,
                 gate_payload=gate_payload,
                 up_payload=up_payload,
                 down_payload=down_payload,

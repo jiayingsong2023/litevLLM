@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.models.deepseek_v4_flash import gpu_backend as backend_module
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
@@ -383,9 +384,11 @@ def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down() 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
+def test_quantized_selected_experts_gemm_matches_existing_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rows = 256
-    columns = 256
+    columns = 512
     hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
     expert_weights = torch.full((6,), 1.0 / 6.0, dtype=torch.float32, device="cuda")
     payloads = [
@@ -395,18 +398,24 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
                 ggml_type=GGML_TYPE_IQ2_XXS,
                 rows=rows,
                 columns=columns,
-                payload=_iq2_xxs_deterministic_payload(rows),
+                payload=_iq2_xxs_deterministic_payload_blocks(
+                    rows,
+                    columns // 256,
+                ),
             ),
             _staged_payload(
                 ggml_type=GGML_TYPE_IQ2_XXS,
                 rows=rows,
                 columns=columns,
-                payload=_iq2_xxs_deterministic_payload(rows),
+                payload=_iq2_xxs_deterministic_payload_blocks(
+                    rows,
+                    columns // 256,
+                ),
             ),
             _staged_payload(
                 ggml_type=GGML_TYPE_Q2_K,
                 rows=rows,
-                columns=columns,
+                columns=rows,
                 payload=_q2_k_deterministic_payload(rows),
             ),
         )
@@ -429,6 +438,20 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
         ) in enumerate(payloads)
     )
 
+    roundtrips_by_width: dict[int, int] = {}
+
+    def counted_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
+        roundtrips_by_width[tensor.numel()] = roundtrips_by_width.get(
+            tensor.numel(),
+            0,
+        ) + 1
+        return deepseek_q8_k_roundtrip_reference(tensor)
+
+    monkeypatch.setattr(
+        backend_module,
+        "deepseek_q8_k_roundtrip_reference",
+        counted_roundtrip,
+    )
     backend = DeepSeekV4FlashGPUBackend()
     actual = backend.quantized_selected_experts_gemm(
         hidden=hidden,
@@ -437,6 +460,7 @@ def test_quantized_selected_experts_gemm_matches_existing_loop() -> None:
     )
 
     torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
+    assert roundtrips_by_width == {columns: 1, rows: 6}
     assert backend.stats() == {
         "quantized_expert_calls": 6,
         "q2_k_triton_calls": 6,
