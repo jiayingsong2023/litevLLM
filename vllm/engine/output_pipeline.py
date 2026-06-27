@@ -46,38 +46,55 @@ class OutputPipeline:
         if getattr(sampling_params, "ignore_eos", False):
             if gen_len >= max_tok:
                 request.finished = True
-        elif next_token in eos_ids and gen_len >= min_tok:
-            request.finished = True
-        elif gen_len >= max_tok:
+        elif next_token in eos_ids and gen_len >= min_tok or gen_len >= max_tok:
             request.finished = True
 
         structured_output_constraint = request.structured_output_constraint
         if structured_output_constraint is not None:
             accepted = structured_output_constraint.on_token(request, next_token)
-            if not accepted:
-                request.finished = True
-            elif structured_output_constraint.should_finish(request):
+            if not accepted or structured_output_constraint.should_finish(request):
                 request.finished = True
 
-        current_text = _decode_generated_text(
-            self.tokenizer, request.generated_ids, sampling_params
-        )
-        if not request.finished and self.policies.should_early_stop(
-            request.generated_ids, current_text
-        ):
-            request.low_info_hits = request.low_info_hits + 1
-            if request.low_info_hits >= 2 and gen_len >= max(10, min_tok):
-                request.finished = True
+        # Early-stop policies that need partial text are the only reason to
+        # decode before the output is actually consumed.
+        if not request.finished and self.policies.needs_partial_text_for_early_stop():
+            partial_text = _decode_generated_text(
+                self.tokenizer, request.generated_ids, sampling_params
+            )
+            if self.policies.should_early_stop(request.generated_ids, partial_text):
+                request.low_info_hits = request.low_info_hits + 1
+                if request.low_info_hits >= 2 and gen_len >= max(10, min_tok):
+                    request.finished = True
+            else:
+                request.low_info_hits = 0
         else:
             request.low_info_hits = 0
 
-        display_text = self.policies.cleanup_output_text(current_text)
-        completion = CompletionOutput(
-            index=0,
-            text=display_text,
-            token_ids=request.generated_ids,
-            cumulative_logprob=0.0,
-        )
+        # Decode eagerly when finished so the final string is cached; otherwise
+        # leave text lazy and only decode when the caller reads it.
+        if request.finished:
+            display_text = self.policies.cleanup_output_text(
+                _decode_generated_text(
+                    self.tokenizer, request.generated_ids, sampling_params
+                )
+            )
+            completion = CompletionOutput(
+                index=0,
+                text=display_text,
+                token_ids=request.generated_ids,
+                cumulative_logprob=0.0,
+            )
+        else:
+            completion = CompletionOutput(
+                index=0,
+                text=None,
+                token_ids=request.generated_ids,
+                cumulative_logprob=0.0,
+                tokenizer=self.tokenizer,
+                sampling_params=sampling_params,
+                text_processor=self.policies.cleanup_output_text,
+                finished=False,
+            )
         return RequestOutput(
             request_id=request_id,
             prompt=request.prompt,

@@ -1,17 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Optional, Any
+from collections.abc import Callable
+from typing import Any
+
 
 class CompletionOutput:
-    """The output data of one completion output of a request."""
-    def __init__(self, index: int, text: str, token_ids: List[int], cumulative_logprob: float, **kwargs):
+    """The output data of one completion output of a request.
+
+    ``text`` is decoded lazily when a tokenizer is supplied and ``text`` was
+    not provided at construction time. This avoids paying the ``tokenizer.decode``
+    cost for intermediate outputs that are never consumed by the caller
+    (e.g. non-streaming requests that only use the final output).
+    """
+
+    def __init__(
+        self,
+        index: int,
+        text: str | None,
+        token_ids: list[int],
+        cumulative_logprob: float,
+        tokenizer: Any = None,
+        sampling_params: Any = None,
+        text_processor: Callable[[str], str] | None = None,
+        finished: bool = False,
+        **kwargs,
+    ):
         self.index = index
-        self.text = text
+        self._text = text
+        self._tokenizer = tokenizer
+        self._sampling_params = sampling_params
+        self._text_processor = text_processor
+        self._finished = finished
         self.token_ids = token_ids
         self.cumulative_logprob = cumulative_logprob
 
+    @property
+    def text(self) -> str:
+        if self._text is not None:
+            return self._text
+        if self._tokenizer is None:
+            return ""
+        decoded = self._tokenizer.decode(
+            self.token_ids,
+            skip_special_tokens=getattr(
+                self._sampling_params, "skip_special_tokens", True
+            ),
+            spaces_between_special_tokens=getattr(
+                self._sampling_params, "spaces_between_special_tokens", False
+            ),
+            clean_up_tokenization_spaces=True,
+        )
+        if self._text_processor is not None:
+            decoded = self._text_processor(decoded)
+        if self._finished:
+            self._text = decoded
+        return decoded
+
+    @text.setter
+    def text(self, value: str | None) -> None:
+        self._text = value
+
+
 class RequestOutput:
     """The output data of a request to the LLM."""
-    def __init__(self, request_id: str, prompt: str, prompt_token_ids: List[int], outputs: List[CompletionOutput], finished: bool, **kwargs):
+
+    def __init__(
+        self,
+        request_id: str,
+        prompt: str,
+        prompt_token_ids: list[int],
+        outputs: list[CompletionOutput],
+        finished: bool,
+        **kwargs,
+    ):
         self.request_id = request_id
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
@@ -28,7 +88,7 @@ class PoolingRequestOutput:
     def __init__(
         self,
         request_id: str = "",
-        prompt_token_ids: Optional[List[int]] = None,
+        prompt_token_ids: list[int] | None = None,
         outputs: Any = None,
         num_cached_tokens: int = 0,
         finished: bool = True,
@@ -41,7 +101,7 @@ class PoolingRequestOutput:
 
 
 class ClassificationOutput:
-    def __init__(self, probs: List[float]):
+    def __init__(self, probs: list[float]):
         self.probs = probs
 
     @classmethod
@@ -68,8 +128,5 @@ class ScoringRequestOutput:
         score = getattr(getattr(base, "outputs", None), "score", None)
         if score is None:
             data = getattr(getattr(base, "outputs", None), "data", None)
-            if isinstance(data, list) and data:
-                score = float(data[0])
-            else:
-                score = 0.0
+            score = float(data[0]) if isinstance(data, list) and data else 0.0
         return cls(ScoringOutput(float(score)))
