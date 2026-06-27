@@ -42,10 +42,16 @@ def layer_kv_cache_shape_for_layer(
     fallback_num_kv_heads: int,
     fallback_kv_head_dim: int,
 ) -> tuple[int, int]:
+    """Return KV cache (num_kv_heads, head_dim) for a layer.
+
+    When ``layer_kv_specs`` is provided, ``hdim`` is the unpacked model head
+    dimension and must be halved for packed uint8 (TurboQuant INT4). When
+    falling back to capability-wide dims, ``fallback_kv_head_dim`` is already
+    the cache-side dimension (packed or not), so it is returned as-is.
+    """
     if layer_kv_specs is None:
-        nkv, hdim = fallback_num_kv_heads, fallback_kv_head_dim
-    else:
-        nkv, hdim = layer_kv_specs[layer_idx]
+        return int(fallback_num_kv_heads), int(fallback_kv_head_dim)
+    nkv, hdim = layer_kv_specs[layer_idx]
     if kv_dtype == torch.uint8:
         return int(nkv), int(hdim // 2)
     return int(nkv), int(hdim)

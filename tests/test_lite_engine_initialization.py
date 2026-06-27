@@ -85,6 +85,18 @@ def test_layer_kv_cache_shape_uint8_packs_head_dim() -> None:
     assert shape == (8, 64)
 
 
+def test_layer_kv_cache_shape_fallback_uint8_uses_packed_dim() -> None:
+    """When specs are unavailable, fallback_kv_head_dim is already cache-side."""
+    shape = layer_kv_cache_shape_for_layer(
+        layer_kv_specs=None,
+        layer_idx=0,
+        kv_dtype=torch.uint8,
+        fallback_num_kv_heads=8,
+        fallback_kv_head_dim=64,
+    )
+    assert shape == (8, 64)
+
+
 def test_compute_kv_theory_bytes_uniform() -> None:
     # 2 layers, 4 blocks, block_size 8, 2 kv heads, 16 head_dim, fp16 = 2 bytes
     # data = 2 * 2 * 4 * 8 * 2 * 16 * 2 = 8192
