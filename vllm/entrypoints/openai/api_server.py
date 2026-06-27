@@ -499,7 +499,7 @@ async def create_chat_completion(request: Request):
         )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="FastInference OpenAI API Server")
     parser.add_argument("--model", type=str, required=True, help="Path to the model.")
     parser.add_argument("--host", type=str, default="0.0.0.0")

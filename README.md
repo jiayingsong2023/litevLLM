@@ -12,6 +12,7 @@
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [FP8 KV 稳定] |
   | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~128, max_new=48, KV cap=512 | **8.00** | [e2e benchmark 2026-05-29] |
   | **Gemma4-31B-it (AWQ)** | BS=1, prompt~128, max_new=48, KV cap=512 | **2.06** | [e2e benchmark 2026-05-29] |
+  | **DeepSeek V4 Flash Q2 GGUF** | batch=1, context=4096, greedy, direct GGUF | **~1 TPS target gate** | [experimental e2e direct smoke] |
 
   最新 Gemma4 数值来自 `tests/e2e_full_benchmark.py`（2026-05-29，benchmark profile）。
   Gemma4-26B `TTFT p50=2148ms`、`prefill_tps_agg=64.26`、`decode_tps_agg=12.19`；
@@ -19,8 +20,8 @@
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
-  - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径。
-  - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`。
+  - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径；DeepSeek V4 Flash 通过目标 DS4 Q2/IQ2 GGUF 走实验性 direct path。
+  - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`，以及目标 GGUF 存在时的 `DeepSeek-V4-Flash` Tier-B smoke。
   - **非目标**: `Qwen3.5-35B` 不再作为正式支持模型。
   - **已删除**: `vllm/worker/`、`vllm/core/`、`vllm/distributed/` 等上游 runtime 子系统。
   - **已删除**: 上游 CLI、pooling/gRPC/executor、spec decode、Helion、vendored `third_party/triton_kernels` 等非 lite 主路径残留。
@@ -97,7 +98,7 @@ SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 uv run python tests/e2e_full_benchmark.py
 ```
 
-`tests/run_inference_correctness_regression.sh` 覆盖四个回归目标：TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B。Gemma4 模型目录自动探测，优先本地路径。
+`tests/run_inference_correctness_regression.sh` 覆盖 TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B；当 DeepSeek V4 Flash 目标 GGUF 文件存在时，还会运行实验性 Tier-B quality smoke。Gemma4 模型目录自动探测，优先本地路径。
 
 默认准确度策略为：`<=14B`：A-strict + B；`>14B`：A-lite + B（Gemma4-26B 例外，默认开启 A-strict + A-lite + B）。在 60GB 级 GPU 上可通过 `SKIP_A_TIER=1` 跳过 A-tier 测试以节省显存。
 

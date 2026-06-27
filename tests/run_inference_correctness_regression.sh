@@ -21,6 +21,8 @@
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
 #   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
+#   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=auto runs the real GGUF DeepSeek Tier-B quality smoke when the model exists.
+#     Set 0 to disable, or 1 to require the model file and fail if it is missing.
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,6 +91,7 @@ MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-models/gemma-4-31B-it-AWQ-4bit}"
 MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-models/gemma-4-26B-A4B-it-AWQ-4bit}"
+MODEL_DEEPSEEK_V4_FLASH_GGUF="${MODEL_DEEPSEEK_V4_FLASH_GGUF:-models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
 TINYLLAMA_PROMPTS_FILE="${TINYLLAMA_PROMPTS_FILE:-tests/tools/fixtures/tinyllama_correctness_prompts_default.json}"
 GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
 
@@ -104,8 +107,10 @@ RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-3
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
 RUN_GEMMA4_26B_A_STRICT="${RUN_GEMMA4_26B_A_STRICT:-1}"
 RUN_GEMMA4_26B_A_LITE="${RUN_GEMMA4_26B_A_LITE:-1}"
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE="${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE:-auto}"
 FI_CORRECTNESS_STAGE_TIMEOUT="${FI_CORRECTNESS_STAGE_TIMEOUT:-45m}"
 FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT="${FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT:-75m}"
+FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT="${FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT:-45m}"
 FI_CORRECTNESS_PERF_STAGE_TIMEOUT="${FI_CORRECTNESS_PERF_STAGE_TIMEOUT:-90m}"
 FI_CORRECTNESS_STAGE_KILL_AFTER="${FI_CORRECTNESS_STAGE_KILL_AFTER:-60s}"
 print_gemma4_profile() {
@@ -114,25 +119,81 @@ print_gemma4_profile() {
   echo "  ${label} profile: $*"
 }
 
+print_model_separator() {
+  local label="$1"
+  echo ""
+  echo "========================================================================"
+  echo "MODEL: ${label}"
+  echo "========================================================================"
+}
+
+print_spotcheck_summary() {
+  local output_log="$1"
+  if ! grep -q '"prompt_preview"' "$output_log"; then
+    return 0
+  fi
+  uv run python - "$output_log" <<'PY_SPOTCHECK_SUMMARY'
+import json
+import sys
+from pathlib import Path
+
+print("[Tier-B] prompt/output summary")
+for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    line = line.strip()
+    if not line.startswith("{") or '"prompt_preview"' not in line:
+        continue
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    detail = row.get("tier_b_detail", {}).get("tier_b_alignment", {})
+    passed = all(
+        detail.get(k, True)
+        for k in ("readability_ok", "coherence_ok", "first_token_ok", "substance_ok")
+    ) and not row.get("heuristic_severe", False)
+    print(f"  [{row.get('id', 'unknown')}] {'PASS' if passed else 'FAIL'}")
+    print(f"    prompt: {row.get('prompt_preview', '')}")
+    print(f"    output: {str(row.get('text', '')).strip()}")
+    notes = row.get("heuristic_warn") or []
+    if notes:
+        print(f"    notes: {notes}")
+PY_SPOTCHECK_SUMMARY
+}
+
 run_stage() {
   local label="$1"
   local stage_timeout="$2"
   shift 2
 
   local start_seconds="$SECONDS"
+  local output_log=""
+  local rc=0
   echo "[Stage] START ${label} timeout=${stage_timeout}"
 
-  local rc=0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" || rc=$?
+  if [[ "${FI_CORRECTNESS_VERBOSE:-0}" == "1" ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" || rc=$?
+    else
+      echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
+      "$@" || rc=$?
+    fi
   else
-    echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
-    "$@" || rc=$?
+    output_log="$(mktemp "${TMPDIR:-/tmp}/fastinference-correctness-stage.XXXXXX.log")"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --foreground --kill-after="$FI_CORRECTNESS_STAGE_KILL_AFTER" "$stage_timeout" "$@" >"$output_log" 2>&1 || rc=$?
+    else
+      echo "[Warn] coreutils 'timeout' not found; running ${label} without wall-clock guard."
+      "$@" >"$output_log" 2>&1 || rc=$?
+    fi
   fi
 
   local elapsed_seconds=$((SECONDS - start_seconds))
   if [[ "$rc" -eq 0 ]]; then
     echo "[Stage] OK ${label} elapsed=${elapsed_seconds}s"
+    if [[ -n "$output_log" ]]; then
+      print_spotcheck_summary "$output_log"
+      rm -f "$output_log"
+    fi
     return 0
   fi
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
@@ -140,6 +201,13 @@ run_stage() {
     echo "        This usually indicates a stuck GPU/ROCm operation, model load, or kernel launch."
   else
     echo "[ERROR] Stage failed: ${label} elapsed=${elapsed_seconds}s rc=${rc}"
+  fi
+  if [[ -n "$output_log" ]]; then
+    if [[ -s "$output_log" ]]; then
+      echo "[Stage] Captured output for failed stage:"
+      cat "$output_log"
+    fi
+    rm -f "$output_log"
   fi
   return "$rc"
 }
@@ -186,6 +254,34 @@ if torch.cuda.is_available():
     ipc_collect = getattr(torch.cuda, "ipc_collect", None)
     if ipc_collect is not None:
         ipc_collect()' >/dev/null 2>&1 || true
+}
+
+print_deepseek_quality_summary() {
+  local json_path="$1"
+  uv run python - "$json_path" <<'PY_SUMMARY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+readability = payload.get("readability", {})
+performance = payload.get("performance", {})
+summary = payload.get("performance_summary", {})
+text = str(readability.get("text", "")).strip()
+reasons = readability.get("reasons", [])
+generated = payload.get("generated_token_ids", [])
+print("[DeepSeek V4 Flash] Tier-B quality smoke")
+print(f"  readability: {'PASS' if readability.get('passed') else 'FAIL'}")
+print(f"  output: {text}")
+print(f"  generated_token_ids: {generated}")
+print(f"  reasons: {reasons}")
+print(
+    "  decode_tps: "
+    f"{float(performance.get('decode_tokens_per_second', 0.0)):.2f} "
+    f"(min={float(summary.get('decode_tps_min', 0.0)):.2f}, "
+    f"median={float(summary.get('decode_tps_median', 0.0)):.2f})"
+)
+PY_SUMMARY
 }
 
 require_model_ref() {
@@ -278,9 +374,9 @@ resolve_gemma4_26b_model_ref() {
 }
 
 SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
-  --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal)
+  --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal --json)
 GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
-  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal
+  --max-new-tokens 48 --temperature 0 --chat-template auto --frugal --json
   --max-model-len 512)
 GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
   --max-new-tokens 32
@@ -308,7 +404,7 @@ MODEL_GEMMA4_26B_A4B="$(resolve_gemma4_26b_model_ref)"
 warn_if_repo_id_proxy_is_unsupported "$MODEL_GEMMA4_31B_Q4"
 
 echo "=== Tier-B (quality_bar_spotcheck) ==="
-echo "[1/2] TinyLlama"
+print_model_separator "TinyLlama Tier-B"
 TINYLLAMA_PROMPT_ARGS=(--prompt-subset minimal)
 if [[ -f "$TINYLLAMA_PROMPTS_FILE" ]]; then
   TINYLLAMA_PROMPT_ARGS=(--prompts-file "$TINYLLAMA_PROMPTS_FILE")
@@ -319,7 +415,7 @@ run_stage "Tier-B TinyLlama spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
   "${SPOTCHECK[@]}" --model "$MODEL_TINYLLAMA" --quant none "${TINYLLAMA_PROMPT_ARGS[@]}"
 
-echo "[2/2] Qwen3.5-9B AWQ"
+print_model_separator "Qwen3.5-9B AWQ Tier-B"
 run_stage "Tier-B Qwen3.5-9B AWQ spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
   "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
@@ -328,7 +424,7 @@ GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
   if [[ -d "$MODEL_GEMMA4_31B_Q4" ]] || is_hf_repo_id "$MODEL_GEMMA4_31B_Q4"; then
     GEMMA4_AVAILABLE=1
-    echo "[3/3] Gemma4-31B Q4 (text-only)"
+    print_model_separator "Gemma4-31B Q4 Tier-B"
     require_model_ref "$MODEL_GEMMA4_31B_Q4" "Gemma4-31B-Q4"
     GEMMA4_PROMPT_ARGS=(--prompt-subset minimal)
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
@@ -352,7 +448,7 @@ GEMMA4_26B_AVAILABLE=0
 if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
   if [[ -d "$MODEL_GEMMA4_26B_A4B" ]] || is_hf_repo_id "$MODEL_GEMMA4_26B_A4B"; then
     GEMMA4_26B_AVAILABLE=1
-    echo "[Gemma4-26B] Q4/A4B (text-only)"
+    print_model_separator "Gemma4-26B A4B Tier-B"
     require_model_ref "$MODEL_GEMMA4_26B_A4B" "Gemma4-26B-A4B"
     GEMMA4_26B_PROMPT_ARGS=(--prompt-subset minimal)
     if [[ -f "$GEMMA4_PROMPTS_FILE" ]]; then
@@ -368,6 +464,57 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
   fi
 fi
 
+if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
+  echo ""
+  print_model_separator "DeepSeek V4 Flash Tier-B"
+  if [[ ! -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
+    if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "auto" ]]; then
+      echo "[Warn] DeepSeek V4 Flash GGUF not found, skipping: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
+      echo "       Set MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf to enable this Tier-B check."
+      echo "       Set RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=0 to suppress this message."
+    else
+      echo "[ERROR] Missing DeepSeek V4 Flash GGUF: ${MODEL_DEEPSEEK_V4_FLASH_GGUF}"
+      echo "        Override with MODEL_DEEPSEEK_V4_FLASH_GGUF=/path/to/model.gguf"
+      exit 1
+    fi
+  else
+    DEEPSEEK_QUALITY_JSON="$(mktemp "${TMPDIR:-/tmp}/fastinference-deepseek-quality.XXXXXX.json")"
+    run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
+      bash -c 'uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
+        --model "$1" \
+        --context-length 4096 \
+        --max-tokens 8 \
+        --min-output-chars 8 \
+        --json-out "$2" >/dev/null' \
+      _ "$MODEL_DEEPSEEK_V4_FLASH_GGUF" "$DEEPSEEK_QUALITY_JSON"
+    print_deepseek_quality_summary "$DEEPSEEK_QUALITY_JSON"
+    rm -f "$DEEPSEEK_QUALITY_JSON"
+    cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
+  fi
+fi
+
+if [[ "$RUN_PERF_DIAG" == "1" ]]; then
+  echo ""
+  echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
+  PERF_MODELS="tinyllama,qwen35_9b_awq"
+  if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
+  fi
+  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b"
+  fi
+  if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" == "1" && -f "$MODEL_DEEPSEEK_V4_FLASH_GGUF" ]]; then
+    PERF_MODELS="${PERF_MODELS},deepseek_v4_flash_q2_gguf"
+  fi
+  PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
+  echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
+  run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
+    uv run python tests/e2e_full_benchmark.py \
+    --models "${PERF_MODELS}" \
+    --json-out "${PERF_JSON}"
+  echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
+fi
+
 if [[ "${SKIP_A_TIER:-0}" == "1" ]]; then
   echo "SKIP_A_TIER=1 — done after Tier-B."
   exit 0
@@ -375,7 +522,7 @@ fi
 
 echo ""
 echo "=== Tier-A-strict (<=14B, HF parity) ==="
-echo "[A1] TinyLlama — Lite vs HF same tree"
+print_model_separator "TinyLlama Tier-A strict"
 run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
   uv run python tests/verify_semantic_integrity.py \
@@ -386,7 +533,7 @@ run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   --prefill-only \
   --apply-chat-template off
 
-echo "[A2] Qwen3.5-9B AWQ vs FP16 HF"
+print_model_separator "Qwen3.5-9B AWQ Tier-A strict"
 require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
 run_stage "Tier-A Qwen3.5-9B HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
@@ -468,22 +615,3 @@ fi
 
 echo ""
 echo "=== All requested correctness regression steps completed OK ==="
-
-if [[ "$RUN_PERF_DIAG" == "1" ]]; then
-  echo ""
-  echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
-  PERF_MODELS="tinyllama,qwen35_9b_awq"
-  if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
-  fi
-  if [[ "${GEMMA4_26B_AVAILABLE}" == "1" ]]; then
-    PERF_MODELS="${PERF_MODELS},gemma4_26b_a4b"
-  fi
-  PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
-  echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
-  run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
-    uv run python tests/e2e_full_benchmark.py \
-    --models "${PERF_MODELS}" \
-    --json-out "${PERF_JSON}"
-  echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
-fi

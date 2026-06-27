@@ -51,6 +51,7 @@ bash tests/run_inference_correctness_regression.sh
 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 RUN_PERF_DIAG=1 bash tests/run_inference_correctness_regression.sh
 RUN_GEMMA4_A_STRICT=0 RUN_GEMMA4_26B_A_STRICT=0 bash tests/run_inference_correctness_regression.sh
+RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 ```
 
 路径与 prompts 默认值：
@@ -59,6 +60,7 @@ RUN_GEMMA4_A_STRICT=0 RUN_GEMMA4_26B_A_STRICT=0 bash tests/run_inference_correct
 - `MODEL_QWEN35_9B_AWQ=models/Qwen3.5-9B-AWQ`
 - `MODEL_GEMMA4_31B_Q4=models/gemma-4-31B-it-AWQ-4bit`
 - `MODEL_GEMMA4_26B_A4B=models/gemma-4-26B-A4B-it-AWQ-4bit`
+- `MODEL_DEEPSEEK_V4_FLASH_GGUF=models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
 - `TINYLLAMA_PROMPTS_FILE=tests/tools/fixtures/tinyllama_correctness_prompts_default.json`
 - `GEMMA4_PROMPTS_FILE=tests/tools/fixtures/gemma4_correctness_prompts_default.json`
 
@@ -137,6 +139,7 @@ uv run python tests/e2e_full_benchmark.py \
 - A-strict prefill audit：`tests/tools/gemma4_prefill_strict_audit.py`
 - Layer drift / 长 decode 诊断：`tests/tools/gemma4_layer_drift_diagnostic.py`
 - 性能网格 wrapper：`tests/tools/perf_grid_search.py`
+- DeepSeek V4 Flash opt-in GPU smoke：`tests/tools/run_deepseek_v4_flash_gpu_smoke.py`
 
 本机当前验收策略：
 

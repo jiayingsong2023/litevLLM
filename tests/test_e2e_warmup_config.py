@@ -91,6 +91,84 @@ def test_resolve_compile_cache_env(tmp_path: Path) -> None:
     assert "TORCHINDUCTOR_CACHE_DIR" in env_map
 
 
+def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
+    spec = bench.MODEL_SPECS["deepseek_v4_flash_q2_gguf"]
+
+    assert spec.model_path.endswith(".gguf")
+    assert spec.quant == "deepseek-v4-flash-gguf"
+    assert spec.concurrent_reqs == 1
+    assert spec.prompt_tokens_target == 4096
+    assert spec.max_new_tokens == 16
+
+
+def test_deepseek_v4_flash_gguf_is_in_default_e2e_models(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["e2e_full_benchmark.py"])
+
+    args = bench._parse_args()
+
+    assert "deepseek_v4_flash_q2_gguf" in {
+        key.strip() for key in args.models.split(",")
+    }
+
+
+def test_deepseek_v4_flash_decode_p50_target_warning_output() -> None:
+    warning = bench._deepseek_v4_flash_decode_target_warning(
+        {
+            "deepseek_v4_flash_q2_gguf": {
+                "decode_tps_aggregate": 1.2,
+                "decode_tps_p50": 0.83,
+            }
+        }
+    )
+
+    assert warning == {
+        "model": "deepseek_v4_flash_q2_gguf",
+        "metric": "decode_tps_p50",
+        "kind": "throughput_target",
+        "current": 0.83,
+        "baseline": 1.0,
+        "ratio": 0.83,
+        "threshold": 1.0,
+    }
+    assert bench._format_perf_regression_warnings([warning]) == [
+        "PERF WARNING: model=deepseek_v4_flash_q2_gguf "
+        "metric=decode_tps_p50 kind=throughput_target current=0.830 "
+        "baseline=1.000 ratio=0.830 threshold=1.000"
+    ]
+
+
+def test_deepseek_v4_flash_missing_decode_p50_warning_output() -> None:
+    for result in (
+        {"decode_tps_aggregate": 1.2},
+        {"decode_tps_aggregate": 1.2, "decode_tps_p50": float("nan")},
+    ):
+        warning = bench._deepseek_v4_flash_decode_target_warning(
+            {"deepseek_v4_flash_q2_gguf": result}
+        )
+
+        assert warning is not None
+        assert warning["kind"] == "throughput_target_missing"
+        assert bench._format_perf_regression_warnings([warning]) == [
+            "PERF WARNING: model=deepseek_v4_flash_q2_gguf "
+            "metric=decode_tps_p50 kind=throughput_target_missing current=n/a "
+            "baseline=1.000 ratio=n/a threshold=1.000"
+        ]
+
+
+def test_deepseek_v4_flash_decode_p50_target_accepts_threshold() -> None:
+    assert (
+        bench._deepseek_v4_flash_decode_target_warning(
+            {
+                "deepseek_v4_flash_q2_gguf": {
+                    "decode_tps_p50": 1.0,
+                },
+                "tinyllama": {"decode_tps_p50": 0.1},
+            }
+        )
+        is None
+    )
+
+
 def test_runtime_metrics_include_async_driver_snapshot() -> None:
     metrics = bench._derive_runtime_metrics(
         {

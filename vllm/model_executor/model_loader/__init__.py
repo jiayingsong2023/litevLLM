@@ -1179,6 +1179,59 @@ def _maybe_init_quant_config_from_hf(vllm_config: VllmConfig) -> None:
     elif quant_method == "compressed-tensors":
         vllm_config.quant_config = CompressedTensorsConfig.from_config(quant_cfg)
 
+
+def _should_skip_safetensors_load(vllm_config: VllmConfig) -> bool:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "") or "").lower()
+    archs = getattr(hf_config, "architectures", []) or []
+    return model_type in ("deepseek_v4", "deepseek4", "deepseek_v4_flash") and any(
+        "deepseekv4flash" in str(arch).lower() for arch in archs
+    )
+
+
+def _build_deepseek_v4_flash_inspect_model(
+    model_cls: type[nn.Module],
+    vllm_config: VllmConfig,
+) -> nn.Module:
+    from vllm.model_executor.models.deepseek_v4_flash.config import (
+        DeepSeekV4FlashMemoryPolicy,
+    )
+    from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
+        DeepSeekV4FlashGPUBackend,
+        DeepSeekV4FlashGPUCapabilities,
+    )
+    from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+        open_deepseek_v4_flash_weight_store,
+    )
+
+    cfg = vllm_config.model_config
+    store = open_deepseek_v4_flash_weight_store(cfg.model)
+    try:
+        policy = DeepSeekV4FlashMemoryPolicy()
+        budget = policy.estimate_runtime_budget(
+            getattr(cfg, "max_model_len", policy.max_first_release_context),
+            model_mmap_bytes=store.diagnostics.file_size_bytes,
+        )
+        policy.validate_runtime_budget(budget)
+        backend = DeepSeekV4FlashGPUBackend(
+            capabilities=DeepSeekV4FlashGPUCapabilities(
+                q8_linear=True,
+                attention=True,
+                compressed_attention=True,
+                cache_update=True,
+                moe=True,
+                output=True,
+            )
+        )
+        model = model_cls(vllm_config, gpu_backend=backend)
+        model_with_store: Any = model
+        model_with_store.attach_weight_store(store, budget)
+        return model.eval()
+    except Exception:
+        store.close()
+        raise
+
+
 def get_model(vllm_config: VllmConfig) -> nn.Module:
     cfg = vllm_config.model_config
     if cfg.hf_config is None:
@@ -1188,6 +1241,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         with open(path, "r") as f:
             data = json.load(f)
             cfg.hf_config = build_fallback_hf_config(data)
+    elif _should_skip_safetensors_load(vllm_config):
+        pass
     elif _looks_like_hf_repo_id(cfg.model):
         try:
             hf_auto_cfg = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
@@ -1199,6 +1254,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         setattr(cfg.hf_config, "num_key_value_heads", getattr(cfg.hf_config, "num_attention_heads", 40))
         setattr(cfg.hf_config, "head_dim", 128)
     model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
+    if _should_skip_safetensors_load(vllm_config):
+        return _build_deepseek_v4_flash_inspect_model(model_cls, vllm_config)
     model = model_cls(vllm_config)
     
     # Pre-resolve target dtype
@@ -1208,7 +1265,8 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
     model.to(dtype=target_dtype)
 
     # [35B OOM FIX] Atomic loading to avoid peaks.
-    _load_safetensors(model, cfg.model, target_dtype=target_dtype)
+    if not _should_skip_safetensors_load(vllm_config):
+        _load_safetensors(model, cfg.model, target_dtype=target_dtype)
     
     # [35B STABILITY] Final deterministic device and dtype sync.
     # Essential for rotary_emb caches, missed expert parameters, etc.

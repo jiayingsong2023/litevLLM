@@ -1,0 +1,366 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import mmap
+import struct
+from dataclasses import dataclass
+from math import prod
+from pathlib import Path
+from typing import Any
+
+from .config import DEEPSEEK_V4_FLASH_SHAPE, DeepSeekV4FlashShape
+
+GGUF_MAGIC = 0x46554747
+GGUF_VERSION = 3
+GGUF_DEFAULT_ALIGNMENT = 32
+GGUF_TYPE_UINT8 = 0
+GGUF_TYPE_INT8 = 1
+GGUF_TYPE_UINT16 = 2
+GGUF_TYPE_INT16 = 3
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_INT32 = 5
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL = 7
+GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
+GGUF_TYPE_UINT64 = 10
+GGUF_TYPE_INT64 = 11
+GGUF_TYPE_FLOAT64 = 12
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q2_K = 10
+GGML_TYPE_IQ2_XXS = 16
+GGML_TYPE_I32 = 26
+SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES = frozenset(
+    (
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_I32,
+    )
+)
+
+
+class GGUFParseError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class DeepSeekV4FlashTensor:
+    name: str
+    dims: tuple[int, ...]
+    tensor_type: int
+    offset: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class DeepSeekV4FlashGGUF:
+    path: Path
+    name: str
+    metadata: dict[str, Any]
+    tensors: dict[str, DeepSeekV4FlashTensor]
+    data_offset: int
+    shape: DeepSeekV4FlashShape = DEEPSEEK_V4_FLASH_SHAPE
+
+
+class _Cursor:
+    def __init__(self, data: memoryview) -> None:
+        self.data = data
+        self.pos = 0
+
+    def read(self, n: int) -> bytes:
+        if self.pos + n > len(self.data):
+            raise GGUFParseError("truncated GGUF")
+        out = self.data[self.pos : self.pos + n].tobytes()
+        self.pos += n
+        return out
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self.read(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self.read(8))[0]
+
+    def string(self) -> str:
+        n = self.u64()
+        return self.read(n).decode("utf-8")
+
+    def skip(self, n: int) -> None:
+        if self.pos + n > len(self.data):
+            raise GGUFParseError("truncated GGUF")
+        self.pos += n
+
+
+_EXPECTED_METADATA: dict[str, Any] = {
+    "general.architecture": "deepseek4",
+    "deepseek4.block_count": DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+    "deepseek4.attention.head_count": DEEPSEEK_V4_FLASH_SHAPE.num_attention_heads,
+    "deepseek4.attention.head_count_kv": DEEPSEEK_V4_FLASH_SHAPE.num_kv_heads,
+    "deepseek4.attention.key_length": DEEPSEEK_V4_FLASH_SHAPE.head_dim,
+    "deepseek4.attention.sliding_window": DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+    "deepseek4.attention.indexer.head_count": DEEPSEEK_V4_FLASH_SHAPE.indexer_heads,
+    "deepseek4.attention.indexer.key_length": DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
+    "deepseek4.attention.indexer.top_k": DEEPSEEK_V4_FLASH_SHAPE.indexer_top_k,
+    "deepseek4.expert_count": DEEPSEEK_V4_FLASH_SHAPE.num_experts,
+    "deepseek4.expert_used_count": DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    "deepseek4.embedding_length": DEEPSEEK_V4_FLASH_SHAPE.hidden_size,
+    "deepseek4.vocab_size": DEEPSEEK_V4_FLASH_SHAPE.vocab_size,
+}
+
+
+_STORED_METADATA_KEYS = frozenset(
+    (
+        *_EXPECTED_METADATA,
+        "general.name",
+        "general.alignment",
+        "tokenizer.ggml.eos_token_id",
+    )
+)
+
+_PRIMITIVE_METADATA_TYPE_BYTES: dict[int, int] = {
+    GGUF_TYPE_UINT8: 1,
+    GGUF_TYPE_INT8: 1,
+    GGUF_TYPE_UINT16: 2,
+    GGUF_TYPE_INT16: 2,
+    GGUF_TYPE_UINT32: 4,
+    GGUF_TYPE_INT32: 4,
+    GGUF_TYPE_FLOAT32: 4,
+    GGUF_TYPE_BOOL: 1,
+    GGUF_TYPE_UINT64: 8,
+    GGUF_TYPE_INT64: 8,
+    GGUF_TYPE_FLOAT64: 8,
+}
+
+
+def _read_value(cursor: _Cursor, value_type: int) -> Any:
+    if value_type == GGUF_TYPE_UINT32:
+        return cursor.u32()
+    if value_type == GGUF_TYPE_STRING:
+        return cursor.string()
+    raise GGUFParseError(f"unsupported GGUF metadata type: {value_type}")
+
+
+def _skip_value(cursor: _Cursor, value_type: int) -> None:
+    if value_type == GGUF_TYPE_STRING:
+        cursor.skip(cursor.u64())
+        return
+    if value_type == GGUF_TYPE_ARRAY:
+        element_type = cursor.u32()
+        element_count = cursor.u64()
+        if element_type == GGUF_TYPE_STRING:
+            for _ in range(element_count):
+                cursor.skip(cursor.u64())
+            return
+        element_size = _PRIMITIVE_METADATA_TYPE_BYTES.get(element_type)
+        if element_size is None:
+            raise GGUFParseError(
+                f"unsupported GGUF metadata array type: {element_type}"
+            )
+        cursor.skip(element_size * element_count)
+        return
+    value_size = _PRIMITIVE_METADATA_TYPE_BYTES.get(value_type)
+    if value_size is None:
+        raise GGUFParseError(f"unsupported GGUF metadata type: {value_type}")
+    cursor.skip(value_size)
+
+
+def _read_metadata_entry(cursor: _Cursor) -> tuple[str, Any] | None:
+    key = cursor.string()
+    value_type = cursor.u32()
+    if key not in _STORED_METADATA_KEYS:
+        _skip_value(cursor, value_type)
+        return None
+    return key, _read_value(cursor, value_type)
+
+
+def _validate_metadata(metadata: dict[str, Any]) -> None:
+    for key, expected in _EXPECTED_METADATA.items():
+        actual = metadata.get(key)
+        if actual != expected:
+            raise GGUFParseError(
+                f"{key.removeprefix('deepseek4.')} must be {expected}; got {actual}"
+            )
+
+    name = metadata.get("general.name")
+    if not isinstance(name, str) or not name:
+        raise GGUFParseError("general.name must be a non-empty string")
+
+    alignment = metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT)
+    if not isinstance(alignment, int) or alignment <= 0:
+        raise GGUFParseError(f"general.alignment must be positive; got {alignment}")
+
+
+def _read_tensor(cursor: _Cursor) -> DeepSeekV4FlashTensor:
+    name = cursor.string()
+    n_dims = cursor.u32()
+    dims = tuple(cursor.u64() for _ in range(n_dims))
+    tensor_type = cursor.u32()
+    offset = cursor.u64()
+    return DeepSeekV4FlashTensor(
+        name=name,
+        dims=dims,
+        tensor_type=tensor_type,
+        offset=offset,
+        nbytes=ggml_tensor_nbytes(dims, tensor_type),
+    )
+
+
+def ggml_tensor_nbytes(dims: tuple[int, ...], tensor_type: int) -> int:
+    element_count = prod(dims)
+    if tensor_type == GGML_TYPE_F32:
+        return element_count * 4
+    if tensor_type == GGML_TYPE_F16:
+        return element_count * 2
+    if tensor_type == GGML_TYPE_I32:
+        return element_count * 4
+    if tensor_type == GGML_TYPE_Q8_0:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=32,
+            block_bytes=34,
+            tensor_type=tensor_type,
+        )
+    if tensor_type == GGML_TYPE_Q2_K:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=256,
+            block_bytes=84,
+            tensor_type=tensor_type,
+        )
+    if tensor_type == GGML_TYPE_IQ2_XXS:
+        return _blocked_tensor_nbytes(
+            element_count,
+            values_per_block=256,
+            block_bytes=66,
+            tensor_type=tensor_type,
+        )
+    return 0
+
+
+def _blocked_tensor_nbytes(
+    element_count: int,
+    *,
+    values_per_block: int,
+    block_bytes: int,
+    tensor_type: int,
+) -> int:
+    if element_count % values_per_block != 0:
+        raise GGUFParseError(
+            "tensor element count must be divisible by block size for "
+            f"GGML type {tensor_type}; got {element_count} elements and "
+            f"block size {values_per_block}"
+        )
+    return element_count // values_per_block * block_bytes
+
+
+def _align_offset(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) // alignment * alignment
+
+
+def _validate_tensor_types(tensors: dict[str, DeepSeekV4FlashTensor]) -> None:
+    for tensor in tensors.values():
+        if tensor.tensor_type not in SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES:
+            supported = ", ".join(
+                str(tensor_type)
+                for tensor_type in sorted(SUPPORTED_DEEPSEEK_V4_FLASH_TENSOR_TYPES)
+            )
+            raise GGUFParseError(
+                "unsupported DeepSeek V4 Flash tensor type "
+                f"{tensor.tensor_type} for {tensor.name}; supported: {supported}"
+            )
+
+
+def _validate_tensor_ranges(
+    tensors: dict[str, DeepSeekV4FlashTensor],
+    *,
+    data_offset: int,
+    file_size: int,
+) -> None:
+    ranges: list[tuple[int, int, str]] = []
+    for tensor in tensors.values():
+        if tensor.nbytes <= 0:
+            raise GGUFParseError(
+                f"tensor {tensor.name} has invalid byte size {tensor.nbytes}"
+            )
+
+        start = data_offset + tensor.offset
+        end = start + tensor.nbytes
+        if start < data_offset or end < start or end > file_size:
+            raise GGUFParseError(
+                f"tensor {tensor.name} range [{start}, {end}) exceeds file "
+                f"size {file_size}"
+            )
+        ranges.append((start, end, tensor.name))
+
+    ranges.sort()
+    for (_, prev_end, prev_name), (start, _end, name) in zip(
+        ranges, ranges[1:], strict=False
+    ):
+        if start < prev_end:
+            raise GGUFParseError(
+                "tensor payload overlap: "
+                f"{prev_name} ends at {prev_end}, {name} starts at {start}"
+            )
+
+
+def read_deepseek_v4_flash_gguf_from_view(
+    path: Path,
+    data: memoryview,
+) -> DeepSeekV4FlashGGUF:
+    cursor = _Cursor(data)
+    magic = cursor.u32()
+    if magic != GGUF_MAGIC:
+        raise GGUFParseError(f"invalid GGUF magic: 0x{magic:08x}")
+
+    version = cursor.u32()
+    if version != GGUF_VERSION:
+        raise GGUFParseError(f"unsupported GGUF version: {version}")
+
+    tensor_count = cursor.u64()
+    metadata_count = cursor.u64()
+
+    metadata: dict[str, Any] = {}
+    for _ in range(metadata_count):
+        entry = _read_metadata_entry(cursor)
+        if entry is not None:
+            key, value = entry
+            metadata[key] = value
+
+    _validate_metadata(metadata)
+
+    tensors: dict[str, DeepSeekV4FlashTensor] = {}
+    for _ in range(tensor_count):
+        tensor = _read_tensor(cursor)
+        if tensor.name in tensors:
+            raise GGUFParseError(f"duplicate tensor name: {tensor.name}")
+        tensors[tensor.name] = tensor
+    _validate_tensor_types(tensors)
+    data_offset = _align_offset(
+        cursor.pos,
+        metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT),
+    )
+    _validate_tensor_ranges(tensors, data_offset=data_offset, file_size=len(data))
+
+    return DeepSeekV4FlashGGUF(
+        path=path,
+        name=metadata["general.name"],
+        metadata=metadata,
+        tensors=tensors,
+        data_offset=data_offset,
+    )
+
+
+def read_deepseek_v4_flash_gguf(path: Path | str) -> DeepSeekV4FlashGGUF:
+    gguf_path = Path(path)
+    with gguf_path.open("rb") as fp:
+        mm = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
+        view = memoryview(mm)
+        try:
+            return read_deepseek_v4_flash_gguf_from_view(gguf_path, view)
+        finally:
+            view.release()
+            mm.close()

@@ -4,7 +4,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGUFParseError,
+    read_deepseek_v4_flash_gguf,
+)
+
 from .base import ModelAdapter
+from .deepseek_v4_flash import DeepSeekV4FlashAdapter
 from .gemma4 import Gemma4Adapter
 from .llama import LlamaAdapter
 from .qwen3_5 import Qwen35Adapter
@@ -73,7 +79,35 @@ def _looks_like_gemma4(model: Any, model_config: Any) -> bool:
     return False
 
 
+def _looks_like_deepseek_v4_flash(model: Any, model_config: Any) -> bool:
+    name = type(model).__name__.lower()
+    if "deepseekv4flash" in name or "deepseek_v4_flash" in name:
+        return True
+    for config in _hf_config_candidates(model_config):
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        archs = getattr(config, "architectures", [])
+        if model_type in (
+            "deepseek_v4",
+            "deepseek4",
+            "deepseek_v4_flash",
+        ) and any("deepseekv4flash" in str(a).lower() for a in (archs or [])):
+            return True
+        if any("deepseekv4flash" in str(a).lower() for a in (archs or [])):
+            return True
+
+    model_path = Path(str(getattr(model_config, "model", "") or ""))
+    if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+        return False
+    try:
+        metadata = read_deepseek_v4_flash_gguf(model_path).metadata
+    except (GGUFParseError, OSError, ValueError):
+        return False
+    return str(metadata.get("general.architecture", "")).lower() == "deepseek4"
+
+
 def get_model_adapter(model: Any, model_config: Any) -> ModelAdapter:
+    if _looks_like_deepseek_v4_flash(model, model_config):
+        return DeepSeekV4FlashAdapter()
     if _looks_like_gemma4(model, model_config):
         return Gemma4Adapter()
     if _looks_like_qwen35(model, model_config):

@@ -31,6 +31,7 @@ or feature status lists.
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
 | Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with batch=1 greedy GPU direct path, LiteEngine/AsyncLLM routing, OpenAI REST smoke, paged compressed KV contracts, opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
 | LoRA runtime | Experimental | Runtime path and tests exist; production policy calibration is still workload dependent. |
 | Multimodal serving | Experimental | Single-image and multi-image paths exist, but require broader real-traffic hardening. |
@@ -51,7 +52,7 @@ or feature status lists.
 | Gemma4-26B AWQ grouped prefill MoE | Experimental | Profile-guided grouped prefill is available for the validated MoE shapes; alternate grouped / fused variants remain benchmark-tool experiments rather than production runtime controls. |
 | OpenAI-compatible REST serving | Supported | Lite subset through `vllm.entrypoints.openai.api_server`: `GET /v1/models` and `POST /v1/chat/completions` with streaming and non-streaming responses. |
 | Tokenize/detokenize REST router | Compatibility | Maintained under `vllm.entrypoints.serve.tokenize` when attached; not part of the standalone OpenAI API server contract. |
-| PagedAttention decode | Supported | Triton path with selective-attention experiments available. |
+| PagedAttention decode | Supported | Triton path with selective-attention experiments available for standard paged-KV models. DeepSeek V4 Flash uses a separate compressed-paged KV implementation. |
 | Prefix cache | Experimental | Minimal runtime and observability exist; defaults still need workload calibration. |
 | Structured outputs | Experimental | Grammar-backed behavior is present and tested, but broad API compatibility should stay gated. |
 | Speculative decoding | Unsupported | Explicitly deferred. |
@@ -64,4 +65,4 @@ or feature status lists.
 | Smoke | `uv run pytest -q tests/smoke` | Import, routing, and no-model HTTP sanity checks. |
 | Fast regression | `bash tests/run_regression_suite.sh` | Unit and structural smoke tests without full model loads. |
 | Correctness | `bash tests/run_inference_correctness_regression.sh` | Local-model quality and semantic gates. |
-| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, profile-level baselines, async runtime counters, and optional baseline warning reports. |
+| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, profile-level baselines, async runtime counters, DeepSeek direct-GGUF smoke benchmark, and optional baseline warning reports. |
