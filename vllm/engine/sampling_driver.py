@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from vllm.engine.request_state import RequestState
 from vllm.sampling_params import SamplingParams
 
 
@@ -56,39 +57,39 @@ class SamplingDriver:
     def sample_next_token(
         self,
         logits_1d: torch.Tensor,
-        request: dict[str, Any],
+        request: RequestState,
     ) -> int:
         token_logits = self.policies.apply_context_bias(
             logits_1d,
-            request["generated_ids"],
-            request["sampling_params"],
-            request.get("capital_question_bias_token_ids"),
-            request.get("is_chinese_capital_question"),
+            request.generated_ids,
+            request.sampling_params,
+            request.capital_question_bias_token_ids,
+            request.is_chinese_capital_question,
         )
         eos_mask = eos_stop_token_ids_for_sampling(
-            self.tokenizer, request["sampling_params"], self.hf_config
+            self.tokenizer, request.sampling_params, self.hf_config
         )
-        structured_output_constraint = request.get("structured_output_constraint")
+        structured_output_constraint = request.structured_output_constraint
         if structured_output_constraint is not None:
             token_logits = structured_output_constraint.apply(token_logits, request)
         return self._sample_token_from_logits(
             token_logits,
-            request["sampling_params"],
-            request["generated_ids"],
-            request.get("rng"),
+            request.sampling_params,
+            request.generated_ids,
+            request.rng,
             eos_token_ids_to_mask=eos_mask,
-            anti_template_token_ids=request.get("anti_template_token_ids"),
+            anti_template_token_ids=request.anti_template_token_ids,
         )
 
-    def completion_eos_ids(self, request: dict[str, Any]) -> list[int]:
+    def completion_eos_ids(self, request: RequestState) -> list[int]:
         return eos_stop_token_ids_for_sampling(
-            self.tokenizer, request["sampling_params"], self.hf_config
+            self.tokenizer, request.sampling_params, self.hf_config
         )
 
     def sample_batch_tokens(
         self,
         logits_2d: torch.Tensor,
-        requests: list[dict[str, Any]],
+        requests: list[RequestState],
     ) -> list[int]:
         if not requests:
             return []
@@ -103,25 +104,25 @@ class SamplingDriver:
         B, VocabSize = logits.shape
 
         for i, req in enumerate(requests):
-            sp = req["sampling_params"]
+            sp = req.sampling_params
 
             # Apply context bias
             row_logits = self.policies.apply_context_bias(
                 logits[i],
-                req["generated_ids"],
+                req.generated_ids,
                 sp,
-                req.get("capital_question_bias_token_ids"),
-                req.get("is_chinese_capital_question"),
+                req.capital_question_bias_token_ids,
+                req.is_chinese_capital_question,
             )
 
             # Apply structured output constraint
-            structured_output_constraint = req.get("structured_output_constraint")
+            structured_output_constraint = req.structured_output_constraint
             if structured_output_constraint is not None:
                 row_logits = structured_output_constraint.apply(row_logits, req)
 
             # Apply repetition penalty
             rp = float(getattr(sp, "repetition_penalty", 1.0) or 1.0)
-            generated_ids = req["generated_ids"]
+            generated_ids = req.generated_ids
             if rp > 1.0 and generated_ids:
                 unique_ids = list(set(int(t) for t in generated_ids))
                 valid_ids = [tid for tid in unique_ids if 0 <= tid < VocabSize]
@@ -178,7 +179,7 @@ class SamplingDriver:
                             row_logits[tid] = float("-inf")
 
             # Anti-template masking
-            anti_template = req.get("anti_template_token_ids")
+            anti_template = req.anti_template_token_ids
             if anti_template and len(generated_ids) < 12:
                 for tid in anti_template:
                     if 0 <= tid < VocabSize:
@@ -187,7 +188,7 @@ class SamplingDriver:
             logits[i] = row_logits
 
         greedy_flags = [
-            float(getattr(req["sampling_params"], "temperature", 0.0) or 0.0) <= 1e-6
+            float(getattr(req.sampling_params, "temperature", 0.0) or 0.0) <= 1e-6
             for req in requests
         ]
         if all(greedy_flags):
@@ -196,23 +197,20 @@ class SamplingDriver:
         # Extract parameters into tensors
         temps = torch.tensor(
             [
-                float(getattr(req["sampling_params"], "temperature", 0.0) or 0.0)
+                float(getattr(req.sampling_params, "temperature", 0.0) or 0.0)
                 for req in requests
             ],
             dtype=torch.float,
             device=device,
         ).unsqueeze(1)
         top_ks = torch.tensor(
-            [
-                int(getattr(req["sampling_params"], "top_k", -1) or -1)
-                for req in requests
-            ],
+            [int(getattr(req.sampling_params, "top_k", -1) or -1) for req in requests],
             dtype=torch.long,
             device=device,
         ).unsqueeze(1)
         top_ps = torch.tensor(
             [
-                float(getattr(req["sampling_params"], "top_p", 1.0) or 1.0)
+                float(getattr(req.sampling_params, "top_p", 1.0) or 1.0)
                 for req in requests
             ],
             dtype=torch.float,
@@ -263,7 +261,7 @@ class SamplingDriver:
                 next_tokens.append(int(torch.argmax(logits_2d[i].float()).item()))
                 continue
 
-            generator = req.get("rng")
+            generator = req.rng
             if generator is not None:
                 token = int(torch.multinomial(row_probs, 1, generator=generator).item())
             else:

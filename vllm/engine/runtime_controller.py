@@ -80,7 +80,7 @@ class RuntimeController:
         )
         for request_id, reason, request in expired:
             if self.lora_registry is not None:
-                self.lora_registry.on_request_removed(request.get("lora_id"))
+                self.lora_registry.on_request_removed(request.lora_id)
             self.observer.on_request_rejected(request_id, reason)
             self.scheduler.publish_exception(
                 request_id,
@@ -97,11 +97,11 @@ class RuntimeController:
         for request_id in admitted:
             req = self.scheduler.get_request(request_id)
             self.backend.maybe_apply_prefix_cache(req)
-            queue_wait_s = max(0.0, now - float(req.get("queued_at") or now))
+            queue_wait_s = max(0.0, now - float(req.queued_at or now))
             self.observer.on_request_admitted(
                 request_id,
                 queue_wait_s,
-                str(req.get("service_class") or "latency"),
+                str(req.service_class or "latency"),
             )
 
     def stats(self) -> dict[str, Any]:

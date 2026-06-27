@@ -7,21 +7,23 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from jsonschema import ValidationError, validate as validate_json_schema
 import xgrammar as xgr
+from jsonschema import ValidationError
+from jsonschema import validate as validate_json_schema
 
+from vllm.engine.request_state import RequestState
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 
 class LiteStructuredOutputConstraint:
-    def apply(self, logits: torch.Tensor, request: dict[str, Any]) -> torch.Tensor:
+    def apply(self, logits: torch.Tensor, request: RequestState) -> torch.Tensor:
         return logits
 
-    def on_token(self, request: dict[str, Any], token_id: int) -> bool:
+    def on_token(self, request: RequestState, token_id: int) -> bool:
         del request, token_id
         return True
 
-    def should_finish(self, request: dict[str, Any]) -> bool:
+    def should_finish(self, request: RequestState) -> bool:
         del request
         return False
 
@@ -79,10 +81,13 @@ class XgrammarStructuredOutputConstraint(LiteStructuredOutputConstraint):
         elif self.grammar_type == "grammar":
             ctx = self._compiler.compile_grammar(self.grammar_spec)
         else:
-            raise ValueError(f"unsupported grammar-backed structured output type: {self.grammar_type}")
+            raise ValueError(
+                "unsupported grammar-backed structured output type: "
+                f"{self.grammar_type}"
+            )
         self._matcher = xgr.GrammarMatcher(ctx, max_rollback_tokens=0)
 
-    def apply(self, logits: torch.Tensor, request: dict[str, Any]) -> torch.Tensor:
+    def apply(self, logits: torch.Tensor, request: RequestState) -> torch.Tensor:
         masked = logits.detach().clone().unsqueeze(0)
         bitmask = self._bitmask.to(device=masked.device)
         bitmask.fill_(-1)
@@ -90,12 +95,12 @@ class XgrammarStructuredOutputConstraint(LiteStructuredOutputConstraint):
         xgr.apply_token_bitmask_inplace(masked, bitmask)
         return masked.squeeze(0)
 
-    def on_token(self, request: dict[str, Any], token_id: int) -> bool:
+    def on_token(self, request: RequestState, token_id: int) -> bool:
         del request
         return bool(self._matcher.accept_token(int(token_id)))
 
-    def should_finish(self, request: dict[str, Any]) -> bool:
-        text = _decode_text(self.tokenizer, list(request.get("generated_ids", [])))
+    def should_finish(self, request: RequestState) -> bool:
+        text = _decode_text(self.tokenizer, list(request.generated_ids))
         if self.finish_mode == "choice":
             return text in set(self.choices or [])
         if self.finish_mode == "json_object":
@@ -240,12 +245,13 @@ class ChoiceStructuredOutputConstraint(LiteStructuredOutputConstraint):
         if not self.choice_token_ids or any(not seq for seq in self.choice_token_ids):
             raise ValueError("structured_outputs.choice must contain non-empty choices")
 
-    def apply(self, logits: torch.Tensor, request: dict[str, Any]) -> torch.Tensor:
-        generated_ids = list(request.get("generated_ids", []))
+    def apply(self, logits: torch.Tensor, request: RequestState) -> torch.Tensor:
+        generated_ids = list(request.generated_ids)
         allowed = {
             seq[len(generated_ids)]
             for seq in self.choice_token_ids
-            if len(seq) > len(generated_ids) and seq[: len(generated_ids)] == generated_ids
+            if len(seq) > len(generated_ids)
+            and seq[: len(generated_ids)] == generated_ids
         }
         if not allowed:
             return logits
@@ -254,8 +260,8 @@ class ChoiceStructuredOutputConstraint(LiteStructuredOutputConstraint):
         masked[index] = logits[index]
         return masked
 
-    def should_finish(self, request: dict[str, Any]) -> bool:
-        generated_ids = list(request.get("generated_ids", []))
+    def should_finish(self, request: RequestState) -> bool:
+        generated_ids = list(request.generated_ids)
         return any(seq == generated_ids for seq in self.choice_token_ids)
 
 
@@ -265,8 +271,8 @@ class JsonStructuredOutputConstraint(LiteStructuredOutputConstraint):
     json_schema: dict[str, Any] | None = None
     candidate_limit: int = 256
 
-    def apply(self, logits: torch.Tensor, request: dict[str, Any]) -> torch.Tensor:
-        generated_ids = list(request.get("generated_ids", []))
+    def apply(self, logits: torch.Tensor, request: RequestState) -> torch.Tensor:
+        generated_ids = list(request.generated_ids)
         if logits.numel() == 0:
             return logits
         candidate_limit = min(int(self.candidate_limit), logits.numel())
@@ -285,13 +291,15 @@ class JsonStructuredOutputConstraint(LiteStructuredOutputConstraint):
             if not allowed:
                 return logits
         masked = torch.full_like(logits, float("-inf"))
-        index = torch.tensor(sorted(set(allowed)), device=logits.device, dtype=torch.long)
+        index = torch.tensor(
+            sorted(set(allowed)), device=logits.device, dtype=torch.long
+        )
         masked[index] = logits[index]
         return masked
 
-    def should_finish(self, request: dict[str, Any]) -> bool:
+    def should_finish(self, request: RequestState) -> bool:
         parsed = _parse_complete_json_object(
-            _decode_text(self.tokenizer, list(request.get("generated_ids", [])))
+            _decode_text(self.tokenizer, list(request.generated_ids))
         )
         if parsed is None:
             return False
@@ -316,10 +324,13 @@ def build_structured_output_constraint(
     except Exception:
         if params.regex is not None or params.grammar is not None:
             raise ValueError(
-                "grammar-backed structured outputs require an xgrammar-compatible tokenizer/backend"
-            )
+                "grammar-backed structured outputs require an "
+                "xgrammar-compatible tokenizer/backend"
+            ) from None
     if params.choice is not None:
-        return ChoiceStructuredOutputConstraint(tokenizer=tokenizer, choices=list(params.choice))
+        return ChoiceStructuredOutputConstraint(
+            tokenizer=tokenizer, choices=list(params.choice)
+        )
     if params.json_object:
         return JsonStructuredOutputConstraint(tokenizer=tokenizer)
     if params.json is not None:
@@ -358,7 +369,9 @@ def _build_xgrammar_constraint(
             finish_mode="json_object",
         )
     if params.json is not None:
-        schema = params.json if isinstance(params.json, dict) else json.loads(params.json)
+        schema = (
+            params.json if isinstance(params.json, dict) else json.loads(params.json)
+        )
         return XgrammarStructuredOutputConstraint(
             tokenizer=tokenizer,
             grammar_type="json",

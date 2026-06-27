@@ -9,97 +9,94 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestState:
+    """Typed request state for the lite engine control plane.
+
+    The previous control plane passed request state around as a ``dict``.  This
+    dataclass keeps the same field names and runtime semantics while making the
+    shape of the state visible to type checkers.  A small dict-like shim
+    (``get``/``__getitem__``/``__setitem__``/``setdefault``) is retained during
+    the transition so callers that still use string-key access continue to work.
+    """
+
     request_id: str
     prompt: str
-    guarded_prompt: str
     input_ids: list[int]
     sampling_params: SamplingParams
+    device: str | None = None
+
+    generated_ids: list[int] = field(default_factory=list)
+    seq_len: int = 0
+    slot_idx: int | None = None
+    is_prefill: bool = True
+    finished: bool = False
+
+    queued_at: float = 0.0
+    admitted_at: float | None = None
+    first_token_at: float | None = None
+
+    multi_modal_data: dict[str, Any] | None = None
+    multi_modal_inputs: Any | None = None
     lora_id: str | None = None
     lora_int_id: int | None = None
     lora_path: str | None = None
-    rng: torch.Generator | None = None
-    generated_ids: list[int] = field(default_factory=list)
-    finished: bool = False
-    slot_idx: int | None = None
-    seq_len: int = 0
-    is_prefill: bool = True
-    linear_attn_carry: list[torch.Tensor | None] = field(default_factory=list)
-    linear_conv_carry: list[torch.Tensor | None] = field(default_factory=list)
-    low_info_hits: int = 0
-    is_chinese_capital_question: bool = False
-    capital_question_bias_token_ids: list[int] = field(default_factory=list)
-    anti_template_token_ids: list[int] = field(default_factory=list)
-    structured_output_constraint: Any = None
     service_class: str = "latency"
-    multi_modal_data: Any = None
+
+    prefix_hit_len: int = 0
+    _prefix_cache_entry: Any | None = None
+    _prefix_cache_hit_len: int = 0
+    _prefix_cache_applied: bool = False
+    _prefix_cache_observed: bool = False
+
+    low_info_hits: int = 0
+    _last_token_tensor: Any | None = None
+    _pending_token_tensors: list[Any] = field(default_factory=list)
+
+    linear_attn_carry: list[Any] | None = None
+    linear_conv_carry: list[Any] | None = None
+
+    structured_output_constraint: Any | None = None
+    anti_template_token_ids: list[int] | None = None
+    capital_question_bias_token_ids: list[int] | None = None
+    is_chinese_capital_question: bool = False
+
+    # Fields introduced after the original typing plan but still required by the
+    # current runtime (request builder, sampling, multimodal scheduling).
+    guarded_prompt: str = ""
+    rng: torch.Generator | None = None
     is_multimodal: bool = False
     is_multimodal_lora: bool = False
 
-    @classmethod
-    def engine_request_fields(cls) -> set[str]:
-        return {
-            "request_id",
-            "input_ids",
-            "generated_ids",
-            "sampling_params",
-            "finished",
-            "prompt",
-            "guarded_prompt",
-            "slot_idx",
-            "seq_len",
-            "is_prefill",
-            "lora_id",
-            "lora_int_id",
-            "lora_path",
-            "rng",
-            "linear_attn_carry",
-            "linear_conv_carry",
-            "low_info_hits",
-            "is_chinese_capital_question",
-            "capital_question_bias_token_ids",
-            "anti_template_token_ids",
-            "structured_output_constraint",
-            "service_class",
-            "multi_modal_data",
-            "is_multimodal",
-            "is_multimodal_lora",
-        }
+    def __post_init__(self) -> None:
+        # Derive multimodal flags from the attached data when not set explicitly.
+        has_image = bool((self.multi_modal_data or {}).get("image"))
+        if not self.is_multimodal and has_image:
+            self.is_multimodal = True
+        if not self.is_multimodal_lora and self.is_multimodal and bool(self.lora_id):
+            self.is_multimodal_lora = True
 
-    def to_engine_request(self) -> dict[str, Any]:
-        request = {
-            "request_id": self.request_id,
-            "input_ids": self.input_ids,
-            "generated_ids": self.generated_ids,
-            "sampling_params": self.sampling_params,
-            "finished": self.finished,
-            "prompt": self.prompt,
-            "guarded_prompt": self.guarded_prompt,
-            "slot_idx": self.slot_idx,
-            "seq_len": self.seq_len,
-            "is_prefill": self.is_prefill,
-            "lora_id": self.lora_id,
-            "lora_int_id": self.lora_int_id,
-            "lora_path": self.lora_path,
-            "rng": self.rng,
-            "linear_attn_carry": self.linear_attn_carry,
-            "linear_conv_carry": self.linear_conv_carry,
-            "low_info_hits": self.low_info_hits,
-            "is_chinese_capital_question": self.is_chinese_capital_question,
-            "capital_question_bias_token_ids": self.capital_question_bias_token_ids,
-            "anti_template_token_ids": self.anti_template_token_ids,
-            "structured_output_constraint": self.structured_output_constraint,
-            "service_class": self.service_class,
-            "multi_modal_data": self.multi_modal_data,
-            "is_multimodal": self.is_multimodal,
-            "is_multimodal_lora": self.is_multimodal_lora,
-        }
-        missing = self.engine_request_fields() - set(request)
-        extra = set(request) - self.engine_request_fields()
-        if missing or extra:
-            raise AssertionError(
-                f"RequestState engine fields mismatch: missing={sorted(missing)} "
-                f"extra={sorted(extra)}"
-            )
-        return request
+    # Backwards-compatible dict-like accessors --------------------------------
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        """Return the attribute named ``key`` if it exists, else ``default``."""
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            return default
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
+    def setdefault(self, key: str, default: Any) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            setattr(self, key, default)
+            return default

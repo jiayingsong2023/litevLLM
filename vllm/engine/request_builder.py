@@ -42,7 +42,7 @@ class LiteRequestBuilder:
         lora_int_id: Optional[int] = None,
         lora_path: Optional[str] = None,
         multi_modal_data: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> RequestState:
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
         max_tokens = min(max_tokens, self.max_tokens_cap)
@@ -79,19 +79,27 @@ class LiteRequestBuilder:
             rng=rng,
             linear_attn_carry=[None] * self.num_layers,
             linear_conv_carry=[None] * self.num_layers,
-            is_chinese_capital_question=self.policies.is_chinese_capital_question(prompt),
-            capital_question_bias_token_ids=self.policies.capital_question_bias_token_ids(prompt),
+            is_chinese_capital_question=self.policies.is_chinese_capital_question(
+                prompt
+            ),
+            capital_question_bias_token_ids=self.policies.capital_question_bias_token_ids(
+                prompt
+            ),
             anti_template_token_ids=self.policies.anti_template_token_ids(),
-            service_class=str(getattr(effective_sampling_params, "service_class", "latency") or "latency"),
+            service_class=str(
+                getattr(effective_sampling_params, "service_class", "latency")
+                or "latency"
+            ),
             multi_modal_data=copy.deepcopy(multi_modal_data),
             is_multimodal=bool((multi_modal_data or {}).get("image")),
-            is_multimodal_lora=bool(lora_id) and bool((multi_modal_data or {}).get("image")),
-        ).to_engine_request()
-        request_state["structured_output_constraint"] = build_structured_output_constraint(
+            is_multimodal_lora=bool(lora_id)
+            and bool((multi_modal_data or {}).get("image")),
+        )
+        request_state.structured_output_constraint = build_structured_output_constraint(
             self.tokenizer,
             effective_sampling_params,
         )
-        request_state["queued_at"] = time.perf_counter()
-        request_state["admitted_at"] = None
-        request_state["first_token_at"] = None
+        request_state.queued_at = time.perf_counter()
+        request_state.admitted_at = None
+        request_state.first_token_at = None
         return request_state

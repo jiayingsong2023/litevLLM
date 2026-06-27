@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import Any
 import base64
 import io
 import urllib.request
+from typing import Any
 from urllib.parse import urlparse
 
 import torch
 from PIL import Image
 
+from vllm.engine.request_state import RequestState
 from vllm.model_executor.models.interfaces import supports_multimodal
 
 
@@ -38,8 +39,8 @@ class LiteMultiModalProcessor:
         self.embeddings_computed = 0
         self.embedding_feature_dim = 0
 
-    def prepare_request(self, request: dict[str, Any]) -> None:
-        mm_data = request.get("multi_modal_data")
+    def prepare_request(self, request: RequestState) -> None:
+        mm_data = request.multi_modal_data
         if not mm_data:
             return
         try:
@@ -51,10 +52,12 @@ class LiteMultiModalProcessor:
             pixel_values_rows = []
             for item in images:
                 if not isinstance(item, dict) or not isinstance(item.get("image"), str):
-                    raise ValueError("multi_modal_data.image item must contain string image url")
+                    raise ValueError(
+                        "multi_modal_data.image item must contain string image url"
+                    )
                 image = self._load_image(item["image"])
                 pixel_values_rows.append(self._image_to_pixel_values(image))
-            request["multi_modal_inputs"] = {
+            request.multi_modal_inputs = {
                 "pixel_values": torch.cat(pixel_values_rows, dim=0),
             }
             self.prepared_requests += 1
@@ -63,15 +66,18 @@ class LiteMultiModalProcessor:
             self.prepare_failures += 1
             raise
 
-    def build_prefill_inputs(self, req_dicts: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        mm_requests = [req for req in req_dicts if req.get("multi_modal_inputs")]
+    def build_prefill_inputs(
+        self, req_dicts: list[RequestState]
+    ) -> dict[str, torch.Tensor]:
+        mm_requests = [req for req in req_dicts if req.multi_modal_inputs]
         if not mm_requests:
             return {}
         if len(req_dicts) != 1 or len(mm_requests) != 1:
             raise ValueError(
-                "lite multimodal prefill currently supports single-request image batches only"
+                "lite multimodal prefill currently supports "
+                "single-request image batches only"
             )
-        mm_inputs = mm_requests[0].get("multi_modal_inputs") or {}
+        mm_inputs = mm_requests[0].multi_modal_inputs or {}
         pixel_values = mm_inputs.get("pixel_values")
         if pixel_values is None:
             return {}

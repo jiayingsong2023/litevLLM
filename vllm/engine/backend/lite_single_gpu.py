@@ -10,6 +10,7 @@ import torch
 
 from vllm.engine.errors import ExecutionStepError
 from vllm.engine.prefix_cache import PrefixCache, PrefixCacheEntry
+from vllm.engine.request_state import RequestState
 from vllm.engine.step_plan import StepPlan
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
@@ -85,17 +86,17 @@ class LiteSingleGpuBackend:
         self.gpu_greedy_bypass_cpu_policies = bool(gpu_greedy_bypass_cpu_policies)
         self.gpu_greedy_ignore_eos = bool(gpu_greedy_ignore_eos)
 
-    def maybe_apply_prefix_cache(self, request_state) -> None:
+    def maybe_apply_prefix_cache(self, request_state: RequestState) -> None:
         cache_key = self._prefix_cache_key(request_state)
         if not cache_key:
             return None
 
-        entry = request_state.get("_prefix_cache_entry")
-        prefix_len = int(request_state.get("_prefix_cache_hit_len") or 0)
+        entry = request_state._prefix_cache_entry
+        prefix_len = int(request_state._prefix_cache_hit_len or 0)
         if entry is None:
             entry, cache_prefix_len = self.prefix_cache.get_longest_prefix(cache_key)
             prefix_len = self._request_prefix_len_from_cache_prefix(cache_prefix_len)
-            exact_hit = prefix_len == len(request_state.get("input_ids", []))
+            exact_hit = prefix_len == len(request_state.input_ids)
             if (
                 entry is None
                 or prefix_len <= 0
@@ -112,8 +113,8 @@ class LiteSingleGpuBackend:
                     saved_prefill_tokens=0,
                 )
                 return None
-            request_state["_prefix_cache_entry"] = entry
-            request_state["_prefix_cache_hit_len"] = prefix_len
+            request_state._prefix_cache_entry = entry
+            request_state._prefix_cache_hit_len = prefix_len
             self._record_prefix_cache_event(
                 request_state,
                 hit=True,
@@ -122,14 +123,12 @@ class LiteSingleGpuBackend:
                 saved_prefill_tokens=prefix_len,
             )
 
-        if request_state.get("slot_idx") is None or request_state.get(
-            "_prefix_cache_applied"
-        ):
+        if request_state.slot_idx is None or request_state._prefix_cache_applied:
             return None
 
         self._ensure_runtime_ready()
         self._materialize_prefix_cache_entry(request_state, entry, prefix_len)
-        request_state["_prefix_cache_applied"] = True
+        request_state._prefix_cache_applied = True
         return None
 
     def maybe_preempt(self, step_plan, scheduler):
@@ -205,8 +204,8 @@ class LiteSingleGpuBackend:
             logits[:, -1, :], requests
         )
         for rid, req, token in zip(request_ids, requests, next_tokens):
-            req["generated_ids"].append(token)
-            req["seq_len"] += 1
+            req.generated_ids.append(token)
+            req.seq_len += 1
             self._process_completion(rid, token, results)
         return results
 
@@ -225,12 +224,12 @@ class LiteSingleGpuBackend:
 
             finished_indices: list[int] = []
             finished_rids: list[str] = []
-            finished_reqs: list[dict[str, Any]] = []
+            finished_reqs: list[RequestState] = []
             finished_logits_list: list[torch.Tensor] = []
 
             for i, rid in enumerate(step_plan.prefills.request_ids):
                 req = self.scheduler.get_request(rid)
-                req["seq_len"] += step_plan.prefills.chunk_len
+                req.seq_len += step_plan.prefills.chunk_len
                 if not is_last_chunk_flags[i]:
                     continue
                 self._store_prefix_cache_entry(rid, req, logits[i, -1, :])
@@ -247,8 +246,8 @@ class LiteSingleGpuBackend:
                 for rid, req, next_token in zip(
                     finished_rids, finished_reqs, next_tokens
                 ):
-                    req["generated_ids"].append(next_token)
-                    req["is_prefill"] = False
+                    req.generated_ids.append(next_token)
+                    req.is_prefill = False
                     self._process_completion(rid, next_token, results)
 
             self.observer.on_prefill_executed(step_plan.prefills, len(results))
@@ -276,8 +275,8 @@ class LiteSingleGpuBackend:
             for rid, req_i, token in zip(
                 step_plan.decodes.request_ids, requests, next_tokens
             ):
-                req_i["generated_ids"].append(token)
-                req_i["seq_len"] += 1
+                req_i.generated_ids.append(token)
+                req_i.seq_len += 1
                 self._process_completion(rid, token, results)
             self.observer.on_decode_executed(step_plan.decodes, len(results))
         except Exception as e:
@@ -300,7 +299,7 @@ class LiteSingleGpuBackend:
         ignore_eos = self.gpu_greedy_ignore_eos
         for rid in request_ids:
             req = self.scheduler.get_request(rid)
-            sp = req["sampling_params"]
+            sp = req.sampling_params
             if float(getattr(sp, "temperature", 0.0) or 0.0) > 1e-6:
                 return False
             if abs(float(getattr(sp, "repetition_penalty", 1.0) or 1.0) - 1.0) > 1e-12:
@@ -319,13 +318,14 @@ class LiteSingleGpuBackend:
                             return False
                     except Exception:
                         return False
-            if req.get("structured_output_constraint") is not None:
+            if req.structured_output_constraint is not None:
                 return False
             if not bypass_cpu_policies:
-                if req.get("anti_template_token_ids"):
+                if req.anti_template_token_ids:
                     return False
-                if req.get("capital_question_bias_token_ids") or req.get(
-                    "is_chinese_capital_question"
+                if (
+                    req.capital_question_bias_token_ids
+                    or req.is_chinese_capital_question
                 ):
                     return False
         return True
@@ -340,19 +340,19 @@ class LiteSingleGpuBackend:
         for i, rid in enumerate(request_ids):
             req = self.scheduler.get_request(rid)
             token_t = next_tokens[i].detach()
-            req["_last_token_tensor"] = token_t
-            pending = req.setdefault("_pending_token_tensors", [])
+            req._last_token_tensor = token_t
+            pending = req._pending_token_tensors
             pending.append(token_t)
-            req["seq_len"] += 1
+            req.seq_len += 1
 
             now = time.perf_counter()
-            if req.get("first_token_at") is None:
-                req["first_token_at"] = now
-                admitted_at = float(req.get("admitted_at") or now)
+            if req.first_token_at is None:
+                req.first_token_at = now
+                admitted_at = float(req.admitted_at or now)
                 self.observer.on_first_token(rid, max(0.0, now - admitted_at))
 
-            generated_len = len(req["generated_ids"]) + len(pending)
-            max_tok = int(req["sampling_params"].max_tokens or 16)
+            generated_len = len(req.generated_ids) + len(pending)
+            max_tok = int(req.sampling_params.max_tokens or 16)
             if generated_len < max_tok:
                 continue
 
@@ -360,13 +360,13 @@ class LiteSingleGpuBackend:
             # token. The generated list is restored before finalize_step so
             # output text and token_ids keep the normal API contract.
             pending_tokens = torch.stack(pending).to(device="cpu").tolist()
-            req["generated_ids"].extend(int(t) for t in pending_tokens)
-            req["_pending_token_tensors"] = []
-            req.pop("_last_token_tensor", None)
+            req.generated_ids.extend(int(t) for t in pending_tokens)
+            req._pending_token_tensors = []
+            req._last_token_tensor = None
             last_token = (
                 int(pending_tokens[-1])
                 if pending_tokens
-                else int(req["generated_ids"][-1])
+                else int(req.generated_ids[-1])
             )
             self._process_completion(rid, last_token, results)
         return results
@@ -447,21 +447,19 @@ class LiteSingleGpuBackend:
     ) -> None:
         req = self.scheduler.get_request(request_id)
         now = time.perf_counter()
-        if req.get("first_token_at") is None:
-            req["first_token_at"] = now
-            admitted_at = float(req.get("admitted_at") or now)
+        if req.first_token_at is None:
+            req.first_token_at = now
+            admitted_at = float(req.admitted_at or now)
             self.observer.on_first_token(request_id, max(0.0, now - admitted_at))
         out = self.output_coordinator.finalize_step(request_id, req, next_token)
         self.scheduler.publish_output(request_id, out)
         results.append(out)
 
-        if req["finished"]:
+        if req.finished:
             finish_reason = "completed"
             if next_token in self.sampling_driver.completion_eos_ids(req):
                 finish_reason = "eos"
-            elif len(req["generated_ids"]) >= int(
-                req["sampling_params"].max_tokens or 16
-            ):
+            elif len(req.generated_ids) >= int(req.sampling_params.max_tokens or 16):
                 finish_reason = "max_tokens"
             self.observer.on_request_finished(request_id, finish_reason)
             self._free_request(request_id)
@@ -469,7 +467,7 @@ class LiteSingleGpuBackend:
     def _free_request(self, request_id: str) -> None:
         request = self.scheduler.free_request(request_id)
         if request is not None and self.lora_registry is not None:
-            self.lora_registry.on_request_removed(request.get("lora_id"))
+            self.lora_registry.on_request_removed(request.lora_id)
 
     def _ensure_runtime_ready(self) -> None:
         if self.sampling_driver is None or self.output_coordinator is None:
@@ -479,17 +477,17 @@ class LiteSingleGpuBackend:
 
     def _record_prefix_cache_event(
         self,
-        request_state: dict[str, Any],
+        request_state: RequestState,
         *,
         hit: bool,
         exact: bool,
         prefix_len: int,
         saved_prefill_tokens: int,
     ) -> None:
-        if request_state.get("_prefix_cache_observed"):
+        if request_state._prefix_cache_observed:
             return
-        request_state["_prefix_cache_observed"] = True
-        request_id = request_state.get("request_id", "<unknown>")
+        request_state._prefix_cache_observed = True
+        request_id = request_state.request_id or "<unknown>"
         self.observer.on_prefix_cache_event(
             request_id,
             hit=hit,
@@ -509,7 +507,7 @@ class LiteSingleGpuBackend:
         if not self.preemptible_service_classes or step_plan.prefills is None:
             return True
         return all(
-            str(scheduler.get_request(rid).get("service_class") or "latency")
+            str(scheduler.get_request(rid).service_class or "latency")
             in self.preemptible_service_classes
             for rid in step_plan.prefills.request_ids
         )
@@ -556,21 +554,20 @@ class LiteSingleGpuBackend:
         )
 
     @staticmethod
-    def _is_multimodal_request(request: dict[str, Any]) -> bool:
+    def _is_multimodal_request(request: RequestState) -> bool:
         return bool(
-            request.get("is_multimodal")
-            or (request.get("multi_modal_data") or {}).get("image")
+            request.is_multimodal or (request.multi_modal_data or {}).get("image")
         )
 
     def _store_prefix_cache_entry(
         self,
         request_id: str,
-        request_state: dict[str, Any],
+        request_state: RequestState,
         last_prompt_logits: torch.Tensor,
     ) -> None:
         del request_id
-        prompt_len = int(request_state.get("seq_len") or 0)
-        slot_idx = request_state.get("slot_idx")
+        prompt_len = int(request_state.seq_len or 0)
+        slot_idx = request_state.slot_idx
         if prompt_len <= 0 or slot_idx is None:
             return
 
@@ -588,47 +585,47 @@ class LiteSingleGpuBackend:
 
     def _materialize_prefix_cache_entry(
         self,
-        request_state: dict[str, Any],
+        request_state: RequestState,
         entry: PrefixCacheEntry,
         prefix_len: int,
     ) -> None:
         prefix_len = max(0, min(int(prefix_len), int(entry.prompt_len)))
         if prefix_len <= 0:
             return
-        slot_idx = int(request_state["slot_idx"])
+        slot_idx = int(request_state.slot_idx)
         self.kv_block_manager.materialize_prefix_entry(
             slot_idx=slot_idx,
             entry=entry,
             prefix_len=prefix_len,
         )
 
-        request_state["seq_len"] = prefix_len
-        request_state["is_prefill"] = prefix_len < len(request_state["input_ids"])
+        request_state.seq_len = prefix_len
+        request_state.is_prefill = prefix_len < len(request_state.input_ids)
         self.prefix_cache_materialized_hits += 1
         self.prefix_cache_materialized_saved_prefill_tokens += prefix_len
-        if prefix_len != len(request_state["input_ids"]):
+        if prefix_len != len(request_state.input_ids):
             self.prefix_cache_materialized_partial_hits += 1
             return
         self.prefix_cache_materialized_exact_hits += 1
 
-        request_id = request_state["request_id"]
+        request_id = request_state.request_id
         next_token = self.sampling_driver.sample_next_token(
             entry.last_prompt_logits,
             request_state,
         )
-        request_state["generated_ids"].append(next_token)
+        request_state.generated_ids.append(next_token)
         results: list[RequestOutput] = []
         self._process_completion(request_id, next_token, results)
 
-    def _prefix_cache_key(self, request_state: dict[str, Any]) -> tuple[int, ...]:
-        input_ids = tuple(int(tok) for tok in request_state.get("input_ids", []))
+    def _prefix_cache_key(self, request_state: RequestState) -> tuple[int, ...]:
+        input_ids = tuple(int(tok) for tok in request_state.input_ids)
         if not input_ids:
             return ()
         namespace = self._prefix_cache_namespace(request_state)
         return (namespace, *input_ids)
 
-    def _prefix_cache_namespace(self, request_state: dict[str, Any]) -> int:
-        mm_data = request_state.get("multi_modal_data") or {}
+    def _prefix_cache_namespace(self, request_state: RequestState) -> int:
+        mm_data = request_state.multi_modal_data or {}
         images = mm_data.get("image") or []
         if not images:
             return -1

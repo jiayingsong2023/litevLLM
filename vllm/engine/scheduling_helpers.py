@@ -32,18 +32,15 @@ def percentile(values: list[float], q: float) -> float:
 
 
 def is_multimodal(request) -> bool:
-    return bool(
-        request.get("is_multimodal")
-        or (request.get("multi_modal_data") or {}).get("image")
-    )
+    return bool(request.is_multimodal or (request.multi_modal_data or {}).get("image"))
 
 
 def is_multimodal_lora(request) -> bool:
-    return is_multimodal(request) and bool(request.get("lora_id"))
+    return is_multimodal(request) and bool(request.lora_id)
 
 
 def lora_adapter_key(request, *, base_lora_adapter: str = BASE_LORA_ADAPTER) -> str:
-    lora_id = request.get("lora_id")
+    lora_id = request.lora_id
     if not lora_id:
         return base_lora_adapter
     return str(lora_id)

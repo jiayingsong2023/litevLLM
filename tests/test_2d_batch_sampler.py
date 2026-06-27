@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm.engine.request_state import RequestState
 from vllm.engine.sampling_driver import SamplingDriver
 from vllm.sampling_params import SamplingParams
 
@@ -43,18 +44,27 @@ def test_2d_batch_sampler_greedy():
     )
 
     requests = [
-        {
-            "generated_ids": [],
-            "sampling_params": SamplingParams(temperature=0.0),
-        },
-        {
-            "generated_ids": [1, 2],
-            "sampling_params": SamplingParams(temperature=0.0),
-        },
-        {
-            "generated_ids": [],
-            "sampling_params": SamplingParams(temperature=0.0),
-        },
+        RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
+        RequestState(
+            request_id="r1",
+            prompt="",
+            input_ids=[],
+            generated_ids=[1, 2],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
+        RequestState(
+            request_id="r2",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
     ]
 
     tokens = driver.sample_batch_tokens(logits, requests)
@@ -76,8 +86,20 @@ def test_2d_batch_sampler_greedy_skips_sort_and_softmax(
         dtype=torch.float32,
     )
     requests = [
-        {"generated_ids": [], "sampling_params": SamplingParams(temperature=0.0)},
-        {"generated_ids": [], "sampling_params": SamplingParams(temperature=0.0)},
+        RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
+        RequestState(
+            request_id="r1",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
     ]
 
     def _unexpected_sort(*args, **kwargs):
@@ -116,22 +138,34 @@ def test_2d_batch_sampler_mixed_params_and_penalties():
     )
 
     requests = [
-        {
-            "generated_ids": [],
-            "sampling_params": SamplingParams(temperature=0.0),
-        },
-        {
-            "generated_ids": [2],
-            "sampling_params": SamplingParams(temperature=0.0, repetition_penalty=5.0),
-        },
-        {
-            "generated_ids": [2],
-            "sampling_params": SamplingParams(temperature=0.0, presence_penalty=9.0),
-        },
-        {
-            "generated_ids": [2, 2],
-            "sampling_params": SamplingParams(temperature=0.0, frequency_penalty=4.0),
-        },
+        RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        ),
+        RequestState(
+            request_id="r1",
+            prompt="",
+            input_ids=[],
+            generated_ids=[2],
+            sampling_params=SamplingParams(temperature=0.0, repetition_penalty=5.0),
+        ),
+        RequestState(
+            request_id="r2",
+            prompt="",
+            input_ids=[],
+            generated_ids=[2],
+            sampling_params=SamplingParams(temperature=0.0, presence_penalty=9.0),
+        ),
+        RequestState(
+            request_id="r3",
+            prompt="",
+            input_ids=[],
+            generated_ids=[2, 2],
+            sampling_params=SamplingParams(temperature=0.0, frequency_penalty=4.0),
+        ),
     ]
 
     tokens = driver.sample_batch_tokens(logits, requests)
@@ -160,14 +194,20 @@ def test_2d_batch_sampler_top_k_top_p():
     )
 
     requests = [
-        {
-            "generated_ids": [],
-            "sampling_params": SamplingParams(temperature=1.0, top_k=3),
-        },
-        {
-            "generated_ids": [],
-            "sampling_params": SamplingParams(temperature=1.0, top_p=0.4),
-        },
+        RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=1.0, top_k=3),
+        ),
+        RequestState(
+            request_id="r1",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=1.0, top_p=0.4),
+        ),
     ]
 
     # Run multiple times to verify token distribution is constrained
@@ -188,7 +228,13 @@ def test_2d_batch_sampler_empty_and_shapes():
     # 1D single-token squeeze test
     logits_1d = torch.tensor([1.0, 5.0, 2.0], dtype=torch.float32)
     requests = [
-        {"generated_ids": [], "sampling_params": SamplingParams(temperature=0.0)}
+        RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=[],
+            generated_ids=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        )
     ]
     assert driver.sample_batch_tokens(logits_1d, requests) == [1]
 

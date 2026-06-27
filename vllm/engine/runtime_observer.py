@@ -4,13 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm.engine.request_state import RequestState
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 
 class RuntimeObserver:
-    def on_request_added(self, request_id: str, request: dict[str, Any]) -> None:
+    def on_request_added(self, request_id: str, request: RequestState) -> None:
         pass
 
     def on_request_admitted(
@@ -102,7 +103,9 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     rejected: list[tuple[str, str]] = field(default_factory=list)
     rejection_reason_counts: dict[str, int] = field(default_factory=dict)
     admitted: list[tuple[str, float, str]] = field(default_factory=list)
-    prefix_cache_events: list[tuple[str, bool, bool, int, int]] = field(default_factory=list)
+    prefix_cache_events: list[tuple[str, bool, bool, int, int]] = field(
+        default_factory=list
+    )
     prefix_cache_hits: int = 0
     prefix_cache_misses: int = 0
     prefix_cache_exact_hits: int = 0
@@ -187,14 +190,14 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     multimodal_max_queue_wait_s: float = 0.0
     multimodal_queue_wait_samples_s: list[float] = field(default_factory=list)
 
-    def on_request_added(self, request_id: str, request: dict[str, Any]) -> None:
-        mm_data = request.get("multi_modal_data") or {}
+    def on_request_added(self, request_id: str, request: RequestState) -> None:
+        mm_data = request.multi_modal_data or {}
         images = mm_data.get("image") if isinstance(mm_data, dict) else None
         self.added.append(request_id)
         if isinstance(images, list) and images:
             self.multimodal_requests += 1
             self.multimodal_images += len(images)
-            if request.get("lora_id"):
+            if request.lora_id:
                 self.multimodal_lora_requests += 1
 
     def on_request_rejected(self, request_id: str, reason: str) -> None:
@@ -264,9 +267,7 @@ class InMemoryRuntimeObserver(RuntimeObserver):
         queued_backlog: int,
         multimodal_prefill_requests: int = 0,
     ) -> None:
-        self.preemption_events.append(
-            (preempted_prefill_requests, queued_backlog)
-        )
+        self.preemption_events.append((preempted_prefill_requests, queued_backlog))
         self.preempted_steps += 1
         self.preempted_prefill_requests += max(0, int(preempted_prefill_requests))
         self.preempted_multimodal_prefill_requests += max(
@@ -417,9 +418,9 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             self.lora_decode_relaxed_steps += 1
         if getattr(plan, "decode_lora_limit_tightened", False):
             self.lora_decode_tightened_steps += 1
-        if len((getattr(plan, "prefill_lora_adapters", None) or {})) > 1:
+        if len(getattr(plan, "prefill_lora_adapters", None) or {}) > 1:
             self.mixed_lora_prefill_steps += 1
-        if len((getattr(plan, "decode_lora_adapters", None) or {})) > 1:
+        if len(getattr(plan, "decode_lora_adapters", None) or {}) > 1:
             self.mixed_lora_decode_steps += 1
         self.max_queue_wait_s = max(
             self.max_queue_wait_s,
@@ -435,7 +436,9 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             self.per_class_max_queue_wait_s,
             getattr(plan, "queued_service_class_max_wait_s", None) or {},
         )
-        self.queue_wait_samples_s.append(float(getattr(plan, "queued_p95_wait_s", 0.0) or 0.0))
+        self.queue_wait_samples_s.append(
+            float(getattr(plan, "queued_p95_wait_s", 0.0) or 0.0)
+        )
         self._merge_wait_samples(
             self.per_class_queue_wait_samples_s,
             getattr(plan, "queued_service_class_p95_wait_s", None) or {},
@@ -459,7 +462,9 @@ class InMemoryRuntimeObserver(RuntimeObserver):
         self.aborted.append(request_id)
 
     def on_background_error(self, exc: BaseException, request_ids: list[str]) -> None:
-        self.background_errors.append(f"{type(exc).__name__}:{exc}:{','.join(request_ids)}")
+        self.background_errors.append(
+            f"{type(exc).__name__}:{exc}:{','.join(request_ids)}"
+        )
 
     def on_model_surface_resolved(
         self,
@@ -525,11 +530,21 @@ class InMemoryRuntimeObserver(RuntimeObserver):
                 "prefill_requests": self.step_multimodal_prefill_requests,
                 "decode_requests": self.step_multimodal_decode_requests,
                 "queued_requests": self.step_multimodal_queued_requests,
-                "admitted_multimodal_lora_requests": self.step_multimodal_lora_admitted_requests,
-                "prefill_multimodal_lora_requests": self.step_multimodal_lora_prefill_requests,
-                "decode_multimodal_lora_requests": self.step_multimodal_lora_decode_requests,
-                "queued_multimodal_lora_requests": self.step_multimodal_lora_queued_requests,
-                "mixed_multimodal_lora_prefill_steps": self.mixed_multimodal_lora_prefill_steps,
+                "admitted_multimodal_lora_requests": (
+                    self.step_multimodal_lora_admitted_requests
+                ),
+                "prefill_multimodal_lora_requests": (
+                    self.step_multimodal_lora_prefill_requests
+                ),
+                "decode_multimodal_lora_requests": (
+                    self.step_multimodal_lora_decode_requests
+                ),
+                "queued_multimodal_lora_requests": (
+                    self.step_multimodal_lora_queued_requests
+                ),
+                "mixed_multimodal_lora_prefill_steps": (
+                    self.mixed_multimodal_lora_prefill_steps
+                ),
                 "prefix_cache_hits": self.multimodal_prefix_cache_hits,
                 "prefix_cache_misses": self.multimodal_prefix_cache_misses,
                 "prefix_cache_saved_prefill_tokens": (
@@ -637,7 +652,9 @@ class InMemoryRuntimeObserver(RuntimeObserver):
                 "partial_hits": self.prefix_cache_partial_hits,
                 "saved_prefill_tokens": self.prefix_cache_saved_prefill_tokens,
                 "hit_rate": (
-                    prefix_cache_hits / prefix_cache_events if prefix_cache_events else 0.0
+                    prefix_cache_hits / prefix_cache_events
+                    if prefix_cache_events
+                    else 0.0
                 ),
                 "exact_hit_rate": (
                     self.prefix_cache_exact_hits / prefix_cache_hits
@@ -677,9 +694,13 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             "fairness": {
                 "aged_admissions": self.aged_admissions,
                 "starvation_protected_steps": self.starvation_protected_steps,
-                "fairness_guardrail_triggered_steps": self.fairness_guardrail_triggered_steps,
+                "fairness_guardrail_triggered_steps": (
+                    self.fairness_guardrail_triggered_steps
+                ),
                 "backlog_service_classes": dict(self.fairness_backlog_service_classes),
-                "admitted_service_classes": dict(self.fairness_admitted_service_classes),
+                "admitted_service_classes": dict(
+                    self.fairness_admitted_service_classes
+                ),
                 "prefill_service_classes": dict(self.fairness_prefill_service_classes),
                 "decode_service_classes": dict(self.fairness_decode_service_classes),
                 "max_queue_wait_s": self.max_queue_wait_s,
@@ -869,14 +890,15 @@ class InMemoryRuntimeObserver(RuntimeObserver):
 
 
 class LoggingRuntimeObserver(RuntimeObserver):
-    def on_request_added(self, request_id: str, request: dict[str, Any]) -> None:
-        mm_data = request.get("multi_modal_data") or {}
+    def on_request_added(self, request_id: str, request: RequestState) -> None:
+        mm_data = request.multi_modal_data or {}
         images = mm_data.get("image") if isinstance(mm_data, dict) else None
         logger.info(
-            "runtime request added id=%s prompt_tokens=%s is_prefill=%s multimodal_images=%s",
+            "runtime request added id=%s prompt_tokens=%s "
+            "is_prefill=%s multimodal_images=%s",
             request_id,
-            len(request.get("input_ids", [])),
-            request.get("is_prefill"),
+            len(request.input_ids),
+            request.is_prefill,
             len(images) if isinstance(images, list) else 0,
         )
 
@@ -906,7 +928,8 @@ class LoggingRuntimeObserver(RuntimeObserver):
         saved_prefill_tokens: int,
     ) -> None:
         logger.debug(
-            "runtime prefix cache id=%s hit=%s exact=%s prefix_len=%s saved_prefill_tokens=%s",
+            "runtime prefix cache id=%s hit=%s exact=%s "
+            "prefix_len=%s saved_prefill_tokens=%s",
             request_id,
             hit,
             exact,
@@ -922,7 +945,8 @@ class LoggingRuntimeObserver(RuntimeObserver):
         multimodal_prefill_requests: int = 0,
     ) -> None:
         logger.debug(
-            "runtime preemption preempted_prefill_requests=%s queued_backlog=%s multimodal_prefills=%s",
+            "runtime preemption preempted_prefill_requests=%s "
+            "queued_backlog=%s multimodal_prefills=%s",
             preempted_prefill_requests,
             queued_backlog,
             multimodal_prefill_requests,
@@ -935,7 +959,8 @@ class LoggingRuntimeObserver(RuntimeObserver):
         prefix_cache_hit_rate: float,
     ) -> None:
         logger.debug(
-            "runtime multimodal preemption guard protected_prefill_requests=%s prefix_cache_hit_rate=%.4f",
+            "runtime multimodal preemption guard "
+            "protected_prefill_requests=%s prefix_cache_hit_rate=%.4f",
             protected_prefill_requests,
             prefix_cache_hit_rate,
         )

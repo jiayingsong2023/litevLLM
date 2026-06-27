@@ -36,11 +36,11 @@ class ServiceClassSelector:
         request_meta: dict[str, tuple[str, int, float]] = {}
         for rid in request_ids:
             request = scheduler.get_request(rid)
-            service_class = str(request.get("service_class") or "latency")
+            service_class = str(request.service_class or "latency")
             request_meta[rid] = (
                 service_class,
-                len(request.get("input_ids", [])),
-                float(request.get("queued_at") or 0.0),
+                len(request.input_ids),
+                float(request.queued_at or 0.0),
             )
             groups.setdefault(service_class, []).append(rid)
         for service_class, grouped_ids in groups.items():
@@ -164,9 +164,7 @@ class LoRAConstraint:
             return [], max_lora_adapters, {}, False, False
         baseline_share = normalized_share_map(baseline_counts)
         pre_limit_gap = share_gap_map(
-            normalized_share_map(
-                self.count_lora_adapters(scheduler, request_ids)
-            ),
+            normalized_share_map(self.count_lora_adapters(scheduler, request_ids)),
             baseline_share,
         )
         effective_limit = max_lora_adapters
@@ -202,9 +200,7 @@ class LoRAConstraint:
                 cursor_attr=cursor_attr,
             )
         fairness_gap = share_gap_map(
-            normalized_share_map(
-                self.count_lora_adapters(scheduler, request_ids)
-            ),
+            normalized_share_map(self.count_lora_adapters(scheduler, request_ids)),
             baseline_share,
         )
         return request_ids, effective_limit, fairness_gap, relaxed, tightened
@@ -239,13 +235,15 @@ class LoRAConstraint:
         ]
         return shaped or request_ids[:1]
 
-    def lora_adapters_for_ids(self, scheduler: Any, request_ids: list[str]) -> list[str]:
-        adapters = {
-            lora_adapter_key(scheduler.get_request(rid)) for rid in request_ids
-        }
+    def lora_adapters_for_ids(
+        self, scheduler: Any, request_ids: list[str]
+    ) -> list[str]:
+        adapters = {lora_adapter_key(scheduler.get_request(rid)) for rid in request_ids}
         return sorted(adapters)
 
-    def count_lora_adapters(self, scheduler: Any, request_ids: list[str]) -> dict[str, int]:
+    def count_lora_adapters(
+        self, scheduler: Any, request_ids: list[str]
+    ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for rid in request_ids:
             key = lora_adapter_key(scheduler.get_request(rid))
@@ -278,10 +276,12 @@ class MultiModalConstraint:
             ):
                 effective_limit = min(
                     candidate_mm_count,
-                    effective_limit + step_scheduler.multimodal_prefill_limit_relax_delta,
+                    effective_limit
+                    + step_scheduler.multimodal_prefill_limit_relax_delta,
                 )
                 relaxed = (
-                    effective_limit > step_scheduler.max_prefill_multimodal_requests_per_batch
+                    effective_limit
+                    > step_scheduler.max_prefill_multimodal_requests_per_batch
                 )
             elif (
                 step_scheduler.multimodal_prefix_cache_tighten_threshold > 0
@@ -290,10 +290,12 @@ class MultiModalConstraint:
             ):
                 effective_limit = max(
                     1,
-                    effective_limit - step_scheduler.multimodal_prefill_limit_tighten_delta,
+                    effective_limit
+                    - step_scheduler.multimodal_prefill_limit_tighten_delta,
                 )
                 tightened = (
-                    effective_limit < step_scheduler.max_prefill_multimodal_requests_per_batch
+                    effective_limit
+                    < step_scheduler.max_prefill_multimodal_requests_per_batch
                 )
         shaped = self.apply_multimodal_request_limit(
             scheduler=scheduler,
@@ -339,7 +341,9 @@ class MultiModalConstraint:
         return shaped or request_ids[:1]
 
     def count_multimodal_requests(self, scheduler: Any, request_ids: list[str]) -> int:
-        return sum(1 for rid in request_ids if is_multimodal(scheduler.get_request(rid)))
+        return sum(
+            1 for rid in request_ids if is_multimodal(scheduler.get_request(rid))
+        )
 
 
 class MultiModalLoRAConstraint:
@@ -415,9 +419,7 @@ class MultiModalLoRAConstraint:
                 max_fairness_gap,
             )
         multimodal_lora_ids = [
-            rid
-            for rid in request_ids
-            if is_multimodal_lora(scheduler.get_request(rid))
+            rid for rid in request_ids if is_multimodal_lora(scheduler.get_request(rid))
         ]
         if len(multimodal_lora_ids) <= max_multimodal_lora_requests:
             return (
@@ -439,7 +441,8 @@ class MultiModalLoRAConstraint:
         setattr(
             step_scheduler,
             cursor_attr,
-            (getattr(step_scheduler, cursor_attr) + 1) % max(1, len(multimodal_lora_ids)),
+            (getattr(step_scheduler, cursor_attr) + 1)
+            % max(1, len(multimodal_lora_ids)),
         )
         shaped = [
             rid
@@ -493,7 +496,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = min(
                 candidate_count,
-                effective_limit + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
+                effective_limit
+                + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
             )
             relaxed_by_fairness = effective_limit > base_limit
         elif (
@@ -502,7 +506,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = min(
                 candidate_count,
-                effective_limit + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
+                effective_limit
+                + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
             )
         elif (
             step_scheduler.multimodal_prefix_cache_tighten_threshold > 0
@@ -515,7 +520,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = max(
                 1,
-                effective_limit - step_scheduler.multimodal_lora_prefill_limit_tighten_delta,
+                effective_limit
+                - step_scheduler.multimodal_lora_prefill_limit_tighten_delta,
             )
             tightened_by_locality = (
                 step_scheduler.multimodal_lora_locality_tighten_threshold > 0
@@ -559,7 +565,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = min(
                 candidate_count,
-                effective_limit + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
+                effective_limit
+                + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
             )
             relaxed_by_fairness = effective_limit > base_limit
         elif (
@@ -568,7 +575,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = min(
                 candidate_count,
-                effective_limit + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
+                effective_limit
+                + step_scheduler.multimodal_lora_prefill_limit_relax_delta,
             )
         elif (
             step_scheduler.multimodal_prefix_cache_tighten_threshold > 0
@@ -581,7 +589,8 @@ class MultiModalLoRAConstraint:
         ):
             effective_limit = max(
                 1,
-                effective_limit - step_scheduler.multimodal_lora_prefill_limit_tighten_delta,
+                effective_limit
+                - step_scheduler.multimodal_lora_prefill_limit_tighten_delta,
             )
             tightened_by_locality = (
                 step_scheduler.multimodal_lora_locality_tighten_threshold > 0
@@ -590,10 +599,16 @@ class MultiModalLoRAConstraint:
             )
         return effective_limit, relaxed_by_fairness, tightened_by_locality, max_gap
 
-    def count_multimodal_lora_requests(self, scheduler: Any, request_ids: list[str]) -> int:
-        return sum(1 for rid in request_ids if is_multimodal_lora(scheduler.get_request(rid)))
+    def count_multimodal_lora_requests(
+        self, scheduler: Any, request_ids: list[str]
+    ) -> int:
+        return sum(
+            1 for rid in request_ids if is_multimodal_lora(scheduler.get_request(rid))
+        )
 
-    def count_multimodal_lora_adapters(self, scheduler: Any, request_ids: list[str]) -> dict[str, int]:
+    def count_multimodal_lora_adapters(
+        self, scheduler: Any, request_ids: list[str]
+    ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for rid in request_ids:
             req = scheduler.get_request(rid)

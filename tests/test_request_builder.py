@@ -73,16 +73,21 @@ def _hf_tokenizer():
     )
 
 
-def test_request_state_declares_all_engine_request_fields() -> None:
+def test_request_state_declares_expected_fields() -> None:
     request = RequestState(
         request_id="r-state",
         prompt="prompt",
         guarded_prompt="guarded",
         input_ids=[1, 2],
         sampling_params=SamplingParams(max_tokens=4),
-    ).to_engine_request()
+    )
 
-    assert set(request) == RequestState.engine_request_fields()
+    assert request.request_id == "r-state"
+    assert request.prompt == "prompt"
+    assert request.guarded_prompt == "guarded"
+    assert request.input_ids == [1, 2]
+    assert request.is_prefill
+    assert not request.finished
 
 
 def test_request_builder_attaches_choice_structured_output_constraint() -> None:
@@ -104,10 +109,10 @@ def test_request_builder_attaches_choice_structured_output_constraint() -> None:
         ),
     )
 
-    assert request["input_ids"] == [10, 11]
-    assert request["structured_output_constraint"] is not None
-    assert request["queued_at"] is not None
-    assert request["service_class"] == "latency"
+    assert request.input_ids == [10, 11]
+    assert request.structured_output_constraint is not None
+    assert request.queued_at is not None
+    assert request.service_class == "latency"
 
 
 def test_request_builder_preserves_explicit_service_class() -> None:
@@ -129,7 +134,7 @@ def test_request_builder_preserves_explicit_service_class() -> None:
         ),
     )
 
-    assert request["service_class"] == "background"
+    assert request.service_class == "background"
 
 
 def test_request_builder_uses_explicit_default_min_new_tokens(monkeypatch) -> None:
@@ -150,7 +155,7 @@ def test_request_builder_uses_explicit_default_min_new_tokens(monkeypatch) -> No
         sampling_params=SamplingParams(max_tokens=4),
     )
 
-    assert request["sampling_params"].min_tokens == 3
+    assert request.sampling_params.min_tokens == 3
 
 
 def test_request_builder_preserves_explicit_min_tokens() -> None:
@@ -170,7 +175,7 @@ def test_request_builder_preserves_explicit_min_tokens() -> None:
         sampling_params=SamplingParams(max_tokens=4, min_tokens=2),
     )
 
-    assert request["sampling_params"].min_tokens == 2
+    assert request.sampling_params.min_tokens == 2
 
 
 def test_request_builder_attaches_json_object_structured_output_constraint() -> None:
@@ -192,7 +197,7 @@ def test_request_builder_attaches_json_object_structured_output_constraint() -> 
         ),
     )
 
-    assert request["structured_output_constraint"] is not None
+    assert request.structured_output_constraint is not None
 
 
 def test_request_builder_marks_multimodal_lora_request() -> None:
@@ -215,11 +220,11 @@ def test_request_builder_marks_multimodal_lora_request() -> None:
         multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
     )
 
-    assert request["lora_id"] == "adapter-a"
-    assert request["lora_int_id"] == 7
-    assert request["lora_path"] == "/tmp/adapter-a"
-    assert request["is_multimodal"] is True
-    assert request["is_multimodal_lora"] is True
+    assert request.lora_id == "adapter-a"
+    assert request.lora_int_id == 7
+    assert request.lora_path == "/tmp/adapter-a"
+    assert request.is_multimodal is True
+    assert request.is_multimodal_lora is True
 
 
 def test_request_builder_adds_structured_constraint_for_multimodal() -> None:
@@ -242,9 +247,9 @@ def test_request_builder_adds_structured_constraint_for_multimodal() -> None:
         multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
     )
 
-    assert request["is_multimodal"] is True
-    assert request["is_multimodal_lora"] is False
-    assert request["structured_output_constraint"] is not None
+    assert request.is_multimodal is True
+    assert request.is_multimodal_lora is False
+    assert request.structured_output_constraint is not None
 
 
 def test_request_builder_rejects_unsupported_structured_output_type() -> None:
@@ -291,7 +296,7 @@ def test_request_builder_adds_grammar_constraint_for_hf_tokenizer() -> None:
         ),
     )
 
-    assert request["structured_output_constraint"] is not None
+    assert request.structured_output_constraint is not None
 
 
 def test_request_builder_adds_choice_constraint_for_hf_tokenizer() -> None:
@@ -313,7 +318,7 @@ def test_request_builder_adds_choice_constraint_for_hf_tokenizer() -> None:
         ),
     )
 
-    assert request["structured_output_constraint"] is not None
+    assert request.structured_output_constraint is not None
 
 
 def test_request_builder_adds_json_constraint_for_hf_tokenizer() -> None:
@@ -335,4 +340,4 @@ def test_request_builder_adds_json_constraint_for_hf_tokenizer() -> None:
         ),
     )
 
-    assert request["structured_output_constraint"] is not None
+    assert request.structured_output_constraint is not None

@@ -4,10 +4,33 @@ from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
 
+from vllm.engine.request_state import RequestState
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import SamplingParams
 
 
-EngineRequest = dict[str, Any]
+def _coerce_request_state(
+    request_id: str, request: RequestState | dict[str, Any]
+) -> RequestState:
+    """Convert legacy dict request state into a typed ``RequestState``.
+
+    This keeps test helpers and one-off callers working while the control plane
+    migrates to attribute-based access.
+    """
+    if isinstance(request, RequestState):
+        return request
+
+    data = dict(request)
+    state = RequestState(
+        request_id=request_id,
+        prompt=data.get("prompt", ""),
+        input_ids=data.get("input_ids", []),
+        sampling_params=data.get("sampling_params") or SamplingParams(),
+    )
+    for key, value in data.items():
+        if hasattr(state, key):
+            setattr(state, key, value)
+    return state
 
 
 class RequestScheduler:
@@ -19,13 +42,17 @@ class RequestScheduler:
         max_queued_requests: int | None = None,
     ) -> None:
         self.max_active_requests = max_active_requests
-        self.max_queued_requests = max_queued_requests or max(1, max_active_requests * 4)
-        self._requests: dict[str, EngineRequest] = {}
+        self.max_queued_requests = max_queued_requests or max(
+            1, max_active_requests * 4
+        )
+        self._requests: dict[str, RequestState] = {}
         self._running_ids: list[str] = []
         self._queued_ids: deque[str] = deque()
         self._free_slots: list[int] = list(range(max_active_requests))
         self._request_slots: dict[str, int] = {}
-        self._request_streams: dict[str, asyncio.Queue[RequestOutput | BaseException]] = {}
+        self._request_streams: dict[
+            str, asyncio.Queue[RequestOutput | BaseException]
+        ] = {}
 
     @property
     def active_request_count(self) -> int:
@@ -60,24 +87,28 @@ class RequestScheduler:
     def allocate_slot(self) -> int:
         return self._free_slots.pop(0)
 
-    def add_request(self, request_id: str, request: EngineRequest) -> None:
-        slot_idx = request.get("slot_idx")
+    def add_request(
+        self, request_id: str, request: RequestState | dict[str, Any]
+    ) -> None:
+        request = _coerce_request_state(request_id, request)
+        slot_idx = request.slot_idx
         self._requests[request_id] = request
         self._request_streams[request_id] = asyncio.Queue()
         if slot_idx is None:
             self._queued_ids.append(request_id)
             return
         slot_idx = int(slot_idx)
-        request["slot_idx"] = slot_idx
+        request.slot_idx = slot_idx
         if slot_idx in self._free_slots:
             self._free_slots.remove(slot_idx)
-        self._requests[request_id] = request
         self._request_slots[request_id] = slot_idx
         self._running_ids.append(request_id)
 
-    def enqueue_request(self, request_id: str, request: EngineRequest) -> None:
-        request = dict(request)
-        request["slot_idx"] = None
+    def enqueue_request(
+        self, request_id: str, request: RequestState | dict[str, Any]
+    ) -> None:
+        request = _coerce_request_state(request_id, request)
+        request.slot_idx = None
         self.add_request(request_id, request)
 
     def admit_queued_requests(self, max_new: int | None = None) -> list[str]:
@@ -87,7 +118,7 @@ class RequestScheduler:
             request_id = self._queued_ids.popleft()
             request = self._requests[request_id]
             slot_idx = self.allocate_slot()
-            request["slot_idx"] = slot_idx
+            request.slot_idx = slot_idx
             self._request_slots[request_id] = slot_idx
             self._running_ids.append(request_id)
             admitted.append(request_id)
@@ -106,8 +137,8 @@ class RequestScheduler:
             self._queued_ids.remove(request_id)
             request = self._requests[request_id]
             slot_idx = self.allocate_slot()
-            request["slot_idx"] = slot_idx
-            request["admitted_at"] = admitted_at
+            request.slot_idx = slot_idx
+            request.admitted_at = admitted_at
             self._request_slots[request_id] = slot_idx
             self._running_ids.append(request_id)
             admitted.append(request_id)
@@ -118,15 +149,15 @@ class RequestScheduler:
         *,
         now: float,
         max_queue_wait_s: float,
-    ) -> list[tuple[str, str, EngineRequest]]:
-        expired: list[tuple[str, str, EngineRequest]] = []
+    ) -> list[tuple[str, str, RequestState]]:
+        expired: list[tuple[str, str, RequestState]] = []
         if max_queue_wait_s <= 0:
             return expired
         for request_id in list(self._queued_ids):
             request = self._requests.get(request_id)
             if request is None:
                 continue
-            queued_at = float(request.get("queued_at") or now)
+            queued_at = float(request.queued_at or now)
             queue_wait = now - queued_at
             if queue_wait < max_queue_wait_s:
                 continue
@@ -144,10 +175,12 @@ class RequestScheduler:
             )
         return expired
 
-    def get_request(self, request_id: str) -> EngineRequest:
+    def get_request(self, request_id: str) -> RequestState:
         return self._requests[request_id]
 
-    def stream_queue(self, request_id: str) -> asyncio.Queue[RequestOutput | BaseException]:
+    def stream_queue(
+        self, request_id: str
+    ) -> asyncio.Queue[RequestOutput | BaseException]:
         return self._request_streams[request_id]
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:
@@ -170,10 +203,10 @@ class RequestScheduler:
         if queue is not None:
             queue.put_nowait(exc)
 
-    def free_request(self, request_id: str) -> EngineRequest | None:
+    def free_request(self, request_id: str) -> RequestState | None:
         request = self._requests.pop(request_id, None)
         if request is not None:
-            slot_idx = request.get("slot_idx")
+            slot_idx = request.slot_idx
             if slot_idx is not None:
                 self._free_slots.append(int(slot_idx))
         self._request_slots.pop(request_id, None)
@@ -191,7 +224,7 @@ class RequestScheduler:
         decodes: list[str] = []
         for request_id in self._running_ids:
             request = self._requests[request_id]
-            if request["is_prefill"]:
+            if request.is_prefill:
                 prefills.append(request_id)
             else:
                 decodes.append(request_id)

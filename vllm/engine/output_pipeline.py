@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from vllm.engine.output_processor import _decode_generated_text
+from vllm.engine.request_state import RequestState
 from vllm.outputs import CompletionOutput, RequestOutput
 
 
@@ -13,17 +14,19 @@ class OutputPipeline:
         self.policies = policies
         self.sampling_driver = sampling_driver
 
-    def build_abort_output(self, request_id: str, request: dict[str, Any]) -> RequestOutput:
+    def build_abort_output(
+        self, request_id: str, request: RequestState
+    ) -> RequestOutput:
         completion = CompletionOutput(
             index=0,
             text="",
-            token_ids=list(request["generated_ids"]),
+            token_ids=list(request.generated_ids),
             cumulative_logprob=0.0,
         )
         return RequestOutput(
             request_id=request_id,
-            prompt=request["prompt"],
-            prompt_token_ids=request["input_ids"],
+            prompt=request.prompt,
+            prompt_token_ids=request.input_ids,
             outputs=[completion],
             finished=True,
         )
@@ -31,54 +34,54 @@ class OutputPipeline:
     def finalize_step(
         self,
         request_id: str,
-        request: dict[str, Any],
+        request: RequestState,
         next_token: int,
     ) -> RequestOutput:
-        sampling_params = request["sampling_params"]
+        sampling_params = request.sampling_params
         eos_ids = self.sampling_driver.completion_eos_ids(request)
         max_tok = int(sampling_params.max_tokens or 16)
-        gen_len = len(request["generated_ids"])
+        gen_len = len(request.generated_ids)
         min_tok = int(getattr(sampling_params, "min_tokens", 0) or 0)
 
         if getattr(sampling_params, "ignore_eos", False):
             if gen_len >= max_tok:
-                request["finished"] = True
+                request.finished = True
         elif next_token in eos_ids and gen_len >= min_tok:
-            request["finished"] = True
+            request.finished = True
         elif gen_len >= max_tok:
-            request["finished"] = True
+            request.finished = True
 
-        structured_output_constraint = request.get("structured_output_constraint")
+        structured_output_constraint = request.structured_output_constraint
         if structured_output_constraint is not None:
             accepted = structured_output_constraint.on_token(request, next_token)
             if not accepted:
-                request["finished"] = True
+                request.finished = True
             elif structured_output_constraint.should_finish(request):
-                request["finished"] = True
+                request.finished = True
 
         current_text = _decode_generated_text(
-            self.tokenizer, request["generated_ids"], sampling_params
+            self.tokenizer, request.generated_ids, sampling_params
         )
-        if not request["finished"] and self.policies.should_early_stop(
-            request["generated_ids"], current_text
+        if not request.finished and self.policies.should_early_stop(
+            request.generated_ids, current_text
         ):
-            request["low_info_hits"] = int(request.get("low_info_hits", 0)) + 1
-            if request["low_info_hits"] >= 2 and gen_len >= max(10, min_tok):
-                request["finished"] = True
+            request.low_info_hits = request.low_info_hits + 1
+            if request.low_info_hits >= 2 and gen_len >= max(10, min_tok):
+                request.finished = True
         else:
-            request["low_info_hits"] = 0
+            request.low_info_hits = 0
 
         display_text = self.policies.cleanup_output_text(current_text)
         completion = CompletionOutput(
             index=0,
             text=display_text,
-            token_ids=request["generated_ids"],
+            token_ids=request.generated_ids,
             cumulative_logprob=0.0,
         )
         return RequestOutput(
             request_id=request_id,
-            prompt=request["prompt"],
-            prompt_token_ids=request["input_ids"],
+            prompt=request.prompt,
+            prompt_token_ids=request.input_ids,
             outputs=[completion],
-            finished=request["finished"],
+            finished=request.finished,
         )

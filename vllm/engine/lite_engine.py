@@ -16,6 +16,7 @@ from vllm.engine.model_surface import resolve_model_surface
 from vllm.engine.output_pipeline import OutputPipeline
 from vllm.engine.request_builder import LiteRequestBuilder
 from vllm.engine.request_scheduler import RequestScheduler
+from vllm.engine.request_state import RequestState
 from vllm.engine.runtime_config import RuntimeConfig
 from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
 from vllm.engine.runtime_observer import NullRuntimeObserver
@@ -763,12 +764,12 @@ class LiteEngine:
 
     @staticmethod
     def _stack_per_layer_carries(
-        req_dicts: list[dict[str, Any]], num_layers: int, key: str
+        req_dicts: list[RequestState], num_layers: int, key: str
     ) -> list[torch.Tensor | None]:
         """Batch (B, ...) tensors per layer for Qwen3.5 linear-attn streaming state."""
         stacked: list[torch.Tensor | None] = []
         for li in range(num_layers):
-            parts = [r[key][li] for r in req_dicts]
+            parts = [getattr(r, key)[li] for r in req_dicts]
             if all(p is None for p in parts):
                 stacked.append(None)
             else:
@@ -784,15 +785,16 @@ class LiteEngine:
     @staticmethod
     def _split_per_layer_carries(
         stacked: list[torch.Tensor | None],
-        req_dicts: list[dict[str, Any]],
+        req_dicts: list[RequestState],
         key: str,
     ) -> None:
         for li, t in enumerate(stacked):
             for i, r in enumerate(req_dicts):
+                carry = getattr(r, key)
                 if t is None:
-                    r[key][li] = None
+                    carry[li] = None
                 else:
-                    r[key][li] = t[i : i + 1].contiguous()
+                    carry[li] = t[i : i + 1].contiguous()
 
     def register_lora_adapter(
         self,
@@ -991,7 +993,7 @@ class LiteEngine:
             raise RequestRejectedError(reason)
         self.execution_backend.maybe_apply_prefix_cache(request_state)
         self.scheduler.enqueue_request(request_id, request_state)
-        self.lora_registry.on_request_added(request_state.get("lora_id"))
+        self.lora_registry.on_request_added(request_state.lora_id)
         self.observer.on_request_added(request_id, request_state)
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:

@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
+from dataclasses import dataclass
 
+from vllm.engine.scheduling_constraints import (
+    LoRAConstraint,
+    MultiModalConstraint,
+    MultiModalLoRAConstraint,
+    ServiceClassSelector,
+)
 from vllm.engine.scheduling_helpers import (
     is_multimodal,
     is_multimodal_lora,
@@ -13,20 +20,13 @@ from vllm.engine.scheduling_helpers import (
     service_class_priority,
     share_gap_map,
 )
-from vllm.engine.scheduling_constraints import (
-    ServiceClassSelector,
-    LoRAConstraint,
-    MultiModalConstraint,
-    MultiModalLoRAConstraint,
-)
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, PrefillPlan, StepPlan
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class LoraSchedulingParams:
     """LoRA scheduling constraints as a frozen value object."""
+
     max_admit_lora_adapters_per_step: int = 0
     max_prefill_lora_adapters_per_batch: int = 0
     max_decode_lora_adapters_per_batch: int = 0
@@ -39,6 +39,7 @@ class LoraSchedulingParams:
 @dataclass(frozen=True)
 class MultiModalSchedulingParams:
     """MultiModal scheduling constraints as a frozen value object."""
+
     max_admit_multimodal_per_step: int = 0
     max_prefill_multimodal_requests_per_batch: int = 0
     max_decode_multimodal_requests_per_batch: int = 0
@@ -107,9 +108,7 @@ class StepScheduler:
             else min(self.max_prefill_chunk_size, 128)
         )
         self.prefill_sla_ttft_ms = float(
-            prefill_sla_ttft_ms
-            if prefill_sla_ttft_ms is not None
-            else 2000.0
+            prefill_sla_ttft_ms if prefill_sla_ttft_ms is not None else 2000.0
         )
 
         self.prefill_reserved_tokens = max(0, int(prefill_reserved_tokens))
@@ -143,27 +142,65 @@ class StepScheduler:
         }
         _lora = lora_params or LoraSchedulingParams()
         _mm = multimodal_params or MultiModalSchedulingParams()
-        self.max_admit_lora_adapters_per_step = max(0, int(_lora.max_admit_lora_adapters_per_step))
-        self.max_prefill_lora_adapters_per_batch = max(0, int(_lora.max_prefill_lora_adapters_per_batch))
-        self.max_decode_lora_adapters_per_batch = max(0, int(_lora.max_decode_lora_adapters_per_batch))
-        self.lora_fairness_relax_threshold = max(0.0, float(_lora.lora_fairness_relax_threshold))
-        self.lora_locality_tighten_threshold = max(0.0, float(_lora.lora_locality_tighten_threshold))
+        self.max_admit_lora_adapters_per_step = max(
+            0, int(_lora.max_admit_lora_adapters_per_step)
+        )
+        self.max_prefill_lora_adapters_per_batch = max(
+            0, int(_lora.max_prefill_lora_adapters_per_batch)
+        )
+        self.max_decode_lora_adapters_per_batch = max(
+            0, int(_lora.max_decode_lora_adapters_per_batch)
+        )
+        self.lora_fairness_relax_threshold = max(
+            0.0, float(_lora.lora_fairness_relax_threshold)
+        )
+        self.lora_locality_tighten_threshold = max(
+            0.0, float(_lora.lora_locality_tighten_threshold)
+        )
         self.lora_limit_relax_delta = max(1, int(_lora.lora_limit_relax_delta))
         self.lora_limit_tighten_delta = max(1, int(_lora.lora_limit_tighten_delta))
-        self.max_admit_multimodal_per_step = max(0, int(_mm.max_admit_multimodal_per_step))
-        self.max_prefill_multimodal_requests_per_batch = max(0, int(_mm.max_prefill_multimodal_requests_per_batch))
-        self.max_decode_multimodal_requests_per_batch = max(0, int(_mm.max_decode_multimodal_requests_per_batch))
-        self.max_admit_multimodal_lora_per_step = max(0, int(_mm.max_admit_multimodal_lora_per_step))
-        self.max_prefill_multimodal_lora_requests_per_batch = max(0, int(_mm.max_prefill_multimodal_lora_requests_per_batch))
-        self.max_decode_multimodal_lora_requests_per_batch = max(0, int(_mm.max_decode_multimodal_lora_requests_per_batch))
-        self.multimodal_prefix_cache_relax_threshold = max(0.0, float(_mm.multimodal_prefix_cache_relax_threshold))
-        self.multimodal_prefix_cache_tighten_threshold = max(0.0, float(_mm.multimodal_prefix_cache_tighten_threshold))
-        self.multimodal_prefill_limit_relax_delta = max(1, int(_mm.multimodal_prefill_limit_relax_delta))
-        self.multimodal_prefill_limit_tighten_delta = max(1, int(_mm.multimodal_prefill_limit_tighten_delta))
-        self.multimodal_lora_prefill_limit_relax_delta = max(1, int(_mm.multimodal_lora_prefill_limit_relax_delta))
-        self.multimodal_lora_prefill_limit_tighten_delta = max(1, int(_mm.multimodal_lora_prefill_limit_tighten_delta))
-        self.multimodal_lora_fairness_relax_threshold = max(0.0, float(_mm.multimodal_lora_fairness_relax_threshold))
-        self.multimodal_lora_locality_tighten_threshold = max(0.0, float(_mm.multimodal_lora_locality_tighten_threshold))
+        self.max_admit_multimodal_per_step = max(
+            0, int(_mm.max_admit_multimodal_per_step)
+        )
+        self.max_prefill_multimodal_requests_per_batch = max(
+            0, int(_mm.max_prefill_multimodal_requests_per_batch)
+        )
+        self.max_decode_multimodal_requests_per_batch = max(
+            0, int(_mm.max_decode_multimodal_requests_per_batch)
+        )
+        self.max_admit_multimodal_lora_per_step = max(
+            0, int(_mm.max_admit_multimodal_lora_per_step)
+        )
+        self.max_prefill_multimodal_lora_requests_per_batch = max(
+            0, int(_mm.max_prefill_multimodal_lora_requests_per_batch)
+        )
+        self.max_decode_multimodal_lora_requests_per_batch = max(
+            0, int(_mm.max_decode_multimodal_lora_requests_per_batch)
+        )
+        self.multimodal_prefix_cache_relax_threshold = max(
+            0.0, float(_mm.multimodal_prefix_cache_relax_threshold)
+        )
+        self.multimodal_prefix_cache_tighten_threshold = max(
+            0.0, float(_mm.multimodal_prefix_cache_tighten_threshold)
+        )
+        self.multimodal_prefill_limit_relax_delta = max(
+            1, int(_mm.multimodal_prefill_limit_relax_delta)
+        )
+        self.multimodal_prefill_limit_tighten_delta = max(
+            1, int(_mm.multimodal_prefill_limit_tighten_delta)
+        )
+        self.multimodal_lora_prefill_limit_relax_delta = max(
+            1, int(_mm.multimodal_lora_prefill_limit_relax_delta)
+        )
+        self.multimodal_lora_prefill_limit_tighten_delta = max(
+            1, int(_mm.multimodal_lora_prefill_limit_tighten_delta)
+        )
+        self.multimodal_lora_fairness_relax_threshold = max(
+            0.0, float(_mm.multimodal_lora_fairness_relax_threshold)
+        )
+        self.multimodal_lora_locality_tighten_threshold = max(
+            0.0, float(_mm.multimodal_lora_locality_tighten_threshold)
+        )
         self._decode_only_streak = 0
         self._decode_rr_cursor = 0
         self._prefill_rr_cursor = 0
@@ -202,11 +239,7 @@ class StepScheduler:
         for rid in list(scheduler.running_ids) + list(scheduler.queued_ids):
             try:
                 req = scheduler.get_request(rid)
-                active_len = (
-                    len(req["input_ids"])
-                    if req.get("is_prefill")
-                    else req.get("seq_len", 0)
-                )
+                active_len = len(req.input_ids) if req.is_prefill else req.seq_len
                 if active_len > max_active_seq_len:
                     max_active_seq_len = active_len
             except KeyError:
@@ -450,7 +483,7 @@ class StepScheduler:
         queued_before = 0
 
         if bool(req.get("is_prefill", False)):
-            remaining = max(1, int(len(req["input_ids"]) - int(req["seq_len"])))
+            remaining = max(1, int(len(req.input_ids) - int(req.seq_len)))
             chunk_len = min(remaining, self.prefill_chunk_size, self.step_token_budget)
             prefill = PrefillPlan(
                 request_ids=[rid],
@@ -502,7 +535,7 @@ class StepScheduler:
         aged_ids = [
             rid
             for rid in queued_ids
-            if (now - float(queued_requests[rid].get("queued_at") or now))
+            if (now - float(queued_requests[rid].queued_at or now))
             >= self.queue_aging_threshold_s
         ]
         aged_set = set(aged_ids)
@@ -717,11 +750,11 @@ class StepScheduler:
                 False,
                 False,
             )
-        base_processed_len = scheduler.get_request(prefills[0])["seq_len"]
+        base_processed_len = scheduler.get_request(prefills[0]).seq_len
         candidate_prefills = [
             rid
             for rid in prefills
-            if scheduler.get_request(rid)["seq_len"] == base_processed_len
+            if scheduler.get_request(rid).seq_len == base_processed_len
         ]
         if not candidate_prefills:
             return (
@@ -811,8 +844,8 @@ class StepScheduler:
                 tightened,
             )
         min_remaining = min(
-            len(scheduler.get_request(rid)["input_ids"])
-            - scheduler.get_request(rid)["seq_len"]
+            len(scheduler.get_request(rid).input_ids)
+            - scheduler.get_request(rid).seq_len
             for rid in request_ids
         )
         per_req_budget = max(1, token_budget // max(1, len(request_ids)))
@@ -849,11 +882,13 @@ class StepScheduler:
         candidate_request_ids: list[str],
         current_request_ids: list[str],
     ) -> tuple[int, bool, bool, float]:
-        return self._multimodal_lora_constraint._effective_prefill_multimodal_lora_limit(
-            scheduler=scheduler,
-            step_scheduler=self,
-            candidate_request_ids=candidate_request_ids,
-            current_request_ids=current_request_ids,
+        return (
+            self._multimodal_lora_constraint._effective_prefill_multimodal_lora_limit(
+                scheduler=scheduler,
+                step_scheduler=self,
+                candidate_request_ids=candidate_request_ids,
+                current_request_ids=current_request_ids,
+            )
         )
 
     def _effective_decode_multimodal_lora_limit(
@@ -999,7 +1034,7 @@ class StepScheduler:
         request_ids: list[str],
     ) -> list[str]:
         present = {
-            str(scheduler.get_request(rid).get("service_class") or "latency")
+            str(scheduler.get_request(rid).service_class or "latency")
             for rid in request_ids
         }
         return sorted(
@@ -1164,9 +1199,9 @@ class StepScheduler:
         max_wait = 0.0
         for rid in queued_ids:
             request = scheduler.get_request(rid)
-            service_class = str(request.get("service_class") or "latency")
+            service_class = str(request.service_class or "latency")
             lora_id = self._lora_adapter_key(request)
-            queue_wait_s = max(0.0, now - float(request.get("queued_at") or now))
+            queue_wait_s = max(0.0, now - float(request.queued_at or now))
             counts[service_class] = counts.get(service_class, 0) + 1
             lora_counts[lora_id] = lora_counts.get(lora_id, 0) + 1
             if self._is_multimodal(request):
@@ -1238,9 +1273,7 @@ class StepScheduler:
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for rid in request_ids:
-            service_class = str(
-                scheduler.get_request(rid).get("service_class") or "latency"
-            )
+            service_class = str(scheduler.get_request(rid).service_class or "latency")
             counts[service_class] = counts.get(service_class, 0) + 1
         return counts
 

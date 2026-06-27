@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from vllm.engine.request_state import RequestState
 from vllm.engine.step_scheduler import StepScheduler
+from vllm.sampling_params import SamplingParams
 
 
 @dataclass
 class _MockScheduler:
-    request: dict
+    request: RequestState
     _queued: int = 0
 
     @property
@@ -35,11 +37,11 @@ class _MockScheduler:
         return True
 
     def classify_requests(self) -> tuple[list[str], list[str]]:
-        if bool(self.request.get("is_prefill", False)):
+        if self.request.is_prefill:
             return ["r0"], []
         return [], ["r0"]
 
-    def get_request(self, request_id: str) -> dict:
+    def get_request(self, request_id: str) -> RequestState:
         assert request_id in {"r0", "q0"}
         return self.request
 
@@ -59,11 +61,14 @@ def _make_scheduler() -> StepScheduler:
 def test_single_request_fast_path_prefill_uses_chunk_cap() -> None:
     scheduler = _make_scheduler()
     mock = _MockScheduler(
-        request={
-            "is_prefill": True,
-            "input_ids": list(range(80)),
-            "seq_len": 10,
-        }
+        request=RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=list(range(80)),
+            sampling_params=SamplingParams(),
+            is_prefill=True,
+            seq_len=10,
+        )
     )
     plan = scheduler.build_plan(mock)
     assert plan.prefills is not None
@@ -76,11 +81,14 @@ def test_single_request_fast_path_prefill_uses_chunk_cap() -> None:
 def test_single_request_fast_path_decode_uses_fast_decode() -> None:
     scheduler = _make_scheduler()
     mock = _MockScheduler(
-        request={
-            "is_prefill": False,
-            "input_ids": list(range(32)),
-            "seq_len": 32,
-        }
+        request=RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=list(range(32)),
+            sampling_params=SamplingParams(),
+            is_prefill=False,
+            seq_len=32,
+        )
     )
     plan = scheduler.build_plan(mock)
     assert plan.prefills is None
@@ -93,11 +101,14 @@ def test_single_request_fast_path_decode_uses_fast_decode() -> None:
 def test_single_request_fast_path_disabled_when_queue_not_empty() -> None:
     scheduler = _make_scheduler()
     mock = _MockScheduler(
-        request={
-            "is_prefill": False,
-            "input_ids": list(range(32)),
-            "seq_len": 32,
-        },
+        request=RequestState(
+            request_id="r0",
+            prompt="",
+            input_ids=list(range(32)),
+            sampling_params=SamplingParams(),
+            is_prefill=False,
+            seq_len=32,
+        ),
         _queued=1,
     )
     plan = scheduler.build_plan(mock)

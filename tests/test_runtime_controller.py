@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from vllm.engine.errors import RequestRejectedError
+from vllm.engine.request_state import RequestState
 from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.engine.step_plan import AdmissionPlan, DecodePlan, StepPlan
@@ -13,16 +14,19 @@ class _FakeScheduler:
         self.running_request_count = 0
         self._queued = ["q1"]
         self.admitted = []
-        self.req = {
-            "queued_at": 10.0,
-            "admitted_at": None,
-            "first_token_at": None,
-            "generated_ids": [],
-            "seq_len": 0,
-            "service_class": "latency",
-            "sampling_params": type("SP", (), {"temperature": 0, "max_tokens": 1})(),
-            "finished": False,
-        }
+        self.req = RequestState(
+            request_id="q1",
+            prompt="",
+            input_ids=[],
+            sampling_params=type("SP", (), {"temperature": 0, "max_tokens": 1})(),
+            queued_at=10.0,
+            admitted_at=None,
+            first_token_at=None,
+            generated_ids=[],
+            seq_len=0,
+            service_class="latency",
+            finished=False,
+        )
 
     def reject_expired_queued_requests(self, *, now: float, max_queue_wait_s: float):
         del now, max_queue_wait_s
@@ -297,7 +301,14 @@ class _TimeoutScheduler:
         self.queued_request_count = 1
         self.available_slots = 0
         self.published = []
-        self.expired_request = {"queued_at": 1.0, "lora_id": "adapter-a"}
+        self.expired_request = RequestState(
+            request_id="q-timeout",
+            prompt="",
+            input_ids=[],
+            sampling_params=type("SP", (), {"temperature": 0, "max_tokens": 1})(),
+            queued_at=1.0,
+            lora_id="adapter-a",
+        )
 
     def reject_expired_queued_requests(self, *, now: float, max_queue_wait_s: float):
         assert now == 10.0

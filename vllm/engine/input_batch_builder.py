@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from vllm.engine.request_state import RequestState
+
 
 class InputBatchBuilder:
     def __init__(
@@ -32,7 +34,7 @@ class InputBatchBuilder:
         scheduler: Any,
         chunk_len: int,
     ) -> tuple[
-        torch.Tensor, torch.Tensor, dict[str, Any], list[dict[str, Any]], list[bool]
+        torch.Tensor, torch.Tensor, dict[str, Any], list[RequestState], list[bool]
     ]:
         curr_input_rows = []
         position_rows = []
@@ -45,12 +47,10 @@ class InputBatchBuilder:
 
         for rid in request_ids:
             req = scheduler.get_request(rid)
-            slot_idx = req["slot_idx"]
-            all_input_ids = req["input_ids"]
-            processed_len = req["seq_len"]
-            prefix_hit_len = int(
-                req.get("prefix_hit_len") or req.get("_prefix_cache_hit_len") or 0
-            )
+            slot_idx = req.slot_idx
+            all_input_ids = req.input_ids
+            processed_len = req.seq_len
+            prefix_hit_len = int(req.prefix_hit_len or req._prefix_cache_hit_len or 0)
             start_pos = max(processed_len, prefix_hit_len)
 
             actual_chunk_len = min(chunk_len, len(all_input_ids) - start_pos)
@@ -98,7 +98,7 @@ class InputBatchBuilder:
         conv_carry_prefill = self._stack_per_layer_carries(
             req_dicts_prefill, self.num_layers, "linear_conv_carry"
         )
-        lora_mapping = [req.get("lora_id") for req in req_dicts_prefill]
+        lora_mapping = [req.lora_id for req in req_dicts_prefill]
         multimodal_flags = [
             self._is_multimodal_request(req) for req in req_dicts_prefill
         ]
@@ -156,7 +156,7 @@ class InputBatchBuilder:
         self,
         request_ids: list[str],
         scheduler: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[dict[str, Any]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[RequestState]]:
         input_tokens = []
         slot_indices = []
         seq_lens = []
@@ -164,10 +164,10 @@ class InputBatchBuilder:
 
         for rid in request_ids:
             req = scheduler.get_request(rid)
-            last_token = req["generated_ids"][-1]
+            last_token = req.generated_ids[-1]
             input_tokens.append([last_token])
-            slot_indices.append(req["slot_idx"])
-            current_len = req["seq_len"]
+            slot_indices.append(req.slot_idx)
+            current_len = req.seq_len
             seq_lens.append(current_len + 1)
             pos_indices.append(current_len)
 
@@ -194,7 +194,7 @@ class InputBatchBuilder:
         conv_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_conv_carry"
         )
-        lora_mapping = [req.get("lora_id") for req in req_dicts]
+        lora_mapping = [req.lora_id for req in req_dicts]
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
         seq_lens_cpu_list = [int(v) for v in seq_lens]
         positions_cpu_list = [int(v) for v in pos_indices]
@@ -245,7 +245,7 @@ class InputBatchBuilder:
         fast_slot_mapping: torch.Tensor,
         fast_seq_lens: torch.Tensor,
         fast_block_tables: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[dict[str, Any]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[RequestState]]:
         bs = len(request_ids)
         input_ids = fast_input_ids[:bs]
         positions = fast_positions[:bs]
@@ -261,24 +261,22 @@ class InputBatchBuilder:
         for i, rid in enumerate(request_ids):
             req = scheduler.get_request(rid)
             req_dicts.append(req)
-            prev_seq_len = int(req["seq_len"])
-            last_token_tensor = req.get("_last_token_tensor")
+            prev_seq_len = int(req.seq_len)
+            last_token_tensor = req._last_token_tensor
             if isinstance(last_token_tensor, torch.Tensor):
                 input_ids[i, 0].copy_(last_token_tensor.reshape(()))
             else:
-                last_token = req["generated_ids"][-1]
+                last_token = req.generated_ids[-1]
                 input_ids[i, 0] = last_token
             positions[i, 0] = prev_seq_len
-            slot_mapping[i] = req["slot_idx"] * self.max_model_len + prev_seq_len
+            slot_mapping[i] = req.slot_idx * self.max_model_len + prev_seq_len
             seq_lens[i] = prev_seq_len + 1
             positions_cpu_list.append(prev_seq_len)
             seq_lens_cpu_list.append(prev_seq_len + 1)
-        lora_mapping = [req.get("lora_id") for req in req_dicts]
+        lora_mapping = [req.lora_id for req in req_dicts]
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
 
-        slots_t = torch.tensor(
-            [req["slot_idx"] for req in req_dicts], device=self.device
-        )
+        slots_t = torch.tensor([req.slot_idx for req in req_dicts], device=self.device)
         block_tables = fast_block_tables.index_select(0, slots_t)
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
@@ -330,15 +328,14 @@ class InputBatchBuilder:
         return cls._lora_adapter_count(lora_mapping) > 1
 
     @staticmethod
-    def _is_multimodal_request(request: dict[str, Any]) -> bool:
+    def _is_multimodal_request(request: RequestState) -> bool:
         return bool(
-            request.get("is_multimodal")
-            or (request.get("multi_modal_data") or {}).get("image")
+            request.is_multimodal or (request.multi_modal_data or {}).get("image")
         )
 
     @classmethod
-    def _is_multimodal_lora_request(cls, request: dict[str, Any]) -> bool:
-        return cls._is_multimodal_request(request) and bool(request.get("lora_id"))
+    def _is_multimodal_lora_request(cls, request: RequestState) -> bool:
+        return cls._is_multimodal_request(request) and bool(request.lora_id)
 
     @classmethod
     def _multimodal_request_count(cls, multimodal_flags: list[bool]) -> int:
@@ -350,13 +347,13 @@ class InputBatchBuilder:
         return 0 < multimodal_count < len(multimodal_flags)
 
     @classmethod
-    def _multimodal_lora_request_count(cls, req_dicts: list[dict[str, Any]]) -> int:
+    def _multimodal_lora_request_count(cls, req_dicts: list[RequestState]) -> int:
         return sum(1 for req in req_dicts if cls._is_multimodal_lora_request(req))
 
     def split_per_layer_carries(
         self,
         attn_metadata: dict[str, Any],
-        req_dicts: list[dict[str, Any]],
+        req_dicts: list[RequestState],
     ) -> None:
         self._split_per_layer_carries(
             attn_metadata["linear_attn_carry"], req_dicts, "linear_attn_carry"
