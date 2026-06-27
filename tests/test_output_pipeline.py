@@ -12,6 +12,7 @@ from vllm.engine.output_pipeline import OutputPipeline
 from vllm.engine.output_processor import OutputProcessor
 from vllm.engine.request_state import RequestState
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.policies.base import GenerationPolicies
 from vllm.sampling_params import SamplingParams
 
 
@@ -174,6 +175,20 @@ def test_build_abort_output_has_empty_text() -> None:
     out = pipeline.build_abort_output("r1", req)
     assert out.finished
     assert out.outputs[0].text == ""
+
+
+def test_output_pipeline_accepts_generation_policies_wrapper() -> None:
+    """GenerationPolicies is the real object passed to OutputPipeline in-engine."""
+    tokenizer = FakeTokenizer()
+    backend = CountingOutputProcessor()
+    policies = GenerationPolicies(backend=backend)
+    pipeline = OutputPipeline(tokenizer, policies, _make_sampling_driver())
+    req = _make_request(generated_ids=[1, 2], max_tokens=2)
+
+    out = pipeline.finalize_step("r1", req, next_token=4)
+
+    assert out.finished
+    assert out.outputs[0].text == "ab"
 
 
 if __name__ == "__main__":
