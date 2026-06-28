@@ -164,6 +164,7 @@ def _q2_k_matvec_multiblock_kernel(
     payload_half_ptr,
     hidden_ptr,
     output_ptr,
+    rows,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
     HALF_WORDS_PER_BLOCK: tl.constexpr,
@@ -180,27 +181,28 @@ def _q2_k_matvec_multiblock_kernel(
 
     for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
         row = row_base + row_offset
-        total = tl.full((), 0.0, tl.float32)
-        for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
-            payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
-            scale_bytes = tl.load(payload_ptr + payload_base + group).to(tl.uint32)
-            q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(
-                tl.uint32
-            )
-            codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
+        if row < rows:
+            total = tl.full((), 0.0, tl.float32)
+            for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+                payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+                scale_bytes = tl.load(payload_ptr + payload_base + group).to(tl.uint32)
+                q_bytes = tl.load(payload_ptr + payload_base + 16 + q_byte_index).to(
+                    tl.uint32
+                )
+                codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
 
-            scale_lows = (scale_bytes & 0x0F).to(tl.float32)
-            scale_highs = (scale_bytes >> 4).to(tl.float32)
-            half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
-            d = tl.load(payload_half_ptr + half_base + 40).to(tl.float32)
-            dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
+                scale_lows = (scale_bytes & 0x0F).to(tl.float32)
+                scale_highs = (scale_bytes >> 4).to(tl.float32)
+                half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
+                d = tl.load(payload_half_ptr + half_base + 40).to(tl.float32)
+                dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
 
-            decoded = d * scale_lows * codes - dmin * scale_highs
-            hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
-                tl.float32
-            )
-            total += tl.sum(decoded * hidden, axis=0)
-        tl.store(output_ptr + row, total)
+                decoded = d * scale_lows * codes - dmin * scale_highs
+                hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
+                    tl.float32
+                )
+                total += tl.sum(decoded * hidden, axis=0)
+            tl.store(output_ptr + row, total)
 
 
 def _q2_k_matvec_triton_cuda(
@@ -242,6 +244,7 @@ def _q2_k_matvec_multiblock_triton_cuda(
         payload_contiguous.view(torch.float16),
         hidden_contiguous,
         output,
+        rows,
         BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
         BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
         HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
@@ -548,6 +551,7 @@ def _iq2_xxs_gate_up_activation_multiblock_kernel(
     ksigns_ptr,
     grid_ptr,
     output_ptr,
+    rows,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
     HALF_WORDS_PER_BLOCK: tl.constexpr,
@@ -563,89 +567,100 @@ def _iq2_xxs_gate_up_activation_multiblock_kernel(
 
     for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
         row = row_base + row_offset
-        gate_total = tl.full((), 0.0, tl.float32)
-        up_total = tl.full((), 0.0, tl.float32)
-        for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
-            payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
-            group_offset = 2 + group * 8
-            metadata_offset = payload_base + group_offset
+        if row < rows:
+            gate_total = tl.full((), 0.0, tl.float32)
+            up_total = tl.full((), 0.0, tl.float32)
+            for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+                payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+                group_offset = 2 + group * 8
+                metadata_offset = payload_base + group_offset
 
-            gate_grid_bytes = tl.load(
-                gate_payload_ptr + metadata_offset + grid_byte_slot
-            ).to(tl.uint32)
-            up_grid_bytes = tl.load(
-                up_payload_ptr + metadata_offset + grid_byte_slot
-            ).to(tl.uint32)
+                gate_grid_bytes = tl.load(
+                    gate_payload_ptr + metadata_offset + grid_byte_slot
+                ).to(tl.uint32)
+                up_grid_bytes = tl.load(
+                    up_payload_ptr + metadata_offset + grid_byte_slot
+                ).to(tl.uint32)
 
-            gate_word_byte0 = tl.load(gate_payload_ptr + metadata_offset + 4).to(
-                tl.uint32
-            )
-            gate_word_byte1 = tl.load(gate_payload_ptr + metadata_offset + 5).to(
-                tl.uint32
-            )
-            gate_word_byte2 = tl.load(gate_payload_ptr + metadata_offset + 6).to(
-                tl.uint32
-            )
-            gate_word_byte3 = tl.load(gate_payload_ptr + metadata_offset + 7).to(
-                tl.uint32
-            )
-            gate_sign_scale = (
-                gate_word_byte0
-                | (gate_word_byte1 << 8)
-                | (gate_word_byte2 << 16)
-                | (gate_word_byte3 << 24)
-            )
+                gate_word_byte0 = tl.load(gate_payload_ptr + metadata_offset + 4).to(
+                    tl.uint32
+                )
+                gate_word_byte1 = tl.load(gate_payload_ptr + metadata_offset + 5).to(
+                    tl.uint32
+                )
+                gate_word_byte2 = tl.load(gate_payload_ptr + metadata_offset + 6).to(
+                    tl.uint32
+                )
+                gate_word_byte3 = tl.load(gate_payload_ptr + metadata_offset + 7).to(
+                    tl.uint32
+                )
+                gate_sign_scale = (
+                    gate_word_byte0
+                    | (gate_word_byte1 << 8)
+                    | (gate_word_byte2 << 16)
+                    | (gate_word_byte3 << 24)
+                )
 
-            up_word_byte0 = tl.load(up_payload_ptr + metadata_offset + 4).to(tl.uint32)
-            up_word_byte1 = tl.load(up_payload_ptr + metadata_offset + 5).to(tl.uint32)
-            up_word_byte2 = tl.load(up_payload_ptr + metadata_offset + 6).to(tl.uint32)
-            up_word_byte3 = tl.load(up_payload_ptr + metadata_offset + 7).to(tl.uint32)
-            up_sign_scale = (
-                up_word_byte0
-                | (up_word_byte1 << 8)
-                | (up_word_byte2 << 16)
-                | (up_word_byte3 << 24)
-            )
+                up_word_byte0 = tl.load(up_payload_ptr + metadata_offset + 4).to(
+                    tl.uint32
+                )
+                up_word_byte1 = tl.load(up_payload_ptr + metadata_offset + 5).to(
+                    tl.uint32
+                )
+                up_word_byte2 = tl.load(up_payload_ptr + metadata_offset + 6).to(
+                    tl.uint32
+                )
+                up_word_byte3 = tl.load(up_payload_ptr + metadata_offset + 7).to(
+                    tl.uint32
+                )
+                up_sign_scale = (
+                    up_word_byte0
+                    | (up_word_byte1 << 8)
+                    | (up_word_byte2 << 16)
+                    | (up_word_byte3 << 24)
+                )
 
-            sign_shift = grid_byte_slot * 7
-            gate_sign_index = (gate_sign_scale >> sign_shift) & 0x7F
-            gate_packed_signs = tl.load(ksigns_ptr + gate_sign_index).to(tl.uint32)
-            gate_sign_bits = (gate_packed_signs >> grid_lane) & 0x01
-            gate_signs = 1.0 - gate_sign_bits.to(tl.float32) * 2.0
+                sign_shift = grid_byte_slot * 7
+                gate_sign_index = (gate_sign_scale >> sign_shift) & 0x7F
+                gate_packed_signs = tl.load(ksigns_ptr + gate_sign_index).to(tl.uint32)
+                gate_sign_bits = (gate_packed_signs >> grid_lane) & 0x01
+                gate_signs = 1.0 - gate_sign_bits.to(tl.float32) * 2.0
 
-            up_sign_index = (up_sign_scale >> sign_shift) & 0x7F
-            up_packed_signs = tl.load(ksigns_ptr + up_sign_index).to(tl.uint32)
-            up_sign_bits = (up_packed_signs >> grid_lane) & 0x01
-            up_signs = 1.0 - up_sign_bits.to(tl.float32) * 2.0
+                up_sign_index = (up_sign_scale >> sign_shift) & 0x7F
+                up_packed_signs = tl.load(ksigns_ptr + up_sign_index).to(tl.uint32)
+                up_sign_bits = (up_packed_signs >> grid_lane) & 0x01
+                up_signs = 1.0 - up_sign_bits.to(tl.float32) * 2.0
 
-            gate_scale_code = (gate_sign_scale >> 28).to(tl.float32)
-            up_scale_code = (up_sign_scale >> 28).to(tl.float32)
-            half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
-            gate_d = tl.load(gate_payload_half_ptr + half_base).to(tl.float32)
-            up_d = tl.load(up_payload_half_ptr + half_base).to(tl.float32)
-            gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
-            up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
+                gate_scale_code = (gate_sign_scale >> 28).to(tl.float32)
+                up_scale_code = (up_sign_scale >> 28).to(tl.float32)
+                half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
+                gate_d = tl.load(gate_payload_half_ptr + half_base).to(tl.float32)
+                up_d = tl.load(up_payload_half_ptr + half_base).to(tl.float32)
+                gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
+                up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
 
-            gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(
-                tl.float32
-            )
-            up_grid = tl.load(grid_ptr + up_grid_bytes * 8 + grid_lane).to(tl.float32)
-            hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
-                tl.float32
-            )
-            gate_total += tl.sum(
-                gate_block_scales * gate_grid * gate_signs * hidden,
-                axis=0,
-            )
-            up_total += tl.sum(
-                up_block_scales * up_grid * up_signs * hidden,
-                axis=0,
-            )
+                gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(
+                    tl.float32
+                )
+                up_grid = tl.load(grid_ptr + up_grid_bytes * 8 + grid_lane).to(
+                    tl.float32
+                )
+                hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
+                    tl.float32
+                )
+                gate_total += tl.sum(
+                    gate_block_scales * gate_grid * gate_signs * hidden,
+                    axis=0,
+                )
+                up_total += tl.sum(
+                    up_block_scales * up_grid * up_signs * hidden,
+                    axis=0,
+                )
 
-        gate_clamped = tl.minimum(gate_total, 10.0)
-        up_clamped = tl.minimum(tl.maximum(up_total, -10.0), 10.0)
-        activated = gate_clamped / (1.0 + tl.exp(-gate_clamped)) * up_clamped
-        tl.store(output_ptr + row, activated)
+            gate_clamped = tl.minimum(gate_total, 10.0)
+            up_clamped = tl.minimum(tl.maximum(up_total, -10.0), 10.0)
+            activated = gate_clamped / (1.0 + tl.exp(-gate_clamped)) * up_clamped
+            tl.store(output_ptr + row, activated)
 
 
 def _iq2_xxs_lookup_tensors_cuda(
@@ -741,6 +756,7 @@ def _iq2_xxs_gate_up_activation_multiblock_triton_cuda(
         ksigns,
         grid,
         output,
+        rows,
         BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
         BLOCK_BYTES=_IQ2_XXS_BLOCK_BYTES,
         HALF_WORDS_PER_BLOCK=_IQ2_XXS_BLOCK_BYTES // 2,
