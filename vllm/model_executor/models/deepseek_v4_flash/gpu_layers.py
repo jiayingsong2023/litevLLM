@@ -1822,7 +1822,7 @@ def _run_staged_routed_experts(
                 payloads=selected_payloads,
                 workspace=workspace,
             ).to(torch.float32)
-        except RuntimeError:
+        except (RuntimeError, NotImplementedError, ValueError):
             pass
     selected_gemm = getattr(backend, "quantized_selected_experts_gemm", None)
     if callable(selected_gemm):
