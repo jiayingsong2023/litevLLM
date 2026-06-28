@@ -205,6 +205,81 @@ def _q2_k_matvec_multiblock_kernel(
             tl.store(output_ptr + row, total)
 
 
+# GGUF Q2_K selected-experts down layout: down_payloads for all experts are
+# concatenated into [num_experts, rows * COLUMNS_BLOCKS * 84] uint8 bytes.
+# workspace holds [num_experts, columns] fp32 activations, and expert_weights
+# holds [num_experts] fp32 scales. One Triton program handles ROWS_PER_BLOCK
+# output rows, loops over experts, decodes each expert's Q2_K row against the
+# corresponding workspace row, and accumulates weight_e * (down_e @ workspace_e)
+# into one final output element per row.
+@triton.jit
+def _q2_k_selected_experts_down_projection_kernel(
+    payload_ptr,
+    payload_half_ptr,
+    workspace_ptr,
+    weights_ptr,
+    output_ptr,
+    rows,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+    COLUMNS_BLOCKS: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+) -> None:
+    row_base = tl.program_id(0) * ROWS_PER_BLOCK
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 16
+    q_half = offsets // 128
+    rem = offsets - q_half * 128
+    shift = (rem // 32) * 2
+    q_byte_index = q_half * 32 + (rem - (rem // 32) * 32)
+
+    expert_stride_bytes = rows * COLUMNS_BLOCKS * BLOCK_BYTES
+    expert_stride_halfs = rows * COLUMNS_BLOCKS * HALF_WORDS_PER_BLOCK
+    workspace_stride = COLUMNS_BLOCKS * BLOCK_SIZE
+
+    for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+        row = row_base + row_offset
+        if row < rows:
+            total = tl.full((), 0.0, tl.float32)
+            for expert_id in tl.range(0, num_experts):
+                weight = tl.load(weights_ptr + expert_id).to(tl.float32)
+                expert_total = tl.full((), 0.0, tl.float32)
+                for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+                    payload_base = (
+                        expert_id * expert_stride_bytes
+                        + (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+                    )
+                    scale_bytes = tl.load(payload_ptr + payload_base + group).to(
+                        tl.uint32
+                    )
+                    q_bytes = tl.load(
+                        payload_ptr + payload_base + 16 + q_byte_index
+                    ).to(tl.uint32)
+                    codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
+
+                    scale_lows = (scale_bytes & 0x0F).to(tl.float32)
+                    scale_highs = (scale_bytes >> 4).to(tl.float32)
+                    half_base = (
+                        expert_id * expert_stride_halfs
+                        + (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
+                    )
+                    d = tl.load(payload_half_ptr + half_base + 40).to(tl.float32)
+                    dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
+
+                    decoded = d * scale_lows * codes - dmin * scale_highs
+                    hidden = tl.load(
+                        workspace_ptr
+                        + expert_id * workspace_stride
+                        + block_idx * BLOCK_SIZE
+                        + offsets
+                    ).to(tl.float32)
+                    expert_total += tl.sum(decoded * hidden, axis=0)
+                total += weight * expert_total
+            tl.store(output_ptr + row, total)
+
+
 def _q2_k_matvec_triton_cuda(
     payload: torch.Tensor,
     hidden: torch.Tensor,
@@ -1057,3 +1132,88 @@ def deepseek_v4_iq2_xxs_selected_experts_activation(
     )
     if workspace_contiguous.data_ptr() != workspace.data_ptr():
         workspace.copy_(workspace_contiguous)
+
+
+def deepseek_v4_q2_k_selected_experts_down_projection(
+    workspace: torch.Tensor,
+    down_payloads: list[torch.Tensor],
+    expert_weights: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> None:
+    """Fused Q2_K down projection and weighted sum across selected experts.
+
+    Memory layout:
+    - workspace is [num_experts, columns] fp32 activations.
+    - down_payloads is a list of uint8 Q2_K payloads, each
+      rows * (columns / 256) blocks.
+    - expert_weights is [num_experts] fp32.
+    - output is [rows] fp32.
+
+    Tiling:
+    - grid (ceil(rows / ROWS_PER_BLOCK),).
+    - each program computes ROWS_PER_BLOCK output rows, looping over experts
+      and K-blocks, applying expert weight inline.
+    """
+    if not down_payloads:
+        raise ValueError("down_payloads must contain at least one expert")
+    if workspace.ndim != 2:
+        raise ValueError(f"workspace must be 2-D; got {workspace.ndim}-D")
+    num_experts = len(down_payloads)
+    if workspace.shape != (num_experts, columns):
+        raise ValueError(
+            "workspace shape must be (num_experts, columns); "
+            f"got {workspace.shape} and expected ({num_experts}, {columns})"
+        )
+    if workspace.dtype != torch.float32:
+        raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
+    if expert_weights.shape != (num_experts,):
+        raise ValueError(
+            "expert_weights shape must be (num_experts,); "
+            f"got {expert_weights.shape} and expected ({num_experts},)"
+        )
+    if expert_weights.dtype != torch.float32:
+        raise ValueError(f"expert_weights must be fp32; got {expert_weights.dtype}")
+    if output.shape != (rows,):
+        raise ValueError(
+            f"output shape must be (rows,); got {output.shape} and expected ({rows},)"
+        )
+    if output.dtype != torch.float32:
+        raise ValueError(f"output must be fp32; got {output.dtype}")
+    if not workspace.is_cuda or not expert_weights.is_cuda or not output.is_cuda:
+        raise ValueError("workspace, expert_weights, and output must be CUDA tensors")
+
+    for payload in down_payloads:
+        _validate_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+            block_bytes=_Q2_K_BLOCK_BYTES,
+        )
+
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
+    down_stack = torch.stack(down_payloads, dim=0).contiguous()
+    workspace_contiguous = workspace.contiguous()
+    weights_contiguous = expert_weights.contiguous()
+    output_contiguous = output.contiguous()
+    rows_per_block = 4
+    grid_rows = (rows + rows_per_block - 1) // rows_per_block
+    _q2_k_selected_experts_down_projection_kernel[(grid_rows,)](
+        down_stack,
+        down_stack.view(torch.float16),
+        workspace_contiguous,
+        weights_contiguous,
+        output_contiguous,
+        rows,
+        num_experts,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
+        COLUMNS_BLOCKS=columns_blocks,
+        ROWS_PER_BLOCK=rows_per_block,
+        num_warps=8,
+    )
+    if output_contiguous.data_ptr() != output.data_ptr():
+        output.copy_(output_contiguous)

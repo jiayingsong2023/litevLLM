@@ -13,6 +13,7 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_iq2_xxs_selected_experts_activation,
     deepseek_v4_q2_k_matvec,
+    deepseek_v4_q2_k_selected_experts_down_projection,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
@@ -635,3 +636,35 @@ def test_q2_iq2_default_triton_path_rejects_multi_block_columns() -> None:
     assert q2_out.shape == (1,)
     with pytest.raises(NotImplementedError, match="IQ2_XXS Triton matvec"):
         deepseek_v4_iq2_xxs_matvec(iq2_payload, hidden, rows=1, columns=512)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_q2_k_selected_experts_down_projection() -> None:
+    down_rows = 4096
+    down_columns = 2048
+    num_experts = 6
+    workspace = torch.randn(
+        (num_experts, down_columns), dtype=torch.float32, device="cuda"
+    )
+    expert_weights = torch.full(
+        (num_experts,), 1.0 / num_experts, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty((down_rows,), dtype=torch.float32, device="cuda")
+    down_payloads: list[torch.Tensor] = []
+    expected = torch.zeros((down_rows,), dtype=torch.float32, device="cuda")
+    for i in range(num_experts):
+        payload = _q2_k_deterministic_payload_blocks(down_rows, down_columns // 256)
+        down_payloads.append(_cuda_payload(payload))
+        matrix = q2_k_matrix_from_gguf_payload(
+            payload, rows=down_rows, columns=down_columns
+        ).to("cuda")
+        expected += expert_weights[i] * matrix.matmul(workspace[i])
+    deepseek_v4_q2_k_selected_experts_down_projection(
+        workspace=workspace,
+        down_payloads=down_payloads,
+        expert_weights=expert_weights,
+        output=output,
+        rows=down_rows,
+        columns=down_columns,
+    )
+    torch.testing.assert_close(output, expected, rtol=8e-2, atol=8e-2)
