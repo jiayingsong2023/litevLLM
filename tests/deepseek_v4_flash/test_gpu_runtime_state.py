@@ -84,3 +84,21 @@ def test_gpu_request_state_rejects_batch_size_other_than_one() -> None:
                 batch_size=2,
             )
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_workspace_shape_and_reuse() -> None:
+    cfg = DeepSeekV4FlashGPUCacheConfig(
+        context_length=1024,
+        hidden_size=4096,
+        batch_size=1,
+        kv_width=512,
+        device=torch.device("cuda"),
+    )
+    state = DeepSeekV4FlashGPURequestState(cfg)
+    ws1 = state.moe_workspace(num_experts=6, intermediate_size=2048)
+    assert ws1.shape == (6, 2048)
+    assert ws1.dtype == torch.float32
+    assert ws1.device.type == "cuda"
+    ws2 = state.moe_workspace(num_experts=6, intermediate_size=2048)
+    assert ws2 is ws1

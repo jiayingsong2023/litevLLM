@@ -68,6 +68,7 @@ class DeepSeekV4FlashGPURequestState:
         )
         self.compressed_kv_cache = self.raw_kv_cache
         self.token_position = 0
+        self._moe_workspace: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
     def advance_token(self) -> None:
         self.require_capacity(self.token_position)
@@ -81,6 +82,29 @@ class DeepSeekV4FlashGPURequestState:
                 f"position {position} exceeds context_length "
                 f"{self.config.context_length}"
             )
+
+    def moe_workspace(
+        self,
+        *,
+        num_experts: int,
+        intermediate_size: int,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = self.config.device
+        if device is None:
+            device = torch.device("cuda")
+        key = (num_experts, intermediate_size, device)
+        cached = self._moe_workspace.get(key)
+        if cached is not None:
+            return cached
+        workspace = torch.empty(
+            (num_experts, intermediate_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._moe_workspace[key] = workspace
+        return workspace
 
     def reset(self) -> None:
         self.token_position = 0
