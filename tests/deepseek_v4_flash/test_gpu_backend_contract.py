@@ -227,6 +227,7 @@ def test_output_argmax_matches_output_logits() -> None:
                 "iq2_xxs_gate_up_fused_calls": 0,
                 "q2_iq2_reference_fallback_calls": 0,
                 "cpu_token_sync_points": 0,
+                "fused_sliding_attention_api_calls": 0,
             },
         ),
         (
@@ -239,6 +240,7 @@ def test_output_argmax_matches_output_logits() -> None:
                 "iq2_xxs_gate_up_fused_calls": 1,
                 "q2_iq2_reference_fallback_calls": 0,
                 "cpu_token_sync_points": 0,
+                "fused_sliding_attention_api_calls": 0,
             },
         ),
     ),
@@ -380,6 +382,7 @@ def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down() 
         "iq2_xxs_gate_up_fused_calls": 1,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
+        "fused_sliding_attention_api_calls": 0,
     }
 
 
@@ -472,6 +475,7 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
         "fused_selected_expert_api_calls": 1,
+        "fused_sliding_attention_api_calls": 0,
     }
 
 
@@ -561,6 +565,7 @@ def test_quantized_expert_gemm_uses_fused_iq2_gate_up_for_multiblock_columns() -
         "iq2_xxs_gate_up_fused_calls": 1,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
+        "fused_sliding_attention_api_calls": 0,
     }
 
 
@@ -611,6 +616,32 @@ def test_fused_quantized_selected_experts_gemm_matches_loop() -> None:
     # The fused path skips the Q8_K round-trip that the looped fallback
     # performs, so allow a slightly looser relative tolerance.
     torch.testing.assert_close(actual, expected, rtol=5.0e-3, atol=1.0e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_matches_reference() -> None:
+    from vllm.model_executor.models.deepseek_v4_flash.attention import (
+        shared_kv_swa_attention_reference,
+    )
+
+    backend = DeepSeekV4FlashGPUBackend()
+    num_heads = 64
+    head_dim = 512
+    window = 128
+    torch.manual_seed(123)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+    attn_sinks = torch.randn((num_heads,), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, attn_sinks)
+    actual = backend.fused_sliding_window_attention(
+        query=query,
+        kv_rows=kv_rows,
+        attn_sinks=attn_sinks,
+        token_idx=7,
+    )
+    assert backend.stats()["fused_sliding_attention_api_calls"] == 1
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:

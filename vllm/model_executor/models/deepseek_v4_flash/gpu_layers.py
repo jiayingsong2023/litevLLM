@@ -305,6 +305,7 @@ def _run_real_sliding_attention(
     *,
     layer: DeepSeekV4FlashLayerSemanticBindings,
     stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     state: DeepSeekV4FlashGPURequestState | None,
     token_idx: int,
     kv_rows: torch.Tensor | None,
@@ -391,11 +392,25 @@ def _run_real_sliding_attention(
     if not kv_rows.is_cuda:
         raise ValueError("DeepSeek V4 Flash real sliding KV rows must be CUDA")
 
-    context = shared_kv_swa_attention_reference(
-        query,
-        kv_rows,
-        stager.stage_vector(attn_sinks),
-    )
+    staged_sinks = stager.stage_vector(attn_sinks)
+    fused_attn = getattr(backend, "fused_sliding_window_attention", None)
+    context: torch.Tensor | None = None
+    if callable(fused_attn):
+        try:
+            context = fused_attn(
+                query=query,
+                kv_rows=kv_rows,
+                attn_sinks=staged_sinks,
+                token_idx=token_idx,
+            )
+        except (RuntimeError, NotImplementedError, ValueError):
+            context = None
+    if context is None:
+        context = shared_kv_swa_attention_reference(
+            query,
+            kv_rows,
+            staged_sinks,
+        )
     context = apply_deepseek_layer_rope_to_tail_reference(
         context,
         token_idx=token_idx,
@@ -566,6 +581,7 @@ def deepseek_v4_flash_sliding_layer_forward(
                 attn_input,
                 layer=layer,
                 stager=stager,
+                backend=backend,
                 state=state,
                 token_idx=token_idx,
                 kv_rows=kv_rows,
@@ -898,6 +914,7 @@ def deepseek_v4_flash_compressed_layer_forward(
                 attn_input,
                 layer=layer,
                 stager=stager,
+                backend=backend,
                 state=state,
                 token_idx=token_idx,
                 kv_rows=None,

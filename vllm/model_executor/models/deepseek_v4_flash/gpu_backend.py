@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from vllm.kernels.triton.deepseek_v4_flash.attention import (
     DeepSeekV4AttentionKernelInputs,
     deepseek_v4_attention,
+    deepseek_v4_fused_sliding_window_attention,
 )
 from vllm.kernels.triton.deepseek_v4_flash.compressed_attention import (
     DeepSeekV4CompressedAttentionTensorInputs,
@@ -97,6 +98,7 @@ class DeepSeekV4FlashGPUBackend:
             "iq2_xxs_gate_up_fused_calls": 0,
             "q2_iq2_reference_fallback_calls": 0,
             "cpu_token_sync_points": 0,
+            "fused_sliding_attention_api_calls": 0,
         }
 
     @property
@@ -323,6 +325,26 @@ class DeepSeekV4FlashGPUBackend:
                 token_idx=token_idx,
                 attn_sinks=attn_sinks,
             )
+        )
+
+    def fused_sliding_window_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        attn_sinks: torch.Tensor | None,
+        token_idx: int,
+    ) -> torch.Tensor:
+        tensors = (query, kv_rows, attn_sinks)
+        if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash fused sliding attention inputs must be CUDA tensors"
+            )
+        self._stats["fused_sliding_attention_api_calls"] += 1
+        return deepseek_v4_fused_sliding_window_attention(
+            query=query.to(torch.float32),
+            kv_rows=kv_rows.to(torch.float32),
+            attn_sinks=attn_sinks.to(torch.float32) if attn_sinks is not None else None,
         )
 
     def routed_moe(
