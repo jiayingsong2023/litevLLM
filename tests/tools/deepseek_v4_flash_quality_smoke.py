@@ -49,6 +49,12 @@ _DEFAULT_GGUF = (
     "models/DeepSeek-V4-Flash-ds4/"
     "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 )
+_DEFAULT_PROMPTS: list[str] = [
+    "What is the capital of France?",
+    "Explain the concept of gravity in one sentence.",
+    "Translate 'Good morning' into Chinese.",
+    "Write a one-line Python function that returns the factorial of n.",
+]
 _TOKENIZER_TOKENS_KEY = "tokenizer.ggml.tokens"
 _TOKENIZER_MERGES_KEY = "tokenizer.ggml.merges"
 _TOKENIZER_BOS_KEY = "tokenizer.ggml.bos_token_id"
@@ -85,8 +91,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--prompt-text",
         type=str,
-        default="What is the capital of France?",
-        help="User prompt text. By default this is wrapped with GGUF chat template.",
+        default=None,
+        help="User prompt text. When given, only this single prompt is run.",
+    )
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        help="JSON list of prompt strings. Defaults to a small built-in suite.",
     )
     parser.add_argument(
         "--raw-prompt",
@@ -97,7 +109,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--prompt-token-ids",
         type=str,
         default="",
-        help="Comma-separated prompt token ids. Overrides --prompt-text.",
+        help=(
+            "Comma-separated prompt token ids. "
+            "Overrides --prompt-text for single-prompt mode."
+        ),
     )
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--warmup-tokens", type=int, default=0)
@@ -110,6 +125,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--enable-profiler", action="store_true")
     return parser.parse_args(argv)
+
+
+def _resolve_prompts(args: argparse.Namespace) -> list[str]:
+    """Return the list of prompts to run.
+
+    Precedence:
+      1. ``--prompt-text`` for single-prompt mode (backwards compatibility).
+      2. ``--prompts`` JSON list supplied by the caller.
+      3. Built-in default suite.
+    """
+    if args.prompt_text is not None:
+        return [args.prompt_text]
+    if args.prompts is not None:
+        parsed = json.loads(args.prompts)
+        if not isinstance(parsed, list):
+            raise ValueError("--prompts must be a JSON list of strings")
+        return [str(p) for p in parsed]
+    return list(_DEFAULT_PROMPTS)
 
 
 class _Cursor:
@@ -558,10 +591,7 @@ def evaluate_readability(
         top_ratio = max(counts.values()) / len(generated_token_ids)
         if top_ratio > _MAX_TOKEN_REPEAT_RATIO:
             reasons.append("token_repeat")
-        if (
-            eos_token_id is not None
-            and eos_token_id in generated_token_ids[:-1]
-        ):
+        if eos_token_id is not None and eos_token_id in generated_token_ids[:-1]:
             reasons.append("tokens_after_eos")
     return {
         "passed": not reasons,
@@ -711,52 +741,16 @@ def _args_with_max_tokens(
     return argparse.Namespace(**updated)
 
 
-def _performance_metrics(
+def _run_single_prompt(
+    args: argparse.Namespace,
     *,
-    generated_ids: list[int],
-    total_elapsed_ms: float,
-) -> dict[str, float | int | str]:
-    decode_tokens_per_second = (
-        len(generated_ids) / (total_elapsed_ms / 1000.0)
-        if total_elapsed_ms > 0.0
-        else 0.0
-    )
-    return {
-        "generated_tokens": len(generated_ids),
-        "metric_scope": "direct_generation_total",
-        "total_elapsed_ms": total_elapsed_ms,
-        "decode_tokens_per_second": decode_tokens_per_second,
-    }
-
-
-def _performance_gate_verdict(
-    *,
-    decode_tps_min: float,
-    total_elapsed_ms: float,
-    min_decode_tps: float,
-    max_total_elapsed_ms: float,
+    prompt_text: str,
+    tokenizer_metadata: GGUFTokenizerMetadata,
+    gguf_tokens: list[str],
 ) -> dict[str, object]:
-    reasons: list[str] = []
-    if min_decode_tps > 0.0 and decode_tps_min < min_decode_tps:
-        reasons.append("decode_tps_below_min")
-    if max_total_elapsed_ms > 0.0 and total_elapsed_ms > max_total_elapsed_ms:
-        reasons.append("total_elapsed_above_max")
-    return {
-        "passed": not reasons,
-        "reasons": reasons,
-        "min_decode_tps": min_decode_tps,
-        "max_total_elapsed_ms": max_total_elapsed_ms,
-    }
-
-
-def main() -> int:
-    args = parse_args()
-    if not args.model.is_file():
-        raise SystemExit(f"DeepSeek V4 Flash GGUF file not found: {args.model}")
-    tokenizer_metadata = read_gguf_tokenizer_metadata(args.model)
-    gguf_tokens = tokenizer_metadata.tokens
+    """Run the quality smoke for one prompt and return a per-case payload."""
     encoded_prompt_text = prompt_text_for_encoding(
-        args.prompt_text,
+        prompt_text,
         tokenizer_metadata=tokenizer_metadata,
         raw_prompt=bool(args.raw_prompt),
     )
@@ -766,17 +760,10 @@ def main() -> int:
             encoded_prompt_text,
             tokenizer_metadata=tokenizer_metadata,
         )
-    warmup_tokens = int(getattr(args, "warmup_tokens", 0))
     repeat = max(1, int(getattr(args, "repeat", 1)))
     min_decode_tps = float(getattr(args, "min_decode_tps", 0.0))
     max_total_elapsed_ms = float(getattr(args, "max_total_elapsed_ms", 0.0))
-    if warmup_tokens > 0:
-        _run_direct_generate(
-            _args_with_max_tokens(args, warmup_tokens),
-            prompt_token_ids=prompt_token_ids,
-            gguf_tokens=gguf_tokens,
-            eos_token_id=tokenizer_metadata.eos_token_id,
-        )
+
     measured_payloads: list[dict[str, Any]] = []
     performance_values: list[dict[str, float | int | str]] = []
     for _ in range(repeat):
@@ -828,13 +815,9 @@ def main() -> int:
         min_output_chars=args.min_output_chars,
         eos_token_id=tokenizer_metadata.eos_token_id,
     )
-    payload: dict[str, object] = {
-        "model": str(args.model),
-        "context_length": args.context_length,
-        "max_tokens": args.max_tokens,
-        "prompt_text": args.prompt_text,
+    return {
+        "prompt_text": prompt_text,
         "encoded_prompt_text": encoded_prompt_text,
-        "raw_prompt": bool(args.raw_prompt),
         "prompt_token_ids": prompt_token_ids,
         "output_token_ids": output_ids,
         "generated_token_ids": generated_ids,
@@ -846,21 +829,123 @@ def main() -> int:
         "gpu_backend": smoke_payload.get("gpu_backend", {}),
         "gpu_staging": smoke_payload.get("gpu_staging", {}),
     }
-    if "profiler" in smoke_payload:
-        payload["profiler"] = smoke_payload["profiler"]
+
+
+def _performance_metrics(
+    *,
+    generated_ids: list[int],
+    total_elapsed_ms: float,
+) -> dict[str, float | int | str]:
+    decode_tokens_per_second = (
+        len(generated_ids) / (total_elapsed_ms / 1000.0)
+        if total_elapsed_ms > 0.0
+        else 0.0
+    )
+    return {
+        "generated_tokens": len(generated_ids),
+        "metric_scope": "direct_generation_total",
+        "total_elapsed_ms": total_elapsed_ms,
+        "decode_tokens_per_second": decode_tokens_per_second,
+    }
+
+
+def _performance_gate_verdict(
+    *,
+    decode_tps_min: float,
+    total_elapsed_ms: float,
+    min_decode_tps: float,
+    max_total_elapsed_ms: float,
+) -> dict[str, object]:
+    reasons: list[str] = []
+    if min_decode_tps > 0.0 and decode_tps_min < min_decode_tps:
+        reasons.append("decode_tps_below_min")
+    if max_total_elapsed_ms > 0.0 and total_elapsed_ms > max_total_elapsed_ms:
+        reasons.append("total_elapsed_above_max")
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "min_decode_tps": min_decode_tps,
+        "max_total_elapsed_ms": max_total_elapsed_ms,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.model.is_file():
+        raise SystemExit(f"DeepSeek V4 Flash GGUF file not found: {args.model}")
+    tokenizer_metadata = read_gguf_tokenizer_metadata(args.model)
+    gguf_tokens = tokenizer_metadata.tokens
+    prompts = _resolve_prompts(args)
+    if not prompts:
+        raise SystemExit("No prompts to run")
+
+    warmup_tokens = int(getattr(args, "warmup_tokens", 0))
+    if warmup_tokens > 0:
+        warmup_prompt = prompts[0]
+        warmup_encoded = prompt_text_for_encoding(
+            warmup_prompt,
+            tokenizer_metadata=tokenizer_metadata,
+            raw_prompt=bool(args.raw_prompt),
+        )
+        warmup_token_ids = encode_prompt_text_with_metadata(
+            warmup_encoded,
+            tokenizer_metadata=tokenizer_metadata,
+        )
+        _run_direct_generate(
+            _args_with_max_tokens(args, warmup_tokens),
+            prompt_token_ids=warmup_token_ids,
+            gguf_tokens=gguf_tokens,
+            eos_token_id=tokenizer_metadata.eos_token_id,
+        )
+
+    cases: list[dict[str, object]] = []
+    for prompt_text in prompts:
+        case_payload = _run_single_prompt(
+            args,
+            prompt_text=prompt_text,
+            tokenizer_metadata=tokenizer_metadata,
+            gguf_tokens=gguf_tokens,
+        )
+        cases.append(case_payload)
+        if "profiler" in case_payload.get("gpu_backend", {}):
+            pass
+
+    readability_passed = all(bool(c["readability"].get("passed")) for c in cases)
+    performance_gates_passed = all(
+        bool(c["performance_gates"].get("passed")) for c in cases
+    )
+    overall_passed = readability_passed and performance_gates_passed
+
+    payload: dict[str, object] = {
+        "model": str(args.model),
+        "context_length": args.context_length,
+        "max_tokens": args.max_tokens,
+        "raw_prompt": bool(args.raw_prompt),
+        "case_count": len(cases),
+        "cases": cases,
+        "readability_passed": readability_passed,
+        "performance_gates_passed": performance_gates_passed,
+        "overall_passed": overall_passed,
+    }
     if args.json_out is not None:
         _write_json(args.json_out, payload)
     if args.dump_step_json is not None:
         _write_json(
             args.dump_step_json,
             {
-                "prompt_token_ids": prompt_token_ids,
-                "generated_token_ids": generated_ids,
-                "step_records": smoke_payload.get("step_records", []),
+                "prompts": [c["prompt_text"] for c in cases],
+                "cases": [
+                    {
+                        "prompt_token_ids": c["prompt_token_ids"],
+                        "generated_token_ids": c["generated_token_ids"],
+                        "step_records": c["step_records"],
+                    }
+                    for c in cases
+                ],
             },
         )
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if bool(verdict["passed"]) and bool(performance_gates["passed"]) else 1
+    return 0 if overall_passed else 1
 
 
 if __name__ == "__main__":

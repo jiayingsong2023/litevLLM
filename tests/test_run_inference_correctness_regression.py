@@ -252,17 +252,23 @@ if [[ "$*" == *"deepseek_v4_flash_quality_smoke.py"* ]]; then
 import json
 import sys
 payload = {{
-    "readability": {{
-        "passed": True,
-        "text": "The capital of France is Paris.",
-        "reasons": [],
-    }},
-    "performance": {{"decode_tokens_per_second": 0.75}},
-    "performance_summary": {{
-        "decode_tps_min": 0.70,
-        "decode_tps_median": 0.75,
-    }},
-    "generated_token_ids": [671, 6102, 294, 8760, 344, 11111, 16, 1],
+    "overall_passed": True,
+    "cases": [
+        {{
+            "prompt_text": "What is the capital of France?",
+            "readability": {{
+                "passed": True,
+                "text": "The capital of France is Paris.",
+                "reasons": [],
+            }},
+            "performance": {{"decode_tokens_per_second": 0.75}},
+            "performance_summary": {{
+                "decode_tps_min": 0.70,
+                "decode_tps_median": 0.75,
+            }},
+            "generated_token_ids": [671, 6102, 294, 8760, 344, 11111, 16, 1],
+        }}
+    ],
 }}
 open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(payload))
 PY_JSON
@@ -303,12 +309,10 @@ exit 0
 
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     assert "[DeepSeek V4 Flash] Tier-B quality smoke" in proc.stdout
+    assert "overall: PASS" in proc.stdout
+    assert "cases: 1" in proc.stdout
     assert "readability: PASS" in proc.stdout
     assert "output: The capital of France is Paris." in proc.stdout
-    assert (
-        "generated_token_ids: [671, 6102, 294, 8760, 344, 11111, 16, 1]"
-        in proc.stdout
-    )
     assert "decode_tps: 0.75 (min=0.70, median=0.75)" in proc.stdout
 
 

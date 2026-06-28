@@ -264,23 +264,28 @@ import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-readability = payload.get("readability", {})
-performance = payload.get("performance", {})
-summary = payload.get("performance_summary", {})
-text = str(readability.get("text", "")).strip()
-reasons = readability.get("reasons", [])
-generated = payload.get("generated_token_ids", [])
+cases = payload.get("cases", [payload])
 print("[DeepSeek V4 Flash] Tier-B quality smoke")
-print(f"  readability: {'PASS' if readability.get('passed') else 'FAIL'}")
-print(f"  output: {text}")
-print(f"  generated_token_ids: {generated}")
-print(f"  reasons: {reasons}")
-print(
-    "  decode_tps: "
-    f"{float(performance.get('decode_tokens_per_second', 0.0)):.2f} "
-    f"(min={float(summary.get('decode_tps_min', 0.0)):.2f}, "
-    f"median={float(summary.get('decode_tps_median', 0.0)):.2f})"
-)
+print(f"  overall: {'PASS' if payload.get('overall_passed') else 'FAIL'}")
+print(f"  cases: {len(cases)}")
+for idx, case in enumerate(cases, start=1):
+    readability = case.get("readability", {})
+    performance = case.get("performance", {})
+    summary = case.get("performance_summary", {})
+    text = str(readability.get("text", "")).strip()
+    reasons = readability.get("reasons", [])
+    generated = case.get("generated_token_ids", [])
+    prompt = str(case.get("prompt_text", "")).strip()
+    print(f"  [{idx}] {prompt[:48]!r}")
+    print(f"       readability: {'PASS' if readability.get('passed') else 'FAIL'}")
+    print(f"       output: {text}")
+    print(f"       reasons: {reasons}")
+    print(
+        "       decode_tps: "
+        f"{float(performance.get('decode_tokens_per_second', 0.0)):.2f} "
+        f"(min={float(summary.get('decode_tps_min', 0.0)):.2f}, "
+        f"median={float(summary.get('decode_tps_median', 0.0)):.2f})"
+    )
 PY_SUMMARY
 }
 
