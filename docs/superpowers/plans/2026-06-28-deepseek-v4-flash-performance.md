@@ -536,3 +536,20 @@ git commit -m "docs: milestone 1 benchmark results"
 - **Placeholder scan:** Milestone 1 task code blocks are concrete except the Triton kernel bodies, which are intentionally described as modifications of existing kernels with explicit layout/tiling rules. The exact kernel code is too long for a plan but the implementer is pointed to the existing patterns.
 - **Type consistency:** `workspace` is consistently `[num_experts, intermediate_size]` fp32; `payloads` tuples match existing `DeepSeekV4FlashSelectedExpertPayloads`.
 - **Risk:** Concatenating payloads before each launch adds a small CPU copy; this should be negligible compared to the current per-expert Python loop. If it becomes a bottleneck, pre-allocate fixed-size concatenated payload buffers and copy into them.
+
+---
+
+## Milestone 1 Results
+
+- **Date:** 2026-06-28
+- **Quality smoke (3 recorded runs, prompt: "What is the capital of France?"):**
+  - Run 1: `decode_tps` = 0.544, readability/logits gates = pass
+  - Run 2: `decode_tps` = 0.568, readability/logits gates = pass
+  - Run 3: `decode_tps` = 0.577, readability/logits gates = pass
+  - **3-run average `decode_tps`:** 0.563 (baseline ~0.39)
+- **Regression suites:**
+  - `tests/run_regression_suite.sh` — PASS
+  - `tests/run_deepseek_v4_flash_real_smoke.sh` — PASS
+  - `tests/run_inference_correctness_regression.sh` (Tier-B only, `SKIP_A_TIER=1`) — PASS
+    - Split into two invocations to fit the 300 s tool wall-clock: Gemma4 models + TinyLlama + Qwen passed; DeepSeek V4 Flash Tier-B quality smoke passed.
+- **Outcome:** Milestone 1 gates passed.
