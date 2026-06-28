@@ -52,7 +52,7 @@ _DEFAULT_GGUF = (
 _DEFAULT_PROMPTS: list[str] = [
     "What is the capital of France?",
     "Explain the concept of gravity in one sentence.",
-    "Translate 'Good morning' into Chinese.",
+    "用中文回答：法国的首都是哪里？",
     "Write a one-line Python function that returns the factorial of n.",
 ]
 _TOKENIZER_TOKENS_KEY = "tokenizer.ggml.tokens"
@@ -471,7 +471,10 @@ def decode_generated_tokens(
     token_ids: list[int],
     *,
     gguf_tokens: list[str],
+    tokenizer: Tokenizer | None = None,
 ) -> str:
+    if tokenizer is not None:
+        return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
     pieces: list[str] = []
     for token_id in token_ids:
         if token_id < 0 or token_id >= len(gguf_tokens):
@@ -484,6 +487,7 @@ def topk_records(
     torch_logits: torch.Tensor | list[float],
     *,
     gguf_tokens: list[str],
+    tokenizer: Tokenizer | None,
     k: int,
 ) -> list[dict[str, object]]:
     logits = (
@@ -503,6 +507,7 @@ def topk_records(
                 "text": decode_generated_tokens(
                     [int(token_id)],
                     gguf_tokens=gguf_tokens,
+                    tokenizer=tokenizer,
                 ),
                 "logit": float(logit),
             }
@@ -628,6 +633,7 @@ def _run_direct_generate(
     *,
     prompt_token_ids: list[int],
     gguf_tokens: list[str],
+    tokenizer: Tokenizer | None,
     eos_token_id: int | None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
@@ -672,16 +678,20 @@ def _run_direct_generate(
                     "token_idx": token_idx,
                     "input_token_id": int(token_id),
                     "input_text": decode_generated_tokens(
-                        [int(token_id)], gguf_tokens=gguf_tokens
+                        [int(token_id)],
+                        gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                     ),
                     "selected_token_id": int(next_token_tensor.item()),
                     "selected_text": decode_generated_tokens(
                         [int(next_token_tensor.item())],
                         gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                     ),
                     "topk": topk_records(
                         logits,
                         gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                         k=args.top_k,
                     ),
                     "logits": logits_stats(logits),
@@ -707,16 +717,20 @@ def _run_direct_generate(
                     "token_idx": len(output_ids) - 1,
                     "input_token_id": selected_id,
                     "input_text": decode_generated_tokens(
-                        [selected_id], gguf_tokens=gguf_tokens
+                        [selected_id],
+                        gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                     ),
                     "selected_token_id": int(next_token_tensor.item()),
                     "selected_text": decode_generated_tokens(
                         [int(next_token_tensor.item())],
                         gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                     ),
                     "topk": topk_records(
                         logits,
                         gguf_tokens=gguf_tokens,
+                        tokenizer=tokenizer,
                         k=args.top_k,
                     ),
                     "logits": logits_stats(logits),
@@ -764,6 +778,14 @@ def _run_single_prompt(
     min_decode_tps = float(getattr(args, "min_decode_tps", 0.0))
     max_total_elapsed_ms = float(getattr(args, "max_total_elapsed_ms", 0.0))
 
+    decoder_tokenizer: Tokenizer | None = None
+    if tokenizer_metadata.merges:
+        decoder_tokenizer = build_bpe_prompt_tokenizer(
+            gguf_tokens=tokenizer_metadata.tokens,
+            gguf_merges=tokenizer_metadata.merges,
+            special_tokens=special_tokens_from_vocab(tokenizer_metadata.tokens),
+        )
+
     measured_payloads: list[dict[str, Any]] = []
     performance_values: list[dict[str, float | int | str]] = []
     for _ in range(repeat):
@@ -772,6 +794,7 @@ def _run_single_prompt(
             args,
             prompt_token_ids=prompt_token_ids,
             gguf_tokens=gguf_tokens,
+            tokenizer=decoder_tokenizer,
             eos_token_id=tokenizer_metadata.eos_token_id,
         )
         total_elapsed_ms = (perf_counter() - generation_start) * 1000.0
@@ -808,7 +831,11 @@ def _run_single_prompt(
         min_decode_tps=min_decode_tps,
         max_total_elapsed_ms=max_total_elapsed_ms,
     )
-    text = decode_generated_tokens(generated_ids, gguf_tokens=gguf_tokens)
+    text = decode_generated_tokens(
+        generated_ids,
+        gguf_tokens=gguf_tokens,
+        tokenizer=decoder_tokenizer,
+    )
     verdict = evaluate_readability(
         text=text,
         generated_token_ids=generated_ids,
@@ -895,6 +922,7 @@ def main() -> int:
             _args_with_max_tokens(args, warmup_tokens),
             prompt_token_ids=warmup_token_ids,
             gguf_tokens=gguf_tokens,
+            tokenizer=None,
             eos_token_id=tokenizer_metadata.eos_token_id,
         )
 
