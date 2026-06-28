@@ -239,12 +239,15 @@ def _q2_k_selected_experts_down_projection_kernel(
     expert_stride_halfs = rows * COLUMNS_BLOCKS * HALF_WORDS_PER_BLOCK
     workspace_stride = COLUMNS_BLOCKS * BLOCK_SIZE
 
-    for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
-        row = row_base + row_offset
-        if row < rows:
-            total = tl.full((), 0.0, tl.float32)
-            for expert_id in tl.range(0, num_experts):
-                weight = tl.load(weights_ptr + expert_id).to(tl.float32)
+    total_0 = tl.full((), 0.0, tl.float32)
+    total_1 = tl.full((), 0.0, tl.float32)
+    total_2 = tl.full((), 0.0, tl.float32)
+    total_3 = tl.full((), 0.0, tl.float32)
+    for expert_id in tl.range(0, num_experts):
+        weight = tl.load(weights_ptr + expert_id).to(tl.float32)
+        for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+            row = row_base + row_offset
+            if row < rows:
                 expert_total = tl.full((), 0.0, tl.float32)
                 for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
                     payload_base = (
@@ -276,8 +279,25 @@ def _q2_k_selected_experts_down_projection_kernel(
                         + offsets
                     ).to(tl.float32)
                     expert_total += tl.sum(decoded * hidden, axis=0)
-                total += weight * expert_total
-            tl.store(output_ptr + row, total)
+                if row_offset == 0:
+                    total_0 += weight * expert_total
+                if row_offset == 1:
+                    total_1 += weight * expert_total
+                if row_offset == 2:
+                    total_2 += weight * expert_total
+                if row_offset == 3:
+                    total_3 += weight * expert_total
+    for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+        row = row_base + row_offset
+        if row < rows:
+            if row_offset == 0:
+                tl.store(output_ptr + row, total_0)
+            if row_offset == 1:
+                tl.store(output_ptr + row, total_1)
+            if row_offset == 2:
+                tl.store(output_ptr + row, total_2)
+            if row_offset == 3:
+                tl.store(output_ptr + row, total_3)
 
 
 def _q2_k_matvec_triton_cuda(
@@ -1184,6 +1204,17 @@ def deepseek_v4_q2_k_selected_experts_down_projection(
         raise ValueError(f"output must be fp32; got {output.dtype}")
     if not workspace.is_cuda or not expert_weights.is_cuda or not output.is_cuda:
         raise ValueError("workspace, expert_weights, and output must be CUDA tensors")
+    expected_device = workspace.device
+    if expert_weights.device != expected_device:
+        raise ValueError(
+            "expert_weights must be on the same device as workspace; "
+            f"got {expert_weights.device} and {expected_device}"
+        )
+    if output.device != expected_device:
+        raise ValueError(
+            "output must be on the same device as workspace; "
+            f"got {output.device} and {expected_device}"
+        )
 
     for payload in down_payloads:
         _validate_payload(
@@ -1192,6 +1223,11 @@ def deepseek_v4_q2_k_selected_experts_down_projection(
             columns=columns,
             block_bytes=_Q2_K_BLOCK_BYTES,
         )
+        if payload.device != expected_device:
+            raise ValueError(
+                "down_payloads must be on the same device as workspace; "
+                f"got {payload.device} and {expected_device}"
+            )
 
     columns_blocks = columns // _GGUF_BLOCK_COLUMNS
     down_stack = torch.stack(down_payloads, dim=0).contiguous()
