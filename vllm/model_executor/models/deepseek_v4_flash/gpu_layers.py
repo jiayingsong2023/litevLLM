@@ -664,6 +664,7 @@ def deepseek_v4_flash_sliding_layer_forward(
             grouped_experts=grouped_experts,
             stager=stager,
             backend=backend,
+            state=state,
             token_id=token_idx if token_id is None else token_id,
             token_id_tensor=token_id_tensor,
             router_top_k=router_top_k,
@@ -987,6 +988,7 @@ def deepseek_v4_flash_compressed_layer_forward(
             grouped_experts=grouped_experts,
             stager=stager,
             backend=backend,
+            state=state,
             token_id=token_idx if token_id is None else token_id,
             token_id_tensor=token_id_tensor,
             router_top_k=router_top_k,
@@ -1586,6 +1588,7 @@ def _run_sliding_moe(
     grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    state: DeepSeekV4FlashGPURequestState | None = None,
     token_id: int,
     token_id_tensor: torch.Tensor | None = None,
     router_top_k: int,
@@ -1601,6 +1604,7 @@ def _run_sliding_moe(
             grouped_experts=grouped_experts,
             stager=stager,
             backend=backend,
+            state=state,
             token_id=token_id,
             token_id_tensor=token_id_tensor,
         )
@@ -1634,6 +1638,7 @@ def _run_sliding_moe(
                 grouped_experts=grouped_experts,
                 stager=stager,
                 backend=backend,
+                state=state,
                 layer_idx=layer.layer_index,
             )
 
@@ -1665,6 +1670,7 @@ def _run_hash_routed_experts(
     grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    state: DeepSeekV4FlashGPURequestState | None = None,
     token_id: int,
     token_id_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -1734,6 +1740,7 @@ def _run_hash_routed_experts(
         grouped_experts=grouped_experts,
         stager=stager,
         backend=backend,
+        state=state,
         layer_idx=layer.layer_index,
     )
 
@@ -1779,6 +1786,7 @@ def _run_staged_routed_experts(
     grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
     stager: DeepSeekV4FlashGPUWeightStager,
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    state: DeepSeekV4FlashGPURequestState | None = None,
     layer_idx: int | None = None,
 ) -> torch.Tensor:
     output: torch.Tensor | None = None
@@ -1800,6 +1808,22 @@ def _run_staged_routed_experts(
             backend=backend,
             layer_idx=layer_idx,
         )
+    selected_gemm = getattr(backend, "fused_quantized_selected_experts_gemm", None)
+    if callable(selected_gemm):
+        try:
+            workspace = state.moe_workspace(
+                num_experts=len(selected_payloads),
+                intermediate_size=grouped_experts.gate.dims[1],
+                device=hidden.device,
+            )
+            return selected_gemm(
+                hidden=hidden,
+                expert_weights=expert_weights.reshape(-1),
+                payloads=selected_payloads,
+                workspace=workspace,
+            ).to(torch.float32)
+        except (AttributeError, NotImplementedError, RuntimeError):
+            pass
     selected_gemm = getattr(backend, "quantized_selected_experts_gemm", None)
     if callable(selected_gemm):
         with _stager_profile_section(

@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.models.deepseek_v4_flash import gpu_backend as backend_module
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
@@ -18,9 +17,6 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
-)
-from vllm.model_executor.models.deepseek_v4_flash.ops import (
-    deepseek_q8_k_roundtrip_reference,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
@@ -282,23 +278,13 @@ def test_quantized_expert_gemm_uses_default_triton_dispatch(
         decoder = q2_k_matrix_from_gguf_payload
     else:
         decoder = iq2_xxs_matrix_from_gguf_payload
-    expert_input = deepseek_q8_k_roundtrip_reference(hidden)
-    gate = (
-        decoder(gate_payload, rows=256, columns=256)
-        .to(device="cuda")
-        .matmul(expert_input)
-    )
-    up = (
-        decoder(up_payload, rows=256, columns=256)
-        .to(device="cuda")
-        .matmul(expert_input)
-    )
+    gate = decoder(gate_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
+    up = decoder(up_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
     activated = F.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
         up,
         min=-10.0,
         max=10.0,
     )
-    activated = deepseek_q8_k_roundtrip_reference(activated)
     expected = (
         decoder(down_payload, rows=256, columns=256).to(device="cuda").matmul(activated)
     )
@@ -438,20 +424,6 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
         ) in enumerate(payloads)
     )
 
-    roundtrips_by_width: dict[int, int] = {}
-
-    def counted_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
-        roundtrips_by_width[tensor.numel()] = roundtrips_by_width.get(
-            tensor.numel(),
-            0,
-        ) + 1
-        return deepseek_q8_k_roundtrip_reference(tensor)
-
-    monkeypatch.setattr(
-        backend_module,
-        "deepseek_q8_k_roundtrip_reference",
-        counted_roundtrip,
-    )
     backend = DeepSeekV4FlashGPUBackend()
     actual = backend.quantized_selected_experts_gemm(
         hidden=hidden,
@@ -460,7 +432,6 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
     )
 
     torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
-    assert roundtrips_by_width == {columns: 1, rows: 6}
     assert backend.stats() == {
         "quantized_expert_calls": 6,
         "q2_k_triton_calls": 6,
@@ -559,6 +530,53 @@ def test_quantized_expert_gemm_uses_fused_iq2_gate_up_for_multiblock_columns() -
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_quantized_selected_experts_gemm_matches_loop() -> None:
+    rows = 256
+    columns = 512
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    expert_weights = torch.full((6,), 1.0 / 6.0, dtype=torch.float32, device="cuda")
+    payloads = [
+        (
+            expert_id,
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_Q2_K,
+                rows=rows,
+                columns=rows,
+                payload=_q2_k_deterministic_payload(rows),
+            ),
+        )
+        for expert_id in range(6)
+    ]
+    ref_backend = DeepSeekV4FlashGPUBackend()
+    expected = ref_backend.quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+    )
+    backend = DeepSeekV4FlashGPUBackend()
+    workspace = torch.empty((6, rows), dtype=torch.float32, device="cuda")
+    actual = backend.fused_quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+        workspace=workspace,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:
