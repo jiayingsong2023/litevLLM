@@ -14,8 +14,37 @@ from vllm.model_executor.models.deepseek_v4_flash.attention import (
     indexer_weight_projection_reference,
     per_head_rms_norm_reference,
     raw_swa_attention_reference,
-    shared_kv_swa_attention_reference,
 )
+from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    shared_kv_swa_attention_reference as _shared_kv_swa_attention_reference,
+)
+
+
+def shared_kv_swa_attention_reference(
+    queries: torch.Tensor,
+    kv_rows: torch.Tensor,
+    attn_sinks: torch.Tensor | None,
+    *,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Wrapper that treats ``attn_sinks=None`` as no sink contribution.
+
+    The underlying reference requires a sink tensor; a sink of ``-inf`` gives
+    the same softmax denominator as omitting the sink entirely.
+    """
+    if attn_sinks is None:
+        attn_sinks = torch.full(
+            (queries.shape[0],),
+            float("-inf"),
+            dtype=queries.dtype,
+            device=queries.device,
+        )
+    return _shared_kv_swa_attention_reference(
+        queries,
+        kv_rows,
+        attn_sinks,
+        softmax_scale=softmax_scale,
+    )
 
 
 def test_raw_swa_attention_reference_scores_supplied_causal_window() -> None:
@@ -39,7 +68,7 @@ def test_raw_swa_attention_reference_returns_float32_value_vector() -> None:
 
     out = raw_swa_attention_reference(query, keys, values)
 
-    assert out.shape == (3, )
+    assert out.shape == (3,)
     assert out.dtype == torch.float32
     torch.testing.assert_close(out, torch.tensor([3.0, 4.0, 5.0]))
 
@@ -259,3 +288,40 @@ def test_compressor_update_state_reference_emits_on_ratio_boundary() -> None:
 
     assert emitted is not None
     torch.testing.assert_close(emitted, torch.tensor([0.0, 8.0]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_matches_reference() -> None:
+    from vllm.kernels.triton.deepseek_v4_flash.attention import (
+        deepseek_v4_fused_sliding_window_attention,
+    )
+
+    num_heads = 64
+    head_dim = 512
+    window = 128
+    torch.manual_seed(42)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+    attn_sinks = torch.randn((num_heads,), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, attn_sinks)
+    actual = deepseek_v4_fused_sliding_window_attention(query, kv_rows, attn_sinks)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_no_sinks() -> None:
+    from vllm.kernels.triton.deepseek_v4_flash.attention import (
+        deepseek_v4_fused_sliding_window_attention,
+    )
+
+    num_heads = 8
+    head_dim = 32
+    window = 7
+    torch.manual_seed(7)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, None)
+    actual = deepseek_v4_fused_sliding_window_attention(query, kv_rows, None)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
