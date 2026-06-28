@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.models.deepseek_v4_flash import gpu_backend as backend_module
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
@@ -17,6 +18,9 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
+)
+from vllm.model_executor.models.deepseek_v4_flash.ops import (
+    deepseek_q8_k_roundtrip_reference,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
@@ -278,13 +282,23 @@ def test_quantized_expert_gemm_uses_default_triton_dispatch(
         decoder = q2_k_matrix_from_gguf_payload
     else:
         decoder = iq2_xxs_matrix_from_gguf_payload
-    gate = decoder(gate_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
-    up = decoder(up_payload, rows=256, columns=256).to(device="cuda").matmul(hidden)
+    expert_input = deepseek_q8_k_roundtrip_reference(hidden)
+    gate = (
+        decoder(gate_payload, rows=256, columns=256)
+        .to(device="cuda")
+        .matmul(expert_input)
+    )
+    up = (
+        decoder(up_payload, rows=256, columns=256)
+        .to(device="cuda")
+        .matmul(expert_input)
+    )
     activated = F.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
         up,
         min=-10.0,
         max=10.0,
     )
+    activated = deepseek_q8_k_roundtrip_reference(activated)
     expected = (
         decoder(down_payload, rows=256, columns=256).to(device="cuda").matmul(activated)
     )
@@ -424,6 +438,23 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
         ) in enumerate(payloads)
     )
 
+    roundtrips_by_width: dict[int, int] = {}
+
+    def counted_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
+        roundtrips_by_width[tensor.numel()] = (
+            roundtrips_by_width.get(
+                tensor.numel(),
+                0,
+            )
+            + 1
+        )
+        return deepseek_q8_k_roundtrip_reference(tensor)
+
+    monkeypatch.setattr(
+        backend_module,
+        "deepseek_q8_k_roundtrip_reference",
+        counted_roundtrip,
+    )
     backend = DeepSeekV4FlashGPUBackend()
     actual = backend.quantized_selected_experts_gemm(
         hidden=hidden,
@@ -432,6 +463,7 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
     )
 
     torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
+    assert roundtrips_by_width == {columns: 1, rows: 6}
     assert backend.stats() == {
         "quantized_expert_calls": 6,
         "q2_k_triton_calls": 6,
@@ -439,7 +471,7 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
         "iq2_xxs_gate_up_fused_calls": 6,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
-        "selected_expert_fused_api_calls": 1,
+        "fused_selected_expert_api_calls": 1,
     }
 
 
@@ -576,7 +608,9 @@ def test_fused_quantized_selected_experts_gemm_matches_loop() -> None:
         payloads=payloads,
         workspace=workspace,
     )
-    torch.testing.assert_close(actual, expected, rtol=1.0e-4, atol=1.0e-4)
+    # The fused path skips the Q8_K round-trip that the looped fallback
+    # performs, so allow a slightly looser relative tolerance.
+    torch.testing.assert_close(actual, expected, rtol=5.0e-3, atol=1.0e-4)
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:

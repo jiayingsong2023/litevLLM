@@ -1809,7 +1809,7 @@ def _run_staged_routed_experts(
             layer_idx=layer_idx,
         )
     selected_gemm = getattr(backend, "fused_quantized_selected_experts_gemm", None)
-    if callable(selected_gemm):
+    if callable(selected_gemm) and state is not None:
         try:
             workspace = state.moe_workspace(
                 num_experts=len(selected_payloads),
@@ -1822,7 +1822,7 @@ def _run_staged_routed_experts(
                 payloads=selected_payloads,
                 workspace=workspace,
             ).to(torch.float32)
-        except (AttributeError, NotImplementedError, RuntimeError):
+        except RuntimeError:
             pass
     selected_gemm = getattr(backend, "quantized_selected_experts_gemm", None)
     if callable(selected_gemm):
