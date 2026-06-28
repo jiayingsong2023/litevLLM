@@ -12,6 +12,7 @@ as the source of truth.
 ```text
 LLM / AsyncLLM / OpenAI API Server
   -> vllm/serving/config_builder.py  # model/config assembly
+  -> vllm/engine/initialization/     # startup allocators and runtime assembly
   -> vllm/engine/lite_engine.py      # orchestration
   -> vllm/engine/step_scheduler.py   # step budget and batch selection
   -> vllm/engine/request_scheduler.py
@@ -28,7 +29,8 @@ executors are not a second supported runtime.
 ```mermaid
 flowchart TD
     API["LLM / AsyncLLM / OpenAI REST"] --> Config["serving/config_builder.py"]
-    Config --> Engine["engine/lite_engine.py"]
+    Config --> Init["engine/initialization/"]
+    Init --> Engine["engine/lite_engine.py"]
     Engine --> Controller["engine/runtime_controller.py"]
     Controller --> ReqSched["engine/request_scheduler.py"]
     Controller --> StepSched["engine/step_scheduler.py"]
@@ -40,6 +42,22 @@ flowchart TD
     Kernels --> Pipeline["engine/output_pipeline.py"]
     Pipeline --> API
 ```
+
+## Engine Initialization
+
+`LiteEngine.__init__` delegates startup work to focused initializers in
+`vllm/engine/initialization/` so the engine body stays focused on orchestration:
+
+| Module | Responsibility |
+| :--- | :--- |
+| `kv_cache_allocator.py` | Compute KV cache shapes and allocate the paged K/V pool plus optional TurboQuant scale caches. |
+| `memory_auditor.py` | Snapshot CUDA-resident model tensor footprint for startup diagnostics. |
+| `runtime_component_factory.py` / `LiteRuntimeAssembler` | Build the runtime component graph consumed by `LiteEngine`. |
+
+These helpers preserve the same dtype, shape, and memory ordering contracts as
+the previous inline code; callers such as `KVBlockManager` and the prefill/decode
+executors receive identical KV cache tensors regardless of which initializer
+produced them.
 
 ## Configuration Flow
 
@@ -119,6 +137,10 @@ single-process model:
 
 - `RequestScheduler` owns running requests, queued requests, stream queues, and
   fixed active slots.
+- `RequestState` is the canonical typed request state (slots dataclass) shared
+  across scheduler, executors, and output pipeline. Code that previously passed
+  the request as a `dict[str, Any]` is being migrated to attribute access on
+  `RequestState`.
 - `StepScheduler` builds one `StepPlan` per engine step. A plan may admit
   queued requests, run chunked prefills, run decodes, or interleave prefill and
   decode work within configured token and fairness limits.
@@ -144,6 +166,20 @@ flowchart LR
     Backend --> Free["free_request"]
     Free --> Queue
 ```
+
+## Output Text Decoding
+
+`OutputPipeline.finalize_step` no longer eagerly decodes generated token ids to
+a string on every step. Instead, `CompletionOutput.text` is a lazy property:
+when the output is constructed without an explicit string and a tokenizer is
+available, `tokenizer.decode` runs only on first access.
+
+For streaming callers, `.text` is read every step, so decoding still happens per
+emitted chunk. For non-streaming callers, intermediate `RequestOutput` objects
+are produced but only consumed at finish time; lazy decoding skips the wasted
+work for discarded intermediate outputs. Finished outputs are still eagerly
+decoded so the final string is cached and cleaned by the configured output
+processor.
 
 ## Model Layer Shape
 
