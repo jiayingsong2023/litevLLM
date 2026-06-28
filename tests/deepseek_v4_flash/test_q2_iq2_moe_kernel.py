@@ -11,6 +11,7 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
     deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
+    deepseek_v4_iq2_xxs_selected_experts_activation,
     deepseek_v4_q2_k_matvec,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
@@ -468,6 +469,44 @@ def test_q2_matvec_requires_cuda_payload() -> None:
 
     with pytest.raises(ValueError, match="payload must be a CUDA tensor"):
         deepseek_v4_q2_k_matvec(payload, hidden, rows=1, columns=256)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_iq2_xxs_selected_experts_activation() -> None:
+    rows = 2048
+    columns = 4096
+    num_experts = 6
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    workspace = torch.empty((num_experts, rows), dtype=torch.float32, device="cuda")
+    payloads = []
+    expected = []
+    for i in range(num_experts):
+        gate = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        up = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        payloads.append((gate, up))
+        gate_out = (
+            iq2_xxs_matrix_from_gguf_payload(bytes(gate), rows=rows, columns=columns)
+            .to("cuda")
+            .matmul(hidden)
+        )
+        up_out = (
+            iq2_xxs_matrix_from_gguf_payload(bytes(up), rows=rows, columns=columns)
+            .to("cuda")
+            .matmul(hidden)
+        )
+        activated = torch.nn.functional.silu(
+            torch.clamp(gate_out, max=10.0)
+        ) * torch.clamp(up_out, min=-10.0, max=10.0)
+        expected.append(activated)
+    deepseek_v4_iq2_xxs_selected_experts_activation(
+        hidden=hidden,
+        payloads=[(_cuda_payload(gate), _cuda_payload(up)) for gate, up in payloads],
+        workspace=workspace,
+        rows=rows,
+        columns=columns,
+    )
+    for i in range(num_experts):
+        torch.testing.assert_close(workspace[i], expected[i], rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
