@@ -553,3 +553,24 @@ git commit -m "docs: milestone 1 benchmark results"
   - `tests/run_inference_correctness_regression.sh` (Tier-B only, `SKIP_A_TIER=1`) — PASS
     - Split into two invocations to fit the 300 s tool wall-clock: Gemma4 models + TinyLlama + Qwen passed; DeepSeek V4 Flash Tier-B quality smoke passed.
 - **Outcome:** Milestone 1 gates passed.
+
+## Milestone 2 Results
+
+- **Date:** 2026-06-28
+- **Quality smoke (warmup + 3 recorded runs, prompt: "What is the capital of France?"):**
+  - Run 1: `decode_tps` = 0.571, readability/logits gates = pass
+  - Run 2: `decode_tps` = 0.607, readability/logits gates = pass
+  - Run 3: `decode_tps` = 0.626, readability/logits gates = pass
+  - **3-run average `decode_tps`:** 0.601 (Milestone 1 average 0.563; baseline ~0.39)
+- **Regression suites:**
+  - `uv run pytest tests/deepseek_v4_flash/test_attention_reference.py tests/deepseek_v4_flash/test_gpu_backend_contract.py tests/deepseek_v4_flash/test_gpu_moe_path.py -q` — PASS (36 passed)
+  - `tests/run_regression_suite.sh` — PASS (133 passed, 2 skipped)
+  - `tests/run_deepseek_v4_flash_real_smoke.sh` — PASS
+  - `tests/run_inference_correctness_regression.sh` (Tier-B only, `SKIP_A_TIER=1`) — split due to 300 s tool wall-clock timeout during DeepSeek V4 Flash stage; all stages passed when run separately:
+    - TinyLlama Tier-B spotcheck — PASS
+    - Qwen3.5-9B AWQ Tier-B spotcheck — PASS
+    - Gemma4-31B Q4 Tier-B spotcheck — PASS
+    - Gemma4-26B A4B Tier-B spotcheck — PASS
+    - DeepSeek V4 Flash Tier-B quality smoke — PASS
+- **Outcome:** Milestone 2 gates passed; fused sliding-window attention delivers a small but consistent decode throughput improvement over Milestone 1 while preserving output quality.
+
