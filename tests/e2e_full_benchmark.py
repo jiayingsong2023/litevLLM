@@ -2931,7 +2931,10 @@ def _format_perf_regression_warnings(warnings: list[dict[str, object]]) -> list[
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="End-to-end performance benchmark focused on Gemma4 26B/31B models."
+        description=(
+            "End-to-end performance benchmark for Gemma4 26B/31B, Qwen3.5, "
+            "TinyLlama, and DeepSeek V4 Flash Q2 GGUF direct-path models."
+        )
     )
     parser.add_argument(
         "--models",
@@ -2940,8 +2943,8 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated model keys. Default: "
             "gemma4_26b_a4b,gemma4_31b_q4,deepseek_v4_flash_q2_gguf. "
-            "Available: tinyllama,qwen35_9b_awq,gemma4_31b_q4,"
-            "gemma4_26b_a4b,deepseek_v4_flash_q2_gguf"
+            "Available: tinyllama, qwen35_9b_awq, gemma4_31b_q4, "
+            "gemma4_26b_a4b, deepseek_v4_flash_q2_gguf."
         ),
     )
     parser.add_argument(
@@ -3070,6 +3073,16 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Override max_model_len for gemma4_26b_a4b.",
+    )
+    parser.add_argument(
+        "--deepseek-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override concurrent request count (batch width) for "
+            "deepseek_v4_flash_q2_gguf only. Default from MODEL_SPECS is 1."
+        ),
     )
     parser.add_argument(
         "--warmup-prefill-rounds",
@@ -3362,6 +3375,15 @@ async def main() -> None:
             new_env = dict(spec.stable_env)
             new_env["FASTINFERENCE_KV_MAX_MODEL_LEN"] = str(n)
             spec = replace(spec, max_model_len=n, stable_env=new_env)
+        if key == "deepseek_v4_flash_q2_gguf" and args.deepseek_concurrent is not None:
+            n = int(args.deepseek_concurrent)
+            if n < 1 or n > 16:
+                raise ValueError("--deepseek-concurrent must be between 1 and 16")
+            spec = replace(
+                spec,
+                concurrent_reqs=n,
+                max_run_seconds=max(spec.max_run_seconds, 120 * n),
+            )
         specs.append(spec)
 
     print("=" * 72)
