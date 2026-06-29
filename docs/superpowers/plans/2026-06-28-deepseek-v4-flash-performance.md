@@ -574,3 +574,32 @@ git commit -m "docs: milestone 1 benchmark results"
     - DeepSeek V4 Flash Tier-B quality smoke — PASS
 - **Outcome:** Milestone 2 gates passed; fused sliding-window attention delivers a small but consistent decode throughput improvement over Milestone 1 while preserving output quality.
 
+## Milestone 3 Results
+
+- **Date:** 2026-06-29
+- **Engine wiring:** Added `use_graph: bool = False` to `LiteEngine.generate_deepseek_v4_flash_greedy` and forwarded it to `model.generate_greedy_kernel(...)`. Added `--use-graph` to `tests/tools/deepseek_v4_flash_quality_smoke.py` so the same script can exercise the captured decode path.
+- **Targeted tests:**
+  - `uv run pytest tests/deepseek_v4_flash/test_decode_graph.py tests/deepseek_v4_flash/test_model_kernel_generate.py tests/deepseek_v4_flash/test_model_kernel_forward.py tests/deepseek_v4_flash/test_attention_reference.py tests/deepseek_v4_flash/test_gpu_backend_contract.py tests/deepseek_v4_flash/test_lite_engine_deepseek_gpu.py -q` — PASS (92 passed, 3 skipped)
+- **Regression suites:**
+  - `tests/run_regression_suite.sh` — PASS (133 passed, 2 skipped)
+  - `tests/run_deepseek_v4_flash_real_smoke.sh` — PASS
+  - `tests/run_inference_correctness_regression.sh` (Tier-B only, `SKIP_A_TIER=1`) — full run exceeded the 300 s tool wall-clock; all Tier-B stages passed when split individually:
+    - TinyLlama Tier-B spotcheck — PASS
+    - Qwen3.5-9B AWQ Tier-B spotcheck — PASS
+    - Gemma4-31B Q4 Tier-B spotcheck — PASS
+    - Gemma4-26B A4B Tier-B spotcheck — PASS
+    - DeepSeek V4 Flash Tier-B quality smoke (`--max-tokens 8`) — PASS
+- **Quality smoke (prompt: "What is the capital of France?", `--max-tokens 32`, `--min-output-chars 8`):**
+  - Non-graph (warmup + 3 recorded runs):
+    - Run 1: `decode_tps` = 0.656, readability/logits gates = pass
+    - Run 2: `decode_tps` = 0.655, readability/logits gates = pass
+    - Run 3: `decode_tps` = 0.657, readability/logits gates = pass
+    - **3-run average `decode_tps`:** 0.656 (Milestone 2 average 0.601)
+  - Graph (warmup + 3 recorded runs):
+    - Run 1: `decode_tps` = 0.583, readability/logits gates = pass
+    - Run 2: `decode_tps` = 0.640, readability/logits gates = pass
+    - Run 3: `decode_tps` = 0.651, readability/logits gates = pass
+    - **3-run average `decode_tps`:** 0.625 (Milestone 2 average 0.601)
+  - **Output quality:** Identical generated text for both paths: "The capital of France is Paris."
+- **Outcome:** Milestone 3 gates passed. The graph path is functional and preserves output quality, but in this short-prompt/short-output benchmark it does not yet beat the warmed-up non-graph path because the per-run model reload amortizes graph capture overhead over only ~8 decode tokens. Sustained decode workloads or a long-running engine are expected to show the full graph benefit.
+
