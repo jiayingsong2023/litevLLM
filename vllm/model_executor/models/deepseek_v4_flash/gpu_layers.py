@@ -1393,6 +1393,342 @@ def deepseek_v4_flash_compressed_layer_forward(
     )
 
 
+def deepseek_v4_flash_compressed_layer_forward_batched(
+    hidden: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    states: list[DeepSeekV4FlashGPURequestState],
+    token_indices: list[int],
+    token_id_tensors: torch.Tensor | None = None,
+    token_ids: list[int] | None = None,
+    kv_rows: torch.Tensor | None = None,
+    extra_kv_rows: torch.Tensor | None = None,
+    kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    use_reference_rope: bool = False,
+) -> torch.Tensor:
+    if not hidden.is_cuda:
+        raise ValueError(
+            "DeepSeek V4 Flash batched compressed layer hidden must be CUDA"
+        )
+    if hidden.ndim != 2:
+        raise ValueError(
+            f"batched compressed layer expects 2-D hidden; got {hidden.ndim}-D"
+        )
+    batch = hidden.shape[0]
+    if len(states) != batch or len(token_indices) != batch:
+        raise ValueError("states and token_indices must match batch size")
+    if token_id_tensors is not None and token_id_tensors.shape != (batch,):
+        raise ValueError(
+            f"token_id_tensors must have shape ({batch},); "
+            f"got {tuple(token_id_tensors.shape)}"
+        )
+    if token_ids is not None and len(token_ids) != batch:
+        raise ValueError(f"token_ids must have length {batch}; got {len(token_ids)}")
+    if (
+        layer.expert_token_to_expert_ids is not None
+        and token_id_tensors is None
+        and token_ids is None
+    ):
+        raise ValueError(
+            "hash-routed compressed layer requires token_id_tensors or token_ids"
+        )
+
+    if layer.attention_hyper_connection is not None:
+        raise NotImplementedError(
+            "batched compressed layer does not support attention hyper-connections"
+        )
+    if layer.ffn_hyper_connection is not None:
+        raise NotImplementedError(
+            "batched compressed layer does not support ffn hyper-connections"
+        )
+
+    if kv_rows is None and kv_rows_by_layer is not None:
+        kv_rows = kv_rows_by_layer.get(layer.layer_index)
+    if extra_kv_rows is None and extra_kv_rows_by_layer is not None:
+        extra_kv_rows = extra_kv_rows_by_layer.get(layer.layer_index)
+
+    ratio = layer_compress_ratio(layer.layer_index)
+    if ratio == 0:
+        raise ValueError(
+            "DeepSeek V4 Flash batched compressed forward received sliding-only "
+            f"layer {layer.layer_index}"
+        )
+
+    attention_norm = stager.stage_vector(
+        _required_tensor(layer.attention_norm, "attention_norm")
+    )
+    ffn_norm = stager.stage_vector(_required_tensor(layer.ffn_norm, "ffn_norm"))
+    grouped_experts = _required_grouped_experts(layer.grouped_experts)
+    compressor = _required_compressor(layer.attention_compressor)
+    if ratio == 4 and layer.indexer is None:
+        raise ValueError("DeepSeek V4 Flash ratio-4 compressed layer missing indexer")
+
+    with _stager_profile_section(
+        stager,
+        "layer_attention_norm",
+        layer_idx=layer.layer_index,
+        layer_type="compressed_batched",
+        ratio=ratio,
+    ):
+        attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
+
+    # Pre-project real attention Q/KV for the whole batch when available.
+    batched_query: torch.Tensor | None = None
+    batched_current_kv: torch.Tensor | None = None
+    with _stager_profile_section(
+        stager,
+        "layer_attention",
+        layer_idx=layer.layer_index,
+        layer_type="compressed_batched",
+        ratio=ratio,
+    ):
+        if _has_real_sliding_attention_tensors(layer):
+            query_a = _required_tensor(layer.attention_query_a, "attention_query_a")
+            query_a_norm = _required_tensor(
+                layer.attention_query_a_norm,
+                "attention_query_a_norm",
+            )
+            query_b = _required_tensor(layer.attention_query_b, "attention_query_b")
+            kv_tensor = _required_tensor(
+                layer.attention_key_value, "attention_key_value"
+            )
+            kv_norm = _required_tensor(
+                layer.attention_key_value_a_norm,
+                "attention_key_value_a_norm",
+            )
+
+            q_latent = _project_tensor(attn_input, query_a, stager)
+            q_latent = deepseek_v4_flash_rms_norm(
+                q_latent,
+                stager.stage_vector(query_a_norm),
+            )
+            batched_query = _project_tensor(q_latent, query_b, stager)
+
+            batched_current_kv = _project_tensor(attn_input, kv_tensor, stager)
+            batched_current_kv = deepseek_v4_flash_rms_norm(
+                batched_current_kv,
+                stager.stage_vector(kv_norm),
+            )
+
+        attn_updates: list[torch.Tensor] = []
+        for b in range(batch):
+            state = states[b]
+            token_idx = token_indices[b]
+            state.require_capacity(token_idx)
+
+            with _stager_profile_section(
+                stager,
+                "compressed_kv_update",
+                layer_idx=layer.layer_index,
+                ratio=ratio,
+            ):
+                candidate_row, emitted_row = _update_compressor_state(
+                    attn_input[b],
+                    state=state,
+                    layer_idx=layer.layer_index,
+                    state_name="attention",
+                    compressor=compressor,
+                    stager=stager,
+                    token_idx=token_idx,
+                    ratio=ratio,
+                    use_reference_rope=use_reference_rope,
+                )
+            indexer_row: torch.Tensor | None = None
+            if layer.indexer is not None:
+                with _stager_profile_section(
+                    stager,
+                    "compressed_indexer_update",
+                    layer_idx=layer.layer_index,
+                    ratio=ratio,
+                ):
+                    _index_candidate, indexer_row = _update_compressor_state(
+                        attn_input[b],
+                        state=state,
+                        layer_idx=layer.layer_index,
+                        state_name="indexer",
+                        compressor=layer.indexer.compressor,
+                        stager=stager,
+                        token_idx=token_idx,
+                        ratio=4,
+                        use_reference_rope=use_reference_rope,
+                    )
+
+            if emitted_row is not None:
+                if ratio == 4 and indexer_row is None:
+                    raise ValueError(
+                        "DeepSeek V4 Flash ratio-4 compressed layer did not emit "
+                        "an indexer row with the attention row"
+                    )
+                _write_compressed_runtime_row(
+                    state,
+                    layer_idx=layer.layer_index,
+                    token_idx=token_idx,
+                    compressed_row=emitted_row,
+                    indexer_row=indexer_row,
+                )
+
+            prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
+            if prior_rows.shape[0] == 0:
+                compressed_attention_rows: torch.Tensor | None = None
+                compressed_extra_rows: torch.Tensor | None = None
+                selected_rows = torch.zeros(
+                    1,
+                    dtype=torch.int64,
+                    device=hidden.device,
+                )
+            elif layer.indexer is not None:
+                with _stager_profile_section(
+                    stager,
+                    "compressed_indexer_select",
+                    layer_idx=layer.layer_index,
+                    ratio=ratio,
+                ):
+                    indexer_rows = state.compressed_kv_cache.read_indexer_rows(
+                        layer.layer_index
+                    )
+                    selected_rows = _select_compressed_rows_with_indexer(
+                        attn_input[b],
+                        layer=layer,
+                        stager=stager,
+                        indexer_rows=indexer_rows,
+                        state=state,
+                        token_idx=token_idx,
+                        use_reference_rope=use_reference_rope,
+                    )
+                compressed_attention_rows = prior_rows
+                compressed_extra_rows = state.compressed_kv_cache.read_compressed(
+                    layer.layer_index,
+                    row_indices=selected_rows,
+                )
+            else:
+                compressed_attention_rows = prior_rows
+                compressed_extra_rows = prior_rows
+                selected_rows = torch.arange(
+                    prior_rows.shape[0],
+                    dtype=torch.int64,
+                    device=hidden.device,
+                )
+
+            if _has_real_sliding_attention_tensors(layer):
+                if batched_query is None or batched_current_kv is None:
+                    raise AssertionError(
+                        "batched real attention projections were not computed"
+                    )
+                effective_extra_kv_rows = (
+                    extra_kv_rows
+                    if extra_kv_rows is not None
+                    else compressed_extra_rows
+                )
+                attn_update = _run_sliding_attention_for_slot(
+                    batched_query[b],
+                    batched_current_kv[b],
+                    layer=layer,
+                    stager=stager,
+                    backend=backend,
+                    state=state,
+                    token_idx=token_idx,
+                    kv_rows=kv_rows,
+                    extra_kv_rows=effective_extra_kv_rows,
+                    use_reference_rope=use_reference_rope,
+                )
+            else:
+                attention_rows = compressed_attention_rows
+                if attention_rows is None:
+                    attention_rows = (
+                        candidate_row if emitted_row is None else emitted_row
+                    ).reshape(1, -1)
+                slot_query = _compressed_attention_query(
+                    attn_input[b],
+                    layer=layer,
+                    stager=stager,
+                )
+                context = backend.compressed_attention(
+                    query=slot_query,
+                    compressed_rows=attention_rows,
+                    selected_rows=selected_rows,
+                )
+                context = _expand_shared_attention_context_for_output(
+                    context,
+                    layer=layer,
+                    stager=stager,
+                )
+                attn_update = _project_sliding_attention_output(
+                    context,
+                    None
+                    if layer.attention_output_a is not None
+                    and layer.attention_output_b is not None
+                    else _required_tensor(
+                        layer.attention_output,
+                        "attention_output",
+                    ),
+                    attention_output_a=layer.attention_output_a,
+                    attention_output_b=layer.attention_output_b,
+                    stager=stager,
+                )
+            attn_updates.append(attn_update)
+
+    attn_update = torch.stack(attn_updates)
+    hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+        hidden,
+        attn_update,
+        stager=stager,
+        hyper_connection=None,
+    )
+
+    with _stager_profile_section(
+        stager,
+        "layer_ffn_norm",
+        layer_idx=layer.layer_index,
+        layer_type="compressed_batched",
+        ratio=ratio,
+    ):
+        ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
+
+    with _stager_profile_section(
+        stager,
+        "layer_moe",
+        layer_idx=layer.layer_index,
+        layer_type="compressed_batched",
+        ratio=ratio,
+    ):
+        moe_updates: list[torch.Tensor] = []
+        for b in range(batch):
+            if token_id_tensors is not None:
+                slot_token_id: int = 0
+                slot_token_id_tensor = token_id_tensors[b]
+            elif token_ids is not None:
+                slot_token_id = token_ids[b]
+                slot_token_id_tensor = None
+            else:
+                slot_token_id = 0
+                slot_token_id_tensor = None
+            moe_updates.append(
+                _run_sliding_moe(
+                    ffn_input[b],
+                    layer=layer,
+                    grouped_experts=grouped_experts,
+                    stager=stager,
+                    backend=backend,
+                    state=states[b],
+                    token_id=slot_token_id,
+                    token_id_tensor=slot_token_id_tensor,
+                    router_top_k=router_top_k,
+                )
+            )
+        moe_update = torch.stack(moe_updates)
+
+    return deepseek_v4_flash_residual_hyper_connection(
+        hidden_after_attn,
+        moe_update,
+        stager=stager,
+        hyper_connection=None,
+    )
+
+
 def _project_sliding_attention_output(
     context: torch.Tensor,
     attention_output: DeepSeekV4FlashTensor | None,
@@ -2536,6 +2872,7 @@ def _required_compressor(
 
 __all__ = [
     "deepseek_v4_flash_compressed_layer_forward",
+    "deepseek_v4_flash_compressed_layer_forward_batched",
     "deepseek_v4_flash_layer_forward",
     "deepseek_v4_flash_q8_0_tensor_projection",
     "deepseek_v4_flash_residual_hyper_connection",
