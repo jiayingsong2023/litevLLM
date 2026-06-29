@@ -59,6 +59,13 @@ class _GPUHyperConnectionState:
     combine: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _GPUHyperConnectionStateBatched:
+    mixed: torch.Tensor
+    post: torch.Tensor
+    combine: torch.Tensor
+
+
 class _SlidingLayerBackend(Protocol):
     def sliding_attention(
         self,
@@ -1849,6 +1856,38 @@ def _ensure_hyper_connection_streams(
     return hidden.to(torch.float32).reshape(1, -1).expand(hc_mult, -1).clone()
 
 
+def _ensure_hyper_connection_streams_batched(
+    hidden: torch.Tensor,
+    *,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    hyper_connection: DeepSeekV4FlashHyperConnectionTensors,
+) -> torch.Tensor:
+    if not hidden.is_cuda:
+        raise ValueError(
+            "DeepSeek V4 Flash batched hyper-connection hidden must be a CUDA tensor"
+        )
+    base = stager.stage_vector(hyper_connection.base)
+    hc_mult = _hyper_connection_stream_count(base)
+    if hidden.ndim == 3:
+        if hidden.shape[1] != hc_mult:
+            raise ValueError(
+                "batched mHC stream count must match hyper-connection tensors; "
+                f"got {hidden.shape[1]} and {hc_mult}"
+            )
+        return hidden.to(torch.float32)
+    if hidden.ndim != 2:
+        raise ValueError(
+            f"batched hidden must be 2-D or stream-shaped 3-D; got {hidden.ndim}-D"
+        )
+    batch, hidden_size = hidden.shape
+    return (
+        hidden.to(torch.float32)
+        .reshape(batch, 1, hidden_size)
+        .expand(batch, hc_mult, hidden_size)
+        .clone()
+    )
+
+
 def _hyper_connection_stream_count(base: torch.Tensor) -> int:
     mix_count = base.numel()
     hc_mult = 1
@@ -1921,6 +1960,70 @@ def _hyper_connection_pre_cuda(
     return _GPUHyperConnectionState(mixed=mixed, post=post, combine=combine)
 
 
+def _hyper_connection_pre_cuda_batched(
+    streams: torch.Tensor,
+    *,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    hyper_connection: DeepSeekV4FlashHyperConnectionTensors,
+) -> _GPUHyperConnectionStateBatched:
+    if not streams.is_cuda:
+        raise ValueError("DeepSeek V4 Flash batched mHC streams must be CUDA tensors")
+    if streams.ndim != 3:
+        raise ValueError(f"batched mHC streams must be 3-D; got {streams.ndim}-D")
+
+    fn_weight = stager.stage_matrix(hyper_connection.fn)
+    base = stager.stage_vector(hyper_connection.base)
+    scale = stager.stage_vector(hyper_connection.scale)
+    batch, hc_mult, hidden_size = streams.shape
+    mix_count = 2 * hc_mult + hc_mult * hc_mult
+    flat_size = hc_mult * hidden_size
+    if fn_weight.shape == (flat_size, mix_count):
+        projection_weight = fn_weight.to(torch.float32).T
+    elif fn_weight.shape == (mix_count, flat_size):
+        projection_weight = fn_weight.to(torch.float32)
+    else:
+        raise ValueError(
+            "hyper-connection fn tensor shape does not match batched streams; "
+            f"got {tuple(fn_weight.shape)}, expected ({flat_size}, {mix_count})"
+        )
+    if base.shape != (mix_count,):
+        raise ValueError(
+            f"hyper-connection base shape must be ({mix_count},); "
+            f"got {tuple(base.shape)}"
+        )
+    if scale.shape != (3,):
+        raise ValueError(
+            f"hyper-connection scale shape must be (3,); got {tuple(scale.shape)}"
+        )
+
+    flat = streams.reshape(batch, flat_size).to(torch.float32)
+    mixes = torch.matmul(flat, projection_weight.T) * torch.rsqrt(
+        flat.pow(2).mean(dim=-1, keepdim=True) + 1e-6
+    )
+    scale_f32 = scale.to(torch.float32)
+    scaled_scale = torch.cat(
+        [
+            scale_f32[0:1].expand(hc_mult),
+            scale_f32[1:2].expand(hc_mult),
+            scale_f32[2:3].expand(hc_mult * hc_mult),
+        ]
+    )
+    mixes = mixes * scaled_scale
+    mixes = mixes + base.to(torch.float32)
+
+    pre = torch.sigmoid(mixes[:, :hc_mult]) + 1e-6
+    post = 2.0 * torch.sigmoid(mixes[:, hc_mult : 2 * hc_mult])
+    combine_scores = mixes[:, 2 * hc_mult :].reshape(batch, hc_mult, hc_mult)
+    combine = torch.softmax(combine_scores, dim=-1) + 1e-6
+    combine = combine / (combine.sum(dim=1, keepdim=True) + 1e-6)
+    for _ in range(1, 20):
+        combine = combine / (combine.sum(dim=-1, keepdim=True) + 1e-6)
+        combine = combine / (combine.sum(dim=1, keepdim=True) + 1e-6)
+
+    mixed = (pre.unsqueeze(-1) * streams.to(torch.float32)).sum(dim=1)
+    return _GPUHyperConnectionStateBatched(mixed=mixed, post=post, combine=combine)
+
+
 def _hyper_connection_post_cuda(
     output: torch.Tensor,
     residual_streams: torch.Tensor,
@@ -1952,6 +2055,49 @@ def _hyper_connection_post_cuda(
         residual_streams.to(torch.float32)
     )
     return state.post.reshape(hc_mult, 1) * output.to(torch.float32) + residual_mix
+
+
+def _hyper_connection_post_cuda_batched(
+    output: torch.Tensor,
+    residual_streams: torch.Tensor,
+    state: _GPUHyperConnectionStateBatched,
+) -> torch.Tensor:
+    if not output.is_cuda or not residual_streams.is_cuda:
+        raise ValueError(
+            "DeepSeek V4 Flash batched mHC post inputs must be CUDA tensors"
+        )
+    if output.ndim != 2:
+        raise ValueError(f"batched mHC output must be 2-D; got {output.ndim}-D")
+    if residual_streams.ndim != 3:
+        raise ValueError(
+            f"batched mHC residual streams must be 3-D; got {residual_streams.ndim}-D"
+        )
+    batch, hc_mult, hidden_size = residual_streams.shape
+    if output.shape != (batch, hidden_size):
+        raise ValueError(
+            f"batched mHC output shape must be ({batch}, {hidden_size}); "
+            f"got {tuple(output.shape)}"
+        )
+    if state.post.shape != (batch, hc_mult):
+        raise ValueError(
+            f"batched mHC post shape must be ({batch}, {hc_mult}); "
+            f"got {tuple(state.post.shape)}"
+        )
+    if state.combine.shape != (batch, hc_mult, hc_mult):
+        raise ValueError(
+            "batched mHC combine shape must match residual streams; "
+            f"got {tuple(state.combine.shape)}"
+        )
+    residual_mix = (
+        state.combine.to(torch.float32)
+        .transpose(-1, -2)
+        .matmul(residual_streams.to(torch.float32))
+    )
+    return (
+        state.post.reshape(batch, hc_mult, 1).to(torch.float32)
+        * output.to(torch.float32).unsqueeze(1)
+        + residual_mix
+    )
 
 
 def _expand_shared_attention_context_for_output(
