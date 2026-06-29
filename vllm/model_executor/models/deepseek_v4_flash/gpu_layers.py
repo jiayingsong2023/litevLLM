@@ -1015,7 +1015,7 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
         ffn_residual_streams = hidden_after_attn
         if layer.ffn_hyper_connection is None:
             ffn_source = ffn_residual_streams.mean(dim=1).to(torch.float32)
-            ffn_hc_state = None
+            ffn_hc_state: _GPUHyperConnectionStateBatched | None = None
         else:
             ffn_hc_state = _hyper_connection_pre_cuda_batched(
                 ffn_residual_streams,
@@ -1034,7 +1034,7 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
         layer_idx=layer.layer_index,
         layer_type="sliding_batched",
     ):
-        deepseek_v4_flash_rms_norm(ffn_source, ffn_norm)
+        ffn_input = deepseek_v4_flash_rms_norm(ffn_source, ffn_norm)
 
     with _stager_profile_section(
         stager,
@@ -1055,7 +1055,7 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
                 slot_token_id_tensor = None
             moe_updates.append(
                 _run_sliding_moe(
-                    ffn_source[b],
+                    ffn_input[b],
                     layer=layer,
                     grouped_experts=grouped_experts,
                     stager=stager,
