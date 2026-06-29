@@ -162,8 +162,14 @@ def deepseek_v4_flash_q8_0_tensor_projection(
     hidden: torch.Tensor,
     tensor: DeepSeekV4FlashTensor,
     stager: DeepSeekV4FlashGPUWeightStager,
+    staged_raw_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Project a vector with a raw GGUF Q8_0 tensor without fp32 matrix decode."""
+    """Project a vector with a raw GGUF Q8_0 tensor without fp32 matrix decode.
+
+    When ``staged_raw_tensor`` is provided, it is used directly as the staged
+    Q8_0 payload; otherwise the tensor is staged on demand. This lets batched
+    callers stage the weight once and reuse it across the batch loop.
+    """
     if not hidden.is_cuda:
         raise ValueError("DeepSeek V4 Flash Q8 projection hidden must be CUDA")
     if hidden.ndim != 1:
@@ -179,7 +185,11 @@ def deepseek_v4_flash_q8_0_tensor_projection(
             "Q8 projection hidden width must match tensor input columns; "
             f"got hidden={hidden.numel()} and columns={columns}"
         )
-    raw_payload = _stage_q8_0_raw_tensor(tensor, stager)
+    raw_payload = (
+        staged_raw_tensor
+        if staged_raw_tensor is not None
+        else _stage_q8_0_raw_tensor(tensor, stager)
+    )
     expected_bytes = rows * (columns // _Q8_0_BLOCK_SIZE) * _Q8_0_BLOCK_BYTES
     if raw_payload.numel() != expected_bytes:
         raise ValueError(
@@ -221,19 +231,22 @@ def _project_tensor(
     stager: DeepSeekV4FlashGPUWeightStager,
 ) -> torch.Tensor:
     if hidden.ndim == 2 and _can_project_q8_0(hidden, tensor):
-        # Batch loop until a batched Q8 kernel is added.
+        # Stage the raw Q8 payload once, then project each batch element.
+        staged = _stage_q8_0_raw_tensor(tensor, stager)
         return torch.stack(
             [
-                deepseek_v4_flash_q8_0_tensor_projection(hidden[b], tensor, stager)
+                deepseek_v4_flash_q8_0_tensor_projection(
+                    hidden[b], tensor, stager, staged_raw_tensor=staged
+                )
                 for b in range(hidden.shape[0])
             ]
         )
     if hidden.ndim == 2:
+        # Stage the decoded matrix once, then project each batch element.
+        staged_weight = stager.stage_matrix(tensor)
         return torch.stack(
             [
-                deepseek_v4_flash_staged_matrix_projection(
-                    hidden[b], stager.stage_matrix(tensor)
-                )
+                deepseek_v4_flash_staged_matrix_projection(hidden[b], staged_weight)
                 for b in range(hidden.shape[0])
             ]
         )
