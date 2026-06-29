@@ -31,7 +31,9 @@ from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_layers import (
     _stage_expert_token_table,
     deepseek_v4_flash_compressed_layer_forward,
+    deepseek_v4_flash_compressed_layer_forward_batched,
     deepseek_v4_flash_sliding_layer_forward,
+    deepseek_v4_flash_sliding_layer_forward_batched,
 )
 from .gpu_runtime import (
     DeepSeekV4FlashGPUCacheConfig,
@@ -661,6 +663,398 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             record_token_times=True,
             use_graph=use_graph,
         )
+
+    def generate_greedy_kernel_batched(
+        self,
+        input_ids_list: list[torch.Tensor],
+        max_tokens: int,
+        *,
+        record_token_times: bool = False,
+    ) -> list[torch.Tensor]:
+        """Greedy decode a batch of requests using the batched decode kernel.
+
+        Prefill is performed per-request with the single-slot kernel. Decode
+        steps run batched through ``_forward_kernel_token_step_batched``.
+        Graph capture is never used, even when the backend supports it.
+        """
+        with self._deepseek_profiler.section(
+            "generate_greedy_kernel_batched",
+            batch_size=len(input_ids_list),
+            max_tokens=max_tokens,
+            record_token_times=record_token_times,
+        ):
+            return self._generate_greedy_kernel_batched_impl(
+                input_ids_list,
+                max_tokens=max_tokens,
+                record_token_times=record_token_times,
+            )
+
+    def _generate_greedy_kernel_batched_impl(
+        self,
+        input_ids_list: list[torch.Tensor],
+        *,
+        max_tokens: int,
+        record_token_times: bool,
+    ) -> list[torch.Tensor]:
+        self._require_weight_store()
+        device = self._validate_generate_greedy_kernel_batched_input(
+            input_ids_list,
+            max_tokens=max_tokens,
+        )
+        self.gpu_backend.require_ready()
+        self._reject_batched_generation_if_hyper_connections()
+
+        eos_token_id = self._eos_token_id()
+        context_length = self._kernel_context_length()
+
+        output_ids_list: list[torch.Tensor] = []
+        states: list[DeepSeekV4FlashGPURequestState] = []
+        input_lengths: list[int] = []
+
+        for input_ids in input_ids_list:
+            input_ids_cuda = input_ids.to(device=device, dtype=torch.long)
+            input_len = int(input_ids_cuda.numel())
+            input_lengths.append(input_len)
+
+            output_ids = torch.empty(
+                (input_len + max_tokens,),
+                dtype=torch.long,
+                device=device,
+            )
+            output_ids[:input_len] = input_ids_cuda
+            output_ids_list.append(output_ids)
+
+            state = DeepSeekV4FlashGPURequestState(
+                DeepSeekV4FlashGPUCacheConfig(
+                    context_length=context_length,
+                    hidden_size=self.shape.hidden_size,
+                    batch_size=1,
+                    kv_width=self.shape.head_dim,
+                    device=device,
+                )
+            )
+            states.append(state)
+
+            # Prefill all prompt tokens except the last one. The last prompt
+            # token is consumed by the first batched decode step.
+            prompt_prefix_ids = input_ids_cuda[:-1].detach().cpu().tolist()
+            for token_id in prompt_prefix_ids:
+                self._forward_kernel_token_step_token_id(
+                    token_id=int(token_id),
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
+
+        active_indices = list(range(len(states)))
+        for step in range(max_tokens):
+            if not active_indices:
+                break
+
+            token_id_tensor = torch.stack(
+                [
+                    output_ids_list[idx][input_lengths[idx] - 1 + step]
+                    for idx in active_indices
+                ]
+            )
+            token_indices = [states[idx].token_position for idx in active_indices]
+            active_states = [states[idx] for idx in active_indices]
+
+            start_event: torch.cuda.Event | None = None
+            end_event: torch.cuda.Event | None = None
+            if record_token_times:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+            next_tokens = self._forward_kernel_token_step_batched(
+                token_id_tensor=token_id_tensor,
+                states=active_states,
+                token_indices=token_indices,
+                device=device,
+            )
+
+            if record_token_times:
+                if start_event is None or end_event is None:
+                    raise AssertionError("CUDA timing events were not initialized")
+                end_event.record()
+
+            new_active: list[int] = []
+            for offset, idx in enumerate(active_indices):
+                generated_token = next_tokens[offset]
+                output_ids_list[idx][input_lengths[idx] + step] = generated_token
+                if eos_token_id is not None:
+                    token_id_int = int(generated_token.item())
+                    if token_id_int == eos_token_id:
+                        continue
+                new_active.append(idx)
+            active_indices = new_active
+
+        # Trim each output to the actual number of generated tokens, matching
+        # the single-slot greedy path which returns a slice up to EOS.
+        results: list[torch.Tensor] = []
+        for idx, output_ids in enumerate(output_ids_list):
+            actual_end = input_lengths[idx] + max_tokens
+            generated_slice = output_ids[input_lengths[idx] : actual_end]
+            if eos_token_id is not None:
+                eos_positions = (generated_slice == eos_token_id).nonzero(
+                    as_tuple=False
+                )
+                if eos_positions.numel() > 0:
+                    actual_end = input_lengths[idx] + int(eos_positions[0].item()) + 1
+            results.append(output_ids[:actual_end])
+        return results
+
+    def _forward_kernel_token_step_batched(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        states: list[DeepSeekV4FlashGPURequestState],
+        token_indices: list[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        store, stager, hidden = self._forward_kernel_token_hidden_batched(
+            token_id_tensor=token_id_tensor,
+            states=states,
+            token_indices=token_indices,
+            device=device,
+        )
+        with self._deepseek_profiler.section(
+            "output_projection",
+            token_idx=token_indices[0] if token_indices else -1,
+        ):
+            next_tokens: list[torch.Tensor] = []
+            for b in range(hidden.shape[0]):
+                streams = self._kernel_output_streams(hidden[b])
+                next_tokens.append(
+                    self._output_token_argmax_chunked_cuda(
+                        store,
+                        stager=stager,
+                        streams=streams,
+                        device=device,
+                    )
+                )
+        result = torch.stack(next_tokens).to(device=device, dtype=torch.long)
+        for state in states:
+            state.advance_token()
+        return result
+
+    def _forward_kernel_token_hidden_batched(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        states: list[DeepSeekV4FlashGPURequestState],
+        token_indices: list[int],
+        device: torch.device,
+    ) -> tuple[
+        DeepSeekV4FlashWeightStore,
+        DeepSeekV4FlashGPUWeightStager,
+        torch.Tensor,
+    ]:
+        store = self._require_weight_store()
+        self.gpu_backend.require_ready()
+        if token_id_tensor.ndim != 1:
+            raise ValueError(
+                f"batched token id tensor must be 1-D; got {token_id_tensor.ndim}-D"
+            )
+        batch = token_id_tensor.shape[0]
+        if len(states) != batch or len(token_indices) != batch:
+            raise ValueError(
+                "states and token_indices must match token_id_tensor batch size"
+            )
+        if not token_id_tensor.is_cuda:
+            raise ValueError("batched token id tensor must be CUDA")
+        if token_id_tensor.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(
+                "batched token id tensor must use an integer dtype; "
+                f"got {token_id_tensor.dtype}"
+            )
+
+        token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
+        torch._assert_async(
+            (token_id_tensor >= 0) & (token_id_tensor < self.shape.vocab_size),
+            f"batched token id is outside vocab range [0, {self.shape.vocab_size})",
+        )
+
+        for state, token_idx in zip(states, token_indices, strict=True):
+            state.require_capacity(token_idx)
+            if token_idx != state.token_position:
+                raise ValueError(
+                    "batched forward token_idx must match request state "
+                    f"token_position; got token_idx={token_idx}, "
+                    f"token_position={state.token_position}"
+                )
+
+        stager = self._get_gpu_weight_stager(device)
+        hidden = self._stage_token_embedding_batch_cuda(
+            store,
+            stager,
+            token_id_tensor,
+            device=device,
+        )
+
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
+        layers = list(layers)
+        for layer_offset, layer in enumerate(layers):
+            if layer.layer_index < 2:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_sliding_batched",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_indices[0] if token_indices else -1,
+                ):
+                    hidden = deepseek_v4_flash_sliding_layer_forward_batched(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        states=states,
+                        token_indices=token_indices,
+                        token_id_tensors=token_id_tensor,
+                    )
+            else:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_compressed_batched",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_indices[0] if token_indices else -1,
+                ):
+                    hidden = deepseek_v4_flash_compressed_layer_forward_batched(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        states=states,
+                        token_indices=token_indices,
+                        token_id_tensors=token_id_tensor,
+                    )
+            if layer_offset + 1 < len(layers):
+                self._schedule_next_layer_expert_prefetch(
+                    stager,
+                    layers[layer_offset + 1],
+                    token_id=None,
+                )
+
+        return store, stager, hidden
+
+    def _stage_token_embedding_batch_cuda(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        token_id_tensor: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        tensor = store.bindings.token_embedding
+        if tensor.tensor_type != GGML_TYPE_F16:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects F16 token_embd.weight; "
+                f"got GGML type {tensor.tensor_type}"
+            )
+        hidden_size = self.shape.hidden_size
+        vocab_size = self.shape.vocab_size
+        if tensor.dims != (hidden_size, vocab_size):
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects token_embd.weight dims "
+                f"({hidden_size}, {vocab_size}); got {tensor.dims}"
+            )
+
+        token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
+        embedding_matrix = stager.stage_matrix(tensor).reshape(vocab_size, hidden_size)
+        hidden = torch.index_select(
+            embedding_matrix,
+            0,
+            token_id_tensor.reshape(-1),
+        )
+        return hidden.to(dtype=torch.float32)
+
+    def _reject_batched_generation_if_hyper_connections(self) -> None:
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return
+        for layer in layers:
+            if (
+                getattr(layer, "attention_hyper_connection", None) is not None
+                or getattr(layer, "ffn_hyper_connection", None) is not None
+            ):
+                raise NotImplementedError(
+                    "batched generation does not support hyper-connections"
+                )
+
+    def _validate_generate_greedy_kernel_batched_input(
+        self,
+        input_ids_list: list[torch.Tensor],
+        *,
+        max_tokens: int,
+    ) -> torch.device:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive; got {max_tokens}")
+        if not input_ids_list:
+            raise ValueError("input_ids_list must not be empty")
+
+        device: torch.device | None = None
+        context_length = self._kernel_context_length()
+
+        for input_ids in input_ids_list:
+            if input_ids.ndim != 1:
+                raise ValueError(
+                    "generate_greedy_kernel_batched supports 1-D input tensors; "
+                    f"got {input_ids.ndim}-D"
+                )
+            if input_ids.dtype not in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
+                raise ValueError(
+                    "input_ids must use an integer dtype; got {input_ids.dtype}"
+                )
+            if not input_ids.is_cuda:
+                raise ValueError(
+                    "generate_greedy_kernel_batched requires CUDA input tensors"
+                )
+            if input_ids.numel() == 0:
+                raise ValueError(
+                    "generate_greedy_kernel_batched requires at least one input token"
+                )
+
+            current_device = torch.device(input_ids.device)
+            if device is None:
+                device = current_device
+            elif device != current_device:
+                raise ValueError(
+                    "generate_greedy_kernel_batched requires all input tensors on "
+                    "the same CUDA device"
+                )
+
+            total_tokens = input_ids.numel() + max_tokens
+            if total_tokens > context_length:
+                raise ValueError(
+                    "generate_greedy_kernel_batched input plus generated tokens "
+                    f"exceeds configured budget: {total_tokens} tokens > "
+                    f"{context_length}"
+                )
+
+            for token_id in input_ids.detach().cpu().tolist():
+                token_id_int = int(token_id)
+                if token_id_int < 0 or token_id_int >= self.shape.vocab_size:
+                    raise ValueError(
+                        f"input token id {token_id_int} is outside vocab range "
+                        f"[0, {self.shape.vocab_size})"
+                    )
+
+        if device is None:
+            raise AssertionError("device should not be None after validation")
+        return device
 
     def _generate_greedy_kernel_impl(
         self,
