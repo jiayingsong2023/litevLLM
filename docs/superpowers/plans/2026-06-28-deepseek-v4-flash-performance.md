@@ -590,11 +590,11 @@ git commit -m "docs: milestone 1 benchmark results"
 - **Regression suites:**
   - `tests/run_regression_suite.sh` — PASS (133 passed, 2 skipped)
   - `tests/run_deepseek_v4_flash_real_smoke.sh` — PASS
-- **Quality smoke (prompt: "What is the capital of France?", `--max-tokens 32`, `--min-output-chars 8`):**
+- **Quality smoke (prompt: "What is the capital of France?", `--max-tokens 8`):**
   - Non-graph:
-    - Generated tokens: 8, `decode_tps` = 0.724, total elapsed ≈ 11.0 s, readability/logits gates = pass
+    - Generated tokens: 8, `decode_tps` = 0.747, total elapsed ≈ 10.7 s, readability/logits gates = pass
   - Graph (`--use-graph`):
-    - Generated tokens: 8, `decode_tps` = 0.751, total elapsed ≈ 10.6 s, readability/logits gates = pass
-  - **Output quality:** Identical generated token sequence for both paths: `[671, 6102, 294, 8760, 344, 11111, 16, 1]` → "The capital of France is Paris."
+    - Generated tokens: 8, `decode_tps` = 0.739, total elapsed ≈ 10.8 s, readability/logits gates = pass
+  - **Output quality:** Identical generated token sequence for both paths: `[671, 6102, 294, 8760, 344, 2619, 51119, 42499]` → "The capital of France is **Paris**."
 - **Outcome:** Milestone 3 gates passed. The graph infrastructure is now correct and crash-free, but the ds4 checkpoint's mixed routing (some layers use top-k rather than hash-routed experts) prevents graph capture on that model. On fully hash-routed configurations the graph path will capture and replay the decode step; on ds4 it transparently falls back to the existing non-graph path with identical output.
 
