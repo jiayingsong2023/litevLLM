@@ -36,6 +36,7 @@ class DeepSeekV4FlashDecodeGraph:
         self.graph = torch.cuda.CUDAGraph()
         self.kv_rows_by_layer: dict[int, torch.Tensor] = {}
         self.extra_kv_rows_by_layer: dict[int, torch.Tensor | None] = {}
+        self.compressed_counts_by_layer: dict[int, int] | None = None
 
     @classmethod
     def capture(
@@ -47,6 +48,7 @@ class DeepSeekV4FlashDecodeGraph:
         device: torch.device,
         kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
         extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> DeepSeekV4FlashDecodeGraph:
         """Capture a single decode step as a CUDA/HIP graph.
 
@@ -66,6 +68,7 @@ class DeepSeekV4FlashDecodeGraph:
             kv_rows_by_layer=kv_rows_by_layer,
             extra_kv_rows_by_layer=extra_kv_rows_by_layer,
         )
+        instance.compressed_counts_by_layer = compressed_counts_by_layer
         # Stage the current token's expert payloads and copy the current KV
         # windows into the stable tensors.
         instance.prepare_replay(
@@ -74,6 +77,7 @@ class DeepSeekV4FlashDecodeGraph:
             token_idx=token_idx,
             token_id_tensor=token_id_tensor,
             device=device,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
 
         def _capture_step() -> None:
@@ -85,6 +89,7 @@ class DeepSeekV4FlashDecodeGraph:
                 advance_state=False,
                 kv_rows_by_layer=instance.kv_rows_by_layer,
                 extra_kv_rows_by_layer=instance.extra_kv_rows_by_layer,
+                compressed_counts_by_layer=instance.compressed_counts_by_layer,
             )
             instance.output_token.copy_(out.reshape(()))
 
@@ -135,12 +140,15 @@ class DeepSeekV4FlashDecodeGraph:
         token_idx: int,
         token_id_tensor: torch.Tensor,
         device: torch.device,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> None:
         """Update stable inputs before ``graph.replay()``.
 
         This stages the current token's expert payloads and copies the current
         KV windows into the stable tensors that the graph was captured with.
         """
+        if compressed_counts_by_layer is not None:
+            self.compressed_counts_by_layer = compressed_counts_by_layer
         model._stage_graph_moe_payloads(
             state=state,
             token_id=int(token_id_tensor.item()),
@@ -161,7 +169,14 @@ class DeepSeekV4FlashDecodeGraph:
             if stable is not None and stable.shape == current.shape:
                 stable.copy_(current)
 
-    def replay(self, token_id_tensor: torch.Tensor) -> torch.Tensor:
+    def replay(
+        self,
+        token_id_tensor: torch.Tensor,
+        *,
+        compressed_counts_by_layer: dict[int, int] | None = None,
+    ) -> torch.Tensor:
+        if compressed_counts_by_layer is not None:
+            self.compressed_counts_by_layer = compressed_counts_by_layer
         self.token_id_placeholder.copy_(token_id_tensor)
         self.graph.replay()
         return self.output_token.clone()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -82,6 +84,16 @@ class _NullAttentionBackend(DeepSeekV4FlashGPUBackend):
         token_idx: int,
     ) -> torch.Tensor | None:
         return None
+
+    def sliding_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        attn_sinks: torch.Tensor | None,
+        token_idx: int,
+    ) -> torch.Tensor:
+        return torch.zeros_like(query, dtype=torch.float32)
 
     def routed_expert_gemm(
         self,
@@ -224,6 +236,77 @@ def _make_real_sliding_layer() -> tuple[
     return layer, store
 
 
+def _make_fake_sliding_layer() -> tuple[
+    DeepSeekV4FlashLayerSemanticBindings,
+    _FakeLayerStore,
+]:
+    """Create a sliding layer that uses the non-real attention fallback path."""
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    head_dim = DEEPSEEK_V4_FLASH_SHAPE.head_dim
+    num_heads = DEEPSEEK_V4_FLASH_SHAPE.num_attention_heads
+    num_experts = 3
+
+    torch.manual_seed(43)
+    store = _FakeLayerStore()
+    tensors: dict[str, DeepSeekV4FlashTensor] = {
+        "attn_norm": _tensor("blk.0.attn_norm.weight", (hidden_size,)),
+        "attn_q": _tensor("blk.0.attn_q.weight", (hidden_size, num_heads * head_dim)),
+        "attn_out": _tensor(
+            "blk.0.attn_output.weight", (num_heads * head_dim, hidden_size)
+        ),
+        "ffn_norm": _tensor("blk.0.ffn_norm.weight", (hidden_size,)),
+        "router": _tensor("blk.0.ffn_gate_inp.weight", (num_experts, hidden_size)),
+        "gate": _tensor(
+            "blk.0.ffn_gate_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+        "up": _tensor(
+            "blk.0.ffn_up_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+        "down": _tensor(
+            "blk.0.ffn_down_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+    }
+
+    store.vectors[(tensors["attn_norm"].name, torch.float32)] = torch.ones(hidden_size)
+    store.vectors[(tensors["ffn_norm"].name, torch.float32)] = torch.ones(hidden_size)
+
+    store.matrices[tensors["attn_q"].name] = (
+        torch.randn(hidden_size, num_heads * head_dim, dtype=torch.float32) * 0.01
+    )
+    store.matrices[tensors["attn_out"].name] = (
+        torch.randn(num_heads * head_dim, hidden_size, dtype=torch.float32) * 0.01
+    )
+
+    # Router that strongly selects expert 0.
+    router = torch.full((num_experts, hidden_size), -10.0, dtype=torch.float32)
+    router[0, :] = 10.0
+    store.matrices[tensors["router"].name] = router
+
+    for tensor_name in ("gate", "up", "down"):
+        store.matrices[tensors[tensor_name].name] = torch.stack(
+            [torch.eye(hidden_size, dtype=torch.float32) for _ in range(num_experts)],
+            dim=-1,
+        )
+
+    layer = DeepSeekV4FlashLayerSemanticBindings(
+        layer_index=0,
+        attention_norm=tensors["attn_norm"],
+        attention_query=tensors["attn_q"],
+        attention_output=tensors["attn_out"],
+        ffn_norm=tensors["ffn_norm"],
+        router=tensors["router"],
+        grouped_experts=DeepSeekV4FlashGroupedExpertTensors(
+            gate=tensors["gate"],
+            up=tensors["up"],
+            down=tensors["down"],
+        ),
+    )
+    return layer, store
+
+
 def _make_state() -> DeepSeekV4FlashGPURequestState:
     return DeepSeekV4FlashGPURequestState(
         DeepSeekV4FlashGPUCacheConfig(
@@ -232,6 +315,26 @@ def _make_state() -> DeepSeekV4FlashGPURequestState:
             device=torch.device("cuda"),
         )
     )
+
+
+def _make_hash_routed_sliding_layer() -> tuple[
+    DeepSeekV4FlashLayerSemanticBindings,
+    _FakeLayerStore,
+]:
+    """Return a real sliding layer augmented with hash-routed experts."""
+    layer, store = _make_real_sliding_layer()
+    vocab_size = 128
+    hash_tensor = _tensor(
+        "blk.0.expert_token_to_expert_ids.weight",
+        (DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok, vocab_size),
+    )
+    # Every token maps to expert 0 for a deterministic, valid routing.
+    store.vectors[(hash_tensor.name, torch.int32)] = torch.zeros(
+        DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+        vocab_size,
+        dtype=torch.int32,
+    )
+    return dataclasses.replace(layer, expert_token_to_expert_ids=hash_tensor), store
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -313,3 +416,121 @@ def test_batched_sliding_layer_rejects_mismatched_batch() -> None:
             token_indices=[0],
             router_top_k=1,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_sliding_layer_non_real_attention_matches_single_slot() -> None:
+    """Batched and single-slot paths agree for the non-real attention fallback."""
+    layer, store = _make_fake_sliding_layer()
+    backend = _NullAttentionBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden_a = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_b = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_batched = torch.stack([hidden_a, hidden_b])
+
+    output_a = deepseek_v4_flash_sliding_layer_forward(
+        hidden_a,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=None,
+        token_idx=0,
+        router_top_k=1,
+    )
+    output_b = deepseek_v4_flash_sliding_layer_forward(
+        hidden_b,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=None,
+        token_idx=1,
+        router_top_k=1,
+    )
+
+    output_batched = deepseek_v4_flash_sliding_layer_forward_batched(
+        hidden_batched,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        states=[_make_state(), _make_state()],
+        token_indices=[0, 1],
+        router_top_k=1,
+    )
+
+    assert output_batched.shape == (2, hidden_size)
+    assert output_batched.device.type == "cuda"
+    torch.testing.assert_close(output_batched[0], output_a)
+    torch.testing.assert_close(output_batched[1], output_b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_sliding_layer_rejects_bad_token_id_tensors_shape() -> None:
+    layer, store = _make_real_sliding_layer()
+    backend = _NullAttentionBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden = torch.randn(2, hidden_size, dtype=torch.float32, device="cuda")
+    bad_token_ids = torch.tensor([0, 1, 2], dtype=torch.long, device="cuda")
+
+    with pytest.raises(ValueError, match="token_id_tensors must have shape"):
+        deepseek_v4_flash_sliding_layer_forward_batched(
+            hidden,
+            layer=layer,
+            stager=stager,
+            backend=backend,
+            states=[_make_state(), _make_state()],
+            token_indices=[0, 0],
+            token_id_tensors=bad_token_ids,
+            router_top_k=1,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_sliding_layer_hash_routing_requires_token_ids() -> None:
+    layer, store = _make_hash_routed_sliding_layer()
+    backend = _NullAttentionBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden = torch.randn(2, hidden_size, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(
+        ValueError,
+        match="hash-routed sliding layer requires token_id_tensors or token_ids",
+    ):
+        deepseek_v4_flash_sliding_layer_forward_batched(
+            hidden,
+            layer=layer,
+            stager=stager,
+            backend=backend,
+            states=[_make_state(), _make_state()],
+            token_indices=[0, 0],
+            router_top_k=1,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_sliding_layer_hash_routing_uses_token_ids() -> None:
+    layer, store = _make_hash_routed_sliding_layer()
+    backend = _NullAttentionBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden = torch.randn(2, hidden_size, dtype=torch.float32, device="cuda")
+
+    output = deepseek_v4_flash_sliding_layer_forward_batched(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        states=[_make_state(), _make_state()],
+        token_indices=[0, 0],
+        token_ids=[0, 1],
+        router_top_k=1,
+    )
+
+    assert output.shape == (2, hidden_size)
+    assert output.device.type == "cuda"

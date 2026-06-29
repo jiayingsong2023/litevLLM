@@ -392,6 +392,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         advance_state: bool = True,
         kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
         extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> torch.Tensor:
         store, stager, hidden = self._forward_kernel_token_hidden_token_tensor(
             token_id_tensor=token_id_tensor,
@@ -400,6 +401,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             device=device,
             kv_rows_by_layer=kv_rows_by_layer,
             extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
         with self._deepseek_profiler.section(
             "output_projection",
@@ -500,6 +502,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         device: torch.device,
         kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
         extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -566,6 +569,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     layer_idx=layer.layer_index,
                     token_idx=token_idx,
                 ):
+                    compressed_count = (
+                        compressed_counts_by_layer.get(layer.layer_index)
+                        if compressed_counts_by_layer is not None
+                        else None
+                    )
                     hidden = deepseek_v4_flash_compressed_layer_forward(
                         hidden,
                         layer=layer,
@@ -578,6 +586,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         extra_kv_rows=layer_extra_kv_rows,
                         kv_rows_by_layer=kv_rows_by_layer,
                         extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                        compressed_count=compressed_count,
                     )
             if layer_offset + 1 < len(layers):
                 self._schedule_next_layer_expert_prefetch(
@@ -730,15 +739,20 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 )
             )
             if can_replay_graph:
+                compressed_counts_by_layer = self._compute_graph_compressed_counts(
+                    token_idx=current_token_idx,
+                )
                 decode_graphs[current_token_idx].prepare_replay(
                     self,
                     state=state,
                     token_idx=current_token_idx,
                     token_id_tensor=token_id_tensor,
                     device=device,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
                 )
                 token_id_tensor = decode_graphs[current_token_idx].replay(
-                    token_id_tensor
+                    token_id_tensor,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
                 )
                 state.advance_token()
             elif can_capture_graph:
@@ -748,12 +762,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         token_idx=current_token_idx,
                     )
                 )
+                compressed_counts_by_layer = self._compute_graph_compressed_counts(
+                    token_idx=current_token_idx,
+                )
                 decode_graphs[current_token_idx] = self._capture_decode_graph(
                     state=state,
                     token_idx=current_token_idx,
                     device=device,
                     kv_rows_by_layer=kv_rows_by_layer,
                     extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
                 )
                 decode_graph_window_shapes[current_token_idx] = (
                     self._decode_kv_window_shapes(
@@ -767,9 +785,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     token_idx=current_token_idx,
                     token_id_tensor=token_id_tensor,
                     device=device,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
                 )
                 token_id_tensor = decode_graphs[current_token_idx].replay(
-                    token_id_tensor
+                    token_id_tensor,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
                 )
                 state.advance_token()
             elif token_id is None:
@@ -841,6 +861,28 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 return False
         return True
 
+    def _compute_graph_compressed_counts(
+        self,
+        *,
+        token_idx: int,
+    ) -> dict[int, int]:
+        """Return per-layer compressed row counts for a graph capture/replay.
+
+        The count matches the number of compressed rows that exist just before
+        the decode step at ``token_idx``; this avoids a CPU sync inside the
+        captured region.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}
+        counts: dict[int, int] = {}
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio > 0:
+                counts[layer.layer_index] = (token_idx + 1) // ratio
+        return counts
+
     def _capture_decode_graph(
         self,
         *,
@@ -849,6 +891,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         device: torch.device,
         kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
         extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> DeepSeekV4FlashDecodeGraph:
         """Capture a CUDA/HIP graph for one steady-state decode step."""
         from .decode_graph import DeepSeekV4FlashDecodeGraph
@@ -860,6 +903,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             device=device,
             kv_rows_by_layer=kv_rows_by_layer,
             extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
 
     def _materialize_decode_kv_windows(

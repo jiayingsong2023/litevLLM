@@ -819,6 +819,7 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
     states: list[DeepSeekV4FlashGPURequestState],
     token_indices: list[int],
     token_id_tensors: torch.Tensor | None = None,
+    token_ids: list[int] | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -831,6 +832,19 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
     batch = hidden.shape[0]
     if len(states) != batch or len(token_indices) != batch:
         raise ValueError("states and token_indices must match batch size")
+    if token_id_tensors is not None and token_id_tensors.shape != (batch,):
+        raise ValueError(
+            f"token_id_tensors must have shape ({batch},); "
+            f"got {tuple(token_id_tensors.shape)}"
+        )
+    if (
+        layer.expert_token_to_expert_ids is not None
+        and token_id_tensors is None
+        and token_ids is None
+    ):
+        raise ValueError(
+            "hash-routed sliding layer requires token_id_tensors or token_ids"
+        )
 
     if layer.attention_hyper_connection is not None:
         raise NotImplementedError(
@@ -970,22 +984,30 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
         layer_idx=layer.layer_index,
         layer_type="sliding_batched",
     ):
-        moe_updates = [
-            _run_sliding_moe(
-                ffn_input[b],
-                layer=layer,
-                grouped_experts=grouped_experts,
-                stager=stager,
-                backend=backend,
-                state=states[b],
-                token_id=token_indices[b],
-                token_id_tensor=(
-                    token_id_tensors[b] if token_id_tensors is not None else None
-                ),
-                router_top_k=router_top_k,
+        moe_updates = []
+        for b in range(batch):
+            if token_id_tensors is not None:
+                slot_token_id: int = 0
+                slot_token_id_tensor = token_id_tensors[b]
+            elif token_ids is not None:
+                slot_token_id = token_ids[b]
+                slot_token_id_tensor = None
+            else:
+                slot_token_id = 0
+                slot_token_id_tensor = None
+            moe_updates.append(
+                _run_sliding_moe(
+                    ffn_input[b],
+                    layer=layer,
+                    grouped_experts=grouped_experts,
+                    stager=stager,
+                    backend=backend,
+                    state=states[b],
+                    token_id=slot_token_id,
+                    token_id_tensor=slot_token_id_tensor,
+                    router_top_k=router_top_k,
+                )
             )
-            for b in range(batch)
-        ]
         moe_update = torch.stack(moe_updates)
 
     return deepseek_v4_flash_residual_hyper_connection(
@@ -1008,6 +1030,7 @@ def deepseek_v4_flash_layer_forward(
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
+    compressed_count: int | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -1038,6 +1061,7 @@ def deepseek_v4_flash_layer_forward(
         token_id_tensor=token_id_tensor,
         kv_rows=kv_rows,
         extra_kv_rows=extra_kv_rows,
+        compressed_count=compressed_count,
         router_top_k=router_top_k,
         use_reference_rope=use_reference_rope,
     )
@@ -1057,6 +1081,7 @@ def deepseek_v4_flash_compressed_layer_forward(
     extra_kv_rows: torch.Tensor | None = None,
     kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
     extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    compressed_count: int | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -1178,11 +1203,13 @@ def deepseek_v4_flash_compressed_layer_forward(
             indexer_row=indexer_row,
         )
 
-    compressed_count = (token_idx + 1) // ratio if ratio > 0 else 0
-    prior_rows = state.compressed_kv_cache.read_compressed(
-        layer.layer_index,
-        count=compressed_count,
-    )
+    if compressed_count is None:
+        prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
+    else:
+        prior_rows = state.compressed_kv_cache.read_compressed(
+            layer.layer_index,
+            count=compressed_count,
+        )
     if prior_rows.shape[0] == 0:
         compressed_attention_rows: torch.Tensor | None = None
         compressed_extra_rows: torch.Tensor | None = None
@@ -1194,24 +1221,35 @@ def deepseek_v4_flash_compressed_layer_forward(
             layer_idx=layer.layer_index,
             ratio=ratio,
         ):
+            indexer_rows = (
+                state.compressed_kv_cache.read_indexer_rows(layer.layer_index)
+                if compressed_count is None
+                else state.compressed_kv_cache.read_indexer_rows(
+                    layer.layer_index,
+                    count=compressed_count,
+                )
+            )
             selected_rows = _select_compressed_rows_with_indexer(
                 attn_input,
                 layer=layer,
                 stager=stager,
-                indexer_rows=state.compressed_kv_cache.read_indexer_rows(
-                    layer.layer_index,
-                    count=compressed_count,
-                ),
+                indexer_rows=indexer_rows,
                 state=state,
                 token_idx=token_idx,
                 use_reference_rope=use_reference_rope,
             )
         compressed_attention_rows = prior_rows
-        compressed_extra_rows = state.compressed_kv_cache.read_compressed(
-            layer.layer_index,
-            row_indices=selected_rows,
-            count=compressed_count,
-        )
+        if compressed_count is None:
+            compressed_extra_rows = state.compressed_kv_cache.read_compressed(
+                layer.layer_index,
+                row_indices=selected_rows,
+            )
+        else:
+            compressed_extra_rows = state.compressed_kv_cache.read_compressed(
+                layer.layer_index,
+                row_indices=selected_rows,
+                count=compressed_count,
+            )
     else:
         compressed_attention_rows = prior_rows
         compressed_extra_rows = prior_rows
