@@ -2252,6 +2252,7 @@ async def run_benchmark(
     warmup_config: WarmupConfig | None = None,
     fixed_decode_len: bool = True,
     clear_prefix_cache_after_warmup: bool = True,
+    deepseek_batched_engine: bool = False,
 ) -> Dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
@@ -2275,7 +2276,10 @@ async def run_benchmark(
     print(f"{'=' * 72}")
 
     if spec.quant == "deepseek-v4-flash-gguf":
-        return _run_deepseek_v4_flash_direct_benchmark(spec)
+        return _run_deepseek_v4_flash_direct_benchmark(
+            spec,
+            batched_engine=deepseek_batched_engine,
+        )
 
     if not os.path.isdir(spec.model_path) and not _is_hf_repo_id(spec.model_path):
         print("  [Skip] Model directory not found.")
@@ -2771,8 +2775,15 @@ def _deepseek_smoke_payload_to_benchmark_result(
     }
 
 
-def _run_deepseek_v4_flash_direct_benchmark(spec: ModelSpec) -> dict[str, Any]:
-    print("  [DeepSeek] Running direct GGUF GPU smoke benchmark.")
+def _run_deepseek_v4_flash_direct_benchmark(
+    spec: ModelSpec,
+    *,
+    batched_engine: bool = False,
+) -> dict[str, Any]:
+    if batched_engine:
+        print("  [DeepSeek] Running batched-engine direct GGUF GPU smoke benchmark.")
+    else:
+        print("  [DeepSeek] Running direct GGUF GPU smoke benchmark.")
     if not os.path.isfile(spec.model_path):
         print("  [Skip] DeepSeek V4 Flash GGUF file not found.")
         return {"skipped": 1.0, "skip_reason": "model_file_not_found"}
@@ -2782,22 +2793,43 @@ def _run_deepseek_v4_flash_direct_benchmark(spec: ModelSpec) -> dict[str, Any]:
         delete=False,
     ) as tmp:
         profile_json = tmp.name
+    script = (
+        "tests/tools/run_deepseek_v4_flash_gpu_smoke_batched.py"
+        if batched_engine
+        else "tests/tools/run_deepseek_v4_flash_gpu_smoke.py"
+    )
     command = [
         sys.executable,
-        "tests/tools/run_deepseek_v4_flash_gpu_smoke.py",
+        script,
         "--model",
         spec.model_path,
         "--context-length",
         str(spec.max_model_len),
         "--max-tokens",
         str(spec.max_new_tokens),
-        "--warmup-tokens",
-        str(spec.max_new_tokens),
-        "--repeat",
-        "1",
         "--profile-json",
         profile_json,
     ]
+    if batched_engine:
+        command.extend(
+            [
+                "--batch-size",
+                str(spec.concurrent_reqs),
+                "--prompt-length",
+                "1",
+                "--repeat",
+                "1",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--warmup-tokens",
+                str(spec.max_new_tokens),
+                "--repeat",
+                "1",
+            ]
+        )
     start = time.perf_counter()
     try:
         proc = subprocess.run(
@@ -3272,6 +3304,15 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Disable per-model child-process isolation even when auto-isolation would apply.",
     )
+    parser.add_argument(
+        "--deepseek-batched-engine",
+        action="store_true",
+        default=False,
+        help=(
+            "For DeepSeek V4 Flash, run the batched engine method "
+            "(generate_deepseek_v4_flash_greedy_batched) instead of one request at a time."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -3443,6 +3484,7 @@ async def main() -> None:
                     clear_prefix_cache_after_warmup=_clear_prefix_cache_after_warmup(
                         args
                     ),
+                    deepseek_batched_engine=args.deepseek_batched_engine,
                 )
                 runtime_stats_summary[spec.key] = dict(
                     summary[spec.key].get("runtime_stats", {})
