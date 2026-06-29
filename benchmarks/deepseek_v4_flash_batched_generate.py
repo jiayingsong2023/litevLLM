@@ -9,13 +9,13 @@ from time import perf_counter
 from typing import Any
 
 import torch
-from vllm.model_executor.models.deepseek_v4_flash.backend import (
-    DeepSeekV4FlashGPUBackend,
-    DeepSeekV4FlashGPUCapabilities,
-)
 
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashMemoryPolicy,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
+    DeepSeekV4FlashGPUBackend,
+    DeepSeekV4FlashGPUCapabilities,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
