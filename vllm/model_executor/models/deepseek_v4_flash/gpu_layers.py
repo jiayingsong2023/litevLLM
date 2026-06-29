@@ -392,6 +392,14 @@ def _run_real_sliding_attention(
                 token_idx,
                 DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
             )
+    if kv_rows is not None:
+        # When the caller supplies a pre-materialized window, append the
+        # current token's KV so the attention sees the same rows as the
+        # reference path that reads from the cache after appending.
+        kv_rows = torch.cat(
+            [kv_rows.to(torch.float32), current_kv.reshape(1, -1)],
+            dim=0,
+        )
     if extra_kv_rows is not None:
         kv_rows = torch.cat(
             [kv_rows.to(torch.float32), extra_kv_rows.to(torch.float32)],
