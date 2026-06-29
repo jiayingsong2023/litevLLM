@@ -692,6 +692,7 @@ class LiteEngine:
         request_id: str,
         prompt: str,
         sampling_params: SamplingParams,
+        use_graph: bool = False,
     ) -> RequestOutput:
         if not getattr(self, "_deepseek_v4_flash_direct", False):
             raise RuntimeError("DeepSeek V4 Flash direct runtime is not enabled")
@@ -711,6 +712,7 @@ class LiteEngine:
         output_ids = self.model.generate_greedy_kernel(
             input_ids,
             max_tokens=max_tokens,
+            use_graph=use_graph,
         )
         generated_token_ids = [
             int(token)

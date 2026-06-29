@@ -45,9 +45,15 @@ class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
         input_ids: torch.Tensor,
         *,
         max_tokens: int = 1,
+        use_graph: bool = False,
     ) -> torch.Tensor:
         self.calls.append(
-            (input_ids.detach().cpu().tolist(), max_tokens, input_ids.device.type)
+            (
+                input_ids.detach().cpu().tolist(),
+                max_tokens,
+                input_ids.device.type,
+                use_graph,
+            )
         )
         assert max_tokens == 2
         return torch.tensor(
@@ -81,7 +87,7 @@ def test_lite_engine_deepseek_direct_greedy_uses_kernel_generate() -> None:
     assert output.finished is True
     assert output.outputs[0].text == "world"
     assert output.outputs[0].token_ids == [11, 12]
-    assert engine.model.calls == [([3, 7], 2, engine.device.type)]
+    assert engine.model.calls == [([3, 7], 2, engine.device.type, False)]
 
 
 def test_lite_engine_deepseek_direct_rejects_non_greedy_sampling() -> None:
