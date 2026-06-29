@@ -333,8 +333,9 @@ def _has_real_sliding_attention_tensors(
     )
 
 
-def _run_real_sliding_attention(
-    attn_input: torch.Tensor,
+def _run_sliding_attention_for_slot(
+    query: torch.Tensor,
+    current_kv: torch.Tensor,
     *,
     layer: DeepSeekV4FlashLayerSemanticBindings,
     stager: DeepSeekV4FlashGPUWeightStager,
@@ -342,30 +343,17 @@ def _run_real_sliding_attention(
     state: DeepSeekV4FlashGPURequestState | None,
     token_idx: int,
     kv_rows: torch.Tensor | None,
-    extra_kv_rows: torch.Tensor | None = None,
-    use_reference_rope: bool = False,
+    extra_kv_rows: torch.Tensor | None,
+    use_reference_rope: bool,
 ) -> torch.Tensor:
-    if not attn_input.is_cuda:
-        raise ValueError("DeepSeek V4 Flash real sliding input must be CUDA")
-    query_a = _required_tensor(layer.attention_query_a, "attention_query_a")
-    query_a_norm = _required_tensor(
-        layer.attention_query_a_norm,
-        "attention_query_a_norm",
-    )
-    query_b = _required_tensor(layer.attention_query_b, "attention_query_b")
-    kv_tensor = _required_tensor(layer.attention_key_value, "attention_key_value")
-    kv_norm = _required_tensor(
-        layer.attention_key_value_a_norm,
-        "attention_key_value_a_norm",
-    )
-    attn_sinks = _required_tensor(layer.attention_sinks, "attention_sinks")
+    """Run the attention body for one slot from pre-projected Q/KV vectors.
 
-    q_latent = _project_tensor(attn_input, query_a, stager)
-    q_latent = deepseek_v4_flash_rms_norm(
-        q_latent,
-        stager.stage_vector(query_a_norm),
-    )
-    query = _project_tensor(q_latent, query_b, stager).reshape(
+    ``query`` is a 1-D tensor of length ``num_heads * head_dim``.
+    ``current_kv`` is a 1-D tensor of length ``head_dim`` and is used as both
+    the key and value for the current token.
+    """
+    attn_sinks = _required_tensor(layer.attention_sinks, "attention_sinks")
+    query = query.reshape(
         DEEPSEEK_V4_FLASH_SHAPE.num_attention_heads,
         DEEPSEEK_V4_FLASH_SHAPE.head_dim,
     )
@@ -381,11 +369,6 @@ def _run_real_sliding_attention(
         cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
         query = apply_precomputed_rope_to_tail(query, cos, sin)
 
-    current_kv = _project_tensor(attn_input, kv_tensor, stager)
-    current_kv = deepseek_v4_flash_rms_norm(
-        current_kv,
-        stager.stage_vector(kv_norm),
-    )
     if use_reference_rope or state is None:
         current_kv = apply_deepseek_layer_rope_to_tail_reference(
             current_kv,
@@ -481,6 +464,59 @@ def _run_real_sliding_attention(
         attention_output_a=layer.attention_output_a,
         attention_output_b=layer.attention_output_b,
         stager=stager,
+    )
+
+
+def _run_real_sliding_attention(
+    attn_input: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    state: DeepSeekV4FlashGPURequestState | None,
+    token_idx: int,
+    kv_rows: torch.Tensor | None,
+    extra_kv_rows: torch.Tensor | None = None,
+    use_reference_rope: bool = False,
+) -> torch.Tensor:
+    if not attn_input.is_cuda:
+        raise ValueError("DeepSeek V4 Flash real sliding input must be CUDA")
+    query_a = _required_tensor(layer.attention_query_a, "attention_query_a")
+    query_a_norm = _required_tensor(
+        layer.attention_query_a_norm,
+        "attention_query_a_norm",
+    )
+    query_b = _required_tensor(layer.attention_query_b, "attention_query_b")
+    kv_tensor = _required_tensor(layer.attention_key_value, "attention_key_value")
+    kv_norm = _required_tensor(
+        layer.attention_key_value_a_norm,
+        "attention_key_value_a_norm",
+    )
+
+    q_latent = _project_tensor(attn_input, query_a, stager)
+    q_latent = deepseek_v4_flash_rms_norm(
+        q_latent,
+        stager.stage_vector(query_a_norm),
+    )
+    query = _project_tensor(q_latent, query_b, stager)
+
+    current_kv = _project_tensor(attn_input, kv_tensor, stager)
+    current_kv = deepseek_v4_flash_rms_norm(
+        current_kv,
+        stager.stage_vector(kv_norm),
+    )
+
+    return _run_sliding_attention_for_slot(
+        query,
+        current_kv,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state,
+        token_idx=token_idx,
+        kv_rows=kv_rows,
+        extra_kv_rows=extra_kv_rows,
+        use_reference_rope=use_reference_rope,
     )
 
 
@@ -766,6 +802,192 @@ def deepseek_v4_flash_sliding_layer_forward(
             ffn_residual_streams,
             ffn_hc_state,
         )
+    return deepseek_v4_flash_residual_hyper_connection(
+        hidden_after_attn,
+        moe_update,
+        stager=stager,
+        hyper_connection=None,
+    )
+
+
+def deepseek_v4_flash_sliding_layer_forward_batched(
+    hidden: torch.Tensor,
+    *,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    stager: DeepSeekV4FlashGPUWeightStager,
+    backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
+    states: list[DeepSeekV4FlashGPURequestState],
+    token_indices: list[int],
+    token_id_tensors: torch.Tensor | None = None,
+    router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    use_reference_rope: bool = False,
+) -> torch.Tensor:
+    if not hidden.is_cuda:
+        raise ValueError("DeepSeek V4 Flash batched sliding layer hidden must be CUDA")
+    if hidden.ndim != 2:
+        raise ValueError(
+            f"batched sliding layer expects 2-D hidden; got {hidden.ndim}-D"
+        )
+    batch = hidden.shape[0]
+    if len(states) != batch or len(token_indices) != batch:
+        raise ValueError("states and token_indices must match batch size")
+
+    if layer.attention_hyper_connection is not None:
+        raise NotImplementedError(
+            "batched sliding layer does not support attention hyper-connections"
+        )
+    if layer.ffn_hyper_connection is not None:
+        raise NotImplementedError(
+            "batched sliding layer does not support ffn hyper-connections"
+        )
+
+    attention_norm = stager.stage_vector(
+        _required_tensor(layer.attention_norm, "attention_norm")
+    )
+    ffn_norm = stager.stage_vector(_required_tensor(layer.ffn_norm, "ffn_norm"))
+    grouped_experts = _required_grouped_experts(layer.grouped_experts)
+
+    with _stager_profile_section(
+        stager,
+        "layer_attention_norm",
+        layer_idx=layer.layer_index,
+        layer_type="sliding_batched",
+    ):
+        attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
+
+    with _stager_profile_section(
+        stager,
+        "layer_attention",
+        layer_idx=layer.layer_index,
+        layer_type="sliding_batched",
+    ):
+        if _has_real_sliding_attention_tensors(layer):
+            query_a = _required_tensor(layer.attention_query_a, "attention_query_a")
+            query_a_norm = _required_tensor(
+                layer.attention_query_a_norm,
+                "attention_query_a_norm",
+            )
+            query_b = _required_tensor(layer.attention_query_b, "attention_query_b")
+            kv_tensor = _required_tensor(
+                layer.attention_key_value,
+                "attention_key_value",
+            )
+            kv_norm = _required_tensor(
+                layer.attention_key_value_a_norm,
+                "attention_key_value_a_norm",
+            )
+
+            q_latent = _project_tensor(attn_input, query_a, stager)
+            q_latent = deepseek_v4_flash_rms_norm(
+                q_latent,
+                stager.stage_vector(query_a_norm),
+            )
+            query = _project_tensor(q_latent, query_b, stager)
+
+            current_kv = _project_tensor(attn_input, kv_tensor, stager)
+            current_kv = deepseek_v4_flash_rms_norm(
+                current_kv,
+                stager.stage_vector(kv_norm),
+            )
+
+            attn_updates = [
+                _run_sliding_attention_for_slot(
+                    query[b],
+                    current_kv[b],
+                    layer=layer,
+                    stager=stager,
+                    backend=backend,
+                    state=states[b],
+                    token_idx=token_indices[b],
+                    kv_rows=None,
+                    extra_kv_rows=None,
+                    use_reference_rope=use_reference_rope,
+                )
+                for b in range(batch)
+            ]
+            attn_update = torch.stack(attn_updates)
+        else:
+            query = _project_tensor(
+                attn_input,
+                _required_tensor(layer.attention_query, "attention_query"),
+                stager,
+            )
+            if layer.attention_query_a_norm is not None:
+                query = deepseek_v4_flash_rms_norm(
+                    query,
+                    stager.stage_vector(layer.attention_query_a_norm),
+                )
+            if layer.attention_query_b is not None:
+                query = _project_tensor(query, layer.attention_query_b, stager)
+
+            attn_sinks = (
+                stager.stage_vector(layer.attention_sinks)
+                if layer.attention_sinks is not None
+                else None
+            )
+            attn_updates = []
+            for b in range(batch):
+                kv_rows = query[b].reshape(1, query[b].numel())
+                if not kv_rows.is_cuda:
+                    raise ValueError(
+                        "DeepSeek V4 Flash sliding attention KV rows must be CUDA"
+                    )
+                attn_out = backend.sliding_attention(
+                    query=query[b],
+                    kv_rows=kv_rows,
+                    attn_sinks=attn_sinks,
+                    token_idx=token_indices[b],
+                )
+                attn_updates.append(
+                    _project_sliding_attention_output(
+                        attn_out,
+                        layer.attention_output,
+                        attention_output_a=layer.attention_output_a,
+                        attention_output_b=layer.attention_output_b,
+                        stager=stager,
+                    )
+                )
+            attn_update = torch.stack(attn_updates)
+
+    hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+        hidden,
+        attn_update,
+        stager=stager,
+        hyper_connection=None,
+    )
+
+    with _stager_profile_section(
+        stager,
+        "layer_ffn_norm",
+        layer_idx=layer.layer_index,
+        layer_type="sliding_batched",
+    ):
+        ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
+
+    with _stager_profile_section(
+        stager,
+        "layer_moe",
+        layer_idx=layer.layer_index,
+        layer_type="sliding_batched",
+    ):
+        moe_updates = [
+            _run_sliding_moe(
+                ffn_input[b],
+                layer=layer,
+                grouped_experts=grouped_experts,
+                stager=stager,
+                backend=backend,
+                state=states[b],
+                token_id=token_indices[b],
+                token_id_tensor=(
+                    token_id_tensors[b] if token_id_tensors is not None else None
+                ),
+                router_top_k=router_top_k,
+            )
+            for b in range(batch)
+        ]
+        moe_update = torch.stack(moe_updates)
+
     return deepseek_v4_flash_residual_hyper_connection(
         hidden_after_attn,
         moe_update,
@@ -2279,5 +2501,6 @@ __all__ = [
     "deepseek_v4_flash_rms_norm",
     "deepseek_v4_flash_router_topk",
     "deepseek_v4_flash_sliding_layer_forward",
+    "deepseek_v4_flash_sliding_layer_forward_batched",
     "deepseek_v4_flash_staged_matrix_projection",
 ]
