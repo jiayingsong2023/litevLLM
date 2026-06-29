@@ -432,21 +432,6 @@ def test_generate_greedy_kernel_batched_accepts_cpu_input_ids(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_generate_greedy_kernel_batched_rejects_hyper_connections() -> None:
-    model = _fake_model(context_length=8)
-    assert model.weight_store is not None
-
-    hyper_layer = _FakeLayer(0, None)
-    hyper_layer.attention_hyper_connection = object()
-    model.weight_store.bindings.layers = [hyper_layer]
-
-    input_ids = torch.tensor([1], dtype=torch.long, device="cuda")
-
-    with pytest.raises(NotImplementedError, match="hyper-connections"):
-        model.generate_greedy_kernel_batched([input_ids], max_tokens=1)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_generate_greedy_kernel_batched_never_uses_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

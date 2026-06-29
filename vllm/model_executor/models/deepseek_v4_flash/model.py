@@ -703,8 +703,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             max_tokens=max_tokens,
         )
         self.gpu_backend.require_ready()
-        self._reject_batched_generation_if_hyper_connections()
-
         eos_token_id = self._eos_token_id()
         context_length = self._kernel_context_length()
 
