@@ -902,6 +902,7 @@ def deepseek_v4_flash_compressed_layer_forward(
     prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
     if prior_rows.shape[0] == 0:
         compressed_attention_rows: torch.Tensor | None = None
+        compressed_extra_rows: torch.Tensor | None = None
         selected_rows = torch.zeros(1, dtype=torch.int64, device=hidden.device)
     elif layer.indexer is not None:
         with _stager_profile_section(
@@ -922,8 +923,13 @@ def deepseek_v4_flash_compressed_layer_forward(
                 use_reference_rope=use_reference_rope,
             )
         compressed_attention_rows = prior_rows
+        compressed_extra_rows = state.compressed_kv_cache.read_compressed(
+            layer.layer_index,
+            row_indices=selected_rows,
+        )
     else:
         compressed_attention_rows = prior_rows
+        compressed_extra_rows = prior_rows
         selected_rows = torch.arange(
             prior_rows.shape[0],
             dtype=torch.int64,
@@ -938,6 +944,12 @@ def deepseek_v4_flash_compressed_layer_forward(
         ratio=ratio,
     ):
         if _has_real_sliding_attention_tensors(layer):
+            if kv_rows is None:
+                effective_kv_rows: torch.Tensor | None = None
+                effective_extra_kv_rows = compressed_extra_rows
+            else:
+                effective_kv_rows = kv_rows
+                effective_extra_kv_rows = extra_kv_rows
             attn_update = _run_real_sliding_attention(
                 attn_input,
                 layer=layer,
@@ -945,8 +957,8 @@ def deepseek_v4_flash_compressed_layer_forward(
                 backend=backend,
                 state=state,
                 token_idx=token_idx,
-                kv_rows=kv_rows,
-                extra_kv_rows=extra_kv_rows,
+                kv_rows=effective_kv_rows,
+                extra_kv_rows=effective_extra_kv_rows,
                 use_reference_rope=use_reference_rope,
             )
         else:
