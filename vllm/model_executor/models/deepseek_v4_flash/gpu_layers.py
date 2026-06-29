@@ -956,12 +956,10 @@ def deepseek_v4_flash_compressed_layer_forward(
         ratio=ratio,
     ):
         if _has_real_sliding_attention_tensors(layer):
-            if kv_rows is None:
-                effective_kv_rows: torch.Tensor | None = None
-                effective_extra_kv_rows = compressed_extra_rows
-            else:
-                effective_kv_rows = kv_rows
-                effective_extra_kv_rows = extra_kv_rows
+            effective_kv_rows = kv_rows
+            effective_extra_kv_rows = (
+                extra_kv_rows if extra_kv_rows is not None else compressed_extra_rows
+            )
             attn_update = _run_real_sliding_attention(
                 attn_input,
                 layer=layer,

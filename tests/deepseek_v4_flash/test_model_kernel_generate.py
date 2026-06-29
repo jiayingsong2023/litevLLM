@@ -13,6 +13,9 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashRuntimeBudget,
     DeepSeekV4FlashShape,
 )
+from vllm.model_executor.models.deepseek_v4_flash.decode_graph import (
+    DeepSeekV4FlashDecodeGraph,
+)
 from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
     DeepSeekV4FlashExpertPrefetchRequest,
 )
@@ -989,7 +992,7 @@ def test_generate_greedy_kernel_uses_token_tensor_path_for_continuation(
 def test_generate_greedy_kernel_with_graph_matches_without_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = _fake_model(context_length=8)
+    model = _fake_model(context_length=12)
 
     def fake_token_step_token_id(
         *,
@@ -1031,15 +1034,46 @@ def test_generate_greedy_kernel_with_graph_matches_without_graph(
         fake_token_step_token_tensor,
     )
 
+    capture_count = 0
+    replay_count = 0
+    original_capture = DeepSeekV4FlashDecodeGraph.capture
+    original_replay = DeepSeekV4FlashDecodeGraph.replay
+
+    def counting_capture(
+        cls: type[DeepSeekV4FlashDecodeGraph],
+        *args: object,
+        **kwargs: object,
+    ) -> DeepSeekV4FlashDecodeGraph:
+        nonlocal capture_count
+        capture_count += 1
+        return original_capture(*args, **kwargs)
+
+    def counting_replay(
+        self: DeepSeekV4FlashDecodeGraph,
+        token_id_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        nonlocal replay_count
+        replay_count += 1
+        return original_replay(self, token_id_tensor)
+
+    monkeypatch.setattr(
+        DeepSeekV4FlashDecodeGraph,
+        "capture",
+        classmethod(counting_capture),
+    )
+    monkeypatch.setattr(DeepSeekV4FlashDecodeGraph, "replay", counting_replay)
+
     prompt = torch.tensor([1, 2], dtype=torch.long, device="cuda")
-    output_without_graph = model.generate_greedy_kernel(prompt, max_tokens=3)
+    output_without_graph = model.generate_greedy_kernel(prompt, max_tokens=6)
     output_with_graph = model.generate_greedy_kernel(
         prompt,
-        max_tokens=3,
+        max_tokens=6,
         use_graph=True,
     )
 
     assert output_without_graph.tolist() == output_with_graph.tolist()
+    assert capture_count >= 2, "expected graphs to be captured for multiple positions"
+    assert replay_count >= 2, "expected graphs to be replayed for multiple positions"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

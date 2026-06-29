@@ -390,7 +390,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         device: torch.device,
         advance_state: bool = True,
         kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-        extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         store, stager, hidden = self._forward_kernel_token_hidden_token_tensor(
             token_id_tensor=token_id_tensor,
@@ -498,7 +498,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token_idx: int,
         device: torch.device,
         kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-        extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -702,22 +702,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         eos_token_id = self._eos_token_id()
         token_id = int(token_id_tensor.item()) if eos_token_id is not None else None
 
-        decode_graph: DeepSeekV4FlashDecodeGraph | None = None
-        decode_graph_token_idx: int | None = None
-        decode_graph_window_shapes: dict[int, tuple[int, ...]] | None = None
-        if use_graph and eos_token_id is None:
-            first_decode_token_idx = state.token_position
-            if not self._decode_step_is_emit_boundary(first_decode_token_idx):
-                decode_graph = self._capture_decode_graph(
-                    state=state,
-                    token_idx=first_decode_token_idx,
-                    device=device,
-                )
-                decode_graph_token_idx = first_decode_token_idx
-                decode_graph_window_shapes = self._decode_kv_window_shapes(
-                    state=state,
-                    token_idx=first_decode_token_idx,
-                )
+        decode_graphs: dict[int, DeepSeekV4FlashDecodeGraph] = {}
+        decode_graph_window_shapes: dict[int, dict[int, tuple[int, ...]]] = {}
 
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
@@ -727,20 +713,49 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            can_replay_graph = (
+            current_token_idx = state.token_position
+            can_capture_graph = (
                 use_graph
-                and decode_graph is not None
                 and token_id is None
-                and state.token_position == decode_graph_token_idx
-                and not self._decode_step_is_emit_boundary(state.token_position)
+                and not self._decode_step_is_emit_boundary(current_token_idx)
+            )
+            can_replay_graph = (
+                can_capture_graph
+                and current_token_idx in decode_graphs
                 and self._decode_kv_window_shapes_match(
                     state=state,
-                    token_idx=state.token_position,
-                    captured_shapes=decode_graph_window_shapes,
+                    token_idx=current_token_idx,
+                    captured_shapes=decode_graph_window_shapes.get(current_token_idx),
                 )
             )
             if can_replay_graph:
-                token_id_tensor = decode_graph.replay(token_id_tensor)
+                token_id_tensor = decode_graphs[current_token_idx].replay(
+                    token_id_tensor
+                )
+                state.advance_token()
+            elif can_capture_graph:
+                kv_rows_by_layer, extra_kv_rows_by_layer = (
+                    self._materialize_decode_kv_windows(
+                        state=state,
+                        token_idx=current_token_idx,
+                    )
+                )
+                decode_graphs[current_token_idx] = self._capture_decode_graph(
+                    state=state,
+                    token_idx=current_token_idx,
+                    device=device,
+                    kv_rows_by_layer=kv_rows_by_layer,
+                    extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                )
+                decode_graph_window_shapes[current_token_idx] = (
+                    self._decode_kv_window_shapes(
+                        state=state,
+                        token_idx=current_token_idx,
+                    )
+                )
+                token_id_tensor = decode_graphs[current_token_idx].replay(
+                    token_id_tensor
+                )
                 state.advance_token()
             elif token_id is None:
                 token_id_tensor = self._forward_kernel_token_step_token_tensor(
@@ -798,20 +813,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     ) -> DeepSeekV4FlashDecodeGraph:
         """Capture a CUDA/HIP graph for one steady-state decode step."""
         from .decode_graph import DeepSeekV4FlashDecodeGraph
 
-        kv_rows_by_layer = self._materialize_decode_kv_windows(
-            state=state,
-            token_idx=token_idx,
-        )
         return DeepSeekV4FlashDecodeGraph.capture(
             self,
             state=state,
             token_idx=token_idx,
             device=device,
             kv_rows_by_layer=kv_rows_by_layer,
+            extra_kv_rows_by_layer=extra_kv_rows_by_layer,
         )
 
     def _materialize_decode_kv_windows(
@@ -819,48 +833,91 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
-    ) -> dict[int, torch.Tensor]:
-        """Return explicit raw KV windows for sliding layers.
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor | None]]:
+        """Return explicit KV windows for all layers at ``token_idx``.
 
-        Compressed layers read their compressed cache from ``state`` inside the
-        graph, so they are omitted from the explicit window dict. This keeps the
-        initial integration simple while still giving the graph stable inputs for
-        the layers whose window shape changes every decode step.
+        Sliding layers return their raw sliding window as ``kv_rows``.
+        Compressed layers leave ``kv_rows`` as ``None`` (the raw window is read
+        inside the graph) and return their compressed extra rows as
+        ``extra_kv_rows`` so the graph sees stable inputs for every layer.
+
+        Compressed layers with an indexer return ``None`` for ``extra_kv_rows``;
+        the indexer selection depends on the query and must run inside the
+        graph to match the reference path.
         """
         store = self._require_weight_store()
         layers = getattr(store.bindings, "layers", None)
         if layers is None:
-            return {}
+            return {}, {}
         kv_rows_by_layer: dict[int, torch.Tensor] = {}
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] = {}
         for layer in layers:
-            if layer.layer_index < 2:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio == 0:
                 kv_rows_by_layer[layer.layer_index] = state.raw_kv_window(
                     layer.layer_index,
                     token_idx,
                     self.shape.sliding_window,
                 )
-        return kv_rows_by_layer
+            else:
+                extra_kv_rows_by_layer[layer.layer_index] = (
+                    self._materialize_compressed_extra_rows(
+                        state=state,
+                        layer=layer,
+                        token_idx=token_idx,
+                    )
+                )
+        return kv_rows_by_layer, extra_kv_rows_by_layer
+
+    def _materialize_compressed_extra_rows(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        layer: Any,
+        token_idx: int,
+    ) -> torch.Tensor | None:
+        """Return the compressed extra rows to feed into a graph step.
+
+        Layers without an indexer use all prior compressed rows, which is
+        stable across decode steps and safe to materialize once per graph.
+        Layers with an indexer select rows based on the current query, so
+        returning ``None`` lets ``_run_real_sliding_attention`` compute the
+        indexer selection inside the graph and match the reference path.
+        """
+        del token_idx
+        if layer.indexer is not None:
+            return None
+        return state.compressed_kv_cache.read_compressed(layer.layer_index)
 
     def _decode_kv_window_shapes(
         self,
         *,
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
-    ) -> dict[int, tuple[int, ...]]:
-        """Return the shapes of raw KV windows for sliding layers."""
+    ) -> dict[int, tuple[int, ...] | None]:
+        """Return the shapes of KV windows for all layers at ``token_idx``."""
         store = self._require_weight_store()
         layers = getattr(store.bindings, "layers", None)
         if layers is None:
             return {}
-        shapes: dict[int, tuple[int, ...]] = {}
+        shapes: dict[int, tuple[int, ...] | None] = {}
         for layer in layers:
-            if layer.layer_index < 2:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio == 0:
                 shapes[layer.layer_index] = tuple(
                     state.raw_kv_window(
                         layer.layer_index,
                         token_idx,
                         self.shape.sliding_window,
                     ).shape
+                )
+            elif layer.indexer is not None:
+                # Indexed compressed layers recompute selection inside the
+                # graph; no concrete extra_kv_rows shape is captured.
+                shapes[layer.layer_index] = None
+            else:
+                shapes[layer.layer_index] = tuple(
+                    state.compressed_kv_cache.read_compressed(layer.layer_index).shape
                 )
         return shapes
 
@@ -869,7 +926,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
-        captured_shapes: dict[int, tuple[int, ...]] | None,
+        captured_shapes: dict[int, tuple[int, ...] | None] | None,
     ) -> bool:
         """Return True if the current decode KV window shapes match capture."""
         if captured_shapes is None:
