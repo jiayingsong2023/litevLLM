@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .attention import build_deepseek_layer_rope_tables
 from .compressed_kv import (
     DeepSeekV4CompressedKVCache,
     DeepSeekV4CompressedKVLayout,
@@ -67,6 +68,18 @@ class DeepSeekV4FlashGPURequestState:
             device=device,
         )
         self.compressed_kv_cache = self.raw_kv_cache
+        shape = DEEPSEEK_V4_FLASH_SHAPE
+        self._rope_cos, self._rope_sin = build_deepseek_layer_rope_tables(
+            context_length=config.context_length,
+            rotary_dim=shape.rotary_dim,
+            rope_freq_base=shape.rope_freq_base,
+            compressed_rope_freq_base=shape.compressed_rope_freq_base,
+            rope_scale_factor=shape.rope_scale_factor,
+            rope_original_context=shape.rope_original_context,
+            rope_yarn_beta_fast=shape.rope_yarn_beta_fast,
+            rope_yarn_beta_slow=shape.rope_yarn_beta_slow,
+            device=device,
+        )
         self.token_position = 0
         self._moe_workspace: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
@@ -105,6 +118,21 @@ class DeepSeekV4FlashGPURequestState:
         )
         self._moe_workspace[key] = workspace
         return workspace
+
+    def rope_tables_for(
+        self,
+        layer_idx: int,
+        token_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the precomputed (cos, sin) vectors for a layer/token pair."""
+        self.require_capacity(token_idx)
+        num_layers = self._rope_cos.shape[0]
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(f"layer_idx must be in [0, {num_layers}); got {layer_idx}")
+        return (
+            self._rope_cos[layer_idx, token_idx],
+            self._rope_sin[layer_idx, token_idx],
+        )
 
     def reset(self) -> None:
         self.token_position = 0

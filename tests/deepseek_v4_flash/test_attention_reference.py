@@ -2,7 +2,10 @@ import pytest
 import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    apply_deepseek_layer_rope_to_tail_reference,
+    apply_precomputed_rope_to_tail,
     apply_rope_to_tail_reference,
+    build_deepseek_layer_rope_tables,
     compressor_pair_projection_reference,
     compressor_pool_state_reference,
     compressor_should_emit_reference,
@@ -17,6 +20,9 @@ from vllm.model_executor.models.deepseek_v4_flash.attention import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     shared_kv_swa_attention_reference as _shared_kv_swa_attention_reference,
+)
+from vllm.model_executor.models.deepseek_v4_flash.config import (
+    DEEPSEEK_V4_FLASH_SHAPE,
 )
 
 
@@ -325,3 +331,60 @@ def test_fused_sliding_window_attention_no_sinks() -> None:
     expected = shared_kv_swa_attention_reference(query, kv_rows, None)
     actual = deepseek_v4_fused_sliding_window_attention(query, kv_rows, None)
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1, 2, 3, 42])
+@pytest.mark.parametrize("token_idx", [0, 1, 63, 127])
+def test_precomputed_rope_matches_reference(
+    layer_idx: int,
+    token_idx: int,
+) -> None:
+    shape = DEEPSEEK_V4_FLASH_SHAPE
+    rotary_dim = shape.rotary_dim
+    context_length = 128
+    device = torch.device("cpu")
+
+    rope_cos, rope_sin = build_deepseek_layer_rope_tables(
+        context_length=context_length,
+        rotary_dim=rotary_dim,
+        rope_freq_base=shape.rope_freq_base,
+        compressed_rope_freq_base=shape.compressed_rope_freq_base,
+        rope_scale_factor=shape.rope_scale_factor,
+        rope_original_context=shape.rope_original_context,
+        rope_yarn_beta_fast=shape.rope_yarn_beta_fast,
+        rope_yarn_beta_slow=shape.rope_yarn_beta_slow,
+        device=device,
+    )
+
+    torch.manual_seed(42)
+    vectors_1d = torch.randn(rotary_dim, dtype=torch.float32, device=device)
+    vectors_2d = torch.randn(4, rotary_dim, dtype=torch.float32, device=device)
+    vectors_larger = torch.randn(rotary_dim + 16, dtype=torch.float32, device=device)
+
+    cos = rope_cos[layer_idx, token_idx]
+    sin = rope_sin[layer_idx, token_idx]
+
+    for vectors in (vectors_1d, vectors_2d, vectors_larger):
+        expected = apply_deepseek_layer_rope_to_tail_reference(
+            vectors,
+            token_idx=token_idx,
+            layer_idx=layer_idx,
+            rotary_dim=rotary_dim,
+        )
+        actual = apply_precomputed_rope_to_tail(vectors, cos, sin)
+        torch.testing.assert_close(actual, expected)
+
+        expected_inv = apply_deepseek_layer_rope_to_tail_reference(
+            vectors,
+            token_idx=token_idx,
+            layer_idx=layer_idx,
+            rotary_dim=rotary_dim,
+            inverse=True,
+        )
+        actual_inv = apply_precomputed_rope_to_tail(
+            vectors,
+            cos,
+            sin,
+            inverse=True,
+        )
+        torch.testing.assert_close(actual_inv, expected_inv)

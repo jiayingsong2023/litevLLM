@@ -43,11 +43,10 @@ def q_lora_attention_projection_reference(
     q_rank = q_a_weight.shape[1]
     if q_norm_weight.shape != (q_rank,):
         raise ValueError(
-            f"q_norm_weight shape must be ({q_rank},); "
-            f"got {tuple(q_norm_weight.shape)}"
+            f"q_norm_weight shape must be ({q_rank},); got {tuple(q_norm_weight.shape)}"
         )
-    q_latent = q_a_weight.transpose(0, 1).to(torch.float32).matmul(
-        hidden.to(torch.float32)
+    q_latent = (
+        q_a_weight.transpose(0, 1).to(torch.float32).matmul(hidden.to(torch.float32))
     )
     q_latent = rms_norm_reference(q_latent, q_norm_weight)
     return q_b_weight.transpose(0, 1).to(torch.float32).matmul(q_latent)
@@ -213,9 +212,11 @@ def _rope_yarn_corr_dim(
     n_rot: float,
     base: float,
 ) -> float:
-    return float(n_dims) * math.log(
-        float(n_ctx_orig) / (n_rot * 2.0 * math.pi)
-    ) / (2.0 * math.log(base))
+    return (
+        float(n_dims)
+        * math.log(float(n_ctx_orig) / (n_rot * 2.0 * math.pi))
+        / (2.0 * math.log(base))
+    )
 
 
 def _rope_yarn_corr_dims(
@@ -273,8 +274,7 @@ def apply_deepseek_layer_rope_to_tail_reference(
         raise ValueError(f"token_idx must be non-negative; got {token_idx}")
     if rotary_dim <= 0 or rotary_dim % 2 != 0:
         raise ValueError(
-            "rotary_dim must be a positive even integer; "
-            f"got {rotary_dim}"
+            f"rotary_dim must be a positive even integer; got {rotary_dim}"
         )
     if vectors.shape[-1] < rotary_dim:
         raise ValueError(
@@ -306,6 +306,122 @@ def apply_deepseek_layer_rope_to_tail_reference(
     x0 = pairs[..., 0]
     x1 = pairs[..., 1]
     rotated = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
+    out[..., -rotary_dim:] = rotated.reshape_as(tail)
+    return out
+
+
+def build_deepseek_layer_rope_tables(
+    *,
+    context_length: int,
+    rotary_dim: int,
+    rope_freq_base: float,
+    compressed_rope_freq_base: float,
+    rope_scale_factor: float,
+    rope_original_context: int,
+    rope_yarn_beta_fast: float,
+    rope_yarn_beta_slow: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute cos/sin tables for all layer positions.
+
+    Returns two tensors of shape [num_layers, context_length, rotary_dim // 2].
+    For dense layers (layer_idx < 2) the compressed-YaRN schedule is unused and
+    the table uses rope_freq_base; for compressed layers it uses the DS4
+    long-context schedule from apply_deepseek_layer_rope_to_tail_reference.
+    """
+    if context_length <= 0:
+        raise ValueError(f"context_length must be positive; got {context_length}")
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError(
+            f"rotary_dim must be a positive even integer; got {rotary_dim}"
+        )
+
+    shape = DEEPSEEK_V4_FLASH_SHAPE
+    num_layers = shape.num_layers
+    half_dim = rotary_dim // 2
+
+    rope_cos = torch.empty(
+        (num_layers, context_length, half_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+    rope_sin = torch.empty(
+        (num_layers, context_length, half_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    token_indices = torch.arange(
+        context_length, dtype=torch.float32, device=device
+    ).unsqueeze(1)
+    i0 = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+
+    for layer_idx in range(num_layers):
+        if layer_compress_ratio(layer_idx) == 0:
+            inv_freq = torch.pow(
+                torch.tensor(rope_freq_base, dtype=torch.float32, device=device),
+                -i0 / float(rotary_dim),
+            )
+            angles = token_indices * inv_freq
+        else:
+            theta_scale = compressed_rope_freq_base ** (-2.0 / float(rotary_dim))
+            theta_extrap = token_indices * torch.pow(theta_scale, i0 / 2.0)
+            theta_interp = (1.0 / rope_scale_factor) * theta_extrap
+            corr_low, corr_high = _rope_yarn_corr_dims(
+                n_dims=rotary_dim,
+                n_ctx_orig=rope_original_context,
+                freq_base=compressed_rope_freq_base,
+                beta_fast=rope_yarn_beta_fast,
+                beta_slow=rope_yarn_beta_slow,
+            )
+            ramp_mix = _rope_yarn_ramp(corr_low, corr_high, i0)
+            angles = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix
+
+        rope_cos[layer_idx] = torch.cos(angles)
+        rope_sin[layer_idx] = torch.sin(angles)
+
+    return rope_cos, rope_sin
+
+
+def apply_precomputed_rope_to_tail(
+    vectors: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply RoPE using precomputed cos/sin vectors.
+
+    vectors is [..., rotary_dim]. cos and sin are [rotary_dim // 2].
+    Only the last rotary_dim entries of vectors are rotated.
+    """
+    if vectors.ndim < 1:
+        raise ValueError("vectors must have at least one dimension")
+    if cos.ndim != 1 or sin.ndim != 1:
+        raise ValueError("cos and sin must be 1-D")
+    if cos.shape != sin.shape:
+        raise ValueError(
+            f"cos and sin shapes must match; got {tuple(cos.shape)} and "
+            f"{tuple(sin.shape)}"
+        )
+    half_dim = cos.numel()
+    rotary_dim = half_dim * 2
+    if vectors.shape[-1] < rotary_dim:
+        raise ValueError(
+            "vector width must be >= rotary_dim; "
+            f"got {vectors.shape[-1]} and {rotary_dim}"
+        )
+
+    out = vectors.to(torch.float32).clone()
+    tail = out[..., -rotary_dim:]
+    pairs = tail.reshape(*tail.shape[:-1], half_dim, 2)
+    sin = -sin if inverse else sin
+    x0 = pairs[..., 0]
+    x1 = pairs[..., 1]
+    rotated = torch.stack(
+        (x0 * cos - x1 * sin, x0 * sin + x1 * cos),
+        dim=-1,
+    )
     out[..., -rotary_dim:] = rotated.reshape_as(tail)
     return out
 
@@ -361,9 +477,7 @@ def grouped_output_projection_reference(
     output_groups: int,
 ) -> torch.Tensor:
     if attention_output.ndim != 2:
-        raise ValueError(
-            f"attention_output must be 2-D; got {attention_output.ndim}-D"
-        )
+        raise ValueError(f"attention_output must be 2-D; got {attention_output.ndim}-D")
     if output_a_weight.ndim != 2 or output_b_weight.ndim != 2:
         raise ValueError("output projection weights must be 2-D")
     if output_groups <= 0:
@@ -398,14 +512,18 @@ def grouped_output_projection_reference(
         output_groups,
         group_input,
     )
-    a_by_group = output_a_weight.to(torch.float32).reshape(
-        group_input,
-        output_groups,
-        rank_per_group,
-    ).permute(1, 2, 0)
+    a_by_group = (
+        output_a_weight.to(torch.float32)
+        .reshape(
+            group_input,
+            output_groups,
+            rank_per_group,
+        )
+        .permute(1, 2, 0)
+    )
     low_rank = torch.einsum("gi,gri->gr", grouped, a_by_group)
-    return output_b_weight.transpose(0, 1).to(torch.float32).matmul(
-        low_rank.reshape(-1)
+    return (
+        output_b_weight.transpose(0, 1).to(torch.float32).matmul(low_rank.reshape(-1))
     )
 
 
@@ -472,8 +590,10 @@ def indexer_query_projection_reference(
             "indexer query output dimension must match heads * head_dim; "
             f"got {indexer_q_b_weight.shape[1]} and {expected_width}"
         )
-    projected = indexer_q_b_weight.transpose(0, 1).to(torch.float32).matmul(
-        qr_norm.to(torch.float32)
+    projected = (
+        indexer_q_b_weight.transpose(0, 1)
+        .to(torch.float32)
+        .matmul(qr_norm.to(torch.float32))
     )
     return projected.reshape(indexer_heads, indexer_head_dim)
 
@@ -493,8 +613,10 @@ def indexer_weight_projection_reference(
             "indexer projection input dimension must match hidden size; "
             f"got {indexer_proj_weight.shape[0]} and {hidden.numel()}"
         )
-    return indexer_proj_weight.transpose(0, 1).to(torch.float32).matmul(
-        hidden.to(torch.float32)
+    return (
+        indexer_proj_weight.transpose(0, 1)
+        .to(torch.float32)
+        .matmul(hidden.to(torch.float32))
     )
 
 
@@ -513,9 +635,7 @@ def indexer_scores_reference(
             f"got {tuple(indexer_weights.shape)}"
         )
     if compressed_rows.ndim != 2:
-        raise ValueError(
-            f"compressed_rows must be 2-D; got {compressed_rows.ndim}-D"
-        )
+        raise ValueError(f"compressed_rows must be 2-D; got {compressed_rows.ndim}-D")
     if compressed_rows.shape[1] != indexer_query.shape[1]:
         raise ValueError(
             "compressed row width must match indexer head dim; "
@@ -524,8 +644,7 @@ def indexer_scores_reference(
     score_scale = (
         float(scale)
         if scale is not None
-        else 1.0
-        / math.sqrt(float(indexer_query.shape[0] * indexer_query.shape[1]))
+        else 1.0 / math.sqrt(float(indexer_query.shape[0] * indexer_query.shape[1]))
     )
     per_head_scores = indexer_query.to(torch.float32).matmul(
         compressed_rows.to(torch.float32).T
@@ -539,9 +658,7 @@ def indexer_topk_reference(scores: torch.Tensor, *, top_k: int) -> torch.Tensor:
     if scores.ndim != 1:
         raise ValueError(f"scores must be 1-D; got {scores.ndim}-D")
     if top_k <= 0 or top_k > scores.numel():
-        raise ValueError(
-            f"top_k must be in [1, {scores.numel()}]; got {top_k}"
-        )
+        raise ValueError(f"top_k must be in [1, {scores.numel()}]; got {top_k}")
     return torch.topk(scores.to(torch.float32), k=top_k, sorted=True).indices
 
 
@@ -563,8 +680,7 @@ def compressor_pool_state_reference(
         )
     if state_score.shape != expected_shape:
         raise ValueError(
-            "state_score shape must match state_kv; "
-            f"got {tuple(state_score.shape)}"
+            f"state_score shape must match state_kv; got {tuple(state_score.shape)}"
         )
 
     pooled = torch.empty(head_dim, dtype=torch.float32, device=state_kv.device)

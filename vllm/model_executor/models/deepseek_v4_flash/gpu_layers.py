@@ -20,6 +20,7 @@ from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
 
 from .attention import (
     apply_deepseek_layer_rope_to_tail_reference,
+    apply_precomputed_rope_to_tail,
     per_head_rms_norm_reference,
     shared_kv_swa_attention_reference,
 )
@@ -310,6 +311,7 @@ def _run_real_sliding_attention(
     token_idx: int,
     kv_rows: torch.Tensor | None,
     extra_kv_rows: torch.Tensor | None = None,
+    use_reference_rope: bool = False,
 ) -> torch.Tensor:
     if not attn_input.is_cuda:
         raise ValueError("DeepSeek V4 Flash real sliding input must be CUDA")
@@ -336,24 +338,32 @@ def _run_real_sliding_attention(
         DEEPSEEK_V4_FLASH_SHAPE.head_dim,
     )
     query = per_head_rms_norm_reference(query)
-    query = apply_deepseek_layer_rope_to_tail_reference(
-        query,
-        token_idx=token_idx,
-        layer_idx=layer.layer_index,
-        rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-    )
+    if use_reference_rope or state is None:
+        query = apply_deepseek_layer_rope_to_tail_reference(
+            query,
+            token_idx=token_idx,
+            layer_idx=layer.layer_index,
+            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+        )
+    else:
+        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+        query = apply_precomputed_rope_to_tail(query, cos, sin)
 
     current_kv = _project_tensor(attn_input, kv_tensor, stager)
     current_kv = deepseek_v4_flash_rms_norm(
         current_kv,
         stager.stage_vector(kv_norm),
     )
-    current_kv = apply_deepseek_layer_rope_to_tail_reference(
-        current_kv,
-        token_idx=token_idx,
-        layer_idx=layer.layer_index,
-        rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-    )
+    if use_reference_rope or state is None:
+        current_kv = apply_deepseek_layer_rope_to_tail_reference(
+            current_kv,
+            token_idx=token_idx,
+            layer_idx=layer.layer_index,
+            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+        )
+    else:
+        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+        current_kv = apply_precomputed_rope_to_tail(current_kv, cos, sin)
     current_kv = deepseek_fp8_kv_qat_reference(
         current_kv,
         head_dim=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
@@ -411,13 +421,22 @@ def _run_real_sliding_attention(
             kv_rows,
             staged_sinks,
         )
-    context = apply_deepseek_layer_rope_to_tail_reference(
-        context,
-        token_idx=token_idx,
-        layer_idx=layer.layer_index,
-        rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-        inverse=True,
-    )
+    if use_reference_rope or state is None:
+        context = apply_deepseek_layer_rope_to_tail_reference(
+            context,
+            token_idx=token_idx,
+            layer_idx=layer.layer_index,
+            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+            inverse=True,
+        )
+    else:
+        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+        context = apply_precomputed_rope_to_tail(
+            context,
+            cos,
+            sin,
+            inverse=True,
+        )
     return _project_sliding_attention_output(
         context.reshape(-1),
         None,
@@ -509,6 +528,7 @@ def deepseek_v4_flash_sliding_layer_forward(
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    use_reference_rope: bool = False,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
         raise ValueError("DeepSeek V4 Flash sliding layer hidden must be CUDA")
@@ -585,6 +605,7 @@ def deepseek_v4_flash_sliding_layer_forward(
                 state=state,
                 token_idx=token_idx,
                 kv_rows=kv_rows,
+                use_reference_rope=use_reference_rope,
             )
         else:
             query = _project_tensor(
@@ -715,6 +736,7 @@ def deepseek_v4_flash_layer_forward(
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    use_reference_rope: bool = False,
 ) -> torch.Tensor:
     ratio = layer_compress_ratio(layer.layer_index)
     if ratio == 0:
@@ -729,6 +751,7 @@ def deepseek_v4_flash_layer_forward(
             token_id_tensor=token_id_tensor,
             kv_rows=kv_rows,
             router_top_k=router_top_k,
+            use_reference_rope=use_reference_rope,
         )
     return deepseek_v4_flash_compressed_layer_forward(
         hidden,
@@ -740,6 +763,7 @@ def deepseek_v4_flash_layer_forward(
         token_id=token_id,
         token_id_tensor=token_id_tensor,
         router_top_k=router_top_k,
+        use_reference_rope=use_reference_rope,
     )
 
 
@@ -754,6 +778,7 @@ def deepseek_v4_flash_compressed_layer_forward(
     token_id: int | None = None,
     token_id_tensor: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
+    use_reference_rope: bool = False,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
         raise ValueError("DeepSeek V4 Flash compressed layer hidden must be CUDA")
@@ -833,6 +858,7 @@ def deepseek_v4_flash_compressed_layer_forward(
             stager=stager,
             token_idx=token_idx,
             ratio=ratio,
+            use_reference_rope=use_reference_rope,
         )
     indexer_row: torch.Tensor | None = None
     if layer.indexer is not None:
@@ -851,6 +877,7 @@ def deepseek_v4_flash_compressed_layer_forward(
                 stager=stager,
                 token_idx=token_idx,
                 ratio=4,
+                use_reference_rope=use_reference_rope,
             )
 
     if emitted_row is not None:
@@ -886,7 +913,9 @@ def deepseek_v4_flash_compressed_layer_forward(
                 indexer_rows=state.compressed_kv_cache.read_indexer_rows(
                     layer.layer_index
                 ),
+                state=state,
                 token_idx=token_idx,
+                use_reference_rope=use_reference_rope,
             )
         attention_rows = prior_rows
         extra_kv_rows = state.compressed_kv_cache.read_compressed(
@@ -919,6 +948,7 @@ def deepseek_v4_flash_compressed_layer_forward(
                 token_idx=token_idx,
                 kv_rows=None,
                 extra_kv_rows=extra_kv_rows,
+                use_reference_rope=use_reference_rope,
             )
         else:
             if attention_rows is None:
@@ -1318,6 +1348,7 @@ def _update_compressor_state(
     stager: DeepSeekV4FlashGPUWeightStager,
     token_idx: int,
     ratio: int,
+    use_reference_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if token_idx < 0:
         raise ValueError("token_idx must be non-negative")
@@ -1400,12 +1431,21 @@ def _update_compressor_state(
     pooled = (weights * kv_rows.to(torch.float32)).sum(dim=0)
     emitted = deepseek_v4_flash_rms_norm(pooled, norm).to(stager.dtype)
     if emitted.numel() >= DEEPSEEK_V4_FLASH_SHAPE.rotary_dim:
-        emitted = apply_deepseek_layer_rope_to_tail_reference(
-            emitted,
-            token_idx=token_idx + 1 - ratio,
-            layer_idx=layer_idx,
-            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-        ).to(stager.dtype)
+        rope_token_idx = token_idx + 1 - ratio
+        if use_reference_rope:
+            emitted = apply_deepseek_layer_rope_to_tail_reference(
+                emitted,
+                token_idx=rope_token_idx,
+                layer_idx=layer_idx,
+                rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+            ).to(stager.dtype)
+        else:
+            cos, sin = state.rope_tables_for(layer_idx, rope_token_idx)
+            emitted = apply_precomputed_rope_to_tail(
+                emitted,
+                cos,
+                sin,
+            ).to(stager.dtype)
     if emitted.numel() == DEEPSEEK_V4_FLASH_SHAPE.head_dim:
         emitted = deepseek_fp8_kv_qat_reference(
             emitted,
@@ -1478,7 +1518,9 @@ def _select_compressed_rows_with_indexer(
     layer: DeepSeekV4FlashLayerSemanticBindings,
     stager: DeepSeekV4FlashGPUWeightStager,
     indexer_rows: torch.Tensor,
+    state: DeepSeekV4FlashGPURequestState | None = None,
     token_idx: int,
+    use_reference_rope: bool = False,
 ) -> torch.Tensor:
     if layer.indexer is None:
         raise ValueError("DeepSeek V4 Flash compressed row selection requires indexer")
@@ -1528,12 +1570,16 @@ def _select_compressed_rows_with_indexer(
             f"got {index_weights.numel()} and {heads}"
         )
     index_query = query_flat.reshape(heads, row_width)
-    index_query = apply_deepseek_layer_rope_to_tail_reference(
-        index_query,
-        token_idx=token_idx,
-        layer_idx=layer.layer_index,
-        rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-    )
+    if use_reference_rope or state is None:
+        index_query = apply_deepseek_layer_rope_to_tail_reference(
+            index_query,
+            token_idx=token_idx,
+            layer_idx=layer.layer_index,
+            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+        )
+    else:
+        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+        index_query = apply_precomputed_rope_to_tail(index_query, cos, sin)
     if row_width == DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim:
         index_query = torch.stack(
             [deepseek_indexer_qat_reference(row) for row in index_query],
