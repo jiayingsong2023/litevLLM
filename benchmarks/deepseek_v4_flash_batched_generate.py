@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import torch
+from vllm.model_executor.models.deepseek_v4_flash.backend import (
+    DeepSeekV4FlashGPUBackend,
+    DeepSeekV4FlashGPUCapabilities,
+)
 
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashMemoryPolicy,
@@ -20,12 +23,6 @@ from vllm.model_executor.models.deepseek_v4_flash.model import (
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     open_deepseek_v4_flash_weight_store,
 )
-
-# Reuse the quality-smoke tokenizer helpers so the benchmark stays small and
-# self-contained.  ``tests/tools`` is a namespace package, so we import the
-# module by name after adding its directory to ``sys.path``.
-sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "tools"))
-import deepseek_v4_flash_quality_smoke as smoke  # type: ignore[import-not-found]
 
 _DEFAULT_GGUF = (
     "models/DeepSeek-V4-Flash-ds4/"
@@ -82,14 +79,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_prompt_token_ids(
-    tokenizer_metadata: smoke.GGUFTokenizerMetadata,
-    prompt_length: int,
-) -> list[int]:
-    token_id = tokenizer_metadata.bos_token_id
-    if token_id is None or token_id < 0 or token_id >= len(tokenizer_metadata.tokens):
-        token_id = 0
-    return [token_id] * prompt_length
+def _validate_positive(name: str, value: int) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive; got {value}")
+
+
+def _build_ready_backend() -> DeepSeekV4FlashGPUBackend:
+    return DeepSeekV4FlashGPUBackend(
+        capabilities=DeepSeekV4FlashGPUCapabilities(
+            q8_linear=True,
+            attention=True,
+            compressed_attention=True,
+            cache_update=True,
+            moe=True,
+            output=True,
+        )
+    )
+
+
+def _build_prompt_token_ids(prompt_length: int) -> list[int]:
+    return [0] * prompt_length
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -103,6 +112,13 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    for name, value in (
+        ("--batch-size", args.batch_size),
+        ("--prompt-length", args.prompt_length),
+        ("--max-tokens", args.max_tokens),
+    ):
+        _validate_positive(name, value)
+
     if not torch.cuda.is_available():
         print("SKIP: CUDA/ROCm torch backend is not available.")
         return 0
@@ -111,16 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SKIP: model file not found: {args.model}")
         return 0
 
-    try:
-        tokenizer_metadata = smoke.read_gguf_tokenizer_metadata(args.model)
-    except Exception as exc:  # pragma: no cover - defensive skip path
-        print(f"SKIP: unable to read tokenizer metadata: {exc}")
-        return 0
-
-    prompt_token_ids = _build_prompt_token_ids(
-        tokenizer_metadata,
-        args.prompt_length,
-    )
+    prompt_token_ids = _build_prompt_token_ids(args.prompt_length)
     device = torch.device(args.device)
     input_ids_list = [
         torch.tensor(prompt_token_ids, dtype=torch.long, device=device)
@@ -138,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             model = DeepSeekV4FlashForCausalLM(
                 weight_store=store,
                 runtime_budget=budget,
-                gpu_backend=smoke._build_ready_backend(args),
+                gpu_backend=_build_ready_backend(),
             )
 
             torch.cuda.synchronize()

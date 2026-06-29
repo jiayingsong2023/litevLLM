@@ -19,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 class _FakeTokenizer:
     def __init__(self, eos_token_id: int = 0) -> None:
         self.eos_token_id = eos_token_id
+        self.last_skip_special_tokens: bool | None = None
 
     def encode(self, prompt: str) -> list[int]:
         return [ord(char) for char in prompt]
@@ -29,7 +30,7 @@ class _FakeTokenizer:
         *,
         skip_special_tokens: bool = True,
     ) -> str:
-        del skip_special_tokens
+        self.last_skip_special_tokens = skip_special_tokens
         return "".join(chr(token_id) for token_id in token_ids)
 
 
@@ -336,3 +337,62 @@ def test_engine_batched_empty_prompts_returns_empty_list() -> None:
     )
 
     assert outputs == []
+
+
+def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_max_tokens() -> (
+    None
+):
+    engine = _make_engine()
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        engine.generate_deepseek_v4_flash_greedy_batched(
+            request_ids=["req-0", "req-1"],
+            prompts=["hello", "world"],
+            sampling_params_list=[
+                _greedy_sampling_params(max_tokens=3),
+                _greedy_sampling_params(max_tokens=5),
+            ],
+        )
+
+
+def test_generate_deepseek_v4_flash_greedy_batched_uses_per_request_skip_special(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _make_engine()
+
+    def fake_batched(
+        input_ids_list: list[torch.Tensor],
+        *,
+        max_tokens: int,
+    ) -> list[torch.Tensor]:
+        return [
+            torch.cat(
+                [
+                    input_ids,
+                    torch.zeros(
+                        max_tokens,
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                ]
+            )
+            for input_ids in input_ids_list
+        ]
+
+    monkeypatch.setattr(engine.model, "generate_greedy_kernel_batched", fake_batched)
+
+    params_first = _greedy_sampling_params(max_tokens=2)
+    params_first.skip_special_tokens = False
+    params_second = _greedy_sampling_params(max_tokens=2)
+    params_second.skip_special_tokens = True
+
+    outputs = engine.generate_deepseek_v4_flash_greedy_batched(
+        request_ids=["req-0", "req-1"],
+        prompts=["a", "b"],
+        sampling_params_list=[params_first, params_second],
+    )
+
+    assert len(outputs) == 2
+    # Decode is called once per request; the last observed flag for the second
+    # request must match its own sampling params.
+    assert engine.tokenizer.last_skip_special_tokens is True
