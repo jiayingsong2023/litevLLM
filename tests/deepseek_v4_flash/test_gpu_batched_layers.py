@@ -28,6 +28,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashGroupedExpertTensors,
+    DeepSeekV4FlashHyperConnectionTensors,
     DeepSeekV4FlashLayerSemanticBindings,
 )
 
@@ -406,7 +407,10 @@ def test_batched_sliding_layer_rejects_mismatched_batch() -> None:
             router_top_k=1,
         )
 
-    with pytest.raises(ValueError, match="batched sliding layer expects 2-D hidden"):
+    with pytest.raises(
+        ValueError,
+        match="batched sliding layer expects 2-D or stream-shaped 3-D hidden",
+    ):
         deepseek_v4_flash_sliding_layer_forward_batched(
             hidden[0],
             layer=layer,
@@ -510,6 +514,101 @@ def test_batched_sliding_layer_hash_routing_requires_token_ids() -> None:
             token_indices=[0, 0],
             router_top_k=1,
         )
+
+
+def _add_hyper_connections_to_sliding_layer(
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    store: _FakeLayerStore,
+    *,
+    hc_mult: int = 2,
+) -> DeepSeekV4FlashLayerSemanticBindings:
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    mix_count = 2 * hc_mult + hc_mult * hc_mult
+    flat_size = hc_mult * hidden_size
+    fn_t = _tensor("blk.0.attn_hc_fn.weight", (flat_size, mix_count))
+    base_t = _tensor("blk.0.attn_hc_base.weight", (mix_count,))
+    scale_t = _tensor("blk.0.attn_hc_scale.weight", (3,))
+    ffn_fn_t = _tensor("blk.0.ffn_hc_fn.weight", (flat_size, mix_count))
+    ffn_base_t = _tensor("blk.0.ffn_hc_base.weight", (mix_count,))
+    ffn_scale_t = _tensor("blk.0.ffn_hc_scale.weight", (3,))
+
+    torch.manual_seed(44)
+    store.matrices[fn_t.name] = (
+        torch.randn(flat_size, mix_count, dtype=torch.float32, device="cuda") * 0.01
+    )
+    store.vectors[(base_t.name, torch.float32)] = torch.randn(
+        mix_count, dtype=torch.float32, device="cuda"
+    )
+    store.vectors[(scale_t.name, torch.float32)] = torch.randn(
+        3, dtype=torch.float32, device="cuda"
+    )
+    store.matrices[ffn_fn_t.name] = (
+        torch.randn(flat_size, mix_count, dtype=torch.float32, device="cuda") * 0.01
+    )
+    store.vectors[(ffn_base_t.name, torch.float32)] = torch.randn(
+        mix_count, dtype=torch.float32, device="cuda"
+    )
+    store.vectors[(ffn_scale_t.name, torch.float32)] = torch.randn(
+        3, dtype=torch.float32, device="cuda"
+    )
+
+    return dataclasses.replace(
+        layer,
+        attention_hyper_connection=DeepSeekV4FlashHyperConnectionTensors(
+            fn=fn_t, base=base_t, scale=scale_t
+        ),
+        ffn_hyper_connection=DeepSeekV4FlashHyperConnectionTensors(
+            fn=ffn_fn_t, base=ffn_base_t, scale=ffn_scale_t
+        ),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_sliding_layer_with_hyper_connections_matches_single_slot() -> None:
+    layer, store = _make_real_sliding_layer()
+    layer = _add_hyper_connections_to_sliding_layer(layer, store, hc_mult=2)
+    backend = _NullAttentionBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden_a = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_b = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_batched = torch.stack([hidden_a, hidden_b])
+
+    output_a = deepseek_v4_flash_sliding_layer_forward(
+        hidden_a,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=_make_state(),
+        token_idx=0,
+        router_top_k=1,
+    )
+    output_b = deepseek_v4_flash_sliding_layer_forward(
+        hidden_b,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=_make_state(),
+        token_idx=0,
+        router_top_k=1,
+    )
+
+    output_batched = deepseek_v4_flash_sliding_layer_forward_batched(
+        hidden_batched,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        states=[_make_state(), _make_state()],
+        token_indices=[0, 0],
+        router_top_k=1,
+    )
+
+    # With hyper-connections the layer returns stream-shaped hidden.
+    assert output_batched.shape == (2, 2, hidden_size)
+    assert output_batched.device.type == "cuda"
+    torch.testing.assert_close(output_batched[0], output_a)
+    torch.testing.assert_close(output_batched[1], output_b)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
