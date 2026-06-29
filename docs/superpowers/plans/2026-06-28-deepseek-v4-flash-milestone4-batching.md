@@ -13,7 +13,7 @@
 - Python 3.12 only; use `uv` for all Python commands.
 - The batched path must remain opt-in; existing `generate_greedy_kernel(batch=1)` behavior and all current tests must keep passing.
 - Per-request KV cache, compressor state, and MoE workspace must stay isolated.
-- CUDA/HIP graph capture from Milestone 3 is explicitly disabled for batch size > 1 in this milestone.
+- CUDA/HIP graph capture from Milestone 3 is explicitly disabled for batch size > 1 in this milestone. Do not extend graph capture to batched decode.
 - All new code must pass `uv run ruff check .` and `uv run ruff format .` for touched files.
 - New kernel paths require a PyTorch-reference correctness test.
 - Before PR: `bash tests/run_regression_suite.sh` and `bash tests/run_deepseek_v4_flash_real_smoke.sh` must pass.
