@@ -17,6 +17,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
 )
 from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
     DeepSeekV4FlashHyperConnectionTensors,
+    DeepSeekV4FlashQuantizedExpertPayload,
 )
 
 
@@ -24,6 +25,27 @@ class _FakeStore:
     def __init__(self) -> None:
         self.matrices: dict[str, torch.Tensor] = {}
         self.vectors: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+    def decode_grouped_expert_matrix(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> torch.Tensor:
+        return torch.zeros(1, 1)
+
+    def raw_grouped_expert_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> DeepSeekV4FlashQuantizedExpertPayload:
+        return DeepSeekV4FlashQuantizedExpertPayload(
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=0,
+            rows=1,
+            columns=1,
+            payload=memoryview(b""),
+        )
 
     def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
         return self.matrices[tensor.name].clone()
@@ -35,6 +57,9 @@ class _FakeStore:
         dtype: torch.dtype,
     ) -> torch.Tensor:
         return self.vectors[(tensor.name, dtype)].clone()
+
+    def tensor_payload(self, tensor: DeepSeekV4FlashTensor) -> memoryview:
+        return memoryview(b"")
 
 
 def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
