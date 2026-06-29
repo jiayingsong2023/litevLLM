@@ -46,6 +46,11 @@ from vllm.model_executor.models.deepseek_v4_flash.ops import (
 )
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE
+from .gpu_weight_staging import (
+    DeepSeekV4FlashGPUWeightStager,
+    DeepSeekV4FlashSelectedExpertPayloads,
+)
+from .weight_store import DeepSeekV4FlashGroupedExpertTensors
 
 
 class DeepSeekV4FlashQuantizedExpertPayloadLike(Protocol):
@@ -577,6 +582,20 @@ class DeepSeekV4FlashGPUBackend:
             columns=down_columns,
         )
         return output
+
+    def stage_selected_expert_payloads(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: torch.Tensor,
+        *,
+        layer_idx: int | None = None,
+    ) -> list[DeepSeekV4FlashSelectedExpertPayloads]:
+        return stager.copy_selected_expert_payload_bytes(
+            grouped_experts,
+            expert_ids,
+            layer_idx=layer_idx,
+        )
 
     def compressed_attention(
         self,
