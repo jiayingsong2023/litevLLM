@@ -668,17 +668,23 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self,
         input_ids_list: list[torch.Tensor],
         max_tokens: int,
+        *,
+        record_token_times: bool = False,
     ) -> list[torch.Tensor]:
         """Greedy decode a batch of requests using the batched decode kernel.
 
         Prefill is performed per-request with the single-slot kernel. Decode
         steps run batched through ``_forward_kernel_token_step_batched``.
         Graph capture is never used, even when the backend supports it.
+
+        ``record_token_times`` is accepted for API symmetry with
+        ``generate_greedy_kernel`` but is currently ignored.
         """
         with self._deepseek_profiler.section(
             "generate_greedy_kernel_batched",
             batch_size=len(input_ids_list),
             max_tokens=max_tokens,
+            record_token_times=record_token_times,
         ):
             return self._generate_greedy_kernel_batched_impl(
                 input_ids_list,

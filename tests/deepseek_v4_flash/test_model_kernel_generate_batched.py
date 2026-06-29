@@ -385,7 +385,7 @@ def test_generate_greedy_kernel_batched_rejects_non_positive_max_tokens(
     max_tokens: int,
 ) -> None:
     model = _fake_model()
-    input_ids = torch.tensor([1], dtype=torch.long, device="cuda")
+    input_ids = torch.tensor([1], dtype=torch.long)
 
     with pytest.raises(ValueError, match="max_tokens must be positive"):
         model.generate_greedy_kernel_batched([input_ids], max_tokens=max_tokens)
@@ -393,7 +393,7 @@ def test_generate_greedy_kernel_batched_rejects_non_positive_max_tokens(
 
 def test_generate_greedy_kernel_batched_rejects_non_1d_input_tensors() -> None:
     model = _fake_model()
-    input_ids = torch.tensor([[1]], dtype=torch.long, device="cuda")
+    input_ids = torch.tensor([[1]], dtype=torch.long)
 
     with pytest.raises(ValueError, match="1-D"):
         model.generate_greedy_kernel_batched([input_ids], max_tokens=1)
