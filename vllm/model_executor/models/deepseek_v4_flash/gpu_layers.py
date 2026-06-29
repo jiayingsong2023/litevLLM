@@ -734,6 +734,7 @@ def deepseek_v4_flash_layer_forward(
     token_id: int | None = None,
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
+    extra_kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -749,6 +750,7 @@ def deepseek_v4_flash_layer_forward(
             token_id=token_id,
             token_id_tensor=token_id_tensor,
             kv_rows=kv_rows,
+            extra_kv_rows=extra_kv_rows,
             router_top_k=router_top_k,
             use_reference_rope=use_reference_rope,
         )
@@ -761,6 +763,8 @@ def deepseek_v4_flash_layer_forward(
         token_idx=token_idx,
         token_id=token_id,
         token_id_tensor=token_id_tensor,
+        kv_rows=kv_rows,
+        extra_kv_rows=extra_kv_rows,
         router_top_k=router_top_k,
         use_reference_rope=use_reference_rope,
     )
@@ -898,7 +902,6 @@ def deepseek_v4_flash_compressed_layer_forward(
     prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
     if prior_rows.shape[0] == 0:
         compressed_attention_rows: torch.Tensor | None = None
-        compressed_extra_rows: torch.Tensor | None = None
         selected_rows = torch.zeros(1, dtype=torch.int64, device=hidden.device)
     elif layer.indexer is not None:
         with _stager_profile_section(
@@ -919,13 +922,8 @@ def deepseek_v4_flash_compressed_layer_forward(
                 use_reference_rope=use_reference_rope,
             )
         compressed_attention_rows = prior_rows
-        compressed_extra_rows = state.compressed_kv_cache.read_compressed(
-            layer.layer_index,
-            row_indices=selected_rows,
-        )
     else:
         compressed_attention_rows = prior_rows
-        compressed_extra_rows = prior_rows
         selected_rows = torch.arange(
             prior_rows.shape[0],
             dtype=torch.int64,
@@ -947,10 +945,8 @@ def deepseek_v4_flash_compressed_layer_forward(
                 backend=backend,
                 state=state,
                 token_idx=token_idx,
-                kv_rows=kv_rows if kv_rows is not None else compressed_attention_rows,
-                extra_kv_rows=(
-                    extra_kv_rows if kv_rows is not None else compressed_extra_rows
-                ),
+                kv_rows=kv_rows,
+                extra_kv_rows=extra_kv_rows,
                 use_reference_rope=use_reference_rope,
             )
         else:

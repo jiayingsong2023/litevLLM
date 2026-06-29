@@ -10,6 +10,9 @@ import torch
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     apply_deepseek_layer_rope_to_tail_reference,
 )
+from vllm.model_executor.models.deepseek_v4_flash.config import (
+    DEEPSEEK_V4_FLASH_SHAPE,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_F32,
     GGML_TYPE_Q8_0,
@@ -126,6 +129,16 @@ def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
         name=name,
         dims=dims,
         tensor_type=GGML_TYPE_Q8_0,
+        offset=0,
+        nbytes=0,
+    )
+
+
+def _f32_tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
+    return DeepSeekV4FlashTensor(
+        name=name,
+        dims=dims,
+        tensor_type=GGML_TYPE_F32,
         offset=0,
         nbytes=0,
     )
@@ -802,3 +815,260 @@ def test_real_gguf_layer2_compressed_forward_smoke() -> None:
     assert output.device.type == "cuda"
     assert output.shape in (hidden.shape, (4, hidden.numel()))
     assert torch.isfinite(output).all()
+
+
+def _make_real_compressed_layer() -> tuple[
+    _FakeLayerStore,
+    DeepSeekV4FlashLayerSemanticBindings,
+]:
+    """Build a compressed layer (layer 2) that uses real sliding attention tensors."""
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    head_dim = DEEPSEEK_V4_FLASH_SHAPE.head_dim
+    num_heads = DEEPSEEK_V4_FLASH_SHAPE.num_attention_heads
+    q_lora_rank = DEEPSEEK_V4_FLASH_SHAPE.q_lora_rank
+    o_lora_rank = DEEPSEEK_V4_FLASH_SHAPE.o_lora_rank
+    output_groups = DEEPSEEK_V4_FLASH_SHAPE.output_groups
+    indexer_head_dim = DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim
+    indexer_heads = DEEPSEEK_V4_FLASH_SHAPE.indexer_heads
+    kv_width = head_dim
+    indexer_width = indexer_head_dim
+    num_experts = 3
+
+    torch.manual_seed(42)
+    store = _FakeLayerStore()
+    tensors: dict[str, DeepSeekV4FlashTensor] = {
+        "attn_norm": _f32_tensor("blk.2.attn_norm.weight", (hidden_size,)),
+        "attn_q_a": _f32_tensor("blk.2.attn_q_a.weight", (q_lora_rank, hidden_size)),
+        "attn_q_a_norm": _f32_tensor("blk.2.attn_q_a_norm.weight", (q_lora_rank,)),
+        "attn_q_b": _f32_tensor(
+            "blk.2.attn_q_b.weight",
+            (num_heads * head_dim, q_lora_rank),
+        ),
+        "attn_kv": _f32_tensor("blk.2.attn_kv_a_mqa.weight", (head_dim, hidden_size)),
+        "attn_kv_norm": _f32_tensor("blk.2.attn_kv_a_norm.weight", (head_dim,)),
+        "attn_sinks": _f32_tensor("blk.2.attn_sinks.weight", (num_heads,)),
+        "attn_out_a": _f32_tensor(
+            "blk.2.attn_output_a.weight",
+            (num_heads * head_dim // output_groups, o_lora_rank),
+        ),
+        "attn_out_b": _f32_tensor(
+            "blk.2.attn_output_b.weight",
+            (o_lora_rank, hidden_size),
+        ),
+        "comp_kv": _f32_tensor(
+            "blk.2.attn_compressor_kv.weight",
+            (hidden_size, kv_width),
+        ),
+        "comp_gate": _f32_tensor(
+            "blk.2.attn_compressor_gate.weight",
+            (hidden_size, kv_width),
+        ),
+        "comp_ape": _f32_tensor(
+            "blk.2.attn_compressor_ape.weight",
+            (kv_width, 4),
+        ),
+        "comp_norm": _f32_tensor("blk.2.attn_compressor_norm.weight", (kv_width,)),
+        "index_q_b": _f32_tensor(
+            "blk.2.indexer.attn_q_b.weight",
+            (hidden_size, indexer_heads * indexer_head_dim),
+        ),
+        "index_proj": _f32_tensor(
+            "blk.2.indexer.proj.weight",
+            (hidden_size, indexer_heads),
+        ),
+        "index_comp_kv": _f32_tensor(
+            "blk.2.indexer_compressor_kv.weight",
+            (hidden_size, indexer_width),
+        ),
+        "index_comp_gate": _f32_tensor(
+            "blk.2.indexer_compressor_gate.weight",
+            (hidden_size, indexer_width),
+        ),
+        "index_comp_ape": _f32_tensor(
+            "blk.2.indexer_compressor_ape.weight",
+            (indexer_width, 4),
+        ),
+        "index_comp_norm": _f32_tensor(
+            "blk.2.indexer_compressor_norm.weight",
+            (indexer_width,),
+        ),
+        "ffn_norm": _f32_tensor("blk.2.ffn_norm.weight", (hidden_size,)),
+        "router": _f32_tensor("blk.2.ffn_gate_inp.weight", (hidden_size, num_experts)),
+        "gate": _f32_tensor(
+            "blk.2.ffn_gate_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+        "up": _f32_tensor(
+            "blk.2.ffn_up_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+        "down": _f32_tensor(
+            "blk.2.ffn_down_exps.weight",
+            (hidden_size, hidden_size, num_experts),
+        ),
+    }
+
+    store.vectors[(tensors["attn_norm"].name, torch.float32)] = torch.ones(hidden_size)
+    store.vectors[(tensors["attn_q_a_norm"].name, torch.float32)] = torch.ones(
+        q_lora_rank
+    )
+    store.vectors[(tensors["attn_kv_norm"].name, torch.float32)] = torch.ones(head_dim)
+    store.vectors[(tensors["attn_sinks"].name, torch.float32)] = torch.zeros(num_heads)
+    store.vectors[(tensors["comp_norm"].name, torch.float32)] = torch.ones(kv_width)
+    store.vectors[(tensors["index_comp_norm"].name, torch.float32)] = torch.ones(
+        indexer_width
+    )
+    store.vectors[(tensors["ffn_norm"].name, torch.float32)] = torch.ones(hidden_size)
+
+    store.matrices[tensors["attn_q_a"].name] = (
+        torch.randn(q_lora_rank, hidden_size, dtype=torch.float32) * 0.01
+    )
+    store.matrices[tensors["attn_q_b"].name] = (
+        torch.randn(num_heads * head_dim, q_lora_rank, dtype=torch.float32) * 0.01
+    )
+    store.matrices[tensors["attn_kv"].name] = (
+        torch.randn(head_dim, hidden_size, dtype=torch.float32) * 0.01
+    )
+    store.matrices[tensors["attn_out_a"].name] = (
+        torch.randn(
+            num_heads * head_dim // output_groups,
+            o_lora_rank,
+            dtype=torch.float32,
+        )
+        * 0.01
+    )
+    store.matrices[tensors["attn_out_b"].name] = (
+        torch.randn(o_lora_rank, hidden_size, dtype=torch.float32) * 0.01
+    )
+
+    # Identity compressor/indexer so emitted rows are well-defined.
+    store.matrices[tensors["comp_kv"].name] = torch.eye(kv_width, hidden_size)
+    store.matrices[tensors["comp_gate"].name] = torch.zeros(hidden_size, kv_width)
+    store.matrices[tensors["comp_ape"].name] = torch.zeros(kv_width, 4)
+    store.matrices[tensors["index_q_b"].name] = torch.cat(
+        [
+            torch.eye(hidden_size),
+            torch.zeros(hidden_size, indexer_heads * indexer_head_dim - hidden_size),
+        ],
+        dim=1,
+    )
+    store.matrices[tensors["index_proj"].name] = torch.ones(hidden_size, indexer_heads)
+    store.matrices[tensors["index_comp_kv"].name] = torch.eye(
+        indexer_width, hidden_size
+    )
+    store.matrices[tensors["index_comp_gate"].name] = store.matrices[
+        tensors["index_comp_kv"].name
+    ].clone()
+    store.matrices[tensors["index_comp_ape"].name] = torch.zeros(indexer_width, 4)
+
+    # Router that strongly selects expert 0.
+    router = torch.full((num_experts, hidden_size), -10.0, dtype=torch.float32)
+    router[0, :] = 10.0
+    store.matrices[tensors["router"].name] = router
+
+    for tensor_name in ("gate", "up", "down"):
+        for expert_id in range(num_experts):
+            store.expert_matrices[(tensors[tensor_name].name, expert_id)] = torch.eye(
+                hidden_size, dtype=torch.float32
+            )
+
+    layer = DeepSeekV4FlashLayerSemanticBindings(
+        layer_index=2,
+        attention_norm=tensors["attn_norm"],
+        attention_query_a=tensors["attn_q_a"],
+        attention_query_a_norm=tensors["attn_q_a_norm"],
+        attention_query_b=tensors["attn_q_b"],
+        attention_key_value=tensors["attn_kv"],
+        attention_key_value_a_norm=tensors["attn_kv_norm"],
+        attention_sinks=tensors["attn_sinks"],
+        attention_output_a=tensors["attn_out_a"],
+        attention_output_b=tensors["attn_out_b"],
+        attention_compressor=DeepSeekV4FlashCompressorTensors(
+            ape=tensors["comp_ape"],
+            gate=tensors["comp_gate"],
+            kv=tensors["comp_kv"],
+            norm=tensors["comp_norm"],
+        ),
+        indexer=DeepSeekV4FlashIndexerTensors(
+            query_b=tensors["index_q_b"],
+            projection=tensors["index_proj"],
+            compressor=DeepSeekV4FlashCompressorTensors(
+                ape=tensors["index_comp_ape"],
+                gate=tensors["index_comp_gate"],
+                kv=tensors["index_comp_kv"],
+                norm=tensors["index_comp_norm"],
+            ),
+        ),
+        ffn_norm=tensors["ffn_norm"],
+        router=tensors["router"],
+        grouped_experts=DeepSeekV4FlashGroupedExpertTensors(
+            gate=tensors["gate"],
+            up=tensors["up"],
+            down=tensors["down"],
+        ),
+    )
+    return store, layer
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_compressed_layer_forward_explicit_kv_rows_matches_state_read() -> None:
+    store, layer = _make_real_compressed_layer()
+    backend = _RecordingCompressedBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    hidden = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    layer_idx = layer.layer_index
+    token_idx = 0
+
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    def _make_state() -> DeepSeekV4FlashGPURequestState:
+        return DeepSeekV4FlashGPURequestState(
+            DeepSeekV4FlashGPUCacheConfig(
+                context_length=128,
+                hidden_size=hidden_size,
+                dtype=torch.float32,
+                device=hidden.device,
+            )
+        )
+
+    state_a = _make_state()
+    output_state_read = deepseek_v4_flash_compressed_layer_forward(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state_a,
+        token_idx=token_idx,
+        router_top_k=1,
+    )
+
+    state_b = _make_state()
+    # Seed the cache so raw_kv_window can materialize the current token's row.
+    _ = deepseek_v4_flash_compressed_layer_forward(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state_b,
+        token_idx=token_idx,
+        router_top_k=1,
+    )
+    explicit_kv_rows = state_b.raw_kv_window(
+        layer_idx,
+        token_idx,
+        DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+    )
+    output_explicit_rows = deepseek_v4_flash_compressed_layer_forward(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=state_b,
+        token_idx=token_idx,
+        kv_rows=explicit_kv_rows,
+        router_top_k=1,
+    )
+
+    assert output_state_read.device.type == "cuda"
+    assert output_explicit_rows.device.type == "cuda"
+    torch.testing.assert_close(output_state_read, output_explicit_rows)
