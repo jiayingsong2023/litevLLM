@@ -139,21 +139,23 @@ def deepseek_v4_flash_staged_matrix_projection(
     """
     if not hidden.is_cuda or not weight.is_cuda:
         raise ValueError("DeepSeek V4 Flash projection inputs must be CUDA tensors")
-    if hidden.ndim != 1:
-        raise ValueError(f"hidden must be 1-D for batch=1; got {hidden.ndim}-D")
+    if hidden.ndim not in (1, 2):
+        raise ValueError(f"hidden must be 1-D or 2-D; got {hidden.ndim}-D")
     if weight.ndim != 2:
         raise ValueError(f"weight must be 2-D; got {weight.ndim}-D")
 
     hidden_f32 = hidden.to(torch.float32)
     weight_f32 = weight.to(torch.float32)
-    if weight.shape[1] == hidden.numel():
-        return weight_f32.matmul(hidden_f32)
-    if weight.shape[0] == hidden.numel():
-        return hidden_f32.matmul(weight_f32)
-    raise ValueError(
-        "projection weight must have one dimension matching hidden size; "
-        f"got weight={tuple(weight.shape)} and hidden={hidden.numel()}"
-    )
+    if weight.shape[1] == hidden.shape[-1]:
+        out = torch.matmul(hidden_f32, weight_f32.T)
+    elif weight.shape[0] == hidden.shape[-1]:
+        out = torch.matmul(hidden_f32, weight_f32)
+    else:
+        raise ValueError(
+            f"weight shape {tuple(weight.shape)} incompatible with hidden "
+            f"{tuple(hidden.shape)}"
+        )
+    return out
 
 
 def deepseek_v4_flash_q8_0_tensor_projection(
@@ -218,6 +220,23 @@ def _project_tensor(
     tensor: DeepSeekV4FlashTensor,
     stager: DeepSeekV4FlashGPUWeightStager,
 ) -> torch.Tensor:
+    if hidden.ndim == 2 and _can_project_q8_0(hidden, tensor):
+        # Batch loop until a batched Q8 kernel is added.
+        return torch.stack(
+            [
+                deepseek_v4_flash_q8_0_tensor_projection(hidden[b], tensor, stager)
+                for b in range(hidden.shape[0])
+            ]
+        )
+    if hidden.ndim == 2:
+        return torch.stack(
+            [
+                deepseek_v4_flash_staged_matrix_projection(
+                    hidden[b], stager.stage_matrix(tensor)
+                )
+                for b in range(hidden.shape[0])
+            ]
+        )
     if _can_project_q8_0(hidden, tensor):
         return deepseek_v4_flash_q8_0_tensor_projection(hidden, tensor, stager)
     return deepseek_v4_flash_staged_matrix_projection(
@@ -230,8 +249,8 @@ def _can_project_q8_0(hidden: torch.Tensor, tensor: DeepSeekV4FlashTensor) -> bo
     return (
         tensor.tensor_type == GGML_TYPE_Q8_0
         and len(tensor.dims) == 2
-        and hidden.ndim == 1
-        and hidden.numel() == tensor.dims[0]
+        and hidden.ndim in (1, 2)
+        and hidden.shape[-1] == tensor.dims[0]
         and tensor.dims[0] % _Q8_0_BLOCK_SIZE == 0
     )
 
