@@ -399,12 +399,36 @@ def test_generate_greedy_kernel_batched_rejects_non_1d_input_tensors() -> None:
         model.generate_greedy_kernel_batched([input_ids], max_tokens=1)
 
 
-def test_generate_greedy_kernel_batched_rejects_cpu_input_ids() -> None:
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_batched_accepts_cpu_input_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model = _fake_model()
-    input_ids = torch.tensor([1], dtype=torch.long)
+    cpu_ids = torch.tensor([1], dtype=torch.long)
+    cuda_ids = cpu_ids.cuda()
 
-    with pytest.raises(ValueError, match="CUDA input tensors"):
-        model.generate_greedy_kernel_batched([input_ids], max_tokens=1)
+    def fake_step(
+        *,
+        token_id_tensor: torch.Tensor,
+        states: list[object],
+        token_indices: list[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        del states, token_indices, device
+        return ((token_id_tensor + 1) % model.shape.vocab_size).to(torch.long)
+
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_batched",
+        fake_step,
+    )
+
+    outputs_cpu = model.generate_greedy_kernel_batched([cpu_ids], max_tokens=4)
+    outputs_cuda = model.generate_greedy_kernel_batched([cuda_ids], max_tokens=4)
+
+    assert len(outputs_cpu) == 1
+    assert len(outputs_cuda) == 1
+    assert outputs_cpu[0].tolist() == outputs_cuda[0].tolist()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

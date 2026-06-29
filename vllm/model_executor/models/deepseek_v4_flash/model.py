@@ -668,8 +668,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self,
         input_ids_list: list[torch.Tensor],
         max_tokens: int,
-        *,
-        record_token_times: bool = False,
     ) -> list[torch.Tensor]:
         """Greedy decode a batch of requests using the batched decode kernel.
 
@@ -681,12 +679,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             "generate_greedy_kernel_batched",
             batch_size=len(input_ids_list),
             max_tokens=max_tokens,
-            record_token_times=record_token_times,
         ):
             return self._generate_greedy_kernel_batched_impl(
                 input_ids_list,
                 max_tokens=max_tokens,
-                record_token_times=record_token_times,
             )
 
     def _generate_greedy_kernel_batched_impl(
@@ -694,7 +690,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids_list: list[torch.Tensor],
         *,
         max_tokens: int,
-        record_token_times: bool,
     ) -> list[torch.Tensor]:
         self._require_weight_store()
         device = self._validate_generate_greedy_kernel_batched_input(
@@ -760,24 +755,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             token_indices = [states[idx].token_position for idx in active_indices]
             active_states = [states[idx] for idx in active_indices]
 
-            start_event: torch.cuda.Event | None = None
-            end_event: torch.cuda.Event | None = None
-            if record_token_times:
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-
             next_tokens = self._forward_kernel_token_step_batched(
                 token_id_tensor=token_id_tensor,
                 states=active_states,
                 token_indices=token_indices,
                 device=device,
             )
-
-            if record_token_times:
-                if start_event is None or end_event is None:
-                    raise AssertionError("CUDA timing events were not initialized")
-                end_event.record()
 
             new_active: list[int] = []
             for offset, idx in enumerate(active_indices):
@@ -878,7 +861,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
         torch._assert_async(
-            (token_id_tensor >= 0) & (token_id_tensor < self.shape.vocab_size),
+            ((token_id_tensor >= 0) & (token_id_tensor < self.shape.vocab_size)).all(),
             f"batched token id is outside vocab range [0, {self.shape.vocab_size})",
         )
 
@@ -1016,11 +999,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 torch.uint8,
             ):
                 raise ValueError(
-                    "input_ids must use an integer dtype; got {input_ids.dtype}"
-                )
-            if not input_ids.is_cuda:
-                raise ValueError(
-                    "generate_greedy_kernel_batched requires CUDA input tensors"
+                    f"input_ids must use an integer dtype; got {input_ids.dtype}"
                 )
             if input_ids.numel() == 0:
                 raise ValueError(
@@ -1028,12 +1007,18 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 )
 
             current_device = torch.device(input_ids.device)
-            if device is None:
-                device = current_device
-            elif device != current_device:
+            if current_device.type == "cuda":
+                if device is None:
+                    device = current_device
+                elif device != current_device:
+                    raise ValueError(
+                        "generate_greedy_kernel_batched requires all CUDA input "
+                        "tensors on the same device"
+                    )
+            elif current_device.type != "cpu":
                 raise ValueError(
-                    "generate_greedy_kernel_batched requires all input tensors on "
-                    "the same CUDA device"
+                    "generate_greedy_kernel_batched supports CPU or CUDA input "
+                    f"tensors; got {current_device}"
                 )
 
             total_tokens = input_ids.numel() + max_tokens
@@ -1053,7 +1038,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     )
 
         if device is None:
-            raise AssertionError("device should not be None after validation")
+            device = torch.device("cuda")
         return device
 
     def _generate_greedy_kernel_impl(
