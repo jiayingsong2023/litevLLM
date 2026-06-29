@@ -837,6 +837,8 @@ def deepseek_v4_flash_sliding_layer_forward_batched(
             f"token_id_tensors must have shape ({batch},); "
             f"got {tuple(token_id_tensors.shape)}"
         )
+    if token_ids is not None and len(token_ids) != batch:
+        raise ValueError(f"token_ids must have length {batch}; got {len(token_ids)}")
     if (
         layer.expert_token_to_expert_ids is not None
         and token_id_tensors is None
@@ -1978,6 +1980,7 @@ def _write_compressed_runtime_row(
             )
         )
     cache._compressed_counts[layer_idx] += 1
+    cache._compressed_counts_cpu[layer_idx] += 1
 
 
 def _run_sliding_moe(

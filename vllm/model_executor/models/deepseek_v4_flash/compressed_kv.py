@@ -151,6 +151,7 @@ class DeepSeekV4CompressedKVCache:
             dtype=torch.long,
             device=device,
         )
+        self._compressed_counts_cpu: list[int] = [0] * num_layers
 
     def append_raw(
         self,
@@ -244,6 +245,7 @@ class DeepSeekV4CompressedKVCache:
         if indexer_row is not None:
             self.indexer_rows[layer_idx, slot].copy_(indexer_row)
         self._compressed_counts[layer_idx] += 1
+        self._compressed_counts_cpu[layer_idx] += 1
         return slot
 
     def read_compressed(
@@ -256,7 +258,7 @@ class DeepSeekV4CompressedKVCache:
         self._validate_layer(layer_idx)
         provided_count = count
         if count is None:
-            count = int(self._compressed_counts[layer_idx].item())
+            count = self._compressed_counts_cpu[layer_idx]
         if row_indices is None:
             return self.compressed_rows[layer_idx, :count]
         if row_indices.ndim != 1:
@@ -277,7 +279,7 @@ class DeepSeekV4CompressedKVCache:
     ) -> torch.Tensor:
         self._validate_layer(layer_idx)
         if count is None:
-            count = int(self._compressed_counts[layer_idx].item())
+            count = self._compressed_counts_cpu[layer_idx]
         return self.indexer_rows[layer_idx, :count]
 
     def _validate_layer(self, layer_idx: int) -> None:

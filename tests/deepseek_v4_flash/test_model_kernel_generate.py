@@ -1051,10 +1051,16 @@ def test_generate_greedy_kernel_with_graph_matches_without_graph(
     def counting_replay(
         self: DeepSeekV4FlashDecodeGraph,
         token_id_tensor: torch.Tensor,
+        *,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> torch.Tensor:
         nonlocal replay_count
         replay_count += 1
-        return original_replay(self, token_id_tensor)
+        return original_replay(
+            self,
+            token_id_tensor,
+            compressed_counts_by_layer=compressed_counts_by_layer,
+        )
 
     monkeypatch.setattr(
         DeepSeekV4FlashDecodeGraph,
