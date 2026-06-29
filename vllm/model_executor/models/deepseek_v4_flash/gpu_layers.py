@@ -1480,9 +1480,10 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
         raise ValueError(
             "DeepSeek V4 Flash batched compressed layer hidden must be CUDA"
         )
-    if hidden.ndim != 2:
+    if hidden.ndim not in (2, 3):
         raise ValueError(
-            f"batched compressed layer expects 2-D hidden; got {hidden.ndim}-D"
+            f"batched compressed layer expects 2-D hidden "
+            f"(or stream-shaped 3-D); got {hidden.ndim}-D"
         )
     batch = hidden.shape[0]
     if len(states) != batch or len(token_indices) != batch:
@@ -1503,14 +1504,32 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
             "hash-routed compressed layer requires token_id_tensors or token_ids"
         )
 
-    if layer.attention_hyper_connection is not None:
-        raise NotImplementedError(
-            "batched compressed layer does not support attention hyper-connections"
+    uses_hyper_connection = (
+        layer.attention_hyper_connection is not None
+        or layer.ffn_hyper_connection is not None
+    )
+    attention_residual_streams: torch.Tensor | None = None
+    attention_hc_state: _GPUHyperConnectionStateBatched | None = None
+    if uses_hyper_connection:
+        stream_hc = layer.attention_hyper_connection or layer.ffn_hyper_connection
+        if stream_hc is None:
+            raise AssertionError("hyper-connection state was not validated")
+        attention_residual_streams = _ensure_hyper_connection_streams_batched(
+            hidden,
+            stager=stager,
+            hyper_connection=stream_hc,
         )
-    if layer.ffn_hyper_connection is not None:
-        raise NotImplementedError(
-            "batched compressed layer does not support ffn hyper-connections"
-        )
+        if layer.attention_hyper_connection is None:
+            attn_source = attention_residual_streams.mean(dim=1).to(torch.float32)
+        else:
+            attention_hc_state = _hyper_connection_pre_cuda_batched(
+                attention_residual_streams,
+                stager=stager,
+                hyper_connection=layer.attention_hyper_connection,
+            )
+            attn_source = attention_hc_state.mixed
+    else:
+        attn_source = hidden
 
     if kv_rows is None and kv_rows_by_layer is not None:
         kv_rows = kv_rows_by_layer.get(layer.layer_index)
@@ -1540,7 +1559,7 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
         layer_type="compressed_batched",
         ratio=ratio,
     ):
-        attn_input = deepseek_v4_flash_rms_norm(hidden, attention_norm)
+        attn_input = deepseek_v4_flash_rms_norm(attn_source, attention_norm)
 
     # Pre-project real attention Q/KV for the whole batch when available.
     batched_query: torch.Tensor | None = None
@@ -1738,12 +1757,43 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
             attn_updates.append(attn_update)
 
     attn_update = torch.stack(attn_updates)
-    hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
-        hidden,
-        attn_update,
-        stager=stager,
-        hyper_connection=None,
-    )
+    if uses_hyper_connection:
+        if attention_residual_streams is None:
+            raise AssertionError("attention residual streams were not initialized")
+        if attention_hc_state is None:
+            hidden_after_attn = attention_residual_streams + attn_update.unsqueeze(1)
+        else:
+            hidden_after_attn = _hyper_connection_post_cuda_batched(
+                attn_update,
+                attention_residual_streams,
+                attention_hc_state,
+            )
+    else:
+        hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+            hidden,
+            attn_update,
+            stager=stager,
+            hyper_connection=None,
+        )
+
+    if uses_hyper_connection:
+        if hidden_after_attn.ndim != 3:
+            raise ValueError("mHC compressed path must carry stream-shaped hidden")
+        ffn_residual_streams = hidden_after_attn
+        if layer.ffn_hyper_connection is None:
+            ffn_source = ffn_residual_streams.mean(dim=1).to(torch.float32)
+            ffn_hc_state: _GPUHyperConnectionStateBatched | None = None
+        else:
+            ffn_hc_state = _hyper_connection_pre_cuda_batched(
+                ffn_residual_streams,
+                stager=stager,
+                hyper_connection=layer.ffn_hyper_connection,
+            )
+            ffn_source = ffn_hc_state.mixed
+    else:
+        ffn_source = hidden_after_attn
+        ffn_residual_streams = None
+        ffn_hc_state = None
 
     with _stager_profile_section(
         stager,
@@ -1752,7 +1802,7 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
         layer_type="compressed_batched",
         ratio=ratio,
     ):
-        ffn_input = deepseek_v4_flash_rms_norm(hidden_after_attn, ffn_norm)
+        ffn_input = deepseek_v4_flash_rms_norm(ffn_source, ffn_norm)
 
     with _stager_profile_section(
         stager,
@@ -1787,6 +1837,16 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
             )
         moe_update = torch.stack(moe_updates)
 
+    if uses_hyper_connection:
+        if ffn_residual_streams is None:
+            raise AssertionError("FFN residual streams were not initialized")
+        if ffn_hc_state is None:
+            return ffn_residual_streams + moe_update.unsqueeze(1)
+        return _hyper_connection_post_cuda_batched(
+            moe_update,
+            ffn_residual_streams,
+            ffn_hc_state,
+        )
     return deepseek_v4_flash_residual_hyper_connection(
         hidden_after_attn,
         moe_update,

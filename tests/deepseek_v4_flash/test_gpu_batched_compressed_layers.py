@@ -153,7 +153,7 @@ def _make_real_compressed_layer_binding(
     layer_index: int = 2,
     *,
     with_indexer: bool = True,
-) -> tuple[_FakeLayerStore, DeepSeekV4FlashLayerSemanticBindings]:
+) -> tuple[DeepSeekV4FlashLayerSemanticBindings, _FakeLayerStore]:
     """Build a compressed layer binding that exercises the real attention path."""
     hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
     head_dim = DEEPSEEK_V4_FLASH_SHAPE.head_dim
@@ -381,7 +381,7 @@ def _make_small_compressed_layer_binding(
     layer_index: int = 2,
     *,
     with_indexer: bool = True,
-) -> tuple[_FakeLayerStore, DeepSeekV4FlashLayerSemanticBindings]:
+) -> tuple[DeepSeekV4FlashLayerSemanticBindings, _FakeLayerStore]:
     """Build a small compressed layer for fast validation/hash-routing tests."""
     hidden_size = 4
     kv_width = 4
@@ -545,8 +545,8 @@ def _make_small_compressed_layer_binding(
 
 
 def _make_hash_routed_compressed_layer_binding() -> tuple[
-    _FakeLayerStore,
     DeepSeekV4FlashLayerSemanticBindings,
+    _FakeLayerStore,
 ]:
     """Return a small compressed layer augmented with hash-routed experts."""
     layer, store = _make_small_compressed_layer_binding(layer_index=2)
@@ -564,8 +564,8 @@ def _make_hash_routed_compressed_layer_binding() -> tuple[
 
 
 def _make_hyper_connection_compressed_layer_binding() -> tuple[
-    _FakeLayerStore,
     DeepSeekV4FlashLayerSemanticBindings,
+    _FakeLayerStore,
 ]:
     """Return a small compressed layer with attention hyper-connection tensors."""
     layer, store = _make_small_compressed_layer_binding(layer_index=2)
@@ -595,6 +595,72 @@ def _make_hyper_connection_compressed_layer_binding() -> tuple[
             scale=hc_tensors["hc_attn_scale"],
         ),
     ), store
+
+
+def _add_hyper_connections_to_compressed_layer(
+    store: _FakeLayerStore,
+    layer: DeepSeekV4FlashLayerSemanticBindings,
+    *,
+    hc_mult: int = 2,
+) -> DeepSeekV4FlashLayerSemanticBindings:
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    mix_count = 2 * hc_mult + hc_mult * hc_mult
+    flat_size = hc_mult * hidden_size
+    layer_index = layer.layer_index
+    fn_t = _f32_tensor(
+        f"blk.{layer_index}.hc_attn_fn.weight",
+        (flat_size, mix_count),
+    )
+    base_t = _f32_tensor(
+        f"blk.{layer_index}.hc_attn_base.weight",
+        (mix_count,),
+    )
+    scale_t = _f32_tensor(
+        f"blk.{layer_index}.hc_attn_scale.weight",
+        (3,),
+    )
+    ffn_fn_t = _f32_tensor(
+        f"blk.{layer_index}.hc_ffn_fn.weight",
+        (flat_size, mix_count),
+    )
+    ffn_base_t = _f32_tensor(
+        f"blk.{layer_index}.hc_ffn_base.weight",
+        (mix_count,),
+    )
+    ffn_scale_t = _f32_tensor(
+        f"blk.{layer_index}.hc_ffn_scale.weight",
+        (3,),
+    )
+
+    torch.manual_seed(44 + layer_index)
+    store.matrices[fn_t.name] = (
+        torch.randn(flat_size, mix_count, dtype=torch.float32, device="cuda") * 0.01
+    )
+    store.vectors[(base_t.name, torch.float32)] = torch.randn(
+        mix_count, dtype=torch.float32, device="cuda"
+    )
+    store.vectors[(scale_t.name, torch.float32)] = torch.randn(
+        3, dtype=torch.float32, device="cuda"
+    )
+    store.matrices[ffn_fn_t.name] = (
+        torch.randn(flat_size, mix_count, dtype=torch.float32, device="cuda") * 0.01
+    )
+    store.vectors[(ffn_base_t.name, torch.float32)] = torch.randn(
+        mix_count, dtype=torch.float32, device="cuda"
+    )
+    store.vectors[(ffn_scale_t.name, torch.float32)] = torch.randn(
+        3, dtype=torch.float32, device="cuda"
+    )
+
+    return dataclasses.replace(
+        layer,
+        attention_hyper_connection=DeepSeekV4FlashHyperConnectionTensors(
+            fn=fn_t, base=base_t, scale=scale_t
+        ),
+        ffn_hyper_connection=DeepSeekV4FlashHyperConnectionTensors(
+            fn=ffn_fn_t, base=ffn_base_t, scale=ffn_scale_t
+        ),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -805,7 +871,54 @@ def test_batched_compressed_layer_hash_routing_uses_token_ids() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_batched_compressed_layer_rejects_attention_hyper_connection() -> None:
+def test_batched_compressed_layer_with_hyper_connections_matches_single_slot() -> None:
+    layer, store = _make_real_compressed_layer_binding(layer_index=2)
+    layer = _add_hyper_connections_to_compressed_layer(store, layer, hc_mult=2)
+    backend = _RecordingCompressedBackend()
+    hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+
+    hidden_a = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_b = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
+    hidden_batched = torch.stack([hidden_a, hidden_b])
+
+    output_a = deepseek_v4_flash_compressed_layer_forward(
+        hidden_a,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=_make_request_state(),
+        token_idx=0,
+        router_top_k=1,
+    )
+    output_b = deepseek_v4_flash_compressed_layer_forward(
+        hidden_b,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=_make_request_state(),
+        token_idx=0,
+        router_top_k=1,
+    )
+
+    output_batched = deepseek_v4_flash_compressed_layer_forward_batched(
+        hidden_batched,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        states=[_make_request_state(), _make_request_state()],
+        token_indices=[0, 0],
+        router_top_k=1,
+    )
+
+    assert output_batched.shape == (2, 2, hidden_size)
+    assert output_batched.device.type == "cuda"
+    torch.testing.assert_close(output_batched[0], output_a)
+    torch.testing.assert_close(output_batched[1], output_b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_batched_compressed_layer_accepts_attention_hyper_connection() -> None:
     layer, store = _make_hyper_connection_compressed_layer_binding()
     backend = _RecordingCompressedBackend()
     hidden_size = 4
@@ -813,16 +926,15 @@ def test_batched_compressed_layer_rejects_attention_hyper_connection() -> None:
 
     hidden = torch.randn(2, hidden_size, dtype=torch.float32, device="cuda")
 
-    with pytest.raises(
-        NotImplementedError,
-        match="batched compressed layer does not support attention hyper-connections",
-    ):
-        deepseek_v4_flash_compressed_layer_forward_batched(
-            hidden,
-            layer=layer,
-            stager=stager,
-            backend=backend,
-            states=[_make_request_state(), _make_request_state()],
-            token_indices=[0, 0],
-            router_top_k=1,
-        )
+    output = deepseek_v4_flash_compressed_layer_forward_batched(
+        hidden,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        states=[_make_request_state(), _make_request_state()],
+        token_indices=[0, 0],
+        router_top_k=1,
+    )
+
+    assert output.shape == (2, 2, hidden_size)
+    assert output.device.type == "cuda"
