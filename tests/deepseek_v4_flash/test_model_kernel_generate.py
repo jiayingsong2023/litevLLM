@@ -986,6 +986,63 @@ def test_generate_greedy_kernel_uses_token_tensor_path_for_continuation(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_generate_greedy_kernel_with_graph_matches_without_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _fake_model(context_length=8)
+
+    def fake_token_step_token_id(
+        *,
+        token_id: int,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del token_idx
+        state.advance_token()
+        return torch.tensor(
+            (token_id + 1) % model.shape.vocab_size,
+            dtype=torch.long,
+            device=device,
+        )
+
+    def fake_token_step_token_tensor(
+        *,
+        token_id_tensor: torch.Tensor,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+        advance_state: bool = True,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del token_idx, kwargs
+        if advance_state:
+            state.advance_token()
+        return (token_id_tensor + 1).to(device=device, dtype=torch.long).reshape(())
+
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_id",
+        fake_token_step_token_id,
+    )
+    monkeypatch.setattr(
+        model,
+        "_forward_kernel_token_step_token_tensor",
+        fake_token_step_token_tensor,
+    )
+
+    prompt = torch.tensor([1, 2], dtype=torch.long, device="cuda")
+    output_without_graph = model.generate_greedy_kernel(prompt, max_tokens=3)
+    output_with_graph = model.generate_greedy_kernel(
+        prompt,
+        max_tokens=3,
+        use_graph=True,
+    )
+
+    assert output_without_graph.tolist() == output_with_graph.tolist()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_generate_greedy_kernel_rejects_context_overflow() -> None:
     model = _fake_model(context_length=3)
 

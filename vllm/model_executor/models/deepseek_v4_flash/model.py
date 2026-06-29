@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -49,6 +49,9 @@ _Q8_0_BLOCK_SIZE = 32
 _Q8_0_BLOCK_BYTES = 2 + _Q8_0_BLOCK_SIZE
 _OUTPUT_PROJECTION_CHUNK_ROWS = 16384
 _READONLY_BUFFER_WARNING = "The given buffer is not writable"
+
+if TYPE_CHECKING:
+    from .decode_graph import DeepSeekV4FlashDecodeGraph
 
 
 class DeepSeekV4FlashForCausalLM(nn.Module):
@@ -619,16 +622,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         max_tokens: int = 1,
+        use_graph: bool = False,
     ) -> torch.Tensor:
         with self._deepseek_profiler.section(
             "generate_greedy_kernel",
             input_tokens=int(input_ids.numel()),
             max_tokens=max_tokens,
+            use_graph=use_graph,
         ):
             output_ids, _token_elapsed_ms = self._generate_greedy_kernel_impl(
                 input_ids,
                 max_tokens=max_tokens,
                 record_token_times=False,
+                use_graph=use_graph,
             )
             return output_ids
 
@@ -637,11 +643,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         max_tokens: int = 1,
+        use_graph: bool = False,
     ) -> tuple[torch.Tensor, list[float]]:
         return self._generate_greedy_kernel_impl(
             input_ids,
             max_tokens=max_tokens,
             record_token_times=True,
+            use_graph=use_graph,
         )
 
     def _generate_greedy_kernel_impl(
@@ -650,6 +658,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         max_tokens: int,
         record_token_times: bool,
+        use_graph: bool,
     ) -> tuple[torch.Tensor, list[float]]:
         self._require_weight_store()
         device = self._validate_generate_greedy_kernel_input(
@@ -692,6 +701,24 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token_id_tensor = output_ids[input_token_count - 1].reshape(())
         eos_token_id = self._eos_token_id()
         token_id = int(token_id_tensor.item()) if eos_token_id is not None else None
+
+        decode_graph: DeepSeekV4FlashDecodeGraph | None = None
+        decode_graph_token_idx: int | None = None
+        decode_graph_window_shapes: dict[int, tuple[int, ...]] | None = None
+        if use_graph and eos_token_id is None:
+            first_decode_token_idx = state.token_position
+            if not self._decode_step_is_emit_boundary(first_decode_token_idx):
+                decode_graph = self._capture_decode_graph(
+                    state=state,
+                    token_idx=first_decode_token_idx,
+                    device=device,
+                )
+                decode_graph_token_idx = first_decode_token_idx
+                decode_graph_window_shapes = self._decode_kv_window_shapes(
+                    state=state,
+                    token_idx=first_decode_token_idx,
+                )
+
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
             start_event: torch.cuda.Event | None = None
@@ -700,7 +727,22 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            if token_id is None:
+            can_replay_graph = (
+                use_graph
+                and decode_graph is not None
+                and token_id is None
+                and state.token_position == decode_graph_token_idx
+                and not self._decode_step_is_emit_boundary(state.token_position)
+                and self._decode_kv_window_shapes_match(
+                    state=state,
+                    token_idx=state.token_position,
+                    captured_shapes=decode_graph_window_shapes,
+                )
+            )
+            if can_replay_graph:
+                token_id_tensor = decode_graph.replay(token_id_tensor)
+                state.advance_token()
+            elif token_id is None:
                 token_id_tensor = self._forward_kernel_token_step_token_tensor(
                     token_id_tensor=token_id_tensor,
                     state=state,
@@ -737,6 +779,106 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         metadata = getattr(model, "metadata", {})
         eos_token_id = metadata.get("tokenizer.ggml.eos_token_id")
         return None if eos_token_id is None else int(eos_token_id)
+
+    def _decode_step_is_emit_boundary(self, token_idx: int) -> bool:
+        """Return True if any compressed layer emits at ``token_idx``."""
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return False
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio > 0 and token_idx % ratio == ratio - 1:
+                return True
+        return False
+
+    def _capture_decode_graph(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+    ) -> DeepSeekV4FlashDecodeGraph:
+        """Capture a CUDA/HIP graph for one steady-state decode step."""
+        from .decode_graph import DeepSeekV4FlashDecodeGraph
+
+        kv_rows_by_layer = self._materialize_decode_kv_windows(
+            state=state,
+            token_idx=token_idx,
+        )
+        return DeepSeekV4FlashDecodeGraph.capture(
+            self,
+            state=state,
+            token_idx=token_idx,
+            device=device,
+            kv_rows_by_layer=kv_rows_by_layer,
+        )
+
+    def _materialize_decode_kv_windows(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+    ) -> dict[int, torch.Tensor]:
+        """Return explicit raw KV windows for sliding layers.
+
+        Compressed layers read their compressed cache from ``state`` inside the
+        graph, so they are omitted from the explicit window dict. This keeps the
+        initial integration simple while still giving the graph stable inputs for
+        the layers whose window shape changes every decode step.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}
+        kv_rows_by_layer: dict[int, torch.Tensor] = {}
+        for layer in layers:
+            if layer.layer_index < 2:
+                kv_rows_by_layer[layer.layer_index] = state.raw_kv_window(
+                    layer.layer_index,
+                    token_idx,
+                    self.shape.sliding_window,
+                )
+        return kv_rows_by_layer
+
+    def _decode_kv_window_shapes(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+    ) -> dict[int, tuple[int, ...]]:
+        """Return the shapes of raw KV windows for sliding layers."""
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}
+        shapes: dict[int, tuple[int, ...]] = {}
+        for layer in layers:
+            if layer.layer_index < 2:
+                shapes[layer.layer_index] = tuple(
+                    state.raw_kv_window(
+                        layer.layer_index,
+                        token_idx,
+                        self.shape.sliding_window,
+                    ).shape
+                )
+        return shapes
+
+    def _decode_kv_window_shapes_match(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        captured_shapes: dict[int, tuple[int, ...]] | None,
+    ) -> bool:
+        """Return True if the current decode KV window shapes match capture."""
+        if captured_shapes is None:
+            return False
+        current_shapes = self._decode_kv_window_shapes(
+            state=state,
+            token_idx=token_idx,
+        )
+        return current_shapes == captured_shapes
 
     def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
         if input_ids.ndim != 1:
