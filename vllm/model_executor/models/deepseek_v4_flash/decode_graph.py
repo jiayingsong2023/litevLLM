@@ -43,8 +43,8 @@ class DeepSeekV4FlashDecodeGraph:
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
-        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-        extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     ) -> DeepSeekV4FlashDecodeGraph:
         """Capture a single decode step as a CUDA/HIP graph.
 
