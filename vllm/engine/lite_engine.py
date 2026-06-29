@@ -662,7 +662,7 @@ class LiteEngine:
         self.num_kv_heads = 0
         self.head_size = 0
         self.num_layers = 0
-        self.max_active_requests = 1
+        self.max_active_requests = 4
         self.max_model_len = int(getattr(self.model_config, "max_model_len", 4096))
         self.block_size = 0
         self.num_blocks_per_seq = 0
@@ -739,6 +739,98 @@ class LiteEngine:
             ],
             finished=True,
         )
+
+    def generate_deepseek_v4_flash_greedy_batched(
+        self,
+        *,
+        request_ids: list[str],
+        prompts: list[str],
+        sampling_params_list: list[SamplingParams],
+        use_graph: bool = False,
+    ) -> list[RequestOutput]:
+        if not getattr(self, "_deepseek_v4_flash_direct", False):
+            raise RuntimeError("DeepSeek V4 Flash direct runtime is not enabled")
+        if self.tokenizer is None:
+            raise RuntimeError("DeepSeek V4 Flash direct runtime requires a tokenizer")
+        if not prompts:
+            return []
+        if len(request_ids) != len(prompts) or len(prompts) != len(
+            sampling_params_list
+        ):
+            raise ValueError(
+                "request_ids, prompts, and sampling_params_list "
+                "must have the same length"
+            )
+
+        # ``use_graph`` is accepted for API symmetry but is ignored in the
+        # batched path; CUDA/HIP graph capture is disabled for batch size > 1.
+        del use_graph
+
+        for sampling_params in sampling_params_list:
+            self._validate_deepseek_v4_flash_sampling(sampling_params)
+
+        max_tokens = int(sampling_params_list[0].max_tokens or 1)
+        if any(
+            int(sampling_params.max_tokens or 1) != max_tokens
+            for sampling_params in sampling_params_list
+        ):
+            raise ValueError(
+                "Batched generation requires all sampling_params.max_tokens to be equal"
+            )
+
+        prompt_token_ids_list: list[list[int]] = []
+        input_ids_list: list[torch.Tensor] = []
+        for prompt in prompts:
+            prompt_token_ids = [int(token) for token in self.tokenizer.encode(prompt)]
+            if not prompt_token_ids:
+                eos = getattr(self.tokenizer, "eos_token_id", None)
+                prompt_token_ids = [0 if eos is None else int(eos)]
+            prompt_token_ids_list.append(prompt_token_ids)
+            input_ids_list.append(
+                torch.tensor(
+                    prompt_token_ids,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            )
+
+        output_ids_list = self.model.generate_greedy_kernel_batched(
+            input_ids_list,
+            max_tokens=max_tokens,
+        )
+
+        outputs: list[RequestOutput] = []
+        for request_id, prompt, prompt_token_ids, output_ids in zip(
+            request_ids, prompts, prompt_token_ids_list, output_ids_list, strict=True
+        ):
+            generated_token_ids = [
+                int(token)
+                for token in output_ids[len(prompt_token_ids) :].detach().cpu().tolist()
+            ]
+            try:
+                text = self.tokenizer.decode(
+                    generated_token_ids,
+                    skip_special_tokens=sampling_params_list[0].skip_special_tokens,
+                )
+            except TypeError:
+                text = self.tokenizer.decode(generated_token_ids)
+            outputs.append(
+                RequestOutput(
+                    request_id=request_id,
+                    prompt=prompt,
+                    prompt_token_ids=prompt_token_ids,
+                    outputs=[
+                        CompletionOutput(
+                            index=0,
+                            text=text,
+                            token_ids=generated_token_ids,
+                            cumulative_logprob=0.0,
+                        )
+                    ],
+                    finished=True,
+                )
+            )
+        return outputs
 
     @staticmethod
     def _validate_deepseek_v4_flash_sampling(
