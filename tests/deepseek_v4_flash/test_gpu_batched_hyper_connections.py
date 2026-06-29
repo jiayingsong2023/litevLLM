@@ -163,3 +163,28 @@ def test_hyper_connection_pre_post_batched_matches_loop() -> None:
         ]
     )
     torch.testing.assert_close(out_b, singles_out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_ensure_hyper_connection_streams_batched_preserves_3d() -> None:
+    hc, store = _make_hc_tensors(hc_mult=2, hidden_size=8)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    streams = torch.randn(3, 2, 8, dtype=torch.float32, device="cuda")
+    out = _ensure_hyper_connection_streams_batched(
+        streams, stager=stager, hyper_connection=hc
+    )
+    assert out is not streams  # clones
+    torch.testing.assert_close(out, streams)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_hyper_connection_post_batched_shape_validation() -> None:
+    hc, store = _make_hc_tensors(hc_mult=2, hidden_size=8)
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    streams = torch.randn(3, 2, 8, dtype=torch.float32, device="cuda")
+    state = _hyper_connection_pre_cuda_batched(
+        streams, stager=stager, hyper_connection=hc
+    )
+    bad_output = torch.randn(3, 4, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="batched mHC output shape must be"):
+        _hyper_connection_post_cuda_batched(bad_output, streams, state)

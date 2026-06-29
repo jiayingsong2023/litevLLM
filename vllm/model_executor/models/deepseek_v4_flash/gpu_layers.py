@@ -1993,7 +1993,7 @@ def _ensure_hyper_connection_streams_batched(
                 "batched mHC stream count must match hyper-connection tensors; "
                 f"got {hidden.shape[1]} and {hc_mult}"
             )
-        return hidden.to(torch.float32)
+        return hidden.to(torch.float32).clone()
     if hidden.ndim != 2:
         raise ValueError(
             f"batched hidden must be 2-D or stream-shaped 3-D; got {hidden.ndim}-D"
