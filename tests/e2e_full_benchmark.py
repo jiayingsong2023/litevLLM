@@ -2842,19 +2842,6 @@ def _run_deepseek_v4_flash_direct_benchmark(
         )
         wall_sec = max(1e-6, time.perf_counter() - start)
         if proc.returncode != 0:
-            if (
-                batched_engine
-                and "batched generation does not support hyper-connections"
-                in proc.stderr
-            ):
-                print(
-                    "  [Skip] Batched engine path does not yet support "
-                    "DeepSeek V4 Flash hyper-connections."
-                )
-                return {
-                    "skipped": 1.0,
-                    "skip_reason": "batched_hyper_connections_unsupported",
-                }
             raise RuntimeError(
                 "DeepSeek V4 Flash GGUF benchmark failed with "
                 f"rc={proc.returncode}: {proc.stderr}"

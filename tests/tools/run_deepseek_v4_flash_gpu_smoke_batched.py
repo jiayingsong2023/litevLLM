@@ -120,8 +120,8 @@ def _make_fake_engine(model: DeepSeekV4FlashForCausalLM) -> LiteEngine:
     engine = object.__new__(LiteEngine)
     engine.device = torch.device("cuda")
     engine.model = model
-    engine.tokenizer = _FakeTokenizer(1)
-    engine._deepseek_v4_flash_direct = True
+    engine.tokenizer = _FakeTokenizer(1)  # type: ignore[assignment]
+    engine._deepseek_v4_flash_direct = True  # type: ignore[attr-defined]
     return engine
 
 

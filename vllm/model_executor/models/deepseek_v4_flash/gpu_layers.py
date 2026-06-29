@@ -414,10 +414,11 @@ def _run_sliding_attention_for_slot(
                 token_idx,
                 DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
             )
-    if kv_rows is not None:
-        # When the caller supplies a pre-materialized window, append the
-        # current token's KV so the attention sees the same rows as the
-        # reference path that reads from the cache after appending.
+    if state is not None and kv_rows is not None:
+        # After the cache append above, append the current token's KV so the
+        # attention sees the same rows as the reference path that reads from
+        # the cache after appending. When state is None the caller already
+        # provided the complete window (or it is just the current token).
         kv_rows = torch.cat(
             [kv_rows.to(torch.float32), current_kv.reshape(1, -1)],
             dim=0,
@@ -614,7 +615,7 @@ def deepseek_v4_flash_sliding_layer_forward(
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
     kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -1148,7 +1149,7 @@ def deepseek_v4_flash_compressed_layer_forward(
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
     kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     compressed_count: int | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
@@ -1472,7 +1473,7 @@ def deepseek_v4_flash_compressed_layer_forward_batched(
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
     kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
-    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:

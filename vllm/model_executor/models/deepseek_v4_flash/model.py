@@ -961,20 +961,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         return hidden.to(dtype=torch.float32)
 
-    def _reject_batched_generation_if_hyper_connections(self) -> None:
-        store = self._require_weight_store()
-        layers = getattr(store.bindings, "layers", None)
-        if layers is None:
-            return
-        for layer in layers:
-            if (
-                getattr(layer, "attention_hyper_connection", None) is not None
-                or getattr(layer, "ffn_hyper_connection", None) is not None
-            ):
-                raise NotImplementedError(
-                    "batched generation does not support hyper-connections"
-                )
-
     def _validate_generate_greedy_kernel_batched_input(
         self,
         input_ids_list: list[torch.Tensor],
