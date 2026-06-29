@@ -134,6 +134,24 @@ class DeepSeekV4FlashGPURequestState:
             self._rope_sin[layer_idx, token_idx],
         )
 
+    def raw_kv_window(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        window: int,
+    ) -> torch.Tensor:
+        """Materialize the raw KV window for a layer/token pair.
+
+        This is intended to be called outside a captured graph so the graph
+        sees a static ``kv_rows`` tensor argument.
+        """
+        rows, _values = self.raw_kv_cache.read_raw_window(
+            layer_idx,
+            token_idx,
+            window,
+        )
+        return rows
+
     def reset(self) -> None:
         self.token_position = 0
         self.raw_kv_cache.raw_token_indices.fill_(-1)

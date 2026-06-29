@@ -392,13 +392,10 @@ def _run_real_sliding_attention(
                 DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
             )
     if extra_kv_rows is not None:
-        if kv_rows is None:
-            kv_rows = extra_kv_rows
-        else:
-            kv_rows = torch.cat(
-                [kv_rows.to(torch.float32), extra_kv_rows.to(torch.float32)],
-                dim=0,
-            )
+        kv_rows = torch.cat(
+            [kv_rows.to(torch.float32), extra_kv_rows.to(torch.float32)],
+            dim=0,
+        )
     if not kv_rows.is_cuda:
         raise ValueError("DeepSeek V4 Flash real sliding KV rows must be CUDA")
 
@@ -527,6 +524,7 @@ def deepseek_v4_flash_sliding_layer_forward(
     token_id: int | None = None,
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
+    extra_kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -605,6 +603,7 @@ def deepseek_v4_flash_sliding_layer_forward(
                 state=state,
                 token_idx=token_idx,
                 kv_rows=kv_rows,
+                extra_kv_rows=extra_kv_rows,
                 use_reference_rope=use_reference_rope,
             )
         else:
@@ -777,6 +776,8 @@ def deepseek_v4_flash_compressed_layer_forward(
     token_idx: int,
     token_id: int | None = None,
     token_id_tensor: torch.Tensor | None = None,
+    kv_rows: torch.Tensor | None = None,
+    extra_kv_rows: torch.Tensor | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -896,8 +897,8 @@ def deepseek_v4_flash_compressed_layer_forward(
 
     prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
     if prior_rows.shape[0] == 0:
-        attention_rows: torch.Tensor | None = None
-        extra_kv_rows: torch.Tensor | None = None
+        compressed_attention_rows: torch.Tensor | None = None
+        compressed_extra_rows: torch.Tensor | None = None
         selected_rows = torch.zeros(1, dtype=torch.int64, device=hidden.device)
     elif layer.indexer is not None:
         with _stager_profile_section(
@@ -917,14 +918,14 @@ def deepseek_v4_flash_compressed_layer_forward(
                 token_idx=token_idx,
                 use_reference_rope=use_reference_rope,
             )
-        attention_rows = prior_rows
-        extra_kv_rows = state.compressed_kv_cache.read_compressed(
+        compressed_attention_rows = prior_rows
+        compressed_extra_rows = state.compressed_kv_cache.read_compressed(
             layer.layer_index,
             row_indices=selected_rows,
         )
     else:
-        attention_rows = prior_rows
-        extra_kv_rows = prior_rows
+        compressed_attention_rows = prior_rows
+        compressed_extra_rows = prior_rows
         selected_rows = torch.arange(
             prior_rows.shape[0],
             dtype=torch.int64,
@@ -946,11 +947,14 @@ def deepseek_v4_flash_compressed_layer_forward(
                 backend=backend,
                 state=state,
                 token_idx=token_idx,
-                kv_rows=None,
-                extra_kv_rows=extra_kv_rows,
+                kv_rows=kv_rows if kv_rows is not None else compressed_attention_rows,
+                extra_kv_rows=(
+                    extra_kv_rows if kv_rows is not None else compressed_extra_rows
+                ),
                 use_reference_rope=use_reference_rope,
             )
         else:
+            attention_rows = compressed_attention_rows
             if attention_rows is None:
                 attention_rows = (
                     candidate_row if emitted_row is None else emitted_row
