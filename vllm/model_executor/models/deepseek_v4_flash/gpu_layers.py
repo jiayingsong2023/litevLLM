@@ -525,6 +525,8 @@ def deepseek_v4_flash_sliding_layer_forward(
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
+    kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -534,6 +536,10 @@ def deepseek_v4_flash_sliding_layer_forward(
         raise ValueError(
             f"hidden must be 1-D or mHC stream-shaped 2-D; got {hidden.ndim}-D"
         )
+    if kv_rows is None and kv_rows_by_layer is not None:
+        kv_rows = kv_rows_by_layer.get(layer.layer_index)
+    if extra_kv_rows is None and extra_kv_rows_by_layer is not None:
+        extra_kv_rows = extra_kv_rows_by_layer.get(layer.layer_index)
 
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
@@ -782,6 +788,8 @@ def deepseek_v4_flash_compressed_layer_forward(
     token_id_tensor: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
     extra_kv_rows: torch.Tensor | None = None,
+    kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+    extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
     router_top_k: int = DEEPSEEK_V4_FLASH_SHAPE.num_experts_per_tok,
     use_reference_rope: bool = False,
 ) -> torch.Tensor:
@@ -791,6 +799,10 @@ def deepseek_v4_flash_compressed_layer_forward(
         raise ValueError(
             f"hidden must be 1-D or mHC stream-shaped 2-D; got {hidden.ndim}-D"
         )
+    if kv_rows is None and kv_rows_by_layer is not None:
+        kv_rows = kv_rows_by_layer.get(layer.layer_index)
+    if extra_kv_rows is None and extra_kv_rows_by_layer is not None:
+        extra_kv_rows = extra_kv_rows_by_layer.get(layer.layer_index)
     ratio = layer_compress_ratio(layer.layer_index)
     if ratio == 0:
         raise ValueError(

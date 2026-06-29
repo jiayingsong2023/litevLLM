@@ -385,12 +385,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        advance_state: bool = True,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         store, stager, hidden = self._forward_kernel_token_hidden_token_tensor(
             token_id_tensor=token_id_tensor,
             state=state,
             token_idx=token_idx,
             device=device,
+            kv_rows_by_layer=kv_rows_by_layer,
+            extra_kv_rows_by_layer=extra_kv_rows_by_layer,
         )
         with self._deepseek_profiler.section(
             "output_projection",
@@ -405,7 +410,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             )
         if not next_token.is_cuda:
             raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU token id")
-        state.advance_token()
+        if advance_state:
+            state.advance_token()
         return next_token.to(device=device, dtype=torch.long).reshape(())
 
     def _forward_kernel_token_hidden(
@@ -488,6 +494,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -519,6 +527,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
         layers = list(layers)
         for layer_offset, layer in enumerate(layers):
+            layer_kv_rows = (
+                kv_rows_by_layer.get(layer.layer_index)
+                if kv_rows_by_layer is not None
+                else None
+            )
+            layer_extra_kv_rows = (
+                extra_kv_rows_by_layer.get(layer.layer_index)
+                if extra_kv_rows_by_layer is not None
+                else None
+            )
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -533,6 +551,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id_tensor=token_id_tensor,
+                        kv_rows=layer_kv_rows,
+                        extra_kv_rows=layer_extra_kv_rows,
+                        kv_rows_by_layer=kv_rows_by_layer,
+                        extra_kv_rows_by_layer=extra_kv_rows_by_layer,
                     )
             else:
                 with self._deepseek_profiler.section(
@@ -548,6 +570,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id_tensor=token_id_tensor,
+                        kv_rows=layer_kv_rows,
+                        extra_kv_rows=layer_extra_kv_rows,
+                        kv_rows_by_layer=kv_rows_by_layer,
+                        extra_kv_rows_by_layer=extra_kv_rows_by_layer,
                     )
             if layer_offset + 1 < len(layers):
                 self._schedule_next_layer_expert_prefetch(
@@ -665,9 +691,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         token_id_tensor = output_ids[input_token_count - 1].reshape(())
         eos_token_id = self._eos_token_id()
-        token_id = (
-            int(token_id_tensor.item()) if eos_token_id is not None else None
-        )
+        token_id = int(token_id_tensor.item()) if eos_token_id is not None else None
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
             start_event: torch.cuda.Event | None = None
@@ -1016,9 +1040,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         store = self._require_weight_store()
         output_head = getattr(store.bindings, "output_head", None)
         if output_head is None:
-            raise RuntimeError(
-                "DeepSeek V4 Flash output.weight binding is required"
-            )
+            raise RuntimeError("DeepSeek V4 Flash output.weight binding is required")
         stager = self._get_gpu_weight_stager(device)
         stager.warm_static_decode_weights(output_weight=output_head)
 
@@ -1490,10 +1512,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
                 chunk_token: torch.Tensor | None = None
                 chunk_value: torch.Tensor | None = None
-                if (
-                    output_hidden is None
-                    and hasattr(self.gpu_backend, "output_hidden")
-                ):
+                if output_hidden is None and hasattr(self.gpu_backend, "output_hidden"):
                     output_hidden = self.gpu_backend.output_hidden(
                         streams=streams,
                         lm_head_values=lm_head_values,
@@ -1509,9 +1528,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                             "DeepSeek V4 Flash GPU output hidden returned CPU tensor"
                         )
 
-                if (
-                    output_hidden is not None
-                    and hasattr(self.gpu_backend, "output_argmax_from_hidden")
+                if output_hidden is not None and hasattr(
+                    self.gpu_backend, "output_argmax_from_hidden"
                 ):
                     token, value = self.gpu_backend.output_argmax_from_hidden(
                         hidden=output_hidden,
@@ -1618,9 +1636,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash full reference requires output HC")
         flat = streams.reshape(-1).to(torch.float32)
         flat = flat * torch.rsqrt(flat.pow(2).mean() + _RMS_NORM_EPS)
-        pre = store.decode_matrix(hc.fn).transpose(0, 1).to(torch.float32).matmul(
-            flat
-        )
+        pre = store.decode_matrix(hc.fn).transpose(0, 1).to(torch.float32).matmul(flat)
         scale = store.tensor_to_torch(hc.scale, dtype=torch.float32)
         base = store.tensor_to_torch(hc.base, dtype=torch.float32)
         if scale.shape != (1,) or base.shape != (4,):
@@ -1771,9 +1787,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         scale_bytes = raw[:, :2].contiguous()
         values = raw[:, 2:].contiguous().view(torch.int8).reshape(rows, columns)
-        scales = scale_bytes.view(torch.float16).to(torch.float32).reshape(
-            rows,
-            blocks_per_row,
+        scales = (
+            scale_bytes.view(torch.float16)
+            .to(torch.float32)
+            .reshape(
+                rows,
+                blocks_per_row,
+            )
         )
         return values, scales
 
