@@ -375,17 +375,18 @@ def _run_real_sliding_attention(
             f"({DEEPSEEK_V4_FLASH_SHAPE.head_dim},); got {tuple(current_kv.shape)}"
         )
 
-    if kv_rows is None:
-        if state is None:
+    if state is None:
+        if kv_rows is None:
             kv_rows = current_kv.reshape(1, -1)
-        else:
-            cache_dtype = state.raw_kv_cache.raw_keys.dtype
-            state.raw_kv_cache.append_raw(
-                layer.layer_index,
-                token_idx,
-                current_kv.to(dtype=cache_dtype),
-                current_kv.to(dtype=cache_dtype),
-            )
+    else:
+        cache_dtype = state.raw_kv_cache.raw_keys.dtype
+        state.raw_kv_cache.append_raw(
+            layer.layer_index,
+            token_idx,
+            current_kv.to(dtype=cache_dtype),
+            current_kv.to(dtype=cache_dtype),
+        )
+        if kv_rows is None:
             kv_rows, _values = state.raw_kv_cache.read_raw_window(
                 layer.layer_index,
                 token_idx,
@@ -496,11 +497,15 @@ def deepseek_v4_flash_residual_hyper_connection(
     flat = residual.reshape(flat_size).to(torch.float32)
     rsqrt = torch.rsqrt(flat.pow(2).mean() + 1e-6)
     mixes = deepseek_v4_flash_staged_matrix_projection(flat, fn_weight) * rsqrt
-    repeat_counts = torch.tensor(
-        [hc_mult, hc_mult, hc_mult * hc_mult],
-        device=scale.device,
+    scale_f32 = scale.to(torch.float32)
+    scaled_scale = torch.cat(
+        [
+            scale_f32[0:1].expand(hc_mult),
+            scale_f32[1:2].expand(hc_mult),
+            scale_f32[2:3].expand(hc_mult * hc_mult),
+        ]
     )
-    mixes = mixes * scale.to(torch.float32).repeat_interleave(repeat_counts)
+    mixes = mixes * scaled_scale
     mixes = mixes + base.to(torch.float32)
     post = 2.0 * torch.sigmoid(mixes[hc_mult : 2 * hc_mult])
     combine_scores = mixes[2 * hc_mult :].reshape(hc_mult, hc_mult)
@@ -911,7 +916,11 @@ def deepseek_v4_flash_compressed_layer_forward(
             indexer_row=indexer_row,
         )
 
-    prior_rows = state.compressed_kv_cache.read_compressed(layer.layer_index)
+    compressed_count = (token_idx + 1) // ratio if ratio > 0 else 0
+    prior_rows = state.compressed_kv_cache.read_compressed(
+        layer.layer_index,
+        count=compressed_count,
+    )
     if prior_rows.shape[0] == 0:
         compressed_attention_rows: torch.Tensor | None = None
         compressed_extra_rows: torch.Tensor | None = None
@@ -928,7 +937,8 @@ def deepseek_v4_flash_compressed_layer_forward(
                 layer=layer,
                 stager=stager,
                 indexer_rows=state.compressed_kv_cache.read_indexer_rows(
-                    layer.layer_index
+                    layer.layer_index,
+                    count=compressed_count,
                 ),
                 state=state,
                 token_idx=token_idx,
@@ -938,6 +948,7 @@ def deepseek_v4_flash_compressed_layer_forward(
         compressed_extra_rows = state.compressed_kv_cache.read_compressed(
             layer.layer_index,
             row_indices=selected_rows,
+            count=compressed_count,
         )
     else:
         compressed_attention_rows = prior_rows
@@ -1250,12 +1261,15 @@ def _hyper_connection_pre_cuda(
 
     flat = streams.reshape(flat_size).to(torch.float32)
     mixes = projection_weight.matmul(flat) * torch.rsqrt(flat.pow(2).mean() + 1e-6)
-    repeat_counts = torch.tensor(
-        [hc_mult, hc_mult, hc_mult * hc_mult],
-        dtype=torch.long,
-        device=scale.device,
+    scale_f32 = scale.to(torch.float32)
+    scaled_scale = torch.cat(
+        [
+            scale_f32[0:1].expand(hc_mult),
+            scale_f32[1:2].expand(hc_mult),
+            scale_f32[2:3].expand(hc_mult * hc_mult),
+        ]
     )
-    mixes = mixes * scale.to(torch.float32).repeat_interleave(repeat_counts)
+    mixes = mixes * scaled_scale
     mixes = mixes + base.to(torch.float32)
     pre = torch.sigmoid(mixes[:hc_mult]) + 1e-6
     post = 2.0 * torch.sigmoid(mixes[hc_mult : 2 * hc_mult])
@@ -1818,6 +1832,9 @@ def _run_hash_routed_experts(
         weights = scores.gather(0, expert_ids.to(device=scores.device))
         weights = weights / torch.clamp(weights.sum(), min=6.103515625e-5)
         weights = weights * 1.5
+    selected_payloads: list[DeepSeekV4FlashSelectedExpertPayloads] | None = None
+    if state is not None:
+        selected_payloads = state.graph_moe_payloads_for_layer(layer.layer_index)
     return _run_staged_routed_experts(
         hidden,
         expert_ids,
@@ -1827,6 +1844,7 @@ def _run_hash_routed_experts(
         backend=backend,
         state=state,
         layer_idx=layer.layer_index,
+        selected_payloads=selected_payloads,
     )
 
 
@@ -1873,26 +1891,28 @@ def _run_staged_routed_experts(
     backend: DeepSeekV4FlashGPUBackend | _SlidingLayerBackend,
     state: DeepSeekV4FlashGPURequestState | None = None,
     layer_idx: int | None = None,
+    selected_payloads: list[DeepSeekV4FlashSelectedExpertPayloads] | None = None,
 ) -> torch.Tensor:
     output: torch.Tensor | None = None
-    try:
-        selected_payloads = _stage_selected_expert_payloads(
-            expert_ids,
-            grouped_experts=grouped_experts,
-            stager=stager,
-            layer_idx=layer_idx,
-            max_experts=expert_weights.numel(),
-        )
-    except (AttributeError, NotImplementedError):
-        return _run_dense_staged_routed_experts(
-            hidden,
-            expert_ids,
-            expert_weights,
-            grouped_experts=grouped_experts,
-            stager=stager,
-            backend=backend,
-            layer_idx=layer_idx,
-        )
+    if selected_payloads is None:
+        try:
+            selected_payloads = _stage_selected_expert_payloads(
+                expert_ids,
+                grouped_experts=grouped_experts,
+                stager=stager,
+                layer_idx=layer_idx,
+                max_experts=expert_weights.numel(),
+            )
+        except (AttributeError, NotImplementedError):
+            return _run_dense_staged_routed_experts(
+                hidden,
+                expert_ids,
+                expert_weights,
+                grouped_experts=grouped_experts,
+                stager=stager,
+                backend=backend,
+                layer_idx=layer_idx,
+            )
     selected_gemm = getattr(backend, "fused_quantized_selected_experts_gemm", None)
     if callable(selected_gemm) and state is not None:
         try:
@@ -2126,7 +2146,7 @@ def _stage_expert_token_table(
     cache_key = cache_key_fn(
         tensor,
         dtype=torch.int32,
-        extra=("expert_token_table",),
+        extra=("expert_token_table", str(device)),
     )
     cached = cache.get(cache_key)
     if cached is not None:

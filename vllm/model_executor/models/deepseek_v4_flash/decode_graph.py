@@ -13,7 +13,7 @@ class DeepSeekV4FlashDecodeGraph:
     The graph assumes:
     - input token is a CUDA scalar long tensor (placeholder)
     - RoPE tables are precomputed and read from state (not captured as constants)
-    - KV window tensors are stable input objects
+    - KV window tensors are stable input objects copied before replay
     - expert payload tensors are stable cached objects whose bytes are copied
       before replay
     """
@@ -34,6 +34,8 @@ class DeepSeekV4FlashDecodeGraph:
             device=device,
         )
         self.graph = torch.cuda.CUDAGraph()
+        self.kv_rows_by_layer: dict[int, torch.Tensor] = {}
+        self.extra_kv_rows_by_layer: dict[int, torch.Tensor | None] = {}
 
     @classmethod
     def capture(
@@ -58,6 +60,22 @@ class DeepSeekV4FlashDecodeGraph:
         # assertions in the model step succeed during warm-up and capture.
         token_id_tensor.fill_(0)
 
+        # Allocate stable KV window tensors from the initial windows so the
+        # graph records operations on stable objects.
+        instance._prepare_kv_windows(
+            kv_rows_by_layer=kv_rows_by_layer,
+            extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+        )
+        # Stage the current token's expert payloads and copy the current KV
+        # windows into the stable tensors.
+        instance.prepare_replay(
+            model=model,
+            state=state,
+            token_idx=token_idx,
+            token_id_tensor=token_id_tensor,
+            device=device,
+        )
+
         def _capture_step() -> None:
             out = model._forward_kernel_token_step_token_tensor(
                 token_id_tensor=token_id_tensor,
@@ -65,8 +83,8 @@ class DeepSeekV4FlashDecodeGraph:
                 token_idx=token_idx,
                 device=device,
                 advance_state=False,
-                kv_rows_by_layer=kv_rows_by_layer,
-                extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                kv_rows_by_layer=instance.kv_rows_by_layer,
+                extra_kv_rows_by_layer=instance.extra_kv_rows_by_layer,
             )
             instance.output_token.copy_(out.reshape(()))
 
@@ -85,6 +103,63 @@ class DeepSeekV4FlashDecodeGraph:
         torch.cuda.current_stream().wait_stream(capture_stream)
 
         return instance
+
+    def _prepare_kv_windows(
+        self,
+        *,
+        kv_rows_by_layer: dict[int, torch.Tensor | None] | None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None,
+    ) -> None:
+        """Allocate stable KV window tensors from the initial windows."""
+        if kv_rows_by_layer is not None:
+            for layer_idx, tensor in kv_rows_by_layer.items():
+                if tensor is None:
+                    continue
+                stable = torch.empty_like(tensor)
+                stable.copy_(tensor)
+                self.kv_rows_by_layer[layer_idx] = stable
+        if extra_kv_rows_by_layer is not None:
+            for layer_idx, tensor in extra_kv_rows_by_layer.items():
+                if tensor is None:
+                    self.extra_kv_rows_by_layer[layer_idx] = None
+                else:
+                    stable = torch.empty_like(tensor)
+                    stable.copy_(tensor)
+                    self.extra_kv_rows_by_layer[layer_idx] = stable
+
+    def prepare_replay(
+        self,
+        model: DeepSeekV4FlashForCausalLM,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        token_id_tensor: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Update stable inputs before ``graph.replay()``.
+
+        This stages the current token's expert payloads and copies the current
+        KV windows into the stable tensors that the graph was captured with.
+        """
+        model._stage_graph_moe_payloads(
+            state=state,
+            token_id=int(token_id_tensor.item()),
+            device=device,
+        )
+        kv_rows_by_layer, extra_kv_rows_by_layer = model._materialize_decode_kv_windows(
+            state=state,
+            token_idx=token_idx,
+        )
+        for layer_idx, current in kv_rows_by_layer.items():
+            stable = self.kv_rows_by_layer.get(layer_idx)
+            if stable is not None and stable.shape == current.shape:
+                stable.copy_(current)
+        for layer_idx, current in extra_kv_rows_by_layer.items():
+            if current is None:
+                continue
+            stable = self.extra_kv_rows_by_layer.get(layer_idx)
+            if stable is not None and stable.shape == current.shape:
+                stable.copy_(current)
 
     def replay(self, token_id_tensor: torch.Tensor) -> torch.Tensor:
         self.token_id_placeholder.copy_(token_id_tensor)

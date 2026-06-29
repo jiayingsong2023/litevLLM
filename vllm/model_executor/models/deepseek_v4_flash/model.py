@@ -29,6 +29,7 @@ from .gguf_reader import (
 )
 from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_layers import (
+    _stage_expert_token_table,
     deepseek_v4_flash_compressed_layer_forward,
     deepseek_v4_flash_sliding_layer_forward,
 )
@@ -716,7 +717,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             current_token_idx = state.token_position
             can_capture_graph = (
                 use_graph
-                and token_id is None
+                and self._model_layers_all_hash_routed()
                 and not self._decode_step_is_emit_boundary(current_token_idx)
             )
             can_replay_graph = (
@@ -729,6 +730,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 )
             )
             if can_replay_graph:
+                decode_graphs[current_token_idx].prepare_replay(
+                    self,
+                    state=state,
+                    token_idx=current_token_idx,
+                    token_id_tensor=token_id_tensor,
+                    device=device,
+                )
                 token_id_tensor = decode_graphs[current_token_idx].replay(
                     token_id_tensor
                 )
@@ -752,6 +760,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=current_token_idx,
                     )
+                )
+                decode_graphs[current_token_idx].prepare_replay(
+                    self,
+                    state=state,
+                    token_idx=current_token_idx,
+                    token_id_tensor=token_id_tensor,
+                    device=device,
                 )
                 token_id_tensor = decode_graphs[current_token_idx].replay(
                     token_id_tensor
@@ -807,6 +822,25 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 return True
         return False
 
+    def _model_layers_all_hash_routed(self) -> bool:
+        """Return True iff every layer uses hash-routed experts.
+
+        CUDA/HIP graph capture currently depends on expert payloads being
+        stageable outside the captured region via the static token-to-expert
+        table. Top-k routed layers select experts from the hidden state inside
+        the graph and cannot be captured safely yet.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if not layers:
+            return True
+        for layer in layers:
+            if layer.grouped_experts is None:
+                continue
+            if layer.expert_token_to_expert_ids is None:
+                return False
+        return True
+
     def _capture_decode_graph(
         self,
         *,
@@ -853,13 +887,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         extra_kv_rows_by_layer: dict[int, torch.Tensor | None] = {}
         for layer in layers:
             ratio = layer_compress_ratio(layer.layer_index)
-            if ratio == 0:
-                kv_rows_by_layer[layer.layer_index] = state.raw_kv_window(
-                    layer.layer_index,
-                    token_idx,
-                    self.shape.sliding_window,
-                )
-            else:
+            kv_rows_by_layer[layer.layer_index] = state.raw_kv_window(
+                layer.layer_index,
+                token_idx,
+                self.shape.sliding_window,
+            )
+            if ratio != 0:
                 extra_kv_rows_by_layer[layer.layer_index] = (
                     self._materialize_compressed_extra_rows(
                         state=state,
@@ -868,6 +901,50 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     )
                 )
         return kv_rows_by_layer, extra_kv_rows_by_layer
+
+    def _stage_graph_moe_payloads(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_id: int,
+        device: torch.device,
+    ) -> None:
+        """Stage the MoE payloads needed for one graph replay step.
+
+        The returned payload tensors are stable cached objects; their bytes are
+        copied in place before each replay so the captured graph sees the
+        current token's experts without running CPU-side staging inside the
+        graph.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return
+        stager = self._get_gpu_weight_stager(device)
+        for layer in layers:
+            if layer.expert_token_to_expert_ids is None:
+                continue
+            grouped = layer.grouped_experts
+            if grouped is None:
+                continue
+            table = _stage_expert_token_table(
+                stager,
+                layer.expert_token_to_expert_ids,
+                device=torch.device("cpu"),
+            )
+            if token_id < 0 or token_id >= table.shape[1]:
+                raise ValueError(
+                    f"graph token_id out of range: {token_id}; "
+                    f"expected [0, {table.shape[1]})"
+                )
+            expert_ids = table[:, token_id].to(torch.int64)
+            payloads = self.gpu_backend.stage_selected_expert_payloads(
+                stager,
+                grouped,
+                expert_ids,
+                layer_idx=layer.layer_index,
+            )
+            state.set_graph_moe_payloads(layer.layer_index, payloads)
 
     def _materialize_compressed_extra_rows(
         self,
@@ -903,20 +980,15 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         shapes: dict[int, tuple[int, ...] | None] = {}
         for layer in layers:
             ratio = layer_compress_ratio(layer.layer_index)
-            if ratio == 0:
-                shapes[layer.layer_index] = tuple(
-                    state.raw_kv_window(
-                        layer.layer_index,
-                        token_idx,
-                        self.shape.sliding_window,
-                    ).shape
-                )
-            elif layer.indexer is not None:
-                # Indexed compressed layers recompute selection inside the
-                # graph; no concrete extra_kv_rows shape is captured.
-                shapes[layer.layer_index] = None
-            else:
-                shapes[layer.layer_index] = tuple(
+            shapes[layer.layer_index] = tuple(
+                state.raw_kv_window(
+                    layer.layer_index,
+                    token_idx,
+                    self.shape.sliding_window,
+                ).shape
+            )
+            if ratio != 0 and layer.indexer is None:
+                shapes[layer.layer_index] = shapes[layer.layer_index] + tuple(
                     state.compressed_kv_cache.read_compressed(layer.layer_index).shape
                 )
         return shapes

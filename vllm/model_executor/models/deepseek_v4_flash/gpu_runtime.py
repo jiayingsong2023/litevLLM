@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -82,6 +83,7 @@ class DeepSeekV4FlashGPURequestState:
         )
         self.token_position = 0
         self._moe_workspace: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        self._graph_moe_payloads: dict[int, Any] | None = None
 
     def advance_token(self) -> None:
         self.require_capacity(self.token_position)
@@ -118,6 +120,30 @@ class DeepSeekV4FlashGPURequestState:
         )
         self._moe_workspace[key] = workspace
         return workspace
+
+    def set_graph_moe_payloads(
+        self,
+        layer_idx: int,
+        payloads: Any,
+    ) -> None:
+        """Store pre-staged MoE payloads for a graph replay step.
+
+        The payload tensors are stable cached objects whose bytes are copied
+        in place before each replay.
+        """
+        if self._graph_moe_payloads is None:
+            self._graph_moe_payloads = {}
+        self._graph_moe_payloads[layer_idx] = payloads
+
+    def graph_moe_payloads_for_layer(
+        self,
+        layer_idx: int,
+    ) -> Any | None:
+        """Return pre-staged MoE payloads for ``layer_idx`` if available."""
+        payloads = self._graph_moe_payloads
+        if payloads is None:
+            return None
+        return payloads.get(layer_idx)
 
     def rope_tables_for(
         self,
@@ -164,3 +190,5 @@ class DeepSeekV4FlashGPURequestState:
         )
         if compressor_states is not None:
             compressor_states.clear()
+        if self._graph_moe_payloads is not None:
+            self._graph_moe_payloads.clear()
