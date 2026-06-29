@@ -195,16 +195,13 @@ def main() -> int:
             cuda_elapsed_ms = float(start_event.elapsed_time(end_event))
             elapsed_ms = cuda_elapsed_ms if cuda_elapsed_ms > 0.0 else wall_elapsed_ms
 
-            output_cpu = [
-                [int(token) for token in output_ids.detach().cpu().tolist()]
-                for output_ids in outputs
-            ]
-            expected_len = args.prompt_length + args.max_tokens
-            for output_ids in output_cpu:
-                if len(output_ids) != expected_len:
+            output_cpu = [output.outputs[0].token_ids for output in outputs]
+            for generated_ids in output_cpu:
+                if len(generated_ids) != args.max_tokens:
                     raise RuntimeError(
                         "DeepSeek V4 Flash batched smoke returned unexpected "
-                        f"token count: got {len(output_ids)}, expected {expected_len}"
+                        f"generated token count: got {len(generated_ids)}, "
+                        f"expected {args.max_tokens}"
                     )
 
             generated_token_count = args.batch_size * args.max_tokens
