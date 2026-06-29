@@ -582,10 +582,11 @@ git commit -m "docs: milestone 1 benchmark results"
   - Fixed expert-token table caching so the GPU copy used by the graph path is keyed separately from the CPU copy.
   - Moved MoE payload staging out of the captured region: `DeepSeekV4FlashDecodeGraph.prepare_replay()` copies current expert bytes into stable cached payload tensors before `graph.replay()`.
   - Added stable KV-window copy into graph-owned tensors in `prepare_replay()` so the graph sees fixed memory objects.
-  - Made several graph-unsafe operations capture-safe: hyper-connection scale repetition, KV QAT constants, and compressed-cache row-count reads now avoid CPU syncs inside the graph.
+  - Made several graph-unsafe operations capture-safe: hyper-connection scale repetition, KV QAT constants, compressed-cache row-count reads, and raw KV index writes now avoid CPU syncs inside the graph.
   - Added `_model_layers_all_hash_routed()` guard: graph capture is only attempted when every routed layer uses the static token-to-expert table. The DeepSeek-V4-Flash ds4 checkpoint contains top-k routed layers, so the graph path currently falls back to the non-graph step and remains correctness-preserving.
+  - Fixed graph-path attention semantics: `_run_real_sliding_attention()` now appends the current token's KV to an explicitly provided `kv_rows` window before attention, matching the reference runner and the non-graph cache-after-append behavior.
 - **Targeted tests:**
-  - `uv run pytest tests/deepseek_v4_flash/test_decode_graph.py tests/deepseek_v4_flash/test_model_kernel_generate.py tests/deepseek_v4_flash/test_attention_reference.py tests/deepseek_v4_flash/test_gpu_backend_contract.py tests/deepseek_v4_flash/test_lite_engine_deepseek_gpu.py -q` — PASS (70 passed, 2 skipped)
+  - `uv run pytest tests/deepseek_v4_flash/test_attention_reference.py tests/deepseek_v4_flash/test_gpu_sliding_layer.py tests/deepseek_v4_flash/test_gpu_moe_path.py tests/deepseek_v4_flash/test_model_kernel_generate.py -q` — PASS (70 passed, 2 skipped)
 - **Regression suites:**
   - `tests/run_regression_suite.sh` — PASS (133 passed, 2 skipped)
   - `tests/run_deepseek_v4_flash_real_smoke.sh` — PASS
