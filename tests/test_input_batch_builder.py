@@ -139,6 +139,57 @@ def test_input_batch_builder_build_decode_batch() -> None:
     assert req_dicts[0]["seq_len"] == 3
 
 
+def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
+    scheduler = _scheduler_with_request()
+    req = scheduler.get_request("r1")
+    req["is_prefill"] = False
+    req["generated_ids"] = [42]
+    req["seq_len"] = 3
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=KVBlockManager(
+            kv_caches=[],
+            kv_scale_caches=[],
+            num_blocks_per_seq=2,
+            block_size=2,
+        ),
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    curr_input, positions, attn_metadata, _ = builder.build_decode_batch(
+        ["r1"], scheduler
+    )
+    ptrs = (
+        curr_input.data_ptr(),
+        positions.data_ptr(),
+        attn_metadata["slot_mapping"].data_ptr(),
+        attn_metadata["seq_lens"].data_ptr(),
+    )
+
+    req["generated_ids"] = [43]
+    req["seq_len"] = 4
+    curr_input2, positions2, attn_metadata2, _ = builder.build_decode_batch(
+        ["r1"], scheduler
+    )
+
+    assert (
+        curr_input2.data_ptr(),
+        positions2.data_ptr(),
+        attn_metadata2["slot_mapping"].data_ptr(),
+        attn_metadata2["seq_lens"].data_ptr(),
+    ) == ptrs
+    assert curr_input2.tolist() == [[43]]
+    assert positions2.tolist() == [[4]]
+    assert attn_metadata2["slot_mapping"].tolist() == [4]
+    assert attn_metadata2["seq_lens"].tolist() == [5]
+
+
 def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(

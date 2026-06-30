@@ -22,11 +22,7 @@ class DecodePlan:
 
 
 @dataclass(frozen=True)
-class StepPlan:
-    admissions: AdmissionPlan | None
-    prefills: PrefillPlan | None
-    decodes: DecodePlan | None
-    step_token_budget: int
+class StepPlanMetrics:
     queued_before: int = 0
     running_before: int = 0
     multimodal_prefix_cache_hit_rate: float = 0.0
@@ -93,3 +89,12 @@ class StepPlan:
     queued_service_class_max_wait_s: dict[str, float] | None = None
     queued_service_class_p95_wait_s: dict[str, float] | None = None
     fairness_guardrail_triggered: bool = False
+
+
+@dataclass(frozen=True)
+class StepPlan:
+    admissions: AdmissionPlan | None
+    prefills: PrefillPlan | None
+    decodes: DecodePlan | None
+    step_token_budget: int
+    metrics: StepPlanMetrics | None = None

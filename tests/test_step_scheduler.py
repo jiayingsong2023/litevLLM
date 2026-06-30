@@ -196,9 +196,15 @@ def test_step_scheduler_ignores_queued_requests_until_admitted() -> None:
 
 def test_step_scheduler_limits_admissions_per_step() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
-    scheduler.enqueue_request("r0", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]})
-    scheduler.enqueue_request("r1", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]})
-    scheduler.enqueue_request("r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]})
+    scheduler.enqueue_request(
+        "r0", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]}
+    )
+    scheduler.enqueue_request(
+        "r1", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]}
+    )
+    scheduler.enqueue_request(
+        "r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]}
+    )
 
     step_scheduler = StepScheduler(
         step_token_budget=8,
@@ -214,8 +220,32 @@ def test_step_scheduler_limits_admissions_per_step() -> None:
 
     assert plan.admissions is not None
     assert plan.admissions.request_ids == ["r0"]
-    assert plan.queued_before == 3
-    assert plan.running_before == 0
+    assert plan.metrics is not None
+    assert plan.metrics.queued_before == 3
+    assert plan.metrics.running_before == 0
+
+
+def test_step_plan_keeps_observer_metrics_out_of_execution_fields() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.enqueue_request(
+        "r0",
+        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3]},
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert not hasattr(plan, "queued_before")
+    assert plan.metrics is not None
+    assert plan.metrics.queued_before == 1
 
 
 def test_step_scheduler_prefers_shorter_queued_requests_for_admission() -> None:
@@ -289,7 +319,12 @@ def test_step_scheduler_aging_can_override_short_prompt_preference(monkeypatch) 
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.enqueue_request(
         "old-long",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3, 4, 5], "queued_at": 1.0},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2, 3, 4, 5],
+            "queued_at": 1.0,
+        },
     )
     scheduler.enqueue_request(
         "new-short",
@@ -348,15 +383,30 @@ def test_step_scheduler_limits_multimodal_admissions_per_step() -> None:
     admitted = set(plan.admissions.request_ids)
     assert "txt0" in admitted
     assert len([rid for rid in admitted if rid.startswith("mm")]) == 1
-    assert plan.admitted_multimodal_requests == 1
+    assert plan.metrics.admitted_multimodal_requests == 1
 
 
 def test_step_scheduler_limits_multimodal_prefill_batch() -> None:
     scheduler = _scheduler_with_requests(
         [
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": False},
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": False,
+            },
         ]
     )
     step_scheduler = StepScheduler(
@@ -376,15 +426,32 @@ def test_step_scheduler_limits_multimodal_prefill_batch() -> None:
     assert plan.prefills is not None
     selected = set(plan.prefills.request_ids)
     assert len([rid for rid in selected if rid in {"r0", "r1"}]) == 1
-    assert plan.prefill_multimodal_requests == 1
+    assert plan.metrics.prefill_multimodal_requests == 1
 
 
-def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate() -> None:
+def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate() -> (
+    None
+):
     scheduler = _scheduler_with_requests(
         [
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
         ]
     )
     step_scheduler = StepScheduler(
@@ -404,9 +471,24 @@ def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate(
     )
     scheduler = _scheduler_with_requests(
         [
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": True},
-            {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "is_multimodal": False},
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": True,
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3],
+                "is_multimodal": False,
+            },
         ]
     )
     step_scheduler = StepScheduler(
@@ -431,11 +513,11 @@ def test_step_scheduler_relaxes_multimodal_prefill_limit_on_low_prefix_hit_rate(
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.prefill_multimodal_requests == 1
-    assert plan.effective_prefill_multimodal_request_limit == 1
-    assert plan.prefill_multimodal_limit_relaxed is False
-    assert plan.prefill_multimodal_limit_tightened is True
-    assert plan.prefill_multimodal_limit_triggered is True
+    assert plan.metrics.prefill_multimodal_requests == 1
+    assert plan.metrics.effective_prefill_multimodal_request_limit == 1
+    assert plan.metrics.prefill_multimodal_limit_relaxed is False
+    assert plan.metrics.prefill_multimodal_limit_tightened is True
+    assert plan.metrics.prefill_multimodal_limit_triggered is True
 
 
 def test_step_scheduler_limits_multimodal_lora_admissions_per_step() -> None:
@@ -490,8 +572,8 @@ def test_step_scheduler_limits_multimodal_lora_admissions_per_step() -> None:
     assert "txt_only" in admitted
     assert "mm_only" in admitted
     assert len([rid for rid in admitted if rid.startswith("mm_lora")]) == 1
-    assert plan.admitted_multimodal_requests == 2
-    assert plan.admitted_multimodal_lora_requests == 1
+    assert plan.metrics.admitted_multimodal_requests == 2
+    assert plan.metrics.admitted_multimodal_lora_requests == 1
 
 
 def test_step_scheduler_limits_multimodal_lora_prefill_batch() -> None:
@@ -539,11 +621,11 @@ def test_step_scheduler_limits_multimodal_lora_prefill_batch() -> None:
     selected = set(plan.prefills.request_ids)
     assert "r2" in selected
     assert len([rid for rid in selected if rid in {"r0", "r1"}]) == 1
-    assert plan.prefill_multimodal_requests == 2
-    assert plan.prefill_multimodal_lora_requests == 1
+    assert plan.metrics.prefill_multimodal_requests == 2
+    assert plan.metrics.prefill_multimodal_lora_requests == 1
 
 
-def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_low_prefix_hit_rate() -> None:
+def test_step_scheduler_relaxes_mm_lora_prefill_limit_on_low_hit_rate() -> None:
     scheduler = _scheduler_with_requests(
         [
             {
@@ -592,14 +674,14 @@ def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_low_prefix_hit_
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.prefill_multimodal_lora_requests == 2
-    assert plan.effective_prefill_multimodal_lora_request_limit == 2
-    assert plan.prefill_multimodal_lora_limit_relaxed is True
-    assert plan.prefill_multimodal_lora_limit_tightened is False
-    assert plan.prefill_multimodal_lora_limit_triggered is False
+    assert plan.metrics.prefill_multimodal_lora_requests == 2
+    assert plan.metrics.effective_prefill_multimodal_lora_request_limit == 2
+    assert plan.metrics.prefill_multimodal_lora_limit_relaxed is True
+    assert plan.metrics.prefill_multimodal_lora_limit_tightened is False
+    assert plan.metrics.prefill_multimodal_lora_limit_triggered is False
 
 
-def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_high_prefix_hit_rate() -> None:
+def test_step_scheduler_tightens_mm_lora_prefill_limit_on_high_hit_rate() -> None:
     scheduler = _scheduler_with_requests(
         [
             {
@@ -648,11 +730,11 @@ def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_high_prefix_hi
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.prefill_multimodal_lora_requests == 1
-    assert plan.effective_prefill_multimodal_lora_request_limit == 1
-    assert plan.prefill_multimodal_lora_limit_relaxed is False
-    assert plan.prefill_multimodal_lora_limit_tightened is True
-    assert plan.prefill_multimodal_lora_limit_triggered is True
+    assert plan.metrics.prefill_multimodal_lora_requests == 1
+    assert plan.metrics.effective_prefill_multimodal_lora_request_limit == 1
+    assert plan.metrics.prefill_multimodal_lora_limit_relaxed is False
+    assert plan.metrics.prefill_multimodal_lora_limit_tightened is True
+    assert plan.metrics.prefill_multimodal_lora_limit_triggered is True
 
 
 def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_fairness_gap() -> None:
@@ -712,13 +794,13 @@ def test_step_scheduler_relaxes_multimodal_lora_prefill_limit_on_fairness_gap() 
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.effective_prefill_multimodal_lora_request_limit == 2
-    assert plan.prefill_multimodal_lora_limit_relaxed is True
-    assert plan.prefill_multimodal_lora_limit_relaxed_by_fairness is True
-    assert plan.prefill_multimodal_lora_max_fairness_gap >= 0.2
+    assert plan.metrics.effective_prefill_multimodal_lora_request_limit == 2
+    assert plan.metrics.prefill_multimodal_lora_limit_relaxed is True
+    assert plan.metrics.prefill_multimodal_lora_limit_relaxed_by_fairness is True
+    assert plan.metrics.prefill_multimodal_lora_max_fairness_gap >= 0.2
 
 
-def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_locality_under_high_hit_rate() -> None:
+def test_step_scheduler_tightens_mm_lora_prefill_limit_on_locality() -> None:
     scheduler = _scheduler_with_requests(
         [
             {
@@ -767,19 +849,39 @@ def test_step_scheduler_tightens_multimodal_lora_prefill_limit_on_locality_under
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.effective_prefill_multimodal_lora_request_limit == 1
-    assert plan.prefill_multimodal_lora_limit_tightened is True
-    assert plan.prefill_multimodal_lora_limit_tightened_by_locality is True
-    assert plan.prefill_multimodal_lora_max_fairness_gap <= 0.2
+    assert plan.metrics.effective_prefill_multimodal_lora_request_limit == 1
+    assert plan.metrics.prefill_multimodal_lora_limit_tightened is True
+    assert plan.metrics.prefill_multimodal_lora_limit_tightened_by_locality is True
+    assert plan.metrics.prefill_multimodal_lora_max_fairness_gap <= 0.2
 
 
 def test_step_scheduler_relaxes_multimodal_lora_decode_limit_on_fairness_gap() -> None:
     scheduler = _scheduler_with_requests(
         [
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-b"},
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
         ]
     )
     step_scheduler = StepScheduler(
@@ -804,17 +906,27 @@ def test_step_scheduler_relaxes_multimodal_lora_decode_limit_on_fairness_gap() -
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.decodes is not None
-    assert plan.effective_decode_multimodal_lora_request_limit == 2
-    assert plan.decode_multimodal_lora_limit_relaxed is True
-    assert plan.decode_multimodal_lora_limit_relaxed_by_fairness is True
-    assert plan.decode_multimodal_lora_max_fairness_gap >= 0.2
+    assert plan.metrics.effective_decode_multimodal_lora_request_limit == 2
+    assert plan.metrics.decode_multimodal_lora_limit_relaxed is True
+    assert plan.metrics.decode_multimodal_lora_limit_relaxed_by_fairness is True
+    assert plan.metrics.decode_multimodal_lora_max_fairness_gap >= 0.2
 
 
-def test_step_scheduler_tightens_multimodal_lora_decode_limit_on_locality_under_high_hit_rate() -> None:
+def test_step_scheduler_tightens_mm_lora_decode_limit_on_locality() -> None:
     scheduler = _scheduler_with_requests(
         [
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-a"},
-            {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": "adapter-b"},
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": False,
+                "seq_len": 8,
+                "is_multimodal": True,
+                "lora_id": "adapter-b",
+            },
             {"is_prefill": False, "seq_len": 8, "is_multimodal": True, "lora_id": None},
         ]
     )
@@ -841,10 +953,10 @@ def test_step_scheduler_tightens_multimodal_lora_decode_limit_on_locality_under_
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.decodes is not None
-    assert plan.effective_decode_multimodal_lora_request_limit == 1
-    assert plan.decode_multimodal_lora_limit_tightened is True
-    assert plan.decode_multimodal_lora_limit_tightened_by_locality is True
-    assert plan.decode_multimodal_lora_max_fairness_gap <= 0.2
+    assert plan.metrics.effective_decode_multimodal_lora_request_limit == 1
+    assert plan.metrics.decode_multimodal_lora_limit_tightened is True
+    assert plan.metrics.decode_multimodal_lora_limit_tightened_by_locality is True
+    assert plan.metrics.decode_multimodal_lora_max_fairness_gap <= 0.2
 
 
 def test_step_scheduler_tracks_multimodal_queue_wait_metrics(monkeypatch) -> None:
@@ -877,10 +989,10 @@ def test_step_scheduler_tracks_multimodal_queue_wait_metrics(monkeypatch) -> Non
     )
     plan = step_scheduler.build_plan(scheduler)
 
-    assert plan.queued_multimodal_requests == 1
-    assert plan.queued_multimodal_avg_wait_s == 6.0
-    assert plan.queued_multimodal_max_wait_s == 6.0
-    assert plan.queued_multimodal_p95_wait_s == 6.0
+    assert plan.metrics.queued_multimodal_requests == 1
+    assert plan.metrics.queued_multimodal_avg_wait_s == 6.0
+    assert plan.metrics.queued_multimodal_max_wait_s == 6.0
+    assert plan.metrics.queued_multimodal_p95_wait_s == 6.0
 
 
 def test_step_scheduler_starvation_protects_prefill_after_decode_streak() -> None:
@@ -908,7 +1020,8 @@ def test_step_scheduler_starvation_protects_prefill_after_decode_streak() -> Non
     assert plan1.prefills is None
     assert plan2.prefills is None
     assert plan3.prefills is not None
-    assert plan3.prefill_starvation_protected is True
+    assert plan3.metrics is not None
+    assert plan3.metrics.prefill_starvation_protected is True
 
 
 def test_step_scheduler_decode_round_robin_when_budget_is_limited() -> None:
@@ -965,7 +1078,8 @@ def test_step_scheduler_prefill_round_robin_and_deferral_protection() -> None:
     assert plan1.prefills is None
     assert plan2.prefills is None
     assert plan3.prefills is not None
-    assert plan3.prefill_starvation_protected is True
+    assert plan3.metrics is not None
+    assert plan3.metrics.prefill_starvation_protected is True
 
 
 def test_step_scheduler_prefill_round_robin_selects_different_request_ids() -> None:
@@ -994,19 +1108,36 @@ def test_step_scheduler_prefill_round_robin_selects_different_request_ids() -> N
     assert plan2.prefills.request_ids == ["r1"]
 
 
-def test_step_scheduler_admission_uses_service_class_weights_across_step_limit() -> None:
+def test_step_scheduler_admission_uses_service_class_weights_across_step_limit() -> (
+    None
+):
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.enqueue_request(
         "latency-0",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2], "service_class": "latency"},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2],
+            "service_class": "latency",
+        },
     )
     scheduler.enqueue_request(
         "latency-1",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "service_class": "latency"},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2, 3],
+            "service_class": "latency",
+        },
     )
     scheduler.enqueue_request(
         "background-0",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1], "service_class": "background"},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1],
+            "service_class": "background",
+        },
     )
 
     step_scheduler = StepScheduler(
@@ -1025,22 +1156,43 @@ def test_step_scheduler_admission_uses_service_class_weights_across_step_limit()
 
     assert plan.admissions is not None
     assert set(plan.admissions.request_ids) == {"latency-0", "background-0"}
-    assert plan.admitted_service_classes == {"latency": 1, "background": 1}
+    assert plan.metrics.admitted_service_classes == {"latency": 1, "background": 1}
 
 
 def test_step_scheduler_decode_uses_weighted_service_class_fairness() -> None:
     scheduler = RequestScheduler(max_active_requests=4)
     scheduler.add_request(
         "latency-0",
-        {"slot_idx": 0, "is_prefill": False, "seq_len": 4, "generated_ids": [1], "input_ids": [1, 2], "service_class": "latency"},
+        {
+            "slot_idx": 0,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "service_class": "latency",
+        },
     )
     scheduler.add_request(
         "background-0",
-        {"slot_idx": 1, "is_prefill": False, "seq_len": 4, "generated_ids": [1], "input_ids": [1, 2], "service_class": "background"},
+        {
+            "slot_idx": 1,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "service_class": "background",
+        },
     )
     scheduler.add_request(
         "background-1",
-        {"slot_idx": 2, "is_prefill": False, "seq_len": 4, "generated_ids": [1], "input_ids": [1, 2], "service_class": "background"},
+        {
+            "slot_idx": 2,
+            "is_prefill": False,
+            "seq_len": 4,
+            "generated_ids": [1],
+            "input_ids": [1, 2],
+            "service_class": "background",
+        },
     )
 
     step_scheduler = StepScheduler(
@@ -1061,7 +1213,8 @@ def test_step_scheduler_decode_uses_weighted_service_class_fairness() -> None:
     assert plan2.decodes is not None
     assert set(plan1.decodes.request_ids) == {"latency-0", "background-0"}
     assert set(plan2.decodes.request_ids) == {"latency-0", "background-1"}
-    assert plan1.decode_service_classes == {"latency": 1, "background": 1}
+    assert plan1.metrics is not None
+    assert plan1.metrics.decode_service_classes == {"latency": 1, "background": 1}
 
 
 def test_step_scheduler_reports_lora_adapter_counts() -> None:
@@ -1111,10 +1264,10 @@ def test_step_scheduler_reports_lora_adapter_counts() -> None:
     )
     plan = step_scheduler.build_plan(scheduler)
 
-    assert plan.admitted_lora_adapters == {"adapter-a": 1}
-    assert plan.prefill_lora_adapters == {"adapter-a": 1}
-    assert plan.decode_lora_adapters == {"adapter-b": 1}
-    assert plan.queued_lora_adapters == {"adapter-a": 1}
+    assert plan.metrics.admitted_lora_adapters == {"adapter-a": 1}
+    assert plan.metrics.prefill_lora_adapters == {"adapter-a": 1}
+    assert plan.metrics.decode_lora_adapters == {"adapter-b": 1}
+    assert plan.metrics.queued_lora_adapters == {"adapter-a": 1}
 
 
 def test_step_scheduler_limits_admit_lora_adapters_per_step_and_rotates() -> None:
@@ -1166,8 +1319,10 @@ def test_step_scheduler_limits_admit_lora_adapters_per_step_and_rotates() -> Non
 
     assert plan1.admissions is not None
     assert plan2.admissions is not None
-    assert len(plan1.admitted_lora_adapters or {}) == 1
-    assert len(plan2.admitted_lora_adapters or {}) == 1
+    assert plan1.metrics is not None
+    assert plan2.metrics is not None
+    assert len(plan1.metrics.admitted_lora_adapters or {}) == 1
+    assert len(plan2.metrics.admitted_lora_adapters or {}) == 1
     assert plan1.admissions.request_ids != plan2.admissions.request_ids
 
 
@@ -1183,7 +1338,12 @@ def test_step_scheduler_relaxes_admit_lora_limit_on_fairness_gap() -> None:
     )
     scheduler.enqueue_request(
         "adapter-c-0",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "lora_id": "adapter-c"},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2, 3],
+            "lora_id": "adapter-c",
+        },
     )
 
     step_scheduler = StepScheduler(
@@ -1204,9 +1364,9 @@ def test_step_scheduler_relaxes_admit_lora_limit_on_fairness_gap() -> None:
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.admissions is not None
-    assert plan.effective_admit_lora_adapter_limit == 2
-    assert len(plan.admitted_lora_adapters or {}) == 2
-    assert plan.admitted_max_lora_fairness_gap > 0.0
+    assert plan.metrics.effective_admit_lora_adapter_limit == 2
+    assert len(plan.metrics.admitted_lora_adapters or {}) == 2
+    assert plan.metrics.admitted_max_lora_fairness_gap > 0.0
 
 
 def test_step_scheduler_limits_prefill_lora_adapters_per_batch() -> None:
@@ -1244,8 +1404,10 @@ def test_step_scheduler_limits_prefill_lora_adapters_per_batch() -> None:
 
     assert plan1.prefills is not None
     assert plan2.prefills is not None
-    assert len(plan1.prefill_lora_adapters or {}) == 1
-    assert len(plan2.prefill_lora_adapters or {}) == 1
+    assert plan1.metrics is not None
+    assert plan2.metrics is not None
+    assert len(plan1.metrics.prefill_lora_adapters or {}) == 1
+    assert len(plan2.metrics.prefill_lora_adapters or {}) == 1
     assert plan1.prefills.request_ids != plan2.prefills.request_ids
 
 
@@ -1283,8 +1445,8 @@ def test_step_scheduler_tightens_prefill_lora_limit_when_locality_is_good() -> N
     plan = step_scheduler.build_plan(scheduler)
 
     assert plan.prefills is not None
-    assert plan.effective_prefill_lora_adapter_limit == 1
-    assert len(plan.prefill_lora_adapters or {}) == 1
+    assert plan.metrics.effective_prefill_lora_adapter_limit == 1
+    assert len(plan.metrics.prefill_lora_adapters or {}) == 1
     assert len(plan.prefills.request_ids) == 1
 
 
@@ -1342,8 +1504,10 @@ def test_step_scheduler_limits_decode_lora_adapters_per_batch() -> None:
 
     assert plan1.decodes is not None
     assert plan2.decodes is not None
-    assert len(plan1.decode_lora_adapters or {}) == 2
-    assert len(plan2.decode_lora_adapters or {}) == 2
+    assert plan1.metrics is not None
+    assert plan2.metrics is not None
+    assert len(plan1.metrics.decode_lora_adapters or {}) == 2
+    assert len(plan2.metrics.decode_lora_adapters or {}) == 2
     assert set(plan1.decodes.request_ids) != set(plan2.decodes.request_ids)
 
 
@@ -1351,7 +1515,13 @@ def test_step_scheduler_reports_aged_admissions() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
     scheduler.enqueue_request(
         "old-latency",
-        {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2, 3], "queued_at": 1.0, "service_class": "latency"},
+        {
+            "is_prefill": True,
+            "seq_len": 0,
+            "input_ids": [1, 2, 3],
+            "queued_at": 1.0,
+            "service_class": "latency",
+        },
     )
 
     step_scheduler = StepScheduler(
@@ -1373,7 +1543,7 @@ def test_step_scheduler_reports_aged_admissions() -> None:
         time.perf_counter = original_perf_counter  # type: ignore[assignment]
 
     assert plan.admissions is not None
-    assert plan.aged_admission_count == 1
+    assert plan.metrics.aged_admission_count == 1
 
 
 def test_step_scheduler_admission_service_class_quota_reserves_slots() -> None:
@@ -1427,7 +1597,7 @@ def test_step_scheduler_admission_service_class_quota_reserves_slots() -> None:
 
     assert plan.admissions is not None
     assert set(plan.admissions.request_ids) == {"latency-0", "background-0"}
-    assert plan.admitted_service_classes == {"latency": 1, "background": 1}
+    assert plan.metrics.admitted_service_classes == {"latency": 1, "background": 1}
 
 
 def test_step_scheduler_decode_service_class_quota_reserves_budget() -> None:
@@ -1482,7 +1652,7 @@ def test_step_scheduler_decode_service_class_quota_reserves_budget() -> None:
 
     assert plan.decodes is not None
     assert "background-0" in plan.decodes.request_ids
-    assert plan.decode_service_classes == {"latency": 1, "background": 1}
+    assert plan.metrics.decode_service_classes == {"latency": 1, "background": 1}
 
 
 def test_step_scheduler_reports_queued_service_class_wait_metrics(monkeypatch) -> None:
@@ -1522,16 +1692,27 @@ def test_step_scheduler_reports_queued_service_class_wait_metrics(monkeypatch) -
 
     plan = step_scheduler.build_plan(scheduler)
 
-    assert plan.queued_service_classes == {"latency": 1, "background": 1}
-    assert plan.queued_max_wait_s == 8.0
-    assert plan.queued_avg_wait_s == 6.0
-    assert plan.queued_p95_wait_s == 8.0
-    assert plan.queued_service_class_avg_wait_s == {"latency": 8.0, "background": 4.0}
-    assert plan.queued_service_class_max_wait_s == {"latency": 8.0, "background": 4.0}
-    assert plan.queued_service_class_p95_wait_s == {"latency": 8.0, "background": 4.0}
+    assert plan.metrics.queued_service_classes == {"latency": 1, "background": 1}
+    assert plan.metrics.queued_max_wait_s == 8.0
+    assert plan.metrics.queued_avg_wait_s == 6.0
+    assert plan.metrics.queued_p95_wait_s == 8.0
+    assert plan.metrics.queued_service_class_avg_wait_s == {
+        "latency": 8.0,
+        "background": 4.0,
+    }
+    assert plan.metrics.queued_service_class_max_wait_s == {
+        "latency": 8.0,
+        "background": 4.0,
+    }
+    assert plan.metrics.queued_service_class_p95_wait_s == {
+        "latency": 8.0,
+        "background": 4.0,
+    }
 
 
-def test_step_scheduler_fairness_guardrail_triggers_prefill_protection(monkeypatch) -> None:
+def test_step_scheduler_fairness_guardrail_triggers_prefill_protection(
+    monkeypatch,
+) -> None:
     scheduler = RequestScheduler(max_active_requests=3)
     scheduler.add_request(
         "p0",
@@ -1580,6 +1761,6 @@ def test_step_scheduler_fairness_guardrail_triggers_prefill_protection(monkeypat
 
     plan = step_scheduler.build_plan(scheduler)
 
-    assert plan.fairness_guardrail_triggered is True
-    assert plan.prefill_starvation_protected is True
+    assert plan.metrics.fairness_guardrail_triggered is True
+    assert plan.metrics.prefill_starvation_protected is True
     assert plan.prefills is not None

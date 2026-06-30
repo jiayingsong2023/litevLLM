@@ -20,7 +20,13 @@ from vllm.engine.scheduling_helpers import (
     service_class_priority,
     share_gap_map,
 )
-from vllm.engine.step_plan import AdmissionPlan, DecodePlan, PrefillPlan, StepPlan
+from vllm.engine.step_plan import (
+    AdmissionPlan,
+    DecodePlan,
+    PrefillPlan,
+    StepPlan,
+    StepPlanMetrics,
+)
 
 
 @dataclass(frozen=True)
@@ -234,6 +240,19 @@ class StepScheduler:
             self._multimodal_prefix_cache_hit_rate_feedback = 0.0
 
     def build_plan(self, scheduler) -> StepPlan:
+        fast_decode_plan = self._build_single_request_decode_fast_path(scheduler)
+        if fast_decode_plan is not None:
+            decode_ids = (
+                fast_decode_plan.decodes.request_ids if fast_decode_plan.decodes else []
+            )
+            self._update_prefill_deferrals(
+                [],
+                decode_ids,
+                None,
+            )
+            self._update_decode_streak(fast_decode_plan)
+            return fast_decode_plan
+
         # Determine the maximum sequence length among all active requests
         max_active_seq_len = 0
         for rid in list(scheduler.running_ids) + list(scheduler.queued_ids):
@@ -355,118 +374,156 @@ class StepScheduler:
             prefills=prefill_plan,
             decodes=decode_plan,
             step_token_budget=self.step_token_budget,
-            queued_before=scheduler.queued_request_count,
-            running_before=scheduler.running_request_count,
-            multimodal_prefix_cache_hit_rate=self._multimodal_prefix_cache_hit_rate_feedback,
-            prefill_starvation_protected=bool(
-                starvation_protected and prefill_plan is not None
+            metrics=StepPlanMetrics(
+                queued_before=scheduler.queued_request_count,
+                running_before=scheduler.running_request_count,
+                multimodal_prefix_cache_hit_rate=(
+                    self._multimodal_prefix_cache_hit_rate_feedback
+                ),
+                prefill_starvation_protected=bool(
+                    starvation_protected and prefill_plan is not None
+                ),
+                aged_admission_count=aged_admission_count,
+                admitted_service_classes=admitted_service_classes,
+                admitted_multimodal_requests=self._count_multimodal_requests(
+                    scheduler, admitted_request_ids
+                ),
+                admitted_multimodal_lora_requests=self._count_multimodal_lora_requests(
+                    scheduler, admitted_request_ids
+                ),
+                effective_admit_multimodal_lora_request_limit=(
+                    effective_admit_multimodal_lora_limit
+                ),
+                admit_multimodal_lora_limit_triggered=(
+                    admit_multimodal_lora_limit_triggered
+                ),
+                admitted_lora_adapters=self._count_lora_adapters(
+                    scheduler, admitted_request_ids
+                ),
+                effective_admit_lora_adapter_limit=effective_admit_lora_limit,
+                admit_lora_limit_relaxed=admit_lora_relaxed,
+                admit_lora_limit_tightened=admit_lora_tightened,
+                admitted_lora_fairness_gap=admitted_lora_gap,
+                admitted_max_lora_fairness_gap=self._max_abs_share_gap(
+                    admitted_lora_gap
+                ),
+                prefill_service_classes=prefill_service_classes,
+                prefill_multimodal_requests=self._count_multimodal_requests(
+                    scheduler, prefill_request_ids
+                ),
+                prefill_multimodal_lora_requests=self._count_multimodal_lora_requests(
+                    scheduler, prefill_request_ids
+                ),
+                effective_prefill_multimodal_request_limit=(
+                    effective_prefill_multimodal_limit
+                ),
+                prefill_multimodal_limit_relaxed=prefill_multimodal_relaxed,
+                prefill_multimodal_limit_tightened=prefill_multimodal_tightened,
+                prefill_multimodal_limit_triggered=prefill_multimodal_limit_triggered,
+                effective_prefill_multimodal_lora_request_limit=(
+                    effective_prefill_multimodal_lora_limit
+                ),
+                prefill_multimodal_lora_limit_relaxed=(prefill_multimodal_lora_relaxed),
+                prefill_multimodal_lora_limit_tightened=(
+                    prefill_multimodal_lora_tightened
+                ),
+                prefill_multimodal_lora_limit_relaxed_by_fairness=(
+                    prefill_multimodal_lora_relaxed_by_fairness
+                ),
+                prefill_multimodal_lora_limit_tightened_by_locality=(
+                    prefill_multimodal_lora_tightened_by_locality
+                ),
+                prefill_multimodal_lora_max_fairness_gap=(
+                    prefill_multimodal_lora_max_fairness_gap
+                ),
+                prefill_multimodal_lora_limit_triggered=(
+                    prefill_multimodal_lora_limit_triggered
+                ),
+                prefill_lora_adapters=prefill_lora_adapters,
+                effective_prefill_lora_adapter_limit=effective_prefill_lora_limit,
+                prefill_lora_limit_relaxed=prefill_lora_relaxed,
+                prefill_lora_limit_tightened=prefill_lora_tightened,
+                prefill_lora_fairness_gap=prefill_lora_gap,
+                prefill_max_lora_fairness_gap=self._max_abs_share_gap(prefill_lora_gap),
+                decode_service_classes=decode_service_classes,
+                decode_multimodal_requests=self._count_multimodal_requests(
+                    scheduler, decode_request_ids
+                ),
+                decode_multimodal_lora_requests=self._count_multimodal_lora_requests(
+                    scheduler, decode_request_ids
+                ),
+                effective_decode_multimodal_lora_request_limit=(
+                    effective_decode_multimodal_lora_limit
+                ),
+                decode_multimodal_lora_limit_relaxed=decode_multimodal_lora_relaxed,
+                decode_multimodal_lora_limit_tightened=decode_multimodal_lora_tightened,
+                decode_multimodal_lora_limit_triggered=(
+                    decode_multimodal_lora_limit_triggered
+                ),
+                decode_multimodal_lora_limit_relaxed_by_fairness=(
+                    decode_multimodal_lora_relaxed_by_fairness
+                ),
+                decode_multimodal_lora_limit_tightened_by_locality=(
+                    decode_multimodal_lora_tightened_by_locality
+                ),
+                decode_multimodal_lora_max_fairness_gap=(
+                    decode_multimodal_lora_max_fairness_gap
+                ),
+                decode_lora_adapters=decode_lora_adapters,
+                effective_decode_lora_adapter_limit=effective_decode_lora_limit,
+                decode_lora_limit_relaxed=decode_lora_relaxed,
+                decode_lora_limit_tightened=decode_lora_tightened,
+                decode_lora_fairness_gap=decode_lora_gap,
+                decode_max_lora_fairness_gap=self._max_abs_share_gap(decode_lora_gap),
+                queued_service_classes=queued_metrics["service_classes"],
+                queued_multimodal_requests=queued_metrics["multimodal_requests"],
+                queued_multimodal_lora_requests=queued_metrics[
+                    "multimodal_lora_requests"
+                ],
+                queued_lora_adapters=queued_metrics["lora_adapters"],
+                queued_avg_wait_s=queued_metrics["avg_wait_s"],
+                queued_max_wait_s=queued_metrics["max_wait_s"],
+                queued_p95_wait_s=queued_metrics["p95_wait_s"],
+                queued_multimodal_avg_wait_s=queued_metrics["multimodal_avg_wait_s"],
+                queued_multimodal_max_wait_s=queued_metrics["multimodal_max_wait_s"],
+                queued_multimodal_p95_wait_s=queued_metrics["multimodal_p95_wait_s"],
+                queued_service_class_avg_wait_s=queued_metrics[
+                    "service_class_avg_wait_s"
+                ],
+                queued_service_class_max_wait_s=queued_metrics[
+                    "service_class_max_wait_s"
+                ],
+                queued_service_class_p95_wait_s=queued_metrics[
+                    "service_class_p95_wait_s"
+                ],
+                fairness_guardrail_triggered=fairness_guardrail_triggered,
             ),
-            aged_admission_count=aged_admission_count,
-            admitted_service_classes=admitted_service_classes,
-            admitted_multimodal_requests=self._count_multimodal_requests(
-                scheduler, admitted_request_ids
-            ),
-            admitted_multimodal_lora_requests=self._count_multimodal_lora_requests(
-                scheduler, admitted_request_ids
-            ),
-            effective_admit_multimodal_lora_request_limit=(
-                effective_admit_multimodal_lora_limit
-            ),
-            admit_multimodal_lora_limit_triggered=(
-                admit_multimodal_lora_limit_triggered
-            ),
-            admitted_lora_adapters=self._count_lora_adapters(
-                scheduler, admitted_request_ids
-            ),
-            effective_admit_lora_adapter_limit=effective_admit_lora_limit,
-            admit_lora_limit_relaxed=admit_lora_relaxed,
-            admit_lora_limit_tightened=admit_lora_tightened,
-            admitted_lora_fairness_gap=admitted_lora_gap,
-            admitted_max_lora_fairness_gap=self._max_abs_share_gap(admitted_lora_gap),
-            prefill_service_classes=prefill_service_classes,
-            prefill_multimodal_requests=self._count_multimodal_requests(
-                scheduler, prefill_request_ids
-            ),
-            prefill_multimodal_lora_requests=self._count_multimodal_lora_requests(
-                scheduler, prefill_request_ids
-            ),
-            effective_prefill_multimodal_request_limit=(
-                effective_prefill_multimodal_limit
-            ),
-            prefill_multimodal_limit_relaxed=prefill_multimodal_relaxed,
-            prefill_multimodal_limit_tightened=prefill_multimodal_tightened,
-            prefill_multimodal_limit_triggered=prefill_multimodal_limit_triggered,
-            effective_prefill_multimodal_lora_request_limit=(
-                effective_prefill_multimodal_lora_limit
-            ),
-            prefill_multimodal_lora_limit_relaxed=(prefill_multimodal_lora_relaxed),
-            prefill_multimodal_lora_limit_tightened=(prefill_multimodal_lora_tightened),
-            prefill_multimodal_lora_limit_relaxed_by_fairness=(
-                prefill_multimodal_lora_relaxed_by_fairness
-            ),
-            prefill_multimodal_lora_limit_tightened_by_locality=(
-                prefill_multimodal_lora_tightened_by_locality
-            ),
-            prefill_multimodal_lora_max_fairness_gap=(
-                prefill_multimodal_lora_max_fairness_gap
-            ),
-            prefill_multimodal_lora_limit_triggered=(
-                prefill_multimodal_lora_limit_triggered
-            ),
-            prefill_lora_adapters=prefill_lora_adapters,
-            effective_prefill_lora_adapter_limit=effective_prefill_lora_limit,
-            prefill_lora_limit_relaxed=prefill_lora_relaxed,
-            prefill_lora_limit_tightened=prefill_lora_tightened,
-            prefill_lora_fairness_gap=prefill_lora_gap,
-            prefill_max_lora_fairness_gap=self._max_abs_share_gap(prefill_lora_gap),
-            decode_service_classes=decode_service_classes,
-            decode_multimodal_requests=self._count_multimodal_requests(
-                scheduler, decode_request_ids
-            ),
-            decode_multimodal_lora_requests=self._count_multimodal_lora_requests(
-                scheduler, decode_request_ids
-            ),
-            effective_decode_multimodal_lora_request_limit=(
-                effective_decode_multimodal_lora_limit
-            ),
-            decode_multimodal_lora_limit_relaxed=decode_multimodal_lora_relaxed,
-            decode_multimodal_lora_limit_tightened=decode_multimodal_lora_tightened,
-            decode_multimodal_lora_limit_triggered=(
-                decode_multimodal_lora_limit_triggered
-            ),
-            decode_multimodal_lora_limit_relaxed_by_fairness=(
-                decode_multimodal_lora_relaxed_by_fairness
-            ),
-            decode_multimodal_lora_limit_tightened_by_locality=(
-                decode_multimodal_lora_tightened_by_locality
-            ),
-            decode_multimodal_lora_max_fairness_gap=(
-                decode_multimodal_lora_max_fairness_gap
-            ),
-            decode_lora_adapters=decode_lora_adapters,
-            effective_decode_lora_adapter_limit=effective_decode_lora_limit,
-            decode_lora_limit_relaxed=decode_lora_relaxed,
-            decode_lora_limit_tightened=decode_lora_tightened,
-            decode_lora_fairness_gap=decode_lora_gap,
-            decode_max_lora_fairness_gap=self._max_abs_share_gap(decode_lora_gap),
-            queued_service_classes=queued_metrics["service_classes"],
-            queued_multimodal_requests=queued_metrics["multimodal_requests"],
-            queued_multimodal_lora_requests=queued_metrics["multimodal_lora_requests"],
-            queued_lora_adapters=queued_metrics["lora_adapters"],
-            queued_avg_wait_s=queued_metrics["avg_wait_s"],
-            queued_max_wait_s=queued_metrics["max_wait_s"],
-            queued_p95_wait_s=queued_metrics["p95_wait_s"],
-            queued_multimodal_avg_wait_s=queued_metrics["multimodal_avg_wait_s"],
-            queued_multimodal_max_wait_s=queued_metrics["multimodal_max_wait_s"],
-            queued_multimodal_p95_wait_s=queued_metrics["multimodal_p95_wait_s"],
-            queued_service_class_avg_wait_s=queued_metrics["service_class_avg_wait_s"],
-            queued_service_class_max_wait_s=queued_metrics["service_class_max_wait_s"],
-            queued_service_class_p95_wait_s=queued_metrics["service_class_p95_wait_s"],
-            fairness_guardrail_triggered=fairness_guardrail_triggered,
         )
         self._update_prefill_deferrals(prefills, decodes, prefill_plan)
         self._update_decode_streak(plan)
         return plan
+
+    def _build_single_request_decode_fast_path(self, scheduler) -> StepPlan | None:
+        if scheduler.queued_request_count != 0 or scheduler.running_request_count != 1:
+            return None
+        rid = scheduler.running_ids[0]
+        req = scheduler.get_request(rid)
+        if bool(req.get("is_prefill", False)):
+            return None
+        return StepPlan(
+            admissions=None,
+            prefills=None,
+            decodes=DecodePlan(
+                request_ids=[rid],
+                token_budget=1,
+                use_fast_path=True,
+            ),
+            step_token_budget=self.step_token_budget,
+            metrics=StepPlanMetrics(
+                queued_before=0,
+                running_before=1,
+            ),
+        )
 
     def _build_single_request_fast_path(self, scheduler) -> StepPlan | None:
         """Fast scheduler path for the common single-running-request case.
@@ -495,8 +552,10 @@ class StepScheduler:
                 prefills=prefill,
                 decodes=None,
                 step_token_budget=self.step_token_budget,
-                queued_before=queued_before,
-                running_before=running_before,
+                metrics=StepPlanMetrics(
+                    queued_before=queued_before,
+                    running_before=running_before,
+                ),
             )
 
         decode = DecodePlan(
@@ -509,8 +568,10 @@ class StepScheduler:
             prefills=None,
             decodes=decode,
             step_token_budget=self.step_token_budget,
-            queued_before=queued_before,
-            running_before=running_before,
+            metrics=StepPlanMetrics(
+                queued_before=queued_before,
+                running_before=running_before,
+            ),
         )
 
     def _build_admission_plan(

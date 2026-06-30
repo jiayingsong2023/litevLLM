@@ -7,6 +7,9 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashMemoryPolicy,
 )
+from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
+    DeepSeekV4FlashDirectRuntime,
+)
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 
@@ -36,6 +39,25 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         return None
+
+    def build_direct_runtime(
+        self,
+        *,
+        model: Any,
+        model_config: Any,
+        runtime_config: Any,
+        tokenizer: Any | None,
+        device: Any,
+        observer: Any | None,
+    ) -> DeepSeekV4FlashDirectRuntime:
+        return DeepSeekV4FlashDirectRuntime(
+            model=model,
+            model_config=model_config,
+            runtime_config=runtime_config,
+            tokenizer=tokenizer,
+            device=device,
+            observer=observer,
+        )
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         shape = DEEPSEEK_V4_FLASH_SHAPE

@@ -26,7 +26,7 @@ class LLM:
         self.vllm_config = build_vllm_config(model, **kwargs)
         self.engine = LiteEngine(self.vllm_config)
         self.tokenizer = get_tokenizer(self.vllm_config.model_config)
-        self.engine.tokenizer = self.tokenizer
+        self.engine.set_tokenizer(self.tokenizer)
 
         from vllm.entrypoints.output_processors import (
             DefaultOutputProcessor,

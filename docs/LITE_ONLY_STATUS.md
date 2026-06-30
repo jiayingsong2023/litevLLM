@@ -26,9 +26,15 @@ targets.
 
 - Engine control plane is decomposed into scheduler, request lifecycle,
   prefill/decode executors, sampling, output assembly, observer, and errors.
+- `StepPlan` is reduced to execution fields; observer counters live in
+  `StepPlanMetrics`.
+- Single-request decode fast path avoids adaptive chunk-size scans, and
+  non-fast decode batch construction reuses builder-owned scratch tensors.
 - Runtime policy flows through `FastInferenceConfig`, runtime profiles, and
   `RuntimeConfig`.
 - Model capability decisions are centralized under `vllm/adapters/`.
+- DeepSeek V4 Flash direct GGUF serving is installed by its adapter-owned
+  direct runtime, not by a model-name branch in `LiteEngine`.
 - Gemma4 model code has been split from a large monolithic module into the
   `vllm/model_executor/models/gemma4/` package.
 - `vllm/worker/`, `vllm/core/`, and `vllm/distributed/` have been removed from
@@ -79,6 +85,7 @@ config/profile fields.
 
 ## Onboarding Rule
 
-New model support should be implemented through adapter, loader, model, and
-policy modules. Do not add model-name conditionals to `LiteEngine`,
-`step_scheduler.py`, executor modules, or generic hot-path loader code.
+New model support should be implemented through adapter, loader, model, policy,
+and, only when needed, an adapter-owned direct runtime module. Do not add
+model-name conditionals to `LiteEngine`, `step_scheduler.py`, executor modules,
+or generic hot-path loader code.

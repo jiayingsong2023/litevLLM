@@ -90,18 +90,25 @@ class _BridgeDriver:
 
 
 class _DirectDeepSeekEngine:
-    _deepseek_v4_flash_direct = True
-
     def __init__(self) -> None:
+        self.direct_runtime = self
         self.generated: list[tuple[str, str, int]] = []
 
-    def generate_deepseek_v4_flash_greedy(
+    def generate(
         self,
         *,
         request_id: str,
         prompt: str,
         sampling_params: SamplingParams,
+        lora_request=None,
+        multi_modal_data=None,
     ) -> RequestOutput:
+        if lora_request is not None:
+            raise ValueError("DeepSeek V4 Flash direct runtime does not support LoRA")
+        if multi_modal_data is not None:
+            raise ValueError(
+                "DeepSeek V4 Flash direct runtime does not support multimodal input"
+            )
         self.generated.append((request_id, prompt, int(sampling_params.max_tokens)))
         return RequestOutput(
             request_id=request_id,

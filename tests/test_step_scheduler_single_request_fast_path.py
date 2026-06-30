@@ -12,6 +12,8 @@ from vllm.sampling_params import SamplingParams
 class _MockScheduler:
     request: RequestState
     _queued: int = 0
+    running_ids_reads: int = 0
+    queued_ids_reads: int = 0
 
     @property
     def queued_request_count(self) -> int:
@@ -23,10 +25,12 @@ class _MockScheduler:
 
     @property
     def queued_ids(self) -> list[str]:
+        self.queued_ids_reads += 1
         return ["q0"] if self._queued else []
 
     @property
     def running_ids(self) -> list[str]:
+        self.running_ids_reads += 1
         return ["r0"]
 
     @property
@@ -96,6 +100,8 @@ def test_single_request_fast_path_decode_uses_fast_decode() -> None:
     assert plan.decodes.request_ids == ["r0"]
     assert plan.decodes.token_budget == 1
     assert plan.decodes.use_fast_path is True
+    assert mock.running_ids_reads == 1
+    assert mock.queued_ids_reads == 0
 
 
 def test_single_request_fast_path_disabled_when_queue_not_empty() -> None:
@@ -112,4 +118,4 @@ def test_single_request_fast_path_disabled_when_queue_not_empty() -> None:
         _queued=1,
     )
     plan = scheduler.build_plan(mock)
-    assert plan.queued_before == 1
+    assert plan.metrics.queued_before == 1

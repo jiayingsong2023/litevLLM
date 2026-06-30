@@ -52,6 +52,11 @@ the file is missing. The target GGUF is roughly 80.7GiB and the path is still
 experimental. Override the path with `MODEL_DEEPSEEK_V4_FLASH_GGUF` when the
 model lives outside `models/DeepSeek-V4-Flash-ds4/`.
 
+DeepSeek V4 Flash uses an adapter-owned direct runtime instead of the standard
+step scheduler/output pipeline. Its benchmark reports decode throughput, but
+`stream_visible=0%` is expected because the direct benchmark does not emit the
+standard per-token streaming observer events.
+
 The script suppresses tool debug logs by default, prints a compact
 prompt/output summary for Tier-B spotchecks, and prints full captured output
 only on failure. Set `FI_CORRECTNESS_VERBOSE=1` to restore full stage output.

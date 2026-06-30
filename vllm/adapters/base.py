@@ -47,3 +47,15 @@ class ModelAdapter(Protocol):
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         """Install model-specific tuning config before model construction."""
+
+    def build_direct_runtime(
+        self,
+        *,
+        model: Any,
+        model_config: Any,
+        runtime_config: Any,
+        tokenizer: Any | None,
+        device: Any,
+        observer: Any | None,
+    ) -> Any | None:
+        """Build a model-owned direct runtime, if this model bypasses LiteEngine."""

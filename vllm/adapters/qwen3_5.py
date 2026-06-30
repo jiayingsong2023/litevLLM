@@ -3,21 +3,24 @@ from typing import Any, cast
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 from .policy_keys import (
-    Qwen35ModelPolicy,
     QWEN35_FLA_CHUNK_ENABLED,
     QWEN35_FULLATTN_STABILIZER,
     QWEN35_FULLATTN_USE_SDPA_PREFILL,
     QWEN35_LINEAR_INPUT_CAP,
     QWEN35_RESIDUAL_STABILIZER,
+    Qwen35ModelPolicy,
 )
 
-QWEN35_PRODUCTION_MODEL_POLICY: Qwen35ModelPolicy = cast(Qwen35ModelPolicy, {
-    QWEN35_FULLATTN_STABILIZER: True,
-    QWEN35_FULLATTN_USE_SDPA_PREFILL: True,
-    QWEN35_RESIDUAL_STABILIZER: True,
-    QWEN35_LINEAR_INPUT_CAP: True,
-    QWEN35_FLA_CHUNK_ENABLED: True,
-})
+QWEN35_PRODUCTION_MODEL_POLICY: Qwen35ModelPolicy = cast(
+    Qwen35ModelPolicy,
+    {
+        QWEN35_FULLATTN_STABILIZER: True,
+        QWEN35_FULLATTN_USE_SDPA_PREFILL: True,
+        QWEN35_RESIDUAL_STABILIZER: True,
+        QWEN35_LINEAR_INPUT_CAP: True,
+        QWEN35_FLA_CHUNK_ENABLED: True,
+    },
+)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -40,11 +43,14 @@ class Qwen35Adapter(ModelAdapter):
         profile = getattr(runtime_config, "profile", None)
         if str(getattr(profile, "effective_name", "")).lower() == "accuracy":
             model_policy.update(
-                cast(Qwen35ModelPolicy, {
-                    QWEN35_FULLATTN_STABILIZER: False,
-                    QWEN35_RESIDUAL_STABILIZER: False,
-                    QWEN35_LINEAR_INPUT_CAP: False,
-                })
+                cast(
+                    Qwen35ModelPolicy,
+                    {
+                        QWEN35_FULLATTN_STABILIZER: False,
+                        QWEN35_RESIDUAL_STABILIZER: False,
+                        QWEN35_LINEAR_INPUT_CAP: False,
+                    },
+                )
             )
         return RuntimeModelPolicy(
             prefill_chunk_size_high_end=2048,
@@ -55,6 +61,18 @@ class Qwen35Adapter(ModelAdapter):
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         # Qwen3.5 production policy lives in ``model_policy``. No model-local
         # tuning env remains after migrating full-attention and FLA controls.
+        return None
+
+    def build_direct_runtime(
+        self,
+        *,
+        model: Any,
+        model_config: Any,
+        runtime_config: Any,
+        tokenizer: Any | None,
+        device: Any,
+        observer: Any | None,
+    ) -> None:
         return None
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:

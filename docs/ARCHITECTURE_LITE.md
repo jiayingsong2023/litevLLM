@@ -26,6 +26,10 @@ LLM / AsyncLLM / OpenAI API Server
 use. Legacy upstream concepts such as workers, block managers, and distributed
 executors are not a second supported runtime.
 
+Model-specific direct runtimes are owned by adapters. `LiteEngine` may install
+an adapter-provided direct runtime, but generic engine code should not branch on
+model class names.
+
 ```mermaid
 flowchart TD
     API["LLM / AsyncLLM / OpenAI REST"] --> Config["serving/config_builder.py"]
@@ -144,6 +148,11 @@ single-process model:
 - `StepScheduler` builds one `StepPlan` per engine step. A plan may admit
   queued requests, run chunked prefills, run decodes, or interleave prefill and
   decode work within configured token and fairness limits.
+- `StepPlan` carries only execution fields. Observer/debug counters live in
+  `StepPlanMetrics` and are consumed by `RuntimeObserver`.
+- Single-request decode fast path bypasses adaptive prefill chunk scanning.
+  Non-fast decode batches reuse `InputBatchBuilder` scratch tensors for
+  `input_ids`, `positions`, `slot_mapping`, and `seq_lens`.
 - `LiteSingleGPUBackend` executes the plan synchronously on one GPU and frees
   request slots when outputs finish.
 
@@ -247,16 +256,21 @@ coverage against a PyTorch reference.
 
 DeepSeek V4 Flash is an experimental exception to the standard paged-KV model
 path. It still enters through `AsyncLLM` and the OpenAI-compatible REST server,
-but `LiteEngine` detects `DeepSeekV4FlashForCausalLM` and installs a direct
-batch=1 greedy runtime instead of the generic step scheduler.
+but its adapter installs a direct batch=1 greedy runtime instead of the generic
+step scheduler.
 
 ```text
 OpenAI REST / AsyncLLM
-  -> LiteEngine.generate_deepseek_v4_flash_greedy()
+  -> LiteEngine direct_runtime
+  -> deepseek_v4_flash/direct_runtime.py
   -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
   -> deepseek_v4_flash/gpu_layers.py
   -> kernels/triton/deepseek_v4_flash/*
 ```
+
+The direct GGUF benchmark reports decode throughput but does not use the
+standard per-token streaming observer; `stream_visible=0%` is expected for that
+benchmark path.
 
 Current limits are explicit in code and docs:
 

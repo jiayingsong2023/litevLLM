@@ -22,7 +22,7 @@ class AsyncLLM(EngineClient):
     def __init__(self, vllm_config: VllmConfig, **kwargs):
         self.vllm_config = vllm_config
         self.engine = LiteEngine(vllm_config)
-        self.engine.tokenizer = get_tokenizer(vllm_config.model_config)
+        self.engine.set_tokenizer(get_tokenizer(vllm_config.model_config))
         runtime_config = getattr(vllm_config, "runtime_config", None)
         min_step_interval_s = float(
             getattr(runtime_config, "async_driver_min_step_interval_s", 0.001)
@@ -48,19 +48,14 @@ class AsyncLLM(EngineClient):
         multi_modal_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
-        if getattr(self.engine, "_deepseek_v4_flash_direct", False):
-            if lora_request is not None:
-                raise ValueError(
-                    "DeepSeek V4 Flash direct runtime does not support LoRA"
-                )
-            if multi_modal_data is not None:
-                raise ValueError(
-                    "DeepSeek V4 Flash direct runtime does not support multimodal input"
-                )
-            yield self.engine.generate_deepseek_v4_flash_greedy(
+        direct_runtime = getattr(self.engine, "direct_runtime", None)
+        if direct_runtime is not None:
+            yield direct_runtime.generate(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
             )
             return
 

@@ -5,7 +5,12 @@ from vllm.engine.errors import RequestRejectedError
 from vllm.engine.request_state import RequestState
 from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.runtime_observer import InMemoryRuntimeObserver
-from vllm.engine.step_plan import AdmissionPlan, DecodePlan, StepPlan
+from vllm.engine.step_plan import (
+    AdmissionPlan,
+    DecodePlan,
+    StepPlan,
+    StepPlanMetrics,
+)
 
 
 class _FakeScheduler:
@@ -58,8 +63,10 @@ class _FakeStepScheduler:
             prefills=None,
             decodes=DecodePlan(request_ids=["q1"], token_budget=1, use_fast_path=True),
             step_token_budget=4,
-            queued_before=1,
-            running_before=scheduler.running_request_count,
+            metrics=StepPlanMetrics(
+                queued_before=1,
+                running_before=scheduler.running_request_count,
+            ),
         )
 
 
@@ -194,8 +201,7 @@ def test_runtime_controller_uses_preempted_step_plan(monkeypatch) -> None:
                     request_ids=["q1"], token_budget=1, use_fast_path=True
                 ),
                 step_token_budget=step_plan.step_token_budget,
-                queued_before=step_plan.queued_before,
-                running_before=step_plan.running_before,
+                metrics=step_plan.metrics,
             )
 
     backend = _PlanChangingBackend()

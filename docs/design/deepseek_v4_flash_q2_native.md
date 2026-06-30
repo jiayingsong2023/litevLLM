@@ -43,7 +43,7 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
-## Implemented State As Of 2026-06-26
+## Implemented State As Of 2026-06-30
 
 The branch currently has an experimental batch=1 greedy GPU direct path for the
 target GGUF. It is REST-callable through the lite OpenAI-compatible chat path
@@ -63,7 +63,9 @@ Current code path summary:
 
 ```text
 OpenAI REST / AsyncLLM
-  -> LiteEngine.generate_deepseek_v4_flash_greedy()
+  -> DeepSeekV4FlashAdapter.build_direct_runtime()
+  -> LiteEngine direct_runtime
+  -> deepseek_v4_flash/direct_runtime.py
   -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
   -> gpu_runtime.py + compressed_kv.py
   -> gpu_layers.py / gpu_backend.py
@@ -625,10 +627,11 @@ vllm/kernels/triton/deepseek_v4_flash/
 
 The model package should stay vertical and explicit, but not monolithic.
 `model.py` wires layers together and owns the reference/kernel dispatch
-boundary. Format parsing, quantized math, attention, and MoE execution stay in
-separate modules so they can be tested independently. The OpenAI API server,
-`AsyncLLM`, `LiteEngine`, and prefill/decode executors remain control-plane
-code and must not grow DeepSeek-specific math.
+boundary. Format parsing, quantized math, attention, direct runtime, and MoE
+execution stay in separate modules so they can be tested independently. The
+OpenAI API server, `AsyncLLM`, `LiteEngine`, and prefill/decode executors remain
+control-plane code and must not grow DeepSeek-specific math or model-name
+routing branches.
 
 ## Data Flow
 
@@ -636,7 +639,8 @@ code and must not grow DeepSeek-specific math.
 flowchart TD
     REST["OpenAI-compatible REST"] --> Async["AsyncLLM"]
     Async --> Engine["LiteEngine"]
-    Engine --> Model["DeepSeekV4FlashForCausalLM"]
+    Engine --> Direct["Adapter-owned DirectRuntime"]
+    Direct --> Model["DeepSeekV4FlashForCausalLM"]
     Model --> Store["DS4 GGUF mmap WeightStore"]
     Model --> KV["Paged DeepSeekV4CompressedKVCache"]
     Model --> Attn["Hybrid raw + compressed attention"]

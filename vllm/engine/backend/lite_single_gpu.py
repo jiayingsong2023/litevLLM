@@ -143,7 +143,7 @@ class LiteSingleGpuBackend:
         if (
             step_plan.prefills is not None
             and step_plan.decodes is not None
-            and not getattr(step_plan, "prefill_starvation_protected", False)
+            and not getattr(step_plan.metrics, "prefill_starvation_protected", False)
             and getattr(scheduler, "queued_request_count", 0)
             >= self.preemption_min_backlog
             and len(step_plan.decodes.request_ids) >= self.preemption_min_decodes
@@ -168,28 +168,7 @@ class LiteSingleGpuBackend:
                 prefills=None,
                 decodes=step_plan.decodes,
                 step_token_budget=step_plan.step_token_budget,
-                queued_before=step_plan.queued_before,
-                running_before=step_plan.running_before,
-                prefill_starvation_protected=step_plan.prefill_starvation_protected,
-                aged_admission_count=step_plan.aged_admission_count,
-                admitted_service_classes=step_plan.admitted_service_classes,
-                admitted_multimodal_requests=step_plan.admitted_multimodal_requests,
-                prefill_service_classes=step_plan.prefill_service_classes,
-                prefill_multimodal_requests=step_plan.prefill_multimodal_requests,
-                decode_service_classes=step_plan.decode_service_classes,
-                decode_multimodal_requests=step_plan.decode_multimodal_requests,
-                queued_service_classes=step_plan.queued_service_classes,
-                queued_multimodal_requests=step_plan.queued_multimodal_requests,
-                queued_avg_wait_s=step_plan.queued_avg_wait_s,
-                queued_max_wait_s=step_plan.queued_max_wait_s,
-                queued_p95_wait_s=step_plan.queued_p95_wait_s,
-                queued_multimodal_avg_wait_s=step_plan.queued_multimodal_avg_wait_s,
-                queued_multimodal_max_wait_s=step_plan.queued_multimodal_max_wait_s,
-                queued_multimodal_p95_wait_s=step_plan.queued_multimodal_p95_wait_s,
-                queued_service_class_avg_wait_s=step_plan.queued_service_class_avg_wait_s,
-                queued_service_class_max_wait_s=step_plan.queued_service_class_max_wait_s,
-                queued_service_class_p95_wait_s=step_plan.queued_service_class_p95_wait_s,
-                fairness_guardrail_triggered=step_plan.fairness_guardrail_triggered,
+                metrics=step_plan.metrics,
             )
         return step_plan
 
@@ -501,7 +480,10 @@ class LiteSingleGpuBackend:
         threshold = self.preemption_max_queue_wait_s
         if threshold <= 0:
             return False
-        return float(getattr(step_plan, "queued_p95_wait_s", 0.0) or 0.0) >= threshold
+        return (
+            float(getattr(step_plan.metrics, "queued_p95_wait_s", 0.0) or 0.0)
+            >= threshold
+        )
 
     def _prefills_are_preemptible(self, step_plan: StepPlan, scheduler: Any) -> bool:
         if not self.preemptible_service_classes or step_plan.prefills is None:
@@ -531,7 +513,8 @@ class LiteSingleGpuBackend:
             self.observer.on_multimodal_preemption_guard(
                 protected_prefill_requests=len(step_plan.prefills.request_ids),
                 prefix_cache_hit_rate=float(
-                    getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0
+                    getattr(step_plan.metrics, "multimodal_prefix_cache_hit_rate", 0.0)
+                    or 0.0
                 ),
             )
             return False
@@ -539,7 +522,10 @@ class LiteSingleGpuBackend:
             if self.preempt_multimodal_max_queue_wait_s <= 0:
                 return True
             return (
-                float(getattr(step_plan, "queued_multimodal_p95_wait_s", 0.0) or 0.0)
+                float(
+                    getattr(step_plan.metrics, "queued_multimodal_p95_wait_s", 0.0)
+                    or 0.0
+                )
                 >= self.preempt_multimodal_max_queue_wait_s
             )
         return False
@@ -549,7 +535,10 @@ class LiteSingleGpuBackend:
         if threshold <= 0:
             return False
         return (
-            float(getattr(step_plan, "multimodal_prefix_cache_hit_rate", 0.0) or 0.0)
+            float(
+                getattr(step_plan.metrics, "multimodal_prefix_cache_hit_rate", 0.0)
+                or 0.0
+            )
             >= threshold
         )
 

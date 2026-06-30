@@ -20,6 +20,9 @@ def test_async_llm_stats_delegates_to_engine(monkeypatch) -> None:
         def stats(self) -> dict[str, object]:
             return {"scheduler": {"active_request_count": 1}}
 
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
+
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             self.reset_calls.append(clear_prefix_cache)
 

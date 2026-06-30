@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
+from vllm.engine.request_state import RequestState
 from vllm.engine.runtime_observer import InMemoryRuntimeObserver
-from vllm.engine.step_plan import StepPlan
+from vllm.engine.step_plan import StepPlan, StepPlanMetrics
+
+
+def _request_state(**overrides) -> RequestState:
+    data = {
+        "request_id": "r1",
+        "prompt": "",
+        "input_ids": [1],
+        "sampling_params": object(),
+    }
+    data.update(overrides)
+    return RequestState(**data)
 
 
 def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
     observer = InMemoryRuntimeObserver()
     observer.on_request_added(
         "r1",
-        {
-            "input_ids": [1, 2],
-            "is_prefill": True,
-            "multi_modal_data": {"image": [{"image": "file:///tmp/cat.png"}]},
-            "lora_id": "adapter-a",
-        },
+        _request_state(
+            input_ids=[1, 2],
+            multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+            lora_id="adapter-a",
+        ),
     )
     observer.on_request_admitted("r1", 0.125, "latency")
     observer.on_prefix_cache_event(
@@ -51,45 +62,47 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
             prefills=None,
             decodes=None,
             step_token_budget=4,
-            aged_admission_count=1,
-            admitted_service_classes={"latency": 1},
-            admitted_multimodal_requests=1,
-            admitted_multimodal_lora_requests=1,
-            effective_admit_multimodal_lora_request_limit=1,
-            admit_multimodal_lora_limit_triggered=True,
-            admitted_lora_adapters={"adapter-a": 1},
-            admit_lora_limit_relaxed=True,
-            prefill_service_classes={"balanced": 1},
-            prefill_multimodal_requests=1,
-            prefill_multimodal_lora_requests=1,
-            effective_prefill_multimodal_lora_request_limit=1,
-            prefill_multimodal_lora_limit_relaxed=True,
-            prefill_multimodal_lora_limit_relaxed_by_fairness=True,
-            prefill_multimodal_lora_max_fairness_gap=0.25,
-            prefill_multimodal_lora_limit_triggered=False,
-            prefill_lora_adapters={"adapter-a": 1, "adapter-b": 1},
-            prefill_lora_limit_tightened=True,
-            decode_service_classes={"background": 2},
-            decode_multimodal_requests=0,
-            decode_multimodal_lora_requests=0,
-            effective_decode_multimodal_lora_request_limit=0,
-            decode_lora_adapters={"adapter-b": 2},
-            decode_lora_limit_relaxed=True,
-            queued_service_classes={"latency": 1},
-            queued_multimodal_requests=1,
-            queued_multimodal_lora_requests=1,
-            queued_lora_adapters={"adapter-a": 1},
-            queued_avg_wait_s=0.125,
-            queued_max_wait_s=0.125,
-            queued_p95_wait_s=0.125,
-            queued_multimodal_avg_wait_s=0.2,
-            queued_multimodal_max_wait_s=0.2,
-            queued_multimodal_p95_wait_s=0.2,
-            queued_service_class_avg_wait_s={"latency": 0.125},
-            queued_service_class_max_wait_s={"latency": 0.125},
-            queued_service_class_p95_wait_s={"latency": 0.125},
-            fairness_guardrail_triggered=True,
-            prefill_starvation_protected=True,
+            metrics=StepPlanMetrics(
+                aged_admission_count=1,
+                admitted_service_classes={"latency": 1},
+                admitted_multimodal_requests=1,
+                admitted_multimodal_lora_requests=1,
+                effective_admit_multimodal_lora_request_limit=1,
+                admit_multimodal_lora_limit_triggered=True,
+                admitted_lora_adapters={"adapter-a": 1},
+                admit_lora_limit_relaxed=True,
+                prefill_service_classes={"balanced": 1},
+                prefill_multimodal_requests=1,
+                prefill_multimodal_lora_requests=1,
+                effective_prefill_multimodal_lora_request_limit=1,
+                prefill_multimodal_lora_limit_relaxed=True,
+                prefill_multimodal_lora_limit_relaxed_by_fairness=True,
+                prefill_multimodal_lora_max_fairness_gap=0.25,
+                prefill_multimodal_lora_limit_triggered=False,
+                prefill_lora_adapters={"adapter-a": 1, "adapter-b": 1},
+                prefill_lora_limit_tightened=True,
+                decode_service_classes={"background": 2},
+                decode_multimodal_requests=0,
+                decode_multimodal_lora_requests=0,
+                effective_decode_multimodal_lora_request_limit=0,
+                decode_lora_adapters={"adapter-b": 2},
+                decode_lora_limit_relaxed=True,
+                queued_service_classes={"latency": 1},
+                queued_multimodal_requests=1,
+                queued_multimodal_lora_requests=1,
+                queued_lora_adapters={"adapter-a": 1},
+                queued_avg_wait_s=0.125,
+                queued_max_wait_s=0.125,
+                queued_p95_wait_s=0.125,
+                queued_multimodal_avg_wait_s=0.2,
+                queued_multimodal_max_wait_s=0.2,
+                queued_multimodal_p95_wait_s=0.2,
+                queued_service_class_avg_wait_s={"latency": 0.125},
+                queued_service_class_max_wait_s={"latency": 0.125},
+                queued_service_class_p95_wait_s={"latency": 0.125},
+                fairness_guardrail_triggered=True,
+                prefill_starvation_protected=True,
+            ),
         )
     )
     observer.on_prefill_executed(object(), 1)
@@ -192,7 +205,7 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
 def test_inmemory_runtime_observer_stats_snapshot() -> None:
     observer = InMemoryRuntimeObserver()
 
-    observer.on_request_added("r1", {"input_ids": [1], "is_prefill": True})
+    observer.on_request_added("r1", _request_state())
     observer.on_request_rejected("r2", "capacity")
     observer.on_request_admitted("r1", 0.2, "latency")
     observer.on_prefix_cache_event(
@@ -231,52 +244,54 @@ def test_inmemory_runtime_observer_stats_snapshot() -> None:
             prefills=None,
             decodes=None,
             step_token_budget=4,
-            aged_admission_count=2,
-            admitted_service_classes={"latency": 1, "background": 1},
-            admitted_multimodal_requests=1,
-            admitted_multimodal_lora_requests=1,
-            effective_admit_multimodal_lora_request_limit=1,
-            admit_multimodal_lora_limit_triggered=True,
-            admitted_lora_adapters={"adapter-a": 1},
-            admit_lora_limit_relaxed=True,
-            prefill_service_classes={"latency": 1},
-            prefill_multimodal_requests=2,
-            prefill_multimodal_lora_requests=1,
-            effective_prefill_multimodal_request_limit=2,
-            prefill_multimodal_limit_relaxed=True,
-            prefill_multimodal_limit_triggered=True,
-            effective_prefill_multimodal_lora_request_limit=1,
-            prefill_multimodal_lora_limit_tightened=True,
-            prefill_multimodal_lora_limit_tightened_by_locality=True,
-            prefill_multimodal_lora_max_fairness_gap=0.1,
-            prefill_multimodal_lora_limit_triggered=True,
-            prefill_lora_adapters={"adapter-a": 1},
-            prefill_lora_limit_tightened=True,
-            decode_service_classes={"background": 1},
-            decode_multimodal_requests=1,
-            decode_multimodal_lora_requests=1,
-            effective_decode_multimodal_lora_request_limit=1,
-            decode_multimodal_lora_limit_tightened=True,
-            decode_multimodal_lora_limit_tightened_by_locality=True,
-            decode_multimodal_lora_limit_triggered=True,
-            decode_multimodal_lora_max_fairness_gap=0.1,
-            decode_lora_adapters={"adapter-b": 1},
-            decode_lora_limit_relaxed=True,
-            queued_service_classes={"latency": 2, "background": 1},
-            queued_multimodal_requests=2,
-            queued_multimodal_lora_requests=1,
-            queued_lora_adapters={"adapter-a": 2, "adapter-b": 1},
-            queued_avg_wait_s=2.0,
-            queued_max_wait_s=5.0,
-            queued_p95_wait_s=5.0,
-            queued_multimodal_avg_wait_s=3.0,
-            queued_multimodal_max_wait_s=4.0,
-            queued_multimodal_p95_wait_s=4.0,
-            queued_service_class_avg_wait_s={"latency": 2.5, "background": 1.0},
-            queued_service_class_max_wait_s={"latency": 5.0, "background": 1.0},
-            queued_service_class_p95_wait_s={"latency": 5.0, "background": 1.0},
-            fairness_guardrail_triggered=True,
-            prefill_starvation_protected=True,
+            metrics=StepPlanMetrics(
+                aged_admission_count=2,
+                admitted_service_classes={"latency": 1, "background": 1},
+                admitted_multimodal_requests=1,
+                admitted_multimodal_lora_requests=1,
+                effective_admit_multimodal_lora_request_limit=1,
+                admit_multimodal_lora_limit_triggered=True,
+                admitted_lora_adapters={"adapter-a": 1},
+                admit_lora_limit_relaxed=True,
+                prefill_service_classes={"latency": 1},
+                prefill_multimodal_requests=2,
+                prefill_multimodal_lora_requests=1,
+                effective_prefill_multimodal_request_limit=2,
+                prefill_multimodal_limit_relaxed=True,
+                prefill_multimodal_limit_triggered=True,
+                effective_prefill_multimodal_lora_request_limit=1,
+                prefill_multimodal_lora_limit_tightened=True,
+                prefill_multimodal_lora_limit_tightened_by_locality=True,
+                prefill_multimodal_lora_max_fairness_gap=0.1,
+                prefill_multimodal_lora_limit_triggered=True,
+                prefill_lora_adapters={"adapter-a": 1},
+                prefill_lora_limit_tightened=True,
+                decode_service_classes={"background": 1},
+                decode_multimodal_requests=1,
+                decode_multimodal_lora_requests=1,
+                effective_decode_multimodal_lora_request_limit=1,
+                decode_multimodal_lora_limit_tightened=True,
+                decode_multimodal_lora_limit_tightened_by_locality=True,
+                decode_multimodal_lora_limit_triggered=True,
+                decode_multimodal_lora_max_fairness_gap=0.1,
+                decode_lora_adapters={"adapter-b": 1},
+                decode_lora_limit_relaxed=True,
+                queued_service_classes={"latency": 2, "background": 1},
+                queued_multimodal_requests=2,
+                queued_multimodal_lora_requests=1,
+                queued_lora_adapters={"adapter-a": 2, "adapter-b": 1},
+                queued_avg_wait_s=2.0,
+                queued_max_wait_s=5.0,
+                queued_p95_wait_s=5.0,
+                queued_multimodal_avg_wait_s=3.0,
+                queued_multimodal_max_wait_s=4.0,
+                queued_multimodal_p95_wait_s=4.0,
+                queued_service_class_avg_wait_s={"latency": 2.5, "background": 1.0},
+                queued_service_class_max_wait_s={"latency": 5.0, "background": 1.0},
+                queued_service_class_p95_wait_s={"latency": 5.0, "background": 1.0},
+                fairness_guardrail_triggered=True,
+                prefill_starvation_protected=True,
+            ),
         )
     )
 
@@ -375,7 +390,10 @@ def test_inmemory_runtime_observer_stats_snapshot() -> None:
         "max_queue_wait_s": 5.0,
         "p95_queue_wait_s": 5.0,
         "avg_admitted_queue_wait_s": 0.2,
-        "per_class_avg_queue_wait_s": {"latency": 1.7333333333333334, "background": 1.0},
+        "per_class_avg_queue_wait_s": {
+            "latency": 1.7333333333333334,
+            "background": 1.0,
+        },
         "per_class_max_queue_wait_s": {"latency": 5.0, "background": 1.0},
         "per_class_p95_queue_wait_s": {"latency": 5.0, "background": 1.0},
     }
@@ -401,7 +419,7 @@ def test_inmemory_runtime_observer_stats_snapshot() -> None:
 
 def test_inmemory_runtime_observer_reset_stats() -> None:
     observer = InMemoryRuntimeObserver()
-    observer.on_request_added("r1", {"input_ids": [1], "is_prefill": True})
+    observer.on_request_added("r1", _request_state())
     observer.on_prefix_cache_event(
         "r1",
         hit=True,

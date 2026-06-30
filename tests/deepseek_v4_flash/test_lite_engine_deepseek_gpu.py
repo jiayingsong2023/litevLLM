@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from vllm.engine.lite_engine import LiteEngine
+from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
+    DeepSeekV4FlashDirectRuntime,
+)
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
@@ -68,14 +71,21 @@ def _deepseek_engine() -> LiteEngine:
     engine.model = _FakeDeepSeekModel()
     engine.tokenizer = _FakeTokenizer()
     engine.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    engine._deepseek_v4_flash_direct = True
+    engine.direct_runtime = DeepSeekV4FlashDirectRuntime(
+        model=engine.model,
+        model_config=SimpleNamespace(max_model_len=4096),
+        runtime_config=SimpleNamespace(queue_timeout_s=30.0),
+        tokenizer=engine.tokenizer,
+        device=engine.device,
+        observer=None,
+    )
     return engine
 
 
 def test_lite_engine_deepseek_direct_greedy_uses_kernel_generate() -> None:
     engine = _deepseek_engine()
 
-    output = engine.generate_deepseek_v4_flash_greedy(
+    output = engine.direct_runtime.generate(
         request_id="req-1",
         prompt="hello",
         sampling_params=SamplingParams(max_tokens=2, temperature=0.0),
@@ -94,7 +104,7 @@ def test_lite_engine_deepseek_direct_rejects_non_greedy_sampling() -> None:
     engine = _deepseek_engine()
 
     with pytest.raises(ValueError, match="greedy"):
-        engine.generate_deepseek_v4_flash_greedy(
+        engine.direct_runtime.generate(
             request_id="req-1",
             prompt="hello",
             sampling_params=SamplingParams(max_tokens=1, temperature=0.7),
@@ -105,7 +115,7 @@ def test_lite_engine_deepseek_direct_rejects_batch_outputs() -> None:
     engine = _deepseek_engine()
 
     with pytest.raises(ValueError, match="n=1"):
-        engine.generate_deepseek_v4_flash_greedy(
+        engine.direct_runtime.generate(
             request_id="req-1",
             prompt="hello",
             sampling_params=SamplingParams(max_tokens=1, temperature=0.0, n=2),
@@ -131,7 +141,10 @@ def test_lite_engine_marks_deepseek_direct_runtime_without_kv_allocation(
                 tuning_env_overrides={},
                 model_policy={},
                 kernel_policy={},
-            )
+            ),
+            build_direct_runtime=lambda **kwargs: DeepSeekV4FlashDirectRuntime(
+                **kwargs
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -161,6 +174,9 @@ def test_lite_engine_marks_deepseek_direct_runtime_without_kv_allocation(
     engine = LiteEngine(cfg)  # type: ignore[arg-type]
 
     assert engine.model is fake_model
-    assert engine._deepseek_v4_flash_direct is True
-    assert engine.max_active_requests == 1
+    assert engine.direct_runtime is not None
+    assert not hasattr(engine, "_deepseek_v4_flash_direct")
     assert engine.model.prepared == (engine.max_model_len, "cuda")
+    tokenizer = _FakeTokenizer()
+    engine.set_tokenizer(tokenizer)
+    assert engine.direct_runtime.tokenizer is tokenizer

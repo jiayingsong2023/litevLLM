@@ -27,6 +27,10 @@ class InputBatchBuilder:
         self.inf_config = inf_config
         self._stack_per_layer_carries = stack_per_layer_carries
         self._split_per_layer_carries = split_per_layer_carries
+        self._decode_input_ids: torch.Tensor | None = None
+        self._decode_positions: torch.Tensor | None = None
+        self._decode_slot_mapping: torch.Tensor | None = None
+        self._decode_seq_lens: torch.Tensor | None = None
 
     def build_prefill(
         self,
@@ -157,37 +161,42 @@ class InputBatchBuilder:
         request_ids: list[str],
         scheduler: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[RequestState]]:
-        input_tokens = []
+        bs = len(request_ids)
+        self._ensure_decode_scratch(bs)
+        assert self._decode_input_ids is not None
+        assert self._decode_positions is not None
+        assert self._decode_slot_mapping is not None
+        assert self._decode_seq_lens is not None
+        curr_input = self._decode_input_ids[:bs]
+        positions = self._decode_positions[:bs]
+        slot_mapping = self._decode_slot_mapping[:bs]
+        seq_lens_t = self._decode_seq_lens[:bs]
+
         slot_indices = []
-        seq_lens = []
-        pos_indices = []
+        seq_lens_cpu_list = []
+        positions_cpu_list = []
+        req_dicts = []
 
-        for rid in request_ids:
+        for i, rid in enumerate(request_ids):
             req = scheduler.get_request(rid)
+            req_dicts.append(req)
             last_token = req.generated_ids[-1]
-            input_tokens.append([last_token])
+            current_len = int(req.seq_len)
+            slot_idx = int(req.slot_idx)
+            curr_input[i, 0] = last_token
+            positions[i, 0] = current_len
+            slot_mapping[i] = slot_idx * self.max_model_len + current_len
+            seq_lens_t[i] = current_len + 1
             slot_indices.append(req.slot_idx)
-            current_len = req.seq_len
-            seq_lens.append(current_len + 1)
-            pos_indices.append(current_len)
+            seq_lens_cpu_list.append(current_len + 1)
+            positions_cpu_list.append(current_len)
 
-        curr_input = torch.tensor(input_tokens, device=self.device)
-        positions = torch.tensor(pos_indices, device=self.device).unsqueeze(1)
         block_tables = torch.stack(
             [
                 self.kv_block_manager.block_table_for_slot(slot_idx, device=self.device)
                 for slot_idx in slot_indices
             ]
         ).to(self.device)
-        slot_mapping = torch.tensor(
-            [
-                int(s) * self.max_model_len + p
-                for s, p in zip(slot_indices, pos_indices)
-            ],
-            device=self.device,
-            dtype=torch.long,
-        )
-        req_dicts = [scheduler.get_request(rid) for rid in request_ids]
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
         )
@@ -196,20 +205,16 @@ class InputBatchBuilder:
         )
         lora_mapping = [req.lora_id for req in req_dicts]
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
-        seq_lens_cpu_list = [int(v) for v in seq_lens]
-        positions_cpu_list = [int(v) for v in pos_indices]
         max_seq_len_cpu = max(seq_lens_cpu_list) if seq_lens_cpu_list else 0
         attn_metadata = {
             "slot_mapping": slot_mapping,
-            "seq_lens": torch.tensor(seq_lens, device=self.device, dtype=torch.int32),
+            "seq_lens": seq_lens_t,
             "seq_lens_cpu": seq_lens_cpu_list,
             "max_seq_len_cpu": int(max_seq_len_cpu),
             "positions_cpu": positions_cpu_list,
             "block_tables": block_tables,
             "is_prefill": False,
-            "kv_start_indices": torch.tensor(
-                pos_indices, device=self.device, dtype=torch.int32
-            ),
+            "kv_start_indices": positions.squeeze(1).to(torch.int32),
             "kv_start_indices_cpu": positions_cpu_list,
             "linear_attn_carry": attn_carry_batch,
             "linear_conv_carry": conv_carry_batch,
@@ -234,6 +239,25 @@ class InputBatchBuilder:
             ),
         }
         return curr_input, positions, attn_metadata, req_dicts
+
+    def _ensure_decode_scratch(self, batch_size: int) -> None:
+        if (
+            self._decode_input_ids is not None
+            and self._decode_input_ids.shape[0] >= batch_size
+        ):
+            return
+        self._decode_input_ids = torch.empty(
+            (batch_size, 1), device=self.device, dtype=torch.long
+        )
+        self._decode_positions = torch.empty(
+            (batch_size, 1), device=self.device, dtype=torch.long
+        )
+        self._decode_slot_mapping = torch.empty(
+            (batch_size,), device=self.device, dtype=torch.long
+        )
+        self._decode_seq_lens = torch.empty(
+            (batch_size,), device=self.device, dtype=torch.int32
+        )
 
     def build_decode_fast(
         self,

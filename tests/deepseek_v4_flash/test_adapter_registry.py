@@ -4,6 +4,9 @@ from fixtures import write_minimal_deepseek_v4_flash_gguf
 
 from vllm.adapters.deepseek_v4_flash import DeepSeekV4FlashAdapter
 from vllm.adapters.registry import get_model_adapter
+from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
+    DeepSeekV4FlashDirectRuntime,
+)
 
 
 def _model_config(**overrides):
@@ -64,3 +67,18 @@ def test_deepseek_adapter_policy_is_experimental_and_capped() -> None:
     assert policy.model_policy["experimental"] is True
     assert policy.model_policy["max_tested_context"] == 8192
     assert policy.kernel_policy["compressed_attention_uses_page_tables"] is True
+
+
+def test_deepseek_adapter_builds_direct_runtime() -> None:
+    adapter = DeepSeekV4FlashAdapter()
+
+    runtime = adapter.build_direct_runtime(
+        model=object(),
+        model_config=_model_config(),
+        runtime_config=SimpleNamespace(queue_timeout_s=30.0),
+        tokenizer=object(),
+        device="cpu",
+        observer=None,
+    )
+
+    assert isinstance(runtime, DeepSeekV4FlashDirectRuntime)

@@ -1,20 +1,38 @@
 # Benchmarks
 
-This directory used to contain vLLM's benchmark scripts and utilities for performance testing and evaluation.
+FastInference uses the lite runtime benchmark entrypoints under `tests/` as the
+maintained performance gate. The upstream vLLM benchmark CLI is not the support
+surface for this repository.
 
-## Contents
+## Main E2E Gate
 
-- **Serving benchmarks**: Scripts for testing online inference performance (latency, throughput)
-- **Throughput benchmarks**: Scripts for testing offline batch inference performance
-- **Specialized benchmarks**: Tools for testing specific features like structured output, prefix caching, long document QA, request prioritization, and multi-modal inference
-- **Dataset utilities**: Framework for loading and sampling from various benchmark datasets (ShareGPT, HuggingFace datasets, synthetic data, etc.)
+```bash
+uv run python tests/e2e_full_benchmark.py
+```
 
-## Usage
+This runs the maintained single-GPU targets:
 
-For detailed usage instructions, examples, and dataset information, see the [Benchmark CLI documentation](https://docs.vllm.ai/en/latest/contributing/benchmarks.html#benchmark-cli).
+- Gemma4-26B-A4B AWQ
+- Gemma4-31B AWQ
+- DeepSeek V4 Flash Q2 GGUF, when the local target model exists
 
-For full CLI reference see:
+Use `--json-out` to keep a machine-readable summary:
 
-- <https://docs.vllm.ai/en/latest/cli/bench/latency.html>
-- <https://docs.vllm.ai/en/latest/cli/bench/serve.html>
-- <https://docs.vllm.ai/en/latest/cli/bench/throughput.html>
+```bash
+uv run python tests/e2e_full_benchmark.py \
+  --json-out /tmp/fastinference_e2e.json
+```
+
+DeepSeek V4 Flash uses an adapter-owned direct GGUF runtime. Its benchmark
+reports decode throughput but does not emit standard per-token streaming
+observer events, so `stream_visible=0%` is expected for that workload.
+
+## Related Gates
+
+```bash
+bash tests/run_regression_suite.sh
+SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
+```
+
+Keep new benchmark scripts tied to a maintained regression entrypoint. One-off
+experiments belong in `tests/tools/` only when a regression command uses them.

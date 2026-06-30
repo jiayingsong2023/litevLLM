@@ -288,6 +288,7 @@ class InMemoryRuntimeObserver(RuntimeObserver):
 
     def on_step_started(self, plan: Any) -> None:
         self.step_count += 1
+        plan = getattr(plan, "metrics", None) or plan
         if getattr(plan, "prefill_starvation_protected", False):
             self.starvation_protected_steps += 1
         if getattr(plan, "fairness_guardrail_triggered", False):

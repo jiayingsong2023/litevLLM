@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -33,10 +32,7 @@ from vllm.engine.runtime_planner import RuntimePlanner
 from vllm.engine.sampling_driver import SamplingDriver
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models.deepseek_v4_flash.model import (
-    DeepSeekV4FlashForCausalLM,
-)
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import RequestOutput
 from vllm.policies import build_generation_policies
 from vllm.sampling_params import SamplingParams
 
@@ -111,6 +107,10 @@ class LiteEngine:
         ) or RuntimeConfig.from_vllm_config(vllm_config)
         self.vllm_config.runtime_config = self.runtime_config
         requested_policy_mode = self.runtime_config.policy_mode
+        self.observer = (
+            getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
+        )
+        self.direct_runtime = None
         self.adapter = get_model_adapter(None, self.model_config)
         self.runtime_policy = self.adapter.runtime_policy(
             self.model_config,
@@ -126,19 +126,18 @@ class LiteEngine:
         self.model = get_model(vllm_config=self.vllm_config)
         print(f">>> LiteEngine: Model Type: {type(self.model)}")
         self.tokenizer = None
-        self._deepseek_v4_flash_direct = isinstance(
-            self.model,
-            DeepSeekV4FlashForCausalLM,
-        )
-        if self._deepseek_v4_flash_direct:
-            self._install_deepseek_v4_flash_direct_runtime()
+        self.adapter = get_model_adapter(self.model, self.model_config)
+        self.direct_runtime = self._build_direct_runtime()
+        if self.direct_runtime is not None:
+            self.max_model_len = int(getattr(self.model_config, "max_model_len", 4096))
+            self.runtime_controller = None
+            self.direct_runtime.prepare()
             return
         self.execution_policy = select_loadtime_policy(
             model_config=self.model_config,
             quant_config=getattr(vllm_config, "quant_config", None),
             policy_mode=requested_policy_mode,  # type: ignore[arg-type]
         )
-        self.adapter = get_model_adapter(self.model, self.model_config)
         self.model_capabilities = self.adapter.detect(self.model, self.model_config)
         self.model_surface = resolve_model_surface(
             model_name=str(getattr(self.model_config, "model", "")),
@@ -365,6 +364,26 @@ class LiteEngine:
         self.step_scheduler = runtime_components["step_scheduler"]
         self.execution_backend = runtime_components["execution_backend"]
         self.runtime_controller = runtime_components["runtime_controller"]
+
+    def _build_direct_runtime(self) -> Any | None:
+        build_direct_runtime = getattr(self.adapter, "build_direct_runtime", None)
+        if build_direct_runtime is None:
+            return None
+        return build_direct_runtime(
+            model=self.model,
+            model_config=self.model_config,
+            runtime_config=self.runtime_config,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            observer=self.observer,
+        )
+
+    def set_tokenizer(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+        if self.direct_runtime is not None and hasattr(
+            self.direct_runtime, "tokenizer"
+        ):
+            self.direct_runtime.tokenizer = tokenizer
 
     def _apply_runtime_model_policy(self) -> None:
         force_kv_dtype = self.runtime_policy.force_kv_cache_dtype
@@ -654,239 +673,6 @@ class LiteEngine:
     def unregister_lora_adapter(self, lora_name: str) -> bool:
         return self.lora_registry.unregister_adapter(lora_name)
 
-    def _install_deepseek_v4_flash_direct_runtime(self) -> None:
-        self.execution_policy = SimpleNamespace(max_tokens_cap=8192)
-        self.model_capabilities = None
-        self.model_surface = None
-        self.num_attention_heads = 0
-        self.num_kv_heads = 0
-        self.head_size = 0
-        self.num_layers = 0
-        self.max_active_requests = 4
-        self.max_model_len = int(getattr(self.model_config, "max_model_len", 4096))
-        self.block_size = 0
-        self.num_blocks_per_seq = 0
-        self.num_total_blocks = 0
-        self.kv_caches = []
-        self.kv_scale_caches = []
-        self.scheduler = None
-        self.lora_registry = LoRARuntimeRegistry()
-        self.policies = None
-        self.sampling_driver = None
-        self.output_pipeline = None
-        self.request_builder = None
-        self.observer = (
-            getattr(self.vllm_config, "runtime_observer", None) or NullRuntimeObserver()
-        )
-        self._queue_timeout_s = float(
-            getattr(self.runtime_config, "queue_timeout_s", 30.0)
-        )
-        self.runtime_controller = None
-        prepare = getattr(self.model, "prepare_for_serving", None)
-        if prepare is not None and self.device.type == "cuda":
-            prepare(context_length=self.max_model_len, device=self.device)
-
-    def _encode_prompt_for_deepseek_v4_flash(
-        self, prompt: str
-    ) -> tuple[list[int], torch.Tensor]:
-        """Tokenize ``prompt`` and return token ids plus a CUDA tensor."""
-        if self.tokenizer is None:
-            raise RuntimeError("DeepSeek V4 Flash direct runtime requires a tokenizer")
-        prompt_token_ids = [int(token) for token in self.tokenizer.encode(prompt)]
-        if not prompt_token_ids:
-            eos = getattr(self.tokenizer, "eos_token_id", None)
-            prompt_token_ids = [0 if eos is None else int(eos)]
-        input_ids = torch.tensor(
-            prompt_token_ids,
-            dtype=torch.long,
-            device=self.device,
-        )
-        return prompt_token_ids, input_ids
-
-    def _decode_generated_token_ids(
-        self,
-        generated_token_ids: list[int],
-        *,
-        skip_special_tokens: bool,
-    ) -> str:
-        """Decode generated token ids, tolerating older tokenizer signatures."""
-        try:
-            return self.tokenizer.decode(
-                generated_token_ids,
-                skip_special_tokens=skip_special_tokens,
-            )
-        except TypeError:
-            return self.tokenizer.decode(generated_token_ids)
-
-    def _build_deepseek_v4_flash_request_output(
-        self,
-        *,
-        request_id: str,
-        prompt: str,
-        prompt_token_ids: list[int],
-        output_ids: torch.Tensor,
-        skip_special_tokens: bool,
-    ) -> RequestOutput:
-        """Build a ``RequestOutput`` from raw model output ids."""
-        generated_token_ids = [
-            int(token)
-            for token in output_ids[len(prompt_token_ids) :].detach().cpu().tolist()
-        ]
-        text = self._decode_generated_token_ids(
-            generated_token_ids,
-            skip_special_tokens=skip_special_tokens,
-        )
-        return RequestOutput(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=prompt_token_ids,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text=text,
-                    token_ids=generated_token_ids,
-                    cumulative_logprob=0.0,
-                )
-            ],
-            finished=True,
-        )
-
-    def generate_deepseek_v4_flash_greedy(
-        self,
-        *,
-        request_id: str,
-        prompt: str,
-        sampling_params: SamplingParams,
-        use_graph: bool = False,
-    ) -> RequestOutput:
-        if not getattr(self, "_deepseek_v4_flash_direct", False):
-            raise RuntimeError("DeepSeek V4 Flash direct runtime is not enabled")
-        if self.tokenizer is None:
-            raise RuntimeError("DeepSeek V4 Flash direct runtime requires a tokenizer")
-        self._validate_deepseek_v4_flash_sampling(sampling_params)
-        max_tokens = int(sampling_params.max_tokens or 1)
-        prompt_token_ids, input_ids = self._encode_prompt_for_deepseek_v4_flash(prompt)
-        output_ids = self.model.generate_greedy_kernel(
-            input_ids,
-            max_tokens=max_tokens,
-            use_graph=use_graph,
-        )
-        return self._build_deepseek_v4_flash_request_output(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=prompt_token_ids,
-            output_ids=output_ids,
-            skip_special_tokens=sampling_params.skip_special_tokens,
-        )
-
-    def generate_deepseek_v4_flash_greedy_batched(
-        self,
-        *,
-        request_ids: list[str],
-        prompts: list[str],
-        sampling_params_list: list[SamplingParams],
-        use_graph: bool = False,
-    ) -> list[RequestOutput]:
-        """Greedy decode a batch of prompts through the batched kernel.
-
-        All prompts must share the same ``max_tokens`` value because the
-        underlying batched kernel accepts a single decode length.  Per-request
-        ``skip_special_tokens`` is honored when decoding each output.
-
-        ``use_graph`` is accepted for API symmetry but is ignored: CUDA/HIP
-        graph capture is disabled for batch size > 1.
-        """
-        if not getattr(self, "_deepseek_v4_flash_direct", False):
-            raise RuntimeError("DeepSeek V4 Flash direct runtime is not enabled")
-        if self.tokenizer is None:
-            raise RuntimeError("DeepSeek V4 Flash direct runtime requires a tokenizer")
-        if not prompts:
-            return []
-        if len(request_ids) != len(prompts) or len(prompts) != len(
-            sampling_params_list
-        ):
-            raise ValueError(
-                "request_ids, prompts, and sampling_params_list "
-                "must have the same length"
-            )
-
-        # ``use_graph`` is accepted for API symmetry but is ignored in the
-        # batched path; CUDA/HIP graph capture is disabled for batch size > 1.
-        del use_graph
-
-        for sampling_params in sampling_params_list:
-            self._validate_deepseek_v4_flash_sampling(sampling_params)
-
-        max_tokens = int(sampling_params_list[0].max_tokens or 1)
-        if any(
-            int(sampling_params.max_tokens or 1) != max_tokens
-            for sampling_params in sampling_params_list
-        ):
-            raise ValueError(
-                "Batched generation requires all sampling_params.max_tokens to be equal"
-            )
-
-        prompt_token_ids_list: list[list[int]] = []
-        input_ids_list: list[torch.Tensor] = []
-        for prompt in prompts:
-            prompt_token_ids, input_ids = self._encode_prompt_for_deepseek_v4_flash(
-                prompt
-            )
-            prompt_token_ids_list.append(prompt_token_ids)
-            input_ids_list.append(input_ids)
-
-        output_ids_list = self.model.generate_greedy_kernel_batched(
-            input_ids_list,
-            max_tokens=max_tokens,
-        )
-
-        outputs: list[RequestOutput] = []
-        for request_id, prompt, prompt_token_ids, output_ids, sampling_params in zip(
-            request_ids,
-            prompts,
-            prompt_token_ids_list,
-            output_ids_list,
-            sampling_params_list,
-            strict=True,
-        ):
-            outputs.append(
-                self._build_deepseek_v4_flash_request_output(
-                    request_id=request_id,
-                    prompt=prompt,
-                    prompt_token_ids=prompt_token_ids,
-                    output_ids=output_ids,
-                    skip_special_tokens=sampling_params.skip_special_tokens,
-                )
-            )
-        return outputs
-
-    @staticmethod
-    def _validate_deepseek_v4_flash_sampling(
-        sampling_params: SamplingParams,
-    ) -> None:
-        if int(getattr(sampling_params, "n", 1) or 1) != 1:
-            raise ValueError("DeepSeek V4 Flash direct runtime supports n=1 only")
-        max_tokens = getattr(sampling_params, "max_tokens", None)
-        if max_tokens is None or int(max_tokens) <= 0:
-            raise ValueError("DeepSeek V4 Flash direct runtime requires max_tokens > 0")
-        if float(getattr(sampling_params, "temperature", 0.0) or 0.0) != 0.0:
-            raise ValueError(
-                "DeepSeek V4 Flash direct runtime supports greedy sampling only"
-            )
-        if float(getattr(sampling_params, "top_p", 1.0) or 1.0) != 1.0:
-            raise ValueError(
-                "DeepSeek V4 Flash direct runtime supports greedy sampling only"
-            )
-        top_k = int(getattr(sampling_params, "top_k", -1) or -1)
-        if top_k not in (-1, 0):
-            raise ValueError(
-                "DeepSeek V4 Flash direct runtime supports greedy sampling only"
-            )
-        if getattr(sampling_params, "structured_outputs", None) is not None:
-            raise ValueError(
-                "DeepSeek V4 Flash direct runtime does not support structured outputs"
-            )
-
     def add_request(
         self,
         request_id: str,
@@ -987,11 +773,12 @@ class LiteEngine:
         return self.runtime_controller.step()
 
     def stats(self) -> dict[str, Any]:
-        if getattr(self, "_deepseek_v4_flash_direct", False):
-            return {"backend": "deepseek_v4_flash_direct"}
+        if self.direct_runtime is not None:
+            return self.direct_runtime.stats()
         return self.runtime_controller.stats()
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
-        if getattr(self, "_deepseek_v4_flash_direct", False):
+        if self.direct_runtime is not None:
+            self.direct_runtime.reset_stats(clear_prefix_cache=clear_prefix_cache)
             return
         self.runtime_controller.reset_stats(clear_prefix_cache=clear_prefix_cache)

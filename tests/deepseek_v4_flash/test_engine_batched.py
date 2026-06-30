@@ -9,6 +9,9 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashRuntimeBudget,
     DeepSeekV4FlashShape,
 )
+from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
+    DeepSeekV4FlashDirectRuntime,
+)
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
 )
@@ -162,7 +165,18 @@ def _make_engine(*, direct_runtime: bool = True) -> LiteEngine:
     engine.device = torch.device("cpu")
     engine.model = _fake_model(context_length=32, vocab_size=16)
     engine.tokenizer = _FakeTokenizer()
-    engine._deepseek_v4_flash_direct = direct_runtime
+    engine.direct_runtime = (
+        DeepSeekV4FlashDirectRuntime(
+            model=engine.model,
+            model_config=type("_Cfg", (), {"max_model_len": 32})(),
+            runtime_config=object(),
+            tokenizer=engine.tokenizer,
+            device=engine.device,
+            observer=None,
+        )
+        if direct_runtime
+        else None
+    )
     return engine
 
 
@@ -218,7 +232,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_parity(
     prompts = ["ab", "xyz"]
     sampling_params_list = [_greedy_sampling_params(max_tokens) for _ in prompts]
 
-    outputs = engine.generate_deepseek_v4_flash_greedy_batched(
+    outputs = engine.direct_runtime.generate_batched(
         request_ids=request_ids,
         prompts=prompts,
         sampling_params_list=sampling_params_list,
@@ -271,26 +285,20 @@ def test_generate_deepseek_v4_flash_greedy_batched_ignores_use_graph(
 
     monkeypatch.setattr(engine.model, "generate_greedy_kernel_batched", fake_batched)
 
-    outputs = engine.generate_deepseek_v4_flash_greedy_batched(
+    outputs = engine.direct_runtime.generate_batched(
         request_ids=["req-0"],
         prompts=["a"],
         sampling_params_list=[_greedy_sampling_params(max_tokens=2)],
-        use_graph=True,
     )
 
     assert len(outputs) == 1
     assert outputs[0].finished is True
 
 
-def test_generate_deepseek_v4_flash_greedy_batched_requires_direct_runtime() -> None:
+def test_engine_has_no_direct_runtime_when_adapter_does_not_build_one() -> None:
     engine = _make_engine(direct_runtime=False)
 
-    with pytest.raises(RuntimeError, match="direct runtime is not enabled"):
-        engine.generate_deepseek_v4_flash_greedy_batched(
-            request_ids=["req-0"],
-            prompts=["hello"],
-            sampling_params_list=[_greedy_sampling_params()],
-        )
+    assert engine.direct_runtime is None
 
 
 @pytest.mark.parametrize(
@@ -309,7 +317,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_invalid_sampling_para
     engine = _make_engine()
 
     with pytest.raises(ValueError):
-        engine.generate_deepseek_v4_flash_greedy_batched(
+        engine.direct_runtime.generate_batched(
             request_ids=["req-0"],
             prompts=["hello"],
             sampling_params_list=[bad_params],
@@ -320,7 +328,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_lengths() 
     engine = _make_engine()
 
     with pytest.raises(ValueError, match="same length"):
-        engine.generate_deepseek_v4_flash_greedy_batched(
+        engine.direct_runtime.generate_batched(
             request_ids=["req-0", "req-1"],
             prompts=["hello"],
             sampling_params_list=[_greedy_sampling_params()],
@@ -330,7 +338,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_lengths() 
 def test_engine_batched_empty_prompts_returns_empty_list() -> None:
     engine = _make_engine()
 
-    outputs = engine.generate_deepseek_v4_flash_greedy_batched(
+    outputs = engine.direct_runtime.generate_batched(
         request_ids=[],
         prompts=[],
         sampling_params_list=[],
@@ -345,7 +353,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_max_tokens
     engine = _make_engine()
 
     with pytest.raises(ValueError, match="max_tokens"):
-        engine.generate_deepseek_v4_flash_greedy_batched(
+        engine.direct_runtime.generate_batched(
             request_ids=["req-0", "req-1"],
             prompts=["hello", "world"],
             sampling_params_list=[
@@ -386,7 +394,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_uses_per_request_skip_special
     params_second = _greedy_sampling_params(max_tokens=2)
     params_second.skip_special_tokens = True
 
-    outputs = engine.generate_deepseek_v4_flash_greedy_batched(
+    outputs = engine.direct_runtime.generate_batched(
         request_ids=["req-0", "req-1"],
         prompts=["a", "b"],
         sampling_params_list=[params_first, params_second],
