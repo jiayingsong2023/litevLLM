@@ -484,7 +484,14 @@ if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
     fi
   else
     DEEPSEEK_QUALITY_JSON="$(mktemp "${TMPDIR:-/tmp}/fastinference-deepseek-quality.XXXXXX.json")"
+    # Use the same optimal DeepSeek V4 Flash env as tests/e2e_full_benchmark.py
+    # so correctness is validated at the throughput-maximizing settings.
     run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
+      env \
+        FASTINFERENCE_KV_TYPE=fp16 \
+        FASTINFERENCE_BLOCK_SIZE=32 \
+        FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
+        FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
       bash -c 'uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
         --model "$1" \
         --context-length 4096 \
