@@ -2787,12 +2787,6 @@ def _run_deepseek_v4_flash_direct_benchmark(
     if not os.path.isfile(spec.model_path):
         print("  [Skip] DeepSeek V4 Flash GGUF file not found.")
         return {"skipped": 1.0, "skip_reason": "model_file_not_found"}
-    with tempfile.NamedTemporaryFile(
-        prefix="fastinference_deepseek_v4_flash_",
-        suffix=".json",
-        delete=False,
-    ) as tmp:
-        profile_json = tmp.name
     script = (
         "tests/tools/run_deepseek_v4_flash_gpu_smoke_batched.py"
         if batched_engine
@@ -2807,8 +2801,6 @@ def _run_deepseek_v4_flash_direct_benchmark(
         str(spec.max_model_len),
         "--max-tokens",
         str(spec.max_new_tokens),
-        "--profile-json",
-        profile_json,
     ]
     if batched_engine:
         command.extend(
@@ -2827,16 +2819,28 @@ def _run_deepseek_v4_flash_direct_benchmark(
                 "--warmup-tokens",
                 str(spec.max_new_tokens),
                 "--repeat",
-                "1",
+                "3",
             ]
         )
     start = time.perf_counter()
+    # Use the same optimal env knobs that give the best single-request
+    # direct decode throughput on DeepSeek V4 Flash.
+    deepseek_env = os.environ.copy()
+    deepseek_env.update(
+        {
+            "FASTINFERENCE_KV_TYPE": "fp16",
+            "FASTINFERENCE_BLOCK_SIZE": "32",
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS": "1",
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB": "1",
+        }
+    )
     try:
         proc = subprocess.run(
             command,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=deepseek_env,
             check=False,
             timeout=spec.max_run_seconds,
         )
@@ -2846,8 +2850,7 @@ def _run_deepseek_v4_flash_direct_benchmark(
                 "DeepSeek V4 Flash GGUF benchmark failed with "
                 f"rc={proc.returncode}: {proc.stderr}"
             )
-        with open(profile_json, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        payload = json.loads(proc.stdout)
         result = _deepseek_smoke_payload_to_benchmark_result(
             spec,
             payload,
@@ -2868,11 +2871,6 @@ def _run_deepseek_v4_flash_direct_benchmark(
             "wall_time_sec": float(spec.max_run_seconds),
             "aggregate_tps": 0.0,
         }
-    finally:
-        try:
-            os.unlink(profile_json)
-        except OSError:
-            pass
 
 
 def _load_perf_baseline(path: str) -> dict[str, Any]:
