@@ -1011,6 +1011,38 @@ def _make_real_compressed_layer() -> tuple[
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_select_compressed_rows_with_indexer_triton_matches_reference() -> None:
+    device = torch.device("cuda")
+    heads = 64
+    row_width = 128
+    n_rows = 1024
+
+    index_query = torch.randn(heads, row_width, device=device, dtype=torch.float32)
+    indexer_rows = torch.randn(n_rows, row_width, device=device, dtype=torch.float32)
+    index_weights = torch.randn(heads, device=device, dtype=torch.float32)
+
+    os.environ["FASTINFERENCE_DEEPSEEK_V4_FLASH_INDEXER_SELECT_FALLBACK"] = "1"
+    # The function also needs layer/stager/state; construct minimal fakes or
+    # recompute reference manually:
+    per_head_scores = index_query.matmul(indexer_rows.T)
+    per_head_scores = torch.clamp_min(per_head_scores, 0.0)
+    scale = 1.0 / float(heads * row_width) ** 0.5
+    expected_scores = (index_weights.reshape(heads, 1) * per_head_scores).sum(
+        dim=0
+    ) * scale
+
+    os.environ["FASTINFERENCE_DEEPSEEK_V4_FLASH_INDEXER_SELECT_FALLBACK"] = "0"
+    from vllm.kernels.triton.deepseek_v4_flash.compressed_indexer_select import (
+        deepseek_v4_indexer_select_scores,
+    )
+
+    got_scores = deepseek_v4_indexer_select_scores(
+        index_query, indexer_rows, index_weights
+    )
+    torch.testing.assert_close(got_scores, expected_scores, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_compressed_layer_forward_explicit_kv_rows_matches_state_read() -> None:
     store, layer = _make_real_compressed_layer()
     backend = _RecordingCompressedBackend()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -362,11 +363,15 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
+        compressed_counts_by_layer = self._compute_graph_compressed_counts(
+            token_idx=token_idx,
+        )
         store, stager, hidden = self._forward_kernel_token_hidden(
             token_id=token_id,
             state=state,
             token_idx=token_idx,
             device=device,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
         with self._deepseek_profiler.section(
             "output_projection",
@@ -429,6 +434,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -485,6 +491,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id=token_id,
+                        compressed_count=compressed_counts_by_layer.get(
+                            layer.layer_index
+                        )
+                        if compressed_counts_by_layer is not None
+                        else None,
                     )
             if layer_offset + 1 < len(layers):
                 self._schedule_next_layer_expert_prefetch(
@@ -1044,6 +1055,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             input_ids,
             max_tokens=max_tokens,
         )
+        self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
         state = DeepSeekV4FlashGPURequestState(
             DeepSeekV4FlashGPUCacheConfig(
@@ -1575,11 +1587,76 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     def _gpu_staging_budget_bytes(self) -> int | None:
         if self.runtime_budget is None:
             return None
-        return max(
+        base = max(
             0,
             self.runtime_budget.available_headroom_bytes
             - self.runtime_budget.min_system_headroom_bytes,
         )
+        extra_gb_str = os.environ.get(
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB",
+            "0",
+        )
+        try:
+            extra_gb = float(extra_gb_str)
+        except ValueError:
+            warnings.warn(
+                f"Ignoring malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB "
+                f"value {extra_gb_str!r}; using 0",
+                stacklevel=2,
+            )
+            extra_gb = 0.0
+        if extra_gb <= 0:
+            return base
+        extra_bytes = int(extra_gb * 1024 * 1024 * 1024)
+        return min(
+            base + extra_bytes,
+            self.runtime_budget.available_headroom_bytes,
+        )
+
+    def pin_hot_experts_for_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Pin experts mapped from the prompt tokens for all hash-routed layers."""
+        if (
+            os.environ.get(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS",
+                "1",
+            )
+            != "1"
+        ):
+            return
+        store = self._require_weight_store()
+        stager = self._get_gpu_weight_stager(device)
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return
+        token_ids = set(int(t) for t in input_ids.detach().cpu().tolist())
+        for layer in layers:
+            expert_token_table = getattr(layer, "expert_token_to_expert_ids", None)
+            if expert_token_table is None:
+                continue
+            if isinstance(expert_token_table, DeepSeekV4FlashTensor):
+                table = _stage_expert_token_table(
+                    stager, expert_token_table, device=stager.device
+                )
+            elif isinstance(expert_token_table, torch.Tensor):
+                table = expert_token_table
+            else:
+                continue
+            if table.ndim != 2:
+                continue
+            table_device = stager.device if table.is_cuda else torch.device("cpu")
+            staged_table = table.to(table_device)
+            for token_id in token_ids:
+                if token_id < 0 or token_id >= staged_table.shape[1]:
+                    continue
+                for expert_id in staged_table[:, token_id].tolist():
+                    stager.pin_grouped_expert(
+                        layer.layer_index,
+                        int(expert_id),
+                    )
 
     def gpu_staging_memory_stats(self) -> dict[str, int | None]:
         stager = self._gpu_weight_stager

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -12,6 +13,9 @@ import torch.nn.functional as F
 from vllm.kernels.triton.deepseek_v4_flash.cache import (
     DeepSeekV4CacheUpdateInputs,
     deepseek_v4_cache_update,
+)
+from vllm.kernels.triton.deepseek_v4_flash.compressed_indexer_select import (
+    deepseek_v4_indexer_select_scores,
 )
 from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
     q8_0_raw_gate_up_activation,
@@ -2525,14 +2529,28 @@ def _select_compressed_rows_with_indexer(
             [deepseek_indexer_qat_reference(row) for row in index_query],
             dim=0,
         ).to(index_query.device, dtype=index_query.dtype)
-    per_head_scores = index_query.to(torch.float32).matmul(
-        indexer_rows.to(torch.float32).T
-    )
-    per_head_scores = torch.clamp_min(per_head_scores, 0.0)
-    scale = 1.0 / float(heads * row_width) ** 0.5
-    scores = (index_weights.to(torch.float32).reshape(heads, 1) * per_head_scores).sum(
-        dim=0
-    ) * scale
+    if (
+        os.environ.get(
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_INDEXER_SELECT_FALLBACK",
+            "0",
+        )
+        != "1"
+    ):
+        scores = deepseek_v4_indexer_select_scores(
+            index_query,
+            indexer_rows,
+            index_weights,
+        )
+    else:
+        per_head_scores = index_query.to(torch.float32).matmul(
+            indexer_rows.to(torch.float32).T
+        )
+        per_head_scores = torch.clamp_min(per_head_scores, 0.0)
+        scale = 1.0 / float(heads * row_width) ** 0.5
+        scores = (
+            index_weights.to(torch.float32).reshape(heads, 1) * per_head_scores
+        ).sum(dim=0) * scale
+
     return torch.topk(scores, k=top_k, sorted=True).indices.to(torch.int64)
 
 

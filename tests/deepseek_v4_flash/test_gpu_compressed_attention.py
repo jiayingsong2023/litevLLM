@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import pytest
 import torch
@@ -16,6 +17,49 @@ from vllm.kernels.triton.deepseek_v4_flash.compressed_attention import (
 from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_deepseek_gpu_compressed_attention_triton_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    for head_dim in (128, 256, 512):
+        for n_selected in (1, 7, 64, 512):
+            query = torch.randn(head_dim, device=device, dtype=torch.float16)
+            compressed_rows = torch.randn(
+                n_selected + 4,
+                head_dim,
+                device=device,
+                dtype=torch.float16,
+            )
+            selected_rows = torch.arange(
+                n_selected,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            monkeypatch.setenv(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK", "1"
+            )
+            expected = deepseek_v4_compressed_attention(
+                DeepSeekV4CompressedAttentionTensorInputs(
+                    query=query,
+                    compressed_rows=compressed_rows,
+                    selected_rows=selected_rows,
+                )
+            )
+            monkeypatch.setenv(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK", "0"
+            )
+            got = deepseek_v4_compressed_attention(
+                DeepSeekV4CompressedAttentionTensorInputs(
+                    query=query,
+                    compressed_rows=compressed_rows,
+                    selected_rows=selected_rows,
+                )
+            )
+            torch.testing.assert_close(got, expected, rtol=1e-3, atol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
