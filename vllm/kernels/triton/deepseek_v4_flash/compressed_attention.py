@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
+
+from .compressed_attention_triton import deepseek_v4_compressed_attention_triton
 
 _PAGE_TABLE_ERROR = "DeepSeek V4 compressed attention requires page table inputs"
 
@@ -91,12 +94,9 @@ class DeepSeekV4CompressedAttentionTensorInputs:
             raise ValueError("selected_rows must contain at least one row")
 
 
-def deepseek_v4_compressed_attention(
+def _deepseek_v4_compressed_attention_reference(
     inputs: DeepSeekV4CompressedAttentionTensorInputs,
 ) -> torch.Tensor:
-    tensors = (inputs.query, inputs.compressed_rows, inputs.selected_rows)
-    if any(not tensor.is_cuda for tensor in tensors):
-        raise ValueError("DeepSeek V4 compressed attention inputs must be CUDA tensors")
     selected = inputs.compressed_rows.index_select(
         0,
         inputs.selected_rows.to(torch.long),
@@ -105,3 +105,24 @@ def deepseek_v4_compressed_attention(
     scores = scores / math.sqrt(float(inputs.query.numel()))
     probs = torch.softmax(scores, dim=0)
     return probs.matmul(selected.to(torch.float32))
+
+
+def deepseek_v4_compressed_attention(
+    inputs: DeepSeekV4CompressedAttentionTensorInputs,
+) -> torch.Tensor:
+    tensors = (inputs.query, inputs.compressed_rows, inputs.selected_rows)
+    if any(not tensor.is_cuda for tensor in tensors):
+        raise ValueError("DeepSeek V4 compressed attention inputs must be CUDA tensors")
+    if (
+        os.environ.get(
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK",
+            "0",
+        )
+        == "1"
+    ):
+        return _deepseek_v4_compressed_attention_reference(inputs)
+    return deepseek_v4_compressed_attention_triton(
+        inputs.query,
+        inputs.compressed_rows,
+        inputs.selected_rows,
+    )

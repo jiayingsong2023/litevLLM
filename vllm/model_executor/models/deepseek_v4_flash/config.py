@@ -8,6 +8,36 @@ DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES = 61 * 1024 * 1024 * 1024
 DEEPSEEK_V4_FLASH_MIN_SYSTEM_HEADROOM_BYTES = 1536 * 1024 * 1024
 
 
+def _detect_default_uma_budget_bytes() -> int:
+    """Use available GPU memory to size the DeepSeek V4 Flash staging budget.
+
+    The legacy default (61 GB) was chosen for 64 GB unified-memory devices.
+    On larger APU/HBM systems we can leave a small safety margin and use the
+    rest for expert-payload caching, which drastically reduces CPU->GPU
+    staging time during decode.
+    """
+    try:
+        import torch
+    except Exception:  # pragma: no cover - no PyTorch in import path
+        return DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES
+    if not torch.cuda.is_available():
+        return DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES
+    try:
+        total = int(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:
+        return DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES
+    # Leave a fixed safety margin for the OS/CPU, ROCm runtime, KV cache and
+    # activations.  The model file itself is mmap'd and does not need to be
+    # double-buffered in this budget.
+    safety_margin = 8 * 1024 * 1024 * 1024
+    if total <= DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES + safety_margin:
+        return DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES
+    return max(
+        DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES,
+        total - safety_margin,
+    )
+
+
 @dataclass(frozen=True)
 class DeepSeekV4FlashShape:
     num_layers: int = 43
@@ -176,6 +206,8 @@ class DeepSeekV4FlashMemoryPolicy:
             raise ValueError("expert cache bytes must be non-negative")
         if uma_budget_bytes is None:
             uma_budget_bytes = self.default_uma_budget_bytes
+            if uma_budget_bytes == DEEPSEEK_V4_FLASH_DEFAULT_UMA_BUDGET_BYTES:
+                uma_budget_bytes = _detect_default_uma_budget_bytes()
         if uma_budget_bytes <= 0:
             raise ValueError("UMA budget bytes must be positive")
 

@@ -136,6 +136,11 @@ _E4M3FN_VALUES = (
 
 _E2M1FN_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
+# Per-device cached lookup tables so CUDA/HIP graph replay does not need to
+# re-create constant tensors from Python scalars during capture.
+_E4M3FN_TABLES: dict[torch.device, torch.Tensor] = {}
+_E2M1FN_TABLES: dict[torch.device, torch.Tensor] = {}
+
 
 def _nearest_table_values(
     values: torch.Tensor,
@@ -143,8 +148,13 @@ def _nearest_table_values(
 ) -> torch.Tensor:
     values_f32 = values.to(torch.float32)
     sign = torch.where(values_f32 < 0.0, -1.0, 1.0)
-    table = torch.tensor(table_values, dtype=torch.float32, device=values.device)
-    max_value = float(table[-1].item())
+    cache = _E4M3FN_TABLES if table_values is _E4M3FN_VALUES else _E2M1FN_TABLES
+    device = values.device
+    table = cache.get(device)
+    if table is None:
+        table = torch.tensor(table_values, dtype=torch.float32, device=device)
+        cache[device] = table
+    max_value = float(table_values[-1])
     abs_values = torch.clamp(values_f32.abs(), max=max_value)
     diffs = torch.abs(abs_values.reshape(-1, 1) - table.reshape(1, -1))
     odd_penalty = (
@@ -173,9 +183,7 @@ def deepseek_fp8_kv_qat_reference(
     if row.numel() != head_dim:
         raise ValueError(f"KV QAT row width must be {head_dim}; got {row.numel()}")
     if rotary_dim < 0 or rotary_dim > head_dim:
-        raise ValueError(
-            f"rotary_dim must be within [0, {head_dim}]; got {rotary_dim}"
-        )
+        raise ValueError(f"rotary_dim must be within [0, {head_dim}]; got {rotary_dim}")
     n_nope = head_dim - rotary_dim
     if n_nope % 64 != 0:
         raise ValueError(f"non-RoPE KV width must be 64-aligned; got {n_nope}")
@@ -184,7 +192,7 @@ def deepseek_fp8_kv_qat_reference(
         block = out[offset : offset + 64]
         amax = torch.clamp(block.abs().max(), min=1.0e-4)
         scale = torch.pow(
-            torch.tensor(2.0, dtype=torch.float32, device=row.device),
+            torch.full((), 2.0, dtype=torch.float32, device=row.device),
             torch.ceil(torch.log2(amax / 448.0)),
         )
         quant_input = torch.clamp(block / scale, min=-448.0, max=448.0)
@@ -210,15 +218,14 @@ def _hadamard128_reference(row: torch.Tensor) -> torch.Tensor:
 def deepseek_indexer_qat_reference(row: torch.Tensor) -> torch.Tensor:
     if row.shape != (128,):
         raise ValueError(
-            "indexer QAT row must have shape (128,); "
-            f"got {tuple(row.shape)}"
+            f"indexer QAT row must have shape (128,); got {tuple(row.shape)}"
         )
     out = _hadamard128_reference(row)
     for offset in range(0, 128, 32):
         block = out[offset : offset + 32]
         amax = torch.clamp(block.abs().max(), min=7.052966104933725e-38)
         scale = torch.pow(
-            torch.tensor(2.0, dtype=torch.float32, device=row.device),
+            torch.full((), 2.0, dtype=torch.float32, device=row.device),
             torch.ceil(torch.log2(amax / 6.0)),
         )
         quant_input = torch.clamp(block / scale, min=-6.0, max=6.0)
@@ -309,13 +316,11 @@ def factorized_linear_reference(
         raise ValueError(f"b must be 2-D; got {b.ndim}-D")
     if a.shape[1] != hidden.numel():
         raise ValueError(
-            "a columns must match hidden size; "
-            f"got {a.shape[1]} and {hidden.numel()}"
+            f"a columns must match hidden size; got {a.shape[1]} and {hidden.numel()}"
         )
     if b.shape[1] != a.shape[0]:
         raise ValueError(
-            "b columns must match a rows; "
-            f"got {b.shape[1]} and {a.shape[0]}"
+            f"b columns must match a rows; got {b.shape[1]} and {a.shape[0]}"
         )
 
     intermediate = a.to(torch.float32).matmul(hidden.to(torch.float32))

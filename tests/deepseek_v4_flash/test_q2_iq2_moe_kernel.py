@@ -11,7 +11,9 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
     deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
+    deepseek_v4_iq2_xxs_selected_experts_activation,
     deepseek_v4_q2_k_matvec,
+    deepseek_v4_q2_k_selected_experts_down_projection,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
@@ -273,6 +275,38 @@ def test_q2_k_default_triton_matvec_matches_reference_multi_block(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("columns", [512, 2048])
+@pytest.mark.parametrize("rows", [1, 5, 9])
+def test_q2_k_default_triton_matvec_handles_non_multiple_of_four_rows(
+    columns: int,
+    rows: int,
+) -> None:
+    payload = _q2_k_deterministic_payload_blocks(rows, columns // 256)
+    hidden = torch.linspace(-1.0, 1.0, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_q2_k_matvec(
+        _cuda_payload(payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    expected = (
+        q2_k_matrix_from_gguf_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("rows", [1, 2, 17, 64])
 def test_iq2_xxs_default_triton_matvec_matches_reference_decoded_matrix(
     rows: int,
@@ -462,12 +496,134 @@ def test_iq2_xxs_gate_up_activation_matches_reference_multi_block(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("columns", [512, 1024, 2048])
+@pytest.mark.parametrize("rows", [1, 5, 9])
+def test_iq2_xxs_gate_up_activation_handles_non_multiple_of_four_rows(
+    columns: int,
+    rows: int,
+) -> None:
+    blocks_per_row = columns // 256
+    gate_payload = _iq2_xxs_deterministic_payload_blocks(rows, blocks_per_row)
+    up_payload = _iq2_xxs_deterministic_payload_blocks(rows, blocks_per_row)
+    hidden = torch.linspace(-0.75, 0.9, columns, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_iq2_xxs_gate_up_activation(
+        _cuda_payload(gate_payload),
+        _cuda_payload(up_payload),
+        hidden,
+        rows=rows,
+        columns=columns,
+    )
+    gate = (
+        iq2_xxs_matrix_from_gguf_payload(
+            gate_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+    up = (
+        iq2_xxs_matrix_from_gguf_payload(
+            up_payload,
+            rows=rows,
+            columns=columns,
+        )
+        .to(device="cuda")
+        .matmul(hidden)
+    )
+    expected = torch.nn.functional.silu(torch.clamp(gate, max=10.0)) * torch.clamp(
+        up,
+        min=-10.0,
+        max=10.0,
+    )
+
+    assert actual.shape == (rows,)
+    assert actual.device.type == "cuda"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=4e-2, atol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_q2_matvec_requires_cuda_payload() -> None:
     payload = torch.tensor(tuple(_q2_k_repeating_codes_payload()), dtype=torch.uint8)
     hidden = torch.ones((256,), dtype=torch.float32, device="cuda")
 
     with pytest.raises(ValueError, match="payload must be a CUDA tensor"):
         deepseek_v4_q2_k_matvec(payload, hidden, rows=1, columns=256)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_iq2_xxs_selected_experts_activation() -> None:
+    rows = 2048
+    columns = 4096
+    num_experts = 6
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    workspace = torch.empty((num_experts, rows), dtype=torch.float32, device="cuda")
+    payloads = []
+    expected = []
+    for i in range(num_experts):
+        gate = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        up = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        payloads.append((gate, up))
+        gate_out = (
+            iq2_xxs_matrix_from_gguf_payload(bytes(gate), rows=rows, columns=columns)
+            .to("cuda")
+            .matmul(hidden)
+        )
+        up_out = (
+            iq2_xxs_matrix_from_gguf_payload(bytes(up), rows=rows, columns=columns)
+            .to("cuda")
+            .matmul(hidden)
+        )
+        activated = torch.nn.functional.silu(
+            torch.clamp(gate_out, max=10.0)
+        ) * torch.clamp(up_out, min=-10.0, max=10.0)
+        expected.append(activated)
+    deepseek_v4_iq2_xxs_selected_experts_activation(
+        hidden=hidden,
+        payloads=[(_cuda_payload(gate), _cuda_payload(up)) for gate, up in payloads],
+        workspace=workspace,
+        rows=rows,
+        columns=columns,
+    )
+    for i in range(num_experts):
+        torch.testing.assert_close(workspace[i], expected[i], rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 5, 9])
+@pytest.mark.parametrize("columns", [256, 512, 2048])
+def test_fused_iq2_xxs_selected_experts_activation_single_expert(
+    rows: int,
+    columns: int,
+) -> None:
+    num_experts = 1
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    workspace = torch.empty((num_experts, rows), dtype=torch.float32, device="cuda")
+    gate = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+    up = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+    gate_out = (
+        iq2_xxs_matrix_from_gguf_payload(bytes(gate), rows=rows, columns=columns)
+        .to("cuda")
+        .matmul(hidden)
+    )
+    up_out = (
+        iq2_xxs_matrix_from_gguf_payload(bytes(up), rows=rows, columns=columns)
+        .to("cuda")
+        .matmul(hidden)
+    )
+    expected = torch.nn.functional.silu(torch.clamp(gate_out, max=10.0)) * torch.clamp(
+        up_out, min=-10.0, max=10.0
+    )
+    deepseek_v4_iq2_xxs_selected_experts_activation(
+        hidden=hidden,
+        payloads=[(_cuda_payload(gate), _cuda_payload(up))],
+        workspace=workspace,
+        rows=rows,
+        columns=columns,
+    )
+    torch.testing.assert_close(workspace[0], expected, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -480,3 +636,68 @@ def test_q2_iq2_default_triton_path_rejects_multi_block_columns() -> None:
     assert q2_out.shape == (1,)
     with pytest.raises(NotImplementedError, match="IQ2_XXS Triton matvec"):
         deepseek_v4_iq2_xxs_matvec(iq2_payload, hidden, rows=1, columns=512)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_q2_k_selected_experts_down_projection() -> None:
+    down_rows = 4096
+    down_columns = 2048
+    num_experts = 6
+    workspace = torch.randn(
+        (num_experts, down_columns), dtype=torch.float32, device="cuda"
+    )
+    expert_weights = torch.full(
+        (num_experts,), 1.0 / num_experts, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty((down_rows,), dtype=torch.float32, device="cuda")
+    down_payloads: list[torch.Tensor] = []
+    expected = torch.zeros((down_rows,), dtype=torch.float32, device="cuda")
+    for i in range(num_experts):
+        payload = _q2_k_deterministic_payload_blocks(down_rows, down_columns // 256)
+        down_payloads.append(_cuda_payload(payload))
+        matrix = q2_k_matrix_from_gguf_payload(
+            payload, rows=down_rows, columns=down_columns
+        ).to("cuda")
+        expected += expert_weights[i] * matrix.matmul(workspace[i])
+    deepseek_v4_q2_k_selected_experts_down_projection(
+        workspace=workspace,
+        down_payloads=down_payloads,
+        expert_weights=expert_weights,
+        output=output,
+        rows=down_rows,
+        columns=down_columns,
+    )
+    torch.testing.assert_close(output, expected, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_q2_k_selected_experts_down_projection_non_multiple_rows() -> None:
+    """Exercise the row-bounds guard when rows are not a multiple of ROWS_PER_BLOCK."""
+    down_rows = 4097
+    down_columns = 2048
+    num_experts = 6
+    workspace = torch.randn(
+        (num_experts, down_columns), dtype=torch.float32, device="cuda"
+    )
+    expert_weights = torch.full(
+        (num_experts,), 1.0 / num_experts, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty((down_rows,), dtype=torch.float32, device="cuda")
+    down_payloads: list[torch.Tensor] = []
+    expected = torch.zeros((down_rows,), dtype=torch.float32, device="cuda")
+    for i in range(num_experts):
+        payload = _q2_k_deterministic_payload_blocks(down_rows, down_columns // 256)
+        down_payloads.append(_cuda_payload(payload))
+        matrix = q2_k_matrix_from_gguf_payload(
+            payload, rows=down_rows, columns=down_columns
+        ).to("cuda")
+        expected += expert_weights[i] * matrix.matmul(workspace[i])
+    deepseek_v4_q2_k_selected_experts_down_projection(
+        workspace=workspace,
+        down_payloads=down_payloads,
+        expert_weights=expert_weights,
+        output=output,
+        rows=down_rows,
+        columns=down_columns,
+    )
+    torch.testing.assert_close(output, expected, rtol=8e-2, atol=8e-2)

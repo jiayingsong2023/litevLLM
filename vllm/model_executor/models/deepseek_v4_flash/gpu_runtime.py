@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
+from .attention import build_deepseek_layer_rope_tables
 from .compressed_kv import (
     DeepSeekV4CompressedKVCache,
     DeepSeekV4CompressedKVLayout,
@@ -67,7 +69,21 @@ class DeepSeekV4FlashGPURequestState:
             device=device,
         )
         self.compressed_kv_cache = self.raw_kv_cache
+        shape = DEEPSEEK_V4_FLASH_SHAPE
+        self._rope_cos, self._rope_sin = build_deepseek_layer_rope_tables(
+            context_length=config.context_length,
+            rotary_dim=shape.rotary_dim,
+            rope_freq_base=shape.rope_freq_base,
+            compressed_rope_freq_base=shape.compressed_rope_freq_base,
+            rope_scale_factor=shape.rope_scale_factor,
+            rope_original_context=shape.rope_original_context,
+            rope_yarn_beta_fast=shape.rope_yarn_beta_fast,
+            rope_yarn_beta_slow=shape.rope_yarn_beta_slow,
+            device=device,
+        )
         self.token_position = 0
+        self._moe_workspace: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        self._graph_moe_payloads: dict[int, Any] | None = None
 
     def advance_token(self) -> None:
         self.require_capacity(self.token_position)
@@ -82,11 +98,92 @@ class DeepSeekV4FlashGPURequestState:
                 f"{self.config.context_length}"
             )
 
+    def moe_workspace(
+        self,
+        *,
+        num_experts: int,
+        intermediate_size: int,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = self.config.device
+        if device is None:
+            device = torch.device("cuda")
+        key = (num_experts, intermediate_size, device)
+        cached = self._moe_workspace.get(key)
+        if cached is not None:
+            return cached
+        workspace = torch.empty(
+            (num_experts, intermediate_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._moe_workspace[key] = workspace
+        return workspace
+
+    def set_graph_moe_payloads(
+        self,
+        layer_idx: int,
+        payloads: Any,
+    ) -> None:
+        """Store pre-staged MoE payloads for a graph replay step.
+
+        The payload tensors are stable cached objects whose bytes are copied
+        in place before each replay.
+        """
+        if self._graph_moe_payloads is None:
+            self._graph_moe_payloads = {}
+        self._graph_moe_payloads[layer_idx] = payloads
+
+    def graph_moe_payloads_for_layer(
+        self,
+        layer_idx: int,
+    ) -> Any | None:
+        """Return pre-staged MoE payloads for ``layer_idx`` if available."""
+        payloads = self._graph_moe_payloads
+        if payloads is None:
+            return None
+        return payloads.get(layer_idx)
+
+    def rope_tables_for(
+        self,
+        layer_idx: int,
+        token_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the precomputed (cos, sin) vectors for a layer/token pair."""
+        self.require_capacity(token_idx)
+        num_layers = self._rope_cos.shape[0]
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(f"layer_idx must be in [0, {num_layers}); got {layer_idx}")
+        return (
+            self._rope_cos[layer_idx, token_idx],
+            self._rope_sin[layer_idx, token_idx],
+        )
+
+    def raw_kv_window(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        window: int,
+    ) -> torch.Tensor:
+        """Materialize the raw KV window for a layer/token pair.
+
+        This is intended to be called outside a captured graph so the graph
+        sees a static ``kv_rows`` tensor argument.
+        """
+        rows, _values = self.raw_kv_cache.read_raw_window(
+            layer_idx,
+            token_idx,
+            window,
+        )
+        return rows
+
     def reset(self) -> None:
         self.token_position = 0
         self.raw_kv_cache.raw_token_indices.fill_(-1)
         self.raw_kv_cache.compressed_token_indices.fill_(-1)
         self.raw_kv_cache._compressed_counts.zero_()
+        self.raw_kv_cache._compressed_counts_cpu = [0] * self.raw_kv_cache.num_layers
         compressor_states = getattr(
             self,
             "_deepseek_v4_flash_compressor_states",
@@ -94,3 +191,5 @@ class DeepSeekV4FlashGPURequestState:
         )
         if compressor_states is not None:
             compressor_states.clear()
+        if self._graph_moe_payloads is not None:
+            self._graph_moe_payloads.clear()

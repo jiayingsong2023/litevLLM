@@ -617,6 +617,14 @@ class DeepSeekV4FlashGPUWeightStager:
         *,
         layer_idx: int | None = None,
     ) -> DeepSeekV4FlashStagedQuantizedExpertPayload:
+        """Return a staged raw payload tensor for a grouped expert.
+
+        The returned ``payload`` tensor is a stable cached object for the
+        ``(tensor, expert_id)`` pair: repeated calls return the same tensor
+        instance (backed by ``_grouped_cache``).  Callers may therefore copy
+        new expert bytes into the returned payload in place before graph
+        replay without changing the tensor identity seen by a captured graph.
+        """
         if self.device.type != "cuda":
             raise ValueError("DeepSeek V4 Flash expert staging requires a CUDA device")
         should_cache = self._should_cache_grouped_expert(layer_idx, expert_id)
@@ -715,6 +723,24 @@ class DeepSeekV4FlashGPUWeightStager:
                 )
             )
         return staged_payloads
+
+    def copy_selected_expert_payload_bytes(
+        self,
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: torch.Tensor,
+        *,
+        layer_idx: int | None = None,
+    ) -> list[DeepSeekV4FlashSelectedExpertPayloads]:
+        """Stage payloads, ensuring returned tensors are the cached stable objects.
+
+        Before graph replay, call this to copy the currently-selected expert bytes
+        into the pre-allocated cached payload tensors.
+        """
+        return self.stage_grouped_expert_payloads_for_ids(
+            grouped_experts,
+            expert_ids,
+            layer_idx=layer_idx,
+        )
 
     def prefetch_grouped_experts(
         self,

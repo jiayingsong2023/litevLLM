@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import warnings
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -29,8 +30,11 @@ from .gguf_reader import (
 )
 from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_layers import (
+    _stage_expert_token_table,
     deepseek_v4_flash_compressed_layer_forward,
+    deepseek_v4_flash_compressed_layer_forward_batched,
     deepseek_v4_flash_sliding_layer_forward,
+    deepseek_v4_flash_sliding_layer_forward_batched,
 )
 from .gpu_runtime import (
     DeepSeekV4FlashGPUCacheConfig,
@@ -49,6 +53,9 @@ _Q8_0_BLOCK_SIZE = 32
 _Q8_0_BLOCK_BYTES = 2 + _Q8_0_BLOCK_SIZE
 _OUTPUT_PROJECTION_CHUNK_ROWS = 16384
 _READONLY_BUFFER_WARNING = "The given buffer is not writable"
+
+if TYPE_CHECKING:
+    from .decode_graph import DeepSeekV4FlashDecodeGraph
 
 
 class DeepSeekV4FlashForCausalLM(nn.Module):
@@ -356,11 +363,15 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token_idx: int,
         device: torch.device,
     ) -> torch.Tensor:
+        compressed_counts_by_layer = self._compute_graph_compressed_counts(
+            token_idx=token_idx,
+        )
         store, stager, hidden = self._forward_kernel_token_hidden(
             token_id=token_id,
             state=state,
             token_idx=token_idx,
             device=device,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
         with self._deepseek_profiler.section(
             "output_projection",
@@ -385,12 +396,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        advance_state: bool = True,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> torch.Tensor:
         store, stager, hidden = self._forward_kernel_token_hidden_token_tensor(
             token_id_tensor=token_id_tensor,
             state=state,
             token_idx=token_idx,
             device=device,
+            kv_rows_by_layer=kv_rows_by_layer,
+            extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+            compressed_counts_by_layer=compressed_counts_by_layer,
         )
         with self._deepseek_profiler.section(
             "output_projection",
@@ -405,7 +423,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             )
         if not next_token.is_cuda:
             raise RuntimeError("DeepSeek V4 Flash GPU forward returned CPU token id")
-        state.advance_token()
+        if advance_state:
+            state.advance_token()
         return next_token.to(device=device, dtype=torch.long).reshape(())
 
     def _forward_kernel_token_hidden(
@@ -415,6 +434,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -471,6 +491,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id=token_id,
+                        compressed_count=compressed_counts_by_layer.get(
+                            layer.layer_index
+                        )
+                        if compressed_counts_by_layer is not None
+                        else None,
                     )
             if layer_offset + 1 < len(layers):
                 self._schedule_next_layer_expert_prefetch(
@@ -488,6 +513,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         state: DeepSeekV4FlashGPURequestState,
         token_idx: int,
         device: torch.device,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
     ) -> tuple[
         DeepSeekV4FlashWeightStore,
         DeepSeekV4FlashGPUWeightStager,
@@ -519,6 +547,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
         layers = list(layers)
         for layer_offset, layer in enumerate(layers):
+            layer_kv_rows = (
+                kv_rows_by_layer.get(layer.layer_index)
+                if kv_rows_by_layer is not None
+                else None
+            )
+            layer_extra_kv_rows = (
+                extra_kv_rows_by_layer.get(layer.layer_index)
+                if extra_kv_rows_by_layer is not None
+                else None
+            )
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -533,6 +571,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id_tensor=token_id_tensor,
+                        kv_rows=layer_kv_rows,
+                        extra_kv_rows=layer_extra_kv_rows,
+                        kv_rows_by_layer=kv_rows_by_layer,
+                        extra_kv_rows_by_layer=extra_kv_rows_by_layer,
                     )
             else:
                 with self._deepseek_profiler.section(
@@ -540,6 +582,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     layer_idx=layer.layer_index,
                     token_idx=token_idx,
                 ):
+                    compressed_count = (
+                        compressed_counts_by_layer.get(layer.layer_index)
+                        if compressed_counts_by_layer is not None
+                        else None
+                    )
                     hidden = deepseek_v4_flash_compressed_layer_forward(
                         hidden,
                         layer=layer,
@@ -548,6 +595,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         state=state,
                         token_idx=token_idx,
                         token_id_tensor=token_id_tensor,
+                        kv_rows=layer_kv_rows,
+                        extra_kv_rows=layer_extra_kv_rows,
+                        kv_rows_by_layer=kv_rows_by_layer,
+                        extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                        compressed_count=compressed_count,
                     )
             if layer_offset + 1 < len(layers):
                 self._schedule_next_layer_expert_prefetch(
@@ -593,16 +645,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         max_tokens: int = 1,
+        use_graph: bool = False,
     ) -> torch.Tensor:
         with self._deepseek_profiler.section(
             "generate_greedy_kernel",
             input_tokens=int(input_ids.numel()),
             max_tokens=max_tokens,
+            use_graph=use_graph,
         ):
             output_ids, _token_elapsed_ms = self._generate_greedy_kernel_impl(
                 input_ids,
                 max_tokens=max_tokens,
                 record_token_times=False,
+                use_graph=use_graph,
             )
             return output_ids
 
@@ -611,12 +666,381 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         max_tokens: int = 1,
+        use_graph: bool = False,
     ) -> tuple[torch.Tensor, list[float]]:
         return self._generate_greedy_kernel_impl(
             input_ids,
             max_tokens=max_tokens,
             record_token_times=True,
+            use_graph=use_graph,
         )
+
+    def generate_greedy_kernel_batched(
+        self,
+        input_ids_list: list[torch.Tensor],
+        max_tokens: int,
+        *,
+        record_token_times: bool = False,
+    ) -> list[torch.Tensor]:
+        """Greedy decode a batch of requests using the batched decode kernel.
+
+        Prefill is performed per-request with the single-slot kernel. Decode
+        steps run batched through ``_forward_kernel_token_step_batched``.
+        Graph capture is never used, even when the backend supports it.
+
+        ``record_token_times`` is accepted for API symmetry with
+        ``generate_greedy_kernel`` but is currently ignored.
+        """
+        with self._deepseek_profiler.section(
+            "generate_greedy_kernel_batched",
+            batch_size=len(input_ids_list),
+            max_tokens=max_tokens,
+            record_token_times=record_token_times,
+        ):
+            return self._generate_greedy_kernel_batched_impl(
+                input_ids_list,
+                max_tokens=max_tokens,
+            )
+
+    def _generate_greedy_kernel_batched_impl(
+        self,
+        input_ids_list: list[torch.Tensor],
+        *,
+        max_tokens: int,
+    ) -> list[torch.Tensor]:
+        self._require_weight_store()
+        device = self._validate_generate_greedy_kernel_batched_input(
+            input_ids_list,
+            max_tokens=max_tokens,
+        )
+        self.gpu_backend.require_ready()
+        eos_token_id = self._eos_token_id()
+        context_length = self._kernel_context_length()
+
+        output_ids_list: list[torch.Tensor] = []
+        states: list[DeepSeekV4FlashGPURequestState] = []
+        input_lengths: list[int] = []
+
+        for input_ids in input_ids_list:
+            input_ids_cuda = input_ids.to(device=device, dtype=torch.long)
+            input_len = int(input_ids_cuda.numel())
+            input_lengths.append(input_len)
+
+            output_ids = torch.empty(
+                (input_len + max_tokens,),
+                dtype=torch.long,
+                device=device,
+            )
+            output_ids[:input_len] = input_ids_cuda
+            output_ids_list.append(output_ids)
+
+            state = DeepSeekV4FlashGPURequestState(
+                DeepSeekV4FlashGPUCacheConfig(
+                    context_length=context_length,
+                    hidden_size=self.shape.hidden_size,
+                    batch_size=1,
+                    kv_width=self.shape.head_dim,
+                    device=device,
+                )
+            )
+            states.append(state)
+
+            # Prefill all prompt tokens except the last one. The last prompt
+            # token is consumed by the first batched decode step.
+            prompt_prefix_ids = input_ids_cuda[:-1].detach().cpu().tolist()
+            for token_id in prompt_prefix_ids:
+                self._forward_kernel_token_step_token_id(
+                    token_id=int(token_id),
+                    state=state,
+                    token_idx=state.token_position,
+                    device=device,
+                )
+
+        active_indices = list(range(len(states)))
+        for step in range(max_tokens):
+            if not active_indices:
+                break
+
+            token_id_tensor = torch.stack(
+                [
+                    output_ids_list[idx][input_lengths[idx] - 1 + step]
+                    for idx in active_indices
+                ]
+            )
+            token_indices = [states[idx].token_position for idx in active_indices]
+            active_states = [states[idx] for idx in active_indices]
+
+            next_tokens = self._forward_kernel_token_step_batched(
+                token_id_tensor=token_id_tensor,
+                states=active_states,
+                token_indices=token_indices,
+                device=device,
+            )
+
+            new_active: list[int] = []
+            for offset, idx in enumerate(active_indices):
+                generated_token = next_tokens[offset]
+                output_ids_list[idx][input_lengths[idx] + step] = generated_token
+                if eos_token_id is not None:
+                    token_id_int = int(generated_token.item())
+                    if token_id_int == eos_token_id:
+                        continue
+                new_active.append(idx)
+            active_indices = new_active
+
+        # Trim each output to the actual number of generated tokens, matching
+        # the single-slot greedy path which returns a slice up to EOS.
+        results: list[torch.Tensor] = []
+        for idx, output_ids in enumerate(output_ids_list):
+            actual_end = input_lengths[idx] + max_tokens
+            generated_slice = output_ids[input_lengths[idx] : actual_end]
+            if eos_token_id is not None:
+                eos_positions = (generated_slice == eos_token_id).nonzero(
+                    as_tuple=False
+                )
+                if eos_positions.numel() > 0:
+                    actual_end = input_lengths[idx] + int(eos_positions[0].item()) + 1
+            results.append(output_ids[:actual_end])
+        return results
+
+    def _forward_kernel_token_step_batched(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        states: list[DeepSeekV4FlashGPURequestState],
+        token_indices: list[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        store, stager, hidden = self._forward_kernel_token_hidden_batched(
+            token_id_tensor=token_id_tensor,
+            states=states,
+            token_indices=token_indices,
+            device=device,
+        )
+        with self._deepseek_profiler.section(
+            "output_projection",
+            token_idx=token_indices[0] if token_indices else -1,
+        ):
+            next_tokens: list[torch.Tensor] = []
+            for b in range(hidden.shape[0]):
+                streams = self._kernel_output_streams(hidden[b])
+                next_tokens.append(
+                    self._output_token_argmax_chunked_cuda(
+                        store,
+                        stager=stager,
+                        streams=streams,
+                        device=device,
+                    )
+                )
+        result = torch.stack(next_tokens).to(device=device, dtype=torch.long)
+        for state in states:
+            state.advance_token()
+        return result
+
+    def _forward_kernel_token_hidden_batched(
+        self,
+        *,
+        token_id_tensor: torch.Tensor,
+        states: list[DeepSeekV4FlashGPURequestState],
+        token_indices: list[int],
+        device: torch.device,
+    ) -> tuple[
+        DeepSeekV4FlashWeightStore,
+        DeepSeekV4FlashGPUWeightStager,
+        torch.Tensor,
+    ]:
+        store = self._require_weight_store()
+        self.gpu_backend.require_ready()
+        if token_id_tensor.ndim != 1:
+            raise ValueError(
+                f"batched token id tensor must be 1-D; got {token_id_tensor.ndim}-D"
+            )
+        batch = token_id_tensor.shape[0]
+        if len(states) != batch or len(token_indices) != batch:
+            raise ValueError(
+                "states and token_indices must match token_id_tensor batch size"
+            )
+        if not token_id_tensor.is_cuda:
+            raise ValueError("batched token id tensor must be CUDA")
+        if token_id_tensor.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise ValueError(
+                "batched token id tensor must use an integer dtype; "
+                f"got {token_id_tensor.dtype}"
+            )
+
+        token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
+        torch._assert_async(
+            ((token_id_tensor >= 0) & (token_id_tensor < self.shape.vocab_size)).all(),
+            f"batched token id is outside vocab range [0, {self.shape.vocab_size})",
+        )
+
+        for state, token_idx in zip(states, token_indices, strict=True):
+            state.require_capacity(token_idx)
+            if token_idx != state.token_position:
+                raise ValueError(
+                    "batched forward token_idx must match request state "
+                    f"token_position; got token_idx={token_idx}, "
+                    f"token_position={state.token_position}"
+                )
+
+        stager = self._get_gpu_weight_stager(device)
+        hidden = self._stage_token_embedding_batch_cuda(
+            store,
+            stager,
+            token_id_tensor,
+            device=device,
+        )
+
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
+        layers = list(layers)
+        for layer_offset, layer in enumerate(layers):
+            if layer.layer_index < 2:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_sliding_batched",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_indices[0] if token_indices else -1,
+                ):
+                    hidden = deepseek_v4_flash_sliding_layer_forward_batched(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        states=states,
+                        token_indices=token_indices,
+                        token_id_tensors=token_id_tensor,
+                    )
+            else:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_compressed_batched",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_indices[0] if token_indices else -1,
+                ):
+                    hidden = deepseek_v4_flash_compressed_layer_forward_batched(
+                        hidden,
+                        layer=layer,
+                        stager=stager,
+                        backend=self.gpu_backend,
+                        states=states,
+                        token_indices=token_indices,
+                        token_id_tensors=token_id_tensor,
+                    )
+            if layer_offset + 1 < len(layers):
+                self._schedule_next_layer_expert_prefetch(
+                    stager,
+                    layers[layer_offset + 1],
+                    token_id=None,
+                )
+
+        return store, stager, hidden
+
+    def _stage_token_embedding_batch_cuda(
+        self,
+        store: DeepSeekV4FlashWeightStore,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        token_id_tensor: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        tensor = store.bindings.token_embedding
+        if tensor.tensor_type != GGML_TYPE_F16:
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects F16 token_embd.weight; "
+                f"got GGML type {tensor.tensor_type}"
+            )
+        hidden_size = self.shape.hidden_size
+        vocab_size = self.shape.vocab_size
+        if tensor.dims != (hidden_size, vocab_size):
+            raise RuntimeError(
+                "DeepSeek V4 Flash GPU forward expects token_embd.weight dims "
+                f"({hidden_size}, {vocab_size}); got {tensor.dims}"
+            )
+
+        token_id_tensor = token_id_tensor.to(device=device, dtype=torch.long)
+        embedding_matrix = stager.stage_matrix(tensor).reshape(vocab_size, hidden_size)
+        hidden = torch.index_select(
+            embedding_matrix,
+            0,
+            token_id_tensor.reshape(-1),
+        )
+        return hidden.to(dtype=torch.float32)
+
+    def _validate_generate_greedy_kernel_batched_input(
+        self,
+        input_ids_list: list[torch.Tensor],
+        *,
+        max_tokens: int,
+    ) -> torch.device:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive; got {max_tokens}")
+        if not input_ids_list:
+            raise ValueError("input_ids_list must not be empty")
+
+        device: torch.device | None = None
+        context_length = self._kernel_context_length()
+
+        for input_ids in input_ids_list:
+            if input_ids.ndim != 1:
+                raise ValueError(
+                    "generate_greedy_kernel_batched supports 1-D input tensors; "
+                    f"got {input_ids.ndim}-D"
+                )
+            if input_ids.dtype not in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
+                raise ValueError(
+                    f"input_ids must use an integer dtype; got {input_ids.dtype}"
+                )
+            if input_ids.numel() == 0:
+                raise ValueError(
+                    "generate_greedy_kernel_batched requires at least one input token"
+                )
+
+            current_device = torch.device(input_ids.device)
+            if current_device.type == "cuda":
+                if device is None:
+                    device = current_device
+                elif device != current_device:
+                    raise ValueError(
+                        "generate_greedy_kernel_batched requires all CUDA input "
+                        "tensors on the same device"
+                    )
+            elif current_device.type != "cpu":
+                raise ValueError(
+                    "generate_greedy_kernel_batched supports CPU or CUDA input "
+                    f"tensors; got {current_device}"
+                )
+
+            total_tokens = input_ids.numel() + max_tokens
+            if total_tokens > context_length:
+                raise ValueError(
+                    "generate_greedy_kernel_batched input plus generated tokens "
+                    f"exceeds configured budget: {total_tokens} tokens > "
+                    f"{context_length}"
+                )
+
+            for token_id in input_ids.detach().cpu().tolist():
+                token_id_int = int(token_id)
+                if token_id_int < 0 or token_id_int >= self.shape.vocab_size:
+                    raise ValueError(
+                        f"input token id {token_id_int} is outside vocab range "
+                        f"[0, {self.shape.vocab_size})"
+                    )
+
+        if device is None:
+            device = torch.device("cuda")
+        return device
 
     def _generate_greedy_kernel_impl(
         self,
@@ -624,12 +1048,14 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         max_tokens: int,
         record_token_times: bool,
+        use_graph: bool,
     ) -> tuple[torch.Tensor, list[float]]:
         self._require_weight_store()
         device = self._validate_generate_greedy_kernel_input(
             input_ids,
             max_tokens=max_tokens,
         )
+        self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
         state = DeepSeekV4FlashGPURequestState(
             DeepSeekV4FlashGPUCacheConfig(
@@ -665,9 +1091,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         token_id_tensor = output_ids[input_token_count - 1].reshape(())
         eos_token_id = self._eos_token_id()
-        token_id = (
-            int(token_id_tensor.item()) if eos_token_id is not None else None
-        )
+        token_id = int(token_id_tensor.item()) if eos_token_id is not None else None
+
+        decode_graphs: dict[int, DeepSeekV4FlashDecodeGraph] = {}
+        decode_graph_window_shapes: dict[int, dict[int, tuple[int, ...]]] = {}
+
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
             start_event: torch.cuda.Event | None = None
@@ -676,7 +1104,76 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            if token_id is None:
+            current_token_idx = state.token_position
+            can_capture_graph = (
+                use_graph
+                and self._model_layers_all_hash_routed()
+                and not self._decode_step_is_emit_boundary(current_token_idx)
+            )
+            can_replay_graph = (
+                can_capture_graph
+                and current_token_idx in decode_graphs
+                and self._decode_kv_window_shapes_match(
+                    state=state,
+                    token_idx=current_token_idx,
+                    captured_shapes=decode_graph_window_shapes.get(current_token_idx),
+                )
+            )
+            if can_replay_graph:
+                compressed_counts_by_layer = self._compute_graph_compressed_counts(
+                    token_idx=current_token_idx,
+                )
+                decode_graphs[current_token_idx].prepare_replay(
+                    self,
+                    state=state,
+                    token_idx=current_token_idx,
+                    token_id_tensor=token_id_tensor,
+                    device=device,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
+                )
+                token_id_tensor = decode_graphs[current_token_idx].replay(
+                    token_id_tensor,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
+                )
+                state.advance_token()
+            elif can_capture_graph:
+                kv_rows_by_layer, extra_kv_rows_by_layer = (
+                    self._materialize_decode_kv_windows(
+                        state=state,
+                        token_idx=current_token_idx,
+                    )
+                )
+                compressed_counts_by_layer = self._compute_graph_compressed_counts(
+                    token_idx=current_token_idx,
+                )
+                decode_graphs[current_token_idx] = self._capture_decode_graph(
+                    state=state,
+                    token_idx=current_token_idx,
+                    device=device,
+                    kv_rows_by_layer=kv_rows_by_layer,
+                    extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
+                )
+                decode_graph_window_shapes[current_token_idx] = (
+                    self._decode_kv_window_shapes(
+                        state=state,
+                        token_idx=current_token_idx,
+                    )
+                )
+                decode_graphs[current_token_idx].prepare_replay(
+                    self,
+                    state=state,
+                    token_idx=current_token_idx,
+                    token_id_tensor=token_id_tensor,
+                    device=device,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
+                )
+                token_id_tensor = decode_graphs[current_token_idx].replay(
+                    token_id_tensor,
+                    compressed_counts_by_layer=compressed_counts_by_layer,
+                )
+                state.advance_token()
+            elif token_id is None:
                 token_id_tensor = self._forward_kernel_token_step_token_tensor(
                     token_id_tensor=token_id_tensor,
                     state=state,
@@ -713,6 +1210,229 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         metadata = getattr(model, "metadata", {})
         eos_token_id = metadata.get("tokenizer.ggml.eos_token_id")
         return None if eos_token_id is None else int(eos_token_id)
+
+    def _decode_step_is_emit_boundary(self, token_idx: int) -> bool:
+        """Return True if any compressed layer emits at ``token_idx``."""
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return False
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio > 0 and token_idx % ratio == ratio - 1:
+                return True
+        return False
+
+    def _model_layers_all_hash_routed(self) -> bool:
+        """Return True iff every layer uses hash-routed experts.
+
+        CUDA/HIP graph capture currently depends on expert payloads being
+        stageable outside the captured region via the static token-to-expert
+        table. Top-k routed layers select experts from the hidden state inside
+        the graph and cannot be captured safely yet.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if not layers:
+            return True
+        for layer in layers:
+            if layer.grouped_experts is None:
+                continue
+            if layer.expert_token_to_expert_ids is None:
+                return False
+        return True
+
+    def _compute_graph_compressed_counts(
+        self,
+        *,
+        token_idx: int,
+    ) -> dict[int, int]:
+        """Return per-layer compressed row counts for a graph capture/replay.
+
+        The count matches the number of compressed rows that exist just before
+        the decode step at ``token_idx``; this avoids a CPU sync inside the
+        captured region.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}
+        counts: dict[int, int] = {}
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            if ratio > 0:
+                counts[layer.layer_index] = (token_idx + 1) // ratio
+        return counts
+
+    def _capture_decode_graph(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        device: torch.device,
+        kv_rows_by_layer: dict[int, torch.Tensor] | None = None,
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] | None = None,
+        compressed_counts_by_layer: dict[int, int] | None = None,
+    ) -> DeepSeekV4FlashDecodeGraph:
+        """Capture a CUDA/HIP graph for one steady-state decode step."""
+        from .decode_graph import DeepSeekV4FlashDecodeGraph
+
+        return DeepSeekV4FlashDecodeGraph.capture(
+            self,
+            state=state,
+            token_idx=token_idx,
+            device=device,
+            kv_rows_by_layer=kv_rows_by_layer,
+            extra_kv_rows_by_layer=extra_kv_rows_by_layer,
+            compressed_counts_by_layer=compressed_counts_by_layer,
+        )
+
+    def _materialize_decode_kv_windows(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor | None]]:
+        """Return explicit KV windows for all layers at ``token_idx``.
+
+        Sliding layers return their raw sliding window as ``kv_rows``.
+        Compressed layers leave ``kv_rows`` as ``None`` (the raw window is read
+        inside the graph) and return their compressed extra rows as
+        ``extra_kv_rows`` so the graph sees stable inputs for every layer.
+
+        Compressed layers with an indexer return ``None`` for ``extra_kv_rows``;
+        the indexer selection depends on the query and must run inside the
+        graph to match the reference path.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}, {}
+        kv_rows_by_layer: dict[int, torch.Tensor] = {}
+        extra_kv_rows_by_layer: dict[int, torch.Tensor | None] = {}
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            kv_rows_by_layer[layer.layer_index] = state.raw_kv_window(
+                layer.layer_index,
+                token_idx,
+                self.shape.sliding_window,
+            )
+            if ratio != 0:
+                extra_kv_rows_by_layer[layer.layer_index] = (
+                    self._materialize_compressed_extra_rows(
+                        state=state,
+                        layer=layer,
+                        token_idx=token_idx,
+                    )
+                )
+        return kv_rows_by_layer, extra_kv_rows_by_layer
+
+    def _stage_graph_moe_payloads(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_id: int,
+        device: torch.device,
+    ) -> None:
+        """Stage the MoE payloads needed for one graph replay step.
+
+        The returned payload tensors are stable cached objects; their bytes are
+        copied in place before each replay so the captured graph sees the
+        current token's experts without running CPU-side staging inside the
+        graph.
+        """
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return
+        stager = self._get_gpu_weight_stager(device)
+        for layer in layers:
+            if layer.expert_token_to_expert_ids is None:
+                continue
+            grouped = layer.grouped_experts
+            if grouped is None:
+                continue
+            table = _stage_expert_token_table(
+                stager,
+                layer.expert_token_to_expert_ids,
+                device=torch.device("cpu"),
+            )
+            if token_id < 0 or token_id >= table.shape[1]:
+                raise ValueError(
+                    f"graph token_id out of range: {token_id}; "
+                    f"expected [0, {table.shape[1]})"
+                )
+            expert_ids = table[:, token_id].to(torch.int64)
+            payloads = self.gpu_backend.stage_selected_expert_payloads(
+                stager,
+                grouped,
+                expert_ids,
+                layer_idx=layer.layer_index,
+            )
+            state.set_graph_moe_payloads(layer.layer_index, payloads)
+
+    def _materialize_compressed_extra_rows(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        layer: Any,
+        token_idx: int,
+    ) -> torch.Tensor | None:
+        """Return the compressed extra rows to feed into a graph step.
+
+        Layers without an indexer use all prior compressed rows, which is
+        stable across decode steps and safe to materialize once per graph.
+        Layers with an indexer select rows based on the current query, so
+        returning ``None`` lets ``_run_real_sliding_attention`` compute the
+        indexer selection inside the graph and match the reference path.
+        """
+        del token_idx
+        if layer.indexer is not None:
+            return None
+        return state.compressed_kv_cache.read_compressed(layer.layer_index)
+
+    def _decode_kv_window_shapes(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+    ) -> dict[int, tuple[int, ...] | None]:
+        """Return the shapes of KV windows for all layers at ``token_idx``."""
+        store = self._require_weight_store()
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return {}
+        shapes: dict[int, tuple[int, ...] | None] = {}
+        for layer in layers:
+            ratio = layer_compress_ratio(layer.layer_index)
+            shapes[layer.layer_index] = tuple(
+                state.raw_kv_window(
+                    layer.layer_index,
+                    token_idx,
+                    self.shape.sliding_window,
+                ).shape
+            )
+            if ratio != 0 and layer.indexer is None:
+                shapes[layer.layer_index] = shapes[layer.layer_index] + tuple(
+                    state.compressed_kv_cache.read_compressed(layer.layer_index).shape
+                )
+        return shapes
+
+    def _decode_kv_window_shapes_match(
+        self,
+        *,
+        state: DeepSeekV4FlashGPURequestState,
+        token_idx: int,
+        captured_shapes: dict[int, tuple[int, ...] | None] | None,
+    ) -> bool:
+        """Return True if the current decode KV window shapes match capture."""
+        if captured_shapes is None:
+            return False
+        current_shapes = self._decode_kv_window_shapes(
+            state=state,
+            token_idx=token_idx,
+        )
+        return current_shapes == captured_shapes
 
     def _validate_full_reference_input(self, input_ids: torch.Tensor) -> None:
         if input_ids.ndim != 1:
@@ -867,11 +1587,76 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     def _gpu_staging_budget_bytes(self) -> int | None:
         if self.runtime_budget is None:
             return None
-        return max(
+        base = max(
             0,
             self.runtime_budget.available_headroom_bytes
             - self.runtime_budget.min_system_headroom_bytes,
         )
+        extra_gb_str = os.environ.get(
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB",
+            "0",
+        )
+        try:
+            extra_gb = float(extra_gb_str)
+        except ValueError:
+            warnings.warn(
+                f"Ignoring malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB "
+                f"value {extra_gb_str!r}; using 0",
+                stacklevel=2,
+            )
+            extra_gb = 0.0
+        if extra_gb <= 0:
+            return base
+        extra_bytes = int(extra_gb * 1024 * 1024 * 1024)
+        return min(
+            base + extra_bytes,
+            self.runtime_budget.available_headroom_bytes,
+        )
+
+    def pin_hot_experts_for_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Pin experts mapped from the prompt tokens for all hash-routed layers."""
+        if (
+            os.environ.get(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS",
+                "1",
+            )
+            != "1"
+        ):
+            return
+        store = self._require_weight_store()
+        stager = self._get_gpu_weight_stager(device)
+        layers = getattr(store.bindings, "layers", None)
+        if layers is None:
+            return
+        token_ids = set(int(t) for t in input_ids.detach().cpu().tolist())
+        for layer in layers:
+            expert_token_table = getattr(layer, "expert_token_to_expert_ids", None)
+            if expert_token_table is None:
+                continue
+            if isinstance(expert_token_table, DeepSeekV4FlashTensor):
+                table = _stage_expert_token_table(
+                    stager, expert_token_table, device=stager.device
+                )
+            elif isinstance(expert_token_table, torch.Tensor):
+                table = expert_token_table
+            else:
+                continue
+            if table.ndim != 2:
+                continue
+            table_device = stager.device if table.is_cuda else torch.device("cpu")
+            staged_table = table.to(table_device)
+            for token_id in token_ids:
+                if token_id < 0 or token_id >= staged_table.shape[1]:
+                    continue
+                for expert_id in staged_table[:, token_id].tolist():
+                    stager.pin_grouped_expert(
+                        layer.layer_index,
+                        int(expert_id),
+                    )
 
     def gpu_staging_memory_stats(self) -> dict[str, int | None]:
         stager = self._gpu_weight_stager
@@ -1016,9 +1801,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         store = self._require_weight_store()
         output_head = getattr(store.bindings, "output_head", None)
         if output_head is None:
-            raise RuntimeError(
-                "DeepSeek V4 Flash output.weight binding is required"
-            )
+            raise RuntimeError("DeepSeek V4 Flash output.weight binding is required")
         stager = self._get_gpu_weight_stager(device)
         stager.warm_static_decode_weights(output_weight=output_head)
 
@@ -1490,10 +2273,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
                 chunk_token: torch.Tensor | None = None
                 chunk_value: torch.Tensor | None = None
-                if (
-                    output_hidden is None
-                    and hasattr(self.gpu_backend, "output_hidden")
-                ):
+                if output_hidden is None and hasattr(self.gpu_backend, "output_hidden"):
                     output_hidden = self.gpu_backend.output_hidden(
                         streams=streams,
                         lm_head_values=lm_head_values,
@@ -1509,9 +2289,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                             "DeepSeek V4 Flash GPU output hidden returned CPU tensor"
                         )
 
-                if (
-                    output_hidden is not None
-                    and hasattr(self.gpu_backend, "output_argmax_from_hidden")
+                if output_hidden is not None and hasattr(
+                    self.gpu_backend, "output_argmax_from_hidden"
                 ):
                     token, value = self.gpu_backend.output_argmax_from_hidden(
                         hidden=output_hidden,
@@ -1618,9 +2397,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             raise RuntimeError("DeepSeek V4 Flash full reference requires output HC")
         flat = streams.reshape(-1).to(torch.float32)
         flat = flat * torch.rsqrt(flat.pow(2).mean() + _RMS_NORM_EPS)
-        pre = store.decode_matrix(hc.fn).transpose(0, 1).to(torch.float32).matmul(
-            flat
-        )
+        pre = store.decode_matrix(hc.fn).transpose(0, 1).to(torch.float32).matmul(flat)
         scale = store.tensor_to_torch(hc.scale, dtype=torch.float32)
         base = store.tensor_to_torch(hc.base, dtype=torch.float32)
         if scale.shape != (1,) or base.shape != (4,):
@@ -1771,9 +2548,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         scale_bytes = raw[:, :2].contiguous()
         values = raw[:, 2:].contiguous().view(torch.int8).reshape(rows, columns)
-        scales = scale_bytes.view(torch.float16).to(torch.float32).reshape(
-            rows,
-            blocks_per_row,
+        scales = (
+            scale_bytes.view(torch.float16)
+            .to(torch.float32)
+            .reshape(
+                rows,
+                blocks_per_row,
+            )
         )
         return values, scales
 

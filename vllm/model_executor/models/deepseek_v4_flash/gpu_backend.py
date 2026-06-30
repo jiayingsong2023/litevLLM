@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from vllm.kernels.triton.deepseek_v4_flash.attention import (
     DeepSeekV4AttentionKernelInputs,
     deepseek_v4_attention,
+    deepseek_v4_fused_sliding_window_attention,
 )
 from vllm.kernels.triton.deepseek_v4_flash.compressed_attention import (
     DeepSeekV4CompressedAttentionTensorInputs,
@@ -32,7 +33,9 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
     deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
+    deepseek_v4_iq2_xxs_selected_experts_activation,
     deepseek_v4_q2_k_matvec,
+    deepseek_v4_q2_k_selected_experts_down_projection,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
@@ -43,6 +46,11 @@ from vllm.model_executor.models.deepseek_v4_flash.ops import (
 )
 
 from .config import DEEPSEEK_V4_FLASH_SHAPE
+from .gpu_weight_staging import (
+    DeepSeekV4FlashGPUWeightStager,
+    DeepSeekV4FlashSelectedExpertPayloads,
+)
+from .weight_store import DeepSeekV4FlashGroupedExpertTensors
 
 
 class DeepSeekV4FlashQuantizedExpertPayloadLike(Protocol):
@@ -95,6 +103,7 @@ class DeepSeekV4FlashGPUBackend:
             "iq2_xxs_gate_up_fused_calls": 0,
             "q2_iq2_reference_fallback_calls": 0,
             "cpu_token_sync_points": 0,
+            "fused_sliding_attention_api_calls": 0,
         }
 
     @property
@@ -323,6 +332,26 @@ class DeepSeekV4FlashGPUBackend:
             )
         )
 
+    def fused_sliding_window_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        attn_sinks: torch.Tensor | None,
+        token_idx: int,
+    ) -> torch.Tensor:
+        tensors = (query, kv_rows, attn_sinks)
+        if any(tensor is not None and not tensor.is_cuda for tensor in tensors):
+            raise ValueError(
+                "DeepSeek V4 Flash fused sliding attention inputs must be CUDA tensors"
+            )
+        self._stats["fused_sliding_attention_api_calls"] += 1
+        return deepseek_v4_fused_sliding_window_attention(
+            query=query.to(torch.float32),
+            kv_rows=kv_rows.to(torch.float32),
+            attn_sinks=attn_sinks.to(torch.float32) if attn_sinks is not None else None,
+        )
+
     def routed_moe(
         self,
         *,
@@ -475,8 +504,8 @@ class DeepSeekV4FlashGPUBackend:
             raise ValueError(
                 "DeepSeek V4 Flash selected expert GEMM inputs must be CUDA tensors"
             )
-        self._stats["selected_expert_fused_api_calls"] = (
-            self._stats.get("selected_expert_fused_api_calls", 0) + 1
+        self._stats["fused_selected_expert_api_calls"] = (
+            self._stats.get("fused_selected_expert_api_calls", 0) + 1
         )
         if not payloads:
             raise ValueError("DeepSeek V4 Flash selected expert GEMM got no payloads")
@@ -502,6 +531,71 @@ class DeepSeekV4FlashGPUBackend:
         if output is None:
             raise ValueError("DeepSeek V4 Flash selected expert GEMM got no payloads")
         return output
+
+    def fused_quantized_selected_experts_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        expert_weights: torch.Tensor,
+        payloads: list[
+            tuple[
+                int,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+                DeepSeekV4FlashQuantizedExpertPayloadLike,
+            ]
+        ],
+        workspace: torch.Tensor,
+    ) -> torch.Tensor:
+        if not hidden.is_cuda or not expert_weights.is_cuda or not workspace.is_cuda:
+            raise ValueError("fused selected expert GEMM inputs must be CUDA tensors")
+        if not payloads:
+            raise ValueError("fused selected expert GEMM got no payloads")
+        self._stats["fused_selected_expert_api_calls"] = (
+            self._stats.get("fused_selected_expert_api_calls", 0) + 1
+        )
+        gate_payloads = []
+        up_payloads = []
+        down_payloads = []
+        for _expert_id, gate, up, down in payloads:
+            gate_payloads.append(gate.payload)
+            up_payloads.append(up.payload)
+            down_payloads.append(down.payload)
+        rows = payloads[0][1].rows
+        columns = payloads[0][1].columns
+        deepseek_v4_iq2_xxs_selected_experts_activation(
+            hidden=hidden.to(torch.float32),
+            payloads=list(zip(gate_payloads, up_payloads)),
+            workspace=workspace,
+            rows=rows,
+            columns=columns,
+        )
+        down_rows = payloads[0][3].rows
+        down_columns = payloads[0][3].columns
+        output = torch.empty((down_rows,), dtype=torch.float32, device=hidden.device)
+        deepseek_v4_q2_k_selected_experts_down_projection(
+            workspace=workspace,
+            down_payloads=down_payloads,
+            expert_weights=expert_weights.reshape(-1),
+            output=output,
+            rows=down_rows,
+            columns=down_columns,
+        )
+        return output
+
+    def stage_selected_expert_payloads(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        grouped_experts: DeepSeekV4FlashGroupedExpertTensors,
+        expert_ids: torch.Tensor,
+        *,
+        layer_idx: int | None = None,
+    ) -> list[DeepSeekV4FlashSelectedExpertPayloads]:
+        return stager.copy_selected_expert_payload_bytes(
+            grouped_experts,
+            expert_ids,
+            layer_idx=layer_idx,
+        )
 
     def compressed_attention(
         self,

@@ -151,6 +151,7 @@ class DeepSeekV4CompressedKVCache:
             dtype=torch.long,
             device=device,
         )
+        self._compressed_counts_cpu: list[int] = [0] * num_layers
 
     def append_raw(
         self,
@@ -167,7 +168,14 @@ class DeepSeekV4CompressedKVCache:
         slot = token_idx % self.raw_window
         self.raw_keys[layer_idx, slot].copy_(key)
         self.raw_values[layer_idx, slot].copy_(value)
-        self.raw_token_indices[layer_idx, slot] = token_idx
+        self.raw_token_indices[layer_idx, slot].copy_(
+            torch.full(
+                (),
+                token_idx,
+                dtype=torch.long,
+                device=self.raw_token_indices.device,
+            )
+        )
 
     def read_raw_window(
         self,
@@ -180,9 +188,7 @@ class DeepSeekV4CompressedKVCache:
         if window <= 0:
             raise ValueError("window must be positive")
         if window > self.raw_window:
-            raise ValueError(
-                f"window {window} exceeds raw_window {self.raw_window}"
-            )
+            raise ValueError(f"window {window} exceeds raw_window {self.raw_window}")
 
         start = max(0, token_idx - window + 1)
         token_indices = self.raw_token_indices[layer_idx]
@@ -239,6 +245,7 @@ class DeepSeekV4CompressedKVCache:
         if indexer_row is not None:
             self.indexer_rows[layer_idx, slot].copy_(indexer_row)
         self._compressed_counts[layer_idx] += 1
+        self._compressed_counts_cpu[layer_idx] += 1
         return slot
 
     def read_compressed(
@@ -246,24 +253,33 @@ class DeepSeekV4CompressedKVCache:
         layer_idx: int,
         *,
         row_indices: torch.Tensor | None = None,
+        count: int | None = None,
     ) -> torch.Tensor:
         self._validate_layer(layer_idx)
-        count = int(self._compressed_counts[layer_idx].item())
+        provided_count = count
+        if count is None:
+            count = self._compressed_counts_cpu[layer_idx]
         if row_indices is None:
             return self.compressed_rows[layer_idx, :count]
         if row_indices.ndim != 1:
-            raise ValueError(
-                f"row_indices must be 1-D; got {row_indices.ndim}-D"
-            )
+            raise ValueError(f"row_indices must be 1-D; got {row_indices.ndim}-D")
         if row_indices.numel() == 0:
             return self.compressed_rows[layer_idx, :0]
-        if torch.any(row_indices < 0) or torch.any(row_indices >= count):
+        if provided_count is None and (
+            torch.any(row_indices < 0) or torch.any(row_indices >= count)
+        ):
             raise ValueError("compressed row index out of range")
         return self.compressed_rows[layer_idx, row_indices.to(torch.long)]
 
-    def read_indexer_rows(self, layer_idx: int) -> torch.Tensor:
+    def read_indexer_rows(
+        self,
+        layer_idx: int,
+        *,
+        count: int | None = None,
+    ) -> torch.Tensor:
         self._validate_layer(layer_idx)
-        count = int(self._compressed_counts[layer_idx].item())
+        if count is None:
+            count = self._compressed_counts_cpu[layer_idx]
         return self.indexer_rows[layer_idx, :count]
 
     def _validate_layer(self, layer_idx: int) -> None:
@@ -275,15 +291,13 @@ class DeepSeekV4CompressedKVCache:
             raise ValueError("token index must be non-negative")
         if token_idx >= self.context_length:
             raise ValueError(
-                f"token index {token_idx} exceeds context_length "
-                f"{self.context_length}"
+                f"token index {token_idx} exceeds context_length {self.context_length}"
             )
 
     def _validate_raw_row(self, name: str, row: torch.Tensor) -> None:
         if row.shape != (self.hidden_size,):
             raise ValueError(
-                f"{name} shape must be ({self.hidden_size},); got "
-                f"{tuple(row.shape)}"
+                f"{name} shape must be ({self.hidden_size},); got {tuple(row.shape)}"
             )
         if row.dtype != self.raw_keys.dtype:
             raise ValueError(

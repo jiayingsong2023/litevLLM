@@ -124,6 +124,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dump-step-json", type=Path, default=None)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--enable-profiler", action="store_true")
+    parser.add_argument(
+        "--use-graph",
+        action="store_true",
+        help="Use CUDA/HIP graph capture for decode (model.generate_greedy_kernel).",
+    )
     return parser.parse_args(argv)
 
 
@@ -661,6 +666,24 @@ def _run_direct_generate(
                 device=torch.device("cuda"),
             )
         )
+        if bool(getattr(args, "use_graph", False)):
+            input_ids = torch.tensor(
+                prompt_token_ids, dtype=torch.long, device=torch.device("cuda")
+            )
+            output_ids_tensor, _token_elapsed_ms = model.generate_greedy_kernel_timed(
+                input_ids,
+                max_tokens=args.max_tokens,
+                use_graph=True,
+            )
+            output_ids = [int(t) for t in output_ids_tensor.detach().cpu().tolist()]
+            torch.cuda.synchronize()
+            return {
+                "output_token_ids": output_ids,
+                "step_records": [],
+                "gpu_backend": model.gpu_backend.stats(),
+                "gpu_staging": model.gpu_staging_memory_stats(),
+                "profiler": model.deepseek_profile(),
+            }
         output_ids = list(prompt_token_ids)
         step_records: list[dict[str, object]] = []
         next_token_tensor: torch.Tensor | None = None

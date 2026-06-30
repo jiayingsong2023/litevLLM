@@ -2,7 +2,10 @@ import pytest
 import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    apply_deepseek_layer_rope_to_tail_reference,
+    apply_precomputed_rope_to_tail,
     apply_rope_to_tail_reference,
+    build_deepseek_layer_rope_tables,
     compressor_pair_projection_reference,
     compressor_pool_state_reference,
     compressor_should_emit_reference,
@@ -14,8 +17,40 @@ from vllm.model_executor.models.deepseek_v4_flash.attention import (
     indexer_weight_projection_reference,
     per_head_rms_norm_reference,
     raw_swa_attention_reference,
-    shared_kv_swa_attention_reference,
 )
+from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    shared_kv_swa_attention_reference as _shared_kv_swa_attention_reference,
+)
+from vllm.model_executor.models.deepseek_v4_flash.config import (
+    DEEPSEEK_V4_FLASH_SHAPE,
+)
+
+
+def shared_kv_swa_attention_reference(
+    queries: torch.Tensor,
+    kv_rows: torch.Tensor,
+    attn_sinks: torch.Tensor | None,
+    *,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Wrapper that treats ``attn_sinks=None`` as no sink contribution.
+
+    The underlying reference requires a sink tensor; a sink of ``-inf`` gives
+    the same softmax denominator as omitting the sink entirely.
+    """
+    if attn_sinks is None:
+        attn_sinks = torch.full(
+            (queries.shape[0],),
+            float("-inf"),
+            dtype=queries.dtype,
+            device=queries.device,
+        )
+    return _shared_kv_swa_attention_reference(
+        queries,
+        kv_rows,
+        attn_sinks,
+        softmax_scale=softmax_scale,
+    )
 
 
 def test_raw_swa_attention_reference_scores_supplied_causal_window() -> None:
@@ -39,7 +74,7 @@ def test_raw_swa_attention_reference_returns_float32_value_vector() -> None:
 
     out = raw_swa_attention_reference(query, keys, values)
 
-    assert out.shape == (3, )
+    assert out.shape == (3,)
     assert out.dtype == torch.float32
     torch.testing.assert_close(out, torch.tensor([3.0, 4.0, 5.0]))
 
@@ -259,3 +294,97 @@ def test_compressor_update_state_reference_emits_on_ratio_boundary() -> None:
 
     assert emitted is not None
     torch.testing.assert_close(emitted, torch.tensor([0.0, 8.0]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_matches_reference() -> None:
+    from vllm.kernels.triton.deepseek_v4_flash.attention import (
+        deepseek_v4_fused_sliding_window_attention,
+    )
+
+    num_heads = 64
+    head_dim = 512
+    window = 128
+    torch.manual_seed(42)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+    attn_sinks = torch.randn((num_heads,), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, attn_sinks)
+    actual = deepseek_v4_fused_sliding_window_attention(query, kv_rows, attn_sinks)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_no_sinks() -> None:
+    from vllm.kernels.triton.deepseek_v4_flash.attention import (
+        deepseek_v4_fused_sliding_window_attention,
+    )
+
+    num_heads = 8
+    head_dim = 32
+    window = 7
+    torch.manual_seed(7)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, None)
+    actual = deepseek_v4_fused_sliding_window_attention(query, kv_rows, None)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1, 2, 3, 42])
+@pytest.mark.parametrize("token_idx", [0, 1, 63, 127])
+def test_precomputed_rope_matches_reference(
+    layer_idx: int,
+    token_idx: int,
+) -> None:
+    shape = DEEPSEEK_V4_FLASH_SHAPE
+    rotary_dim = shape.rotary_dim
+    context_length = 128
+    device = torch.device("cpu")
+
+    rope_cos, rope_sin = build_deepseek_layer_rope_tables(
+        context_length=context_length,
+        rotary_dim=rotary_dim,
+        rope_freq_base=shape.rope_freq_base,
+        compressed_rope_freq_base=shape.compressed_rope_freq_base,
+        rope_scale_factor=shape.rope_scale_factor,
+        rope_original_context=shape.rope_original_context,
+        rope_yarn_beta_fast=shape.rope_yarn_beta_fast,
+        rope_yarn_beta_slow=shape.rope_yarn_beta_slow,
+        device=device,
+    )
+
+    torch.manual_seed(42)
+    vectors_1d = torch.randn(rotary_dim, dtype=torch.float32, device=device)
+    vectors_2d = torch.randn(4, rotary_dim, dtype=torch.float32, device=device)
+    vectors_larger = torch.randn(rotary_dim + 16, dtype=torch.float32, device=device)
+
+    cos = rope_cos[layer_idx, token_idx]
+    sin = rope_sin[layer_idx, token_idx]
+
+    for vectors in (vectors_1d, vectors_2d, vectors_larger):
+        expected = apply_deepseek_layer_rope_to_tail_reference(
+            vectors,
+            token_idx=token_idx,
+            layer_idx=layer_idx,
+            rotary_dim=rotary_dim,
+        )
+        actual = apply_precomputed_rope_to_tail(vectors, cos, sin)
+        torch.testing.assert_close(actual, expected)
+
+        expected_inv = apply_deepseek_layer_rope_to_tail_reference(
+            vectors,
+            token_idx=token_idx,
+            layer_idx=layer_idx,
+            rotary_dim=rotary_dim,
+            inverse=True,
+        )
+        actual_inv = apply_precomputed_rope_to_tail(
+            vectors,
+            cos,
+            sin,
+            inverse=True,
+        )
+        torch.testing.assert_close(actual_inv, expected_inv)

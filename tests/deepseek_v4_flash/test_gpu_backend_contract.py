@@ -8,13 +8,32 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.models.deepseek_v4_flash import gpu_backend as backend_module
+from vllm.model_executor.models.deepseek_v4_flash.attention import (
+    apply_deepseek_layer_rope_to_tail_reference,
+    per_head_rms_norm_reference,
+    shared_kv_swa_attention_reference,
+)
+from vllm.model_executor.models.deepseek_v4_flash.config import (
+    DEEPSEEK_V4_FLASH_SHAPE,
+)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_F16,
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_Q2_K,
+    DeepSeekV4FlashTensor,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
     DeepSeekV4FlashGPUCapabilities,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
+    _project_sliding_attention_output,
+    _project_tensor,
+    _run_real_sliding_attention,
+    deepseek_v4_flash_rms_norm,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
+    DeepSeekV4FlashGPUWeightStager,
 )
 from vllm.model_executor.models.deepseek_v4_flash.model import (
     DeepSeekV4FlashForCausalLM,
@@ -25,6 +44,9 @@ from vllm.model_executor.models.deepseek_v4_flash.ops import (
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
     iq2_xxs_matrix_from_gguf_payload,
     q2_k_matrix_from_gguf_payload,
+)
+from vllm.model_executor.models.deepseek_v4_flash.weight_store import (
+    DeepSeekV4FlashLayerSemanticBindings,
 )
 
 
@@ -227,6 +249,7 @@ def test_output_argmax_matches_output_logits() -> None:
                 "iq2_xxs_gate_up_fused_calls": 0,
                 "q2_iq2_reference_fallback_calls": 0,
                 "cpu_token_sync_points": 0,
+                "fused_sliding_attention_api_calls": 0,
             },
         ),
         (
@@ -239,6 +262,7 @@ def test_output_argmax_matches_output_logits() -> None:
                 "iq2_xxs_gate_up_fused_calls": 1,
                 "q2_iq2_reference_fallback_calls": 0,
                 "cpu_token_sync_points": 0,
+                "fused_sliding_attention_api_calls": 0,
             },
         ),
     ),
@@ -380,6 +404,7 @@ def test_quantized_expert_gemm_matches_reference_with_iq2_gate_up_and_q2_down() 
         "iq2_xxs_gate_up_fused_calls": 1,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
+        "fused_sliding_attention_api_calls": 0,
     }
 
 
@@ -441,10 +466,13 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
     roundtrips_by_width: dict[int, int] = {}
 
     def counted_roundtrip(tensor: torch.Tensor) -> torch.Tensor:
-        roundtrips_by_width[tensor.numel()] = roundtrips_by_width.get(
-            tensor.numel(),
-            0,
-        ) + 1
+        roundtrips_by_width[tensor.numel()] = (
+            roundtrips_by_width.get(
+                tensor.numel(),
+                0,
+            )
+            + 1
+        )
         return deepseek_q8_k_roundtrip_reference(tensor)
 
     monkeypatch.setattr(
@@ -468,7 +496,8 @@ def test_quantized_selected_experts_gemm_matches_existing_loop(
         "iq2_xxs_gate_up_fused_calls": 6,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
-        "selected_expert_fused_api_calls": 1,
+        "fused_selected_expert_api_calls": 1,
+        "fused_sliding_attention_api_calls": 0,
     }
 
 
@@ -558,7 +587,245 @@ def test_quantized_expert_gemm_uses_fused_iq2_gate_up_for_multiblock_columns() -
         "iq2_xxs_gate_up_fused_calls": 1,
         "q2_iq2_reference_fallback_calls": 0,
         "cpu_token_sync_points": 0,
+        "fused_sliding_attention_api_calls": 0,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_quantized_selected_experts_gemm_matches_loop() -> None:
+    rows = 256
+    columns = 512
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    expert_weights = torch.full((6,), 1.0 / 6.0, dtype=torch.float32, device="cuda")
+    payloads = [
+        (
+            expert_id,
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_Q2_K,
+                rows=rows,
+                columns=rows,
+                payload=_q2_k_deterministic_payload(rows),
+            ),
+        )
+        for expert_id in range(6)
+    ]
+    ref_backend = DeepSeekV4FlashGPUBackend()
+    expected = ref_backend.quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+    )
+    backend = DeepSeekV4FlashGPUBackend()
+    workspace = torch.empty((6, rows), dtype=torch.float32, device="cuda")
+    actual = backend.fused_quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+        workspace=workspace,
+    )
+    # The fused path skips the Q8_K round-trip that the looped fallback
+    # performs, so allow a slightly looser relative tolerance.
+    torch.testing.assert_close(actual, expected, rtol=5.0e-3, atol=1.0e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_sliding_window_attention_matches_reference() -> None:
+    from vllm.model_executor.models.deepseek_v4_flash.attention import (
+        shared_kv_swa_attention_reference,
+    )
+
+    backend = DeepSeekV4FlashGPUBackend()
+    num_heads = 64
+    head_dim = 512
+    window = 128
+    torch.manual_seed(123)
+    query = torch.randn((num_heads, head_dim), dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn((window, head_dim), dtype=torch.float32, device="cuda")
+    attn_sinks = torch.randn((num_heads,), dtype=torch.float32, device="cuda")
+
+    expected = shared_kv_swa_attention_reference(query, kv_rows, attn_sinks)
+    actual = backend.fused_sliding_window_attention(
+        query=query,
+        kv_rows=kv_rows,
+        attn_sinks=attn_sinks,
+        token_idx=7,
+    )
+    assert backend.stats()["fused_sliding_attention_api_calls"] == 1
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("exc_type", [RuntimeError, ValueError])
+def test_run_real_sliding_attention_falls_back_when_fused_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    exc_type: type[RuntimeError] | type[ValueError],
+) -> None:
+    """`_run_real_sliding_attention` must use the reference path when the
+    fused backend method raises ``RuntimeError`` or ``ValueError``.
+    """
+    shape = DEEPSEEK_V4_FLASH_SHAPE
+    hidden_size = shape.hidden_size
+    q_lora_rank = shape.q_lora_rank
+    o_lora_rank = shape.o_lora_rank
+    num_heads = shape.num_attention_heads
+    head_dim = shape.head_dim
+    group_input = (num_heads * head_dim) // shape.output_groups
+
+    def _f16_tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
+        return DeepSeekV4FlashTensor(
+            name=name,
+            dims=dims,
+            tensor_type=GGML_TYPE_F16,
+            offset=0,
+            nbytes=0,
+        )
+
+    layer = DeepSeekV4FlashLayerSemanticBindings(
+        layer_index=0,
+        attention_query_a=_f16_tensor(
+            "attn_q_a.weight",
+            (hidden_size, q_lora_rank),
+        ),
+        attention_query_a_norm=_f16_tensor(
+            "attn_q_a_norm.weight",
+            (q_lora_rank,),
+        ),
+        attention_query_b=_f16_tensor(
+            "attn_q_b.weight",
+            (q_lora_rank, num_heads * head_dim),
+        ),
+        attention_key_value=_f16_tensor(
+            "attn_kv.weight",
+            (hidden_size, head_dim),
+        ),
+        attention_key_value_a_norm=_f16_tensor(
+            "attn_kv_a_norm.weight",
+            (head_dim,),
+        ),
+        attention_sinks=_f16_tensor(
+            "attn_sinks.weight",
+            (num_heads,),
+        ),
+        attention_output_a=_f16_tensor(
+            "attn_output_a.weight",
+            (group_input, o_lora_rank),
+        ),
+        attention_output_b=_f16_tensor(
+            "attn_output_b.weight",
+            (o_lora_rank, hidden_size),
+        ),
+    )
+
+    class _MockStore:
+        def decode_matrix(self, tensor: DeepSeekV4FlashTensor) -> torch.Tensor:
+            # GGUF stores matrices as (input_dim, output_dim); the real stager
+            # returns them row-major as (output_dim, input_dim).
+            return torch.randn(
+                (tensor.dims[1], tensor.dims[0]),
+                dtype=torch.float32,
+                device="cpu",
+            )
+
+        def tensor_to_torch(
+            self,
+            tensor: DeepSeekV4FlashTensor,
+            *,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            total = 1
+            for dim in tensor.dims:
+                total *= dim
+            return torch.randn((total,), dtype=dtype, device="cpu")
+
+    stager = DeepSeekV4FlashGPUWeightStager(store=_MockStore())
+    backend = DeepSeekV4FlashGPUBackend()
+
+    def _raising_fused(
+        *,
+        query: torch.Tensor,
+        kv_rows: torch.Tensor,
+        attn_sinks: torch.Tensor | None,
+        token_idx: int,
+    ) -> torch.Tensor:
+        del query, kv_rows, attn_sinks, token_idx
+        raise exc_type("fused attention unavailable")
+
+    monkeypatch.setattr(
+        backend,
+        "fused_sliding_window_attention",
+        _raising_fused,
+    )
+
+    torch.manual_seed(7)
+    attn_input = torch.zeros(hidden_size, dtype=torch.float32, device="cuda")
+    kv_rows = torch.randn(
+        (shape.sliding_window, head_dim),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    token_idx = 0
+
+    actual = _run_real_sliding_attention(
+        attn_input,
+        layer=layer,
+        stager=stager,
+        backend=backend,
+        state=None,
+        token_idx=token_idx,
+        kv_rows=kv_rows,
+    )
+
+    # Reproduce the query computation so we can build the expected reference
+    # output through the same post-attention projection path.
+    q_latent = _project_tensor(attn_input, layer.attention_query_a, stager)
+    q_latent = deepseek_v4_flash_rms_norm(
+        q_latent,
+        stager.stage_vector(layer.attention_query_a_norm),
+    )
+    query = _project_tensor(q_latent, layer.attention_query_b, stager).reshape(
+        num_heads,
+        head_dim,
+    )
+    query = per_head_rms_norm_reference(query)
+    query = apply_deepseek_layer_rope_to_tail_reference(
+        query,
+        token_idx=token_idx,
+        layer_idx=layer.layer_index,
+        rotary_dim=shape.rotary_dim,
+    )
+
+    staged_sinks = stager.stage_vector(layer.attention_sinks)
+    ref_context = shared_kv_swa_attention_reference(query, kv_rows, staged_sinks)
+    ref_context = apply_deepseek_layer_rope_to_tail_reference(
+        ref_context,
+        token_idx=token_idx,
+        layer_idx=layer.layer_index,
+        rotary_dim=shape.rotary_dim,
+        inverse=True,
+    )
+    expected = _project_sliding_attention_output(
+        ref_context.reshape(-1),
+        None,
+        attention_output_a=layer.attention_output_a,
+        attention_output_b=layer.attention_output_b,
+        stager=stager,
+    )
+
+    assert backend.stats()["fused_sliding_attention_api_calls"] == 0
+    assert actual.shape == (hidden_size,)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_model_keeps_kernel_execution_disabled_until_backend_ready() -> None:
