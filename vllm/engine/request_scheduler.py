@@ -1,36 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import contextlib
+import threading
 from collections import deque
 from collections.abc import AsyncIterator
-from typing import Any
 
 from vllm.engine.request_state import RequestState
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
-
-
-def _coerce_request_state(
-    request_id: str, request: RequestState | dict[str, Any]
-) -> RequestState:
-    """Convert legacy dict request state into a typed ``RequestState``.
-
-    This keeps test helpers and one-off callers working while the control plane
-    migrates to attribute-based access.
-    """
-    if isinstance(request, RequestState):
-        return request
-
-    data = dict(request)
-    state = RequestState(
-        request_id=request_id,
-        prompt=data.get("prompt", ""),
-        input_ids=data.get("input_ids", []),
-        sampling_params=data.get("sampling_params") or SamplingParams(),
-    )
-    for key, value in data.items():
-        if hasattr(state, key):
-            setattr(state, key, value)
-    return state
 
 
 class RequestScheduler:
@@ -47,12 +23,33 @@ class RequestScheduler:
         )
         self._requests: dict[str, RequestState] = {}
         self._running_ids: list[str] = []
+        self._running_ids_set: set[str] = set()
         self._queued_ids: deque[str] = deque()
-        self._free_slots: list[int] = list(range(max_active_requests))
+        self._queued_ids_set: set[str] = set()
+        self._prefill_ids: set[str] = set()
+        self._decode_ids: set[str] = set()
+        self._free_slots: deque[int] = deque(range(max_active_requests))
         self._request_slots: dict[str, int] = {}
         self._request_streams: dict[
             str, asyncio.Queue[RequestOutput | BaseException]
         ] = {}
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        with contextlib.suppress(RuntimeError):
+            self._event_loop = asyncio.get_running_loop()
+        self._event_loop_thread_id: int | None = threading.current_thread().ident
+
+    def _set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the asyncio event loop that owns this scheduler's stream queues.
+
+        Called by AsyncDriver when it starts in an async context. This lets
+        publish_output/publish_exception safely dispatch from a background
+        worker thread back to the event loop thread.
+        """
+        self._event_loop = loop
+        self._event_loop_thread_id = threading.current_thread().ident
+
+    def _is_event_loop_thread(self) -> bool:
+        return threading.current_thread().ident == self._event_loop_thread_id
 
     @property
     def active_request_count(self) -> int:
@@ -85,29 +82,56 @@ class RequestScheduler:
         return len(self._queued_ids) < self.max_queued_requests
 
     def allocate_slot(self) -> int:
-        return self._free_slots.pop(0)
+        return self._free_slots.popleft()
+
+    def _add_running(self, request_id: str, request: RequestState) -> None:
+        """Register a request as running and update prefill/decode indexes."""
+        self._running_ids.append(request_id)
+        self._running_ids_set.add(request_id)
+        if request.is_prefill:
+            self._prefill_ids.add(request_id)
+        else:
+            self._decode_ids.add(request_id)
+
+    def _remove_from_indexes(self, request_id: str) -> None:
+        self._running_ids_set.discard(request_id)
+        self._queued_ids_set.discard(request_id)
+        self._prefill_ids.discard(request_id)
+        self._decode_ids.discard(request_id)
 
     def add_request(
-        self, request_id: str, request: RequestState | dict[str, Any]
+        self,
+        request_id: str,
+        request: RequestState,
     ) -> None:
-        request = _coerce_request_state(request_id, request)
+        if not isinstance(request, RequestState):
+            raise TypeError(
+                f"RequestScheduler.add_request expects RequestState, got "
+                f"{type(request).__name__}"
+            )
         slot_idx = request.slot_idx
         self._requests[request_id] = request
         self._request_streams[request_id] = asyncio.Queue()
         if slot_idx is None:
             self._queued_ids.append(request_id)
+            self._queued_ids_set.add(request_id)
             return
         slot_idx = int(slot_idx)
         request.slot_idx = slot_idx
-        if slot_idx in self._free_slots:
-            self._free_slots.remove(slot_idx)
+        self._free_slots.remove(slot_idx)
         self._request_slots[request_id] = slot_idx
-        self._running_ids.append(request_id)
+        self._add_running(request_id, request)
 
     def enqueue_request(
-        self, request_id: str, request: RequestState | dict[str, Any]
+        self,
+        request_id: str,
+        request: RequestState,
     ) -> None:
-        request = _coerce_request_state(request_id, request)
+        if not isinstance(request, RequestState):
+            raise TypeError(
+                f"RequestScheduler.enqueue_request expects RequestState, got "
+                f"{type(request).__name__}"
+            )
         request.slot_idx = None
         self.add_request(request_id, request)
 
@@ -116,11 +140,12 @@ class RequestScheduler:
         admit_limit = len(self._free_slots) if max_new is None else max(0, int(max_new))
         while self._queued_ids and self._free_slots and len(admitted) < admit_limit:
             request_id = self._queued_ids.popleft()
+            self._queued_ids_set.discard(request_id)
             request = self._requests[request_id]
             slot_idx = self.allocate_slot()
             request.slot_idx = slot_idx
             self._request_slots[request_id] = slot_idx
-            self._running_ids.append(request_id)
+            self._add_running(request_id, request)
             admitted.append(request_id)
         return admitted
 
@@ -132,15 +157,16 @@ class RequestScheduler:
     ) -> list[str]:
         admitted: list[str] = []
         for request_id in request_ids:
-            if request_id not in self._queued_ids or not self._free_slots:
+            if request_id not in self._queued_ids_set or not self._free_slots:
                 continue
             self._queued_ids.remove(request_id)
+            self._queued_ids_set.discard(request_id)
             request = self._requests[request_id]
             slot_idx = self.allocate_slot()
             request.slot_idx = slot_idx
             request.admitted_at = admitted_at
             self._request_slots[request_id] = slot_idx
-            self._running_ids.append(request_id)
+            self._add_running(request_id, request)
             admitted.append(request_id)
         return admitted
 
@@ -162,6 +188,7 @@ class RequestScheduler:
             if queue_wait < max_queue_wait_s:
                 continue
             self._queued_ids.remove(request_id)
+            self._queued_ids_set.discard(request_id)
             removed_request = self._requests.pop(request_id, None)
             self._request_slots.pop(request_id, None)
             if removed_request is None:
@@ -169,11 +196,22 @@ class RequestScheduler:
             expired.append(
                 (
                     request_id,
-                    f"queue timeout after {queue_wait:.3f}s (limit={max_queue_wait_s:.3f}s)",
+                    f"queue timeout after {queue_wait:.3f}s "
+                    f"(limit={max_queue_wait_s:.3f}s)",
                     removed_request,
                 )
             )
         return expired
+
+    def transition_to_decode(self, request_id: str) -> None:
+        """Move a running request from the prefill index to the decode index.
+
+        Called by the execution backend when a prefill chunk finishes and the
+        request starts decoding.
+        """
+        if request_id in self._running_ids_set:
+            self._prefill_ids.discard(request_id)
+            self._decode_ids.add(request_id)
 
     def get_request(self, request_id: str) -> RequestState:
         return self._requests[request_id]
@@ -195,13 +233,21 @@ class RequestScheduler:
 
     def publish_output(self, request_id: str, output: RequestOutput) -> None:
         queue = self._request_streams.get(request_id)
-        if queue is not None:
-            queue.put_nowait(output)
+        if queue is None:
+            return
+        if self._event_loop is not None and not self._is_event_loop_thread():
+            self._event_loop.call_soon_threadsafe(queue.put_nowait, output)
+            return
+        queue.put_nowait(output)
 
     def publish_exception(self, request_id: str, exc: BaseException) -> None:
         queue = self._request_streams.get(request_id)
-        if queue is not None:
-            queue.put_nowait(exc)
+        if queue is None:
+            return
+        if self._event_loop is not None and not self._is_event_loop_thread():
+            self._event_loop.call_soon_threadsafe(queue.put_nowait, exc)
+            return
+        queue.put_nowait(exc)
 
     def free_request(self, request_id: str) -> RequestState | None:
         request = self._requests.pop(request_id, None)
@@ -210,6 +256,7 @@ class RequestScheduler:
             if slot_idx is not None:
                 self._free_slots.append(int(slot_idx))
         self._request_slots.pop(request_id, None)
+        self._remove_from_indexes(request_id)
         if request_id in self._running_ids:
             self._running_ids.remove(request_id)
         if request_id in self._queued_ids:
@@ -220,14 +267,11 @@ class RequestScheduler:
         self.free_request(request_id)
 
     def classify_requests(self) -> tuple[list[str], list[str]]:
-        prefills: list[str] = []
-        decodes: list[str] = []
-        for request_id in self._running_ids:
-            request = self._requests[request_id]
-            if request.is_prefill:
-                prefills.append(request_id)
-            else:
-                decodes.append(request_id)
+        # Preserve the admission order of running requests; ``set`` iteration is
+        # not stable, so derive the lists from ``_running_ids`` while using the
+        # indexes for O(1) membership checks.
+        prefills = [rid for rid in self._running_ids if rid in self._prefill_ids]
+        decodes = [rid for rid in self._running_ids if rid in self._decode_ids]
         return prefills, decodes
 
     def request_ids(self) -> list[str]:

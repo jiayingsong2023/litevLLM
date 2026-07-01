@@ -2,15 +2,27 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
 from vllm.engine import async_llm as async_llm_module
 from vllm.engine.async_driver import AsyncDriver
 from vllm.engine.request_scheduler import RequestScheduler
+from vllm.engine.request_state import RequestState
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+
+
+def _rs(request_id: str, **kwargs: Any) -> RequestState:
+    return RequestState(
+        request_id=request_id,
+        prompt=kwargs.pop("prompt", ""),
+        input_ids=kwargs.pop("input_ids", []),
+        sampling_params=kwargs.pop("sampling_params", SamplingParams()),
+        **kwargs,
+    )
 
 
 def _request_output(request_id: str, finished: bool) -> RequestOutput:
@@ -33,7 +45,7 @@ def _request_output(request_id: str, finished: bool) -> RequestOutput:
 @pytest.mark.asyncio
 async def test_request_scheduler_stream_finishes_with_terminal_output() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
-    scheduler.add_request("r1", {"slot_idx": 0, "is_prefill": True})
+    scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
     scheduler.publish_output("r1", _request_output("r1", finished=False))
     scheduler.publish_output("r1", _request_output("r1", finished=True))
 
@@ -48,7 +60,7 @@ async def test_request_scheduler_stream_finishes_with_terminal_output() -> None:
 @pytest.mark.asyncio
 async def test_request_scheduler_stream_raises_published_exception() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
-    scheduler.add_request("r1", {"slot_idx": 0, "is_prefill": True})
+    scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
     scheduler.publish_exception("r1", RuntimeError("boom"))
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -58,9 +70,9 @@ async def test_request_scheduler_stream_raises_published_exception() -> None:
 
 def test_request_scheduler_enqueue_and_admit_releases_queue() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
-    scheduler.add_request("r1", {"slot_idx": 0, "is_prefill": True})
+    scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
     scheduler.enqueue_request(
-        "r2", {"is_prefill": True, "seq_len": 0, "input_ids": [1, 2]}
+        "r2", _rs("r2", is_prefill=True, seq_len=0, input_ids=[1, 2])
     )
 
     assert scheduler.active_request_count == 2
@@ -74,12 +86,12 @@ def test_request_scheduler_enqueue_and_admit_releases_queue() -> None:
     assert admitted == ["r2"]
     assert scheduler.running_ids == ["r2"]
     assert scheduler.queued_request_count == 0
-    assert scheduler.get_request("r2")["slot_idx"] == 0
+    assert scheduler.get_request("r2").slot_idx == 0
 
 
 def test_request_scheduler_abort_removes_queued_request() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
-    scheduler.enqueue_request("r1", {"is_prefill": True})
+    scheduler.enqueue_request("r1", _rs("r1", is_prefill=True))
 
     assert scheduler.queued_ids == ["r1"]
     scheduler.abort_request("r1")
@@ -90,14 +102,14 @@ def test_request_scheduler_abort_removes_queued_request() -> None:
 
 def test_request_scheduler_rejects_expired_queued_requests() -> None:
     scheduler = RequestScheduler(max_active_requests=1)
-    scheduler.enqueue_request("r1", {"is_prefill": True, "queued_at": 1.0})
-    scheduler.enqueue_request("r2", {"is_prefill": True, "queued_at": 9.5})
+    scheduler.enqueue_request("r1", _rs("r1", is_prefill=True, queued_at=1.0))
+    scheduler.enqueue_request("r2", _rs("r2", is_prefill=True, queued_at=9.5))
 
     expired = scheduler.reject_expired_queued_requests(now=10.0, max_queue_wait_s=5.0)
 
     assert len(expired) == 1
     assert expired[0][0] == "r1"
-    assert expired[0][2]["queued_at"] == 1.0
+    assert expired[0][2].queued_at == 1.0
     assert scheduler.queued_ids == ["r2"]
 
 
@@ -116,11 +128,13 @@ def test_async_driver_default_backpressure_interval_is_positive() -> None:
 @pytest.mark.asyncio
 async def test_async_driver_applies_positive_backpressure_interval() -> None:
     sleep_delays: list[float] = []
+    done_event = asyncio.Event()
 
-    async def fake_sleep(delay: float) -> None:
+    def fake_sleep(delay: float) -> None:
         sleep_delays.append(delay)
         if len(sleep_delays) >= 2:
             engine.active_request_count = 0
+            done_event.set()
 
     class FakeEngine:
         def __init__(self) -> None:
@@ -138,7 +152,7 @@ async def test_async_driver_applies_positive_backpressure_interval() -> None:
         sleep_fn=fake_sleep,
     )
     driver.notify_new_work()
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(done_event.wait(), timeout=5.0)
     driver.shutdown()
 
     assert engine.calls >= 2
@@ -149,6 +163,8 @@ async def test_async_driver_applies_positive_backpressure_interval() -> None:
 
 @pytest.mark.asyncio
 async def test_async_driver_propagates_background_error_to_engine() -> None:
+    error_event = asyncio.Event()
+
     class FakeEngine:
         def __init__(self) -> None:
             self.active_request_count = 1
@@ -162,11 +178,12 @@ async def test_async_driver_propagates_background_error_to_engine() -> None:
         def handle_background_error(self, exc: BaseException) -> None:
             self.error = exc
             self.active_request_count = 0
+            error_event.set()
 
     engine = FakeEngine()
     driver = AsyncDriver(engine)
     driver.notify_new_work()
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(error_event.wait(), timeout=5.0)
     driver.shutdown()
 
     assert engine.calls >= 1
@@ -180,6 +197,9 @@ def test_async_llm_passes_runtime_backpressure_interval_to_driver(
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
+
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
 
     class FakeDriver:
         def __init__(self, engine, *, min_step_interval_s: float) -> None:
@@ -215,6 +235,9 @@ def test_async_llm_stats_include_async_driver_stats(
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
+
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
 
         def stats(self) -> dict[str, object]:
             return {"scheduler": {"active_request_count": 1}}
@@ -257,6 +280,9 @@ async def test_async_llm_generate_abort_end_to_end(
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
+
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
             self.streams: dict[str, asyncio.Queue] = {}
 
         def add_request(
@@ -325,6 +351,9 @@ async def test_async_llm_generate_passes_lora_request(
     class FakeEngine:
         def __init__(self, _vllm_config) -> None:
             self.tokenizer = None
+
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
             self.calls = []
             self.streams: dict[str, asyncio.Queue] = {}
 

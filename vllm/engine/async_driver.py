@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import contextlib
+import queue
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
 
 from vllm.engine.errors import BackgroundLoopError
 from vllm.logger import init_logger
@@ -11,21 +16,31 @@ logger = init_logger(__name__)
 
 
 class AsyncDriver:
-    """Event-driven wrapper around LiteEngine.step()."""
+    """Background-thread driver for LiteEngine.step().
+
+    The synchronous ``engine.step()`` call (including its CUDA synchronization
+    and sampling CPU work) runs on a dedicated worker thread so that the asyncio
+    event loop remains responsive to HTTP/SSE traffic. Outputs are still produced
+    by ``engine.step()`` internally via ``scheduler.publish_output``; the
+    scheduler is thread-safe and dispatches queue writes back to the event loop
+    thread when called from the worker.
+    """
 
     def __init__(
         self,
-        engine: object,
+        engine: Any,
         *,
         min_step_interval_s: float = 0.001,
-        sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ):
         self.engine = engine
         self.min_step_interval_s = max(0.0, float(min_step_interval_s))
         self._sleep = sleep_fn
-        self._loop_task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._work_queue: queue.Queue[bool] = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
+        self._shutdown_event = threading.Event()
         self._running = False
-        self._work_event = asyncio.Event()
         self._steps = 0
         self._backpressure_sleeps = 0
         self._idle_waits = 0
@@ -35,39 +50,51 @@ class AsyncDriver:
         if self._running:
             return
         self._running = True
-        self._loop_task = asyncio.create_task(self._run_loop())
+        self._loop = asyncio.get_running_loop()
+        scheduler = getattr(self.engine, "scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "_set_event_loop"):
+            scheduler._set_event_loop(self._loop)
+        self._worker_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._worker_thread.start()
 
     def notify_new_work(self) -> None:
         self.start()
-        self._work_event.set()
+        self._work_queue.put(True)
 
-    async def _run_loop(self) -> None:
+    def _run_loop(self) -> None:
         while self._running:
             if self.engine.active_request_count == 0:
                 self._idle_waits += 1
-                self._work_event.clear()
-                await self._work_event.wait()
+                try:
+                    self._work_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if not self._running:
+                    break
+                # A notification arrived; loop around and process if there is
+                # still active work.
                 continue
 
             try:
-                outputs = self.engine.step()
-                del outputs
+                self.engine.step()
                 self._steps += 1
-                # Yield with optional positive backpressure between active steps so
-                # streaming consumers can run without letting the driver spin in a
-                # pure event-loop busy loop under sustained decode load.
-                if self.engine.active_request_count > 0:
-                    self._backpressure_sleeps += 1
-                    await self._sleep(self.min_step_interval_s)
-            except asyncio.CancelledError:
-                raise
             except Exception as exc:
                 error = BackgroundLoopError(str(exc))
                 self._background_errors += 1
-                logger.exception("AsyncDriver loop error: %s", error)
-                if hasattr(self.engine, "handle_background_error"):
-                    self.engine.handle_background_error(error)
-                await self._sleep(self.min_step_interval_s)
+                logger.exception("AsyncDriver worker thread error: %s", error)
+                loop = self._loop
+                if loop is not None and hasattr(self.engine, "handle_background_error"):
+                    loop.call_soon_threadsafe(
+                        self.engine.handle_background_error, error
+                    )
+                self._sleep(self.min_step_interval_s)
+                continue
+
+            if self.engine.active_request_count > 0:
+                self._backpressure_sleeps += 1
+                self._sleep(self.min_step_interval_s)
+
+        self._shutdown_event.set()
 
     def stats(self) -> dict[str, int | float]:
         return {
@@ -80,6 +107,8 @@ class AsyncDriver:
 
     def shutdown(self) -> None:
         self._running = False
-        self._work_event.set()
-        if self._loop_task is not None:
-            self._loop_task.cancel()
+        with contextlib.suppress(Exception):
+            self._work_queue.put_nowait(False)
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5.0)
+        self._shutdown_event.set()

@@ -13,11 +13,9 @@ from vllm.sampling_params import SamplingParams
 class RequestState:
     """Typed request state for the lite engine control plane.
 
-    The previous control plane passed request state around as a ``dict``.  This
-    dataclass keeps the same field names and runtime semantics while making the
-    shape of the state visible to type checkers.  A small dict-like shim
-    (``get``/``__getitem__``/``__setitem__``/``setdefault``) is retained during
-    the transition so callers that still use string-key access continue to work.
+    This dataclass replaces the previous ``dict[str, Any]`` request state. All
+    callers access fields directly as attributes; legacy dict-like accessors have
+    been removed.
     """
 
     request_id: str
@@ -75,28 +73,3 @@ class RequestState:
             self.is_multimodal = True
         if not self.is_multimodal_lora and self.is_multimodal and bool(self.lora_id):
             self.is_multimodal_lora = True
-
-    # Backwards-compatible dict-like accessors --------------------------------
-
-    def get(self, key: str, default: Any | None = None) -> Any:
-        """Return the attribute named ``key`` if it exists, else ``default``."""
-        try:
-            return getattr(self, key)
-        except AttributeError:
-            return default
-
-    def __getitem__(self, key: str) -> Any:
-        try:
-            return getattr(self, key)
-        except AttributeError as exc:
-            raise KeyError(key) from exc
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        setattr(self, key, value)
-
-    def setdefault(self, key: str, default: Any) -> Any:
-        try:
-            return getattr(self, key)
-        except AttributeError:
-            setattr(self, key, default)
-            return default

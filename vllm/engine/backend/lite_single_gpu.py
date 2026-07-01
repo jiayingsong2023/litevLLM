@@ -227,6 +227,7 @@ class LiteSingleGpuBackend:
                 ):
                     req.generated_ids.append(next_token)
                     req.is_prefill = False
+                    self.scheduler.transition_to_decode(rid)
                     self._process_completion(rid, next_token, results)
 
             self.observer.on_prefill_executed(step_plan.prefills, len(results))

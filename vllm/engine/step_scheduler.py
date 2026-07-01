@@ -2,6 +2,7 @@
 import time
 from dataclasses import dataclass
 
+from vllm.engine.planners import AdmissionPlanner, BudgetComputer
 from vllm.engine.scheduling_constraints import (
     LoRAConstraint,
     MultiModalConstraint,
@@ -21,7 +22,6 @@ from vllm.engine.scheduling_helpers import (
     share_gap_map,
 )
 from vllm.engine.step_plan import (
-    AdmissionPlan,
     DecodePlan,
     PrefillPlan,
     StepPlan,
@@ -211,18 +211,38 @@ class StepScheduler:
         self._decode_rr_cursor = 0
         self._prefill_rr_cursor = 0
         self._prefill_deferrals: dict[str, int] = {}
-        self._admission_service_cursor = 0
         self._decode_service_cursor = 0
-        self._admission_lora_cursor = 0
         self._prefill_lora_cursor = 0
         self._decode_lora_cursor = 0
-        self._admission_multimodal_cursor = 0
         self._prefill_multimodal_cursor = 0
         self._decode_multimodal_cursor = 0
-        self._admission_multimodal_lora_cursor = 0
         self._prefill_multimodal_lora_cursor = 0
         self._decode_multimodal_lora_cursor = 0
         self._multimodal_prefix_cache_hit_rate_feedback = 0.0
+
+        self._admission_planner = AdmissionPlanner(
+            max_admit_per_step=max_admit_per_step,
+            queue_aging_threshold_s=queue_aging_threshold_s,
+            service_class_weights=self.service_class_weights,
+            admission_service_class_quotas=self.admission_service_class_quotas,
+            max_admit_lora_adapters_per_step=self.max_admit_lora_adapters_per_step,
+            max_admit_multimodal_per_step=self.max_admit_multimodal_per_step,
+            max_admit_multimodal_lora_per_step=(
+                self.max_admit_multimodal_lora_per_step
+            ),
+            lora_fairness_relax_threshold=self.lora_fairness_relax_threshold,
+            lora_locality_tighten_threshold=self.lora_locality_tighten_threshold,
+            lora_limit_relax_delta=self.lora_limit_relax_delta,
+            lora_limit_tighten_delta=self.lora_limit_tighten_delta,
+        )
+        self._budget_computer = BudgetComputer(
+            step_token_budget=step_token_budget,
+            prefill_chunk_size=self.prefill_chunk_size,
+            decode_priority_enabled=decode_priority_enabled,
+            prefill_reserved_tokens=prefill_reserved_tokens,
+            prefill_reserve_backlog=prefill_reserve_backlog,
+            prefill_catchup_ratio=prefill_catchup_ratio,
+        )
 
         self._service_class_selector = ServiceClassSelector()
         self._lora_constraint = LoRAConstraint()
@@ -292,18 +312,22 @@ class StepScheduler:
             self._update_decode_streak(fast_plan)
             return fast_plan
 
+        now = time.perf_counter()
         queued_metrics = self._compute_queued_metrics(scheduler)
-        (
-            admissions,
-            aged_admission_count,
-            admitted_service_classes,
-            admitted_lora_gap,
-            effective_admit_lora_limit,
-            effective_admit_multimodal_lora_limit,
-            admit_multimodal_lora_limit_triggered,
-            admit_lora_relaxed,
-            admit_lora_tightened,
-        ) = self._build_admission_plan(scheduler)
+        admission = self._admission_planner.plan(scheduler, now)
+        admissions = admission.plan
+        aged_admission_count = admission.aged_count
+        admitted_service_classes = admission.service_classes
+        admitted_lora_gap = admission.lora_gap
+        effective_admit_lora_limit = admission.effective_lora_limit
+        effective_admit_multimodal_lora_limit = (
+            admission.effective_multimodal_lora_limit
+        )
+        admit_multimodal_lora_limit_triggered = (
+            admission.multimodal_lora_limit_triggered
+        )
+        admit_lora_relaxed = admission.lora_relaxed
+        admit_lora_tightened = admission.lora_tightened
         prefills, decodes = scheduler.classify_requests()
         fairness_guardrail_triggered = self._is_fairness_guardrail_triggered(
             queued_metrics
@@ -313,11 +337,13 @@ class StepScheduler:
             decodes,
             fairness_guardrail_triggered=fairness_guardrail_triggered,
         )
-        prefill_budget, decode_limit = self._compute_budgets(
+        budget = self._budget_computer.compute(
             num_prefills=len(prefills),
             num_decodes=len(decodes),
             starvation_protected=starvation_protected,
         )
+        prefill_budget = budget.prefill_budget
+        decode_limit = budget.decode_limit
 
         (
             prefill_plan,
@@ -508,7 +534,7 @@ class StepScheduler:
             return None
         rid = scheduler.running_ids[0]
         req = scheduler.get_request(rid)
-        if bool(req.get("is_prefill", False)):
+        if req.is_prefill:
             return None
         return StepPlan(
             admissions=None,
@@ -539,7 +565,7 @@ class StepScheduler:
         running_before = 1
         queued_before = 0
 
-        if bool(req.get("is_prefill", False)):
+        if req.is_prefill:
             remaining = max(1, int(len(req.input_ids) - int(req.seq_len)))
             chunk_len = min(remaining, self.prefill_chunk_size, self.step_token_budget)
             prefill = PrefillPlan(
@@ -573,175 +599,6 @@ class StepScheduler:
                 running_before=running_before,
             ),
         )
-
-    def _build_admission_plan(
-        self,
-        scheduler,
-    ) -> tuple[
-        AdmissionPlan | None,
-        int,
-        dict[str, int],
-        dict[str, float],
-        int,
-        int,
-        bool,
-        bool,
-        bool,
-    ]:
-        if not scheduler.has_capacity() or scheduler.queued_request_count == 0:
-            return None, 0, {}, {}, 0, 0, False, False, False
-        now = time.perf_counter()
-        queued_ids = scheduler.queued_ids
-        queued_requests = {rid: scheduler.get_request(rid) for rid in queued_ids}
-        aged_ids = [
-            rid
-            for rid in queued_ids
-            if (now - float(queued_requests[rid].queued_at or now))
-            >= self.queue_aging_threshold_s
-        ]
-        aged_set = set(aged_ids)
-        non_aged_ids = [rid for rid in queued_ids if rid not in aged_set]
-        admit_limit = min(
-            scheduler.queued_request_count,
-            scheduler.available_slots,
-            self.max_admit_per_step,
-        )
-        request_ids = self._select_weighted_requests(
-            scheduler=scheduler,
-            request_ids=aged_ids,
-            limit=admit_limit,
-            cursor_attr="_admission_service_cursor",
-            prefer_short_prompts=False,
-            quotas=self.admission_service_class_quotas,
-        )
-        if len(request_ids) < admit_limit:
-            selected_set = set(request_ids)
-            request_ids.extend(
-                self._select_weighted_requests(
-                    scheduler=scheduler,
-                    request_ids=[
-                        rid for rid in non_aged_ids if rid not in selected_set
-                    ],
-                    limit=admit_limit - len(request_ids),
-                    cursor_attr="_admission_service_cursor",
-                    prefer_short_prompts=True,
-                    quotas=self.admission_service_class_quotas,
-                )
-            )
-        (
-            request_ids,
-            effective_lora_limit,
-            fairness_gap,
-            relaxed,
-            tightened,
-        ) = self._shape_lora_batch(
-            scheduler=scheduler,
-            request_ids=request_ids,
-            baseline_counts=self._count_lora_adapters(scheduler, queued_ids),
-            max_lora_adapters=self.max_admit_lora_adapters_per_step,
-            cursor_attr="_admission_lora_cursor",
-        )
-        (
-            request_ids,
-            effective_multimodal_lora_limit,
-            multimodal_lora_limit_triggered,
-            _admit_multimodal_lora_relaxed,
-            _admit_multimodal_lora_tightened,
-            _admit_multimodal_lora_relaxed_by_fairness,
-            _admit_multimodal_lora_tightened_by_locality,
-            _admit_multimodal_lora_max_fairness_gap,
-        ) = self._apply_multimodal_lora_request_limit(
-            scheduler=scheduler,
-            request_ids=request_ids,
-            max_multimodal_lora_requests=self.max_admit_multimodal_lora_per_step,
-            cursor_attr="_admission_multimodal_lora_cursor",
-        )
-        request_ids = self._apply_multimodal_request_limit(
-            scheduler=scheduler,
-            request_ids=request_ids,
-            max_multimodal_requests=self.max_admit_multimodal_per_step,
-            cursor_attr="_admission_multimodal_cursor",
-        )
-        if not request_ids:
-            return (
-                None,
-                0,
-                {},
-                {},
-                effective_lora_limit,
-                effective_multimodal_lora_limit,
-                multimodal_lora_limit_triggered,
-                relaxed,
-                tightened,
-            )
-        aged_admission_count = sum(1 for rid in request_ids if rid in aged_set)
-        return (
-            AdmissionPlan(request_ids=request_ids),
-            aged_admission_count,
-            self._count_service_classes(scheduler, request_ids),
-            fairness_gap,
-            effective_lora_limit,
-            effective_multimodal_lora_limit,
-            multimodal_lora_limit_triggered,
-            relaxed,
-            tightened,
-        )
-
-    def _compute_budgets(
-        self,
-        *,
-        num_prefills: int,
-        num_decodes: int,
-        starvation_protected: bool,
-    ) -> tuple[int, int]:
-        if self.decode_priority_enabled:
-            prefill_budget = 0
-            if num_prefills:
-                backlog_factor = (
-                    min(2.0, float(num_prefills) / float(self.prefill_reserve_backlog))
-                    if self.prefill_reserve_backlog > 0
-                    else 1.0
-                )
-                adjusted_catchup_ratio = min(
-                    0.9, self.prefill_catchup_ratio * backlog_factor
-                )
-                if num_prefills >= self.prefill_reserve_backlog:
-                    adjusted_catchup_ratio = max(adjusted_catchup_ratio, 0.35)
-                else:
-                    adjusted_catchup_ratio = max(
-                        adjusted_catchup_ratio, self.prefill_catchup_ratio
-                    )
-            else:
-                adjusted_catchup_ratio = self.prefill_catchup_ratio
-
-            if starvation_protected and num_prefills:
-                reserve_tokens = max(
-                    1,
-                    self.prefill_reserved_tokens,
-                    int(self.step_token_budget * max(adjusted_catchup_ratio, 0.25)),
-                )
-                prefill_budget = min(self.step_token_budget, reserve_tokens)
-            elif num_prefills and not num_decodes:
-                prefill_budget = min(self.prefill_chunk_size, self.step_token_budget)
-            elif num_prefills and num_prefills >= self.prefill_reserve_backlog:
-                reserve_tokens = max(
-                    self.prefill_reserved_tokens,
-                    int(self.step_token_budget * adjusted_catchup_ratio),
-                )
-                prefill_budget = min(self.step_token_budget, max(1, reserve_tokens))
-            decode_limit = min(
-                num_decodes, max(0, self.step_token_budget - prefill_budget)
-            )
-        else:
-            if num_prefills:
-                reserve_tokens = max(1, self.prefill_reserved_tokens or 1)
-                decode_limit = max(
-                    0, min(num_decodes, self.step_token_budget - reserve_tokens)
-                )
-            else:
-                decode_limit = min(num_decodes, self.step_token_budget)
-            prefill_budget = max(0, self.step_token_budget - decode_limit)
-        return prefill_budget, decode_limit
 
     def _should_protect_prefills(
         self,
@@ -991,6 +848,7 @@ class StepScheduler:
         dict[str, float],
         int,
         int,
+        bool,
         bool,
         bool,
         bool,
