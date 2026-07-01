@@ -10,12 +10,11 @@ from typing import Protocol, cast
 import torch
 import torch.nn.functional as F
 
-from vllm.kernels.triton.deepseek_v4_flash.cache import (
-    DeepSeekV4CacheUpdateInputs,
-    deepseek_v4_cache_update,
-)
 from vllm.kernels.triton.deepseek_v4_flash.compressed_indexer_select import (
     deepseek_v4_indexer_select_scores,
+)
+from vllm.kernels.triton.deepseek_v4_flash.indexer_qat import (
+    deepseek_v4_indexer_qat,
 )
 from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
     q8_0_raw_gate_up_activation,
@@ -29,7 +28,10 @@ from .attention import (
     shared_kv_swa_attention_reference,
 )
 from .config import DEEPSEEK_V4_FLASH_SHAPE, layer_compress_ratio
-from .gguf_reader import GGML_TYPE_Q8_0, DeepSeekV4FlashTensor
+from .gguf_reader import (
+    GGML_TYPE_Q8_0,
+    DeepSeekV4FlashTensor,
+)
 from .gpu_backend import DeepSeekV4FlashGPUBackend
 from .gpu_runtime import DeepSeekV4FlashGPURequestState
 from .gpu_weight_staging import (
@@ -47,6 +49,19 @@ from .weight_store import (
 
 _Q8_0_BLOCK_SIZE = 32
 _Q8_0_BLOCK_BYTES = 2 + _Q8_0_BLOCK_SIZE
+
+
+def _env_limited_top_k(default: int, *, env_name: str) -> int:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return min(default, value)
 
 
 @dataclass
@@ -401,6 +416,7 @@ def _run_sliding_attention_for_slot(
             f"({DEEPSEEK_V4_FLASH_SHAPE.head_dim},); got {tuple(current_kv.shape)}"
         )
 
+    explicit_kv_rows = kv_rows is not None
     if state is None:
         if kv_rows is None:
             kv_rows = current_kv.reshape(1, -1)
@@ -418,7 +434,7 @@ def _run_sliding_attention_for_slot(
                 token_idx,
                 DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
             )
-    if state is not None and kv_rows is not None:
+    if state is not None and explicit_kv_rows and kv_rows is not None:
         # After the cache append above, append the current token's KV so the
         # attention sees the same rows as the reference path that reads from
         # the cache after appending. When state is None the caller already
@@ -2298,8 +2314,22 @@ def _update_compressor_state(
         raise ValueError("token_idx must be non-negative")
     if ratio <= 0:
         raise ValueError(f"compressor ratio must be positive; got {ratio}")
-    kv_cur = _project_tensor(hidden, compressor.kv, stager)
-    score_cur = _project_tensor(hidden, compressor.gate, stager)
+    with _stager_profile_section(
+        stager,
+        "compressor_project_kv",
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+    ):
+        kv_cur = _project_tensor(hidden, compressor.kv, stager)
+    with _stager_profile_section(
+        stager,
+        "compressor_project_score",
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+    ):
+        score_cur = _project_tensor(hidden, compressor.gate, stager)
     if kv_cur.shape != score_cur.shape:
         raise ValueError(
             "compressor KV and gate projections must share one shape; "
@@ -2346,17 +2376,31 @@ def _update_compressor_state(
         device=hidden.device,
     )
     target_row = ratio + pos_mod if use_ratio4_carry else pos_mod
-    runtime_state.kv_rows[target_row].copy_(kv_cur.to(torch.float32))
-    runtime_state.score_rows[target_row].copy_(
-        score_cur.to(torch.float32) + ape_pos.to(torch.float32)
-    )
+    with _stager_profile_section(
+        stager,
+        "compressor_runtime_update",
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+    ):
+        runtime_state.kv_rows[target_row].copy_(kv_cur.to(torch.float32))
+        runtime_state.score_rows[target_row].copy_(
+            score_cur.to(torch.float32) + ape_pos.to(torch.float32)
+        )
     runtime_state.count = min(runtime_state.count + 1, ratio)
 
     candidate_source = kv_cur[row_width : 2 * row_width] if use_ratio4_carry else kv_cur
-    candidate = deepseek_v4_flash_rms_norm(
-        candidate_source.to(torch.float32),
-        norm,
-    ).to(stager.dtype)
+    with _stager_profile_section(
+        stager,
+        "compressor_candidate_norm",
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+    ):
+        candidate = deepseek_v4_flash_rms_norm(
+            candidate_source.to(torch.float32),
+            norm,
+        ).to(stager.dtype)
     if (token_idx + 1) % ratio != 0 or runtime_state.count < ratio:
         return candidate, None
 
@@ -2371,40 +2415,75 @@ def _update_compressor_state(
         score_rows = runtime_state.score_rows
         kv_rows = runtime_state.kv_rows
 
-    weights = torch.softmax(score_rows.to(torch.float32), dim=0)
-    pooled = (weights * kv_rows.to(torch.float32)).sum(dim=0)
-    emitted = deepseek_v4_flash_rms_norm(pooled, norm).to(stager.dtype)
+    with _stager_profile_section(
+        stager,
+        "compressor_emit_pool",
+        layer_idx=layer_idx,
+        state_name=state_name,
+        ratio=ratio,
+    ):
+        weights = torch.softmax(score_rows.to(torch.float32), dim=0)
+        pooled = (weights * kv_rows.to(torch.float32)).sum(dim=0)
+        emitted = deepseek_v4_flash_rms_norm(pooled, norm).to(stager.dtype)
     if emitted.numel() >= DEEPSEEK_V4_FLASH_SHAPE.rotary_dim:
         rope_token_idx = token_idx + 1 - ratio
-        if use_reference_rope:
-            emitted = apply_deepseek_layer_rope_to_tail_reference(
+        with _stager_profile_section(
+            stager,
+            "compressor_emit_rope",
+            layer_idx=layer_idx,
+            state_name=state_name,
+            ratio=ratio,
+        ):
+            if use_reference_rope:
+                emitted = apply_deepseek_layer_rope_to_tail_reference(
+                    emitted,
+                    token_idx=rope_token_idx,
+                    layer_idx=layer_idx,
+                    rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+                ).to(stager.dtype)
+            else:
+                cos, sin = state.rope_tables_for(layer_idx, rope_token_idx)
+                emitted = apply_precomputed_rope_to_tail(
+                    emitted,
+                    cos,
+                    sin,
+                ).to(stager.dtype)
+    if emitted.numel() == DEEPSEEK_V4_FLASH_SHAPE.head_dim:
+        with _stager_profile_section(
+            stager,
+            "compressor_emit_fp8_qat",
+            layer_idx=layer_idx,
+            state_name=state_name,
+            ratio=ratio,
+        ):
+            emitted = deepseek_fp8_kv_qat_reference(
                 emitted,
-                token_idx=rope_token_idx,
-                layer_idx=layer_idx,
+                head_dim=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
                 rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
             ).to(stager.dtype)
-        else:
-            cos, sin = state.rope_tables_for(layer_idx, rope_token_idx)
-            emitted = apply_precomputed_rope_to_tail(
-                emitted,
-                cos,
-                sin,
-            ).to(stager.dtype)
-    if emitted.numel() == DEEPSEEK_V4_FLASH_SHAPE.head_dim:
-        emitted = deepseek_fp8_kv_qat_reference(
-            emitted,
-            head_dim=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
-            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-        ).to(stager.dtype)
     elif emitted.numel() == DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim:
-        emitted = deepseek_indexer_qat_reference(emitted).to(stager.dtype)
+        with _stager_profile_section(
+            stager,
+            "compressor_emit_indexer_qat",
+            layer_idx=layer_idx,
+            state_name=state_name,
+            ratio=ratio,
+        ):
+            emitted = deepseek_v4_indexer_qat(emitted).to(stager.dtype)
     if use_ratio4_carry:
-        carry_kv_full = runtime_state.kv_rows[ratio : 2 * ratio].clone()
-        carry_score_full = runtime_state.score_rows[ratio : 2 * ratio].clone()
-        runtime_state.kv_rows[:ratio].copy_(carry_kv_full)
-        runtime_state.score_rows[:ratio].copy_(carry_score_full)
-        runtime_state.kv_rows[ratio : 2 * ratio].copy_(carry_kv_full)
-        runtime_state.score_rows[ratio : 2 * ratio].copy_(carry_score_full)
+        with _stager_profile_section(
+            stager,
+            "compressor_carry_update",
+            layer_idx=layer_idx,
+            state_name=state_name,
+            ratio=ratio,
+        ):
+            carry_kv_full = runtime_state.kv_rows[ratio : 2 * ratio].clone()
+            carry_score_full = runtime_state.score_rows[ratio : 2 * ratio].clone()
+            runtime_state.kv_rows[:ratio].copy_(carry_kv_full)
+            runtime_state.score_rows[:ratio].copy_(carry_score_full)
+            runtime_state.kv_rows[ratio : 2 * ratio].copy_(carry_kv_full)
+            runtime_state.score_rows[ratio : 2 * ratio].copy_(carry_score_full)
     runtime_state.count = 0
     return candidate, emitted
 
@@ -2474,7 +2553,13 @@ def _select_compressed_rows_with_indexer(
         raise ValueError("indexer_rows must contain at least one row")
     if not indexer_rows.is_cuda:
         raise ValueError("indexer_rows must be CUDA")
-    top_k = min(DEEPSEEK_V4_FLASH_SHAPE.indexer_top_k, indexer_rows.shape[0])
+    top_k = min(
+        _env_limited_top_k(
+            DEEPSEEK_V4_FLASH_SHAPE.indexer_top_k,
+            env_name="FASTINFERENCE_DEEPSEEK_V4_FLASH_INDEXER_TOP_K",
+        ),
+        indexer_rows.shape[0],
+    )
     if top_k <= 0:
         raise ValueError("indexer selected no compressed rows")
     if indexer_rows.shape[0] <= top_k:
@@ -2563,7 +2648,7 @@ def _write_compressed_runtime_row(
     indexer_row: torch.Tensor | None,
 ) -> None:
     cache = state.compressed_kv_cache
-    slot = int(cache._compressed_counts[layer_idx].item())
+    slot = cache._compressed_counts_cpu[layer_idx]
     if slot >= cache.compressed_rows.shape[1]:
         raise ValueError("compressed cache capacity exceeded")
     if compressed_row.shape != (cache.hidden_size,):
@@ -2571,18 +2656,8 @@ def _write_compressed_runtime_row(
             f"compressed row shape must be ({cache.hidden_size},); "
             f"got {tuple(compressed_row.shape)}"
         )
-    page_table = torch.zeros(
-        cache.compressed_rows.shape[1],
-        dtype=torch.int32,
-        device=compressed_row.device,
-    )
-    deepseek_v4_cache_update(
-        DeepSeekV4CacheUpdateInputs(
-            page_table=page_table,
-            kv_row=compressed_row.to(cache.compressed_rows.dtype),
-            cache_storage=cache.compressed_rows[layer_idx].unsqueeze(0),
-            logical_row=slot,
-        )
+    cache.compressed_rows[layer_idx, slot].copy_(
+        compressed_row.to(cache.compressed_rows.dtype)
     )
     cache.compressed_token_indices[layer_idx, slot] = token_idx
     if indexer_row is not None:
@@ -2591,13 +2666,8 @@ def _write_compressed_runtime_row(
                 "indexer row shape must match runtime indexer width; "
                 f"got {tuple(indexer_row.shape)} and {cache.indexer_rows.shape[-1]}"
             )
-        deepseek_v4_cache_update(
-            DeepSeekV4CacheUpdateInputs(
-                page_table=page_table,
-                kv_row=indexer_row.to(cache.indexer_rows.dtype),
-                cache_storage=cache.indexer_rows[layer_idx].unsqueeze(0),
-                logical_row=slot,
-            )
+        cache.indexer_rows[layer_idx, slot].copy_(
+            indexer_row.to(cache.indexer_rows.dtype)
         )
     cache._compressed_counts[layer_idx] += 1
     cache._compressed_counts_cpu[layer_idx] += 1
@@ -2645,7 +2715,10 @@ def _run_sliding_moe(
             logits = _project_tensor(hidden, router, stager)
             expert_ids, expert_weights = _router_topk_from_logits(
                 logits,
-                top_k=router_top_k,
+                top_k=_env_limited_top_k(
+                    router_top_k,
+                    env_name="FASTINFERENCE_DEEPSEEK_V4_FLASH_ROUTER_TOP_K",
+                ),
                 correction_bias=correction_bias,
             )
         with _stager_profile_section(
@@ -2837,19 +2910,37 @@ def _run_staged_routed_experts(
                 layer_idx=layer_idx,
             )
     selected_gemm = getattr(backend, "fused_quantized_selected_experts_gemm", None)
-    if callable(selected_gemm) and state is not None:
+    if callable(selected_gemm):
         try:
-            workspace = state.moe_workspace(
-                num_experts=len(selected_payloads),
-                intermediate_size=grouped_experts.gate.dims[1],
-                device=hidden.device,
+            intermediate_size = grouped_experts.gate.dims[1]
+            workspace = (
+                state.moe_workspace(
+                    num_experts=len(selected_payloads),
+                    intermediate_size=intermediate_size,
+                    device=hidden.device,
+                )
+                if state is not None
+                else torch.empty(
+                    (len(selected_payloads), intermediate_size),
+                    dtype=torch.float32,
+                    device=hidden.device,
+                )
             )
-            return selected_gemm(
-                hidden=hidden,
-                expert_weights=expert_weights.reshape(-1),
-                payloads=selected_payloads,
-                workspace=workspace,
-            ).to(torch.float32)
+            with _stager_profile_section(
+                stager,
+                "router_selected_experts_kernel",
+                layer_idx=layer_idx,
+                expert_count=len(selected_payloads),
+            ):
+                return selected_gemm(
+                    hidden=hidden,
+                    expert_weights=expert_weights.reshape(-1),
+                    payloads=selected_payloads,
+                    workspace=workspace,
+                    gate_stack=None,
+                    up_stack=None,
+                    down_stack=None,
+                ).to(torch.float32)
         except (RuntimeError, NotImplementedError, ValueError):
             pass
     selected_gemm = getattr(backend, "quantized_selected_experts_gemm", None)

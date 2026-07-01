@@ -190,6 +190,14 @@ class DeepSeekV4CompressedKVCache:
         if window > self.raw_window:
             raise ValueError(f"window {window} exceeds raw_window {self.raw_window}")
 
+        if token_idx < self.raw_window:
+            start = max(0, token_idx - window + 1)
+            end = token_idx + 1
+            return (
+                self.raw_keys[layer_idx, start:end],
+                self.raw_values[layer_idx, start:end],
+            )
+
         start = max(0, token_idx - window + 1)
         token_indices = self.raw_token_indices[layer_idx]
         present = (token_indices >= start) & (token_indices <= token_idx)

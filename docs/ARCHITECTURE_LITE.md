@@ -299,9 +299,26 @@ and ratio-4 indexer rows are owned by DeepSeek-specific paged/cache structures.
 
 The current performance work moved the hot path from CPU reference decoding to
 GPU execution for Q8 projections, selected IQ2 gate/up, Q2 down experts,
-compressed attention, and chunked output projection. Remaining bottlenecks are
-model-local: layer MoE, compressed attention/indexer overhead, expert staging
-misses, and Python launch/synchronization cost.
+compressed attention, and chunked output projection. The latest kept changes
+are deliberately narrow and semantic-preserving:
+
+- selected expert kernels consume direct staged payloads instead of rebuilding
+  per-layer payload stacks on the hot path.
+- Q8_0 raw kernels sign-extend payload bytes with `uint8 -> int8 -> fp32`,
+  avoiding an explicit `raw >= 128` select.
+- compressor updates expose nested profile sections for projection, runtime
+  copy, norm, pooling, RoPE, FP8 QAT, indexer QAT, and carry work.
+- emitted indexer QAT uses a Triton implementation instead of the PyTorch
+  reference path.
+
+Rejected performance routes are also part of the architecture record:
+graph/capture has been attempted enough times to stop pursuing it; full expert
+GPU tables were semantically equivalent but cost too much cold-start time and
+memory; Q2 down static unroll and batched Q8 raw matvec did not improve the
+measured hot path; compressor dual Q8 projection does not apply to the current
+DS4 GGUF because compressor `kv/gate` tensors are F16, not Q8_0. Remaining
+bottlenecks are model-local: layer MoE, compressed attention/indexer overhead,
+expert staging misses, and Python launch/synchronization cost.
 
 ## Compatibility Code
 

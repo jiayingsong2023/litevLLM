@@ -33,9 +33,9 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up,
     deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
-    deepseek_v4_iq2_xxs_selected_experts_activation,
+    deepseek_v4_iq2_xxs_selected_experts_activation_direct,
     deepseek_v4_q2_k_matvec,
-    deepseek_v4_q2_k_selected_experts_down_projection,
+    deepseek_v4_q2_k_selected_experts_down_projection_direct,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_IQ2_XXS,
@@ -546,6 +546,9 @@ class DeepSeekV4FlashGPUBackend:
             ]
         ],
         workspace: torch.Tensor,
+        gate_stack: torch.Tensor | None = None,
+        up_stack: torch.Tensor | None = None,
+        down_stack: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not hidden.is_cuda or not expert_weights.is_cuda or not workspace.is_cuda:
             raise ValueError("fused selected expert GEMM inputs must be CUDA tensors")
@@ -557,13 +560,13 @@ class DeepSeekV4FlashGPUBackend:
         gate_payloads = []
         up_payloads = []
         down_payloads = []
-        for _expert_id, gate, up, down in payloads:
+        for payload_index, (_expert_id, gate, up, down) in enumerate(payloads):
             gate_payloads.append(gate.payload)
             up_payloads.append(up.payload)
             down_payloads.append(down.payload)
         rows = payloads[0][1].rows
         columns = payloads[0][1].columns
-        deepseek_v4_iq2_xxs_selected_experts_activation(
+        deepseek_v4_iq2_xxs_selected_experts_activation_direct(
             hidden=hidden.to(torch.float32),
             payloads=list(zip(gate_payloads, up_payloads)),
             workspace=workspace,
@@ -573,7 +576,7 @@ class DeepSeekV4FlashGPUBackend:
         down_rows = payloads[0][3].rows
         down_columns = payloads[0][3].columns
         output = torch.empty((down_rows,), dtype=torch.float32, device=hidden.device)
-        deepseek_v4_q2_k_selected_experts_down_projection(
+        deepseek_v4_q2_k_selected_experts_down_projection_direct(
             workspace=workspace,
             down_payloads=down_payloads,
             expert_weights=expert_weights.reshape(-1),

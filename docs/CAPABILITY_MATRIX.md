@@ -32,7 +32,7 @@ or feature status lists.
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
 | Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed-paged KV contracts, opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed-paged KV contracts, opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. Recent measured warm-cache decode is in the 1.6-1.9 tok/s range after selected-expert, Q8, and indexer-QAT work; this is not a production-speed parity claim. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
 | LoRA runtime | Experimental | Runtime path and tests exist; production policy calibration is still workload dependent. |
 | Multimodal serving | Experimental | Single-image and multi-image paths exist, but require broader real-traffic hardening. |
@@ -54,6 +54,7 @@ or feature status lists.
 | OpenAI-compatible REST serving | Supported | Lite subset through `vllm.entrypoints.openai.api_server`: `GET /v1/models` and `POST /v1/chat/completions` with streaming and non-streaming responses. |
 | Tokenize/detokenize REST router | Compatibility | Maintained under `vllm.entrypoints.serve.tokenize` when attached; not part of the standalone OpenAI API server contract. |
 | PagedAttention decode | Supported | Triton path with selective-attention experiments available for standard paged-KV models. DeepSeek V4 Flash uses a separate compressed-paged KV implementation. |
+| DeepSeek V4 Flash direct kernels | Experimental | Current kept optimizations are semantic-preserving: direct selected Q2/IQ2 payload kernels, Q8_0 raw sign-extension trim, fused indexer-select scale, profiler breakdown, and Triton indexer QAT. Rejected experiments include graph/capture, full expert GPU tables, Q2 static unroll, batched Q8 raw matvec, and compressor dual Q8 projection. |
 | Step scheduler metrics split | Supported | `StepPlan` carries execution fields; `StepPlanMetrics` carries observer/debug counters. |
 | Decode batch tensor reuse | Supported | Non-fast decode batch construction reuses `InputBatchBuilder` scratch tensors for core metadata tensors. |
 | Prefix cache | Experimental | Minimal runtime and observability exist; defaults still need workload calibration. |

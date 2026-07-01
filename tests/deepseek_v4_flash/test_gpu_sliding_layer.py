@@ -123,6 +123,10 @@ class _FakeLayerStore:
 class _NullAttentionBackend(DeepSeekV4FlashGPUBackend):
     """Backend that forces reference attention and zero expert outputs."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.kv_row_counts: list[int] = []
+
     def fused_sliding_window_attention(
         self,
         *,
@@ -131,6 +135,7 @@ class _NullAttentionBackend(DeepSeekV4FlashGPUBackend):
         attn_sinks: torch.Tensor | None,
         token_idx: int,
     ) -> torch.Tensor | None:
+        self.kv_row_counts.append(int(kv_rows.shape[0]))
         return None
 
     def routed_expert_gemm(
@@ -280,7 +285,6 @@ def test_sliding_layer_forward_explicit_kv_rows_matches_state_read() -> None:
     backend = _NullAttentionBackend()
     hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
     hidden = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
-    layer_idx = layer.layer_index
     token_idx = 0
 
     # Align the router so expert 0 is always selected for this hidden.
@@ -317,20 +321,10 @@ def test_sliding_layer_forward_explicit_kv_rows_matches_state_read() -> None:
     )
 
     state_b = _make_state()
-    # Seed the cache so raw_kv_window can materialize the current token's row.
-    _ = deepseek_v4_flash_sliding_layer_forward(
-        hidden,
-        layer=layer,
-        stager=stager,
-        backend=backend,
-        state=state_b,
-        token_idx=token_idx,
-        router_top_k=1,
-    )
-    explicit_kv_rows = state_b.raw_kv_window(
-        layer_idx,
-        token_idx,
-        DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+    explicit_kv_rows = torch.empty(
+        (0, DEEPSEEK_V4_FLASH_SHAPE.head_dim),
+        dtype=torch.float16,
+        device=hidden.device,
     )
     output_explicit_rows = deepseek_v4_flash_sliding_layer_forward(
         hidden,
@@ -345,4 +339,5 @@ def test_sliding_layer_forward_explicit_kv_rows_matches_state_read() -> None:
 
     assert output_state_read.device.type == "cuda"
     assert output_explicit_rows.device.type == "cuda"
+    assert backend.kv_row_counts[0] == 1
     torch.testing.assert_close(output_state_read, output_explicit_rows)

@@ -3,6 +3,9 @@ import struct
 import pytest
 import torch
 
+from vllm.kernels.triton.deepseek_v4_flash.indexer_qat import (
+    deepseek_v4_indexer_qat,
+)
 from vllm.model_executor.models.deepseek_v4_flash.attention import (
     apply_deepseek_layer_rope_to_tail_reference,
     apply_rope_to_tail_reference,
@@ -132,6 +135,16 @@ def test_deepseek_indexer_qat_reference_runs_hadamard_fp4_roundtrip() -> None:
     assert actual.shape == (128,)
     assert torch.count_nonzero(actual).item() == 128
     assert torch.all(torch.abs(actual) <= 0.125)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_deepseek_indexer_qat_triton_matches_reference() -> None:
+    row = torch.linspace(-3.0, 3.0, 128, dtype=torch.float32, device="cuda")
+
+    actual = deepseek_v4_indexer_qat(row)
+    expected = deepseek_indexer_qat_reference(row).to("cuda")
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_deepseek_layer_rope_keeps_dense_layers_on_default_base() -> None:

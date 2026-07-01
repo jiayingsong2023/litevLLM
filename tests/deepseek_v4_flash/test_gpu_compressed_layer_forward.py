@@ -1048,7 +1048,6 @@ def test_compressed_layer_forward_explicit_kv_rows_matches_state_read() -> None:
     backend = _RecordingCompressedBackend()
     hidden_size = DEEPSEEK_V4_FLASH_SHAPE.hidden_size
     hidden = torch.randn(hidden_size, dtype=torch.float32, device="cuda") * 0.01
-    layer_idx = layer.layer_index
     token_idx = 0
 
     stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
@@ -1075,20 +1074,10 @@ def test_compressed_layer_forward_explicit_kv_rows_matches_state_read() -> None:
     )
 
     state_b = _make_state()
-    # Seed the cache so raw_kv_window can materialize the current token's row.
-    _ = deepseek_v4_flash_compressed_layer_forward(
-        hidden,
-        layer=layer,
-        stager=stager,
-        backend=backend,
-        state=state_b,
-        token_idx=token_idx,
-        router_top_k=1,
-    )
-    explicit_kv_rows = state_b.raw_kv_window(
-        layer_idx,
-        token_idx,
-        DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+    explicit_kv_rows = torch.empty(
+        (0, DEEPSEEK_V4_FLASH_SHAPE.head_dim),
+        dtype=torch.float32,
+        device=hidden.device,
     )
     output_explicit_rows = deepseek_v4_flash_compressed_layer_forward(
         hidden,

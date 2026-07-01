@@ -1566,8 +1566,14 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self._gpu_weight_stager = DeepSeekV4FlashGPUWeightStager(
                 store,
                 device=device,
-                max_staged_bytes=self._gpu_staging_budget_bytes(),
+                max_staged_bytes=(
+                    None
+                    if self._deepseek_full_resident_enabled()
+                    else self._gpu_staging_budget_bytes()
+                ),
             )
+            if self._deepseek_full_resident_enabled():
+                self._gpu_weight_stager.enable_full_resident_mode()
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
         self._gpu_weight_stager.profiler = self._deepseek_profiler
@@ -1611,6 +1617,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         return min(
             base + extra_bytes,
             self.runtime_budget.available_headroom_bytes,
+        )
+
+    @staticmethod
+    def _deepseek_full_resident_enabled() -> bool:
+        return (
+            os.environ.get(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT",
+                "0",
+            )
+            == "1"
         )
 
     def pin_hot_experts_for_input_ids(
@@ -1664,6 +1680,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             return {
                 "staged_bytes": 0,
                 "max_staged_bytes": self._gpu_staging_budget_bytes(),
+                "full_resident_enabled": int(self._deepseek_full_resident_enabled()),
                 "dynamic_entries": 0,
                 "grouped_entries": 0,
             }

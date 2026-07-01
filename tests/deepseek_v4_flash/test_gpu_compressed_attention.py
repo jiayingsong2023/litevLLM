@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import pytest
 import torch
@@ -68,6 +67,32 @@ def test_deepseek_gpu_cache_update_writes_through_page_table() -> None:
     cache_storage = torch.zeros((2, 2, 4), dtype=torch.float32, device=device)
     page_table = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_row = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+
+    deepseek_v4_cache_update(
+        DeepSeekV4CacheUpdateInputs(
+            page_table=page_table,
+            kv_row=kv_row,
+            cache_storage=cache_storage,
+            logical_row=1,
+        )
+    )
+
+    torch.testing.assert_close(cache_storage[1, 1], kv_row)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_deepseek_gpu_cache_update_does_not_sync_page_table_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    cache_storage = torch.zeros((2, 2, 4), dtype=torch.float32, device=device)
+    page_table = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    kv_row = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+
+    def fail_item(_tensor: torch.Tensor) -> int:
+        raise AssertionError("cache update must not call Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
 
     deepseek_v4_cache_update(
         DeepSeekV4CacheUpdateInputs(

@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_Q2_K,
     GGML_TYPE_Q8_0,
     DeepSeekV4FlashTensor,
 )
@@ -16,6 +18,7 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_backend import (
     DeepSeekV4FlashGPUBackend,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
+    _env_limited_top_k,
     _run_hash_routed_experts,
     _run_staged_routed_experts,
     _run_staged_shared_expert,
@@ -23,6 +26,10 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_layers import (
     deepseek_v4_flash_router_topk,
     deepseek_v4_flash_sliding_layer_forward,
     deepseek_v4_flash_staged_matrix_projection,
+)
+from vllm.model_executor.models.deepseek_v4_flash.gpu_runtime import (
+    DeepSeekV4FlashGPUCacheConfig,
+    DeepSeekV4FlashGPURequestState,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gpu_weight_staging import (
     DeepSeekV4FlashGPUWeightStager,
@@ -288,6 +295,42 @@ class _QuantizedRecordingBackend:
         return torch.full_like(hidden, float(expert_id))
 
 
+class _FusedQuantizedRecordingBackend(_QuantizedRecordingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fused_calls = 0
+        self.workspace_shapes: list[tuple[int, ...]] = []
+        self.payload_stack_shapes: dict[str, tuple[int, ...] | None] = {}
+
+    def fused_quantized_selected_experts_gemm(
+        self,
+        *,
+        hidden: torch.Tensor,
+        expert_weights: torch.Tensor,
+        payloads: list[
+            tuple[
+                int,
+                DeepSeekV4FlashStagedQuantizedExpertPayload,
+                DeepSeekV4FlashStagedQuantizedExpertPayload,
+                DeepSeekV4FlashStagedQuantizedExpertPayload,
+            ]
+        ],
+        workspace: torch.Tensor,
+        gate_stack: torch.Tensor | None = None,
+        up_stack: torch.Tensor | None = None,
+        down_stack: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del expert_weights
+        self.fused_calls += 1
+        self.workspace_shapes.append(tuple(workspace.shape))
+        self.payload_stack_shapes = {
+            "gate": tuple(gate_stack.shape) if gate_stack is not None else None,
+            "up": tuple(up_stack.shape) if up_stack is not None else None,
+            "down": tuple(down_stack.shape) if down_stack is not None else None,
+        }
+        return torch.full_like(hidden, float(sum(item[0] for item in payloads)))
+
+
 def _tensor(name: str, dims: tuple[int, ...]) -> DeepSeekV4FlashTensor:
     return DeepSeekV4FlashTensor(
         name=name,
@@ -306,6 +349,35 @@ def _q8_payload(rows: list[tuple[float, tuple[int, ...]]]) -> bytes:
         payload.extend(struct.pack("<e", scale))
         payload.extend(struct.pack("<" + "b" * 32, *values))
     return bytes(payload)
+
+
+def test_env_limited_top_k_caps_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FASTINFERENCE_DEEPSEEK_V4_FLASH_ROUTER_TOP_K", "2")
+
+    assert (
+        _env_limited_top_k(
+            6,
+            env_name="FASTINFERENCE_DEEPSEEK_V4_FLASH_ROUTER_TOP_K",
+        )
+        == 2
+    )
+
+
+def test_env_limited_top_k_ignores_bad_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for value in ("0", "-1", "bad"):
+        monkeypatch.setenv("FASTINFERENCE_DEEPSEEK_V4_FLASH_ROUTER_TOP_K", value)
+
+        assert (
+            _env_limited_top_k(
+                6,
+                env_name="FASTINFERENCE_DEEPSEEK_V4_FLASH_ROUTER_TOP_K",
+            )
+            == 6
+        )
 
 
 def _add_identity_layer_weights(
@@ -439,6 +511,95 @@ def test_staged_routed_experts_prefers_quantized_payload_path(
         ("down", 1, 7),
     ]
     torch.testing.assert_close(output, torch.full((2,), 1.5))
+
+
+def test_staged_routed_experts_prefers_fused_selected_path_without_state() -> None:
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=replace(_tensor("gate", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        up=replace(_tensor("up", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        down=replace(_tensor("down", (4, 2, 4)), tensor_type=GGML_TYPE_Q2_K),
+    )
+    stager = _RoutedExpertTestStager()
+    backend = _FusedQuantizedRecordingBackend()
+
+    output = _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([3, 1], dtype=torch.int64),
+        torch.tensor([0.25, 0.75], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        layer_idx=7,
+    )
+
+    assert backend.fused_calls == 1
+    assert backend.quantized_expert_ids == []
+    assert backend.workspace_shapes == [(2, 4)]
+    torch.testing.assert_close(output, torch.full((2,), 4.0))
+
+
+def test_staged_routed_experts_uses_direct_payload_path_with_state() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=replace(_tensor("gate", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        up=replace(_tensor("up", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        down=replace(_tensor("down", (4, 2, 4)), tensor_type=GGML_TYPE_Q2_K),
+    )
+    stager = _RoutedExpertTestStager()
+    backend = _FusedQuantizedRecordingBackend()
+    state = DeepSeekV4FlashGPURequestState(
+        DeepSeekV4FlashGPUCacheConfig(
+            context_length=8,
+            hidden_size=2,
+            device=device,
+        )
+    )
+
+    output = _run_staged_routed_experts(
+        torch.ones(2, device=device),
+        torch.tensor([3, 1], dtype=torch.int64, device=device),
+        torch.tensor([0.25, 0.75], dtype=torch.float32, device=device),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=backend,
+        state=state,
+        layer_idx=7,
+    )
+
+    assert backend.fused_calls == 1
+    assert backend.payload_stack_shapes == {
+        "gate": None,
+        "up": None,
+        "down": None,
+    }
+    torch.testing.assert_close(output, torch.full((2,), 4.0, device=device))
+
+
+def test_staged_routed_experts_profiles_fused_selected_path() -> None:
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=replace(_tensor("gate", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        up=replace(_tensor("up", (2, 4, 4)), tensor_type=GGML_TYPE_IQ2_XXS),
+        down=replace(_tensor("down", (4, 2, 4)), tensor_type=GGML_TYPE_Q2_K),
+    )
+    stager = _RoutedExpertTestStager()
+    stager.profiler = DeepSeekV4FlashProfiler(enabled=True)
+
+    _run_staged_routed_experts(
+        torch.ones(2),
+        torch.tensor([3, 1], dtype=torch.int64),
+        torch.tensor([0.25, 0.75], dtype=torch.float32),
+        grouped_experts=grouped,
+        stager=stager,
+        backend=_FusedQuantizedRecordingBackend(),
+        layer_idx=7,
+    )
+
+    events = stager.profiler.to_dict()["events"]
+    kernel_events = [
+        event for event in events if event["name"] == "router_selected_experts_kernel"
+    ]
+    assert len(kernel_events) == 1
+    assert kernel_events[0]["metadata"] == {"layer_idx": 7, "expert_count": 2}
 
 
 def test_staged_routed_experts_reuses_grouped_payload_cache(

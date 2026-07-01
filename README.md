@@ -12,14 +12,22 @@
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [FP8 KV 稳定] |
   | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **5.85** | [e2e benchmark 2026-06-30] |
   | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.13** | [e2e benchmark 2026-06-30] |
-  | **DeepSeek V4 Flash Q2 GGUF** | batch=1, context~4096, greedy, direct GGUF | **0.71** | [experimental e2e direct smoke] |
+  | **DeepSeek V4 Flash Q2 GGUF** | batch=1, context~4096, greedy, direct GGUF | **1.6-1.9 decode** | [experimental direct smoke / e2e direct benchmark] |
 
   最新数值来自 `tests/e2e_full_benchmark.py`（2026-06-30，benchmark profile）。
   Gemma4-26B `TTFT p50=2189.5ms`、`prefill_tps_agg=179.95`、`decode_tps_agg=12.04`；
   Gemma4-31B `TTFT p50=5138.1ms`、`prefill_tps_agg=76.68`、`decode_tps_agg=3.75`；
-  DeepSeek V4 Flash direct GGUF `decode_tps_agg=1.88`。DeepSeek direct benchmark
+  DeepSeek V4 Flash direct GGUF 当前 warm-cache smoke 约 `1.6 tok/s`，
+  e2e direct benchmark 曾测得 `decode_tps_agg=1.88`。DeepSeek direct benchmark
   does not use the standard per-token streaming observer, so `stream_visible=0%`
   is an observability limitation rather than a correctness failure.
+
+  DeepSeek V4 Flash 的近期性能优化集中在不改变模型语义的热路径：
+  selected-expert Q2/IQ2 直接 payload kernel、Q8_0 raw matvec sign-extension
+  精简、compressor/indexer profile 拆分、Triton indexer QAT，以及移除小型
+  PyTorch launch。已否决的路线包括 graph/capture、full expert GPU tables、
+  Q2 down static unroll、batched Q8 raw matvec 和 compressor dual Q8 projection；
+  这些路线要么未命中当前 decode 热点，要么实测变慢、冷启动/显存成本过高。
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。

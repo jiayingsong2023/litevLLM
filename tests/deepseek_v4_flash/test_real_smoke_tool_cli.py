@@ -163,6 +163,42 @@ def test_smoke_steady_decode_tps_gate_accepts_threshold() -> None:
     )
 
 
+def test_smoke_decode_profile_top_sections_uses_profile_summary() -> None:
+    summary = smoke.decode_profile_top_sections(
+        {
+            "top_events": [
+                {
+                    "name": "layer_moe",
+                    "total_ms": 12.5,
+                    "avg_ms": 1.25,
+                    "count": 10,
+                },
+                {
+                    "name": "layer_attention",
+                    "total_ms": 3.0,
+                    "avg_ms": 0.3,
+                    "count": 10,
+                },
+            ]
+        }
+    )
+
+    assert summary == [
+        {
+            "name": "layer_moe",
+            "total_ms": 12.5,
+            "avg_ms": 1.25,
+            "count": 10,
+        },
+        {
+            "name": "layer_attention",
+            "total_ms": 3.0,
+            "avg_ms": 0.3,
+            "count": 10,
+        },
+    ]
+
+
 def test_smoke_timed_generate_prefers_model_timed_api() -> None:
     class TimedModel:
         def generate_greedy_kernel_timed(
@@ -801,17 +837,23 @@ def test_phase3_metrics_schema_is_stable() -> None:
     metrics = smoke.phase3_metrics(
         profile={"counters": {"deepseek_prefetch_failures": 1}},
         gpu_staging={
+            "full_resident_enabled": 1,
             "lru_evictions": 2,
             "streamed_bytes": 3,
             "prefetch_hits": 4,
             "prefetch_misses": 5,
             "prefetch_failures": 6,
         },
-        gpu_backend={"quantized_expert_calls": 7},
+        gpu_backend={
+            "fused_selected_expert_api_calls": 8,
+            "quantized_expert_calls": 7,
+        },
     )
 
     assert metrics == {
         "cpu_sync_points": 0,
+        "full_resident_enabled": 1,
+        "fused_selected_expert_api_calls": 8,
         "lru_evictions": 2,
         "prefetch_failures": 7,
         "prefetch_hits": 4,
@@ -856,6 +898,7 @@ def test_usable_inference_metrics_schema_is_stable() -> None:
     metrics = smoke.usable_inference_metrics(
         profile={"counters": {"deepseek_prefetch_failures": 2}},
         gpu_staging={
+            "full_resident_enabled": 1,
             "lru_evictions": 3,
             "pinned_entries": 4,
             "prefetch_failures": 5,
@@ -865,12 +908,15 @@ def test_usable_inference_metrics_schema_is_stable() -> None:
             "streamed_bytes": 9,
         },
         gpu_backend={
+            "fused_selected_expert_api_calls": 12,
             "iq2_xxs_gate_up_fused_calls": 10,
             "q2_iq2_reference_fallback_calls": 11,
         },
     )
 
     assert metrics == {
+        "full_resident_enabled": 1,
+        "fused_selected_expert_api_calls": 12,
         "iq2_xxs_gate_up_fused_calls": 10,
         "lru_evictions": 3,
         "pinned_entries": 4,

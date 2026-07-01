@@ -101,6 +101,37 @@ def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     assert spec.max_new_tokens == 16
 
 
+def test_deepseek_v4_flash_direct_benchmark_enables_full_resident(
+    monkeypatch,
+) -> None:
+    captured_env: dict[str, str] = {}
+
+    class FakeProc:
+        returncode = 0
+        stderr = ""
+        stdout = (
+            '{"context_length":4096,"max_tokens":1,"repeat":1,'
+            '"runs":[{"elapsed_ms":1000.0,"generated_token_count":1,'
+            '"decode_tokens_total":1,"decode_ms_total":1000.0,'
+            '"decode_tps_steady_state":1.0}],"gpu_backend":{},'
+            '"gpu_staging":{},"runtime_budget":{}}'
+        )
+
+    def fake_run(*_args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(bench.os.path, "isfile", lambda _path: True)
+    monkeypatch.setattr(bench.subprocess, "run", fake_run)
+
+    result = bench._run_deepseek_v4_flash_direct_benchmark(
+        bench.MODEL_SPECS["deepseek_v4_flash_q2_gguf"]
+    )
+
+    assert result["skipped"] == 0.0
+    assert captured_env["FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT"] == "1"
+
+
 def test_deepseek_v4_flash_gguf_is_in_default_e2e_models(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["e2e_full_benchmark.py"])
 

@@ -56,6 +56,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-tokens", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--min-steady-decode-tps", type=float, default=0.0)
+    parser.add_argument(
+        "--use-graph",
+        action="store_true",
+        help="Enable the DeepSeek V4 Flash CUDA/HIP graph decode path.",
+    )
     parser.add_argument("--profile-json", type=Path, default=None)
     parser.add_argument(
         "--profile-events",
@@ -141,17 +146,34 @@ def profile_summary_payload(model: DeepSeekV4FlashForCausalLM) -> dict[str, obje
     }
 
 
+def decode_profile_top_sections(
+    profile_summary: dict[str, object],
+    *,
+    limit: int = 12,
+) -> list[dict[str, object]]:
+    top_events = profile_summary.get("top_events", [])
+    if not isinstance(top_events, list):
+        return []
+    return [
+        dict(event)
+        for event in top_events[: max(limit, 0)]
+        if isinstance(event, dict)
+    ]
+
+
 def generate_greedy_with_token_timings(
     model: DeepSeekV4FlashForCausalLM,
     input_ids: torch.Tensor,
     *,
     max_tokens: int,
+    use_graph: bool,
 ) -> tuple[torch.Tensor, list[float]]:
     timed_generate = getattr(model, "generate_greedy_kernel_timed", None)
     if timed_generate is not None:
         output_ids, token_elapsed_ms = timed_generate(
             input_ids,
             max_tokens=max_tokens,
+            use_graph=use_graph,
         )
         return output_ids, [float(ms) for ms in token_elapsed_ms]
 
@@ -161,7 +183,11 @@ def generate_greedy_with_token_timings(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        output_ids = model.generate_greedy_kernel(output_ids, max_tokens=1)
+        output_ids = model.generate_greedy_kernel(
+            output_ids,
+            max_tokens=1,
+            use_graph=use_graph,
+        )
         end_event.record()
         torch.cuda.synchronize()
         token_elapsed_ms.append(float(start_event.elapsed_time(end_event)))
@@ -178,6 +204,10 @@ def phase3_metrics(
     if not isinstance(counters, dict):
         counters = {}
     return {
+        "full_resident_enabled": int(gpu_staging.get("full_resident_enabled", 0)),
+        "fused_selected_expert_api_calls": int(
+            gpu_backend.get("fused_selected_expert_api_calls", 0)
+        ),
         "lru_evictions": int(gpu_staging.get("lru_evictions", 0)),
         "streamed_bytes": int(gpu_staging.get("streamed_bytes", 0)),
         "prefetch_hits": int(gpu_staging.get("prefetch_hits", 0)),
@@ -217,6 +247,10 @@ def usable_inference_metrics(
     if not isinstance(counters, dict):
         counters = {}
     return {
+        "full_resident_enabled": int(gpu_staging.get("full_resident_enabled", 0)),
+        "fused_selected_expert_api_calls": int(
+            gpu_backend.get("fused_selected_expert_api_calls", 0)
+        ),
         "iq2_xxs_gate_up_fused_calls": int(
             gpu_backend.get("iq2_xxs_gate_up_fused_calls", 0)
         ),
@@ -270,6 +304,7 @@ def main() -> int:
             model.generate_greedy_kernel(
                 input_ids,
                 max_tokens=args.warmup_tokens,
+                use_graph=args.use_graph,
             )
         torch.cuda.synchronize()
         model.enable_deepseek_profile(args.profile_json is not None)
@@ -284,6 +319,7 @@ def main() -> int:
                 model,
                 input_ids,
                 max_tokens=args.max_tokens,
+                use_graph=args.use_graph,
             )
             end_event.record()
             torch.cuda.synchronize()
@@ -333,11 +369,15 @@ def main() -> int:
             "context_length": args.context_length,
             "max_tokens": args.max_tokens,
             "warmup_tokens": args.warmup_tokens,
+            "use_graph": args.use_graph,
             "output_token_ids": output_cpu,
             "repeat": args.repeat,
             "runs": runs,
             "profile": profile,
             "profile_summary": profile_summary,
+            "decode_profile_top_sections": decode_profile_top_sections(
+                profile_summary
+            ),
             "gpu_staging": gpu_staging,
             "gpu_backend": gpu_backend,
             "phase3_metrics": phase3_metrics(

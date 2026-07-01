@@ -245,6 +245,7 @@ def test_model_gpu_staging_budget_preserves_required_headroom() -> None:
     assert model.gpu_staging_memory_stats() == {
         "staged_bytes": 0,
         "max_staged_bytes": 340,
+        "full_resident_enabled": 0,
         "dynamic_entries": 0,
         "grouped_entries": 0,
     }

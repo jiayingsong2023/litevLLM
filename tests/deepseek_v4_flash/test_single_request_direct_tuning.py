@@ -327,3 +327,23 @@ def test_gpu_staging_budget_malformed_env_defaults_to_zero() -> None:
     assert malformed is not None
     assert base is not None
     assert malformed == base
+
+
+def test_full_resident_env_removes_staging_budget_cap() -> None:
+    model = _fake_model(
+        context_length=16,
+        runtime_budget=_runtime_budget(
+            16,
+            uma_budget_bytes=4 * 1024 * 1024 * 1024,
+            min_system_headroom_bytes=1024 * 1024 * 1024,
+        ),
+    )
+
+    with patch.dict(
+        os.environ,
+        {"FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": "1"},
+    ):
+        stager = model._get_gpu_weight_stager(torch.device("cuda"))
+
+    assert stager.max_staged_bytes is None
+    assert stager.full_resident_enabled is True

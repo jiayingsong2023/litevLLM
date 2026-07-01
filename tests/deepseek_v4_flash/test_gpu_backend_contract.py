@@ -641,6 +641,59 @@ def test_fused_quantized_selected_experts_gemm_matches_loop() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_quantized_selected_experts_gemm_accepts_payload_workspaces() -> None:
+    rows = 256
+    columns = 512
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    expert_weights = torch.full((6,), 1.0 / 6.0, dtype=torch.float32, device="cuda")
+    payloads = [
+        (
+            expert_id,
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_IQ2_XXS,
+                rows=rows,
+                columns=columns,
+                payload=_iq2_xxs_deterministic_payload_blocks(rows, columns // 256),
+            ),
+            _staged_payload(
+                ggml_type=GGML_TYPE_Q2_K,
+                rows=rows,
+                columns=rows,
+                payload=_q2_k_deterministic_payload(rows),
+            ),
+        )
+        for expert_id in range(6)
+    ]
+    backend = DeepSeekV4FlashGPUBackend()
+    expected = backend.fused_quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+        workspace=torch.empty((6, rows), dtype=torch.float32, device="cuda"),
+    )
+
+    actual = backend.fused_quantized_selected_experts_gemm(
+        hidden=hidden,
+        expert_weights=expert_weights,
+        payloads=payloads,
+        workspace=torch.empty((6, rows), dtype=torch.float32, device="cuda"),
+        down_stack=torch.empty(
+            (6, payloads[0][3].payload.numel()),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=5.0e-3, atol=1.0e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fused_sliding_window_attention_matches_reference() -> None:
     from vllm.model_executor.models.deepseek_v4_flash.attention import (
         shared_kv_swa_attention_reference,

@@ -13,6 +13,8 @@ from vllm.triton_utils import tl, triton
 _Q2_K_BLOCK_BYTES = 84
 _IQ2_XXS_BLOCK_BYTES = 66
 _GGUF_BLOCK_COLUMNS = 256
+_SELECTED_IQ2_ROWS_PER_BLOCK = 4
+_SELECTED_Q2_ROWS_PER_BLOCK = 4
 _DS4_SWIGLU_CLAMP = 10.0
 _IQ2_XXS_LOOKUP_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -300,6 +302,135 @@ def _q2_k_selected_experts_down_projection_kernel(
                 tl.store(output_ptr + row, total_3)
 
 
+# GGUF Q2_K direct selected-experts down layout: each selected expert has its
+# own raw payload pointer. The grid is ceil(rows / ROWS_PER_BLOCK). Each
+# program computes ROWS_PER_BLOCK output rows and loops across up to six
+# selected experts, applying expert weights inline.
+@triton.jit
+def _q2_k_selected_experts_down_projection_direct6_kernel(
+    down0_ptr,
+    down0_half_ptr,
+    down1_ptr,
+    down1_half_ptr,
+    down2_ptr,
+    down2_half_ptr,
+    down3_ptr,
+    down3_half_ptr,
+    down4_ptr,
+    down4_half_ptr,
+    down5_ptr,
+    down5_half_ptr,
+    workspace_ptr,
+    weights_ptr,
+    output_ptr,
+    rows,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+    COLUMNS_BLOCKS: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+) -> None:
+    row_base = tl.program_id(0) * ROWS_PER_BLOCK
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 16
+    q_half = offsets // 128
+    rem = offsets - q_half * 128
+    shift = (rem // 32) * 2
+    q_byte_index = q_half * 32 + (rem - (rem // 32) * 32)
+    workspace_stride = COLUMNS_BLOCKS * BLOCK_SIZE
+
+    total_0 = tl.full((), 0.0, tl.float32)
+    total_1 = tl.full((), 0.0, tl.float32)
+    total_2 = tl.full((), 0.0, tl.float32)
+    total_3 = tl.full((), 0.0, tl.float32)
+    for expert_id in tl.range(0, num_experts):
+        payload_ptr = tl.where(
+            expert_id == 0,
+            down0_ptr,
+            tl.where(
+                expert_id == 1,
+                down1_ptr,
+                tl.where(
+                    expert_id == 2,
+                    down2_ptr,
+                    tl.where(
+                        expert_id == 3,
+                        down3_ptr,
+                        tl.where(expert_id == 4, down4_ptr, down5_ptr),
+                    ),
+                ),
+            ),
+        )
+        payload_half_ptr = tl.where(
+            expert_id == 0,
+            down0_half_ptr,
+            tl.where(
+                expert_id == 1,
+                down1_half_ptr,
+                tl.where(
+                    expert_id == 2,
+                    down2_half_ptr,
+                    tl.where(
+                        expert_id == 3,
+                        down3_half_ptr,
+                        tl.where(expert_id == 4, down4_half_ptr, down5_half_ptr),
+                    ),
+                ),
+            ),
+        )
+        weight = tl.load(weights_ptr + expert_id).to(tl.float32)
+        for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+            row = row_base + row_offset
+            if row < rows:
+                expert_total = tl.full((), 0.0, tl.float32)
+                for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+                    payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+                    scale_bytes = tl.load(payload_ptr + payload_base + group).to(
+                        tl.uint32
+                    )
+                    q_bytes = tl.load(
+                        payload_ptr + payload_base + 16 + q_byte_index
+                    ).to(tl.uint32)
+                    codes = ((q_bytes >> shift) & 0x03).to(tl.float32)
+
+                    scale_lows = (scale_bytes & 0x0F).to(tl.float32)
+                    scale_highs = (scale_bytes >> 4).to(tl.float32)
+                    half_base = (
+                        row * COLUMNS_BLOCKS + block_idx
+                    ) * HALF_WORDS_PER_BLOCK
+                    d = tl.load(payload_half_ptr + half_base + 40).to(tl.float32)
+                    dmin = tl.load(payload_half_ptr + half_base + 41).to(tl.float32)
+
+                    decoded = d * scale_lows * codes - dmin * scale_highs
+                    hidden = tl.load(
+                        workspace_ptr
+                        + expert_id * workspace_stride
+                        + block_idx * BLOCK_SIZE
+                        + offsets
+                    ).to(tl.float32)
+                    expert_total += tl.sum(decoded * hidden, axis=0)
+                if row_offset == 0:
+                    total_0 += weight * expert_total
+                if row_offset == 1:
+                    total_1 += weight * expert_total
+                if row_offset == 2:
+                    total_2 += weight * expert_total
+                if row_offset == 3:
+                    total_3 += weight * expert_total
+    for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+        row = row_base + row_offset
+        if row < rows:
+            if row_offset == 0:
+                tl.store(output_ptr + row, total_0)
+            if row_offset == 1:
+                tl.store(output_ptr + row, total_1)
+            if row_offset == 2:
+                tl.store(output_ptr + row, total_2)
+            if row_offset == 3:
+                tl.store(output_ptr + row, total_3)
+
+
 def _q2_k_matvec_triton_cuda(
     payload: torch.Tensor,
     hidden: torch.Tensor,
@@ -332,7 +463,7 @@ def _q2_k_matvec_multiblock_triton_cuda(
     output = torch.empty((rows,), dtype=torch.float32, device=hidden.device)
     payload_contiguous = payload.contiguous()
     hidden_contiguous = hidden.contiguous()
-    rows_per_block = 4
+    rows_per_block = _SELECTED_IQ2_ROWS_PER_BLOCK
     grid_rows = (rows + rows_per_block - 1) // rows_per_block
     _q2_k_matvec_multiblock_kernel[(grid_rows,)](
         payload_contiguous,
@@ -631,6 +762,207 @@ def _iq2_xxs_selected_experts_activation_kernel(
             tl.store(output_ptr + expert_row_offset + row, activated)
 
 
+# GGUF IQ2_XXS direct selected-experts activation layout: each selected
+# expert has its own raw payload pointer. The 2-D grid is
+# (num_experts, ceil(rows / ROWS_PER_BLOCK)); program_id(0) selects one of
+# up to six expert pointers and program_id(1) selects the row tile.
+@triton.jit
+def _iq2_xxs_selected_experts_activation_direct6_kernel(
+    gate0_ptr,
+    gate0_half_ptr,
+    gate1_ptr,
+    gate1_half_ptr,
+    gate2_ptr,
+    gate2_half_ptr,
+    gate3_ptr,
+    gate3_half_ptr,
+    gate4_ptr,
+    gate4_half_ptr,
+    gate5_ptr,
+    gate5_half_ptr,
+    up0_ptr,
+    up0_half_ptr,
+    up1_ptr,
+    up1_half_ptr,
+    up2_ptr,
+    up2_half_ptr,
+    up3_ptr,
+    up3_half_ptr,
+    up4_ptr,
+    up4_half_ptr,
+    up5_ptr,
+    up5_half_ptr,
+    hidden_ptr,
+    ksigns_ptr,
+    grid_ptr,
+    output_ptr,
+    rows,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+    HALF_WORDS_PER_BLOCK: tl.constexpr,
+    COLUMNS_BLOCKS: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+) -> None:
+    expert_id = tl.program_id(0)
+    row_base = tl.program_id(1) * ROWS_PER_BLOCK
+    offsets = tl.arange(0, BLOCK_SIZE)
+    group = offsets // 32
+    group_lane = offsets - group * 32
+    grid_byte_slot = group_lane // 8
+    grid_lane = group_lane - grid_byte_slot * 8
+
+    gate_ptr = tl.where(
+        expert_id == 0,
+        gate0_ptr,
+        tl.where(
+            expert_id == 1,
+            gate1_ptr,
+            tl.where(
+                expert_id == 2,
+                gate2_ptr,
+                tl.where(
+                    expert_id == 3,
+                    gate3_ptr,
+                    tl.where(expert_id == 4, gate4_ptr, gate5_ptr),
+                ),
+            ),
+        ),
+    )
+    gate_half_ptr = tl.where(
+        expert_id == 0,
+        gate0_half_ptr,
+        tl.where(
+            expert_id == 1,
+            gate1_half_ptr,
+            tl.where(
+                expert_id == 2,
+                gate2_half_ptr,
+                tl.where(
+                    expert_id == 3,
+                    gate3_half_ptr,
+                    tl.where(expert_id == 4, gate4_half_ptr, gate5_half_ptr),
+                ),
+            ),
+        ),
+    )
+    up_ptr = tl.where(
+        expert_id == 0,
+        up0_ptr,
+        tl.where(
+            expert_id == 1,
+            up1_ptr,
+            tl.where(
+                expert_id == 2,
+                up2_ptr,
+                tl.where(
+                    expert_id == 3,
+                    up3_ptr,
+                    tl.where(expert_id == 4, up4_ptr, up5_ptr),
+                ),
+            ),
+        ),
+    )
+    up_half_ptr = tl.where(
+        expert_id == 0,
+        up0_half_ptr,
+        tl.where(
+            expert_id == 1,
+            up1_half_ptr,
+            tl.where(
+                expert_id == 2,
+                up2_half_ptr,
+                tl.where(
+                    expert_id == 3,
+                    up3_half_ptr,
+                    tl.where(expert_id == 4, up4_half_ptr, up5_half_ptr),
+                ),
+            ),
+        ),
+    )
+    expert_row_offset = expert_id * rows
+
+    for row_offset in tl.static_range(0, ROWS_PER_BLOCK):
+        row = row_base + row_offset
+        if row < rows:
+            gate_total = tl.full((), 0.0, tl.float32)
+            up_total = tl.full((), 0.0, tl.float32)
+            for block_idx in tl.static_range(0, COLUMNS_BLOCKS):
+                payload_base = (row * COLUMNS_BLOCKS + block_idx) * BLOCK_BYTES
+                group_offset = 2 + group * 8
+                metadata_offset = payload_base + group_offset
+
+                gate_grid_bytes = tl.load(
+                    gate_ptr + metadata_offset + grid_byte_slot
+                ).to(tl.uint32)
+                up_grid_bytes = tl.load(up_ptr + metadata_offset + grid_byte_slot).to(
+                    tl.uint32
+                )
+
+                gate_word_byte0 = tl.load(gate_ptr + metadata_offset + 4).to(tl.uint32)
+                gate_word_byte1 = tl.load(gate_ptr + metadata_offset + 5).to(tl.uint32)
+                gate_word_byte2 = tl.load(gate_ptr + metadata_offset + 6).to(tl.uint32)
+                gate_word_byte3 = tl.load(gate_ptr + metadata_offset + 7).to(tl.uint32)
+                gate_sign_scale = (
+                    gate_word_byte0
+                    | (gate_word_byte1 << 8)
+                    | (gate_word_byte2 << 16)
+                    | (gate_word_byte3 << 24)
+                )
+
+                up_word_byte0 = tl.load(up_ptr + metadata_offset + 4).to(tl.uint32)
+                up_word_byte1 = tl.load(up_ptr + metadata_offset + 5).to(tl.uint32)
+                up_word_byte2 = tl.load(up_ptr + metadata_offset + 6).to(tl.uint32)
+                up_word_byte3 = tl.load(up_ptr + metadata_offset + 7).to(tl.uint32)
+                up_sign_scale = (
+                    up_word_byte0
+                    | (up_word_byte1 << 8)
+                    | (up_word_byte2 << 16)
+                    | (up_word_byte3 << 24)
+                )
+
+                sign_shift = grid_byte_slot * 7
+                gate_sign_index = (gate_sign_scale >> sign_shift) & 0x7F
+                gate_packed_signs = tl.load(ksigns_ptr + gate_sign_index).to(tl.uint32)
+                gate_sign_bits = (gate_packed_signs >> grid_lane) & 0x01
+                gate_signs = tl.where(gate_sign_bits == 0, 1.0, -1.0)
+
+                up_sign_index = (up_sign_scale >> sign_shift) & 0x7F
+                up_packed_signs = tl.load(ksigns_ptr + up_sign_index).to(tl.uint32)
+                up_sign_bits = (up_packed_signs >> grid_lane) & 0x01
+                up_signs = tl.where(up_sign_bits == 0, 1.0, -1.0)
+
+                gate_scale_code = (gate_sign_scale >> 28).to(tl.float32)
+                up_scale_code = (up_sign_scale >> 28).to(tl.float32)
+                half_base = (row * COLUMNS_BLOCKS + block_idx) * HALF_WORDS_PER_BLOCK
+                gate_d = tl.load(gate_half_ptr + half_base).to(tl.float32)
+                up_d = tl.load(up_half_ptr + half_base).to(tl.float32)
+                gate_block_scales = gate_d * (0.5 + gate_scale_code) * 0.25
+                up_block_scales = up_d * (0.5 + up_scale_code) * 0.25
+
+                gate_grid = tl.load(grid_ptr + gate_grid_bytes * 8 + grid_lane).to(
+                    tl.float32
+                )
+                up_grid = tl.load(grid_ptr + up_grid_bytes * 8 + grid_lane).to(
+                    tl.float32
+                )
+                hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
+                    tl.float32
+                )
+                gate_total += tl.sum(
+                    gate_block_scales * gate_grid * gate_signs * hidden,
+                    axis=0,
+                )
+                up_total += tl.sum(
+                    up_block_scales * up_grid * up_signs * hidden,
+                    axis=0,
+                )
+
+            gate_clamped = tl.minimum(gate_total, 10.0)
+            up_clamped = tl.minimum(tl.maximum(up_total, -10.0), 10.0)
+            activated = gate_clamped / (1.0 + tl.exp(-gate_clamped)) * up_clamped
+            tl.store(output_ptr + expert_row_offset + row, activated)
+
+
 # GGUF IQ2_XXS multi-block fused gate/up layout: each matrix row stores
 # COLUMNS_BLOCKS consecutive 66-byte IQ2_XXS blocks. One Triton program handles
 # ROWS_PER_BLOCK output rows, loops across each row's 256-value K blocks,
@@ -840,7 +1172,7 @@ def _iq2_xxs_gate_up_activation_multiblock_triton_cuda(
     up_payload_contiguous = up_payload.contiguous()
     hidden_contiguous = hidden.contiguous()
     ksigns, grid = _iq2_xxs_lookup_tensors_cuda(hidden.device)
-    rows_per_block = 4
+    rows_per_block = _SELECTED_Q2_ROWS_PER_BLOCK
     grid_rows = (rows + rows_per_block - 1) // rows_per_block
     _iq2_xxs_gate_up_activation_multiblock_kernel[(grid_rows,)](
         gate_payload_contiguous,
@@ -1108,7 +1440,6 @@ def deepseek_v4_iq2_xxs_selected_experts_activation(
     if workspace.dtype != torch.float32:
         raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
 
-    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
     gate_list: list[torch.Tensor] = []
     up_list: list[torch.Tensor] = []
     for gate_payload, up_payload in payloads:
@@ -1129,15 +1460,170 @@ def deepseek_v4_iq2_xxs_selected_experts_activation(
 
     gate_stack = torch.stack(gate_list, dim=0).contiguous()
     up_stack = torch.stack(up_list, dim=0).contiguous()
+    deepseek_v4_iq2_xxs_selected_experts_activation_stacked(
+        hidden=hidden_f32,
+        gate_stack=gate_stack,
+        up_stack=up_stack,
+        workspace=workspace,
+        rows=rows,
+        columns=columns,
+    )
+
+
+def deepseek_v4_iq2_xxs_selected_experts_activation_stacked(
+    *,
+    hidden: torch.Tensor,
+    gate_stack: torch.Tensor,
+    up_stack: torch.Tensor,
+    workspace: torch.Tensor,
+    rows: int,
+    columns: int,
+) -> None:
+    """Fused gate/up activation for pre-stacked IQ2_XXS selected experts."""
+    hidden_f32 = _validate_hidden(hidden, columns=columns).contiguous()
+    if gate_stack.ndim != 2 or up_stack.ndim != 2:
+        raise ValueError("gate_stack and up_stack must be 2-D")
+    if gate_stack.shape != up_stack.shape:
+        raise ValueError(
+            f"gate_stack and up_stack shapes must match; got {gate_stack.shape} "
+            f"and {up_stack.shape}"
+        )
+    num_experts = int(gate_stack.shape[0])
+    if num_experts <= 0:
+        raise ValueError("gate_stack must contain at least one expert")
+    expected_payload_bytes = (
+        rows * (columns // _GGUF_BLOCK_COLUMNS) * _IQ2_XXS_BLOCK_BYTES
+    )
+    if gate_stack.shape[1] != expected_payload_bytes:
+        raise ValueError(
+            "gate_stack payload bytes mismatch: "
+            f"got {gate_stack.shape[1]}, expected {expected_payload_bytes}"
+        )
+    if gate_stack.dtype != torch.uint8 or up_stack.dtype != torch.uint8:
+        raise ValueError("gate_stack and up_stack must be uint8")
+    if gate_stack.device != hidden.device or up_stack.device != hidden.device:
+        raise ValueError("gate_stack and up_stack must be on the same device as hidden")
+    if workspace.ndim != 2:
+        raise ValueError(f"workspace must be 2-D; got {workspace.ndim}-D")
+    if workspace.shape != (num_experts, rows):
+        raise ValueError(
+            "workspace shape must be (num_experts, rows); "
+            f"got {workspace.shape} and expected ({num_experts}, {rows})"
+        )
+    if workspace.device != hidden.device:
+        raise ValueError("workspace must be on the same device as hidden")
+    if workspace.dtype != torch.float32:
+        raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
+    gate_stack_contiguous = gate_stack.contiguous()
+    up_stack_contiguous = up_stack.contiguous()
     workspace_contiguous = workspace.contiguous()
     ksigns, grid = _iq2_xxs_lookup_tensors_cuda(hidden.device)
     rows_per_block = 4
     grid_rows = (rows + rows_per_block - 1) // rows_per_block
     _iq2_xxs_selected_experts_activation_kernel[(num_experts, grid_rows)](
-        gate_stack,
-        gate_stack.view(torch.float16),
-        up_stack,
-        up_stack.view(torch.float16),
+        gate_stack_contiguous,
+        gate_stack_contiguous.view(torch.float16),
+        up_stack_contiguous,
+        up_stack_contiguous.view(torch.float16),
+        hidden_f32,
+        ksigns,
+        grid,
+        workspace_contiguous,
+        rows,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_IQ2_XXS_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_IQ2_XXS_BLOCK_BYTES // 2,
+        COLUMNS_BLOCKS=columns_blocks,
+        ROWS_PER_BLOCK=rows_per_block,
+        num_warps=8,
+    )
+    if workspace_contiguous.data_ptr() != workspace.data_ptr():
+        workspace.copy_(workspace_contiguous)
+
+
+def deepseek_v4_iq2_xxs_selected_experts_activation_direct(
+    hidden: torch.Tensor,
+    payloads: list[tuple[torch.Tensor, torch.Tensor]],
+    workspace: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> None:
+    """Fused gate/up activation for up to six IQ2_XXS selected expert payloads."""
+    if not payloads:
+        raise ValueError("payloads must contain at least one expert")
+    if len(payloads) > 6:
+        raise ValueError(
+            f"direct selected activation supports <=6 experts; got {len(payloads)}"
+        )
+    hidden_f32 = _validate_hidden(hidden, columns=columns).contiguous()
+    num_experts = len(payloads)
+    if workspace.ndim != 2:
+        raise ValueError(f"workspace must be 2-D; got {workspace.ndim}-D")
+    if workspace.shape != (num_experts, rows):
+        raise ValueError(
+            "workspace shape must be (num_experts, rows); "
+            f"got {workspace.shape} and expected ({num_experts}, {rows})"
+        )
+    if workspace.device != hidden.device:
+        raise ValueError("workspace must be on the same device as hidden")
+    if workspace.dtype != torch.float32:
+        raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
+    gate_payloads: list[torch.Tensor] = []
+    up_payloads: list[torch.Tensor] = []
+    for gate_payload, up_payload in payloads:
+        _validate_payload(
+            gate_payload,
+            rows=rows,
+            columns=columns,
+            block_bytes=_IQ2_XXS_BLOCK_BYTES,
+        )
+        _validate_payload(
+            up_payload,
+            rows=rows,
+            columns=columns,
+            block_bytes=_IQ2_XXS_BLOCK_BYTES,
+        )
+        if gate_payload.device != hidden.device or up_payload.device != hidden.device:
+            raise ValueError("payloads must be on the same device as hidden")
+        gate_payloads.append(gate_payload.contiguous())
+        up_payloads.append(up_payload.contiguous())
+
+    while len(gate_payloads) < 6:
+        gate_payloads.append(gate_payloads[0])
+        up_payloads.append(up_payloads[0])
+
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
+    workspace_contiguous = workspace.contiguous()
+    ksigns, grid = _iq2_xxs_lookup_tensors_cuda(hidden.device)
+    rows_per_block = _SELECTED_IQ2_ROWS_PER_BLOCK
+    grid_rows = (rows + rows_per_block - 1) // rows_per_block
+    _iq2_xxs_selected_experts_activation_direct6_kernel[(num_experts, grid_rows)](
+        gate_payloads[0],
+        gate_payloads[0].view(torch.float16),
+        gate_payloads[1],
+        gate_payloads[1].view(torch.float16),
+        gate_payloads[2],
+        gate_payloads[2].view(torch.float16),
+        gate_payloads[3],
+        gate_payloads[3].view(torch.float16),
+        gate_payloads[4],
+        gate_payloads[4].view(torch.float16),
+        gate_payloads[5],
+        gate_payloads[5].view(torch.float16),
+        up_payloads[0],
+        up_payloads[0].view(torch.float16),
+        up_payloads[1],
+        up_payloads[1].view(torch.float16),
+        up_payloads[2],
+        up_payloads[2].view(torch.float16),
+        up_payloads[3],
+        up_payloads[3].view(torch.float16),
+        up_payloads[4],
+        up_payloads[4].view(torch.float16),
+        up_payloads[5],
+        up_payloads[5].view(torch.float16),
         hidden_f32,
         ksigns,
         grid,
@@ -1229,16 +1715,187 @@ def deepseek_v4_q2_k_selected_experts_down_projection(
                 f"got {payload.device} and {expected_device}"
             )
 
-    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
     down_stack = torch.stack(down_payloads, dim=0).contiguous()
+    deepseek_v4_q2_k_selected_experts_down_projection_stacked(
+        workspace=workspace,
+        down_stack=down_stack,
+        expert_weights=expert_weights,
+        output=output,
+        rows=rows,
+        columns=columns,
+    )
+
+
+def deepseek_v4_q2_k_selected_experts_down_projection_stacked(
+    *,
+    workspace: torch.Tensor,
+    down_stack: torch.Tensor,
+    expert_weights: torch.Tensor,
+    output: torch.Tensor,
+    rows: int,
+    columns: int,
+) -> None:
+    """Fused Q2_K down projection for pre-stacked selected experts."""
+    if down_stack.ndim != 2:
+        raise ValueError(f"down_stack must be 2-D; got {down_stack.ndim}-D")
+    num_experts = int(down_stack.shape[0])
+    if num_experts <= 0:
+        raise ValueError("down_stack must contain at least one expert")
+    expected_payload_bytes = rows * (columns // _GGUF_BLOCK_COLUMNS) * _Q2_K_BLOCK_BYTES
+    if down_stack.shape[1] != expected_payload_bytes:
+        raise ValueError(
+            "down_stack payload bytes mismatch: "
+            f"got {down_stack.shape[1]}, expected {expected_payload_bytes}"
+        )
+    if down_stack.dtype != torch.uint8:
+        raise ValueError(f"down_stack must be uint8; got {down_stack.dtype}")
+    if workspace.ndim != 2:
+        raise ValueError(f"workspace must be 2-D; got {workspace.ndim}-D")
+    if workspace.shape != (num_experts, columns):
+        raise ValueError(
+            "workspace shape must be (num_experts, columns); "
+            f"got {workspace.shape} and expected ({num_experts}, {columns})"
+        )
+    if workspace.dtype != torch.float32:
+        raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
+    if expert_weights.shape != (num_experts,):
+        raise ValueError(
+            "expert_weights shape must be (num_experts,); "
+            f"got {expert_weights.shape} and expected ({num_experts},)"
+        )
+    if expert_weights.dtype != torch.float32:
+        raise ValueError(f"expert_weights must be fp32; got {expert_weights.dtype}")
+    if output.shape != (rows,):
+        raise ValueError(
+            f"output shape must be (rows,); got {output.shape} and expected ({rows},)"
+        )
+    if output.dtype != torch.float32:
+        raise ValueError(f"output must be fp32; got {output.dtype}")
+    if not workspace.is_cuda or not expert_weights.is_cuda or not output.is_cuda:
+        raise ValueError("workspace, expert_weights, and output must be CUDA tensors")
+    expected_device = workspace.device
+    if down_stack.device != expected_device:
+        raise ValueError(
+            "down_stack must be on the same device as workspace; "
+            f"got {down_stack.device} and {expected_device}"
+        )
+    if expert_weights.device != expected_device:
+        raise ValueError(
+            "expert_weights must be on the same device as workspace; "
+            f"got {expert_weights.device} and {expected_device}"
+        )
+    if output.device != expected_device:
+        raise ValueError(
+            "output must be on the same device as workspace; "
+            f"got {output.device} and {expected_device}"
+        )
+    down_stack_contiguous = down_stack.contiguous()
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
     workspace_contiguous = workspace.contiguous()
     weights_contiguous = expert_weights.contiguous()
     output_contiguous = output.contiguous()
     rows_per_block = 4
     grid_rows = (rows + rows_per_block - 1) // rows_per_block
     _q2_k_selected_experts_down_projection_kernel[(grid_rows,)](
-        down_stack,
-        down_stack.view(torch.float16),
+        down_stack_contiguous,
+        down_stack_contiguous.view(torch.float16),
+        workspace_contiguous,
+        weights_contiguous,
+        output_contiguous,
+        rows,
+        num_experts,
+        BLOCK_SIZE=_GGUF_BLOCK_COLUMNS,
+        BLOCK_BYTES=_Q2_K_BLOCK_BYTES,
+        HALF_WORDS_PER_BLOCK=_Q2_K_BLOCK_BYTES // 2,
+        COLUMNS_BLOCKS=columns_blocks,
+        ROWS_PER_BLOCK=rows_per_block,
+        num_warps=8,
+    )
+    if output_contiguous.data_ptr() != output.data_ptr():
+        output.copy_(output_contiguous)
+
+
+def deepseek_v4_q2_k_selected_experts_down_projection_direct(
+    *,
+    workspace: torch.Tensor,
+    down_payloads: list[torch.Tensor],
+    expert_weights: torch.Tensor,
+    output: torch.Tensor,
+    rows: int,
+    columns: int,
+) -> None:
+    """Fused Q2_K down projection for up to six selected expert payloads."""
+    if not down_payloads:
+        raise ValueError("down_payloads must contain at least one expert")
+    if len(down_payloads) > 6:
+        raise ValueError(
+            "direct selected down projection supports <=6 experts; "
+            f"got {len(down_payloads)}"
+        )
+    num_experts = len(down_payloads)
+    if workspace.ndim != 2:
+        raise ValueError(f"workspace must be 2-D; got {workspace.ndim}-D")
+    if workspace.shape != (num_experts, columns):
+        raise ValueError(
+            "workspace shape must be (num_experts, columns); "
+            f"got {workspace.shape} and expected ({num_experts}, {columns})"
+        )
+    if workspace.dtype != torch.float32:
+        raise ValueError(f"workspace must be fp32; got {workspace.dtype}")
+    if expert_weights.shape != (num_experts,):
+        raise ValueError(
+            "expert_weights shape must be (num_experts,); "
+            f"got {expert_weights.shape} and expected ({num_experts},)"
+        )
+    if expert_weights.dtype != torch.float32:
+        raise ValueError(f"expert_weights must be fp32; got {expert_weights.dtype}")
+    if output.shape != (rows,):
+        raise ValueError(
+            f"output shape must be (rows,); got {output.shape} and expected ({rows},)"
+        )
+    if output.dtype != torch.float32:
+        raise ValueError(f"output must be fp32; got {output.dtype}")
+    if not workspace.is_cuda or not expert_weights.is_cuda or not output.is_cuda:
+        raise ValueError("workspace, expert_weights, and output must be CUDA tensors")
+    expected_device = workspace.device
+    if expert_weights.device != expected_device or output.device != expected_device:
+        raise ValueError("workspace, expert_weights, and output must share one device")
+    contiguous_payloads: list[torch.Tensor] = []
+    for payload in down_payloads:
+        _validate_payload(
+            payload,
+            rows=rows,
+            columns=columns,
+            block_bytes=_Q2_K_BLOCK_BYTES,
+        )
+        if payload.device != expected_device:
+            raise ValueError(
+                "down_payloads must be on the same device as workspace; "
+                f"got {payload.device} and {expected_device}"
+            )
+        contiguous_payloads.append(payload.contiguous())
+    while len(contiguous_payloads) < 6:
+        contiguous_payloads.append(contiguous_payloads[0])
+
+    columns_blocks = columns // _GGUF_BLOCK_COLUMNS
+    workspace_contiguous = workspace.contiguous()
+    weights_contiguous = expert_weights.contiguous()
+    output_contiguous = output.contiguous()
+    rows_per_block = _SELECTED_Q2_ROWS_PER_BLOCK
+    grid_rows = (rows + rows_per_block - 1) // rows_per_block
+    _q2_k_selected_experts_down_projection_direct6_kernel[(grid_rows,)](
+        contiguous_payloads[0],
+        contiguous_payloads[0].view(torch.float16),
+        contiguous_payloads[1],
+        contiguous_payloads[1].view(torch.float16),
+        contiguous_payloads[2],
+        contiguous_payloads[2].view(torch.float16),
+        contiguous_payloads[3],
+        contiguous_payloads[3].view(torch.float16),
+        contiguous_payloads[4],
+        contiguous_payloads[4].view(torch.float16),
+        contiguous_payloads[5],
+        contiguous_payloads[5].view(torch.float16),
         workspace_contiguous,
         weights_contiguous,
         output_contiguous,

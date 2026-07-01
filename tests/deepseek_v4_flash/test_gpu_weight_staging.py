@@ -353,6 +353,49 @@ def test_grouped_expert_payload_stage_rereads_evicted_payloads(
     assert "selected_payload_cache_hits" not in stager.cache_stats()
 
 
+def test_full_resident_grouped_payloads_are_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_cuda_to(monkeypatch)
+    store = _FakeGroupedExpertStore()
+    grouped = DeepSeekV4FlashGroupedExpertTensors(
+        gate=_tensor("blk.2.ffn_gate_exps.weight", dims=(2, 2, 8)),
+        up=_tensor("blk.2.ffn_up_exps.weight", dims=(2, 2, 8)),
+        down=_tensor("blk.2.ffn_down_exps.weight", dims=(2, 2, 8)),
+    )
+    for tensor in (grouped.gate, grouped.up, grouped.down):
+        for expert_id in (1, 3):
+            store.raw_payloads[(tensor.name, expert_id)] = bytes(
+                [expert_id, len(tensor.name) % 251]
+            )
+    stager = DeepSeekV4FlashGPUWeightStager(
+        store,
+        device="cuda",
+        max_staged_bytes=6,
+    )
+
+    stager.enable_full_resident_mode()
+    first = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        torch.tensor([1, 3], dtype=torch.int64),
+        layer_idx=2,
+    )
+    second = stager.stage_grouped_expert_payloads_for_ids(
+        grouped,
+        torch.tensor([1, 3], dtype=torch.int64),
+        layer_idx=2,
+    )
+
+    assert stager.full_resident_enabled is True
+    assert first[0][1].payload.data_ptr() == second[0][1].payload.data_ptr()
+    assert store.raw_payload_read_count == 6
+    stats = stager.memory_stats()
+    assert stats["grouped_entries"] == 6
+    assert stats["pinned_entries"] == 6
+    assert stats["streamed_bytes"] == 0
+    assert stats["lru_evictions"] == 0
+
+
 def test_grouped_expert_payload_hits_refresh_grouped_lru_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -596,6 +639,7 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
     assert stager.memory_stats() == {
         "staged_bytes": 24,
         "max_staged_bytes": None,
+        "full_resident_enabled": 0,
         "dynamic_entries": 2,
         "grouped_entries": 0,
         "dynamic_hits": 2,

@@ -2830,6 +2830,7 @@ def _run_deepseek_v4_flash_direct_benchmark(
         {
             "FASTINFERENCE_KV_TYPE": "fp16",
             "FASTINFERENCE_BLOCK_SIZE": "32",
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": "1",
             "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS": "1",
             "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB": "1",
         }

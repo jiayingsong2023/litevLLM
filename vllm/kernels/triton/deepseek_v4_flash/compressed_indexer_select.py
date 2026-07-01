@@ -15,6 +15,7 @@ def _indexer_select_scores_kernel(
     HEADS: tl.constexpr,
     ROW_WIDTH: tl.constexpr,
     BLOCK_WIDTH: tl.constexpr,
+    SCALE: tl.constexpr,
 ):
     # Memory layout:
     # - query_ptr is [HEADS, ROW_WIDTH] fp32.
@@ -51,7 +52,7 @@ def _indexer_select_scores_kernel(
         dot = tl.maximum(dot, 0.0)
         weight = tl.load(weights_ptr + h)
         acc = acc + weight * dot
-    tl.store(scores_ptr + row, acc)
+    tl.store(scores_ptr + row, acc * SCALE)
 
 
 def deepseek_v4_indexer_select_scores(
@@ -98,6 +99,7 @@ def deepseek_v4_indexer_select_scores(
     query_f32 = query.to(torch.float32).contiguous()
     rows_f32 = indexer_rows.to(torch.float32).contiguous()
     weights_f32 = index_weights.to(torch.float32).contiguous()
+    scale = 1.0 / float(query.shape[0] * row_width) ** 0.5
 
     scores = torch.empty((n_rows,), dtype=torch.float32, device=query.device)
     _indexer_select_scores_kernel[(n_rows,)](
@@ -108,7 +110,6 @@ def deepseek_v4_indexer_select_scores(
         HEADS=query.shape[0],
         ROW_WIDTH=row_width,
         BLOCK_WIDTH=block_width,
+        SCALE=scale,
     )
-    scale = 1.0 / float(query.shape[0] * row_width) ** 0.5
-    scores = scores * scale
     return scores

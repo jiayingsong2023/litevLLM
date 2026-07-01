@@ -87,6 +87,33 @@ Triton/GPU paths, but the model is still much harder than Gemma/Qwen because it
 combines an 80.7GiB GGUF, 43 layers, top-6 routed MoE, 256 routed experts, and
 DeepSeek-specific compressed attention.
 
+Current kept performance work:
+
+- direct selected-expert Q2/IQ2 kernels avoid CPU payload scheduling and
+  per-layer `torch.stack()` churn for selected experts.
+- Q8_0 raw matvec and gate/up activation kernels now use direct int8
+  sign-extension instead of a separate byte-range select.
+- `deepseek_v4_indexer_select_scores` applies its scale in the Triton store,
+  removing a small PyTorch elementwise launch.
+- `_update_compressor_state` has nested profiler sections so
+  `compressed_kv_update` and `compressed_indexer_update` can be attributed to
+  projection, runtime copy, norm, pool, RoPE, QAT, and carry work.
+- emitted indexer QAT is implemented as Triton Hadamard + E2M1 roundtrip
+  kernels, replacing the GPU-path call to `deepseek_indexer_qat_reference`.
+
+Rejected or stopped performance attempts:
+
+- graph/capture: repeated attempts showed the decode step still has too much
+  dynamic per-token state for this to be the next useful route.
+- full expert GPU tables: semantically equivalent, but cold start and memory
+  cost were high and throughput did not justify keeping it.
+- Q2 down static unroll: made the direct down-projection kernel slower in
+  rocprof.
+- batched Q8 raw matvec: did not enter the single-request direct decode hot
+  path.
+- compressor dual Q8 projection: did not apply to the profiled DS4 file because
+  compressor `kv/gate` weights are F16 tensors, not Q8_0 tensors.
+
 Implemented:
 
 - GGUF parse and explicit DeepSeek V4 Flash adapter/loader routing for the

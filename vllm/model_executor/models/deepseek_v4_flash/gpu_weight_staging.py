@@ -97,6 +97,7 @@ class DeepSeekV4FlashGPUWeightStager:
         if max_staged_bytes is not None and max_staged_bytes < 0:
             raise ValueError("max staged bytes must be non-negative")
         self.max_staged_bytes = max_staged_bytes
+        self._full_resident_enabled = False
         self._staged_bytes = 0
         self._grouped_cache: dict[DeepSeekV4FlashCacheKey, torch.Tensor] = {}
         self._dynamic_cache: dict[DeepSeekV4FlashCacheKey, torch.Tensor] = {}
@@ -126,6 +127,14 @@ class DeepSeekV4FlashGPUWeightStager:
         }
 
     @property
+    def full_resident_enabled(self) -> bool:
+        return self._full_resident_enabled
+
+    def enable_full_resident_mode(self) -> None:
+        self._full_resident_enabled = True
+        self.max_staged_bytes = None
+
+    @property
     def staged_bytes(self) -> int:
         return self._staged_bytes
 
@@ -133,6 +142,7 @@ class DeepSeekV4FlashGPUWeightStager:
         return {
             "staged_bytes": self._staged_bytes,
             "max_staged_bytes": self.max_staged_bytes,
+            "full_resident_enabled": int(self._full_resident_enabled),
             "dynamic_entries": len(self._dynamic_cache),
             "grouped_entries": len(self._grouped_cache),
             "pinned_entries": len(self._pinned_cache_keys),
@@ -295,6 +305,8 @@ class DeepSeekV4FlashGPUWeightStager:
         layer_idx: int | None,
         expert_id: int,
     ) -> bool:
+        if self._full_resident_enabled:
+            return True
         if layer_idx is None:
             return False
         return (
@@ -307,6 +319,8 @@ class DeepSeekV4FlashGPUWeightStager:
         layer_idx: int | None,
         expert_id: int,
     ) -> bool:
+        if self._full_resident_enabled:
+            return True
         return self.cache_admission_policy.should_cache_grouped_expert(
             layer_idx=layer_idx,
             expert_id=expert_id,

@@ -33,8 +33,7 @@ def _q8_0_raw_matvec_kernel(
         scale_hi = tl.load(raw_ptr + block_offset + 1).to(tl.uint32)
         scale_bits = ((scale_hi << 8) | scale_lo).to(tl.uint16)
         scale = scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
-        raw_values = tl.load(raw_ptr + block_offset + 2 + offsets).to(tl.int32)
-        values = tl.where(raw_values >= 128, raw_values - 256, raw_values).to(
+        values = tl.load(raw_ptr + block_offset + 2 + offsets).to(tl.int8).to(
             tl.float32
         )
         hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(tl.float32)
@@ -73,27 +72,17 @@ def _q8_0_raw_gate_up_activation_kernel(
         gate_scale_hi = tl.load(gate_raw_ptr + block_offset + 1).to(tl.uint32)
         gate_scale_bits = ((gate_scale_hi << 8) | gate_scale_lo).to(tl.uint16)
         gate_scale = gate_scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
-        gate_raw_values = tl.load(gate_raw_ptr + block_offset + 2 + offsets).to(
-            tl.int32
-        )
-        gate_values = tl.where(
-            gate_raw_values >= 128,
-            gate_raw_values - 256,
-            gate_raw_values,
+        gate_values = tl.load(gate_raw_ptr + block_offset + 2 + offsets).to(
+            tl.int8
         ).to(tl.float32)
 
         up_scale_lo = tl.load(up_raw_ptr + block_offset).to(tl.uint32)
         up_scale_hi = tl.load(up_raw_ptr + block_offset + 1).to(tl.uint32)
         up_scale_bits = ((up_scale_hi << 8) | up_scale_lo).to(tl.uint16)
         up_scale = up_scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
-        up_raw_values = tl.load(up_raw_ptr + block_offset + 2 + offsets).to(
-            tl.int32
+        up_values = tl.load(up_raw_ptr + block_offset + 2 + offsets).to(tl.int8).to(
+            tl.float32
         )
-        up_values = tl.where(
-            up_raw_values >= 128,
-            up_raw_values - 256,
-            up_raw_values,
-        ).to(tl.float32)
 
         hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(tl.float32)
         gate_total += tl.sum(gate_values * gate_scale * hidden, axis=0)
