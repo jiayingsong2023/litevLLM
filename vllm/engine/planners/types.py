@@ -27,6 +27,9 @@ class BudgetResult:
 
 @dataclass(frozen=True)
 class PrefillPlanResult:
+    """Immutable result of prefill-phase planning, including the prefill plan
+    and metadata about multimodal/lora limit relaxations and fairness gaps."""
+
     plan: PrefillPlan | None
     fairness_gap: dict[str, float]
     effective_multimodal_request_limit: int
@@ -47,6 +50,9 @@ class PrefillPlanResult:
 
 @dataclass(frozen=True)
 class DecodePlanResult:
+    """Immutable result of decode-phase planning, including the decode plan
+    and metadata about lora/multimodal limits and fairness relaxations."""
+
     plan: DecodePlan | None
     fairness_gap: dict[str, float]
     effective_lora_adapter_limit: int
