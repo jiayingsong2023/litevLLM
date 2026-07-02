@@ -86,6 +86,30 @@ class LiteSingleGpuBackend:
         self.gpu_greedy_bypass_cpu_policies = bool(gpu_greedy_bypass_cpu_policies)
         self.gpu_greedy_ignore_eos = bool(gpu_greedy_ignore_eos)
 
+    def ensure_kv_blocks(self, step_plan: StepPlan) -> None:
+        request_ids: list[str] = []
+        token_counts: list[int] = []
+
+        if step_plan.prefills is not None:
+            for rid in step_plan.prefills.request_ids:
+                req = self.scheduler.get_request(rid)
+                start_pos = max(
+                    int(req.seq_len),
+                    int(req.prefix_hit_len or req._prefix_cache_hit_len or 0),
+                )
+                chunk_len = step_plan.prefills.chunk_len
+                request_ids.append(rid)
+                token_counts.append(start_pos + chunk_len)
+
+        if step_plan.decodes is not None:
+            for rid in step_plan.decodes.request_ids:
+                req = self.scheduler.get_request(rid)
+                request_ids.append(rid)
+                token_counts.append(int(req.seq_len) + 1)
+
+        if request_ids:
+            self.kv_block_manager.ensure_blocks_for_requests(request_ids, token_counts)
+
     def maybe_apply_prefix_cache(self, request_state: RequestState) -> None:
         cache_key = self._prefix_cache_key(request_state)
         if not cache_key:
@@ -445,6 +469,7 @@ class LiteSingleGpuBackend:
             self._free_request(request_id)
 
     def _free_request(self, request_id: str) -> None:
+        self.kv_block_manager.free_request_blocks(request_id)
         request = self.scheduler.free_request(request_id)
         if request is not None and self.lora_registry is not None:
             self.lora_registry.on_request_removed(request.lora_id)
@@ -555,10 +580,8 @@ class LiteSingleGpuBackend:
         request_state: RequestState,
         last_prompt_logits: torch.Tensor,
     ) -> None:
-        del request_id
         prompt_len = int(request_state.seq_len or 0)
-        slot_idx = request_state.slot_idx
-        if prompt_len <= 0 or slot_idx is None:
+        if prompt_len <= 0:
             return
 
         key = self._prefix_cache_key(request_state)
@@ -567,7 +590,7 @@ class LiteSingleGpuBackend:
 
         entry = self.kv_block_manager.capture_prefix_entry(
             key=key,
-            slot_idx=int(slot_idx),
+            request_id=request_id,
             prompt_len=prompt_len,
             last_prompt_logits=last_prompt_logits,
         )
@@ -582,11 +605,14 @@ class LiteSingleGpuBackend:
         prefix_len = max(0, min(int(prefix_len), int(entry.prompt_len)))
         if prefix_len <= 0:
             return
-        slot_idx = int(request_state.slot_idx)
         self.kv_block_manager.materialize_prefix_entry(
-            slot_idx=slot_idx,
+            request_id=request_state.request_id,
             entry=entry,
             prefix_len=prefix_len,
+        )
+        self.kv_block_manager.update_block_table_row(
+            int(request_state.slot_idx),
+            request_state.request_id,
         )
 
         request_state.seq_len = prefix_len

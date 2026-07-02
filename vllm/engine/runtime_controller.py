@@ -59,6 +59,8 @@ class RuntimeController:
         if self.scheduler.running_request_count == 0:
             return []
 
+        self.backend.ensure_kv_blocks(step_plan)
+
         self.observer.on_step_started(step_plan)
 
         if (
