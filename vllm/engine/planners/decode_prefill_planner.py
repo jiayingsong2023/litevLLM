@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm.engine.planners.types import PrefillPlanResult
+from vllm.engine.planners.types import DecodePlanResult, PrefillPlanResult
 from vllm.engine.scheduling_constraints import (
     LoRAConstraint,
     MultiModalConstraint,
@@ -11,7 +11,7 @@ from vllm.engine.scheduling_constraints import (
     ServiceClassSelector,
 )
 from vllm.engine.scheduling_helpers import lora_adapter_key, rotate_candidates
-from vllm.engine.step_plan import PrefillPlan
+from vllm.engine.step_plan import DecodePlan, PrefillPlan
 
 
 class DecodePrefillPlanner:
@@ -181,6 +181,44 @@ class DecodePrefillPlanner:
             candidate_prefills=candidate_prefills,
         )
 
+    def _select_weighted_requests(
+        self,
+        *,
+        scheduler,
+        request_ids: list[str],
+        limit: int,
+        cursor_attr: str,
+        prefer_short_prompts: bool,
+        intra_class_rotate: bool = False,
+        quotas: dict[str, int] | None = None,
+    ) -> list[str]:
+        return self._service_class_selector.select_weighted_requests(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            limit=limit,
+            cursor_attr=cursor_attr,
+            prefer_short_prompts=prefer_short_prompts,
+            intra_class_rotate=intra_class_rotate,
+            quotas=quotas,
+        )
+
+    def _apply_multimodal_request_limit(
+        self,
+        *,
+        scheduler,
+        request_ids: list[str],
+        max_multimodal_requests: int,
+        cursor_attr: str,
+    ) -> list[str]:
+        return self._multimodal_constraint.apply_multimodal_request_limit(
+            scheduler=scheduler,
+            step_scheduler=self,
+            request_ids=request_ids,
+            max_multimodal_requests=max_multimodal_requests,
+            cursor_attr=cursor_attr,
+        )
+
     @staticmethod
     def _rotate_candidates(request_ids: list[str], cursor: int) -> list[str]:
         return rotate_candidates(request_ids, cursor)
@@ -343,6 +381,116 @@ class DecodePrefillPlanner:
             multimodal_lora_limit_triggered=multimodal_lora_limit_triggered,
             multimodal_limit_relaxed=multimodal_relaxed,
             multimodal_limit_tightened=multimodal_tightened,
+            multimodal_lora_limit_relaxed=multimodal_lora_relaxed,
+            multimodal_lora_limit_tightened=multimodal_lora_tightened,
+            multimodal_lora_relaxed_by_fairness=multimodal_lora_relaxed_by_fairness,
+            multimodal_lora_tightened_by_locality=multimodal_lora_tightened_by_locality,
+            multimodal_lora_max_fairness_gap=multimodal_lora_max_fairness_gap,
+            lora_limit_relaxed=relaxed,
+            lora_limit_tightened=tightened,
+        )
+
+    def build_decode_plan(
+        self,
+        scheduler,
+        decodes: list[str],
+        decode_limit: int,
+        no_prefills_selected: bool,
+    ) -> DecodePlanResult:
+        """Assemble a decode plan for the next engine step.
+
+        Selects decode candidates, applies LoRA and multimodal constraints, and
+        determines whether the fast decode path can be used when all decodes are
+        scheduled and no prefills were selected.
+
+        Args:
+            scheduler: The request scheduler holding request states.
+            decodes: Ordered list of request IDs waiting for decode.
+            decode_limit: Maximum number of decode requests to schedule.
+            no_prefills_selected: Whether any prefills were selected this step.
+
+        Returns:
+            A ``DecodePlanResult`` containing the plan (or ``None`` when no
+            requests can be scheduled) and metadata about effective limits and
+            fairness/relaxation state.
+        """
+        if decode_limit < len(decodes):
+            request_ids = self._select_weighted_requests(
+                scheduler=scheduler,
+                request_ids=decodes,
+                limit=decode_limit,
+                cursor_attr="_decode_service_cursor",
+                prefer_short_prompts=False,
+                intra_class_rotate=True,
+                quotas=self.decode_service_class_quotas,
+            )
+        else:
+            request_ids = decodes[:decode_limit]
+            self._decode_rr_cursor = 0
+            self._decode_service_cursor = 0
+        (
+            request_ids,
+            effective_lora_limit,
+            fairness_gap,
+            relaxed,
+            tightened,
+        ) = self._shape_lora_batch(
+            scheduler=scheduler,
+            request_ids=request_ids,
+            baseline_counts=self._count_lora_adapters(scheduler, decodes),
+            max_lora_adapters=self.max_decode_lora_adapters_per_batch,
+            cursor_attr="_decode_lora_cursor",
+        )
+        (
+            request_ids,
+            effective_multimodal_lora_limit,
+            multimodal_lora_limit_triggered,
+            multimodal_lora_relaxed,
+            multimodal_lora_tightened,
+            multimodal_lora_relaxed_by_fairness,
+            multimodal_lora_tightened_by_locality,
+            multimodal_lora_max_fairness_gap,
+        ) = self._apply_multimodal_lora_request_limit(
+            scheduler=scheduler,
+            request_ids=request_ids,
+            max_multimodal_lora_requests=(
+                self.max_decode_multimodal_lora_requests_per_batch
+            ),
+            cursor_attr="_decode_multimodal_lora_cursor",
+            candidate_request_ids=decodes,
+        )
+        request_ids = self._apply_multimodal_request_limit(
+            scheduler=scheduler,
+            request_ids=request_ids,
+            max_multimodal_requests=self.max_decode_multimodal_requests_per_batch,
+            cursor_attr="_decode_multimodal_cursor",
+        )
+        if not request_ids:
+            return DecodePlanResult(
+                plan=None,
+                fairness_gap=fairness_gap,
+                effective_lora_adapter_limit=effective_lora_limit,
+                effective_multimodal_lora_request_limit=effective_multimodal_lora_limit,
+                multimodal_lora_limit_triggered=multimodal_lora_limit_triggered,
+                multimodal_lora_limit_relaxed=multimodal_lora_relaxed,
+                multimodal_lora_limit_tightened=multimodal_lora_tightened,
+                multimodal_lora_relaxed_by_fairness=multimodal_lora_relaxed_by_fairness,
+                multimodal_lora_tightened_by_locality=multimodal_lora_tightened_by_locality,
+                multimodal_lora_max_fairness_gap=multimodal_lora_max_fairness_gap,
+                lora_limit_relaxed=relaxed,
+                lora_limit_tightened=tightened,
+            )
+        use_fast_path = bool(no_prefills_selected and len(request_ids) == len(decodes))
+        return DecodePlanResult(
+            plan=DecodePlan(
+                request_ids=request_ids,
+                token_budget=decode_limit,
+                use_fast_path=use_fast_path,
+            ),
+            fairness_gap=fairness_gap,
+            effective_lora_adapter_limit=effective_lora_limit,
+            effective_multimodal_lora_request_limit=effective_multimodal_lora_limit,
+            multimodal_lora_limit_triggered=multimodal_lora_limit_triggered,
             multimodal_lora_limit_relaxed=multimodal_lora_relaxed,
             multimodal_lora_limit_tightened=multimodal_lora_tightened,
             multimodal_lora_relaxed_by_fairness=multimodal_lora_relaxed_by_fairness,
