@@ -34,10 +34,13 @@ and feature status, use the capability matrix as the source of truth.
 LLM / AsyncLLM / OpenAI API Server
   -> vllm/serving/config_builder.py
   -> vllm/engine/lite_engine.py
+  -> vllm/engine/async_driver.py          # background worker thread
   -> vllm/engine/step_scheduler.py
+     -> vllm/engine/planners/            # AdmissionPlanner / BudgetComputer
   -> vllm/engine/request_scheduler.py
   -> vllm/engine/prefill_executor.py + vllm/engine/decode_executor.py
   -> vllm/engine/sampling_driver.py
+     -> vllm/engine/sampling/            # PenaltyEncoder / Sampler
   -> vllm/engine/output_pipeline.py
 ```
 

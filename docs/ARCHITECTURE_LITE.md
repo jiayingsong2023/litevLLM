@@ -14,11 +14,13 @@ LLM / AsyncLLM / OpenAI API Server
   -> vllm/serving/config_builder.py  # model/config assembly
   -> vllm/engine/initialization/     # startup allocators and runtime assembly
   -> vllm/engine/lite_engine.py      # orchestration
+  -> vllm/engine/async_driver.py     # background worker thread for engine steps
   -> vllm/engine/step_scheduler.py   # step budget and batch selection
+     -> vllm/engine/planners/        # admission and budget computation
   -> vllm/engine/request_scheduler.py
   -> vllm/engine/prefill_executor.py
   -> vllm/engine/decode_executor.py
-  -> vllm/engine/sampling_driver.py
+  -> vllm/engine/sampling_driver.py  # delegates to vllm/engine/sampling/
   -> vllm/engine/output_pipeline.py
 ```
 
@@ -139,20 +141,31 @@ FastInference does not maintain the upstream vLLM worker/block-manager
 continuous batching runtime. The lite scheduler implements a smaller
 single-process model:
 
+- `AsyncDriver` runs `engine.step()` on a dedicated background worker thread so
+  that GPU/ROCm synchronization does not block the asyncio event loop. Results
+  are posted back to the event loop with `loop.call_soon_threadsafe`.
 - `RequestScheduler` owns running requests, queued requests, stream queues, and
-  fixed active slots.
+  fixed active slots. It uses set indexes and a deque free-slot pool for O(1)
+  membership checks and slot allocation; request iteration order is preserved.
 - `RequestState` is the canonical typed request state (slots dataclass) shared
-  across scheduler, executors, and output pipeline. Code that previously passed
-  the request as a `dict[str, Any]` is being migrated to attribute access on
-  `RequestState`.
-- `StepScheduler` builds one `StepPlan` per engine step. A plan may admit
-  queued requests, run chunked prefills, run decodes, or interleave prefill and
-  decode work within configured token and fairness limits.
+  across scheduler, executors, and output pipeline. Legacy `dict[str, Any]`
+  shims have been removed.
+- `StepScheduler` builds one `StepPlan` per engine step. Admission and budget
+  computation are delegated to `vllm/engine/planners/` (`AdmissionPlanner` and
+  `BudgetComputer`). Prefill/decode plan assembly still lives in
+  `StepScheduler` and may be split into a dedicated planner in a future change.
+  A plan may admit queued requests, run chunked prefills, run decodes, or
+  interleave prefill and decode work within configured token and fairness limits.
 - `StepPlan` carries only execution fields. Observer/debug counters live in
   `StepPlanMetrics` and are consumed by `RuntimeObserver`.
 - Single-request decode fast path bypasses adaptive prefill chunk scanning.
   Non-fast decode batches reuse `InputBatchBuilder` scratch tensors for
   `input_ids`, `positions`, `slot_mapping`, and `seq_lens`.
+- `SamplingDriver` is now a thin orchestrator: penalties, biases, and masks are
+  applied by `vllm/engine/sampling/penalty_encoder.py` (`PenaltyEncoder`), and
+  temperature/top-k/top-p/multinomial sampling is performed by
+  `vllm/engine/sampling/sampler.py` (`Sampler`). A `FASTINFERENCE_USE_LEGACY_SAMPLING`
+  opt-out is routed through `RuntimeConfig`.
 - `LiteSingleGPUBackend` executes the plan synchronously on one GPU and frees
   request slots when outputs finish.
 

@@ -26,10 +26,25 @@ targets.
 
 - Engine control plane is decomposed into scheduler, request lifecycle,
   prefill/decode executors, sampling, output assembly, observer, and errors.
+- `AsyncDriver` runs engine steps on a background worker thread so GPU
+  synchronization does not block the asyncio event loop.
+- `RequestState` dict-like shims were removed; it is now a strict dataclass and
+  the only request state representation used by `RequestScheduler` and the
+  engine.
+- `RequestScheduler` uses set indexes and a deque free-slot pool for O(1)
+  membership/slot operations while preserving admission order.
+- `StepScheduler` delegates admission and budget computation to focused
+  planners in `vllm/engine/planners/` (`AdmissionPlanner`, `BudgetComputer`).
 - `StepPlan` is reduced to execution fields; observer counters live in
   `StepPlanMetrics`.
 - Single-request decode fast path avoids adaptive chunk-size scans, and
   non-fast decode batch construction reuses builder-owned scratch tensors.
+- `SamplingDriver` is split into a thin orchestrator over
+  `vllm/engine/sampling/penalty_encoder.py` (`PenaltyEncoder`) and
+  `vllm/engine/sampling/sampler.py` (`Sampler`). Vectorized penalty/mask
+  application is used by default; structured-output constraints and non-uniform
+  context biases fall back to per-row processing. The legacy path is available
+  via `FASTINFERENCE_USE_LEGACY_SAMPLING` routed through `RuntimeConfig`.
 - Runtime policy flows through `FastInferenceConfig`, runtime profiles, and
   `RuntimeConfig`.
 - Model capability decisions are centralized under `vllm/adapters/`.
