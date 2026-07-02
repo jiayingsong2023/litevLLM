@@ -9,6 +9,12 @@ from vllm.engine.request_state import RequestState
 class Sampler:
     """Vectorized temperature / top-k / top-p / multinomial sampling."""
 
+    def __init__(self) -> None:
+        """Initialize the sampler.
+
+        The sampler is stateless and requires no configuration.
+        """
+
     def sample(
         self,
         logits: torch.Tensor,

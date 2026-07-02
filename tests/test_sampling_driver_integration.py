@@ -12,6 +12,8 @@ class FakeTokenizer:
 
 
 class NoOpOutputProcessor:
+    """Policies backend that performs no output processing."""
+
     def apply_context_bias(
         self,
         logits: torch.Tensor,
@@ -20,6 +22,7 @@ class NoOpOutputProcessor:
         bias_token_ids: list[int] | None,
         is_capital_question: bool,
     ) -> torch.Tensor:
+        """Return logits unchanged."""
         return logits
 
 
@@ -115,9 +118,7 @@ def test_vectorized_and_legacy_sampling_parity(monkeypatch) -> None:
     vectorized_tokens = vectorized_driver.sample_batch_tokens(
         logits.clone(), vectorized_requests
     )
-    legacy_tokens = legacy_driver.sample_batch_tokens(
-        logits.clone(), legacy_requests
-    )
+    legacy_tokens = legacy_driver.sample_batch_tokens(logits.clone(), legacy_requests)
 
     assert vectorized_tokens == legacy_tokens
 

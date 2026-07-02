@@ -14,6 +14,14 @@ class PenaltyEncoder:
     """Apply sampling penalties, biases and masks to a batch of logits."""
 
     def __init__(self, tokenizer: Any, hf_config: Any | None, policies: Any) -> None:
+        """Initialize the penalty encoder.
+
+        Args:
+            tokenizer: The tokenizer used to resolve EOS/stop token IDs.
+            hf_config: The model's Hugging Face config, if available.
+            policies: The generation policies backend that applies context bias
+                and structured-output constraints.
+        """
         self.tokenizer = tokenizer
         self.hf_config = hf_config
         self.policies = policies
