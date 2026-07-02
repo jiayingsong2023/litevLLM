@@ -14,6 +14,21 @@ class Sampler:
         logits: torch.Tensor,
         requests: list[RequestState],
     ) -> list[int]:
+        """Sample next tokens for a batch of requests.
+
+        Applies temperature scaling, top-k filtering, top-p (nucleus) filtering,
+        and multinomial sampling in a vectorized manner. Requests with
+        ``temperature <= 1e-6`` use greedy argmax sampling.
+
+        Args:
+            logits: A 1-D or 2-D tensor of shape ``(batch_size, vocab_size)``
+                containing raw logits for the current step.
+            requests: A list of :class:`RequestState` objects, one per batch
+                row, holding ``sampling_params`` and per-request RNG state.
+
+        Returns:
+            A list of integer token IDs, one for each request in the batch.
+        """
         if logits.ndim == 1:
             logits = logits.unsqueeze(0)
         device = logits.device
