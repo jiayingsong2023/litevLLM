@@ -42,6 +42,7 @@ class Sampler:
         """
         if logits.ndim == 1:
             logits = logits.unsqueeze(0)
+        original_logits = logits.clone()
         device = logits.device
         logits = logits.float()
         batch_size, vocab_size = logits.shape
@@ -102,7 +103,7 @@ class Sampler:
             row_probs = probs[i]
             psum = row_probs.sum()
             if not torch.isfinite(psum) or psum <= 0:
-                next_tokens.append(int(torch.argmax(logits[i]).item()))
+                next_tokens.append(int(torch.argmax(original_logits[i]).item()))
                 continue
             generator = req.rng
             if generator is not None:

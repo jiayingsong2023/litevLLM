@@ -23,7 +23,7 @@ class _NoOpTokenizer:
     eos_token_id: int | None = None
 
 
-def _legacy_driver() -> SamplingDriver:
+def _reference_driver() -> SamplingDriver:
     return SamplingDriver(
         tokenizer=_NoOpTokenizer(),
         hf_config=None,
@@ -72,7 +72,7 @@ def test_sampler_non_greedy_shape_and_properties() -> None:
     assert all(0 <= t < logits.shape[-1] for t in tokens)
 
 
-def test_sampler_non_greedy_matches_legacy() -> None:
+def test_sampler_non_greedy_matches_reference_driver() -> None:
     torch.manual_seed(42)
     batch_size = 4
     vocab_size = 20
@@ -80,22 +80,22 @@ def test_sampler_non_greedy_matches_legacy() -> None:
     sp = SamplingParams(temperature=0.7, top_k=5, top_p=0.9)
 
     requests_sampler: list[RequestState] = []
-    requests_legacy: list[RequestState] = []
+    requests_reference: list[RequestState] = []
     for i in range(batch_size):
         seed = 123 + i
         rng_sampler = torch.Generator(device=logits.device).manual_seed(seed)
-        rng_legacy = torch.Generator(device=logits.device).manual_seed(seed)
+        rng_reference = torch.Generator(device=logits.device).manual_seed(seed)
         requests_sampler.append(_request(f"r{i}", sp, rng=rng_sampler))
-        requests_legacy.append(_request(f"r{i}", sp, rng=rng_legacy))
+        requests_reference.append(_request(f"r{i}", sp, rng=rng_reference))
 
     sampler = Sampler()
     sampler_tokens = sampler.sample(logits.clone(), requests_sampler)
 
-    legacy_tokens = _legacy_driver().sample_batch_tokens(
-        logits.clone(), requests_legacy
+    reference_tokens = _reference_driver().sample_batch_tokens(
+        logits.clone(), requests_reference
     )
 
-    assert sampler_tokens == legacy_tokens
+    assert sampler_tokens == reference_tokens
 
 
 def test_sampler_mixed_greedy_non_greedy() -> None:
