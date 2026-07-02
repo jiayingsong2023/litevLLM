@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.engine.backend.lite_single_gpu import LiteSingleGpuBackend
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.decode_executor import DecodeExecutor
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
@@ -18,15 +19,16 @@ from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePol
 from vllm.engine.step_scheduler import StepScheduler
 
 if TYPE_CHECKING:
-    from vllm.engine.sampling_driver import SamplingDriver
-    from vllm.engine.output_pipeline import OutputPipeline
     from vllm.engine.lora_runtime import LoRARuntimeRegistry
+    from vllm.engine.output_pipeline import OutputPipeline
     from vllm.engine.request_scheduler import RequestScheduler
     from vllm.engine.runtime_observer import RuntimeObserver
+    from vllm.engine.sampling_driver import SamplingDriver
 
 
 @dataclass(frozen=True)
 class RuntimeAssemblyContext:
+    block_allocator: BlockAllocator
     kv_caches: list[torch.Tensor]
     kv_scale_caches: list[torch.Tensor]
     num_blocks_per_seq: int
@@ -56,11 +58,11 @@ class RuntimeAssemblyContext:
     max_active_requests: int
     scheduler_policy: SchedulerRuntimePolicy
     backend_policy: BackendRuntimePolicy
-    scheduler: "RequestScheduler"
-    observer: "RuntimeObserver"
-    lora_registry: "LoRARuntimeRegistry"
-    sampling_driver: "SamplingDriver"
-    output_pipeline: "OutputPipeline"
+    scheduler: RequestScheduler
+    observer: RuntimeObserver
+    lora_registry: LoRARuntimeRegistry
+    sampling_driver: SamplingDriver
+    output_pipeline: OutputPipeline
     queue_timeout_s: float
 
 
@@ -74,6 +76,8 @@ class LiteRuntimeFactory:
             kv_scale_caches=context.kv_scale_caches,
             num_blocks_per_seq=context.num_blocks_per_seq,
             block_size=context.block_size,
+            max_active_requests=context.max_active_requests,
+            block_allocator=context.block_allocator,
         )
         input_batch_builder = InputBatchBuilder(
             device=context.device,

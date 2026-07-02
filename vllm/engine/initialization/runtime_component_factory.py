@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
 
 
@@ -16,6 +17,7 @@ class LiteRuntimeAssembler:
     def assemble(
         cls,
         *,
+        block_allocator: BlockAllocator,
         kv_caches: list[torch.Tensor],
         kv_scale_caches: list[torch.Tensor],
         num_blocks_per_seq: int,
@@ -51,6 +53,7 @@ class LiteRuntimeAssembler:
         queue_timeout_s: float,
     ) -> dict[str, Any]:
         runtime_context = RuntimeAssemblyContext(
+            block_allocator=block_allocator,
             kv_caches=kv_caches,
             kv_scale_caches=kv_scale_caches,
             num_blocks_per_seq=num_blocks_per_seq,
