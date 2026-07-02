@@ -53,7 +53,7 @@ class InputBatchBuilder:
 
         for rid in request_ids:
             req = scheduler.get_request(rid)
-            slot_idx = req.slot_idx
+            slot_idx = int(req.slot_idx)
             all_input_ids = req.input_ids
             processed_len = req.seq_len
             prefix_hit_len = int(req.prefix_hit_len or req._prefix_cache_hit_len or 0)

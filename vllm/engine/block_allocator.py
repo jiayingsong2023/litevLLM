@@ -17,6 +17,7 @@ class BlockAllocator:
             raise ValueError("num_total_blocks must be positive")
         # Reserve ID 0; hand out IDs 1..N-1.
         self._free_ids: deque[int] = deque(range(1, self.num_total_blocks))
+        self._allocated_ids: set[int] = set()
 
     def allocate(self, n: int) -> list[int]:
         n = int(n)
@@ -26,13 +27,18 @@ class BlockAllocator:
             raise RuntimeError(
                 f"Cannot allocate {n} blocks; only {len(self._free_ids)} free"
             )
-        return [self._free_ids.popleft() for _ in range(n)]
+        ids = [self._free_ids.popleft() for _ in range(n)]
+        self._allocated_ids.update(ids)
+        return ids
 
     def free(self, block_ids: Iterable[int]) -> None:
         for bid in block_ids:
             bid = int(bid)
             if bid <= 0 or bid >= self.num_total_blocks:
                 raise ValueError(f"Invalid block id to free: {bid}")
+            if bid not in self._allocated_ids:
+                raise ValueError(f"Block id {bid} is not currently allocated")
+            self._allocated_ids.discard(bid)
             self._free_ids.append(bid)
 
     @property

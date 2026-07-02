@@ -41,8 +41,13 @@ class KVBlockManager:
         return len(self.kv_caches)
 
     def ensure_blocks(self, request_id: str, num_tokens: int) -> int:
-        """Allocate additional blocks if needed. Return newly allocated count."""
+        """Allocate additional blocks if needed. Return newly allocated count.
+
+        The number of blocks per request is capped to ``num_blocks_per_seq`` so
+        the block-table row in ``_block_table_buffer`` can always hold the IDs.
+        """
         needed = cdiv(int(num_tokens), self.block_size)
+        needed = min(needed, self.num_blocks_per_seq)
         current_blocks = self._request_blocks.get(request_id)
         current_len = len(current_blocks) if current_blocks is not None else 0
         if needed <= current_len:
@@ -86,12 +91,21 @@ class KVBlockManager:
             self._block_table_buffer[slot_idx].zero_()
             self._slot_request_id.pop(slot_idx, None)
 
+    def _check_slot_idx(self, slot_idx: int) -> None:
+        if slot_idx < 0 or slot_idx >= self._block_table_buffer.shape[0]:
+            raise IndexError(
+                f"slot_idx {slot_idx} out of range [0, "
+                f"{self._block_table_buffer.shape[0]})"
+            )
+
     def block_table_for_slot(self, slot_idx: int) -> torch.Tensor:
         """Return the device's block-table row for the given slot."""
+        self._check_slot_idx(slot_idx)
         return self._block_table_buffer[slot_idx]
 
     def update_block_table_row(self, slot_idx: int, request_id: str) -> None:
         """Copy request block IDs into the shared block-table buffer row."""
+        self._check_slot_idx(slot_idx)
         row = self._block_table_buffer[slot_idx]
         row.zero_()
 
@@ -160,6 +174,8 @@ class KVBlockManager:
         if prefix_len <= 0:
             return
         used_blocks = max(1, cdiv(prefix_len, self.block_size))
+        # ensure_blocks only grows the block table, so the destination blocks
+        # are guaranteed to exist and materialization never shrinks the table.
         self.ensure_blocks(request_id, prefix_len)
         dst_block_ids = self._request_blocks[request_id][:used_blocks]
 

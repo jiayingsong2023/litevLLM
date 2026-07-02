@@ -87,6 +87,9 @@ class LiteSingleGpuBackend:
         self.gpu_greedy_ignore_eos = bool(gpu_greedy_ignore_eos)
 
     def ensure_kv_blocks(self, step_plan: StepPlan) -> None:
+        # This runs before the step and only grows request block tables.
+        # Monotonic growth guarantees that prefix-cache materialization later
+        # in the step never shrinks a request's block table.
         request_ids: list[str] = []
         token_counts: list[int] = []
 
@@ -605,6 +608,9 @@ class LiteSingleGpuBackend:
         prefix_len = max(0, min(int(prefix_len), int(entry.prompt_len)))
         if prefix_len <= 0:
             return
+        # ensure_kv_blocks has already allocated at least prefix_len tokens,
+        # so materialization only writes KV data into existing blocks and never
+        # shrinks the request's block table.
         self.kv_block_manager.materialize_prefix_entry(
             request_id=request_state.request_id,
             entry=entry,

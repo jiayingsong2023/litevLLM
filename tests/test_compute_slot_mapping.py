@@ -46,3 +46,18 @@ def test_compute_slot_mapping_with_padding():
     expected = _cpu_reference(query_start_loc, positions, block_table, block_size, -1)
     assert torch.equal(slot_mapping[:3].cpu(), expected.cpu())
     assert slot_mapping[3].item() == -1
+
+
+def test_compute_slot_mapping_oob_block_idx():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    block_size = 16
+    # Only one block column available for the request.
+    block_table = torch.tensor([[1]], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 16], dtype=torch.long, device=device)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    slot_mapping = torch.empty(2, dtype=torch.long, device=device)
+    compute_slot_mapping(
+        query_start_loc, positions, block_table, block_size, slot_mapping, pad_id=-1
+    )
+    assert slot_mapping[0].item() == 1 * block_size + 0
+    assert slot_mapping[1].item() == -1

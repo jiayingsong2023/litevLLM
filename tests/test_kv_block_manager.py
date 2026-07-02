@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm.engine.block_allocator import BlockAllocator
@@ -59,6 +60,12 @@ def test_ensure_blocks_does_not_shrink() -> None:
     assert len(mgr._request_blocks["r0"]) == 3
     mgr.ensure_blocks("r0", 16)
     assert len(mgr._request_blocks["r0"]) == 3
+
+
+def test_ensure_blocks_caps_at_num_blocks_per_seq() -> None:
+    mgr = _make_manager(num_blocks_per_seq=2)
+    mgr.ensure_blocks("r0", 100)
+    assert len(mgr._request_blocks["r0"]) == 2
 
 
 def test_ensure_blocks_for_requests() -> None:
@@ -154,3 +161,28 @@ def test_prefix_capture_and_materialize() -> None:
 
     new_block_id = mgr._request_blocks["r1"][0]
     assert torch.isclose(k0[new_block_id, 0, 0, 0], torch.tensor(3.14))
+
+
+def test_freed_blocks_are_zeroed_on_reuse() -> None:
+    mgr = _make_manager(num_total_blocks=8)
+    mgr.ensure_blocks("r0", 16)
+    k0, _ = mgr.kv_caches[0]
+    block_id = mgr._request_blocks["r0"][0]
+    k0[block_id, 0, 0, 0] = 2.71
+
+    mgr.free_request_blocks("r0")
+    mgr.ensure_blocks("r1", 16)
+    reused_block_id = mgr._request_blocks["r1"][0]
+    # The allocator will likely hand out the same block; ensure it was zeroed.
+    assert k0[reused_block_id, 0, 0, 0].item() != 2.71
+    assert k0[reused_block_id, 0, 0, 0].item() == 0.0
+
+
+def test_slot_idx_bounds() -> None:
+    mgr = _make_manager()
+    with pytest.raises(IndexError):
+        mgr.block_table_for_slot(-1)
+    with pytest.raises(IndexError):
+        mgr.block_table_for_slot(4)
+    with pytest.raises(IndexError):
+        mgr.update_block_table_row(4, "r0")

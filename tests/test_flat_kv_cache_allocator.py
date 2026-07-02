@@ -73,5 +73,4 @@ def test_flat_allocator_per_layer_specs_and_scales():
     scale_storage_elems = (
         kv_scale_caches[0][0].untyped_storage().size() // torch.float32.itemsize
     )
-    assert scale_storage_elems <= expected_scale_elems
     assert scale_storage_elems == expected_scale_elems

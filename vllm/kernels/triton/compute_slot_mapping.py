@@ -30,6 +30,7 @@ def _compute_slot_mapping_kernel(
     num_reqs,
     block_size,
     max_num_reqs,
+    max_blocks_per_req,
     stride_bt_req,
     stride_bt_block,
     PAD_ID: tl.constexpr,
@@ -57,6 +58,10 @@ def _compute_slot_mapping_kernel(
 
     pos = tl.load(positions_ptr + token_idx).to(tl.int64)
     block_idx = pos // block_size
+    if block_idx >= max_blocks_per_req:
+        tl.store(slot_mapping_ptr + token_idx, PAD_ID)
+        return
+
     block_id = tl.load(
         block_table_ptr + req_idx * stride_bt_req + block_idx * stride_bt_block
     ).to(tl.int64)
@@ -90,6 +95,14 @@ def compute_slot_mapping(
     if positions.is_cpu:
         # Pure-PyTorch fallback for CPU testing. Triton kernels cannot access
         # host memory, so replicate the kernel logic with tensor ops.
+        assert positions.device == block_table.device, (
+            "compute_slot_mapping CPU fallback requires positions and block_table "
+            f"to be on the same device; got {positions.device} and {block_table.device}"
+        )
+        assert positions.device.type == "cpu", (
+            "compute_slot_mapping CPU fallback requires positions and block_table "
+            f"to be on CPU; got {positions.device}"
+        )
         token_indices = torch.arange(slot_mapping.shape[0], dtype=torch.int64)
         starts = query_start_loc[:-1].to(torch.int64)
         ends = query_start_loc[1:].to(torch.int64)
@@ -104,12 +117,13 @@ def compute_slot_mapping(
 
         pos_indices = torch.where(valid, token_indices, torch.zeros_like(token_indices))
         pos = positions[pos_indices]
-        block_idx = (pos // block_size).clamp_(0, block_table.shape[1] - 1)
+        block_idx = pos // block_size
+        in_table = valid & (block_idx < block_table.shape[1])
+        block_idx = block_idx.clamp_(0, block_table.shape[1] - 1)
         block_ids = block_table[req_indices, block_idx].to(torch.int64)
         slots = block_ids * block_size + (pos % block_size)
         pad_tensor = torch.full_like(slots, pad_id, dtype=torch.int64)
-        slots = torch.where(block_ids != 0, slots, pad_tensor)
-        slots = torch.where(valid, slots, pad_tensor)
+        slots = torch.where(in_table & (block_ids != 0), slots, pad_tensor)
         slot_mapping.copy_(slots)
         return
 
@@ -123,6 +137,7 @@ def compute_slot_mapping(
         num_reqs,
         block_size,
         block_table.shape[0],
+        block_table.shape[1],
         block_table.stride(0),
         block_table.stride(1),
         PAD_ID=pad_id,

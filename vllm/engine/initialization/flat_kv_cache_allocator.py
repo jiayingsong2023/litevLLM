@@ -9,7 +9,10 @@ from vllm.engine.initialization.kv_cache_allocator import (
 
 
 class FlatKVCacheAllocator:
-    """Allocates a single flat GPU buffer for all per-layer K/V caches."""
+    """Allocates a single flat GPU buffer for all per-layer K/V caches.
+
+    Block ID 0 is reserved as the zeroed null block and is never handed out.
+    """
 
     def __init__(
         self,

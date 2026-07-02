@@ -23,3 +23,20 @@ def test_allocate_and_free():
     assert ba.num_free == 2
     ids3 = ba.allocate(2)
     assert set(ids3) == set(ids1)
+
+
+def test_free_rejects_double_free():
+    ba = BlockAllocator(num_total_blocks=5)
+    ids = ba.allocate(2)
+    ba.free(ids)
+    with pytest.raises(ValueError, match="not currently allocated"):
+        ba.free(ids)
+
+
+def test_free_rejects_unallocated_and_reserved_ids():
+    ba = BlockAllocator(num_total_blocks=5)
+    ba.allocate(2)
+    with pytest.raises(ValueError, match="Invalid block id"):
+        ba.free([0])
+    with pytest.raises(ValueError, match="not currently allocated"):
+        ba.free([3])
