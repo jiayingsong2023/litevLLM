@@ -105,14 +105,15 @@ def test_vectorized_and_legacy_sampling_parity(monkeypatch) -> None:
             )
         )
 
-    monkeypatch.delenv("FASTINFERENCE_USE_LEGACY_SAMPLING", raising=False)
     vectorized_driver = SamplingDriver(
         FakeTokenizer(), None, GenerationPolicies(backend=NoOpOutputProcessor())
     )
 
-    monkeypatch.setenv("FASTINFERENCE_USE_LEGACY_SAMPLING", "1")
     legacy_driver = SamplingDriver(
-        FakeTokenizer(), None, GenerationPolicies(backend=NoOpOutputProcessor())
+        FakeTokenizer(),
+        None,
+        GenerationPolicies(backend=NoOpOutputProcessor()),
+        use_legacy=True,
     )
 
     vectorized_tokens = vectorized_driver.sample_batch_tokens(

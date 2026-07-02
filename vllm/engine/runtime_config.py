@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass, field
 
 from vllm.engine.fastinference_config import resolve_fastinference_config
@@ -67,6 +68,7 @@ class RuntimeConfig:
     paged_attn_num_warps_local: int | None = None
     paged_attn_num_stages_local: int | None = None
     gemma4_c1_preset: bool = False
+    use_legacy_sampling: bool = False
     tuning_env: dict[str, str] | None = None
     kv_select_ratio: float = 0.0
     kv_select_min_blocks: int = 4
@@ -94,6 +96,9 @@ class RuntimeConfig:
         )
         tuning_env = dict(fastinference_config.tuning_keyvals)
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
+        use_legacy_sampling = (
+            os.environ.get("FASTINFERENCE_USE_LEGACY_SAMPLING", "0") == "1"
+        )
         kv_cache_dtype = fastinference_config.kv_type.strip().lower()
         if kv_cache_dtype == "auto":
             kv_cache_dtype = profile.kv_cache_dtype
@@ -131,6 +136,7 @@ class RuntimeConfig:
             k_scale=profile.k_scale,
             v_scale=profile.v_scale,
             use_prompt_guard=profile.use_prompt_guard,
+            use_legacy_sampling=use_legacy_sampling,
             tuning_env=tuning_env,
             scheduler_policy=profile.scheduler_policy,
             backend_policy=profile.backend_policy,

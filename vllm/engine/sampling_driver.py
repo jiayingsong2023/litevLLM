@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 from collections import Counter
 from typing import Any
 
@@ -21,15 +20,20 @@ class SamplingDriver:
     processes rows individually and is kept for parity verification.
     """
 
-    def __init__(self, tokenizer: Any, hf_config: Any | None, policies: Any) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        hf_config: Any | None,
+        policies: Any,
+        *,
+        use_legacy: bool = False,
+    ) -> None:
         self.tokenizer = tokenizer
         self.hf_config = hf_config
         self.policies = policies
         self._penalty_encoder = PenaltyEncoder(tokenizer, hf_config, policies)
         self._sampler = Sampler()
-        self._use_legacy = (
-            os.environ.get("FASTINFERENCE_USE_LEGACY_SAMPLING", "0") == "1"
-        )
+        self._use_legacy = use_legacy
 
     def sample_next_token(
         self,

@@ -280,6 +280,7 @@ def test_production_engine_uses_config_not_public_runtime_env_controls() -> None
                     "FASTINFERENCE_DEBUG",
                     "FASTINFERENCE_KV_TYPE",
                     "FASTINFERENCE_LOG_LEVEL",
+                    "FASTINFERENCE_USE_LEGACY_SAMPLING",
                 }
             )
         unexpected = names - file_allowed
@@ -288,7 +289,9 @@ def test_production_engine_uses_config_not_public_runtime_env_controls() -> None
 
 def test_runtime_profile_has_config_resolver_for_production_path() -> None:
     profile = _read("vllm/engine/runtime_profile.py")
-    production_text = profile.split("    @classmethod\n    def resolve_from_env", maxsplit=1)[0]
+    production_text = profile.split(
+        "    @classmethod\n    def resolve_from_env", maxsplit=1
+    )[0]
 
     assert "resolve_from_config" in profile
     assert 'os.environ.get("FASTINFERENCE_PROFILE"' not in production_text
@@ -313,7 +316,7 @@ def test_lite_inference_config_has_no_env_factory() -> None:
 
     forbidden_patterns = (
         "def from_env",
-        "os.environ.get(\"FASTINFERENCE_",
+        'os.environ.get("FASTINFERENCE_',
         "os.environ.items()",
     )
     for pattern in forbidden_patterns:
@@ -329,8 +332,8 @@ def test_kv_attention_layers_do_not_read_fastinference_env_directly() -> None:
         "vllm/model_executor/layers/quantization/kv_cache.py",
     ]
     forbidden_patterns = (
-        "os.environ.get(\"FASTINFERENCE_",
-        "os.getenv(\"FASTINFERENCE_",
+        'os.environ.get("FASTINFERENCE_',
+        'os.getenv("FASTINFERENCE_',
         "FASTINFERENCE_KV_TYPE",
         "FASTINFERENCE_K_SCALE",
         "FASTINFERENCE_V_SCALE",
@@ -358,8 +361,7 @@ def test_awq_kernels_do_not_capture_fastinference_env_by_prefix() -> None:
         text = _read(rel)
         for pattern in forbidden_patterns:
             assert pattern not in text, (
-                f"{rel} must not capture arbitrary tuning env by prefix via "
-                f"{pattern!r}"
+                f"{rel} must not capture arbitrary tuning env by prefix via {pattern!r}"
             )
 
 
@@ -376,7 +378,9 @@ def test_production_runtime_has_no_direct_fastinference_env_reads() -> None:
         rel = str(path.relative_to(ROOT))
         if rel in ignored or "__pycache__" in rel:
             continue
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
             match = pattern.search(line)
             if match:
                 violations.append(f"{rel}:{lineno}:{match.group(1)}")

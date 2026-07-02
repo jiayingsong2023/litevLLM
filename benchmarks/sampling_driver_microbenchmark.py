@@ -31,6 +31,10 @@ class NoOpOutputProcessor:
         return logits
 
 
+# Honor the legacy-sampling opt-out when the benchmark is imported.
+_USE_LEGACY_SAMPLING = os.environ.get("FASTINFERENCE_USE_LEGACY_SAMPLING", "0") == "1"
+
+
 @dataclass
 class Config:
     batch_size: int
@@ -69,9 +73,16 @@ def make_requests(config: Config) -> list[RequestState]:
     return requests
 
 
-def bench(label: str, config: Config, warmup: int = 10, reps: int = 50) -> float:
+def bench(
+    label: str,
+    config: Config,
+    warmup: int = 10,
+    reps: int = 50,
+    *,
+    use_legacy: bool = False,
+) -> float:
     policies = GenerationPolicies(backend=NoOpOutputProcessor())
-    driver = SamplingDriver(FakeTokenizer(), None, policies)
+    driver = SamplingDriver(FakeTokenizer(), None, policies, use_legacy=use_legacy)
     requests = make_requests(config)
     for _ in range(warmup):
         logits = torch.randn(
@@ -98,26 +109,36 @@ def bench(label: str, config: Config, warmup: int = 10, reps: int = 50) -> float
 
 
 def main() -> None:
+    global _USE_LEGACY_SAMPLING
     for vocab_size in [32000, 151936]:
         print(f"\n--- vocab_size={vocab_size} ---")
         for bs in [1, 2, 4, 8, 16]:
+            _USE_LEGACY_SAMPLING = False
             vectorized = bench(
-                "penalties+sample", Config(bs, vocab_size, 0.7, 1.1, 0.1, 0.1)
+                "penalties+sample",
+                Config(bs, vocab_size, 0.7, 1.1, 0.1, 0.1),
+                use_legacy=_USE_LEGACY_SAMPLING,
             )
             if bs in (1, 8, 16):
-                os.environ["FASTINFERENCE_USE_LEGACY_SAMPLING"] = "1"
+                _USE_LEGACY_SAMPLING = True
                 legacy = bench(
                     "legacy penalties+sample",
                     Config(bs, vocab_size, 0.7, 1.1, 0.1, 0.1),
+                    use_legacy=_USE_LEGACY_SAMPLING,
                 )
-                os.environ["FASTINFERENCE_USE_LEGACY_SAMPLING"] = "0"
+                _USE_LEGACY_SAMPLING = False
                 ratio = legacy / vectorized if vectorized > 0 else float("inf")
                 print(
                     f"speedup             bs={bs:3d} "
                     f"vocab={vocab_size:6d} {ratio:6.2f}x"
                 )
         for bs in [1, 8, 16]:
-            bench("greedy", Config(bs, vocab_size, 0.0, 1.0, 0.0, 0.0))
+            _USE_LEGACY_SAMPLING = False
+            bench(
+                "greedy",
+                Config(bs, vocab_size, 0.0, 1.0, 0.0, 0.0),
+                use_legacy=_USE_LEGACY_SAMPLING,
+            )
 
 
 if __name__ == "__main__":

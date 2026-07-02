@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class EnvScope(str, Enum):
+class EnvScope(StrEnum):
     PUBLIC = "public"
     DEPRECATED = "deprecated"
     TOOL_ONLY = "tool_only"
@@ -599,6 +599,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     ),
     "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY": _tool_only(
         "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY"
+    ),
+    "FASTINFERENCE_USE_LEGACY_SAMPLING": _tool_only(
+        "FASTINFERENCE_USE_LEGACY_SAMPLING",
+        description="Temporary opt-out for the vectorized sampling rollout.",
     ),
     "FASTINFERENCE_VERIFY_GPU_MEM_UTIL": _tool_only(
         "FASTINFERENCE_VERIFY_GPU_MEM_UTIL"

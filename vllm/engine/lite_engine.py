@@ -690,6 +690,7 @@ class LiteEngine:
                 self.tokenizer,
                 getattr(self.model_config, "hf_config", None),
                 self.policies,
+                use_legacy=self.runtime_config.use_legacy_sampling,
             )
             self.output_pipeline = OutputPipeline(
                 self.tokenizer, self.policies, self.sampling_driver
