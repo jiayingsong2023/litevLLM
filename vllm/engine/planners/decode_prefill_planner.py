@@ -110,13 +110,16 @@ class DecodePrefillPlanner:
         self._multimodal_constraint = MultiModalConstraint()
         self._multimodal_lora_constraint = MultiModalLoRAConstraint()
 
-    def update_runtime_feedback(self, feedback: dict[str, Any]) -> None:
+    def update_runtime_feedback(self, feedback: dict[str, Any] | None) -> None:
         """Consume runtime feedback to adjust future planning decisions.
 
         Extracts the multimodal prefix cache hit rate from the observer
         feedback so that multimodal prefill limits can be relaxed or tightened
-        in subsequent steps.
+        in subsequent steps. ``None`` is treated as no feedback.
         """
+        if feedback is None:
+            self._multimodal_prefix_cache_hit_rate_feedback = 0.0
+            return
         self._multimodal_prefix_cache_hit_rate_feedback = float(
             feedback.get("observer", {})
             .get("multimodal", {})

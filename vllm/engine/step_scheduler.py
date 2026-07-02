@@ -7,7 +7,6 @@ from vllm.engine.scheduling_constraints import (
     LoRAConstraint,
     MultiModalConstraint,
     MultiModalLoRAConstraint,
-    ServiceClassSelector,
 )
 from vllm.engine.scheduling_helpers import (
     is_multimodal,
@@ -18,7 +17,6 @@ from vllm.engine.scheduling_helpers import (
     normalized_share_map,
     percentile,
     rotate_candidates,
-    service_class_priority,
     share_gap_map,
 )
 from vllm.engine.step_plan import (
@@ -259,7 +257,6 @@ class StepScheduler:
             prefill_microbatch_size=self.prefill_microbatch_size,
         )
 
-        self._service_class_selector = ServiceClassSelector()
         self._lora_constraint = LoRAConstraint()
         self._multimodal_constraint = MultiModalConstraint()
         self._multimodal_lora_constraint = MultiModalLoRAConstraint()
@@ -313,6 +310,7 @@ class StepScheduler:
         self.prefill_chunk_size = max(
             self.min_prefill_chunk_size, min(chunk_size, self.max_prefill_chunk_size)
         )
+        self._decode_prefill_planner.prefill_chunk_size = self.prefill_chunk_size
 
         fast_plan = self._build_single_request_fast_path(scheduler)
         if fast_plan is not None:
@@ -670,54 +668,6 @@ class StepScheduler:
     def _rotate_candidates(request_ids: list[str], cursor: int) -> list[str]:
         return rotate_candidates(request_ids, cursor)
 
-    def _count_multimodal_lora_adapters(
-        self,
-        scheduler,
-        request_ids: list[str],
-    ) -> dict[str, int]:
-        return self._multimodal_lora_constraint.count_multimodal_lora_adapters(
-            scheduler, request_ids
-        )
-
-    def _shape_lora_batch(
-        self,
-        *,
-        scheduler,
-        request_ids: list[str],
-        baseline_counts: dict[str, int],
-        max_lora_adapters: int,
-        cursor_attr: str,
-    ) -> tuple[list[str], int, dict[str, float], bool, bool]:
-        return self._lora_constraint.shape_lora_batch(
-            scheduler=scheduler,
-            step_scheduler=self,
-            request_ids=request_ids,
-            baseline_counts=baseline_counts,
-            max_lora_adapters=max_lora_adapters,
-            cursor_attr=cursor_attr,
-        )
-
-    def _lora_adapters_for_ids(
-        self,
-        scheduler,
-        request_ids: list[str],
-    ) -> list[str]:
-        return self._lora_constraint.lora_adapters_for_ids(scheduler, request_ids)
-
-    def _take_candidates(
-        self,
-        *,
-        candidates: list[str],
-        take: int,
-        intra_class_rotate: bool,
-    ) -> list[str]:
-        return self._service_class_selector._take_candidates(
-            step_scheduler=self,
-            candidates=candidates,
-            take=take,
-            intra_class_rotate=intra_class_rotate,
-        )
-
     def _compute_queued_metrics(
         self,
         scheduler,
@@ -889,10 +839,6 @@ class StepScheduler:
     @classmethod
     def _lora_adapter_key(cls, request) -> str:
         return lora_adapter_key(request, base_lora_adapter=cls.BASE_LORA_ADAPTER)
-
-    @staticmethod
-    def _service_class_priority(service_class: object) -> int:
-        return service_class_priority(service_class)
 
     def _update_prefill_deferrals(
         self,
