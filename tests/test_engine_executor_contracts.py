@@ -49,7 +49,6 @@ class _FakeBatchBuilder:
         fast_positions,
         fast_slot_mapping,
         fast_seq_lens,
-        fast_block_tables,
     ):
         assert request_ids == ["decode-1"]
         assert scheduler == "scheduler"
@@ -57,7 +56,6 @@ class _FakeBatchBuilder:
         assert fast_positions.tolist() == [0]
         assert fast_slot_mapping.tolist() == [0]
         assert fast_seq_lens.tolist() == [1]
-        assert fast_block_tables.tolist() == [[0]]
         return (
             torch.tensor([3], dtype=torch.long),
             torch.tensor([2], dtype=torch.long),
@@ -125,7 +123,6 @@ def test_decode_executor_fast_path_is_thin_model_call_wrapper() -> None:
         fast_positions=torch.tensor([0]),
         fast_slot_mapping=torch.tensor([0]),
         fast_seq_lens=torch.tensor([1]),
-        fast_block_tables=torch.tensor([[0]]),
     )
 
     logits, req_dicts = executor.execute_sync_fast(["decode-1"], "scheduler")
@@ -155,7 +152,6 @@ def test_decode_executor_batch_path_is_thin_model_call_wrapper() -> None:
         fast_positions=torch.tensor([0]),
         fast_slot_mapping=torch.tensor([0]),
         fast_seq_lens=torch.tensor([1]),
-        fast_block_tables=torch.tensor([[0]]),
     )
 
     logits, req_dicts = executor.execute_batch(["decode-2"], "scheduler")

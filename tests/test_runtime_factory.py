@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.runtime_config import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
 
 
 def test_lite_runtime_factory_builds_expected_components() -> None:
     context = RuntimeAssemblyContext(
+        block_allocator=BlockAllocator(num_total_blocks=8),
         kv_caches=[],
         kv_scale_caches=[],
         num_blocks_per_seq=2,
@@ -22,7 +24,6 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
         fast_positions=object(),
         fast_slot_mapping=object(),
         fast_seq_lens=object(),
-        fast_block_tables=object(),
         step_token_budget=16,
         decode_priority_enabled=True,
         prefill_chunk_size=8,

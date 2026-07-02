@@ -44,7 +44,6 @@ class RuntimeAssemblyContext:
     fast_positions: torch.Tensor
     fast_slot_mapping: torch.Tensor
     fast_seq_lens: torch.Tensor
-    fast_block_tables: torch.Tensor
     step_token_budget: int
     decode_priority_enabled: bool
     prefill_chunk_size: int
@@ -106,7 +105,6 @@ class LiteRuntimeFactory:
             fast_positions=context.fast_positions,
             fast_slot_mapping=context.fast_slot_mapping,
             fast_seq_lens=context.fast_seq_lens,
-            fast_block_tables=context.fast_block_tables,
         )
         from vllm.engine.step_scheduler import (
             LoraSchedulingParams,

@@ -17,7 +17,6 @@ class DecodeExecutor:
         fast_positions: torch.Tensor,
         fast_slot_mapping: torch.Tensor,
         fast_seq_lens: torch.Tensor,
-        fast_block_tables: torch.Tensor,
     ) -> None:
         self.model = model
         self.input_batch_builder = input_batch_builder
@@ -26,21 +25,21 @@ class DecodeExecutor:
         self._fast_positions = fast_positions
         self._fast_slot_mapping = fast_slot_mapping
         self._fast_seq_lens = fast_seq_lens
-        self._fast_block_tables = fast_block_tables
 
     def execute_sync_fast(
         self,
         request_ids: list[str],
         scheduler: Any,
     ) -> tuple[Any, list[dict[str, Any]]]:
-        input_ids, positions, attn_metadata, req_dicts = self.input_batch_builder.build_decode_fast(
-            request_ids,
-            scheduler,
-            fast_input_ids=self._fast_input_ids,
-            fast_positions=self._fast_positions,
-            fast_slot_mapping=self._fast_slot_mapping,
-            fast_seq_lens=self._fast_seq_lens,
-            fast_block_tables=self._fast_block_tables,
+        input_ids, positions, attn_metadata, req_dicts = (
+            self.input_batch_builder.build_decode_fast(
+                request_ids,
+                scheduler,
+                fast_input_ids=self._fast_input_ids,
+                fast_positions=self._fast_positions,
+                fast_slot_mapping=self._fast_slot_mapping,
+                fast_seq_lens=self._fast_seq_lens,
+            )
         )
         logits = self.model(
             input_ids,
@@ -57,8 +56,8 @@ class DecodeExecutor:
         request_ids: list[str],
         scheduler: Any,
     ) -> tuple[Any, list[dict[str, Any]]]:
-        curr_input, positions, attn_metadata, req_dicts = self.input_batch_builder.build_decode_batch(
-            request_ids, scheduler
+        curr_input, positions, attn_metadata, req_dicts = (
+            self.input_batch_builder.build_decode_batch(request_ids, scheduler)
         )
         logits = self.model(
             curr_input,

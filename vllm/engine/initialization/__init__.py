@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.initialization.flat_kv_cache_allocator import (
     FlatKVCacheAllocator,
 )
@@ -11,6 +12,7 @@ from vllm.engine.initialization.runtime_component_factory import (
 )
 
 __all__ = [
+    "BlockAllocator",
     "KVCacheAllocator",
     "FlatKVCacheAllocator",
     "MemoryAuditor",

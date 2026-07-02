@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.initialization import (
     KVCacheAllocator,
     LiteRuntimeAssembler,
@@ -261,6 +262,7 @@ def test_lite_runtimeAssembler_signature_compiles_context() -> None:
     ) as mock_build:
         mock_build.return_value = {"dummy": True}
         result = LiteRuntimeAssembler.assemble(
+            block_allocator=BlockAllocator(num_total_blocks=8),
             kv_caches=kv_caches,
             kv_scale_caches=kv_scale_caches,
             num_blocks_per_seq=4,
@@ -276,7 +278,6 @@ def test_lite_runtimeAssembler_signature_compiles_context() -> None:
             fast_positions=MagicMock(spec=torch.Tensor),
             fast_slot_mapping=MagicMock(spec=torch.Tensor),
             fast_seq_lens=MagicMock(spec=torch.Tensor),
-            fast_block_tables=MagicMock(spec=torch.Tensor),
             step_token_budget=16,
             decode_priority_enabled=False,
             prefill_chunk_size=128,

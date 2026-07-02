@@ -32,6 +32,7 @@ class InputBatchBuilder:
         self._decode_positions: torch.Tensor | None = None
         self._decode_slot_mapping: torch.Tensor | None = None
         self._decode_seq_lens: torch.Tensor | None = None
+        self._decode_block_tables: torch.Tensor | None = None
 
     def build_prefill(
         self,
@@ -275,6 +276,11 @@ class InputBatchBuilder:
         self._decode_seq_lens = torch.empty(
             (batch_size,), device=self.device, dtype=torch.int32
         )
+        self._decode_block_tables = torch.empty(
+            (batch_size, self.kv_block_manager.num_blocks_per_seq),
+            device=self.device,
+            dtype=torch.int32,
+        )
 
     def build_decode_fast(
         self,
@@ -285,14 +291,19 @@ class InputBatchBuilder:
         fast_positions: torch.Tensor,
         fast_slot_mapping: torch.Tensor,
         fast_seq_lens: torch.Tensor,
-        fast_block_tables: torch.Tensor,
+        fast_block_tables: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], list[RequestState]]:
         bs = len(request_ids)
         input_ids = fast_input_ids[:bs]
         positions = fast_positions[:bs]
         slot_mapping = fast_slot_mapping[:bs]
         seq_lens = fast_seq_lens[:bs]
-        block_tables = fast_block_tables[:bs]
+        if fast_block_tables is not None:
+            block_tables = fast_block_tables[:bs]
+        else:
+            self._ensure_decode_scratch(bs)
+            assert self._decode_block_tables is not None
+            block_tables = self._decode_block_tables[:bs]
 
         req_dicts = []
         # CPU-side scalars built during the same loop that writes device tensors,

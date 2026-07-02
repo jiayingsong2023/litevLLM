@@ -10,7 +10,8 @@ from vllm.config import VllmConfig
 from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
 from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.initialization import (
-    KVCacheAllocator,
+    BlockAllocator,
+    FlatKVCacheAllocator,
     LiteRuntimeAssembler,
     MemoryAuditor,
 )
@@ -252,13 +253,13 @@ class LiteEngine:
             f"~{kv_theory_bytes / (1024**3):.3f} GiB theoretical)"
         )
         mem_before_kv = int(torch.cuda.memory_allocated(self.device))
-        allocator = KVCacheAllocator(
+        allocator = FlatKVCacheAllocator(
             num_layers=self.num_layers,
             num_total_blocks=self.num_total_blocks,
             block_size=self.block_size,
             device=self.device,
         )
-        self.kv_caches, self.kv_scale_caches = allocator.allocate(
+        self.kv_caches, self.kv_scale_caches, _ = allocator.allocate(
             layer_kv_specs=self._layer_kv_specs,
             kv_dtype=self.kv_dtype,
             kv_head_dim=self.kv_head_dim,
@@ -266,6 +267,7 @@ class LiteEngine:
             fallback_kv_head_dim=self.kv_head_dim,
             needs_scale_cache=kv_plan.needs_scale_cache,
         )
+        block_allocator = BlockAllocator(num_total_blocks=self.num_total_blocks)
         print(">>>> LiteEngine: KV Cache allocated successfully.")
         mem_after_kv = int(torch.cuda.memory_allocated(self.device))
         auditor = MemoryAuditor(device=self.device)
@@ -306,22 +308,9 @@ class LiteEngine:
         self._fast_seq_lens = torch.empty(
             (self.max_active_requests,), dtype=torch.int32, device=self.device
         )
-        self._fast_block_tables = torch.empty(
-            (self.max_active_requests, self.num_blocks_per_seq),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
-        # Static block tables (only depends on slot_idx)
-        for s in range(self.max_active_requests):
-            start_block = s * self.num_blocks_per_seq
-            self._fast_block_tables[s] = torch.arange(
-                start_block,
-                start_block + self.num_blocks_per_seq,
-                dtype=torch.int32,
-                device=self.device,
-            )
         runtime_components = LiteRuntimeAssembler.assemble(
+            block_allocator=block_allocator,
             kv_caches=self.kv_caches,
             kv_scale_caches=self.kv_scale_caches,
             num_blocks_per_seq=self.num_blocks_per_seq,
@@ -337,7 +326,6 @@ class LiteEngine:
             fast_positions=self._fast_positions,
             fast_slot_mapping=self._fast_slot_mapping,
             fast_seq_lens=self._fast_seq_lens,
-            fast_block_tables=self._fast_block_tables,
             step_token_budget=self._step_token_budget,
             decode_priority_enabled=self._decode_priority_enabled,
             prefill_chunk_size=self._prefill_chunk_size,
