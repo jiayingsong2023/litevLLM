@@ -36,7 +36,7 @@ LLM / AsyncLLM / OpenAI API Server
   -> vllm/engine/lite_engine.py
   -> vllm/engine/async_driver.py          # background worker thread
   -> vllm/engine/step_scheduler.py
-     -> vllm/engine/planners/            # AdmissionPlanner / BudgetComputer
+     -> vllm/engine/planners/            # AdmissionPlanner / BudgetComputer / DecodePrefillPlanner
   -> vllm/engine/request_scheduler.py
   -> vllm/engine/prefill_executor.py + vllm/engine/decode_executor.py
   -> vllm/engine/sampling_driver.py

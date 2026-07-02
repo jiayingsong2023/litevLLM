@@ -43,7 +43,7 @@
 - **分层执行架构**: `LiteEngine` 负责 orchestration，`AsyncDriver` 在后台工作线程执行 `engine.step()` 以避免 GPU sync 阻塞事件循环，`StepScheduler` 做 step 级调度并委托 admission/budget 给 `vllm/engine/planners/`，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` 委托 penalty/mask 和 sampling 给 `vllm/engine/sampling/`，`OutputPipeline` 做输出拼装。
 - **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，policy keys 有 `TypedDict` 类型约束。DeepSeek V4 Flash 的 direct runtime 由 adapter 安装，generic engine 不再包含 DeepSeek 模型名分支。
 - **RequestState / RequestScheduler 清债**: `RequestState` 移除 dict-like shim，成为严格 dataclass；`RequestScheduler` 仅接受 `RequestState`，使用 set 索引和 deque 空闲 slot 池优化，同时保留请求 admission 顺序。
-- **StepScheduler 薄片拆分**: admission 与 budget 逻辑已拆出 `AdmissionPlanner` 和 `BudgetComputer`；prefill/decode plan 组装仍保留在 `StepScheduler` 内，可作为下一个垂直薄片继续拆分。
+- **StepScheduler 薄片拆分**: admission、budget 与 prefill/decode plan 组装已分别拆出 `AdmissionPlanner`、`BudgetComputer` 和 `DecodePrefillPlanner`，`StepScheduler` 仅保留 step 级编排与委托调用。
 - **SamplingDriver 向量化**: penalty（repetition / frequency / presence）、EOS mask、anti-template mask 改为 batch 级 PyTorch 操作；结构化输出约束与特殊 context bias 仍走逐行 fallback。
 - **瘦身 StepPlan**: `StepPlan` 只承载执行字段；observer/debug 统计字段放在 `StepPlanMetrics`，由 runtime observer 消费。
 - **decode 热路径优化**: 单请求 decode fast path 跳过自适应 chunk 扫描；普通 decode batch 复用 `InputBatchBuilder` 内部 scratch tensors，减少每步 tensor 构造。
@@ -60,7 +60,7 @@ LLM / AsyncLLM / OpenAI API Server
   -> LiteEngine
   -> async_driver.py          # 后台工作线程执行 engine.step
   -> step_scheduler.py
-     -> planners/             # AdmissionPlanner / BudgetComputer
+     -> planners/             # AdmissionPlanner / BudgetComputer / DecodePrefillPlanner
   -> request_scheduler.py
   -> prefill_executor.py / decode_executor.py
   -> sampling_driver.py

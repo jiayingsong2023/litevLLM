@@ -150,12 +150,12 @@ single-process model:
 - `RequestState` is the canonical typed request state (slots dataclass) shared
   across scheduler, executors, and output pipeline. Legacy `dict[str, Any]`
   shims have been removed.
-- `StepScheduler` builds one `StepPlan` per engine step. Admission and budget
-  computation are delegated to `vllm/engine/planners/` (`AdmissionPlanner` and
-  `BudgetComputer`). Prefill/decode plan assembly still lives in
-  `StepScheduler` and may be split into a dedicated planner in a future change.
-  A plan may admit queued requests, run chunked prefills, run decodes, or
-  interleave prefill and decode work within configured token and fairness limits.
+- `StepScheduler` builds one `StepPlan` per engine step. Admission, budget, and
+  prefill/decode plan assembly are delegated to focused planners in
+  `vllm/engine/planners/`: `AdmissionPlanner`, `BudgetComputer`, and
+  `DecodePrefillPlanner`. A plan may admit queued requests, run chunked prefills,
+  run decodes, or interleave prefill and decode work within configured token and
+  fairness limits.
 - `StepPlan` carries only execution fields. Observer/debug counters live in
   `StepPlanMetrics` and are consumed by `RuntimeObserver`.
 - Single-request decode fast path bypasses adaptive prefill chunk scanning.

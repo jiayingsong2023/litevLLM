@@ -33,8 +33,9 @@ targets.
   engine.
 - `RequestScheduler` uses set indexes and a deque free-slot pool for O(1)
   membership/slot operations while preserving admission order.
-- `StepScheduler` delegates admission and budget computation to focused
-  planners in `vllm/engine/planners/` (`AdmissionPlanner`, `BudgetComputer`).
+- `StepScheduler` delegates admission, budget, and prefill/decode plan assembly
+  to focused planners in `vllm/engine/planners/` (`AdmissionPlanner`,
+  `BudgetComputer`, `DecodePrefillPlanner`).
 - `StepPlan` is reduced to execution fields; observer counters live in
   `StepPlanMetrics`.
 - Single-request decode fast path avoids adaptive chunk-size scans, and
