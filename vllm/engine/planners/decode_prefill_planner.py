@@ -43,6 +43,12 @@ class DecodePrefillPlanner:
         prefill_chunk_size: int,
         prefill_microbatch_size: int,
     ) -> None:
+        """Initialize the planner with scheduling limits and cursor state.
+
+        Stores the configuration parameters used to shape prefill and decode
+        batches, initializes round-robin cursors, and creates the constraint
+        helpers for service classes, LoRA adapters, and multimodal requests.
+        """
         self.service_class_weights = service_class_weights
         self.decode_service_class_quotas = decode_service_class_quotas
         self.max_prefill_lora_adapters_per_batch = max_prefill_lora_adapters_per_batch
@@ -105,6 +111,12 @@ class DecodePrefillPlanner:
         self._multimodal_lora_constraint = MultiModalLoRAConstraint()
 
     def update_runtime_feedback(self, feedback: dict[str, Any]) -> None:
+        """Consume runtime feedback to adjust future planning decisions.
+
+        Extracts the multimodal prefix cache hit rate from the observer
+        feedback so that multimodal prefill limits can be relaxed or tightened
+        in subsequent steps.
+        """
         self._multimodal_prefix_cache_hit_rate_feedback = float(
             feedback.get("observer", {})
             .get("multimodal", {})
@@ -179,6 +191,23 @@ class DecodePrefillPlanner:
         prefills: list[str],
         token_budget: int,
     ) -> PrefillPlanResult:
+        """Assemble a prefill plan for the next engine step.
+
+        Selects prefill candidates that share the same processed sequence length,
+        rotates them by the round-robin cursor, applies multimodal and LoRA
+        constraints, and computes a per-request chunk length bounded by the
+        token budget and ``prefill_chunk_size``.
+
+        Args:
+            scheduler: The request scheduler holding request states.
+            prefills: Ordered list of request IDs waiting for prefill.
+            token_budget: Total tokens available for prefill this step.
+
+        Returns:
+            A ``PrefillPlanResult`` containing the plan (or ``None`` when no
+            requests can be scheduled) and metadata about effective limits and
+            fairness/relaxation state.
+        """
         if not prefills or token_budget <= 0:
             return PrefillPlanResult(
                 plan=None,
