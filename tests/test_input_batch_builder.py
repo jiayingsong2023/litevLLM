@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.request_scheduler import RequestScheduler
@@ -24,6 +25,21 @@ def _split(stacked, req_dicts: list[RequestState], key: str):
         for i, r in enumerate(req_dicts):
             carry = getattr(r, key)
             carry[li] = None if t is None else t[i : i + 1].contiguous()
+
+
+def _make_kv_block_manager(
+    *, num_blocks_per_seq: int = 2, block_size: int = 2, max_active_requests: int = 1
+) -> KVBlockManager:
+    return KVBlockManager(
+        kv_caches=[],
+        kv_scale_caches=[],
+        num_blocks_per_seq=num_blocks_per_seq,
+        block_size=block_size,
+        max_active_requests=max_active_requests,
+        block_allocator=BlockAllocator(
+            num_total_blocks=max(2, num_blocks_per_seq * max_active_requests + 1)
+        ),
+    )
 
 
 def _scheduler_with_request() -> RequestScheduler:
@@ -49,13 +65,13 @@ def _scheduler_with_request() -> RequestScheduler:
 
 def test_input_batch_builder_build_prefill() -> None:
     scheduler = _scheduler_with_request()
+    kv_block_manager = _make_kv_block_manager()
+    kv_block_manager.ensure_blocks("r1", 3)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -67,8 +83,8 @@ def test_input_batch_builder_build_prefill() -> None:
     )
     assert curr_input.tolist() == [[12, 13]]
     assert positions.tolist() == [[1, 2]]
-    assert attn_metadata["slot_mapping"].tolist() == [1, 2]
-    assert attn_metadata["block_tables"].tolist() == [[0, 1]]
+    assert attn_metadata["slot_mapping"].tolist() == [3, 4]
+    assert attn_metadata["block_tables"].tolist() == [[1, 2]]
     assert attn_metadata["seq_lens"].tolist() == [3]
     assert attn_metadata["lora_mapping"] == [None]
     assert attn_metadata["lora_adapter_count"] == 0
@@ -80,13 +96,12 @@ def test_input_batch_builder_build_prefill() -> None:
 def test_input_batch_builder_rejects_zero_token_prefill() -> None:
     scheduler = _scheduler_with_request()
     scheduler.get_request("r1").seq_len = 4
+    kv_block_manager = _make_kv_block_manager()
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -103,13 +118,13 @@ def test_input_batch_builder_build_decode_batch() -> None:
     req.is_prefill = False
     req.generated_ids = [42]
     req.seq_len = 3
+    kv_block_manager = _make_kv_block_manager()
+    kv_block_manager.ensure_blocks("r1", 4)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -121,8 +136,8 @@ def test_input_batch_builder_build_decode_batch() -> None:
     )
     assert curr_input.tolist() == [[42]]
     assert positions.tolist() == [[3]]
-    assert attn_metadata["slot_mapping"].tolist() == [3]
-    assert attn_metadata["block_tables"].tolist() == [[0, 1]]
+    assert attn_metadata["slot_mapping"].tolist() == [5]
+    assert attn_metadata["block_tables"].tolist() == [[1, 2]]
     assert attn_metadata["seq_lens"].tolist() == [4]
     assert attn_metadata["lora_mapping"] == [None]
     assert attn_metadata["lora_adapter_count"] == 0
@@ -136,13 +151,13 @@ def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     req.is_prefill = False
     req.generated_ids = [42]
     req.seq_len = 3
+    kv_block_manager = _make_kv_block_manager(num_blocks_per_seq=4)
+    kv_block_manager.ensure_blocks("r1", 5)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -171,7 +186,7 @@ def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     ) == ptrs
     assert curr_input2.tolist() == [[43]]
     assert positions2.tolist() == [[4]]
-    assert attn_metadata2["slot_mapping"].tolist() == [4]
+    assert attn_metadata2["slot_mapping"].tolist() == [6]
     assert attn_metadata2["seq_lens"].tolist() == [5]
 
 
@@ -209,13 +224,14 @@ def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
             sampling_params=SamplingParams(),
         ),
     )
+    kv_block_manager = _make_kv_block_manager(max_active_requests=2)
+    kv_block_manager.ensure_blocks("r1", 4)
+    kv_block_manager.ensure_blocks("r2", 4)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -268,13 +284,14 @@ def test_input_batch_builder_tracks_multimodal_lora_prefill_contract() -> None:
             sampling_params=SamplingParams(),
         ),
     )
+    kv_block_manager = _make_kv_block_manager(max_active_requests=2)
+    kv_block_manager.ensure_blocks("r1", 3)
+    kv_block_manager.ensure_blocks("r2", 3)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),

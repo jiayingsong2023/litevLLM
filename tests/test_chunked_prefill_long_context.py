@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.planners.budget_computer import BudgetComputer
@@ -137,13 +138,20 @@ def test_prefix_cache_chunked_prefill() -> None:
     def dummy_split(stacked, req_dicts, key: str):
         pass
 
+    kv_block_manager = KVBlockManager(
+        kv_caches=[],
+        kv_scale_caches=[],
+        num_blocks_per_seq=2,
+        block_size=2,
+        max_active_requests=1,
+        block_allocator=BlockAllocator(4),
+    )
+    kv_block_manager.ensure_blocks("r1", 3)
     builder = InputBatchBuilder(
         device=torch.device("cpu"),
         max_model_len=8,
         num_layers=1,
-        kv_block_manager=KVBlockManager(
-            kv_caches=[], kv_scale_caches=[], num_blocks_per_seq=2, block_size=2
-        ),
+        kv_block_manager=kv_block_manager,
         inf_config=type(
             "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
         )(),
@@ -155,7 +163,7 @@ def test_prefix_cache_chunked_prefill() -> None:
     )
     assert curr_input.tolist() == [[30]]
     assert positions.tolist() == [[2]]
-    assert attn_metadata["slot_mapping"].tolist() == [2]
+    assert attn_metadata["slot_mapping"].tolist() == [4]
     assert attn_metadata["kv_start_indices"].tolist() == [2]
     assert last_flags == [False]
 

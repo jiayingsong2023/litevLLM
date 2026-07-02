@@ -86,6 +86,33 @@ def compute_slot_mapping(
             f"positions ({positions.shape[0]})"
         )
     num_reqs = query_start_loc.shape[0] - 1
+
+    if positions.is_cpu:
+        # Pure-PyTorch fallback for CPU testing. Triton kernels cannot access
+        # host memory, so replicate the kernel logic with tensor ops.
+        token_indices = torch.arange(slot_mapping.shape[0], dtype=torch.int64)
+        starts = query_start_loc[:-1].to(torch.int64)
+        ends = query_start_loc[1:].to(torch.int64)
+        req_indices = torch.searchsorted(ends, token_indices, right=True).clamp_(
+            0, num_reqs - 1
+        )
+        valid = (
+            (token_indices >= starts[req_indices])
+            & (token_indices < ends[req_indices])
+            & (token_indices < num_tokens)
+        )
+
+        pos_indices = torch.where(valid, token_indices, torch.zeros_like(token_indices))
+        pos = positions[pos_indices]
+        block_idx = (pos // block_size).clamp_(0, block_table.shape[1] - 1)
+        block_ids = block_table[req_indices, block_idx].to(torch.int64)
+        slots = block_ids * block_size + (pos % block_size)
+        pad_tensor = torch.full_like(slots, pad_id, dtype=torch.int64)
+        slots = torch.where(block_ids != 0, slots, pad_tensor)
+        slots = torch.where(valid, slots, pad_tensor)
+        slot_mapping.copy_(slots)
+        return
+
     grid = (slot_mapping.shape[0],)
     _compute_slot_mapping_kernel[grid](
         query_start_loc,

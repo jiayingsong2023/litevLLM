@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from vllm.engine.request_state import RequestState
+from vllm.kernels.triton.compute_slot_mapping import compute_slot_mapping
 
 
 class InputBatchBuilder:
@@ -42,8 +43,8 @@ class InputBatchBuilder:
     ]:
         curr_input_rows = []
         position_rows = []
-        slot_mapping_rows = []
         block_tables = []
+        chunk_lengths = []
         seq_lens_prefill = []
         kv_start_indices = []
         req_dicts_prefill = [scheduler.get_request(rid) for rid in request_ids]
@@ -78,24 +79,31 @@ class InputBatchBuilder:
                     dtype=torch.long,
                 )
             )
-            slot_mapping_rows.append(
-                int(slot_idx) * self.max_model_len
-                + torch.arange(
-                    start_pos,
-                    start_pos + actual_chunk_len,
-                    device=self.device,
-                    dtype=torch.long,
-                )
-            )
-            block_tables.append(
-                self.kv_block_manager.block_table_for_slot(slot_idx, device=self.device)
-            )
+            chunk_lengths.append(actual_chunk_len)
+            self.kv_block_manager.update_block_table_row(slot_idx, rid)
+            block_tables.append(self.kv_block_manager.block_table_for_slot(slot_idx))
             seq_lens_prefill.append(start_pos + actual_chunk_len)
             kv_start_indices.append(start_pos)
 
         curr_input = torch.tensor(curr_input_rows, device=self.device)
         positions = torch.stack(position_rows, dim=0).to(self.device)
-        slot_mapping = torch.cat(slot_mapping_rows, dim=0).to(self.device)
+        total_tokens = sum(chunk_lengths)
+        query_start_loc = torch.zeros(
+            len(chunk_lengths) + 1, device=self.device, dtype=torch.int32
+        )
+        query_start_loc[1:] = torch.cumsum(
+            torch.tensor(chunk_lengths, device=self.device, dtype=torch.int32), dim=0
+        )
+        slot_mapping = torch.empty(total_tokens, device=self.device, dtype=torch.long)
+        block_tables_t = torch.stack(block_tables, dim=0).to(self.device)
+        compute_slot_mapping(
+            query_start_loc,
+            positions.view(-1),
+            block_tables_t,
+            self.kv_block_manager.block_size,
+            slot_mapping,
+            pad_id=-1,
+        )
         attn_carry_prefill = self._stack_per_layer_carries(
             req_dicts_prefill, self.num_layers, "linear_attn_carry"
         )
@@ -125,7 +133,7 @@ class InputBatchBuilder:
                 kv_start_indices, device=self.device, dtype=torch.int32
             ),
             "kv_start_indices_cpu": kv_start_cpu_list,
-            "block_tables": torch.stack(block_tables).to(self.device),
+            "block_tables": block_tables_t,
             "linear_attn_carry": attn_carry_prefill,
             "linear_conv_carry": conv_carry_prefill,
             "kv_scale_cache": self.kv_block_manager.kv_scale_caches,
@@ -185,18 +193,27 @@ class InputBatchBuilder:
             slot_idx = int(req.slot_idx)
             curr_input[i, 0] = last_token
             positions[i, 0] = current_len
-            slot_mapping[i] = slot_idx * self.max_model_len + current_len
             seq_lens_t[i] = current_len + 1
-            slot_indices.append(req.slot_idx)
+            slot_indices.append(slot_idx)
             seq_lens_cpu_list.append(current_len + 1)
             positions_cpu_list.append(current_len)
+            self.kv_block_manager.update_block_table_row(slot_idx, rid)
 
         block_tables = torch.stack(
             [
-                self.kv_block_manager.block_table_for_slot(slot_idx, device=self.device)
+                self.kv_block_manager.block_table_for_slot(slot_idx)
                 for slot_idx in slot_indices
             ]
         ).to(self.device)
+        query_start_loc = torch.arange(bs + 1, device=self.device, dtype=torch.int32)
+        compute_slot_mapping(
+            query_start_loc,
+            positions.view(-1),
+            block_tables,
+            self.kv_block_manager.block_size,
+            slot_mapping,
+            pad_id=-1,
+        )
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
         )
@@ -275,6 +292,7 @@ class InputBatchBuilder:
         positions = fast_positions[:bs]
         slot_mapping = fast_slot_mapping[:bs]
         seq_lens = fast_seq_lens[:bs]
+        block_tables = fast_block_tables[:bs]
 
         req_dicts = []
         # CPU-side scalars built during the same loop that writes device tensors,
@@ -282,10 +300,12 @@ class InputBatchBuilder:
         # hipMemcpyWithStream / `.item()` syncs on the decode hot path.
         seq_lens_cpu_list: list[int] = []
         positions_cpu_list: list[int] = []
+        slot_indices = []
         for i, rid in enumerate(request_ids):
             req = scheduler.get_request(rid)
             req_dicts.append(req)
             prev_seq_len = int(req.seq_len)
+            slot_idx = int(req.slot_idx)
             last_token_tensor = req._last_token_tensor
             if isinstance(last_token_tensor, torch.Tensor):
                 input_ids[i, 0].copy_(last_token_tensor.reshape(()))
@@ -293,15 +313,28 @@ class InputBatchBuilder:
                 last_token = req.generated_ids[-1]
                 input_ids[i, 0] = last_token
             positions[i, 0] = prev_seq_len
-            slot_mapping[i] = req.slot_idx * self.max_model_len + prev_seq_len
             seq_lens[i] = prev_seq_len + 1
             positions_cpu_list.append(prev_seq_len)
             seq_lens_cpu_list.append(prev_seq_len + 1)
+            slot_indices.append(slot_idx)
+            self.kv_block_manager.update_block_table_row(slot_idx, rid)
+
+        # Copy the dynamic block-table rows from KVBlockManager into the
+        # caller-provided fast buffer so the model reuses the pre-allocated
+        # device tensor instead of allocating a new one each decode step.
+        for i, slot_idx in enumerate(slot_indices):
+            block_tables[i].copy_(self.kv_block_manager.block_table_for_slot(slot_idx))
+        query_start_loc = torch.arange(bs + 1, device=self.device, dtype=torch.int32)
+        compute_slot_mapping(
+            query_start_loc,
+            positions.view(-1),
+            block_tables,
+            self.kv_block_manager.block_size,
+            slot_mapping,
+            pad_id=-1,
+        )
         lora_mapping = [req.lora_id for req in req_dicts]
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
-
-        slots_t = torch.tensor([req.slot_idx for req in req_dicts], device=self.device)
-        block_tables = fast_block_tables.index_select(0, slots_t)
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
         )
