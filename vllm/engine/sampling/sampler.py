@@ -28,6 +28,11 @@ class Sampler:
 
         Returns:
             A list of integer token IDs, one for each request in the batch.
+
+        Note:
+            The input ``logits`` tensor may be mutated in-place (e.g., during
+            temperature scaling and scatter-back from top-p/top-k filtering).
+            Callers should pass a clone if they need to retain the original.
         """
         if logits.ndim == 1:
             logits = logits.unsqueeze(0)

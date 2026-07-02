@@ -13,7 +13,15 @@ from vllm.engine.sampling.utils import eos_stop_token_ids_for_sampling
 
 
 class SamplingDriver:
-    def __init__(self, tokenizer: Any, hf_config: Any | None, policies: Any):
+    """High-level sampling coordinator for the lite engine.
+
+    Prepares logits via :class:`PenaltyEncoder` and delegates sampling to
+    :class:`Sampler`. The default path vectorizes penalties and sampling across
+    a batch; the legacy path (enabled via ``FASTINFERENCE_USE_LEGACY_SAMPLING=1``)
+    processes rows individually and is kept for parity verification.
+    """
+
+    def __init__(self, tokenizer: Any, hf_config: Any | None, policies: Any) -> None:
         self.tokenizer = tokenizer
         self.hf_config = hf_config
         self.policies = policies
