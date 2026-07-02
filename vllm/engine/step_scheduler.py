@@ -369,23 +369,17 @@ class StepScheduler:
         effective_prefill_multimodal_limit = (
             prefill_result.effective_multimodal_request_limit
         )
-        effective_prefill_lora_limit = (
-            prefill_result.effective_lora_adapter_limit
-        )
+        effective_prefill_lora_limit = prefill_result.effective_lora_adapter_limit
         effective_prefill_multimodal_lora_limit = (
             prefill_result.effective_multimodal_lora_request_limit
         )
-        prefill_multimodal_limit_triggered = (
-            prefill_result.multimodal_limit_triggered
-        )
+        prefill_multimodal_limit_triggered = prefill_result.multimodal_limit_triggered
         prefill_multimodal_lora_limit_triggered = (
             prefill_result.multimodal_lora_limit_triggered
         )
         prefill_multimodal_relaxed = prefill_result.multimodal_limit_relaxed
         prefill_multimodal_tightened = prefill_result.multimodal_limit_tightened
-        prefill_multimodal_lora_relaxed = (
-            prefill_result.multimodal_lora_limit_relaxed
-        )
+        prefill_multimodal_lora_relaxed = prefill_result.multimodal_lora_limit_relaxed
         prefill_multimodal_lora_tightened = (
             prefill_result.multimodal_lora_limit_tightened
         )
@@ -415,21 +409,15 @@ class StepScheduler:
         )
         decode_plan = decode_result.plan
         decode_lora_gap = decode_result.fairness_gap
-        effective_decode_lora_limit = (
-            decode_result.effective_lora_adapter_limit
-        )
+        effective_decode_lora_limit = decode_result.effective_lora_adapter_limit
         effective_decode_multimodal_lora_limit = (
             decode_result.effective_multimodal_lora_request_limit
         )
         decode_multimodal_lora_limit_triggered = (
             decode_result.multimodal_lora_limit_triggered
         )
-        decode_multimodal_lora_relaxed = (
-            decode_result.multimodal_lora_limit_relaxed
-        )
-        decode_multimodal_lora_tightened = (
-            decode_result.multimodal_lora_limit_tightened
-        )
+        decode_multimodal_lora_relaxed = decode_result.multimodal_lora_limit_relaxed
+        decode_multimodal_lora_tightened = decode_result.multimodal_lora_limit_tightened
         decode_multimodal_lora_relaxed_by_fairness = (
             decode_result.multimodal_lora_relaxed_by_fairness
         )
