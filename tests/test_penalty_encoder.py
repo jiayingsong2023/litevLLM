@@ -162,3 +162,26 @@ def test_mixed_batch_with_fallback_rows() -> None:
 
     logits = torch.randn(4, vocab_size)
     _assert_parity(encoder, logits, requests)
+
+
+def test_vectorized_matches_per_row_out_of_range_generated_ids() -> None:
+    encoder = _make_driver()
+    vocab_size = 128
+    requests = []
+    for i in range(4):
+        sp = SamplingParams(
+            temperature=0.7,
+            repetition_penalty=1.1,
+            frequency_penalty=0.1,
+            presence_penalty=0.2,
+        )
+        req = RequestState(
+            request_id=f"oor{i}",
+            prompt="",
+            input_ids=[1, 2, 3],
+            sampling_params=sp,
+            generated_ids=[-10, -1, 10, 20, 30, 127, 128, 200],
+        )
+        requests.append(req)
+    logits = torch.randn(4, vocab_size)
+    _assert_parity(encoder, logits, requests)

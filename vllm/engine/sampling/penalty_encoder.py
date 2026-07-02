@@ -117,6 +117,12 @@ class PenaltyEncoder:
                 fallback.add(i)
         return fallback
 
+    def _valid_generated_ids(
+        self, generated_ids: list[Any], vocab_size: int
+    ) -> list[int]:
+        """Return generated token IDs clamped to the valid vocabulary range."""
+        return [int(t) for t in generated_ids if 0 <= int(t) < vocab_size]
+
     def _apply_vectorized_penalties(
         self,
         logits: torch.Tensor,
@@ -130,7 +136,8 @@ class PenaltyEncoder:
 
         # --- repetition penalty (multiplicative) ---
         unique_lists = [
-            list(set(int(t) for t in requests[i].generated_ids)) for i in rows
+            list(set(self._valid_generated_ids(requests[i].generated_ids, vocab_size)))
+            for i in rows
         ]
         max_len = max((len(u) for u in unique_lists), default=0)
         if max_len:
@@ -176,7 +183,9 @@ class PenaltyEncoder:
         freq_counts = []
         max_freq = 0
         for i in rows:
-            counts = Counter(int(t) for t in requests[i].generated_ids)
+            counts = Counter(
+                self._valid_generated_ids(requests[i].generated_ids, vocab_size)
+            )
             tids = list(counts.keys())
             cnts = [counts[t] for t in tids]
             freq_lists.append(tids)
@@ -216,7 +225,8 @@ class PenaltyEncoder:
 
         # Presence
         pres_lists = [
-            list(set(int(t) for t in requests[i].generated_ids)) for i in rows
+            list(set(self._valid_generated_ids(requests[i].generated_ids, vocab_size)))
+            for i in rows
         ]
         max_pres = max((len(u) for u in pres_lists), default=0)
         if max_pres:
