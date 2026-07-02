@@ -245,5 +245,3 @@ class SamplingDriver:
             next_tokens.append(token)
 
         return next_tokens
-
-
