@@ -2648,29 +2648,14 @@ def _write_compressed_runtime_row(
     indexer_row: torch.Tensor | None,
 ) -> None:
     cache = state.compressed_kv_cache
-    slot = cache._compressed_counts_cpu[layer_idx]
-    if slot >= cache.compressed_rows.shape[1]:
-        raise ValueError("compressed cache capacity exceeded")
-    if compressed_row.shape != (cache.hidden_size,):
-        raise ValueError(
-            f"compressed row shape must be ({cache.hidden_size},); "
-            f"got {tuple(compressed_row.shape)}"
-        )
-    cache.compressed_rows[layer_idx, slot].copy_(
-        compressed_row.to(cache.compressed_rows.dtype)
+    cache.append_compressed(
+        layer_idx,
+        token_idx,
+        compressed_row.to(cache.compressed_rows.dtype),
+        indexer_row=(
+            None if indexer_row is None else indexer_row.to(cache.indexer_rows.dtype)
+        ),
     )
-    cache.compressed_token_indices[layer_idx, slot] = token_idx
-    if indexer_row is not None:
-        if indexer_row.shape != (cache.indexer_rows.shape[-1],):
-            raise ValueError(
-                "indexer row shape must match runtime indexer width; "
-                f"got {tuple(indexer_row.shape)} and {cache.indexer_rows.shape[-1]}"
-            )
-        cache.indexer_rows[layer_idx, slot].copy_(
-            indexer_row.to(cache.indexer_rows.dtype)
-        )
-    cache._compressed_counts[layer_idx] += 1
-    cache._compressed_counts_cpu[layer_idx] += 1
 
 
 def _run_sliding_moe(
