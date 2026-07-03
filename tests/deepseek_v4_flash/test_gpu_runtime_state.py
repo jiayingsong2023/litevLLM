@@ -49,7 +49,8 @@ def test_gpu_request_state_constructs_cuda_request_local_caches() -> None:
         state.compressed_kv_cache.compressed_rows.shape[-1]
         == DEEPSEEK_V4_FLASH_SHAPE.head_dim
     )
-    assert state.page_allocator is not None
+    assert state.kv_cache is state.raw_kv_cache
+    assert state.request_id
 
 
 def test_gpu_request_state_advances_capacity_checks_and_resets() -> None:

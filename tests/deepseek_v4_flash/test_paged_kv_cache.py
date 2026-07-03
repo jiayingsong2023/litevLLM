@@ -13,6 +13,9 @@ from vllm.model_executor.models.deepseek_v4_flash.gpu_runtime import (
     DeepSeekV4FlashGPUCacheConfig,
     DeepSeekV4FlashGPURequestState,
 )
+from vllm.model_executor.models.deepseek_v4_flash.model import (
+    DeepSeekV4FlashForCausalLM,
+)
 
 
 def test_paged_cache_lazily_allocates_backing_chunks_by_family() -> None:
@@ -114,7 +117,6 @@ def test_paged_cache_free_reuses_zeroed_blocks_without_releasing_chunks() -> Non
     torch.testing.assert_close(values, torch.zeros(1, 4))
 
 
-
 def test_runtime_write_helper_uses_paged_cache_api() -> None:
     state = DeepSeekV4FlashGPURequestState(
         DeepSeekV4FlashGPUCacheConfig(
@@ -148,3 +150,79 @@ def test_runtime_write_helper_uses_paged_cache_api() -> None:
         cache.indexer_rows[2, 0, :3],
         torch.tensor([0.0, 1.0, 2.0]),
     )
+
+
+def test_paged_cache_reuses_freed_blocks_across_request_views() -> None:
+    pool = DeepSeekV4PagedKVCache(
+        context_length=256,
+        hidden_size=4,
+        num_layers=4,
+        blocks_per_chunk=1,
+    )
+    first = pool.bind_request("first")
+    second = pool.bind_request("second")
+
+    first.append_raw(layer_idx=0, token_idx=0, key=torch.ones(4), value=torch.ones(4))
+    assert pool.num_allocated_chunks("raw") == 1
+
+    first.free_request_blocks()
+    second.append_raw(
+        layer_idx=0,
+        token_idx=0,
+        key=torch.zeros(4),
+        value=torch.zeros(4),
+    )
+    keys, values = second.read_raw_window(layer_idx=0, token_idx=0, window=1)
+
+    assert pool.num_allocated_chunks("raw") == 1
+    torch.testing.assert_close(keys, torch.zeros(1, 4))
+    torch.testing.assert_close(values, torch.zeros(1, 4))
+
+
+def test_request_state_can_share_model_level_paged_cache() -> None:
+    pool = DeepSeekV4PagedKVCache(
+        context_length=256,
+        hidden_size=4,
+        num_layers=DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+        blocks_per_chunk=1,
+    )
+    config = DeepSeekV4FlashGPUCacheConfig(
+        context_length=256,
+        hidden_size=DEEPSEEK_V4_FLASH_SHAPE.hidden_size,
+        kv_width=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    first = DeepSeekV4FlashGPURequestState(config, kv_cache=pool, request_id="first")
+    second = DeepSeekV4FlashGPURequestState(config, kv_cache=pool, request_id="second")
+
+    first.raw_kv_cache.append_raw(
+        layer_idx=0,
+        token_idx=0,
+        key=torch.ones(4),
+        value=torch.ones(4),
+    )
+    first.reset()
+    second.raw_kv_cache.append_raw(
+        layer_idx=0,
+        token_idx=0,
+        key=torch.zeros(4),
+        value=torch.zeros(4),
+    )
+
+    assert first.kv_cache is first.raw_kv_cache
+    assert second.kv_cache is second.compressed_kv_cache
+    assert pool.num_allocated_chunks("raw") == 1
+
+
+def test_model_creates_request_states_from_one_paged_pool() -> None:
+    model = DeepSeekV4FlashForCausalLM()
+
+    first = model._new_gpu_request_state(context_length=256, device=torch.device("cpu"))
+    second = model._new_gpu_request_state(
+        context_length=256,
+        device=torch.device("cpu"),
+    )
+
+    assert first.kv_cache._pool is second.kv_cache._pool
+    assert first.request_id != second.request_id

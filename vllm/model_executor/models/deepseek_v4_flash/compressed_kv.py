@@ -320,6 +320,17 @@ class DeepSeekV4CompressedKVCache:
             )
 
 
+_DEFAULT_REQUEST_ID = "__default__"
+
+
+@dataclass
+class _PagedRequestState:
+    raw_token_indices: torch.Tensor
+    compressed_token_indices: torch.Tensor
+    compressed_counts: torch.Tensor
+    compressed_counts_cpu: list[int]
+
+
 class _LazyPagedRows:
     def __init__(
         self,
@@ -351,17 +362,17 @@ class _LazyPagedRows:
             raise ValueError("blocks_per_chunk must be positive")
         self._num_total_blocks = self.num_layers * self.num_blocks_per_layer + 1
         self._allocator = BlockAllocator(self._num_total_blocks)
-        self._layer_blocks: list[list[int]] = [[] for _ in range(self.num_layers)]
+        self._request_blocks: dict[str, list[list[int]]] = {}
         self._chunks: dict[int, tuple[torch.Tensor, ...]] = {}
 
     def num_allocated_chunks(self) -> int:
         return len(self._chunks)
 
-    def ensure(self, layer_idx: int, logical_units: int) -> None:
+    def ensure(self, request_id: str, layer_idx: int, logical_units: int) -> None:
         needed = min(
             cdiv(int(logical_units), self.block_size), self.num_blocks_per_layer
         )
-        blocks = self._layer_blocks[layer_idx]
+        blocks = self._blocks_for(request_id)[layer_idx]
         if needed <= len(blocks):
             return
         new_ids = self._allocator.allocate(needed - len(blocks))
@@ -371,45 +382,93 @@ class _LazyPagedRows:
             for tensor in chunk:
                 tensor[block_offset].zero_()
 
-    def free_all(self) -> None:
-        # ponytail: request-local cache; reset allocator for prompt block reuse.
-        self._allocator = BlockAllocator(self._num_total_blocks)
-        self._layer_blocks = [[] for _ in range(self.num_layers)]
+    def free_request(self, request_id: str) -> None:
+        layer_blocks = self._request_blocks.pop(request_id, None)
+        if layer_blocks is None:
+            return
+        block_ids = [block_id for blocks in layer_blocks for block_id in blocks]
+        if block_ids:
+            self._allocator.free(block_ids)
 
     def write(
-        self, layer_idx: int, logical_idx: int, rows: tuple[torch.Tensor, ...]
+        self,
+        request_id: str,
+        layer_idx: int,
+        logical_idx: int,
+        rows: tuple[torch.Tensor, ...],
     ) -> None:
         if len(rows) != self.tensors_per_row:
             raise ValueError(f"{self.name} expects {self.tensors_per_row} row tensors")
-        self.ensure(layer_idx, logical_idx + 1)
-        block_id, row_offset = self._resolve(layer_idx, logical_idx)
+        self.ensure(request_id, layer_idx, logical_idx + 1)
+        block_id, row_offset = self._resolve(request_id, layer_idx, logical_idx)
         chunk, block_offset = self._block_storage(block_id)
         for tensor, row in zip(chunk, rows):
             tensor[block_offset, row_offset].copy_(row)
 
     def read(
-        self, layer_idx: int, logical_indices: torch.Tensor
+        self,
+        request_id: str,
+        layer_idx: int,
+        logical_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         if logical_indices.numel() == 0:
             empty = torch.empty(
                 (0, *self.row_shape), dtype=self.dtype, device=self.device
             )
             return tuple(empty.clone() for _ in range(self.tensors_per_row))
-        outputs: list[list[torch.Tensor]] = [[] for _ in range(self.tensors_per_row)]
-        for logical_idx in logical_indices.detach().cpu().to(torch.long).tolist():
-            block_id, row_offset = self._resolve(layer_idx, int(logical_idx))
-            chunk, block_offset = self._block_storage(block_id)
-            for rows, tensor in zip(outputs, chunk):
-                rows.append(tensor[block_offset, row_offset])
-        return tuple(torch.stack(rows, dim=0) for rows in outputs)
 
-    def _resolve(self, layer_idx: int, logical_idx: int) -> tuple[int, int]:
-        block_pos = int(logical_idx) // self.block_size
-        if block_pos >= len(self._layer_blocks[layer_idx]):
+        logical_indices = logical_indices.to(device=self.device, dtype=torch.long)
+        block_positions = logical_indices // self.block_size
+        row_offsets = logical_indices % self.block_size
+        blocks = self._blocks_for(request_id)[layer_idx]
+        if int(block_positions.max().item()) >= len(blocks):
             raise ValueError(f"{self.name} row index out of range")
-        return self._layer_blocks[layer_idx][block_pos], int(
-            logical_idx
-        ) % self.block_size
+        block_ids = torch.tensor(blocks, dtype=torch.long, device=self.device)[
+            block_positions
+        ]
+        chunk_ids = block_ids // self.blocks_per_chunk
+        block_offsets = block_ids % self.blocks_per_chunk
+        flat_offsets = block_offsets * self.block_size + row_offsets
+
+        results = [
+            torch.empty(
+                (logical_indices.numel(), *self.row_shape),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            for _ in range(self.tensors_per_row)
+        ]
+        for chunk_id_tensor in torch.unique(chunk_ids).detach().cpu().tolist():
+            chunk_id = int(chunk_id_tensor)
+            mask = chunk_ids == chunk_id
+            out_positions = torch.nonzero(mask, as_tuple=False).flatten()
+            chunk = self._chunks.get(chunk_id)
+            if chunk is None:
+                raise ValueError(f"{self.name} backing chunk {chunk_id} is missing")
+            selected_offsets = flat_offsets[out_positions]
+            for result, tensor in zip(results, chunk):
+                flat = tensor.view(
+                    self.blocks_per_chunk * self.block_size,
+                    *self.row_shape,
+                )
+                result[out_positions] = flat.index_select(0, selected_offsets)
+        return tuple(results)
+
+    def _blocks_for(self, request_id: str) -> list[list[int]]:
+        blocks = self._request_blocks.get(request_id)
+        if blocks is None:
+            blocks = [[] for _ in range(self.num_layers)]
+            self._request_blocks[request_id] = blocks
+        return blocks
+
+    def _resolve(
+        self, request_id: str, layer_idx: int, logical_idx: int
+    ) -> tuple[int, int]:
+        block_pos = int(logical_idx) // self.block_size
+        blocks = self._blocks_for(request_id)[layer_idx]
+        if block_pos >= len(blocks):
+            raise ValueError(f"{self.name} row index out of range")
+        return blocks[block_pos], int(logical_idx) % self.block_size
 
     def _block_storage(self, block_id: int) -> tuple[tuple[torch.Tensor, ...], int]:
         chunk_id = int(block_id) // self.blocks_per_chunk
@@ -430,11 +489,13 @@ class _PagedFamilyView:
         self,
         *,
         cache: DeepSeekV4PagedKVCache,
+        request_id: str,
         family: str,
         row_width: int,
         max_rows: int,
     ) -> None:
         self._cache = cache
+        self._request_id = request_id
         self._family = family
         self._row_width = int(row_width)
         self._max_rows = int(max_rows)
@@ -460,25 +521,164 @@ class _PagedFamilyView:
             raise IndexError(f"{self._family} view expects layer and row indices")
         layer_idx = int(key[0])
         row_idx = int(key[1])
+        row_indices = torch.tensor([row_idx], device=self.device)
         if self._family == "compressed":
             row = self._cache.read_compressed(
                 layer_idx=layer_idx,
-                row_indices=torch.tensor([row_idx], device=self.device),
+                row_indices=row_indices,
+                request_id=self._request_id,
             )[0]
         else:
             row = self._cache._families["indexer"].read(
+                self._request_id,
                 layer_idx,
-                torch.tensor([row_idx], device=self.device),
+                row_indices,
             )[0][0]
         return row if len(key) == 2 else row[key[2:]]
 
 
-class DeepSeekV4PagedKVCache:
-    """DeepSeek-local lazy-grow paged KV cache.
+class DeepSeekV4PagedKVRequestCache:
+    def __init__(self, pool: DeepSeekV4PagedKVCache, request_id: str) -> None:
+        self._pool = pool
+        self.request_id = request_id
+        self.compressed_rows = _PagedFamilyView(
+            cache=pool,
+            request_id=request_id,
+            family="compressed",
+            row_width=pool.hidden_size,
+            max_rows=pool.max_compressed_rows,
+        )
+        self.indexer_rows = _PagedFamilyView(
+            cache=pool,
+            request_id=request_id,
+            family="indexer",
+            row_width=DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
+            max_rows=pool.max_compressed_rows,
+        )
 
-    Request blocks are returned on reset/free; backing chunks stay allocated for
-    reuse to avoid GPU allocator churn.
-    """
+    @property
+    def context_length(self) -> int:
+        return self._pool.context_length
+
+    @property
+    def hidden_size(self) -> int:
+        return self._pool.hidden_size
+
+    @property
+    def raw_window(self) -> int:
+        return self._pool.raw_window
+
+    @property
+    def num_layers(self) -> int:
+        return self._pool.num_layers
+
+    @property
+    def raw_keys(self) -> torch.Tensor:
+        return self._pool.raw_keys
+
+    @property
+    def raw_values(self) -> torch.Tensor:
+        return self._pool.raw_values
+
+    @property
+    def raw_token_indices(self) -> torch.Tensor:
+        return self._pool._state_for(self.request_id).raw_token_indices
+
+    @property
+    def compressed_token_indices(self) -> torch.Tensor:
+        return self._pool._state_for(self.request_id).compressed_token_indices
+
+    @property
+    def _compressed_counts(self) -> torch.Tensor:
+        return self._pool._state_for(self.request_id).compressed_counts
+
+    @property
+    def _compressed_counts_cpu(self) -> list[int]:
+        return self._pool._state_for(self.request_id).compressed_counts_cpu
+
+    @_compressed_counts_cpu.setter
+    def _compressed_counts_cpu(self, value: list[int]) -> None:
+        self._pool._state_for(self.request_id).compressed_counts_cpu = value
+
+    def append_raw(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        self._pool.append_raw(
+            layer_idx,
+            token_idx,
+            key,
+            value,
+            request_id=self.request_id,
+        )
+
+    def read_raw_window(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        window: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.read_raw_window(
+            layer_idx,
+            token_idx,
+            window,
+            request_id=self.request_id,
+        )
+
+    def append_compressed(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        row: torch.Tensor,
+        *,
+        indexer_row: torch.Tensor | None = None,
+    ) -> int:
+        return self._pool.append_compressed(
+            layer_idx,
+            token_idx,
+            row,
+            indexer_row=indexer_row,
+            request_id=self.request_id,
+        )
+
+    def read_compressed(
+        self,
+        layer_idx: int,
+        *,
+        row_indices: torch.Tensor | None = None,
+        count: int | None = None,
+    ) -> torch.Tensor:
+        return self._pool.read_compressed(
+            layer_idx,
+            row_indices=row_indices,
+            count=count,
+            request_id=self.request_id,
+        )
+
+    def read_indexer_rows(
+        self,
+        layer_idx: int,
+        *,
+        count: int | None = None,
+    ) -> torch.Tensor:
+        return self._pool.read_indexer_rows(
+            layer_idx,
+            count=count,
+            request_id=self.request_id,
+        )
+
+    def free_request_blocks(self) -> None:
+        self._pool.free_request_blocks(self.request_id)
+
+    def num_allocated_chunks(self, family: str) -> int:
+        return self._pool.num_allocated_chunks(family)
+
+
+class DeepSeekV4PagedKVCache:
+    """Model-level lazy-grow paged KV pool for DeepSeek request views."""
 
     def __init__(
         self,
@@ -507,31 +707,24 @@ class DeepSeekV4PagedKVCache:
         self.hidden_size = int(hidden_size)
         self.raw_window = int(raw_window)
         self.num_layers = int(num_layers)
+        self.max_compressed_rows = context_length // 4 + 2
         self.raw_keys = torch.empty((0, hidden_size), dtype=dtype, device=device)
         self.raw_values = torch.empty_like(self.raw_keys)
-        max_compressed_rows = context_length // 4 + 2
+        self._request_states: dict[str, _PagedRequestState] = {}
         self.compressed_rows = _PagedFamilyView(
             cache=self,
+            request_id=_DEFAULT_REQUEST_ID,
             family="compressed",
             row_width=hidden_size,
-            max_rows=max_compressed_rows,
+            max_rows=self.max_compressed_rows,
         )
         self.indexer_rows = _PagedFamilyView(
             cache=self,
+            request_id=_DEFAULT_REQUEST_ID,
             family="indexer",
             row_width=DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
-            max_rows=max_compressed_rows,
+            max_rows=self.max_compressed_rows,
         )
-        self.raw_token_indices = torch.full(
-            (num_layers, raw_window), -1, dtype=torch.long, device=device
-        )
-        self.compressed_token_indices = torch.full(
-            (num_layers, max_compressed_rows), -1, dtype=torch.long, device=device
-        )
-        self._compressed_counts = torch.zeros(
-            (num_layers,), dtype=torch.long, device=device
-        )
-        self._compressed_counts_cpu: list[int] = [0] * num_layers
         self._families = {
             "raw": _LazyPagedRows(
                 name="raw",
@@ -547,7 +740,7 @@ class DeepSeekV4PagedKVCache:
             "compressed": _LazyPagedRows(
                 name="compressed",
                 num_layers=num_layers,
-                num_blocks_per_layer=cdiv(max_compressed_rows, block_size),
+                num_blocks_per_layer=cdiv(self.max_compressed_rows, block_size),
                 block_size=block_size,
                 blocks_per_chunk=blocks_per_chunk,
                 row_shape=(hidden_size,),
@@ -558,7 +751,7 @@ class DeepSeekV4PagedKVCache:
             "indexer": _LazyPagedRows(
                 name="indexer",
                 num_layers=num_layers,
-                num_blocks_per_layer=cdiv(max_compressed_rows, block_size),
+                num_blocks_per_layer=cdiv(self.max_compressed_rows, block_size),
                 block_size=block_size,
                 blocks_per_chunk=blocks_per_chunk,
                 row_shape=(DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,),
@@ -568,34 +761,68 @@ class DeepSeekV4PagedKVCache:
             ),
         }
 
+    @property
+    def raw_token_indices(self) -> torch.Tensor:
+        return self._state_for(_DEFAULT_REQUEST_ID).raw_token_indices
+
+    @property
+    def compressed_token_indices(self) -> torch.Tensor:
+        return self._state_for(_DEFAULT_REQUEST_ID).compressed_token_indices
+
+    @property
+    def _compressed_counts(self) -> torch.Tensor:
+        return self._state_for(_DEFAULT_REQUEST_ID).compressed_counts
+
+    @property
+    def _compressed_counts_cpu(self) -> list[int]:
+        return self._state_for(_DEFAULT_REQUEST_ID).compressed_counts_cpu
+
+    @_compressed_counts_cpu.setter
+    def _compressed_counts_cpu(self, value: list[int]) -> None:
+        self._state_for(_DEFAULT_REQUEST_ID).compressed_counts_cpu = value
+
+    def bind_request(self, request_id: str) -> DeepSeekV4PagedKVRequestCache:
+        return DeepSeekV4PagedKVRequestCache(self, request_id)
+
     def num_allocated_chunks(self, family: str) -> int:
         return self._families[family].num_allocated_chunks()
 
-    def free_request_blocks(self) -> None:
+    def free_request_blocks(self, request_id: str = _DEFAULT_REQUEST_ID) -> None:
         for family in self._families.values():
-            family.free_all()
-        self.raw_token_indices.fill_(-1)
-        self.compressed_token_indices.fill_(-1)
-        self._compressed_counts.zero_()
-        self._compressed_counts_cpu = [0] * self.num_layers
+            family.free_request(request_id)
+        state = self._request_states.pop(request_id, None)
+        if state is not None:
+            state.raw_token_indices.fill_(-1)
+            state.compressed_token_indices.fill_(-1)
+            state.compressed_counts.zero_()
+            state.compressed_counts_cpu = [0] * self.num_layers
 
     def append_raw(
-        self, layer_idx: int, token_idx: int, key: torch.Tensor, value: torch.Tensor
+        self,
+        layer_idx: int,
+        token_idx: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        request_id: str = _DEFAULT_REQUEST_ID,
     ) -> None:
         self._validate_layer(layer_idx)
         self._validate_token_idx(token_idx)
         self._validate_raw_row("key", key)
         self._validate_raw_row("value", value)
         slot = token_idx % self.raw_window
-        self._families["raw"].write(layer_idx, slot, (key, value))
-        self.raw_token_indices[layer_idx, slot].copy_(
-            torch.full(
-                (), token_idx, dtype=torch.long, device=self.raw_token_indices.device
-            )
+        self._families["raw"].write(request_id, layer_idx, slot, (key, value))
+        self._state_for(request_id).raw_token_indices[layer_idx, slot].copy_(
+            torch.full((), token_idx, dtype=torch.long, device=self.raw_keys.device)
         )
 
     def read_raw_window(
-        self, layer_idx: int, token_idx: int, window: int
+        self,
+        layer_idx: int,
+        token_idx: int,
+        window: int,
+        *,
+        request_id: str = _DEFAULT_REQUEST_ID,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._validate_layer(layer_idx)
         self._validate_token_idx(token_idx)
@@ -604,7 +831,7 @@ class DeepSeekV4PagedKVCache:
         if window > self.raw_window:
             raise ValueError(f"window {window} exceeds raw_window {self.raw_window}")
         start = max(0, token_idx - window + 1)
-        token_indices = self.raw_token_indices[layer_idx]
+        token_indices = self._state_for(request_id).raw_token_indices[layer_idx]
         present = (token_indices >= start) & (token_indices <= token_idx)
         slots = torch.nonzero(present, as_tuple=False).flatten()
         if slots.numel() == 0:
@@ -615,8 +842,7 @@ class DeepSeekV4PagedKVCache:
             )
             return empty, empty.clone()
         order = torch.argsort(token_indices[slots])
-        keys, values = self._families["raw"].read(layer_idx, slots[order])
-        return keys, values
+        return self._families["raw"].read(request_id, layer_idx, slots[order])
 
     def append_compressed(
         self,
@@ -625,6 +851,7 @@ class DeepSeekV4PagedKVCache:
         row: torch.Tensor,
         *,
         indexer_row: torch.Tensor | None = None,
+        request_id: str = _DEFAULT_REQUEST_ID,
     ) -> int:
         self._validate_layer(layer_idx)
         self._validate_token_idx(token_idx)
@@ -644,15 +871,16 @@ class DeepSeekV4PagedKVCache:
                 raise ValueError(
                     f"indexer row device must be {row.device}; got {indexer_row.device}"
                 )
-        slot = self._compressed_counts_cpu[layer_idx]
-        if slot >= self.compressed_token_indices.shape[1]:
+        state = self._state_for(request_id)
+        slot = state.compressed_counts_cpu[layer_idx]
+        if slot >= state.compressed_token_indices.shape[1]:
             raise ValueError("compressed cache capacity exceeded")
-        self._families["compressed"].write(layer_idx, slot, (row,))
-        self.compressed_token_indices[layer_idx, slot] = token_idx
+        self._families["compressed"].write(request_id, layer_idx, slot, (row,))
+        state.compressed_token_indices[layer_idx, slot] = token_idx
         if indexer_row is not None:
-            self._families["indexer"].write(layer_idx, slot, (indexer_row,))
-        self._compressed_counts[layer_idx] += 1
-        self._compressed_counts_cpu[layer_idx] += 1
+            self._families["indexer"].write(request_id, layer_idx, slot, (indexer_row,))
+        state.compressed_counts[layer_idx] += 1
+        state.compressed_counts_cpu[layer_idx] += 1
         return slot
 
     def read_compressed(
@@ -661,11 +889,13 @@ class DeepSeekV4PagedKVCache:
         *,
         row_indices: torch.Tensor | None = None,
         count: int | None = None,
+        request_id: str = _DEFAULT_REQUEST_ID,
     ) -> torch.Tensor:
         self._validate_layer(layer_idx)
+        state = self._state_for(request_id)
         provided_count = count
         if count is None:
-            count = self._compressed_counts_cpu[layer_idx]
+            count = state.compressed_counts_cpu[layer_idx]
         if row_indices is None:
             row_indices = torch.arange(count, device=self.raw_keys.device)
         if row_indices.ndim != 1:
@@ -680,16 +910,23 @@ class DeepSeekV4PagedKVCache:
             torch.any(row_indices < 0) or torch.any(row_indices >= count)
         ):
             raise ValueError("compressed row index out of range")
-        return self._families["compressed"].read(layer_idx, row_indices.to(torch.long))[
-            0
-        ]
+        return self._families["compressed"].read(
+            request_id,
+            layer_idx,
+            row_indices.to(torch.long),
+        )[0]
 
     def read_indexer_rows(
-        self, layer_idx: int, *, count: int | None = None
+        self,
+        layer_idx: int,
+        *,
+        count: int | None = None,
+        request_id: str = _DEFAULT_REQUEST_ID,
     ) -> torch.Tensor:
         self._validate_layer(layer_idx)
+        state = self._state_for(request_id)
         if count is None:
-            count = self._compressed_counts_cpu[layer_idx]
+            count = state.compressed_counts_cpu[layer_idx]
         if count <= 0:
             return torch.empty(
                 (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim),
@@ -697,7 +934,31 @@ class DeepSeekV4PagedKVCache:
                 device=self.raw_keys.device,
             )
         row_indices = torch.arange(count, device=self.raw_keys.device)
-        return self._families["indexer"].read(layer_idx, row_indices)[0]
+        return self._families["indexer"].read(request_id, layer_idx, row_indices)[0]
+
+    def _state_for(self, request_id: str) -> _PagedRequestState:
+        state = self._request_states.get(request_id)
+        if state is None:
+            state = _PagedRequestState(
+                raw_token_indices=torch.full(
+                    (self.num_layers, self.raw_window),
+                    -1,
+                    dtype=torch.long,
+                    device=self.raw_keys.device,
+                ),
+                compressed_token_indices=torch.full(
+                    (self.num_layers, self.max_compressed_rows),
+                    -1,
+                    dtype=torch.long,
+                    device=self.raw_keys.device,
+                ),
+                compressed_counts=torch.zeros(
+                    (self.num_layers,), dtype=torch.long, device=self.raw_keys.device
+                ),
+                compressed_counts_cpu=[0] * self.num_layers,
+            )
+            self._request_states[request_id] = state
+        return state
 
     def _validate_layer(self, layer_idx: int) -> None:
         if layer_idx < 0 or layer_idx >= self.num_layers:

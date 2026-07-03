@@ -39,7 +39,7 @@ class BlockAllocator:
             if bid not in self._allocated_ids:
                 raise ValueError(f"Block id {bid} is not currently allocated")
             self._allocated_ids.discard(bid)
-            self._free_ids.append(bid)
+            self._free_ids.appendleft(bid)
 
     @property
     def num_free(self) -> int:

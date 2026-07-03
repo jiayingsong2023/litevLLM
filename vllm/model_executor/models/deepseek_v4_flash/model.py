@@ -14,7 +14,7 @@ from .block import (
     DeepSeekV4FlashCompressedLayerReferenceRunner,
     DeepSeekV4FlashSlidingLayerReferenceRunner,
 )
-from .compressed_kv import DeepSeekV4CompressedKVCache
+from .compressed_kv import DeepSeekV4CompressedKVCache, DeepSeekV4PagedKVCache
 from .config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashRuntimeBudget,
@@ -87,6 +87,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager: DeepSeekV4FlashGPUWeightStager | None = None
         self._gpu_weight_stager_store_id: int | None = None
         self._gpu_weight_stager_device: torch.device | None = None
+        self._gpu_request_seq = 0
+        self._gpu_kv_pools: dict[
+            tuple[int, int, torch.dtype, str], DeepSeekV4PagedKVCache
+        ] = {}
         self._deepseek_profiler = DeepSeekV4FlashProfiler(
             enabled=False,
             sync_fn=self._sync_deepseek_profile_device,
@@ -102,6 +106,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager = None
         self._gpu_weight_stager_store_id = None
         self._gpu_weight_stager_device = None
+        self._gpu_kv_pools.clear()
+        self._gpu_request_seq = 0
 
     def close(self) -> None:
         if self.weight_store is not None:
@@ -110,6 +116,41 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager = None
         self._gpu_weight_stager_store_id = None
         self._gpu_weight_stager_device = None
+        self._gpu_kv_pools.clear()
+        self._gpu_request_seq = 0
+
+    def _new_gpu_request_state(
+        self,
+        *,
+        context_length: int,
+        device: torch.device,
+    ) -> DeepSeekV4FlashGPURequestState:
+        config = DeepSeekV4FlashGPUCacheConfig(
+            context_length=context_length,
+            hidden_size=self.shape.hidden_size,
+            batch_size=1,
+            kv_width=self.shape.head_dim,
+            device=device,
+        )
+        key = (context_length, self.shape.head_dim, config.dtype, str(device))
+        pool = self._gpu_kv_pools.get(key)
+        if pool is None:
+            pool = DeepSeekV4PagedKVCache(
+                context_length=context_length,
+                hidden_size=self.shape.head_dim,
+                raw_window=DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+                num_layers=DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+                dtype=config.dtype,
+                device=device,
+            )
+            self._gpu_kv_pools[key] = pool
+        request_id = f"gpu-{self._gpu_request_seq}"
+        self._gpu_request_seq += 1
+        return DeepSeekV4FlashGPURequestState(
+            config,
+            kv_cache=pool,
+            request_id=request_id,
+        )
 
     def enable_deepseek_profile(self, enabled: bool = True) -> None:
         self._deepseek_profiler.enabled = enabled
@@ -309,21 +350,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._require_weight_store()
         token_id, device = self._validate_forward_kernel_input(input_ids)
         self.gpu_backend.require_ready()
-        state = DeepSeekV4FlashGPURequestState(
-            DeepSeekV4FlashGPUCacheConfig(
-                context_length=self._kernel_context_length(),
-                hidden_size=self.shape.hidden_size,
-                batch_size=1,
-                kv_width=self.shape.head_dim,
-                device=device,
-            )
-        )
-        return self._forward_kernel_token_step(
-            token_id=token_id,
-            state=state,
-            token_idx=state.token_position,
+        state = self._new_gpu_request_state(
+            context_length=self._kernel_context_length(),
             device=device,
         )
+        try:
+            return self._forward_kernel_token_step(
+                token_id=token_id,
+                state=state,
+                token_idx=state.token_position,
+                device=device,
+            )
+        finally:
+            state.reset()
 
     def _forward_kernel_token_step(
         self,
@@ -734,14 +773,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             output_ids[:input_len] = input_ids_cuda
             output_ids_list.append(output_ids)
 
-            state = DeepSeekV4FlashGPURequestState(
-                DeepSeekV4FlashGPUCacheConfig(
-                    context_length=context_length,
-                    hidden_size=self.shape.hidden_size,
-                    batch_size=1,
-                    kv_width=self.shape.head_dim,
-                    device=device,
-                )
+            state = self._new_gpu_request_state(
+                context_length=context_length,
+                device=device,
             )
             states.append(state)
 
@@ -756,37 +790,41 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     device=device,
                 )
 
-        active_indices = list(range(len(states)))
-        for step in range(max_tokens):
-            if not active_indices:
-                break
+        try:
+            active_indices = list(range(len(states)))
+            for step in range(max_tokens):
+                if not active_indices:
+                    break
 
-            token_id_tensor = torch.stack(
-                [
-                    output_ids_list[idx][input_lengths[idx] - 1 + step]
-                    for idx in active_indices
-                ]
-            )
-            token_indices = [states[idx].token_position for idx in active_indices]
-            active_states = [states[idx] for idx in active_indices]
+                token_id_tensor = torch.stack(
+                    [
+                        output_ids_list[idx][input_lengths[idx] - 1 + step]
+                        for idx in active_indices
+                    ]
+                )
+                token_indices = [states[idx].token_position for idx in active_indices]
+                active_states = [states[idx] for idx in active_indices]
 
-            next_tokens = self._forward_kernel_token_step_batched(
-                token_id_tensor=token_id_tensor,
-                states=active_states,
-                token_indices=token_indices,
-                device=device,
-            )
+                next_tokens = self._forward_kernel_token_step_batched(
+                    token_id_tensor=token_id_tensor,
+                    states=active_states,
+                    token_indices=token_indices,
+                    device=device,
+                )
 
-            new_active: list[int] = []
-            for offset, idx in enumerate(active_indices):
-                generated_token = next_tokens[offset]
-                output_ids_list[idx][input_lengths[idx] + step] = generated_token
-                if eos_token_id is not None:
-                    token_id_int = int(generated_token.item())
-                    if token_id_int == eos_token_id:
-                        continue
-                new_active.append(idx)
-            active_indices = new_active
+                new_active: list[int] = []
+                for offset, idx in enumerate(active_indices):
+                    generated_token = next_tokens[offset]
+                    output_ids_list[idx][input_lengths[idx] + step] = generated_token
+                    if eos_token_id is not None:
+                        token_id_int = int(generated_token.item())
+                        if token_id_int == eos_token_id:
+                            continue
+                    new_active.append(idx)
+                active_indices = new_active
+        finally:
+            for state in states:
+                state.reset()
 
         # Trim each output to the actual number of generated tokens, matching
         # the single-slot greedy path which returns a slice up to EOS.
@@ -1057,14 +1095,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
-        state = DeepSeekV4FlashGPURequestState(
-            DeepSeekV4FlashGPUCacheConfig(
-                context_length=self._kernel_context_length(),
-                hidden_size=self.shape.hidden_size,
-                batch_size=1,
-                kv_width=self.shape.head_dim,
-                device=device,
-            )
+        state = self._new_gpu_request_state(
+            context_length=self._kernel_context_length(),
+            device=device,
         )
 
         input_token_count = int(input_ids.numel())
@@ -1197,11 +1230,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             if eos_token_id is not None:
                 token_id = int(token_id_tensor.item())
                 if token_id == eos_token_id:
+                    state.reset()
                     return (
                         output_ids[: input_token_count + generated_idx + 1],
                         token_elapsed_ms,
                     )
 
+        state.reset()
         return output_ids, token_elapsed_ms
 
     def _eos_token_id(self) -> int | None:

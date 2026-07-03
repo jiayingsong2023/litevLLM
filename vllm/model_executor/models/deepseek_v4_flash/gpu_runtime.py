@@ -9,10 +9,12 @@ import torch
 from .attention import build_deepseek_layer_rope_tables
 from .compressed_kv import (
     DeepSeekV4CompressedKVLayout,
-    DeepSeekV4KVPageAllocator,
     DeepSeekV4PagedKVCache,
+    DeepSeekV4PagedKVRequestCache,
 )
 from .config import DEEPSEEK_V4_FLASH_SHAPE
+
+_DEFAULT_GPU_REQUEST_ID = "__default_gpu_request__"
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,13 @@ class DeepSeekV4FlashGPURequestState:
     the GPU weight stager/cache and are intentionally not referenced here.
     """
 
-    def __init__(self, config: DeepSeekV4FlashGPUCacheConfig) -> None:
+    def __init__(
+        self,
+        config: DeepSeekV4FlashGPUCacheConfig,
+        *,
+        kv_cache: DeepSeekV4PagedKVCache | None = None,
+        request_id: str | None = None,
+    ) -> None:
         if config.batch_size != 1:
             raise ValueError(
                 "DeepSeek V4 Flash GPU runtime currently supports batch_size=1; "
@@ -55,20 +63,25 @@ class DeepSeekV4FlashGPURequestState:
         self.layout = DeepSeekV4CompressedKVLayout(
             context_length=config.context_length,
         )
-        self.page_allocator = DeepSeekV4KVPageAllocator(self.layout)
         device = config.device
         if device is None:
             device = torch.device("cuda")
 
-        self.raw_kv_cache = DeepSeekV4PagedKVCache(
-            context_length=config.context_length,
-            hidden_size=config.kv_width,
-            raw_window=DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
-            num_layers=DEEPSEEK_V4_FLASH_SHAPE.num_layers,
-            dtype=config.dtype,
-            device=device,
-        )
-        self.compressed_kv_cache = self.raw_kv_cache
+        if kv_cache is None:
+            kv_cache = DeepSeekV4PagedKVCache(
+                context_length=config.context_length,
+                hidden_size=config.kv_width,
+                raw_window=DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+                num_layers=DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+                dtype=config.dtype,
+                device=device,
+            )
+        if request_id is None:
+            request_id = _DEFAULT_GPU_REQUEST_ID
+        self.request_id = request_id
+        self.kv_cache: DeepSeekV4PagedKVRequestCache = kv_cache.bind_request(request_id)
+        self.raw_kv_cache = self.kv_cache
+        self.compressed_kv_cache = self.kv_cache
         shape = DEEPSEEK_V4_FLASH_SHAPE
         self._rope_cos, self._rope_sin = build_deepseek_layer_rope_tables(
             context_length=config.context_length,
