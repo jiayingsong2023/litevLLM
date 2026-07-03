@@ -226,3 +226,22 @@ def test_model_creates_request_states_from_one_paged_pool() -> None:
 
     assert first.kv_cache._pool is second.kv_cache._pool
     assert first.request_id != second.request_id
+
+def test_paged_cache_returns_empty_indexer_rows_for_ratio128_layers() -> None:
+    cache = DeepSeekV4PagedKVCache(
+        context_length=256,
+        hidden_size=4,
+        num_layers=4,
+        blocks_per_chunk=1,
+    )
+    cache.append_compressed(
+        layer_idx=3,
+        token_idx=127,
+        row=torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+
+    rows = cache.read_indexer_rows(layer_idx=3)
+
+    assert rows.shape == (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim)
+    assert rows.dtype == torch.float32
+

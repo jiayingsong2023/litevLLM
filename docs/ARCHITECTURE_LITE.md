@@ -311,13 +311,12 @@ The model-local package owns the heavy work:
 | `kernels/triton/deepseek_v4_flash/` | Q8 linear, Q2/IQ2 MoE matvec, attention/cache/output kernels. |
 
 Architecturally, DeepSeek does not use the generic PagedAttention algorithm or
-the lite engine's flat KV pool. Instead, each request's state owns its own raw
-sliding-window rows, compressed rows, and ratio-4 indexer rows in
-`DeepSeekV4CompressedKVCache`. These buffers are currently allocated up to the
-request's `context_length` at request-state creation time, not handed out
-dynamically from the global `BlockAllocator`. The `DeepSeekV4KVPageAllocator`
-provides logical page/offset resolution for these buffers but does not perform
-physical block allocation.
+the lite engine's flat KV pool. Its direct GPU path uses a model-level
+`DeepSeekV4PagedKVCache` shared by request states. The pool owns separate lazy
+physical row families for raw sliding-window rows, compressed rows, and ratio-4
+indexer rows; each family uses `BlockAllocator` for block IDs and keeps
+request-local metadata for raw token indices and per-layer compressed counts.
+`DeepSeekV4CompressedKVCache` remains the dense reference cache path only.
 
 The current performance work moved the hot path from CPU reference decoding to
 GPU execution for Q8 projections, selected IQ2 gate/up, Q2 down experts,

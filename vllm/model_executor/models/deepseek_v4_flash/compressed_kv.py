@@ -16,51 +16,6 @@ from .config import (
 
 
 @dataclass(frozen=True)
-class DeepSeekV4PageRef:
-    chunk_id: int
-    page_id: int
-    row_offset: int
-
-
-@dataclass(frozen=True)
-class DeepSeekV4KVPagePool:
-    name: str
-    page_rows: int
-    pages_per_chunk: int
-    row_width: int
-    bytes_per_value: int
-
-    def __post_init__(self) -> None:
-        if self.page_rows <= 0:
-            raise ValueError("page_rows must be positive")
-        if self.pages_per_chunk <= 0:
-            raise ValueError("pages_per_chunk must be positive")
-        if self.row_width <= 0:
-            raise ValueError("row_width must be positive")
-        if self.bytes_per_value <= 0:
-            raise ValueError("bytes_per_value must be positive")
-
-    @property
-    def rows_per_chunk(self) -> int:
-        return self.page_rows * self.pages_per_chunk
-
-    @property
-    def max_chunk_bytes(self) -> int:
-        return self.rows_per_chunk * self.row_width * self.bytes_per_value
-
-    def resolve(self, logical_row: int) -> DeepSeekV4PageRef:
-        if logical_row < 0:
-            raise ValueError("logical row must be non-negative")
-        chunk_id = logical_row // self.rows_per_chunk
-        row_in_chunk = logical_row % self.rows_per_chunk
-        return DeepSeekV4PageRef(
-            chunk_id=chunk_id,
-            page_id=row_in_chunk // self.page_rows,
-            row_offset=row_in_chunk % self.page_rows,
-        )
-
-
-@dataclass(frozen=True)
 class DeepSeekV4CompressedKVLayout:
     context_length: int
     raw_window: int = DEEPSEEK_V4_FLASH_SHAPE.sliding_window
@@ -364,6 +319,7 @@ class _LazyPagedRows:
         self._allocator = BlockAllocator(self._num_total_blocks)
         self._request_blocks: dict[str, list[list[int]]] = {}
         self._chunks: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._reuse_ids: list[int] = []
 
     def num_allocated_chunks(self) -> int:
         return len(self._chunks)
@@ -375,7 +331,13 @@ class _LazyPagedRows:
         blocks = self._blocks_for(request_id)[layer_idx]
         if needed <= len(blocks):
             return
-        new_ids = self._allocator.allocate(needed - len(blocks))
+        need = needed - len(blocks)
+        new_ids: list[int] = []
+        while need > 0 and self._reuse_ids:
+            new_ids.append(self._reuse_ids.pop())
+            need -= 1
+        if need > 0:
+            new_ids.extend(self._allocator.allocate(need))
         blocks.extend(new_ids)
         for block_id in new_ids:
             chunk, block_offset = self._block_storage(block_id)
@@ -386,9 +348,10 @@ class _LazyPagedRows:
         layer_blocks = self._request_blocks.pop(request_id, None)
         if layer_blocks is None:
             return
-        block_ids = [block_id for blocks in layer_blocks for block_id in blocks]
-        if block_ids:
-            self._allocator.free(block_ids)
+        # ponytail: grow-only pool; keep freed ids local for immediate request reuse.
+        self._reuse_ids.extend(
+            block_id for blocks in layer_blocks for block_id in reversed(blocks)
+        )
 
     def write(
         self,
@@ -708,8 +671,8 @@ class DeepSeekV4PagedKVCache:
         self.raw_window = int(raw_window)
         self.num_layers = int(num_layers)
         self.max_compressed_rows = context_length // 4 + 2
-        self.raw_keys = torch.empty((0, hidden_size), dtype=dtype, device=device)
-        self.raw_values = torch.empty_like(self.raw_keys)
+        self._dtype = dtype
+        self._device = torch.empty((), dtype=dtype, device=device).device
         self._request_states: dict[str, _PagedRequestState] = {}
         self.compressed_rows = _PagedFamilyView(
             cache=self,
@@ -784,6 +747,22 @@ class DeepSeekV4PagedKVCache:
     def bind_request(self, request_id: str) -> DeepSeekV4PagedKVRequestCache:
         return DeepSeekV4PagedKVRequestCache(self, request_id)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def raw_keys(self) -> torch.Tensor:
+        return torch.empty((0, self.hidden_size), dtype=self.dtype, device=self.device)
+
+    @property
+    def raw_values(self) -> torch.Tensor:
+        return torch.empty((0, self.hidden_size), dtype=self.dtype, device=self.device)
+
     def num_allocated_chunks(self, family: str) -> int:
         return self._families[family].num_allocated_chunks()
 
@@ -813,7 +792,7 @@ class DeepSeekV4PagedKVCache:
         slot = token_idx % self.raw_window
         self._families["raw"].write(request_id, layer_idx, slot, (key, value))
         self._state_for(request_id).raw_token_indices[layer_idx, slot].copy_(
-            torch.full((), token_idx, dtype=torch.long, device=self.raw_keys.device)
+            torch.full((), token_idx, dtype=torch.long, device=self.device)
         )
 
     def read_raw_window(
@@ -837,8 +816,8 @@ class DeepSeekV4PagedKVCache:
         if slots.numel() == 0:
             empty = torch.empty(
                 (0, self.hidden_size),
-                dtype=self.raw_keys.dtype,
-                device=self.raw_keys.device,
+                dtype=self.dtype,
+                device=self.device,
             )
             return empty, empty.clone()
         order = torch.argsort(token_indices[slots])
@@ -897,14 +876,14 @@ class DeepSeekV4PagedKVCache:
         if count is None:
             count = state.compressed_counts_cpu[layer_idx]
         if row_indices is None:
-            row_indices = torch.arange(count, device=self.raw_keys.device)
+            row_indices = torch.arange(count, device=self.device)
         if row_indices.ndim != 1:
             raise ValueError(f"row_indices must be 1-D; got {row_indices.ndim}-D")
         if row_indices.numel() == 0:
             return torch.empty(
                 (0, self.hidden_size),
-                dtype=self.raw_keys.dtype,
-                device=self.raw_keys.device,
+                dtype=self.dtype,
+                device=self.device,
             )
         if provided_count is None and (
             torch.any(row_indices < 0) or torch.any(row_indices >= count)
@@ -924,16 +903,22 @@ class DeepSeekV4PagedKVCache:
         request_id: str = _DEFAULT_REQUEST_ID,
     ) -> torch.Tensor:
         self._validate_layer(layer_idx)
+        if layer_compress_ratio(layer_idx) != 4:
+            return torch.empty(
+                (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+            )
         state = self._state_for(request_id)
         if count is None:
             count = state.compressed_counts_cpu[layer_idx]
         if count <= 0:
             return torch.empty(
                 (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim),
-                dtype=self.raw_keys.dtype,
-                device=self.raw_keys.device,
+                dtype=self.dtype,
+                device=self.device,
             )
-        row_indices = torch.arange(count, device=self.raw_keys.device)
+        row_indices = torch.arange(count, device=self.device)
         return self._families["indexer"].read(request_id, layer_idx, row_indices)[0]
 
     def _state_for(self, request_id: str) -> _PagedRequestState:
@@ -944,16 +929,16 @@ class DeepSeekV4PagedKVCache:
                     (self.num_layers, self.raw_window),
                     -1,
                     dtype=torch.long,
-                    device=self.raw_keys.device,
+                    device=self.device,
                 ),
                 compressed_token_indices=torch.full(
                     (self.num_layers, self.max_compressed_rows),
                     -1,
                     dtype=torch.long,
-                    device=self.raw_keys.device,
+                    device=self.device,
                 ),
                 compressed_counts=torch.zeros(
-                    (self.num_layers,), dtype=torch.long, device=self.raw_keys.device
+                    (self.num_layers,), dtype=torch.long, device=self.device
                 ),
                 compressed_counts_cpu=[0] * self.num_layers,
             )
@@ -977,81 +962,11 @@ class DeepSeekV4PagedKVCache:
             raise ValueError(
                 f"{name} shape must be ({self.hidden_size},); got {tuple(row.shape)}"
             )
-        if row.dtype != self.raw_keys.dtype:
+        if row.dtype != self.dtype:
             raise ValueError(
-                f"{name} dtype must be {self.raw_keys.dtype}; got {row.dtype}"
+                f"{name} dtype must be {self.dtype}; got {row.dtype}"
             )
-        if row.device != self.raw_keys.device:
+        if row.device != self.device:
             raise ValueError(
-                f"{name} device must be {self.raw_keys.device}; got {row.device}"
+                f"{name} device must be {self.device}; got {row.device}"
             )
-
-
-class DeepSeekV4KVPageAllocator:
-    """Logical page mapping for DeepSeek V4 compressed KV.
-
-    This preserves the PagedAttention memory property: logical KV growth is
-    resolved through compact page references and chunk pools instead of one
-    contiguous full-context KV allocation.
-    """
-
-    def __init__(self, layout: DeepSeekV4CompressedKVLayout) -> None:
-        self.layout = layout
-        self.raw_pool = DeepSeekV4KVPagePool(
-            name="raw",
-            page_rows=16,
-            pages_per_chunk=64,
-            row_width=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
-            bytes_per_value=4,
-        )
-        self.compressed_pool = DeepSeekV4KVPagePool(
-            name="compressed",
-            page_rows=64,
-            pages_per_chunk=64,
-            row_width=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
-            bytes_per_value=2,
-        )
-        self.indexer_pool = DeepSeekV4KVPagePool(
-            name="indexer",
-            page_rows=64,
-            pages_per_chunk=64,
-            row_width=DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
-            bytes_per_value=4,
-        )
-
-    def allocate_raw_row(self, layer_idx: int, logical_row: int) -> DeepSeekV4PageRef:
-        self._validate_layer(layer_idx)
-        return self.raw_pool.resolve(logical_row)
-
-    def allocate_compressed_row(
-        self,
-        layer_idx: int,
-        logical_row: int,
-    ) -> DeepSeekV4PageRef:
-        self._validate_layer(layer_idx)
-        if self.layout.layer_comp_capacity(layer_idx) == 0:
-            raise ValueError(f"layer {layer_idx} has no compressed KV rows")
-        if logical_row >= self.layout.layer_comp_capacity(layer_idx):
-            raise ValueError(
-                f"compressed logical row {logical_row} exceeds layer {layer_idx} "
-                f"capacity {self.layout.layer_comp_capacity(layer_idx)}"
-            )
-        return self.compressed_pool.resolve(logical_row)
-
-    def allocate_indexer_row(
-        self,
-        layer_idx: int,
-        logical_row: int,
-    ) -> DeepSeekV4PageRef:
-        self._validate_layer(layer_idx)
-        if not self.layout.has_indexer_cache(layer_idx):
-            raise ValueError(f"layer {layer_idx} has no ratio-4 indexer cache")
-        if logical_row >= self.layout.layer_comp_capacity(layer_idx):
-            raise ValueError(
-                f"indexer logical row {logical_row} exceeds layer {layer_idx} "
-                f"capacity {self.layout.layer_comp_capacity(layer_idx)}"
-            )
-        return self.indexer_pool.resolve(logical_row)
-
-    def _validate_layer(self, layer_idx: int) -> None:
-        layer_compress_ratio(layer_idx)
