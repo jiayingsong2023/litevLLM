@@ -8,9 +8,9 @@ import torch
 
 from .attention import build_deepseek_layer_rope_tables
 from .compressed_kv import (
-    DeepSeekV4CompressedKVCache,
     DeepSeekV4CompressedKVLayout,
     DeepSeekV4KVPageAllocator,
+    DeepSeekV4PagedKVCache,
 )
 from .config import DEEPSEEK_V4_FLASH_SHAPE
 
@@ -60,7 +60,7 @@ class DeepSeekV4FlashGPURequestState:
         if device is None:
             device = torch.device("cuda")
 
-        self.raw_kv_cache = DeepSeekV4CompressedKVCache(
+        self.raw_kv_cache = DeepSeekV4PagedKVCache(
             context_length=config.context_length,
             hidden_size=config.kv_width,
             raw_window=DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
@@ -180,10 +180,7 @@ class DeepSeekV4FlashGPURequestState:
 
     def reset(self) -> None:
         self.token_position = 0
-        self.raw_kv_cache.raw_token_indices.fill_(-1)
-        self.raw_kv_cache.compressed_token_indices.fill_(-1)
-        self.raw_kv_cache._compressed_counts.zero_()
-        self.raw_kv_cache._compressed_counts_cpu = [0] * self.raw_kv_cache.num_layers
+        self.raw_kv_cache.free_request_blocks()
         compressor_states = getattr(
             self,
             "_deepseek_v4_flash_compressor_states",

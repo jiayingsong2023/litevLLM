@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.engine.block_allocator import BlockAllocator
+from vllm.utils.math_utils import cdiv
+
 from .config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashMemoryPolicy,
@@ -289,6 +292,412 @@ class DeepSeekV4CompressedKVCache:
         if count is None:
             count = self._compressed_counts_cpu[layer_idx]
         return self.indexer_rows[layer_idx, :count]
+
+    def _validate_layer(self, layer_idx: int) -> None:
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(f"layer index out of range: {layer_idx}")
+
+    def _validate_token_idx(self, token_idx: int) -> None:
+        if token_idx < 0:
+            raise ValueError("token index must be non-negative")
+        if token_idx >= self.context_length:
+            raise ValueError(
+                f"token index {token_idx} exceeds context_length {self.context_length}"
+            )
+
+    def _validate_raw_row(self, name: str, row: torch.Tensor) -> None:
+        if row.shape != (self.hidden_size,):
+            raise ValueError(
+                f"{name} shape must be ({self.hidden_size},); got {tuple(row.shape)}"
+            )
+        if row.dtype != self.raw_keys.dtype:
+            raise ValueError(
+                f"{name} dtype must be {self.raw_keys.dtype}; got {row.dtype}"
+            )
+        if row.device != self.raw_keys.device:
+            raise ValueError(
+                f"{name} device must be {self.raw_keys.device}; got {row.device}"
+            )
+
+
+class _LazyPagedRows:
+    def __init__(
+        self,
+        *,
+        name: str,
+        num_layers: int,
+        num_blocks_per_layer: int,
+        block_size: int,
+        blocks_per_chunk: int,
+        row_shape: tuple[int, ...],
+        tensors_per_row: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> None:
+        self.name = name
+        self.num_layers = int(num_layers)
+        self.num_blocks_per_layer = int(num_blocks_per_layer)
+        self.block_size = int(block_size)
+        self.blocks_per_chunk = int(blocks_per_chunk)
+        self.row_shape = row_shape
+        self.tensors_per_row = int(tensors_per_row)
+        self.dtype = dtype
+        self.device = device
+        if self.num_blocks_per_layer <= 0:
+            raise ValueError("num_blocks_per_layer must be positive")
+        if self.block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if self.blocks_per_chunk <= 0:
+            raise ValueError("blocks_per_chunk must be positive")
+        self._num_total_blocks = self.num_layers * self.num_blocks_per_layer + 1
+        self._allocator = BlockAllocator(self._num_total_blocks)
+        self._layer_blocks: list[list[int]] = [[] for _ in range(self.num_layers)]
+        self._chunks: dict[int, tuple[torch.Tensor, ...]] = {}
+
+    def num_allocated_chunks(self) -> int:
+        return len(self._chunks)
+
+    def ensure(self, layer_idx: int, logical_units: int) -> None:
+        needed = min(
+            cdiv(int(logical_units), self.block_size), self.num_blocks_per_layer
+        )
+        blocks = self._layer_blocks[layer_idx]
+        if needed <= len(blocks):
+            return
+        new_ids = self._allocator.allocate(needed - len(blocks))
+        blocks.extend(new_ids)
+        for block_id in new_ids:
+            chunk, block_offset = self._block_storage(block_id)
+            for tensor in chunk:
+                tensor[block_offset].zero_()
+
+    def free_all(self) -> None:
+        # ponytail: request-local cache; reset allocator for prompt block reuse.
+        self._allocator = BlockAllocator(self._num_total_blocks)
+        self._layer_blocks = [[] for _ in range(self.num_layers)]
+
+    def write(
+        self, layer_idx: int, logical_idx: int, rows: tuple[torch.Tensor, ...]
+    ) -> None:
+        if len(rows) != self.tensors_per_row:
+            raise ValueError(f"{self.name} expects {self.tensors_per_row} row tensors")
+        self.ensure(layer_idx, logical_idx + 1)
+        block_id, row_offset = self._resolve(layer_idx, logical_idx)
+        chunk, block_offset = self._block_storage(block_id)
+        for tensor, row in zip(chunk, rows):
+            tensor[block_offset, row_offset].copy_(row)
+
+    def read(
+        self, layer_idx: int, logical_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        if logical_indices.numel() == 0:
+            empty = torch.empty(
+                (0, *self.row_shape), dtype=self.dtype, device=self.device
+            )
+            return tuple(empty.clone() for _ in range(self.tensors_per_row))
+        outputs: list[list[torch.Tensor]] = [[] for _ in range(self.tensors_per_row)]
+        for logical_idx in logical_indices.detach().cpu().to(torch.long).tolist():
+            block_id, row_offset = self._resolve(layer_idx, int(logical_idx))
+            chunk, block_offset = self._block_storage(block_id)
+            for rows, tensor in zip(outputs, chunk):
+                rows.append(tensor[block_offset, row_offset])
+        return tuple(torch.stack(rows, dim=0) for rows in outputs)
+
+    def _resolve(self, layer_idx: int, logical_idx: int) -> tuple[int, int]:
+        block_pos = int(logical_idx) // self.block_size
+        if block_pos >= len(self._layer_blocks[layer_idx]):
+            raise ValueError(f"{self.name} row index out of range")
+        return self._layer_blocks[layer_idx][block_pos], int(
+            logical_idx
+        ) % self.block_size
+
+    def _block_storage(self, block_id: int) -> tuple[tuple[torch.Tensor, ...], int]:
+        chunk_id = int(block_id) // self.blocks_per_chunk
+        block_offset = int(block_id) % self.blocks_per_chunk
+        chunk = self._chunks.get(chunk_id)
+        if chunk is None:
+            shape = (self.blocks_per_chunk, self.block_size, *self.row_shape)
+            chunk = tuple(
+                torch.zeros(shape, dtype=self.dtype, device=self.device)
+                for _ in range(self.tensors_per_row)
+            )
+            self._chunks[chunk_id] = chunk
+        return chunk, block_offset
+
+
+class _PagedFamilyView:
+    def __init__(
+        self,
+        *,
+        cache: DeepSeekV4PagedKVCache,
+        family: str,
+        row_width: int,
+        max_rows: int,
+    ) -> None:
+        self._cache = cache
+        self._family = family
+        self._row_width = int(row_width)
+        self._max_rows = int(max_rows)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._cache.raw_keys.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._cache.raw_keys.device
+
+    @property
+    def is_cuda(self) -> bool:
+        return self.device.type == "cuda"
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self._cache.num_layers, self._max_rows, self._row_width)
+
+    def __getitem__(self, key: object) -> torch.Tensor:
+        if not isinstance(key, tuple) or len(key) < 2:
+            raise IndexError(f"{self._family} view expects layer and row indices")
+        layer_idx = int(key[0])
+        row_idx = int(key[1])
+        if self._family == "compressed":
+            row = self._cache.read_compressed(
+                layer_idx=layer_idx,
+                row_indices=torch.tensor([row_idx], device=self.device),
+            )[0]
+        else:
+            row = self._cache._families["indexer"].read(
+                layer_idx,
+                torch.tensor([row_idx], device=self.device),
+            )[0][0]
+        return row if len(key) == 2 else row[key[2:]]
+
+
+class DeepSeekV4PagedKVCache:
+    """DeepSeek-local lazy-grow paged KV cache.
+
+    Request blocks are returned on reset/free; backing chunks stay allocated for
+    reuse to avoid GPU allocator churn.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_length: int,
+        hidden_size: int,
+        raw_window: int = DEEPSEEK_V4_FLASH_SHAPE.sliding_window,
+        num_layers: int = DEEPSEEK_V4_FLASH_SHAPE.num_layers,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+        block_size: int = 16,
+        blocks_per_chunk: int = 64,
+    ) -> None:
+        DeepSeekV4FlashMemoryPolicy().validate_context_length(context_length)
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        if raw_window != DEEPSEEK_V4_FLASH_SHAPE.sliding_window:
+            raise ValueError(
+                "DeepSeek V4 Flash first release requires raw_window="
+                f"{DEEPSEEK_V4_FLASH_SHAPE.sliding_window}"
+            )
+        if num_layers <= 0 or num_layers > DEEPSEEK_V4_FLASH_SHAPE.num_layers:
+            raise ValueError(f"num_layers out of range: {num_layers}")
+
+        self.context_length = int(context_length)
+        self.hidden_size = int(hidden_size)
+        self.raw_window = int(raw_window)
+        self.num_layers = int(num_layers)
+        self.raw_keys = torch.empty((0, hidden_size), dtype=dtype, device=device)
+        self.raw_values = torch.empty_like(self.raw_keys)
+        max_compressed_rows = context_length // 4 + 2
+        self.compressed_rows = _PagedFamilyView(
+            cache=self,
+            family="compressed",
+            row_width=hidden_size,
+            max_rows=max_compressed_rows,
+        )
+        self.indexer_rows = _PagedFamilyView(
+            cache=self,
+            family="indexer",
+            row_width=DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,
+            max_rows=max_compressed_rows,
+        )
+        self.raw_token_indices = torch.full(
+            (num_layers, raw_window), -1, dtype=torch.long, device=device
+        )
+        self.compressed_token_indices = torch.full(
+            (num_layers, max_compressed_rows), -1, dtype=torch.long, device=device
+        )
+        self._compressed_counts = torch.zeros(
+            (num_layers,), dtype=torch.long, device=device
+        )
+        self._compressed_counts_cpu: list[int] = [0] * num_layers
+        self._families = {
+            "raw": _LazyPagedRows(
+                name="raw",
+                num_layers=num_layers,
+                num_blocks_per_layer=cdiv(raw_window, block_size),
+                block_size=block_size,
+                blocks_per_chunk=blocks_per_chunk,
+                row_shape=(hidden_size,),
+                tensors_per_row=2,
+                dtype=dtype,
+                device=device,
+            ),
+            "compressed": _LazyPagedRows(
+                name="compressed",
+                num_layers=num_layers,
+                num_blocks_per_layer=cdiv(max_compressed_rows, block_size),
+                block_size=block_size,
+                blocks_per_chunk=blocks_per_chunk,
+                row_shape=(hidden_size,),
+                tensors_per_row=1,
+                dtype=dtype,
+                device=device,
+            ),
+            "indexer": _LazyPagedRows(
+                name="indexer",
+                num_layers=num_layers,
+                num_blocks_per_layer=cdiv(max_compressed_rows, block_size),
+                block_size=block_size,
+                blocks_per_chunk=blocks_per_chunk,
+                row_shape=(DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,),
+                tensors_per_row=1,
+                dtype=dtype,
+                device=device,
+            ),
+        }
+
+    def num_allocated_chunks(self, family: str) -> int:
+        return self._families[family].num_allocated_chunks()
+
+    def free_request_blocks(self) -> None:
+        for family in self._families.values():
+            family.free_all()
+        self.raw_token_indices.fill_(-1)
+        self.compressed_token_indices.fill_(-1)
+        self._compressed_counts.zero_()
+        self._compressed_counts_cpu = [0] * self.num_layers
+
+    def append_raw(
+        self, layer_idx: int, token_idx: int, key: torch.Tensor, value: torch.Tensor
+    ) -> None:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        self._validate_raw_row("key", key)
+        self._validate_raw_row("value", value)
+        slot = token_idx % self.raw_window
+        self._families["raw"].write(layer_idx, slot, (key, value))
+        self.raw_token_indices[layer_idx, slot].copy_(
+            torch.full(
+                (), token_idx, dtype=torch.long, device=self.raw_token_indices.device
+            )
+        )
+
+    def read_raw_window(
+        self, layer_idx: int, token_idx: int, window: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if window > self.raw_window:
+            raise ValueError(f"window {window} exceeds raw_window {self.raw_window}")
+        start = max(0, token_idx - window + 1)
+        token_indices = self.raw_token_indices[layer_idx]
+        present = (token_indices >= start) & (token_indices <= token_idx)
+        slots = torch.nonzero(present, as_tuple=False).flatten()
+        if slots.numel() == 0:
+            empty = torch.empty(
+                (0, self.hidden_size),
+                dtype=self.raw_keys.dtype,
+                device=self.raw_keys.device,
+            )
+            return empty, empty.clone()
+        order = torch.argsort(token_indices[slots])
+        keys, values = self._families["raw"].read(layer_idx, slots[order])
+        return keys, values
+
+    def append_compressed(
+        self,
+        layer_idx: int,
+        token_idx: int,
+        row: torch.Tensor,
+        *,
+        indexer_row: torch.Tensor | None = None,
+    ) -> int:
+        self._validate_layer(layer_idx)
+        self._validate_token_idx(token_idx)
+        self._validate_raw_row("compressed row", row)
+        if indexer_row is not None:
+            if indexer_row.shape != (DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,):
+                raise ValueError(
+                    "indexer row shape must be "
+                    f"({DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim},); "
+                    f"got {tuple(indexer_row.shape)}"
+                )
+            if indexer_row.dtype != row.dtype:
+                raise ValueError(
+                    f"indexer row dtype must be {row.dtype}; got {indexer_row.dtype}"
+                )
+            if indexer_row.device != row.device:
+                raise ValueError(
+                    f"indexer row device must be {row.device}; got {indexer_row.device}"
+                )
+        slot = self._compressed_counts_cpu[layer_idx]
+        if slot >= self.compressed_token_indices.shape[1]:
+            raise ValueError("compressed cache capacity exceeded")
+        self._families["compressed"].write(layer_idx, slot, (row,))
+        self.compressed_token_indices[layer_idx, slot] = token_idx
+        if indexer_row is not None:
+            self._families["indexer"].write(layer_idx, slot, (indexer_row,))
+        self._compressed_counts[layer_idx] += 1
+        self._compressed_counts_cpu[layer_idx] += 1
+        return slot
+
+    def read_compressed(
+        self,
+        layer_idx: int,
+        *,
+        row_indices: torch.Tensor | None = None,
+        count: int | None = None,
+    ) -> torch.Tensor:
+        self._validate_layer(layer_idx)
+        provided_count = count
+        if count is None:
+            count = self._compressed_counts_cpu[layer_idx]
+        if row_indices is None:
+            row_indices = torch.arange(count, device=self.raw_keys.device)
+        if row_indices.ndim != 1:
+            raise ValueError(f"row_indices must be 1-D; got {row_indices.ndim}-D")
+        if row_indices.numel() == 0:
+            return torch.empty(
+                (0, self.hidden_size),
+                dtype=self.raw_keys.dtype,
+                device=self.raw_keys.device,
+            )
+        if provided_count is None and (
+            torch.any(row_indices < 0) or torch.any(row_indices >= count)
+        ):
+            raise ValueError("compressed row index out of range")
+        return self._families["compressed"].read(layer_idx, row_indices.to(torch.long))[
+            0
+        ]
+
+    def read_indexer_rows(
+        self, layer_idx: int, *, count: int | None = None
+    ) -> torch.Tensor:
+        self._validate_layer(layer_idx)
+        if count is None:
+            count = self._compressed_counts_cpu[layer_idx]
+        if count <= 0:
+            return torch.empty(
+                (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim),
+                dtype=self.raw_keys.dtype,
+                device=self.raw_keys.device,
+            )
+        row_indices = torch.arange(count, device=self.raw_keys.device)
+        return self._families["indexer"].read(layer_idx, row_indices)[0]
 
     def _validate_layer(self, layer_idx: int) -> None:
         if layer_idx < 0 or layer_idx >= self.num_layers:
