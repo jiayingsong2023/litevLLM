@@ -89,7 +89,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager_device: torch.device | None = None
         self._gpu_request_seq = 0
         self._gpu_kv_pools: dict[
-            tuple[int, int, torch.dtype, str], DeepSeekV4PagedKVCache
+            tuple[int, int, torch.dtype, str, int], DeepSeekV4PagedKVCache
         ] = {}
         self._deepseek_profiler = DeepSeekV4FlashProfiler(
             enabled=False,
@@ -124,6 +124,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         *,
         context_length: int,
         device: torch.device,
+        max_requests: int = 1,
     ) -> DeepSeekV4FlashGPURequestState:
         config = DeepSeekV4FlashGPUCacheConfig(
             context_length=context_length,
@@ -132,7 +133,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             kv_width=self.shape.head_dim,
             device=device,
         )
-        key = (context_length, self.shape.head_dim, config.dtype, str(device))
+        key = (
+            context_length,
+            self.shape.head_dim,
+            config.dtype,
+            str(device),
+            int(max_requests),
+        )
         pool = self._gpu_kv_pools.get(key)
         if pool is None:
             pool = DeepSeekV4PagedKVCache(
@@ -142,6 +149,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 num_layers=DEEPSEEK_V4_FLASH_SHAPE.num_layers,
                 dtype=config.dtype,
                 device=device,
+                max_requests=max_requests,
             )
             self._gpu_kv_pools[key] = pool
         request_id = f"gpu-{self._gpu_request_seq}"
@@ -776,6 +784,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             state = self._new_gpu_request_state(
                 context_length=context_length,
                 device=device,
+                max_requests=len(input_ids_list),
             )
             states.append(state)
 

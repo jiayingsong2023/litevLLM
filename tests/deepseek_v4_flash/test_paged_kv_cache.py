@@ -245,3 +245,41 @@ def test_paged_cache_returns_empty_indexer_rows_for_ratio128_layers() -> None:
     assert rows.shape == (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim)
     assert rows.dtype == torch.float32
 
+def test_paged_cache_sizes_allocator_for_concurrent_request_views() -> None:
+    pool = DeepSeekV4PagedKVCache(
+        context_length=128,
+        hidden_size=4,
+        num_layers=1,
+        block_size=16,
+        blocks_per_chunk=1,
+        max_requests=2,
+    )
+    first = pool.bind_request("first")
+    second = pool.bind_request("second")
+
+    for token_idx in range(128):
+        row = torch.full((4,), float(token_idx))
+        first.append_raw(layer_idx=0, token_idx=token_idx, key=row, value=row)
+        second.append_raw(layer_idx=0, token_idx=token_idx, key=row, value=row)
+
+    keys, _values = second.read_raw_window(layer_idx=0, token_idx=127, window=1)
+
+    torch.testing.assert_close(keys, torch.full((1, 4), 127.0))
+
+def test_model_request_state_pool_tracks_max_requests() -> None:
+    model = DeepSeekV4FlashForCausalLM()
+
+    first = model._new_gpu_request_state(
+        context_length=256,
+        device=torch.device("cpu"),
+        max_requests=2,
+    )
+    second = model._new_gpu_request_state(
+        context_length=256,
+        device=torch.device("cpu"),
+        max_requests=2,
+    )
+
+    assert first.kv_cache._pool is second.kv_cache._pool
+    assert first.kv_cache._pool.max_requests == 2
+

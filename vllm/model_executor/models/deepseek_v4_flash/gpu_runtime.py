@@ -8,7 +8,6 @@ import torch
 
 from .attention import build_deepseek_layer_rope_tables
 from .compressed_kv import (
-    DeepSeekV4CompressedKVLayout,
     DeepSeekV4PagedKVCache,
     DeepSeekV4PagedKVRequestCache,
 )
@@ -60,9 +59,6 @@ class DeepSeekV4FlashGPURequestState:
                 f"got {config.batch_size}"
             )
         self.config = config
-        self.layout = DeepSeekV4CompressedKVLayout(
-            context_length=config.context_length,
-        )
         device = config.device
         if device is None:
             device = torch.device("cuda")

@@ -295,6 +295,7 @@ class _LazyPagedRows:
         num_blocks_per_layer: int,
         block_size: int,
         blocks_per_chunk: int,
+        max_requests: int,
         row_shape: tuple[int, ...],
         tensors_per_row: int,
         dtype: torch.dtype,
@@ -305,6 +306,7 @@ class _LazyPagedRows:
         self.num_blocks_per_layer = int(num_blocks_per_layer)
         self.block_size = int(block_size)
         self.blocks_per_chunk = int(blocks_per_chunk)
+        self.max_requests = int(max_requests)
         self.row_shape = row_shape
         self.tensors_per_row = int(tensors_per_row)
         self.dtype = dtype
@@ -315,7 +317,11 @@ class _LazyPagedRows:
             raise ValueError("block_size must be positive")
         if self.blocks_per_chunk <= 0:
             raise ValueError("blocks_per_chunk must be positive")
-        self._num_total_blocks = self.num_layers * self.num_blocks_per_layer + 1
+        if self.max_requests <= 0:
+            raise ValueError("max_requests must be positive")
+        self._num_total_blocks = (
+            self.max_requests * self.num_layers * self.num_blocks_per_layer + 1
+        )
         self._allocator = BlockAllocator(self._num_total_blocks)
         self._request_blocks: dict[str, list[list[int]]] = {}
         self._chunks: dict[int, tuple[torch.Tensor, ...]] = {}
@@ -348,7 +354,8 @@ class _LazyPagedRows:
         layer_blocks = self._request_blocks.pop(request_id, None)
         if layer_blocks is None:
             return
-        # ponytail: grow-only pool; keep freed ids local for immediate request reuse.
+        # Grow-only chunk pool: keep freed block IDs local for immediate reuse
+        # instead of returning them to the allocator, avoiding GPU memory churn.
         self._reuse_ids.extend(
             block_id for blocks in layer_blocks for block_id in reversed(blocks)
         )
@@ -654,6 +661,7 @@ class DeepSeekV4PagedKVCache:
         device: torch.device | str | None = None,
         block_size: int = 16,
         blocks_per_chunk: int = 64,
+        max_requests: int = 1,
     ) -> None:
         DeepSeekV4FlashMemoryPolicy().validate_context_length(context_length)
         if hidden_size <= 0:
@@ -665,15 +673,24 @@ class DeepSeekV4PagedKVCache:
             )
         if num_layers <= 0 or num_layers > DEEPSEEK_V4_FLASH_SHAPE.num_layers:
             raise ValueError(f"num_layers out of range: {num_layers}")
+        if max_requests <= 0:
+            raise ValueError("max_requests must be positive")
 
         self.context_length = int(context_length)
         self.hidden_size = int(hidden_size)
         self.raw_window = int(raw_window)
         self.num_layers = int(num_layers)
+        self.max_requests = int(max_requests)
         self.max_compressed_rows = context_length // 4 + 2
         self._dtype = dtype
         self._device = torch.empty((), dtype=dtype, device=device).device
+        self._raw_keys_placeholder = torch.empty(
+            (0, self.hidden_size), dtype=self.dtype, device=self.device
+        )
+        self._raw_values_placeholder = torch.empty_like(self._raw_keys_placeholder)
         self._request_states: dict[str, _PagedRequestState] = {}
+        # Default-request views are kept for tests/debugging and dense-cache API
+        # compatibility. Production request state uses bind_request().
         self.compressed_rows = _PagedFamilyView(
             cache=self,
             request_id=_DEFAULT_REQUEST_ID,
@@ -695,6 +712,7 @@ class DeepSeekV4PagedKVCache:
                 num_blocks_per_layer=cdiv(raw_window, block_size),
                 block_size=block_size,
                 blocks_per_chunk=blocks_per_chunk,
+                max_requests=max_requests,
                 row_shape=(hidden_size,),
                 tensors_per_row=2,
                 dtype=dtype,
@@ -706,6 +724,7 @@ class DeepSeekV4PagedKVCache:
                 num_blocks_per_layer=cdiv(self.max_compressed_rows, block_size),
                 block_size=block_size,
                 blocks_per_chunk=blocks_per_chunk,
+                max_requests=max_requests,
                 row_shape=(hidden_size,),
                 tensors_per_row=1,
                 dtype=dtype,
@@ -717,6 +736,7 @@ class DeepSeekV4PagedKVCache:
                 num_blocks_per_layer=cdiv(self.max_compressed_rows, block_size),
                 block_size=block_size,
                 blocks_per_chunk=blocks_per_chunk,
+                max_requests=max_requests,
                 row_shape=(DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim,),
                 tensors_per_row=1,
                 dtype=dtype,
@@ -757,11 +777,11 @@ class DeepSeekV4PagedKVCache:
 
     @property
     def raw_keys(self) -> torch.Tensor:
-        return torch.empty((0, self.hidden_size), dtype=self.dtype, device=self.device)
+        return self._raw_keys_placeholder
 
     @property
     def raw_values(self) -> torch.Tensor:
-        return torch.empty((0, self.hidden_size), dtype=self.dtype, device=self.device)
+        return self._raw_values_placeholder
 
     def num_allocated_chunks(self, family: str) -> int:
         return self._families[family].num_allocated_chunks()

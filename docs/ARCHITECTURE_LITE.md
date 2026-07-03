@@ -314,9 +314,10 @@ Architecturally, DeepSeek does not use the generic PagedAttention algorithm or
 the lite engine's flat KV pool. Its direct GPU path uses a model-level
 `DeepSeekV4PagedKVCache` shared by request states. The pool owns separate lazy
 physical row families for raw sliding-window rows, compressed rows, and ratio-4
-indexer rows; each family uses `BlockAllocator` for block IDs and keeps
-request-local metadata for raw token indices and per-layer compressed counts.
-`DeepSeekV4CompressedKVCache` remains the dense reference cache path only.
+indexer rows; each family uses `BlockAllocator` for block IDs sized by the
+pool's `max_requests` and keeps request-local metadata for raw token indices
+and per-layer compressed counts. `DeepSeekV4CompressedKVCache` remains the
+dense reference cache path only.
 
 The current performance work moved the hot path from CPU reference decoding to
 GPU execution for Q8 projections, selected IQ2 gate/up, Q2 down experts,
