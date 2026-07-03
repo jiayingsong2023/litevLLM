@@ -53,6 +53,15 @@ targets.
   direct runtime, not by a model-name branch in `LiteEngine`.
 - Gemma4 model code has been split from a large monolithic module into the
   `vllm/model_executor/models/gemma4/` package.
+- `FlatKVCacheAllocator` allocates all per-layer K/V caches (and optional scale
+  caches) from a single flat GPU buffer; per-layer views preserve the existing
+  PagedAttention / `reshape_and_cache` tensor contract.
+- `BlockAllocator` manages physical KV cache block IDs from a global free list
+  with a reserved null block (ID 0).
+- `KVBlockManager` maintains per-request dynamic block tables and supports
+  prefix-cache capture/materialize at block granularity.
+- `InputBatchBuilder` constructs slot mappings through the
+  `compute_slot_mapping` Triton kernel using dynamic per-request block tables.
 - `vllm/worker/`, `vllm/core/`, and `vllm/distributed/` have been removed from
   the code tree.
 

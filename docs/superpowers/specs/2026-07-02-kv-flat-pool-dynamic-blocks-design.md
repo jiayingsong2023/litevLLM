@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-02  
 **Author:** Kimi Code CLI  
-**Status:** Pending user review
+**Status:** Implemented on `feat/kv-flat-pool` and merged into the maintained lite runtime. DeepSeek V4 Flash KV management remains out of scope (see Out of Scope).
 
 ## Summary
 

@@ -56,7 +56,7 @@ flowchart TD
 
 | Module | Responsibility |
 | :--- | :--- |
-| `kv_cache_allocator.py` | Compute KV cache shapes and allocate the paged K/V pool plus optional TurboQuant scale caches. |
+| `flat_kv_cache_allocator.py` / `kv_cache_allocator.py` | Compute KV cache shapes and allocate the flat pooled K/V buffer plus optional TurboQuant scale caches; `BlockAllocator` hands out physical block IDs from the reserved pool. |
 | `memory_auditor.py` | Snapshot CUDA-resident model tensor footprint for startup diagnostics. |
 | `runtime_component_factory.py` / `LiteRuntimeAssembler` | Build the runtime component graph consumed by `LiteEngine`. |
 
@@ -228,17 +228,22 @@ policy and loader coverage instead of restoring generic upstream wrappers.
 
 ## Attention And Kernels
 
-The maintained decode path uses Triton PagedAttention. Prefill uses the
-current hardware-backed SDPA path where appropriate. AWQ decode and Gemma4
-paths include specialized Triton kernels for fused QKV, fused gate/up, M=1
-GEMV, and selected MoE decode shapes.
+The maintained decode path uses Triton PagedAttention over a single flat KV
+pool. All per-layer K/V caches (and optional scale caches) are views into one
+contiguous GPU buffer allocated by `FlatKVCacheAllocator`. Physical blocks are
+assigned to requests dynamically by `BlockAllocator` and tracked per request by
+`KVBlockManager`; `InputBatchBuilder` uses the `compute_slot_mapping` Triton
+kernel to map token positions through per-request block tables into linear slot
+indices. Prefill uses the current hardware-backed SDPA path where appropriate.
+AWQ decode and Gemma4 paths include specialized Triton kernels for fused QKV,
+fused gate/up, M=1 GEMV, and selected MoE decode shapes.
 
 PagedAttention is the maintained decode attention path. The request state tracks
 logical sequence length and slot assignment; decode kernels read the KV cache
-through block tables instead of treating every request as one contiguous KV
-tensor. This keeps decode memory access bounded around physical KV blocks and
-allows active requests with different sequence lengths to share the same decode
-batch shape.
+through dynamic block tables instead of treating every request as one contiguous
+KV tensor. This keeps decode memory access bounded around physical KV blocks and
+allows active requests with different sequence lengths to share the same global
+pool and decode batch shape.
 
 ```mermaid
 flowchart TD
@@ -305,10 +310,14 @@ The model-local package owns the heavy work:
 | `gpu_layers.py` / `model.py` | Layer orchestration, sliding/compressed attention, MoE routing, output projection. |
 | `kernels/triton/deepseek_v4_flash/` | Q8 linear, Q2/IQ2 MoE matvec, attention/cache/output kernels. |
 
-Architecturally, DeepSeek does not use the generic PagedAttention algorithm, but
-it keeps the same important memory rule: growing context must not require one
-large contiguous KV allocation. Its raw sliding-window rows, compressed rows,
-and ratio-4 indexer rows are owned by DeepSeek-specific paged/cache structures.
+Architecturally, DeepSeek does not use the generic PagedAttention algorithm or
+the lite engine's flat KV pool. Instead, each request's state owns its own raw
+sliding-window rows, compressed rows, and ratio-4 indexer rows in
+`DeepSeekV4CompressedKVCache`. These buffers are currently allocated up to the
+request's `context_length` at request-state creation time, not handed out
+dynamically from the global `BlockAllocator`. The `DeepSeekV4KVPageAllocator`
+provides logical page/offset resolution for these buffers but does not perform
+physical block allocation.
 
 The current performance work moved the hot path from CPU reference decoding to
 GPU execution for Q8 projections, selected IQ2 gate/up, Q2 down experts,
