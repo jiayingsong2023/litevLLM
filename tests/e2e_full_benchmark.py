@@ -196,7 +196,9 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         display_name="DeepSeek V4 Flash Q2 GGUF",
         quant="deepseek-v4-flash-gguf",
         concurrent_reqs=1,
-        prompt_tokens_target=4096,
+        # DeepSeek direct prefill is currently sequential token replay.
+        # Keep the default smoke short; use --deepseek-prompt-tokens for long runs.
+        prompt_tokens_target=32,
         max_new_tokens=16,
         gpu_memory_utilization=0.90,
         max_model_len=4096,
@@ -2680,6 +2682,27 @@ def _deepseek_smoke_payload_to_benchmark_result(
             if isinstance(run, dict) and "decode_ms_total" in run
         ]
     )
+    explicit_prefill_tokens = _finite_values(
+        [
+            float(run.get("prefill_tokens_total", 0.0))
+            for run in runs
+            if isinstance(run, dict) and "prefill_tokens_total" in run
+        ]
+    )
+    explicit_prefill_ms = _finite_values(
+        [
+            float(run.get("prefill_ms_total", 0.0))
+            for run in runs
+            if isinstance(run, dict) and "prefill_ms_total" in run
+        ]
+    )
+    prefill_tps_values = _finite_values(
+        [
+            float(run.get("prefill_tps", 0.0))
+            for run in runs
+            if isinstance(run, dict) and "prefill_tps" in run
+        ]
+    )
     max_tokens = float(payload.get("max_tokens", spec.max_new_tokens) or 0.0)
     repeat = float(payload.get("repeat", len(runs) or 1) or 1.0)
     decode_tokens_total = (
@@ -2694,9 +2717,23 @@ def _deepseek_smoke_payload_to_benchmark_result(
         if elapsed_ms_values
         else 0.0
     )
+    prompt_length = float(
+        payload.get("prompt_length", spec.prompt_tokens_target) or 0.0
+    )
+    prefill_tokens_total = (
+        float(sum(explicit_prefill_tokens))
+        if explicit_prefill_tokens
+        else max(prompt_length - 1.0, 0.0) * repeat
+    )
+    prefill_ms_total = float(sum(explicit_prefill_ms)) if explicit_prefill_ms else 0.0
     decode_tps_aggregate = (
         decode_tokens_total * 1000.0 / decode_ms_total
         if decode_tokens_total > 0.0 and decode_ms_total > 0.0
+        else 0.0
+    )
+    prefill_tps_aggregate = (
+        prefill_tokens_total * 1000.0 / prefill_ms_total
+        if prefill_tokens_total > 0.0 and prefill_ms_total > 0.0
         else 0.0
     )
     aggregate_tps = (
@@ -2716,27 +2753,31 @@ def _deepseek_smoke_payload_to_benchmark_result(
         "ttft_p50_ms": (
             median(elapsed_ms_values) if elapsed_ms_values else float("nan")
         ),
-        "ttft_p95_ms": (
-            _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
-        ),
+        "ttft_p95_ms": (_p95(elapsed_ms_values) if elapsed_ms_values else float("nan")),
         "e2e_p50_ms": (
             median(elapsed_ms_values) if elapsed_ms_values else float("nan")
         ),
-        "e2e_p95_ms": (
-            _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
+        "e2e_p95_ms": (_p95(elapsed_ms_values) if elapsed_ms_values else float("nan")),
+        "prefill_p50_ms": (
+            median(explicit_prefill_ms) if explicit_prefill_ms else float("nan")
         ),
-        "prefill_p50_ms": float("nan"),
-        "prefill_p95_ms": float("nan"),
+        "prefill_p95_ms": (
+            _p95(explicit_prefill_ms) if explicit_prefill_ms else float("nan")
+        ),
         "decode_p50_ms": (
             median(elapsed_ms_values) if elapsed_ms_values else float("nan")
         ),
         "decode_p95_ms": (
             _p95(elapsed_ms_values) if elapsed_ms_values else float("nan")
         ),
-        "prompt_tokens_total": 1.0,
-        "prefill_tps_aggregate": 0.0,
-        "prefill_tps_p50": float("nan"),
-        "prefill_tps_p95": float("nan"),
+        "prompt_tokens_total": prefill_tokens_total,
+        "prefill_tps_aggregate": prefill_tps_aggregate,
+        "prefill_tps_p50": (
+            median(prefill_tps_values) if prefill_tps_values else float("nan")
+        ),
+        "prefill_tps_p95": (
+            _p95(prefill_tps_values) if prefill_tps_values else float("nan")
+        ),
         "decode_ms_total": decode_ms_total,
         "decode_tokens_total": decode_tokens_total,
         "decode_tps_aggregate": decode_tps_aggregate,
@@ -2750,9 +2791,8 @@ def _deepseek_smoke_payload_to_benchmark_result(
         "awq_metrics": {},
         "workload": {
             "kind": "deepseek_v4_flash_direct_gguf",
-            "context_length": int(
-                payload.get("context_length", spec.max_model_len)
-            ),
+            "context_length": int(payload.get("context_length", spec.max_model_len)),
+            "prompt_length": int(prompt_length),
             "max_tokens": int(max_tokens),
         },
         "stable_env": dict(spec.stable_env),
@@ -2766,9 +2806,7 @@ def _deepseek_smoke_payload_to_benchmark_result(
                 ),
                 "phase3_metrics": payload.get("phase3_metrics", {}),
                 "phase4_metrics": payload.get("phase4_metrics", {}),
-                "usable_inference_metrics": payload.get(
-                    "usable_inference_metrics", {}
-                ),
+                "usable_inference_metrics": payload.get("usable_inference_metrics", {}),
             }
         },
         "warmup_trace": [],
@@ -2816,6 +2854,8 @@ def _run_deepseek_v4_flash_direct_benchmark(
     else:
         command.extend(
             [
+                "--prompt-length",
+                str(spec.prompt_tokens_target),
                 "--warmup-tokens",
                 str(spec.max_new_tokens),
                 "--repeat",
@@ -3114,6 +3154,13 @@ def _parse_args() -> argparse.Namespace:
             "Override concurrent request count (batch width) for "
             "deepseek_v4_flash_q2_gguf only. Default from MODEL_SPECS is 1."
         ),
+    )
+    parser.add_argument(
+        "--deepseek-prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override prompt token target for deepseek_v4_flash_q2_gguf.",
     )
     parser.add_argument(
         "--warmup-prefill-rounds",
@@ -3424,6 +3471,14 @@ async def main() -> None:
                 concurrent_reqs=n,
                 max_run_seconds=max(spec.max_run_seconds, 120 * n),
             )
+        if (
+            key == "deepseek_v4_flash_q2_gguf"
+            and args.deepseek_prompt_tokens is not None
+        ):
+            n = int(args.deepseek_prompt_tokens)
+            if n < 1:
+                raise ValueError("--deepseek-prompt-tokens must be >= 1")
+            spec = replace(spec, prompt_tokens_target=n)
         specs.append(spec)
 
     print("=" * 72)

@@ -55,11 +55,18 @@ class DeepSeekV4FlashDirectRuntime:
         self._validate_sampling(sampling_params)
         max_tokens = int(sampling_params.max_tokens or 1)
         prompt_token_ids, input_ids = self._encode_prompt(prompt)
-        output_ids = self.model.generate_greedy_kernel(
-            input_ids,
-            max_tokens=max_tokens,
-            use_graph=False,
-        )
+        prefill = getattr(self.model, "prefill_greedy_kernel", None)
+        decode = getattr(self.model, "decode_greedy_kernel", None)
+        if callable(prefill) and callable(decode):
+            session = prefill(input_ids, max_tokens=max_tokens)
+            decoded = decode(session, max_tokens=max_tokens, use_graph=False)
+            output_ids = decoded[0] if isinstance(decoded, tuple) else decoded
+        else:
+            output_ids = self.model.generate_greedy_kernel(
+                input_ids,
+                max_tokens=max_tokens,
+                use_graph=False,
+            )
         return self._build_request_output(
             request_id=request_id,
             prompt=prompt,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -56,6 +57,18 @@ _READONLY_BUFFER_WARNING = "The given buffer is not writable"
 
 if TYPE_CHECKING:
     from .decode_graph import DeepSeekV4FlashDecodeGraph
+
+
+@dataclass
+class DeepSeekV4FlashGreedyKernelSession:
+    state: DeepSeekV4FlashGPURequestState
+    output_ids: torch.Tensor
+    input_token_count: int
+    token_id_tensor: torch.Tensor
+    token_id: int | None
+    device: torch.device
+    decode_graphs: dict[int, DeepSeekV4FlashDecodeGraph]
+    decode_graph_window_shapes: dict[int, dict[int, tuple[int, ...]]]
 
 
 class DeepSeekV4FlashForCausalLM(nn.Module):
@@ -1089,14 +1102,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             device = torch.device("cuda")
         return device
 
-    def _generate_greedy_kernel_impl(
+    def prefill_greedy_kernel(
         self,
         input_ids: torch.Tensor,
         *,
         max_tokens: int,
-        record_token_times: bool,
-        use_graph: bool,
-    ) -> tuple[torch.Tensor, list[float]]:
+    ) -> DeepSeekV4FlashGreedyKernelSession:
         self._require_weight_store()
         device = self._validate_generate_greedy_kernel_input(
             input_ids,
@@ -1134,9 +1145,34 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token_id_tensor = output_ids[input_token_count - 1].reshape(())
         eos_token_id = self._eos_token_id()
         token_id = int(token_id_tensor.item()) if eos_token_id is not None else None
+        return DeepSeekV4FlashGreedyKernelSession(
+            state=state,
+            output_ids=output_ids,
+            input_token_count=input_token_count,
+            token_id_tensor=token_id_tensor,
+            token_id=token_id,
+            device=device,
+            decode_graphs={},
+            decode_graph_window_shapes={},
+        )
 
-        decode_graphs: dict[int, DeepSeekV4FlashDecodeGraph] = {}
-        decode_graph_window_shapes: dict[int, dict[int, tuple[int, ...]]] = {}
+    def decode_greedy_kernel(
+        self,
+        session: DeepSeekV4FlashGreedyKernelSession,
+        *,
+        max_tokens: int,
+        record_token_times: bool = False,
+        use_graph: bool = False,
+    ) -> tuple[torch.Tensor, list[float]]:
+        state = session.state
+        output_ids = session.output_ids
+        input_token_count = session.input_token_count
+        token_id_tensor = session.token_id_tensor
+        token_id = session.token_id
+        device = session.device
+        decode_graphs = session.decode_graphs
+        decode_graph_window_shapes = session.decode_graph_window_shapes
+        eos_token_id = self._eos_token_id()
 
         token_elapsed_ms: list[float] = []
         for generated_idx in range(max_tokens):
@@ -1247,6 +1283,25 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         state.reset()
         return output_ids, token_elapsed_ms
+
+    def _generate_greedy_kernel_impl(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+        record_token_times: bool,
+        use_graph: bool,
+    ) -> tuple[torch.Tensor, list[float]]:
+        session = self.prefill_greedy_kernel(
+            input_ids,
+            max_tokens=max_tokens,
+        )
+        return self.decode_greedy_kernel(
+            session,
+            max_tokens=max_tokens,
+            record_token_times=record_token_times,
+            use_graph=use_graph,
+        )
 
     def _eos_token_id(self) -> int | None:
         store = self._require_weight_store()
@@ -1621,6 +1676,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
         self._gpu_weight_stager.profiler = self._deepseek_profiler
+        self.gpu_backend.profiler = self._deepseek_profiler
         return self._gpu_weight_stager
 
     @staticmethod

@@ -31,7 +31,7 @@ class _FakeTokenizer:
 class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
     def __init__(self) -> None:
         super().__init__()
-        self.calls: list[tuple[list[int], int, str]] = []
+        self.calls: list[tuple[str, list[int] | None, int, str | None]] = []
         self.prepared: tuple[int, str] | None = None
 
     def prepare_for_serving(
@@ -43,6 +43,38 @@ class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
         self.prepared = (context_length, device.type)
         return {}
 
+    def prefill_greedy_kernel(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+    ) -> object:
+        self.calls.append(
+            (
+                "prefill",
+                input_ids.detach().cpu().tolist(),
+                max_tokens,
+                input_ids.device.type,
+            )
+        )
+        return {"device": input_ids.device, "input_ids": input_ids}
+
+    def decode_greedy_kernel(
+        self,
+        session: object,
+        *,
+        max_tokens: int,
+        use_graph: bool = False,
+    ) -> torch.Tensor:
+        sess = session if isinstance(session, dict) else {}
+        self.calls.append(("decode", None, max_tokens, str(use_graph)))
+        assert max_tokens == 2
+        return torch.tensor(
+            [3, 7, 11, 12],
+            dtype=torch.long,
+            device=sess["device"],
+        )
+
     def generate_greedy_kernel(
         self,
         input_ids: torch.Tensor,
@@ -50,20 +82,7 @@ class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
         max_tokens: int = 1,
         use_graph: bool = False,
     ) -> torch.Tensor:
-        self.calls.append(
-            (
-                input_ids.detach().cpu().tolist(),
-                max_tokens,
-                input_ids.device.type,
-                use_graph,
-            )
-        )
-        assert max_tokens == 2
-        return torch.tensor(
-            [3, 7, 11, 12],
-            dtype=torch.long,
-            device=input_ids.device,
-        )
+        raise AssertionError("direct runtime should use explicit prefill/decode stages")
 
 
 def _deepseek_engine() -> LiteEngine:
@@ -97,7 +116,10 @@ def test_lite_engine_deepseek_direct_greedy_uses_kernel_generate() -> None:
     assert output.finished is True
     assert output.outputs[0].text == "world"
     assert output.outputs[0].token_ids == [11, 12]
-    assert engine.model.calls == [([3, 7], 2, engine.device.type, False)]
+    assert engine.model.calls == [
+        ("prefill", [3, 7], 2, engine.device.type),
+        ("decode", None, 2, "False"),
+    ]
 
 
 def test_lite_engine_deepseek_direct_rejects_non_greedy_sampling() -> None:

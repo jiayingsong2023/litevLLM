@@ -90,6 +90,8 @@ def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
             "8",
             "--warmup-tokens",
             "4",
+            "--prompt-length",
+            "17",
             "--repeat",
             "2",
             "--min-steady-decode-tps",
@@ -103,6 +105,7 @@ def test_smoke_parser_accepts_profile_and_repeat_args(tmp_path: Path) -> None:
     assert args.context_length == 4096
     assert args.max_tokens == 8
     assert args.warmup_tokens == 4
+    assert args.prompt_length == 17
     assert args.repeat == 2
     assert args.min_steady_decode_tps == 1.25
     assert args.profile_json == profile_path
@@ -221,6 +224,62 @@ def test_smoke_timed_generate_prefers_model_timed_api() -> None:
     assert token_elapsed_ms == [12.0, 34.0]
 
 
+def test_smoke_stage_timing_uses_explicit_prefill_decode(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class FakeEvent:
+        calls = 0
+
+        def __init__(self, **_kwargs: object) -> None:
+            self.idx = FakeEvent.calls
+            FakeEvent.calls += 1
+
+        def record(self) -> None:
+            pass
+
+        def elapsed_time(self, _other: object) -> float:
+            return 25.0
+
+    class StagedModel:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def prefill_greedy_kernel(
+            self, input_ids: list[int], *, max_tokens: int
+        ) -> object:
+            self.calls.append(f"prefill:{input_ids}:{max_tokens}")
+            return {"input_ids": input_ids}
+
+        def decode_greedy_kernel(
+            self,
+            session: object,
+            *,
+            max_tokens: int,
+            record_token_times: bool = False,
+            use_graph: bool = False,
+        ) -> tuple[list[int], list[float]]:
+            assert session == {"input_ids": [1, 2]}
+            assert record_token_times is True
+            assert use_graph is False
+            self.calls.append(f"decode:{max_tokens}")
+            return [1, 2, 3, 4], [11.0, 12.0]
+
+    model = StagedModel()
+    monkeypatch.setattr(smoke.torch.cuda, "Event", lambda **kwargs: FakeEvent(**kwargs))
+    monkeypatch.setattr(smoke.torch.cuda, "synchronize", lambda: None)
+
+    output_ids, token_elapsed_ms, prefill_ms = smoke.generate_greedy_with_stage_timings(
+        model,
+        [1, 2],
+        max_tokens=2,
+    )
+
+    assert output_ids == [1, 2, 3, 4]
+    assert token_elapsed_ms == [11.0, 12.0]
+    assert prefill_ms == 25.0
+    assert model.calls == ["prefill:[1, 2]:2", "decode:2"]
+
+
 def test_smoke_timed_generate_falls_back_to_single_token_calls(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -301,6 +360,61 @@ def test_e2e_deepseek_parser_prefers_steady_state_decode_metrics() -> None:
     assert result["decode_ms_total"] == 14700.0
     assert result["decode_tps_aggregate"] == 16 * 1000.0 / 14700.0
     assert result["decode_tps_p50"] == 15 * 1000.0 / 13500.0
+
+
+def test_e2e_deepseek_parser_maps_prefill_metrics() -> None:
+    spec = e2e_benchmark.ModelSpec(
+        key="deepseek",
+        model_path="model.gguf",
+        display_name="DeepSeek",
+        quant="deepseek-v4-flash-gguf",
+        concurrent_reqs=1,
+        prompt_tokens_target=32,
+        max_new_tokens=4,
+        gpu_memory_utilization=0.9,
+        max_model_len=4096,
+        max_run_seconds=60,
+        stable_env={},
+    )
+    payload = {
+        "context_length": 4096,
+        "prompt_length": 32,
+        "max_tokens": 4,
+        "repeat": 2,
+        "runs": [
+            {
+                "elapsed_ms": 120.0,
+                "prefill_tokens_total": 31,
+                "prefill_ms_total": 62.0,
+                "prefill_tps": 500.0,
+                "decode_tokens_total": 4,
+                "decode_ms_total": 58.0,
+                "decode_tps_steady_state": 80.0,
+            },
+            {
+                "elapsed_ms": 100.0,
+                "prefill_tokens_total": 31,
+                "prefill_ms_total": 50.0,
+                "prefill_tps": 620.0,
+                "decode_tokens_total": 4,
+                "decode_ms_total": 50.0,
+                "decode_tps_steady_state": 80.0,
+            },
+        ],
+    }
+
+    result = e2e_benchmark._deepseek_smoke_payload_to_benchmark_result(
+        spec,
+        payload,
+        wall_sec=1.0,
+    )
+
+    assert result["prompt_tokens_total"] == 62.0
+    assert result["prefill_p50_ms"] == 56.0
+    assert result["prefill_tps_aggregate"] == 62.0 * 1000.0 / 112.0
+    assert result["prefill_tps_p50"] == 560.0
+    assert result["decode_ms_total"] == 108.0
+    assert result["decode_tokens_total"] == 8.0
 
 
 def test_quality_parser_accepts_readability_args(tmp_path: Path) -> None:
@@ -488,6 +602,7 @@ def test_quality_topk_records_decode_text() -> None:
     records = quality.topk_records(
         torch_logits=[0.1, 5.0, 1.0],
         gguf_tokens=["<s>", "Paris", " London"],
+        tokenizer=None,
         k=2,
     )
 
@@ -552,9 +667,11 @@ def test_quality_main_payload_includes_performance_metrics(
 
     stdout_payload = json.loads(capsys.readouterr().out)
     file_payload = json.loads(json_path.read_text(encoding="utf-8"))
-    assert stdout_payload["performance"] == file_payload["performance"]
-    assert stdout_payload["gpu_staging"] == {"prefetch_payload_hits": 1}
-    assert stdout_payload["performance"] == {
+    stdout_case = stdout_payload["cases"][0]
+    file_case = file_payload["cases"][0]
+    assert stdout_case["performance"] == file_case["performance"]
+    assert stdout_case["gpu_staging"] == {"prefetch_payload_hits": 1}
+    assert stdout_case["performance"] == {
         "generated_tokens": 2,
         "metric_scope": "direct_generation_total",
         "total_elapsed_ms": 500.0,
@@ -620,14 +737,15 @@ def test_quality_main_payload_includes_repeat_performance_summary(
     assert quality.main() == 0
 
     stdout_payload = json.loads(capsys.readouterr().out)
+    stdout_case = stdout_payload["cases"][0]
     assert call_max_tokens == [1, 2, 2]
-    assert stdout_payload["performance"] == {
+    assert stdout_case["performance"] == {
         "generated_tokens": 2,
         "metric_scope": "direct_generation_total",
         "total_elapsed_ms": 500.0,
         "decode_tokens_per_second": 4.0,
     }
-    assert stdout_payload["performance_summary"] == {
+    assert stdout_case["performance_summary"] == {
         "repeat": 2,
         "decode_tps_values": [4.0, 2.0],
         "decode_tps_min": 2.0,
@@ -692,9 +810,10 @@ def test_quality_main_fails_explicit_decode_tps_gate(
     assert quality.main() == 1
 
     stdout_payload = json.loads(capsys.readouterr().out)
-    assert stdout_payload["readability"]["passed"] is True
-    assert stdout_payload["performance_summary"]["decode_tps_min"] == 2.0
-    assert stdout_payload["performance_gates"] == {
+    stdout_case = stdout_payload["cases"][0]
+    assert stdout_case["readability"]["passed"] is True
+    assert stdout_case["performance_summary"]["decode_tps_min"] == 2.0
+    assert stdout_case["performance_gates"] == {
         "passed": False,
         "reasons": ["decode_tps_below_min"],
         "min_decode_tps": 3.0,
@@ -927,3 +1046,25 @@ def test_usable_inference_metrics_schema_is_stable() -> None:
         "routed_expert_id_materializations": 8,
         "streamed_bytes": 9,
     }
+
+
+def test_smoke_expert_cost_metrics_extract_profile_sections() -> None:
+    profile = {
+        "aggregate_by_name": {
+            "selected_experts_activation_direct": {"total_ms": 12.5, "count": 4},
+            "selected_experts_down_projection_direct": {"total_ms": 7.0, "count": 4},
+            "selected_experts_payload_pack": {"total_ms": 1.5, "count": 4},
+            "q8_roundtrip_input": {"total_ms": 2.0, "count": 2},
+            "stage_payload_read_clone": {"total_ms": 3.0, "count": 1},
+            "stage_payload_h2d_copy": {"total_ms": 4.0, "count": 1},
+        }
+    }
+    metrics = smoke.expert_cost_metrics(profile=profile)
+
+    assert metrics["selected_experts_activation_direct_ms"] == 12.5
+    assert metrics["selected_experts_down_projection_direct_ms"] == 7.0
+    assert metrics["selected_experts_payload_pack_ms"] == 1.5
+    assert metrics["q8_roundtrip_ms"] == 2.0
+    assert metrics["stage_payload_read_clone_ms"] == 3.0
+    assert metrics["stage_payload_h2d_copy_ms"] == 4.0
+    assert metrics["selected_experts_activation_direct_count"] == 4

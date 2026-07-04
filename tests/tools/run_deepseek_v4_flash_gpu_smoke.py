@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 from time import perf_counter
@@ -52,6 +53,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--prompt-token-id", type=int, default=1)
+    parser.add_argument(
+        "--prompt-length",
+        type=int,
+        default=1,
+        help="Number of repeated prompt tokens to replay before decode timing.",
+    )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--warmup-tokens", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=1)
@@ -155,10 +162,20 @@ def decode_profile_top_sections(
     if not isinstance(top_events, list):
         return []
     return [
-        dict(event)
-        for event in top_events[: max(limit, 0)]
-        if isinstance(event, dict)
+        dict(event) for event in top_events[: max(limit, 0)] if isinstance(event, dict)
     ]
+
+
+def _call_generate_greedy(
+    generate: object,
+    input_ids: torch.Tensor,
+    *,
+    max_tokens: int,
+    use_graph: bool,
+) -> object:
+    if "use_graph" in inspect.signature(generate).parameters:
+        return generate(input_ids, max_tokens=max_tokens, use_graph=use_graph)  # type: ignore[misc]
+    return generate(input_ids, max_tokens=max_tokens)  # type: ignore[misc]
 
 
 def generate_greedy_with_token_timings(
@@ -166,11 +183,12 @@ def generate_greedy_with_token_timings(
     input_ids: torch.Tensor,
     *,
     max_tokens: int,
-    use_graph: bool,
+    use_graph: bool = False,
 ) -> tuple[torch.Tensor, list[float]]:
     timed_generate = getattr(model, "generate_greedy_kernel_timed", None)
     if timed_generate is not None:
-        output_ids, token_elapsed_ms = timed_generate(
+        output_ids, token_elapsed_ms = _call_generate_greedy(
+            timed_generate,
             input_ids,
             max_tokens=max_tokens,
             use_graph=use_graph,
@@ -183,7 +201,8 @@ def generate_greedy_with_token_timings(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        output_ids = model.generate_greedy_kernel(
+        output_ids = _call_generate_greedy(
+            model.generate_greedy_kernel,
             output_ids,
             max_tokens=1,
             use_graph=use_graph,
@@ -192,6 +211,143 @@ def generate_greedy_with_token_timings(
         torch.cuda.synchronize()
         token_elapsed_ms.append(float(start_event.elapsed_time(end_event)))
     return output_ids, token_elapsed_ms
+
+
+def _call_decode_greedy(
+    decode: object,
+    session: object,
+    *,
+    max_tokens: int,
+    record_token_times: bool,
+    use_graph: bool,
+) -> object:
+    params = inspect.signature(decode).parameters
+    kwargs: dict[str, object] = {"max_tokens": max_tokens}
+    if "record_token_times" in params:
+        kwargs["record_token_times"] = record_token_times
+    if "use_graph" in params:
+        kwargs["use_graph"] = use_graph
+    return decode(session, **kwargs)  # type: ignore[misc]
+
+
+def generate_greedy_with_stage_timings(
+    model: DeepSeekV4FlashForCausalLM,
+    input_ids: torch.Tensor,
+    *,
+    max_tokens: int,
+    use_graph: bool = False,
+) -> tuple[torch.Tensor, list[float], float]:
+    prefill = getattr(model, "prefill_greedy_kernel", None)
+    decode = getattr(model, "decode_greedy_kernel", None)
+    if callable(prefill) and callable(decode):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        session = prefill(input_ids, max_tokens=max_tokens)
+        end_event.record()
+        torch.cuda.synchronize()
+        prefill_ms = float(start_event.elapsed_time(end_event))
+        decoded = _call_decode_greedy(
+            decode,
+            session,
+            max_tokens=max_tokens,
+            record_token_times=True,
+            use_graph=use_graph,
+        )
+        if isinstance(decoded, tuple):
+            output_ids, token_elapsed_ms = decoded
+        else:
+            output_ids = decoded
+            token_elapsed_ms = []
+        return output_ids, [float(ms) for ms in token_elapsed_ms], prefill_ms
+
+    output_ids, token_elapsed_ms = generate_greedy_with_token_timings(
+        model,
+        input_ids,
+        max_tokens=max_tokens,
+        use_graph=use_graph,
+    )
+    return output_ids, token_elapsed_ms, 0.0
+
+
+def _profile_total(profile: dict[str, object], name: str) -> float:
+    aggregates = profile.get("aggregate_by_name", {})
+    if not isinstance(aggregates, dict):
+        return 0.0
+    entry = aggregates.get(name, {})
+    if not isinstance(entry, dict):
+        return 0.0
+    return float(entry.get("total_ms", 0.0))
+
+
+def _profile_count(profile: dict[str, object], name: str) -> int:
+    aggregates = profile.get("aggregate_by_name", {})
+    if not isinstance(aggregates, dict):
+        return 0
+    entry = aggregates.get(name, {})
+    if not isinstance(entry, dict):
+        return 0
+    return int(entry.get("count", 0))
+
+
+def expert_cost_metrics(*, profile: dict[str, object]) -> dict[str, float | int]:
+    q8_roundtrip_ms = _profile_total(profile, "q8_roundtrip_input") + _profile_total(
+        profile, "q8_roundtrip_activated"
+    )
+    return {
+        "selected_experts_payload_pack_ms": _profile_total(
+            profile, "selected_experts_payload_pack"
+        ),
+        "selected_experts_payload_pack_count": _profile_count(
+            profile, "selected_experts_payload_pack"
+        ),
+        "selected_experts_activation_direct_ms": _profile_total(
+            profile, "selected_experts_activation_direct"
+        ),
+        "selected_experts_activation_direct_count": _profile_count(
+            profile, "selected_experts_activation_direct"
+        ),
+        "selected_experts_down_projection_direct_ms": _profile_total(
+            profile, "selected_experts_down_projection_direct"
+        ),
+        "selected_experts_down_projection_direct_count": _profile_count(
+            profile, "selected_experts_down_projection_direct"
+        ),
+        "selected_experts_output_alloc_ms": _profile_total(
+            profile, "selected_experts_output_alloc"
+        ),
+        "q8_roundtrip_ms": q8_roundtrip_ms,
+        "q8_roundtrip_input_ms": _profile_total(profile, "q8_roundtrip_input"),
+        "q8_roundtrip_activated_ms": _profile_total(profile, "q8_roundtrip_activated"),
+        "iq2_gate_up_activation_ms": _profile_total(profile, "iq2_gate_up_activation"),
+        "iq2_gate_up_matvec_ms": _profile_total(profile, "iq2_gate_up_matvec"),
+        "q2_down_matvec_ms": _profile_total(profile, "q2_down_matvec"),
+        "selected_experts_swiglu_ms": _profile_total(
+            profile, "selected_experts_swiglu"
+        ),
+        "stage_payload_cache_hit_ms": _profile_total(
+            profile, "stage_payload_cache_hit"
+        ),
+        "stage_payload_cache_hit_count": _profile_count(
+            profile, "stage_payload_cache_hit"
+        ),
+        "stage_payload_read_clone_ms": _profile_total(
+            profile, "stage_payload_read_clone"
+        ),
+        "stage_payload_read_clone_count": _profile_count(
+            profile, "stage_payload_read_clone"
+        ),
+        "stage_payload_h2d_copy_ms": _profile_total(profile, "stage_payload_h2d_copy"),
+        "stage_payload_h2d_copy_count": _profile_count(
+            profile, "stage_payload_h2d_copy"
+        ),
+        "stage_payload_stream_h2d_copy_ms": _profile_total(
+            profile, "stage_payload_stream_h2d_copy"
+        ),
+        "stage_payload_cache_insert_ms": _profile_total(
+            profile, "stage_payload_cache_insert"
+        ),
+    }
 
 
 def phase3_metrics(
@@ -274,6 +430,8 @@ def main() -> int:
     args = parse_args()
     if args.repeat <= 0:
         raise SystemExit("--repeat must be positive")
+    if args.prompt_length <= 0:
+        raise SystemExit("--prompt-length must be positive")
     if args.warmup_tokens < 0:
         raise SystemExit("--warmup-tokens must be non-negative")
     if not args.model.is_file():
@@ -293,8 +451,9 @@ def main() -> int:
             runtime_budget=budget,
             gpu_backend=_build_ready_backend(),
         )
-        input_ids = torch.tensor(
-            [args.prompt_token_id],
+        input_ids = torch.full(
+            (args.prompt_length,),
+            int(args.prompt_token_id),
             dtype=torch.long,
             device="cuda",
         )
@@ -315,11 +474,13 @@ def main() -> int:
             end_event = torch.cuda.Event(enable_timing=True)
             start_wall = perf_counter()
             start_event.record()
-            output_ids, token_elapsed_ms = generate_greedy_with_token_timings(
-                model,
-                input_ids,
-                max_tokens=args.max_tokens,
-                use_graph=args.use_graph,
+            output_ids, token_elapsed_ms, prefill_ms_total = (
+                generate_greedy_with_stage_timings(
+                    model,
+                    input_ids,
+                    max_tokens=args.max_tokens,
+                    use_graph=args.use_graph,
+                )
             )
             end_event.record()
             torch.cuda.synchronize()
@@ -327,10 +488,11 @@ def main() -> int:
             cuda_elapsed_ms = float(start_event.elapsed_time(end_event))
             elapsed_ms = cuda_elapsed_ms if cuda_elapsed_ms > 0.0 else wall_elapsed_ms
             output_cpu = [int(token) for token in output_ids.detach().cpu().tolist()]
-            if len(output_cpu) != 1 + args.max_tokens:
+            expected_token_count = args.prompt_length + args.max_tokens
+            if len(output_cpu) != expected_token_count:
                 raise RuntimeError(
                     "DeepSeek V4 Flash smoke returned unexpected token count: "
-                    f"got {len(output_cpu)}, expected {1 + args.max_tokens}"
+                    f"got {len(output_cpu)}, expected {expected_token_count}"
                 )
             generated_token_count = len(token_elapsed_ms)
             if generated_token_count != args.max_tokens:
@@ -339,6 +501,13 @@ def main() -> int:
                     f"got {generated_token_count}, expected {args.max_tokens}"
                 )
             decode_metrics = decode_metrics_from_token_times(token_elapsed_ms)
+            prefill_tokens_total = float(max(args.prompt_length - 1, 0))
+            prefill_ms_total = float(prefill_ms_total)
+            prefill_tps = (
+                prefill_tokens_total * 1000.0 / prefill_ms_total
+                if prefill_tokens_total > 0.0 and prefill_ms_total > 0.0
+                else 0.0
+            )
             validate_steady_decode_tps(
                 decode_tps_steady_state=decode_metrics["decode_tps_steady_state"],
                 min_steady_decode_tps=args.min_steady_decode_tps,
@@ -352,6 +521,9 @@ def main() -> int:
                     "cuda_elapsed_ms": cuda_elapsed_ms,
                     "elapsed_ms": elapsed_ms,
                     "generated_token_count": generated_token_count,
+                    "prefill_tokens_total": prefill_tokens_total,
+                    "prefill_ms_total": prefill_ms_total,
+                    "prefill_tps": prefill_tps,
                     "output_token_ids": output_cpu,
                     "token_elapsed_ms": token_elapsed_ms,
                     "tokens_per_second": tokens_per_second,
@@ -367,6 +539,7 @@ def main() -> int:
         summary = {
             "model": str(args.model),
             "context_length": args.context_length,
+            "prompt_length": args.prompt_length,
             "max_tokens": args.max_tokens,
             "warmup_tokens": args.warmup_tokens,
             "use_graph": args.use_graph,
@@ -375,9 +548,7 @@ def main() -> int:
             "runs": runs,
             "profile": profile,
             "profile_summary": profile_summary,
-            "decode_profile_top_sections": decode_profile_top_sections(
-                profile_summary
-            ),
+            "decode_profile_top_sections": decode_profile_top_sections(profile_summary),
             "gpu_staging": gpu_staging,
             "gpu_backend": gpu_backend,
             "phase3_metrics": phase3_metrics(
@@ -395,6 +566,7 @@ def main() -> int:
                 gpu_staging=gpu_staging,
                 gpu_backend=gpu_backend,
             ),
+            "expert_cost_metrics": expert_cost_metrics(profile=profile),
             "runtime_budget": {
                 "resident_bytes": budget.resident_bytes,
                 "available_headroom_bytes": budget.available_headroom_bytes,
