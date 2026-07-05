@@ -202,6 +202,31 @@ def test_inmemory_runtime_observer_records_lifecycle_events() -> None:
     ]
 
 
+
+def test_inmemory_runtime_observer_records_deepseek_events() -> None:
+    observer = InMemoryRuntimeObserver()
+
+    observer.on_deepseek_event("decode_batch", batch_size=2, latency_ms=1.5)
+    observer.on_deepseek_event("decode_batch", batch_size=1, latency_ms=0.5)
+    observer.on_deepseek_event("stager_cache_hit", cache="grouped")
+
+    assert observer.stats()["deepseek"] == {
+        "events": {
+            "decode_batch": 2,
+            "stager_cache_hit": 1,
+        },
+        "decode_batch_tokens": 3,
+        "decode_batch_max_size": 2,
+        "decode_batch_latency_ms_sum": 2.0,
+        "stager_cache_hits": 1,
+        "stager_cache_misses": 0,
+        "kv_family_allocations": 0,
+    }
+
+    observer.reset_stats()
+
+    assert observer.stats()["deepseek"]["events"] == {}
+
 def test_inmemory_runtime_observer_stats_snapshot() -> None:
     observer = InMemoryRuntimeObserver()
 
@@ -452,6 +477,15 @@ def test_inmemory_runtime_observer_reset_stats() -> None:
         "rejections": {
             "reasons": {},
             "queue_timeout": 0,
+        },
+        "deepseek": {
+            "events": {},
+            "decode_batch_tokens": 0,
+            "decode_batch_max_size": 0,
+            "decode_batch_latency_ms_sum": 0.0,
+            "stager_cache_hits": 0,
+            "stager_cache_misses": 0,
+            "kv_family_allocations": 0,
         },
         "model_surface": {
             "events": 0,

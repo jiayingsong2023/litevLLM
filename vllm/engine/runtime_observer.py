@@ -86,6 +86,9 @@ class RuntimeObserver:
     ) -> None:
         pass
 
+    def on_deepseek_event(self, event: str, **payload: Any) -> None:
+        pass
+
     def stats(self) -> dict[str, Any]:
         return {}
 
@@ -154,6 +157,13 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     aborted: list[str] = field(default_factory=list)
     background_errors: list[str] = field(default_factory=list)
     model_surface_events: list[dict[str, str]] = field(default_factory=list)
+    deepseek_events: dict[str, int] = field(default_factory=dict)
+    deepseek_decode_batch_tokens: int = 0
+    deepseek_decode_batch_max_size: int = 0
+    deepseek_decode_batch_latency_ms_sum: float = 0.0
+    deepseek_stager_cache_hits: int = 0
+    deepseek_stager_cache_misses: int = 0
+    deepseek_kv_family_allocations: int = 0
     step_count: int = 0
     multimodal_requests: int = 0
     multimodal_images: int = 0
@@ -486,6 +496,26 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             }
         )
 
+
+    def on_deepseek_event(self, event: str, **payload: Any) -> None:
+        event = str(event)
+        self.deepseek_events[event] = self.deepseek_events.get(event, 0) + 1
+        if event == "decode_batch":
+            batch_size = int(payload.get("batch_size", 0) or 0)
+            self.deepseek_decode_batch_tokens += max(0, batch_size)
+            self.deepseek_decode_batch_max_size = max(
+                self.deepseek_decode_batch_max_size, batch_size
+            )
+            self.deepseek_decode_batch_latency_ms_sum += float(
+                payload.get("latency_ms", 0.0) or 0.0
+            )
+        elif event == "stager_cache_hit":
+            self.deepseek_stager_cache_hits += 1
+        elif event == "stager_cache_miss":
+            self.deepseek_stager_cache_misses += 1
+        elif event == "kv_family_allocation":
+            self.deepseek_kv_family_allocations += 1
+
     def stats(self) -> dict[str, Any]:
         prefix_cache_hits = self.prefix_cache_hits
         prefix_cache_events = len(self.prefix_cache_events)
@@ -504,6 +534,17 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             "rejections": {
                 "reasons": dict(self.rejection_reason_counts),
                 "queue_timeout": self.rejection_reason_counts.get("queue_timeout", 0),
+            },
+            "deepseek": {
+                "events": dict(self.deepseek_events),
+                "decode_batch_tokens": self.deepseek_decode_batch_tokens,
+                "decode_batch_max_size": self.deepseek_decode_batch_max_size,
+                "decode_batch_latency_ms_sum": (
+                    self.deepseek_decode_batch_latency_ms_sum
+                ),
+                "stager_cache_hits": self.deepseek_stager_cache_hits,
+                "stager_cache_misses": self.deepseek_stager_cache_misses,
+                "kv_family_allocations": self.deepseek_kv_family_allocations,
             },
             "model_surface": {
                 "events": len(self.model_surface_events),
@@ -804,6 +845,13 @@ class InMemoryRuntimeObserver(RuntimeObserver):
         self.aborted.clear()
         self.background_errors.clear()
         self.model_surface_events.clear()
+        self.deepseek_events.clear()
+        self.deepseek_decode_batch_tokens = 0
+        self.deepseek_decode_batch_max_size = 0
+        self.deepseek_decode_batch_latency_ms_sum = 0.0
+        self.deepseek_stager_cache_hits = 0
+        self.deepseek_stager_cache_misses = 0
+        self.deepseek_kv_family_allocations = 0
         self.step_count = 0
         self.multimodal_requests = 0
         self.multimodal_images = 0

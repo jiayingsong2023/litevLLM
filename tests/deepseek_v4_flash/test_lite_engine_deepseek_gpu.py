@@ -237,7 +237,10 @@ class _CustomAdapter:
 
     def runtime_policy(self, model_config, runtime_config):
         del model_config, runtime_config
-        return RuntimeModelPolicy(model_policy={}, kernel_policy={})
+        return RuntimeModelPolicy(
+            model_policy={"runtime_budget_bytes": 175},
+            kernel_policy={},
+        )
 
     def install_tuning_config(self, tuning_env):
         del tuning_env
@@ -266,6 +269,13 @@ class _CustomAdapter:
             decode_executor=_CustomDecode(),
             kv_block_manager=self.kv,
         )
+
+    def estimate_kv_bytes(self, *, max_active_requests, context_length):
+        del context_length
+        return int(max_active_requests) * 100
+
+    def estimate_staging_bytes(self, *, max_active_requests):
+        return int(max_active_requests) * 50
 
     def validate_request(self, **kwargs):
         del kwargs
@@ -310,7 +320,7 @@ def _custom_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[LiteEngine, _Custom
     )
     monkeypatch.setattr(
         "vllm.engine.lite_engine.get_model",
-        lambda vllm_config: SimpleNamespace(),
+        lambda vllm_config: adapter,
     )
     monkeypatch.setattr("vllm.engine.lite_engine.get_total_gpu_memory_gb", lambda: 16.0)
     monkeypatch.setattr(
@@ -385,3 +395,24 @@ def test_lite_engine_deepseek_custom_runtime_abort_frees_resources(
     engine.abort_request("req-1")
 
     assert kv.stats()["active_requests"] == 0
+
+
+def test_lite_engine_deepseek_admission_cap_uses_model_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _kv = _custom_engine(monkeypatch)
+
+    assert engine.max_active_requests == 1
+    assert engine.scheduler.max_active_requests == 1
+    engine.add_request(
+        "req-1",
+        "1 2 3",
+        SamplingParams(max_tokens=2, temperature=0.0),
+    )
+
+    with pytest.raises(Exception, match="request admission cap reached"):
+        engine.add_request(
+            "req-2",
+            "4 5 6",
+            SamplingParams(max_tokens=2, temperature=0.0),
+        )

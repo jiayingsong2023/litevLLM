@@ -105,6 +105,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             tuple[int, int, torch.dtype, str, int], DeepSeekV4PagedKVCache
         ] = {}
         self._gpu_request_states: dict[str, DeepSeekV4FlashGPURequestState] = {}
+        self._gpu_request_states_high_water = 0
         self._gpu_sessions: dict[str, DeepSeekV4FlashGreedyKernelSession] = {}
         self._deepseek_profiler = DeepSeekV4FlashProfiler(
             enabled=False,
@@ -123,6 +124,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager_device = None
         self._gpu_kv_pools.clear()
         self._gpu_request_states.clear()
+        self._gpu_request_states_high_water = 0
         self._gpu_sessions.clear()
         self._gpu_request_seq = 0
 
@@ -135,6 +137,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager_device = None
         self._gpu_kv_pools.clear()
         self._gpu_request_states.clear()
+        self._gpu_request_states_high_water = 0
         self._gpu_sessions.clear()
         self._gpu_request_seq = 0
 
@@ -215,6 +218,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             request_id=request_id,
         )
         self._gpu_request_states[request_id] = state
+        self._gpu_request_states_high_water = max(
+            self._gpu_request_states_high_water,
+            len(self._gpu_request_states),
+        )
         return state
 
     def ensure_request_capacity(self, request_id: str, token_idx: int) -> None:
@@ -231,6 +238,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
     def kv_stats(self) -> dict[str, Any]:
         return {
             "active_requests": len(self._gpu_request_states),
+            "active_requests_high_water": self._gpu_request_states_high_water,
             "num_pools": len(self._gpu_kv_pools),
         }
 
@@ -249,6 +257,10 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         self._gpu_sessions[request_id] = session
         self._gpu_request_states[request_id] = session.state
+        self._gpu_request_states_high_water = max(
+            self._gpu_request_states_high_water,
+            len(self._gpu_request_states),
+        )
         return self.decode_single_token(request_id)
 
     def decode_single_token(self, request_id: str) -> int:
@@ -262,6 +274,30 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         token = int(output_ids[session.input_token_count].detach().cpu().item())
         session.input_token_count += 1
         return token
+
+    def decode_tokens_batch(self, request_ids: list[str]) -> torch.Tensor:
+        if not request_ids:
+            return torch.empty((0,), dtype=torch.long, device=self.device())
+        sessions = [self._gpu_sessions[request_id] for request_id in request_ids]
+        device = sessions[0].device
+        token_id_tensor = torch.stack(
+            [
+                session.token_id_tensor.to(device=device, dtype=torch.long)
+                for session in sessions
+            ]
+        ).reshape(len(sessions))
+        next_tokens = self._forward_kernel_token_step_batched(
+            token_id_tensor=token_id_tensor,
+            states=[session.state for session in sessions],
+            token_indices=[session.state.token_position for session in sessions],
+            device=device,
+        )
+        for session, token in zip(sessions, next_tokens, strict=True):
+            session.output_ids[session.input_token_count] = token
+            session.input_token_count += 1
+            session.token_id_tensor = token.reshape(())
+            session.token_id = int(token.detach().cpu().item())
+        return next_tokens.to(device=self.device(), dtype=torch.long)
 
     def enable_deepseek_profile(self, enabled: bool = True) -> None:
         self._deepseek_profiler.enabled = enabled

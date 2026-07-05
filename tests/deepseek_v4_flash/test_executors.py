@@ -29,6 +29,7 @@ class _Model:
     def __init__(self) -> None:
         self.prefill_calls: list[tuple[str, list[int], int]] = []
         self.decode_calls: list[str] = []
+        self.batch_decode_calls: list[list[str]] = []
 
     def device(self) -> torch.device:
         return torch.device("cpu")
@@ -45,6 +46,10 @@ class _Model:
     def decode_single_token(self, request_id: str) -> int:
         self.decode_calls.append(request_id)
         return 43
+
+    def decode_tokens_batch(self, request_ids: list[str]) -> torch.Tensor:
+        self.batch_decode_calls.append(list(request_ids))
+        return torch.tensor([44 + i for i, _ in enumerate(request_ids)])
 
 
 def test_deepseek_prefill_executor_returns_token_result() -> None:
@@ -84,8 +89,28 @@ def test_deepseek_decode_executor_returns_token_result() -> None:
     )
 
     assert isinstance(result, TokenDecodeResult)
-    torch.testing.assert_close(result.next_token_ids, torch.tensor([43]))
-    assert model.decode_calls == ["req-1"]
+    torch.testing.assert_close(result.next_token_ids, torch.tensor([44]))
+    assert model.batch_decode_calls == [["req-1"]]
+    assert model.decode_calls == []
+
+
+def test_deepseek_decode_executor_batches_decode_requests() -> None:
+    request = RequestState(
+        request_id="req-1",
+        prompt="hello",
+        input_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=5, temperature=0.0),
+    )
+    model = _Model()
+
+    result = DeepSeekDecodeExecutor(model=model, observer=None).execute_batch(
+        ["req-1", "req-2"],
+        _Scheduler(request),
+    )
+
+    torch.testing.assert_close(result.next_token_ids, torch.tensor([44, 45]))
+    assert model.batch_decode_calls == [["req-1", "req-2"]]
+    assert model.decode_calls == []
 
 
 def test_model_prefill_request_stores_session_under_external_request_id(

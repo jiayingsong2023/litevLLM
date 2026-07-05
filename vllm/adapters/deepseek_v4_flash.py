@@ -83,6 +83,7 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
             device=device,
             context_length=context_length,
             max_active_requests=max_active_requests,
+            observer=observer,
         )
         return CustomRuntimeComponents(
             prefill_executor=DeepSeekPrefillExecutor(model=model, observer=observer),
@@ -91,6 +92,32 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
             multimodal_processor=None,
         )
 
+
+
+    def estimate_kv_bytes(
+        self,
+        *,
+        max_active_requests: int,
+        context_length: int,
+    ) -> int:
+        block_size = 16
+        raw_blocks = (int(context_length) + block_size - 1) // block_size
+        raw_bytes = (
+            int(max_active_requests)
+            * DEEPSEEK_V4_FLASH_SHAPE.num_layers
+            * raw_blocks
+            * block_size
+            * DEEPSEEK_V4_FLASH_SHAPE.num_kv_heads
+            * DEEPSEEK_V4_FLASH_SHAPE.head_dim
+            * 2
+        )
+        # ponytail: rough static cap; replace with model-reported compressed KV bytes
+        # when DeepSeek exposes exact pool allocation sizing.
+        return raw_bytes
+
+    def estimate_staging_bytes(self, *, max_active_requests: int) -> int:
+        del max_active_requests
+        return int(DeepSeekV4FlashMemoryPolicy.default_expert_cache_bytes)
 
     def validate_request(
         self,

@@ -216,6 +216,7 @@ class LiteEngine:
         self._prefill_reserve_backlog = execution_plan.prefill_reserve_backlog
         self._prefill_catchup_ratio = execution_plan.prefill_catchup_ratio
         self._prefill_microbatch_size = execution_plan.prefill_microbatch_size
+        self._apply_deepseek_admission_cap()
 
         print(
             ">>>> LiteEngine: Step scheduler "
@@ -382,6 +383,36 @@ class LiteEngine:
 
     def set_tokenizer(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
+
+
+    def _apply_deepseek_admission_cap(self) -> None:
+        if bool(getattr(self.model_capabilities, "supports_chunked_prefill", True)):
+            return
+        budget = int(
+            (getattr(self.runtime_config, "model_policy", {}) or {}).get(
+                "runtime_budget_bytes", 0
+            )
+            or 0
+        )
+        if budget <= 0:
+            return
+        estimate_kv = getattr(self.adapter, "estimate_kv_bytes", None)
+        estimate_staging = getattr(self.adapter, "estimate_staging_bytes", None)
+        if not callable(estimate_kv) or not callable(estimate_staging):
+            return
+        per_request = int(
+            estimate_kv(
+                max_active_requests=1,
+                context_length=self.max_model_len,
+            )
+        ) + int(estimate_staging(max_active_requests=1))
+        if per_request <= 0:
+            return
+        capped = max(1, min(self.max_active_requests, budget // per_request))
+        if capped < self.max_active_requests:
+            self.max_active_requests = capped
+            self.num_total_blocks = self.num_blocks_per_seq * capped
+            object.__setattr__(self.runtime_config, "kv_max_active_requests", capped)
 
     def _apply_runtime_model_policy(self) -> None:
         force_kv_dtype = self.runtime_policy.force_kv_cache_dtype
@@ -759,6 +790,17 @@ class LiteEngine:
             reason = str(exc)
             self.observer.on_request_rejected(request_id, reason)
             raise RequestRejectedError(reason) from exc
+        if (
+            not bool(getattr(self.model_capabilities, "supports_chunked_prefill", True))
+            and self.scheduler.active_request_count >= self.max_active_requests
+        ):
+            reason = (
+                "request admission cap reached "
+                f"({self.scheduler.active_request_count}/{self.max_active_requests})"
+            )
+            self.observer.on_request_rejected(request_id, reason)
+            raise RequestRejectedError(reason)
+
         self.execution_backend.maybe_apply_prefix_cache(request_state)
         self.scheduler.enqueue_request(request_id, request_state)
         self.lora_registry.on_request_added(request_state.lora_id)

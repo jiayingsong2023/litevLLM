@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -61,14 +62,27 @@ class DeepSeekDecodeExecutor:
         scheduler: Any,
     ) -> TokenDecodeResult:
         del scheduler
-        next_tokens = [
-            int(self.model.decode_single_token(request_id))
-            for request_id in request_ids
-        ]
-        return TokenDecodeResult(
-            next_token_ids=torch.tensor(
-                next_tokens,
+        start = time.perf_counter()
+        decode_batch = getattr(self.model, "decode_tokens_batch", None)
+        if callable(decode_batch):
+            next_token_ids = decode_batch(request_ids).to(
+                device=self.model.device(),
+                dtype=torch.long,
+            )
+        else:
+            next_token_ids = torch.tensor(
+                [
+                    int(self.model.decode_single_token(request_id))
+                    for request_id in request_ids
+                ],
                 dtype=torch.long,
                 device=self.model.device(),
             )
-        )
+        record = getattr(self.observer, "on_deepseek_event", None)
+        if callable(record):
+            record(
+                "decode_batch",
+                batch_size=len(request_ids),
+                latency_ms=(time.perf_counter() - start) * 1000.0,
+            )
+        return TokenDecodeResult(next_token_ids=next_token_ids)

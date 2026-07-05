@@ -18,11 +18,13 @@ class DeepSeekKVLifecycleAdapter:
         context_length: int,
         device: torch.device,
         max_active_requests: int,
+        observer: Any | None = None,
     ) -> None:
         self.model = model
         self.context_length = int(context_length)
         self.device = torch.device(device)
         self.max_active_requests = int(max_active_requests)
+        self.observer = observer
 
     @property
     def block_size(self) -> int:
@@ -55,6 +57,18 @@ class DeepSeekKVLifecycleAdapter:
                 request_id,
                 max(0, int(total_tokens) - 1),
             )
+            record = getattr(self.observer, "on_deepseek_event", None)
+            if callable(record):
+                stats = self.model.kv_stats()
+                record(
+                    "kv_family_allocation",
+                    request_id=request_id,
+                    token_count=int(total_tokens),
+                    active_requests=int(stats.get("active_requests", 0)),
+                    active_requests_high_water=int(
+                        stats.get("active_requests_high_water", 0)
+                    ),
+                )
 
     def free_request_blocks(self, request_id: str) -> None:
         self.model.free_request_state(request_id)
