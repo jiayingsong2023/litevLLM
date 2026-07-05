@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from vllm.engine.custom_runtime_components import CustomRuntimeComponents
+
 
 @dataclass(frozen=True)
 class ModelCapabilities:
@@ -16,6 +18,7 @@ class ModelCapabilities:
     supports_int4_kv: bool
     supports_paged_prefill: bool
     preferred_kv_dtype: str
+    supports_chunked_prefill: bool = True
 
 
 @dataclass(frozen=True)
@@ -48,14 +51,15 @@ class ModelAdapter(Protocol):
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         """Install model-specific tuning config before model construction."""
 
-    def build_direct_runtime(
+    def build_executors(
         self,
         *,
         model: Any,
         model_config: Any,
         runtime_config: Any,
-        tokenizer: Any | None,
-        device: Any,
         observer: Any | None,
-    ) -> Any | None:
-        """Build a model-owned direct runtime, if this model bypasses LiteEngine."""
+        **kwargs: Any,
+    ) -> CustomRuntimeComponents | None:
+        """Return model-owned lite runtime components, if needed."""
+        del model, model_config, runtime_config, observer, kwargs
+        return None

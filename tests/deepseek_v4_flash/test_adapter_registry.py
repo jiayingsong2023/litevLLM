@@ -4,8 +4,13 @@ from fixtures import write_minimal_deepseek_v4_flash_gguf
 
 from vllm.adapters.deepseek_v4_flash import DeepSeekV4FlashAdapter
 from vllm.adapters.registry import get_model_adapter
-from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
-    DeepSeekV4FlashDirectRuntime,
+from vllm.engine.custom_runtime_components import CustomRuntimeComponents
+from vllm.model_executor.models.deepseek_v4_flash.executors import (
+    DeepSeekDecodeExecutor,
+    DeepSeekPrefillExecutor,
+)
+from vllm.model_executor.models.deepseek_v4_flash.kv_lifecycle import (
+    DeepSeekKVLifecycleAdapter,
 )
 
 
@@ -63,22 +68,64 @@ def test_deepseek_adapter_policy_is_experimental_and_capped() -> None:
 
     assert caps.supports_moe is True
     assert caps.supports_paged_prefill is False
+    assert caps.supports_chunked_prefill is False
     assert caps.preferred_kv_dtype == "deepseek_v4_compressed"
     assert policy.model_policy["experimental"] is True
     assert policy.model_policy["max_tested_context"] == 8192
     assert policy.kernel_policy["compressed_attention_uses_page_tables"] is True
 
 
-def test_deepseek_adapter_builds_direct_runtime() -> None:
+def test_deepseek_adapter_builds_custom_runtime_components() -> None:
     adapter = DeepSeekV4FlashAdapter()
-
-    runtime = adapter.build_direct_runtime(
-        model=object(),
-        model_config=_model_config(),
-        runtime_config=SimpleNamespace(queue_timeout_s=30.0),
-        tokenizer=object(),
-        device="cpu",
-        observer=None,
+    model = SimpleNamespace(
+        raw_block_size=lambda: 16,
+        num_raw_blocks_per_seq=lambda: 512,
+        num_layers=lambda: 43,
     )
 
-    assert isinstance(runtime, DeepSeekV4FlashDirectRuntime)
+    assert (
+        adapter.build_direct_runtime(
+            model=model,
+            model_config=_model_config(),
+            runtime_config=SimpleNamespace(queue_timeout_s=30.0),
+            tokenizer=object(),
+            device="cpu",
+            observer=None,
+        )
+        is None
+    )
+
+    components = adapter.build_executors(
+        model=model,
+        model_config=_model_config(),
+        runtime_config=SimpleNamespace(kv_max_model_len=8192, kv_max_active_requests=2),
+        observer=None,
+        device="cpu",
+        max_active_requests=2,
+    )
+
+    assert isinstance(components, CustomRuntimeComponents)
+    assert isinstance(components.prefill_executor, DeepSeekPrefillExecutor)
+    assert isinstance(components.decode_executor, DeepSeekDecodeExecutor)
+    assert isinstance(components.kv_block_manager, DeepSeekKVLifecycleAdapter)
+    assert components.multimodal_processor is None
+
+
+def test_model_capabilities_default_to_chunked_prefill() -> None:
+    from vllm.adapters.base import ModelCapabilities
+
+    caps = ModelCapabilities(
+        model_type="dummy",
+        num_layers=1,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=8,
+        max_model_len=128,
+        supports_moe=False,
+        supports_fp8_kv=True,
+        supports_int4_kv=True,
+        supports_paged_prefill=True,
+        preferred_kv_dtype="float16",
+    )
+
+    assert caps.supports_chunked_prefill is True

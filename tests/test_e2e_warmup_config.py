@@ -97,7 +97,7 @@ def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     assert spec.model_path.endswith(".gguf")
     assert spec.quant == "deepseek-v4-flash-gguf"
     assert spec.concurrent_reqs == 1
-    assert spec.prompt_tokens_target == 4096
+    assert spec.prompt_tokens_target == 32
     assert spec.max_new_tokens == 16
 
 

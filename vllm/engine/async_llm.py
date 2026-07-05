@@ -48,17 +48,6 @@ class AsyncLLM(EngineClient):
         multi_modal_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
-        direct_runtime = getattr(self.engine, "direct_runtime", None)
-        if direct_runtime is not None:
-            yield direct_runtime.generate(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=sampling_params,
-                lora_request=lora_request,
-                multi_modal_data=multi_modal_data,
-            )
-            return
-
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
         try:
             self.engine.add_request(

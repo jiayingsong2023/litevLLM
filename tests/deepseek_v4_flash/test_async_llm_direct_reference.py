@@ -3,11 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 
-import pytest
 import torch
 
 from vllm.engine.async_llm import AsyncLLM
-from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
 
@@ -66,7 +64,7 @@ class _BridgeEngine:
         assert getattr(sampling_params, "max_tokens", None) == 1
         assert lora_id is None
         assert lora_request is None
-        assert multi_modal_data is None
+        self.multi_modal_data = multi_modal_data
 
     async def get_request_stream(self, request_id: str) -> AsyncGenerator[object, None]:
         yield _FakeRequestOutput("bridge", True)
@@ -87,43 +85,6 @@ class _BridgeDriver:
 
     def stats(self) -> dict[str, object]:
         return {"driver": True}
-
-
-class _DirectDeepSeekEngine:
-    def __init__(self) -> None:
-        self.direct_runtime = self
-        self.generated: list[tuple[str, str, int]] = []
-
-    def generate(
-        self,
-        *,
-        request_id: str,
-        prompt: str,
-        sampling_params: SamplingParams,
-        lora_request=None,
-        multi_modal_data=None,
-    ) -> RequestOutput:
-        if lora_request is not None:
-            raise ValueError("DeepSeek V4 Flash direct runtime does not support LoRA")
-        if multi_modal_data is not None:
-            raise ValueError(
-                "DeepSeek V4 Flash direct runtime does not support multimodal input"
-            )
-        self.generated.append((request_id, prompt, int(sampling_params.max_tokens)))
-        return RequestOutput(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=[7],
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="direct",
-                    token_ids=[42],
-                    cumulative_logprob=0.0,
-                )
-            ],
-            finished=True,
-        )
 
 
 def _generate_greedy_reference_chat(
@@ -184,9 +145,9 @@ def test_async_llm_generate_bridges_request_stream() -> None:
     assert llm.stats() == {"bridge": True, "async_driver": {"driver": True}}
 
 
-def test_async_llm_generate_uses_deepseek_direct_runtime_without_driver() -> None:
+def test_async_llm_generate_does_not_use_direct_runtime_shortcut() -> None:
     llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _DirectDeepSeekEngine()
+    llm.engine = _BridgeEngine()
     llm.driver = _BridgeDriver()
 
     async def run() -> list[str]:
@@ -199,27 +160,29 @@ def test_async_llm_generate_uses_deepseek_direct_runtime_without_driver() -> Non
             outputs.append(output.outputs[0].text)
         return outputs
 
-    assert asyncio.run(run()) == ["direct"]
-    assert llm.engine.generated == [("req-direct", "direct prompt", 1)]
-    assert llm.driver.notified is False
+    assert asyncio.run(run()) == ["bridge"]
+    assert llm.engine.added_requests == [("req-direct", "direct prompt")]
+    assert llm.driver.notified is True
 
 
-def test_async_llm_deepseek_direct_rejects_multimodal_input() -> None:
+def test_async_llm_generate_forwards_multimodal_to_engine() -> None:
     llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _DirectDeepSeekEngine()
+    llm.engine = _BridgeEngine()
     llm.driver = _BridgeDriver()
+    image = object()
 
     async def run() -> None:
         async for _ in llm.generate(
             "direct prompt",
             SamplingParams(max_tokens=1, temperature=0.0),
             "req-direct",
-            multi_modal_data={"image": object()},
+            multi_modal_data={"image": image},
         ):
             pass
 
-    with pytest.raises(ValueError, match="multimodal"):
-        asyncio.run(run())
+    asyncio.run(run())
+
+    assert llm.engine.multi_modal_data == {"image": image}
 
 
 def test_async_llm_abort_forwards_request_ids() -> None:

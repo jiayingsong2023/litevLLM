@@ -12,7 +12,10 @@ from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.decode_executor import DecodeExecutor
 from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
-from vllm.engine.multimodal_processor import LiteMultiModalProcessor
+from vllm.engine.multimodal_processor import (
+    LiteMultiModalProcessor,
+    NullMultiModalProcessor,
+)
 from vllm.engine.prefill_executor import PrefillExecutor
 from vllm.engine.runtime_controller import RuntimeController
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
@@ -28,7 +31,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class RuntimeAssemblyContext:
-    block_allocator: BlockAllocator
+    block_allocator: BlockAllocator | None
     kv_caches: list[torch.Tensor]
     kv_scale_caches: list[torch.Tensor]
     num_blocks_per_seq: int
@@ -63,6 +66,7 @@ class RuntimeAssemblyContext:
     sampling_driver: SamplingDriver
     output_pipeline: OutputPipeline
     queue_timeout_s: float
+    custom_runtime_components: Any | None = None
 
 
 class LiteRuntimeFactory:
@@ -70,42 +74,54 @@ class LiteRuntimeFactory:
     def build(cls, context: RuntimeAssemblyContext) -> dict[str, Any]:
         scheduler_policy = context.scheduler_policy
         backend_policy = context.backend_policy
-        kv_block_manager = KVBlockManager(
-            kv_caches=context.kv_caches,
-            kv_scale_caches=context.kv_scale_caches,
-            num_blocks_per_seq=context.num_blocks_per_seq,
-            block_size=context.block_size,
-            max_active_requests=context.max_active_requests,
-            block_allocator=context.block_allocator,
-        )
-        input_batch_builder = InputBatchBuilder(
-            device=context.device,
-            max_model_len=context.max_model_len,
-            num_layers=context.num_layers,
-            kv_block_manager=kv_block_manager,
-            inf_config=context.inf_config,
-            stack_per_layer_carries=context.stack_per_layer_carries,
-            split_per_layer_carries=context.split_per_layer_carries,
-        )
-        multimodal_processor = LiteMultiModalProcessor(
-            model=context.model,
-            device=context.device,
-        )
-        prefill_executor = PrefillExecutor(
-            model=context.model,
-            input_batch_builder=input_batch_builder,
-            kv_caches=context.kv_caches,
-            multimodal_processor=multimodal_processor,
-        )
-        decode_executor = DecodeExecutor(
-            model=context.model,
-            input_batch_builder=input_batch_builder,
-            kv_caches=context.kv_caches,
-            fast_input_ids=context.fast_input_ids,
-            fast_positions=context.fast_positions,
-            fast_slot_mapping=context.fast_slot_mapping,
-            fast_seq_lens=context.fast_seq_lens,
-        )
+        custom = context.custom_runtime_components
+        if custom is not None:
+            kv_block_manager = custom.kv_block_manager
+            input_batch_builder = None
+            multimodal_processor = (
+                custom.multimodal_processor or NullMultiModalProcessor()
+            )
+            prefill_executor = custom.prefill_executor
+            decode_executor = custom.decode_executor
+        else:
+            if context.block_allocator is None:
+                raise RuntimeError("standard runtime requires a block allocator")
+            kv_block_manager = KVBlockManager(
+                kv_caches=context.kv_caches,
+                kv_scale_caches=context.kv_scale_caches,
+                num_blocks_per_seq=context.num_blocks_per_seq,
+                block_size=context.block_size,
+                max_active_requests=context.max_active_requests,
+                block_allocator=context.block_allocator,
+            )
+            input_batch_builder = InputBatchBuilder(
+                device=context.device,
+                max_model_len=context.max_model_len,
+                num_layers=context.num_layers,
+                kv_block_manager=kv_block_manager,
+                inf_config=context.inf_config,
+                stack_per_layer_carries=context.stack_per_layer_carries,
+                split_per_layer_carries=context.split_per_layer_carries,
+            )
+            multimodal_processor = LiteMultiModalProcessor(
+                model=context.model,
+                device=context.device,
+            )
+            prefill_executor = PrefillExecutor(
+                model=context.model,
+                input_batch_builder=input_batch_builder,
+                kv_caches=context.kv_caches,
+                multimodal_processor=multimodal_processor,
+            )
+            decode_executor = DecodeExecutor(
+                model=context.model,
+                input_batch_builder=input_batch_builder,
+                kv_caches=context.kv_caches,
+                fast_input_ids=context.fast_input_ids,
+                fast_positions=context.fast_positions,
+                fast_slot_mapping=context.fast_slot_mapping,
+                fast_seq_lens=context.fast_seq_lens,
+            )
         from vllm.engine.step_scheduler import (
             LoraSchedulingParams,
             MultiModalSchedulingParams,

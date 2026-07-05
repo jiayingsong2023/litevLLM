@@ -111,7 +111,6 @@ class LiteEngine:
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
         )
-        self.direct_runtime = None
         self.adapter = get_model_adapter(None, self.model_config)
         self.runtime_policy = self.adapter.runtime_policy(
             self.model_config,
@@ -128,12 +127,6 @@ class LiteEngine:
         print(f">>> LiteEngine: Model Type: {type(self.model)}")
         self.tokenizer = None
         self.adapter = get_model_adapter(self.model, self.model_config)
-        self.direct_runtime = self._build_direct_runtime()
-        if self.direct_runtime is not None:
-            self.max_model_len = int(getattr(self.model_config, "max_model_len", 4096))
-            self.runtime_controller = None
-            self.direct_runtime.prepare()
-            return
         self.execution_policy = select_loadtime_policy(
             model_config=self.model_config,
             quant_config=getattr(vllm_config, "quant_config", None),
@@ -234,51 +227,69 @@ class LiteEngine:
             f"prefill_microbatch={self._prefill_microbatch_size})"
         )
 
-        self._resolve_kv_metadata(kv_plan)
-        kv_theory_bytes = compute_kv_theory_bytes(
-            layer_kv_specs=self._layer_kv_specs,
-            num_layers=self.num_layers,
-            num_total_blocks=self.num_total_blocks,
-            block_size=self.block_size,
-            fallback_num_kv_heads=self.num_kv_heads,
-            fallback_kv_head_dim=self.kv_head_dim,
-            kv_dtype=self.kv_dtype,
-            needs_scale_cache=kv_plan.needs_scale_cache,
-        )
-        print(
-            f">>>> LiteEngine: Allocating KV Cache on {self.device} "
-            f"({self.max_active_requests} seq slots, "
-            f"{self.max_model_len} tokens/seq cap, {self.num_layers} layers, "
-            f"block={self.block_size} tok, dtype={self.kv_dtype}, "
-            f"~{kv_theory_bytes / (1024**3):.3f} GiB theoretical)"
-        )
-        mem_before_kv = int(torch.cuda.memory_allocated(self.device))
-        allocator = FlatKVCacheAllocator(
-            num_layers=self.num_layers,
-            num_total_blocks=self.num_total_blocks,
-            block_size=self.block_size,
+        custom_runtime_components = self.adapter.build_executors(
+            model=self.model,
+            model_config=self.model_config,
+            runtime_config=self.runtime_config,
+            observer=self.observer,
             device=self.device,
+            max_active_requests=self.max_active_requests,
         )
-        self.kv_caches, self.kv_scale_caches, _ = allocator.allocate(
-            layer_kv_specs=self._layer_kv_specs,
-            kv_dtype=self.kv_dtype,
-            kv_head_dim=self.kv_head_dim,
-            fallback_num_kv_heads=self.num_kv_heads,
-            fallback_kv_head_dim=self.kv_head_dim,
-            needs_scale_cache=kv_plan.needs_scale_cache,
-        )
-        block_allocator = BlockAllocator(num_total_blocks=self.num_total_blocks)
-        print(">>>> LiteEngine: KV Cache allocated successfully.")
-        mem_after_kv = int(torch.cuda.memory_allocated(self.device))
-        auditor = MemoryAuditor(device=self.device)
-        audit = auditor.audit(self.model)
-        self._print_startup_memory_audit(
-            kv_plan=kv_plan,
-            kv_theory_bytes=kv_theory_bytes,
-            mem_before_kv=mem_before_kv,
-            mem_after_kv=mem_after_kv,
-            audit=audit,
-        )
+        if custom_runtime_components is not None:
+            self.kv_caches = []
+            self.kv_scale_caches = []
+            block_allocator = None
+            self.block_size = custom_runtime_components.kv_block_manager.block_size
+            self.num_blocks_per_seq = (
+                custom_runtime_components.kv_block_manager.num_blocks_per_seq
+            )
+            print(">>>> LiteEngine: Using model-owned KV runtime components.")
+        else:
+            self._resolve_kv_metadata(kv_plan)
+            kv_theory_bytes = compute_kv_theory_bytes(
+                layer_kv_specs=self._layer_kv_specs,
+                num_layers=self.num_layers,
+                num_total_blocks=self.num_total_blocks,
+                block_size=self.block_size,
+                fallback_num_kv_heads=self.num_kv_heads,
+                fallback_kv_head_dim=self.kv_head_dim,
+                kv_dtype=self.kv_dtype,
+                needs_scale_cache=kv_plan.needs_scale_cache,
+            )
+            print(
+                f">>>> LiteEngine: Allocating KV Cache on {self.device} "
+                f"({self.max_active_requests} seq slots, "
+                f"{self.max_model_len} tokens/seq cap, {self.num_layers} layers, "
+                f"block={self.block_size} tok, dtype={self.kv_dtype}, "
+                f"~{kv_theory_bytes / (1024**3):.3f} GiB theoretical)"
+            )
+            mem_before_kv = int(torch.cuda.memory_allocated(self.device))
+            allocator = FlatKVCacheAllocator(
+                num_layers=self.num_layers,
+                num_total_blocks=self.num_total_blocks,
+                block_size=self.block_size,
+                device=self.device,
+            )
+            self.kv_caches, self.kv_scale_caches, _ = allocator.allocate(
+                layer_kv_specs=self._layer_kv_specs,
+                kv_dtype=self.kv_dtype,
+                kv_head_dim=self.kv_head_dim,
+                fallback_num_kv_heads=self.num_kv_heads,
+                fallback_kv_head_dim=self.kv_head_dim,
+                needs_scale_cache=kv_plan.needs_scale_cache,
+            )
+            block_allocator = BlockAllocator(num_total_blocks=self.num_total_blocks)
+            print(">>>> LiteEngine: KV Cache allocated successfully.")
+            mem_after_kv = int(torch.cuda.memory_allocated(self.device))
+            auditor = MemoryAuditor(device=self.device)
+            audit = auditor.audit(self.model)
+            self._print_startup_memory_audit(
+                kv_plan=kv_plan,
+                kv_theory_bytes=kv_theory_bytes,
+                mem_before_kv=mem_before_kv,
+                mem_after_kv=mem_after_kv,
+                audit=audit,
+            )
 
         # slot_mapping maps batch tokens to physical indices
         self.scheduler = RequestScheduler(self.max_active_requests)
@@ -309,6 +320,21 @@ class LiteEngine:
             (self.max_active_requests,), dtype=torch.int32, device=self.device
         )
 
+        supports_chunked_prefill = bool(
+            getattr(self.model_capabilities, "supports_chunked_prefill", True)
+        )
+        effective_prefill_chunk_size = (
+            self._prefill_chunk_size if supports_chunked_prefill else self.max_model_len
+        )
+        effective_prefill_microbatch_size = (
+            self._prefill_microbatch_size if supports_chunked_prefill else 1
+        )
+        effective_max_prefill_chunk_size = (
+            self.runtime_config.max_prefill_chunk_size
+            if supports_chunked_prefill
+            else self.max_model_len
+        )
+
         runtime_components = LiteRuntimeAssembler.assemble(
             block_allocator=block_allocator,
             kv_caches=self.kv_caches,
@@ -328,13 +354,13 @@ class LiteEngine:
             fast_seq_lens=self._fast_seq_lens,
             step_token_budget=self._step_token_budget,
             decode_priority_enabled=self._decode_priority_enabled,
-            prefill_chunk_size=self._prefill_chunk_size,
+            prefill_chunk_size=effective_prefill_chunk_size,
             prefill_reserved_tokens=self._prefill_reserved_tokens,
             prefill_reserve_backlog=self._prefill_reserve_backlog,
             prefill_catchup_ratio=self._prefill_catchup_ratio,
-            prefill_microbatch_size=self._prefill_microbatch_size,
+            prefill_microbatch_size=effective_prefill_microbatch_size,
             min_prefill_chunk_size=self.runtime_config.min_prefill_chunk_size,
-            max_prefill_chunk_size=self.runtime_config.max_prefill_chunk_size,
+            max_prefill_chunk_size=effective_max_prefill_chunk_size,
             prefill_sla_ttft_ms=self.runtime_config.prefill_sla_ttft_ms,
             max_active_requests=self.max_active_requests,
             scheduler_policy=self.runtime_config.scheduler_policy,
@@ -343,6 +369,7 @@ class LiteEngine:
             observer=self.observer,
             lora_registry=self.lora_registry,
             queue_timeout_s=self._queue_timeout_s,
+            custom_runtime_components=custom_runtime_components,
         )
         self.kv_block_manager = runtime_components["kv_block_manager"]
         self.input_batch_builder = runtime_components["input_batch_builder"]
@@ -353,25 +380,8 @@ class LiteEngine:
         self.execution_backend = runtime_components["execution_backend"]
         self.runtime_controller = runtime_components["runtime_controller"]
 
-    def _build_direct_runtime(self) -> Any | None:
-        build_direct_runtime = getattr(self.adapter, "build_direct_runtime", None)
-        if build_direct_runtime is None:
-            return None
-        return build_direct_runtime(
-            model=self.model,
-            model_config=self.model_config,
-            runtime_config=self.runtime_config,
-            tokenizer=self.tokenizer,
-            device=self.device,
-            observer=self.observer,
-        )
-
     def set_tokenizer(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
-        if self.direct_runtime is not None and hasattr(
-            self.direct_runtime, "tokenizer"
-        ):
-            self.direct_runtime.tokenizer = tokenizer
 
     def _apply_runtime_model_policy(self) -> None:
         force_kv_dtype = self.runtime_policy.force_kv_cache_dtype
@@ -703,6 +713,20 @@ class LiteEngine:
             self.observer.on_request_rejected(request_id, reason)
             raise RequestRejectedError(reason)
 
+        validate_request = getattr(self.adapter, "validate_request", None)
+        if validate_request is not None:
+            try:
+                validate_request(
+                    sampling_params=sampling_params,
+                    lora_id=lora_id,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                )
+            except ValueError as exc:
+                reason = str(exc)
+                self.observer.on_request_rejected(request_id, reason)
+                raise RequestRejectedError(reason) from exc
+
         try:
             resolved_lora = self.lora_registry.resolve_adapter(
                 lora_id=lora_id,
@@ -721,6 +745,15 @@ class LiteEngine:
                 else None,
                 multi_modal_data=multi_modal_data,
             )
+            if not bool(
+                getattr(self.model_capabilities, "supports_chunked_prefill", True)
+            ):
+                max_prefill_tokens = min(self.max_model_len, self._step_token_budget)
+                if len(request_state.input_ids) > max_prefill_tokens:
+                    raise ValueError(
+                        "request prompt too long for full-prefill model "
+                        f"({len(request_state.input_ids)} > {max_prefill_tokens})"
+                    )
             self.multimodal_processor.prepare_request(request_state)
         except ValueError as exc:
             reason = str(exc)
@@ -743,6 +776,7 @@ class LiteEngine:
         output = self.output_pipeline.build_abort_output(request_id, req)
         self.scheduler.publish_output(request_id, output)
         self.scheduler.abort_request(request_id)
+        self.execution_backend.free_request_resources(request_id)
         self.observer.on_request_aborted(request_id)
 
     def handle_background_error(self, exc: BaseException) -> None:
@@ -755,6 +789,7 @@ class LiteEngine:
                 if isinstance(exc, BackgroundLoopError)
                 else BackgroundLoopError(str(exc)),
             )
+            self.execution_backend.free_request_resources(request_id)
             self.scheduler.free_request(request_id)
 
     @torch.inference_mode()
@@ -762,12 +797,7 @@ class LiteEngine:
         return self.runtime_controller.step()
 
     def stats(self) -> dict[str, Any]:
-        if self.direct_runtime is not None:
-            return self.direct_runtime.stats()
         return self.runtime_controller.stats()
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
-        if self.direct_runtime is not None:
-            self.direct_runtime.reset_stats(clear_prefix_cache=clear_prefix_cache)
-            return
         self.runtime_controller.reset_stats(clear_prefix_cache=clear_prefix_cache)

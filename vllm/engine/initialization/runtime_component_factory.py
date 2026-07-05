@@ -17,7 +17,7 @@ class LiteRuntimeAssembler:
     def assemble(
         cls,
         *,
-        block_allocator: BlockAllocator,
+        block_allocator: BlockAllocator | None,
         kv_caches: list[torch.Tensor],
         kv_scale_caches: list[torch.Tensor],
         num_blocks_per_seq: int,
@@ -50,6 +50,7 @@ class LiteRuntimeAssembler:
         observer: Any,
         lora_registry: Any,
         queue_timeout_s: float,
+        custom_runtime_components: Any | None = None,
     ) -> dict[str, Any]:
         runtime_context = RuntimeAssemblyContext(
             block_allocator=block_allocator,
@@ -87,5 +88,6 @@ class LiteRuntimeAssembler:
             sampling_driver=None,
             output_pipeline=None,
             queue_timeout_s=queue_timeout_s,
+            custom_runtime_components=custom_runtime_components,
         )
         return LiteRuntimeFactory.build(runtime_context)

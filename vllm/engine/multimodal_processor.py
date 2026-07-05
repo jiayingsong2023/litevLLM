@@ -14,6 +14,30 @@ from vllm.engine.request_state import RequestState
 from vllm.model_executor.models.interfaces import supports_multimodal
 
 
+class NullMultiModalProcessor:
+    """No-op multimodal processor for runtimes that reject multimodal input."""
+
+    def prepare_request(self, request: RequestState) -> None:
+        del request
+
+    def build_prefill_inputs(self, req_dicts: list[RequestState]) -> dict[str, Any]:
+        del req_dicts
+        return {}
+
+    def get_multimodal_embeddings(
+        self,
+        mm_inputs: dict[str, torch.Tensor],
+    ) -> None:
+        del mm_inputs
+        return None
+
+    def stats(self) -> dict[str, Any]:
+        return {}
+
+    def reset_stats(self) -> None:
+        return None
+
+
 class LiteMultiModalProcessor:
     """Minimal multimodal preprocessor for Lite runtime.
 

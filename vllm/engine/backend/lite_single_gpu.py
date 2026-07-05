@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from vllm.engine.errors import ExecutionStepError
+from vllm.engine.executor_result import TokenDecodeResult, TokenPrefillResult
 from vllm.engine.prefix_cache import PrefixCache, PrefixCacheEntry
 from vllm.engine.request_state import RequestState
 from vllm.engine.step_plan import StepPlan
@@ -201,10 +202,22 @@ class LiteSingleGpuBackend:
 
     def decode_step_sync(self, request_ids: list[str]) -> list[RequestOutput]:
         self._ensure_runtime_ready()
-        logits, _ = self.decode_executor.execute_sync_fast(request_ids, self.scheduler)
+        decode_result = self.decode_executor.execute_sync_fast(
+            request_ids, self.scheduler
+        )
+        results: list[RequestOutput] = []
+        if isinstance(decode_result, TokenDecodeResult):
+            for i, rid in enumerate(request_ids):
+                req = self.scheduler.get_request(rid)
+                token_id = int(decode_result.next_token_ids[i].item())
+                req.generated_ids.append(token_id)
+                req.seq_len += 1
+                self._process_completion(rid, token_id, results)
+            return results
+
+        logits, _ = decode_result
         if self._can_use_gpu_greedy_decode(request_ids):
             return self._decode_step_gpu_greedy(request_ids, logits)
-        results: list[RequestOutput] = []
         requests = [self.scheduler.get_request(rid) for rid in request_ids]
         next_tokens = self.sampling_driver.sample_batch_tokens(
             logits[:, -1, :], requests
@@ -220,13 +233,26 @@ class LiteSingleGpuBackend:
         if step_plan.prefills is None:
             return
         try:
-            logits, _req_dicts_prefill, is_last_chunk_flags = (
-                self.prefill_executor.execute(
-                    step_plan.prefills.request_ids,
-                    self.scheduler,
-                    step_plan.prefills.chunk_len,
-                )
+            prefill_result = self.prefill_executor.execute(
+                step_plan.prefills.request_ids,
+                self.scheduler,
+                step_plan.prefills.chunk_len,
             )
+            if isinstance(prefill_result, TokenPrefillResult):
+                for i, rid in enumerate(step_plan.prefills.request_ids):
+                    req = self.scheduler.get_request(rid)
+                    req.seq_len += int(prefill_result.prefilled_tokens[i])
+                    if not prefill_result.is_last_chunk[i]:
+                        continue
+                    token_id = int(prefill_result.next_token_ids[i].item())
+                    req.generated_ids.append(token_id)
+                    req.is_prefill = False
+                    self.scheduler.transition_to_decode(rid)
+                    self._process_completion(rid, token_id, results)
+                self.observer.on_prefill_executed(step_plan.prefills, len(results))
+                return
+
+            logits, _req_dicts_prefill, is_last_chunk_flags = prefill_result
 
             finished_indices: list[int] = []
             finished_rids: list[str] = []
@@ -270,9 +296,20 @@ class LiteSingleGpuBackend:
         if step_plan.decodes is None:
             return
         try:
-            logits, _req_dicts = self.decode_executor.execute_batch(
+            decode_result = self.decode_executor.execute_batch(
                 step_plan.decodes.request_ids, self.scheduler
             )
+            if isinstance(decode_result, TokenDecodeResult):
+                for i, rid in enumerate(step_plan.decodes.request_ids):
+                    req_i = self.scheduler.get_request(rid)
+                    token_id = int(decode_result.next_token_ids[i].item())
+                    req_i.generated_ids.append(token_id)
+                    req_i.seq_len += 1
+                    self._process_completion(rid, token_id, results)
+                self.observer.on_decode_executed(step_plan.decodes, len(results))
+                return
+
+            logits, _req_dicts = decode_result
             requests = [
                 self.scheduler.get_request(rid) for rid in step_plan.decodes.request_ids
             ]
@@ -471,8 +508,11 @@ class LiteSingleGpuBackend:
             self.observer.on_request_finished(request_id, finish_reason)
             self._free_request(request_id)
 
-    def _free_request(self, request_id: str) -> None:
+    def free_request_resources(self, request_id: str) -> None:
         self.kv_block_manager.free_request_blocks(request_id)
+
+    def _free_request(self, request_id: str) -> None:
+        self.free_request_resources(request_id)
         request = self.scheduler.free_request(request_id)
         if request is not None and self.lora_registry is not None:
             self.lora_registry.on_request_removed(request.lora_id)

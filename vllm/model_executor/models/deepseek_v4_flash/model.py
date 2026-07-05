@@ -104,6 +104,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_kv_pools: dict[
             tuple[int, int, torch.dtype, str, int], DeepSeekV4PagedKVCache
         ] = {}
+        self._gpu_request_states: dict[str, DeepSeekV4FlashGPURequestState] = {}
+        self._gpu_sessions: dict[str, DeepSeekV4FlashGreedyKernelSession] = {}
         self._deepseek_profiler = DeepSeekV4FlashProfiler(
             enabled=False,
             sync_fn=self._sync_deepseek_profile_device,
@@ -120,6 +122,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager_store_id = None
         self._gpu_weight_stager_device = None
         self._gpu_kv_pools.clear()
+        self._gpu_request_states.clear()
+        self._gpu_sessions.clear()
         self._gpu_request_seq = 0
 
     def close(self) -> None:
@@ -130,6 +134,8 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self._gpu_weight_stager_store_id = None
         self._gpu_weight_stager_device = None
         self._gpu_kv_pools.clear()
+        self._gpu_request_states.clear()
+        self._gpu_sessions.clear()
         self._gpu_request_seq = 0
 
     def _new_gpu_request_state(
@@ -138,6 +144,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         context_length: int,
         device: torch.device,
         max_requests: int = 1,
+        request_id: str | None = None,
     ) -> DeepSeekV4FlashGPURequestState:
         config = DeepSeekV4FlashGPUCacheConfig(
             context_length=context_length,
@@ -165,13 +172,96 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 max_requests=max_requests,
             )
             self._gpu_kv_pools[key] = pool
-        request_id = f"gpu-{self._gpu_request_seq}"
-        self._gpu_request_seq += 1
+        if request_id is None:
+            request_id = f"gpu-{self._gpu_request_seq}"
+            self._gpu_request_seq += 1
         return DeepSeekV4FlashGPURequestState(
             config,
             kv_cache=pool,
             request_id=request_id,
         )
+
+    def raw_block_size(self) -> int:
+        return 16
+
+    def num_raw_blocks_per_seq(self) -> int:
+        raw_window = DEEPSEEK_V4_FLASH_SHAPE.sliding_window
+        block_size = self.raw_block_size()
+        return (raw_window + block_size - 1) // block_size
+
+    def num_layers(self) -> int:
+        return int(self.shape.num_layers)
+
+    def device(self) -> torch.device:
+        if self._gpu_weight_stager_device is not None:
+            return self._gpu_weight_stager_device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def ensure_request_state(
+        self,
+        *,
+        request_id: str,
+        context_length: int,
+        device: torch.device,
+        max_active_requests: int,
+    ) -> DeepSeekV4FlashGPURequestState:
+        existing = self._gpu_request_states.get(request_id)
+        if existing is not None:
+            return existing
+        state = self._new_gpu_request_state(
+            context_length=context_length,
+            device=device,
+            max_requests=max_active_requests,
+            request_id=request_id,
+        )
+        self._gpu_request_states[request_id] = state
+        return state
+
+    def ensure_request_capacity(self, request_id: str, token_idx: int) -> None:
+        self.get_request_state(request_id).require_capacity(token_idx)
+
+    def get_request_state(self, request_id: str) -> DeepSeekV4FlashGPURequestState:
+        return self._gpu_request_states[request_id]
+
+    def free_request_state(self, request_id: str) -> None:
+        state = self._gpu_request_states.pop(request_id, None)
+        if state is not None:
+            state.reset()
+
+    def kv_stats(self) -> dict[str, Any]:
+        return {
+            "active_requests": len(self._gpu_request_states),
+            "num_pools": len(self._gpu_kv_pools),
+        }
+
+    def prefill_request(
+        self,
+        request_id: str,
+        input_ids: list[int],
+        max_tokens: int,
+    ) -> int:
+        device = self.device()
+        input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device)
+        session = self.prefill_greedy_kernel(
+            input_tensor,
+            max_tokens=max_tokens,
+            request_id=request_id,
+        )
+        self._gpu_sessions[request_id] = session
+        self._gpu_request_states[request_id] = session.state
+        return self.decode_single_token(request_id)
+
+    def decode_single_token(self, request_id: str) -> int:
+        session = self._gpu_sessions[request_id]
+        output_ids, _elapsed = self.decode_greedy_kernel(
+            session,
+            max_tokens=1,
+            use_graph=False,
+            reset_state=False,
+        )
+        token = int(output_ids[session.input_token_count].detach().cpu().item())
+        session.input_token_count += 1
+        return token
 
     def enable_deepseek_profile(self, enabled: bool = True) -> None:
         self._deepseek_profiler.enabled = enabled
@@ -1107,6 +1197,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         max_tokens: int,
+        request_id: str | None = None,
     ) -> DeepSeekV4FlashGreedyKernelSession:
         self._require_weight_store()
         device = self._validate_generate_greedy_kernel_input(
@@ -1115,10 +1206,19 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         )
         self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
-        state = self._new_gpu_request_state(
-            context_length=self._kernel_context_length(),
-            device=device,
+        state = (
+            self._gpu_request_states.get(request_id)
+            if request_id is not None
+            else None
         )
+        if state is None:
+            state = self._new_gpu_request_state(
+                context_length=self._kernel_context_length(),
+                device=device,
+                request_id=request_id,
+            )
+            if request_id is not None:
+                self._gpu_request_states[request_id] = state
 
         input_token_count = int(input_ids.numel())
         output_ids = torch.empty(
@@ -1163,6 +1263,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         max_tokens: int,
         record_token_times: bool = False,
         use_graph: bool = False,
+        reset_state: bool = True,
     ) -> tuple[torch.Tensor, list[float]]:
         state = session.state
         output_ids = session.output_ids
@@ -1275,13 +1376,21 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             if eos_token_id is not None:
                 token_id = int(token_id_tensor.item())
                 if token_id == eos_token_id:
-                    state.reset()
+                    if reset_state:
+                        state.reset()
+                    else:
+                        session.token_id_tensor = token_id_tensor
+                        session.token_id = token_id
                     return (
                         output_ids[: input_token_count + generated_idx + 1],
                         token_elapsed_ms,
                     )
 
-        state.reset()
+        if reset_state:
+            state.reset()
+        else:
+            session.token_id_tensor = token_id_tensor
+            session.token_id = int(token_id_tensor.detach().cpu().item())
         return output_ids, token_elapsed_ms
 
     def _generate_greedy_kernel_impl(

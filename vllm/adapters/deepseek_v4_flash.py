@@ -3,12 +3,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm.engine.custom_runtime_components import CustomRuntimeComponents
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DEEPSEEK_V4_FLASH_SHAPE,
     DeepSeekV4FlashMemoryPolicy,
 )
-from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
-    DeepSeekV4FlashDirectRuntime,
+from vllm.model_executor.models.deepseek_v4_flash.executors import (
+    DeepSeekDecodeExecutor,
+    DeepSeekPrefillExecutor,
+)
+from vllm.model_executor.models.deepseek_v4_flash.kv_lifecycle import (
+    DeepSeekKVLifecycleAdapter,
 )
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
@@ -49,15 +54,82 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
         tokenizer: Any | None,
         device: Any,
         observer: Any | None,
-    ) -> DeepSeekV4FlashDirectRuntime:
-        return DeepSeekV4FlashDirectRuntime(
-            model=model,
-            model_config=model_config,
-            runtime_config=runtime_config,
-            tokenizer=tokenizer,
-            device=device,
-            observer=observer,
+    ) -> None:
+        del model, model_config, runtime_config, tokenizer, device, observer
+        return None
+
+    def build_executors(
+        self,
+        *,
+        model: Any,
+        model_config: Any,
+        runtime_config: Any,
+        observer: Any | None,
+        **kwargs: Any,
+    ) -> CustomRuntimeComponents:
+        device = kwargs.get("device") or getattr(model, "device", lambda: "cuda:0")()
+        context_length = int(
+            getattr(runtime_config, "kv_max_model_len", None)
+            or getattr(runtime_config, "max_model_len", None)
+            or getattr(model_config, "get_max_model_len", lambda: 8192)()
         )
+        max_active_requests = int(
+            kwargs.get("max_active_requests")
+            or getattr(runtime_config, "kv_max_active_requests", 1)
+            or 1
+        )
+        kv_block_manager = DeepSeekKVLifecycleAdapter(
+            model=model,
+            device=device,
+            context_length=context_length,
+            max_active_requests=max_active_requests,
+        )
+        return CustomRuntimeComponents(
+            prefill_executor=DeepSeekPrefillExecutor(model=model, observer=observer),
+            decode_executor=DeepSeekDecodeExecutor(model=model, observer=observer),
+            kv_block_manager=kv_block_manager,
+            multimodal_processor=None,
+        )
+
+
+    def validate_request(
+        self,
+        *,
+        sampling_params: Any,
+        lora_id: str | None,
+        lora_request: Any | None,
+        multi_modal_data: dict[str, Any] | None,
+    ) -> None:
+        if lora_id is not None or lora_request is not None:
+            raise ValueError("DeepSeek V4 Flash LiteEngine path does not support LoRA")
+        if multi_modal_data:
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path does not support multimodal inputs"
+            )
+        if int(getattr(sampling_params, "n", 1) or 1) != 1:
+            raise ValueError("DeepSeek V4 Flash LiteEngine path supports n=1 only")
+        max_tokens = getattr(sampling_params, "max_tokens", None)
+        if max_tokens is None or int(max_tokens) <= 0:
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path requires max_tokens > 0"
+            )
+        if float(getattr(sampling_params, "temperature", 0.0) or 0.0) != 0.0:
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path supports greedy sampling only"
+            )
+        if float(getattr(sampling_params, "top_p", 1.0) or 1.0) != 1.0:
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path supports greedy sampling only"
+            )
+        top_k = int(getattr(sampling_params, "top_k", -1) or -1)
+        if top_k not in (-1, 0):
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path supports greedy sampling only"
+            )
+        if getattr(sampling_params, "structured_outputs", None) is not None:
+            raise ValueError(
+                "DeepSeek V4 Flash LiteEngine path does not support structured outputs"
+            )
 
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         shape = DEEPSEEK_V4_FLASH_SHAPE
@@ -77,4 +149,5 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
             supports_int4_kv=False,
             supports_paged_prefill=False,
             preferred_kv_dtype="deepseek_v4_compressed",
+            supports_chunked_prefill=False,
         )

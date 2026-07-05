@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm.engine.lite_engine import LiteEngine
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DeepSeekV4FlashContextEstimate,
     DeepSeekV4FlashRuntimeBudget,
@@ -160,24 +159,25 @@ def _fake_model(
     )
 
 
-def _make_engine(*, direct_runtime: bool = True) -> LiteEngine:
-    engine = object.__new__(LiteEngine)
-    engine.device = torch.device("cpu")
-    engine.model = _fake_model(context_length=32, vocab_size=16)
-    engine.tokenizer = _FakeTokenizer()
-    engine.direct_runtime = (
+def _make_runtime() -> tuple[
+    DeepSeekV4FlashDirectRuntime,
+    DeepSeekV4FlashForCausalLM,
+    _FakeTokenizer,
+]:
+    model = _fake_model(context_length=32, vocab_size=16)
+    tokenizer = _FakeTokenizer()
+    return (
         DeepSeekV4FlashDirectRuntime(
-            model=engine.model,
+            model=model,
             model_config=type("_Cfg", (), {"max_model_len": 32})(),
             runtime_config=object(),
-            tokenizer=engine.tokenizer,
-            device=engine.device,
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
             observer=None,
-        )
-        if direct_runtime
-        else None
+        ),
+        model,
+        tokenizer,
     )
-    return engine
 
 
 def _greedy_sampling_params(max_tokens: int = 3) -> SamplingParams:
@@ -193,7 +193,7 @@ def _greedy_sampling_params(max_tokens: int = 3) -> SamplingParams:
 def test_generate_deepseek_v4_flash_greedy_batched_parity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
     max_tokens = 3
 
     def fake_batched(
@@ -205,7 +205,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_parity(
         for input_ids in input_ids_list:
             last = int(input_ids[-1].item())
             generated = [
-                (last + offset) % engine.model.shape.vocab_size
+                (last + offset) % model.shape.vocab_size
                 for offset in range(1, max_tokens + 1)
             ]
             outputs.append(
@@ -223,7 +223,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_parity(
         return outputs
 
     monkeypatch.setattr(
-        engine.model,
+        model,
         "generate_greedy_kernel_batched",
         fake_batched,
     )
@@ -232,7 +232,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_parity(
     prompts = ["ab", "xyz"]
     sampling_params_list = [_greedy_sampling_params(max_tokens) for _ in prompts]
 
-    outputs = engine.direct_runtime.generate_batched(
+    outputs = runtime.generate_batched(
         request_ids=request_ids,
         prompts=prompts,
         sampling_params_list=sampling_params_list,
@@ -262,7 +262,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_parity(
 def test_generate_deepseek_v4_flash_greedy_batched_ignores_use_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
     def fake_batched(
         input_ids_list: list[torch.Tensor],
@@ -283,9 +283,9 @@ def test_generate_deepseek_v4_flash_greedy_batched_ignores_use_graph(
             for input_ids in input_ids_list
         ]
 
-    monkeypatch.setattr(engine.model, "generate_greedy_kernel_batched", fake_batched)
+    monkeypatch.setattr(model, "generate_greedy_kernel_batched", fake_batched)
 
-    outputs = engine.direct_runtime.generate_batched(
+    outputs = runtime.generate_batched(
         request_ids=["req-0"],
         prompts=["a"],
         sampling_params_list=[_greedy_sampling_params(max_tokens=2)],
@@ -293,12 +293,6 @@ def test_generate_deepseek_v4_flash_greedy_batched_ignores_use_graph(
 
     assert len(outputs) == 1
     assert outputs[0].finished is True
-
-
-def test_engine_has_no_direct_runtime_when_adapter_does_not_build_one() -> None:
-    engine = _make_engine(direct_runtime=False)
-
-    assert engine.direct_runtime is None
 
 
 @pytest.mark.parametrize(
@@ -314,10 +308,10 @@ def test_engine_has_no_direct_runtime_when_adapter_does_not_build_one() -> None:
 def test_generate_deepseek_v4_flash_greedy_batched_rejects_invalid_sampling_params(
     bad_params: SamplingParams,
 ) -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
     with pytest.raises(ValueError):
-        engine.direct_runtime.generate_batched(
+        runtime.generate_batched(
             request_ids=["req-0"],
             prompts=["hello"],
             sampling_params_list=[bad_params],
@@ -325,10 +319,10 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_invalid_sampling_para
 
 
 def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_lengths() -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
     with pytest.raises(ValueError, match="same length"):
-        engine.direct_runtime.generate_batched(
+        runtime.generate_batched(
             request_ids=["req-0", "req-1"],
             prompts=["hello"],
             sampling_params_list=[_greedy_sampling_params()],
@@ -336,9 +330,9 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_lengths() 
 
 
 def test_engine_batched_empty_prompts_returns_empty_list() -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
-    outputs = engine.direct_runtime.generate_batched(
+    outputs = runtime.generate_batched(
         request_ids=[],
         prompts=[],
         sampling_params_list=[],
@@ -350,10 +344,10 @@ def test_engine_batched_empty_prompts_returns_empty_list() -> None:
 def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_max_tokens() -> (
     None
 ):
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
     with pytest.raises(ValueError, match="max_tokens"):
-        engine.direct_runtime.generate_batched(
+        runtime.generate_batched(
             request_ids=["req-0", "req-1"],
             prompts=["hello", "world"],
             sampling_params_list=[
@@ -366,7 +360,7 @@ def test_generate_deepseek_v4_flash_greedy_batched_rejects_mismatched_max_tokens
 def test_generate_deepseek_v4_flash_greedy_batched_uses_per_request_skip_special(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = _make_engine()
+    runtime, model, tokenizer = _make_runtime()
 
     def fake_batched(
         input_ids_list: list[torch.Tensor],
@@ -387,14 +381,14 @@ def test_generate_deepseek_v4_flash_greedy_batched_uses_per_request_skip_special
             for input_ids in input_ids_list
         ]
 
-    monkeypatch.setattr(engine.model, "generate_greedy_kernel_batched", fake_batched)
+    monkeypatch.setattr(model, "generate_greedy_kernel_batched", fake_batched)
 
     params_first = _greedy_sampling_params(max_tokens=2)
     params_first.skip_special_tokens = False
     params_second = _greedy_sampling_params(max_tokens=2)
     params_second.skip_special_tokens = True
 
-    outputs = engine.direct_runtime.generate_batched(
+    outputs = runtime.generate_batched(
         request_ids=["req-0", "req-1"],
         prompts=["a", "b"],
         sampling_params_list=[params_first, params_second],
@@ -403,4 +397,4 @@ def test_generate_deepseek_v4_flash_greedy_batched_uses_per_request_skip_special
     assert len(outputs) == 2
     # Decode is called once per request; the last observed flag for the second
     # request must match its own sampling params.
-    assert engine.tokenizer.last_skip_special_tokens is True
+    assert tokenizer.last_skip_special_tokens is True
