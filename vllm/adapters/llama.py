@@ -51,5 +51,6 @@ class LlamaAdapter(ModelAdapter):
             supports_fp8_kv=True,
             supports_int4_kv=True,
             supports_paged_prefill=True,
+            supports_lora=True,
             preferred_kv_dtype="float16",
         )

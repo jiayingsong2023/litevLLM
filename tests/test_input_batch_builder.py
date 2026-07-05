@@ -190,7 +190,7 @@ def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     assert attn_metadata2["seq_lens"].tolist() == [5]
 
 
-def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
+def test_input_batch_builder_rejects_mixed_lora_decode_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -238,13 +238,11 @@ def test_input_batch_builder_marks_mixed_lora_decode_batch() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    _, _, attn_metadata, _ = builder.build_decode_batch(["r1", "r2"], scheduler)
-    assert attn_metadata["lora_mapping"] == ["adapter-a", "adapter-b"]
-    assert attn_metadata["lora_adapter_count"] == 2
-    assert attn_metadata["mixed_lora_batch"] is True
+    with pytest.raises(ValueError, match="mixed LoRA"):
+        builder.build_decode_batch(["r1", "r2"], scheduler)
 
 
-def test_input_batch_builder_tracks_multimodal_lora_prefill_contract() -> None:
+def test_input_batch_builder_rejects_base_and_lora_prefill_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -298,12 +296,5 @@ def test_input_batch_builder_tracks_multimodal_lora_prefill_contract() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    _, _, attn_metadata, _, _ = builder.build_prefill(["r1", "r2"], scheduler, 2)
-    assert attn_metadata["lora_mapping"] == ["adapter-a", None]
-    assert attn_metadata["lora_adapter_count"] == 1
-    assert attn_metadata["mixed_lora_batch"] is False
-    assert attn_metadata["multimodal_request_count"] == 1
-    assert attn_metadata["has_multimodal_requests"] is True
-    assert attn_metadata["mixed_multimodal_batch"] is True
-    assert attn_metadata["multimodal_lora_request_count"] == 1
-    assert attn_metadata["has_multimodal_lora_requests"] is True
+    with pytest.raises(ValueError, match="mixed LoRA"):
+        builder.build_prefill(["r1", "r2"], scheduler, 2)

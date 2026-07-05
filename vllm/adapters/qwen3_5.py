@@ -126,5 +126,6 @@ class Qwen35Adapter(ModelAdapter):
             supports_fp8_kv=True,
             supports_int4_kv=not supports_moe,
             supports_paged_prefill=True,
+            supports_lora=True,
             preferred_kv_dtype="bfloat16",
         )

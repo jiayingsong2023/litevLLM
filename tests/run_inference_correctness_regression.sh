@@ -29,6 +29,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
 # KV defaults are now handled per-model inside this script.
+UV_RUN=(uv run)
+if [[ "${FASTINFERENCE_UV_NO_SYNC:-0}" == "1" ]]; then
+  UV_RUN=(uv run --no-sync)
+fi
 
 FI_REGRESSION_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fastinference-correctness-config.XXXXXX")"
 cleanup_fastinference_regression_config() {
@@ -132,7 +136,7 @@ print_spotcheck_summary() {
   if ! grep -q '"prompt_preview"' "$output_log"; then
     return 0
   fi
-  uv run python - "$output_log" <<'PY_SPOTCHECK_SUMMARY'
+  "${UV_RUN[@]}" python - "$output_log" <<'PY_SPOTCHECK_SUMMARY'
 import json
 import sys
 from pathlib import Path
@@ -248,7 +252,7 @@ warn_if_repo_id_proxy_is_unsupported() {
 cleanup_after_model_step() {
   local label="$1"
   echo "[Info] Cleanup after ${label}"
-  uv run python -c 'import gc; gc.collect(); import torch;
+  "${UV_RUN[@]}" python -c 'import gc; gc.collect(); import torch;
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
     ipc_collect = getattr(torch.cuda, "ipc_collect", None)
@@ -258,7 +262,7 @@ if torch.cuda.is_available():
 
 print_deepseek_quality_summary() {
   local json_path="$1"
-  uv run python - "$json_path" <<'PY_SUMMARY'
+  "${UV_RUN[@]}" python - "$json_path" <<'PY_SUMMARY'
 import json
 import sys
 from pathlib import Path
@@ -378,24 +382,24 @@ resolve_gemma4_26b_model_ref() {
   return 0
 }
 
-SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
+SPOTCHECK=("${UV_RUN[@]}" python tests/tools/quality_bar_spotcheck.py
   --prompt-subset minimal --max-new-tokens 96 --temperature 0 --chat-template auto --frugal --json)
-GEMMA4_SPOTCHECK=(uv run python tests/tools/quality_bar_spotcheck.py
+GEMMA4_SPOTCHECK=("${UV_RUN[@]}" python tests/tools/quality_bar_spotcheck.py
   --max-new-tokens 48 --temperature 0 --chat-template auto --frugal --json
   --max-model-len 512)
-GEMMA4_A_LITE_SMOKE=(uv run python tests/tools/gemma4_single_prompt_smoke.py
+GEMMA4_A_LITE_SMOKE=("${UV_RUN[@]}" python tests/tools/gemma4_single_prompt_smoke.py
   --max-new-tokens 32
   --temperature 0
   --gpu-memory-utilization 0.90
   --max-model-len 512
   --min-output-chars 8
   --max-num-batched-tokens 1024)
-GEMMA4_A_STRICT_AUDIT=(uv run python tests/tools/gemma4_prefill_strict_audit.py
+GEMMA4_A_STRICT_AUDIT=("${UV_RUN[@]}" python tests/tools/gemma4_prefill_strict_audit.py
   --hf-device cuda
   --max-model-len 256
   --gpu-memory-utilization 0.80
   --max-num-batched-tokens 512)
-GEMMA4_26B_A_STRICT_AUDIT=(uv run python tests/tools/gemma4_prefill_strict_audit.py
+GEMMA4_26B_A_STRICT_AUDIT=("${UV_RUN[@]}" python tests/tools/gemma4_prefill_strict_audit.py
   --preset gemma4_26b_a4b
   --hf-device cuda
   --max-model-len 256
@@ -492,13 +496,12 @@ if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
         FASTINFERENCE_BLOCK_SIZE=32 \
         FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
         FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
-      bash -c 'uv run python tests/tools/deepseek_v4_flash_quality_smoke.py \
-        --model "$1" \
+      "${UV_RUN[@]}" python tests/tools/deepseek_v4_flash_quality_smoke.py \
+        --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
         --context-length 4096 \
         --max-tokens 8 \
         --min-output-chars 8 \
-        --json-out "$2" >/dev/null' \
-      _ "$MODEL_DEEPSEEK_V4_FLASH_GGUF" "$DEEPSEEK_QUALITY_JSON"
+        --json-out "$DEEPSEEK_QUALITY_JSON"
     print_deepseek_quality_summary "$DEEPSEEK_QUALITY_JSON"
     rm -f "$DEEPSEEK_QUALITY_JSON"
     cleanup_after_model_step "DeepSeek V4 Flash quality smoke"
@@ -521,7 +524,7 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   PERF_JSON="${PERF_JSON:-.tmp_perf_regression_awq_from_accuracy_suite.json}"
   echo "[P1] Running tests/e2e_full_benchmark.py --models ${PERF_MODELS}"
   run_stage "Optional perf diagnostics" "$FI_CORRECTNESS_PERF_STAGE_TIMEOUT" \
-    uv run python tests/e2e_full_benchmark.py \
+    "${UV_RUN[@]}" python tests/e2e_full_benchmark.py \
     --models "${PERF_MODELS}" \
     --json-out "${PERF_JSON}"
   echo "[P1] Perf diagnostics JSON: ${PERF_JSON}"
@@ -537,7 +540,7 @@ echo "=== Tier-A-strict (<=14B, HF parity) ==="
 print_model_separator "TinyLlama Tier-A strict"
 run_stage "Tier-A TinyLlama HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_TINY_FP8" \
-  uv run python tests/verify_semantic_integrity.py \
+  "${UV_RUN[@]}" python tests/verify_semantic_integrity.py \
   --model "$MODEL_TINYLLAMA" \
   --preset tinyllama \
   --hf-same-as-lite \
@@ -549,7 +552,7 @@ print_model_separator "Qwen3.5-9B AWQ Tier-A strict"
 require_model_dir "$HF_QWEN35_9B_FP16" "Qwen3.5-9B-FP16"
 run_stage "Tier-A Qwen3.5-9B HF parity" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
-  uv run python tests/verify_semantic_integrity.py \
+  "${UV_RUN[@]}" python tests/verify_semantic_integrity.py \
   --model "$MODEL_QWEN35_9B_AWQ" \
   --preset qwen35_9b_awq \
   --hf-model "$HF_QWEN35_9B_FP16" \
@@ -607,7 +610,7 @@ if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
   echo "=== AWQ Fused A/B (RUN_AWQ_FUSED_AB=1) ==="
   echo "[AB1] Qwen3.5-9B AWQ baseline (fused disabled)"
   run_stage "AWQ fused A/B Qwen3.5 baseline" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
-    uv run python tests/verify_semantic_integrity.py \
+    "${UV_RUN[@]}" python tests/verify_semantic_integrity.py \
     --model "$MODEL_QWEN35_9B_AWQ" \
     --preset qwen35_9b_awq \
     --hf-model "$HF_QWEN35_9B_FP16" \
@@ -616,7 +619,7 @@ if [[ "$RUN_AWQ_FUSED_AB" == "1" ]]; then
     --apply-chat-template off
   echo "[AB2] Qwen3.5-9B AWQ fused forced"
   run_stage "AWQ fused A/B Qwen3.5 forced" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
-    uv run python tests/verify_semantic_integrity.py \
+    "${UV_RUN[@]}" python tests/verify_semantic_integrity.py \
     --model "$MODEL_QWEN35_9B_AWQ" \
     --preset qwen35_9b_awq \
     --hf-model "$HF_QWEN35_9B_FP16" \

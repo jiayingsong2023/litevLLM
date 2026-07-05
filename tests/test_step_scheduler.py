@@ -1890,3 +1890,86 @@ def test_step_scheduler_fairness_guardrail_triggers_prefill_protection(
     assert plan.metrics.fairness_guardrail_triggered is True
     assert plan.metrics.prefill_starvation_protected is True
     assert plan.prefills is not None
+
+
+def test_step_scheduler_phase1_splits_base_and_lora_prefill_batches() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4],
+                "lora_id": "adapter-a",
+            },
+            {
+                "is_prefill": True,
+                "seq_len": 0,
+                "input_ids": [1, 2, 3, 4],
+                "lora_id": None,
+            },
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=1.0,
+        prefill_microbatch_size=2,
+        lora_params=LoraSchedulingParams(max_prefill_lora_adapters_per_batch=1),
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is not None
+    assert len(plan.prefills.request_ids) == 1
+    assert len(plan.metrics.prefill_lora_adapters or {}) == 1
+
+
+def test_step_scheduler_phase1_splits_base_and_lora_decode_batches() -> None:
+    scheduler = RequestScheduler(max_active_requests=2)
+    scheduler.add_request(
+        "decode-a",
+        RequestState(
+            request_id="decode-a",
+            prompt="",
+            slot_idx=0,
+            is_prefill=False,
+            seq_len=4,
+            generated_ids=[1],
+            input_ids=[1, 2],
+            lora_id="adapter-a",
+            sampling_params=SamplingParams(),
+        ),
+    )
+    scheduler.add_request(
+        "decode-base",
+        RequestState(
+            request_id="decode-base",
+            prompt="",
+            slot_idx=1,
+            is_prefill=False,
+            seq_len=4,
+            generated_ids=[1],
+            input_ids=[1, 2],
+            lora_id=None,
+            sampling_params=SamplingParams(),
+        ),
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=2,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=1,
+        prefill_catchup_ratio=1.0,
+        prefill_microbatch_size=1,
+        lora_params=LoraSchedulingParams(max_decode_lora_adapters_per_batch=1),
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.decodes is not None
+    assert len(plan.decodes.request_ids) == 1
+    assert len(plan.metrics.decode_lora_adapters or {}) == 1

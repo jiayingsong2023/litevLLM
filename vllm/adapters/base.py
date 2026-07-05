@@ -19,6 +19,8 @@ class ModelCapabilities:
     supports_paged_prefill: bool
     preferred_kv_dtype: str
     supports_chunked_prefill: bool = True
+    supports_lora: bool = False
+    supports_multimodal: bool = False
 
 
 @dataclass(frozen=True)

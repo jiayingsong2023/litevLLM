@@ -32,6 +32,7 @@ from vllm.engine.runtime_observer import NullRuntimeObserver
 from vllm.engine.runtime_planner import RuntimePlanner
 from vllm.engine.sampling_driver import SamplingDriver
 from vllm.logger import init_logger
+from vllm.lora.manager import LoRAManager
 from vllm.model_executor.model_loader import get_model
 from vllm.outputs import RequestOutput
 from vllm.policies import build_generation_policies
@@ -296,6 +297,8 @@ class LiteEngine:
         self.scheduler = RequestScheduler(self.max_active_requests)
         self.scheduler.runtime_config = self.runtime_config
         self.lora_registry = LoRARuntimeRegistry()
+        self.lora_manager = LoRAManager(self.model)
+        self.lora_manager.bind_to_model(self.model)
         self.policies = None
         self.sampling_driver = None
         self.output_pipeline = None
@@ -688,10 +691,16 @@ class LiteEngine:
         lora_path: str | None = None,
         lora_int_id: int | None = None,
     ) -> dict[str, Any]:
+        if not bool(getattr(self.model_capabilities, "supports_lora", False)):
+            raise ValueError("model does not support LoRA")
         request = self.lora_registry.register_adapter(
             lora_name=lora_name,
             lora_path=lora_path,
             lora_int_id=lora_int_id,
+        )
+        self.lora_manager.register_adapter(
+            lora_name=request.lora_name,
+            lora_path=request.lora_path,
         )
         return {
             "lora_name": request.lora_name,
@@ -763,6 +772,21 @@ class LiteEngine:
                 lora_id=lora_id,
                 lora_request=lora_request,
             )
+            if resolved_lora is not None and not bool(
+                getattr(self.model_capabilities, "supports_lora", False)
+            ):
+                raise ValueError("model does not support LoRA")
+            if multi_modal_data is not None and not bool(
+                getattr(self.model_capabilities, "supports_multimodal", False)
+            ):
+                raise ValueError("model does not support multimodal input")
+            if resolved_lora is not None and not self.lora_manager.has_adapter(
+                resolved_lora.lora_name
+            ):
+                self.lora_manager.register_adapter(
+                    lora_name=resolved_lora.lora_name,
+                    lora_path=resolved_lora.lora_path,
+                )
             request_state = self.request_builder.build(
                 request_id=request_id,
                 prompt=prompt,

@@ -34,8 +34,8 @@ class SchedulerRuntimePolicy:
     fairness_guardrail_queue_wait_s: float = 0.0
     fairness_guardrail_service_classes: AbstractSet[str] | None = None
     max_admit_lora_adapters_per_step: int = 0
-    max_prefill_lora_adapters_per_batch: int = 0
-    max_decode_lora_adapters_per_batch: int = 0
+    max_prefill_lora_adapters_per_batch: int = 1
+    max_decode_lora_adapters_per_batch: int = 1
     lora_fairness_relax_threshold: float = 0.0
     lora_locality_tighten_threshold: float = 0.0
     lora_limit_relax_delta: int = 1
