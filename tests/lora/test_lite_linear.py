@@ -36,3 +36,55 @@ def test_lite_linear_adds_lora_delta() -> None:
     base = torch.nn.functional.linear(x, layer.weight)
     delta = torch.tensor([[[36.0, 60.0]]])
     assert torch.allclose(out, base + delta)
+
+
+def test_lite_linear_adds_mixed_lora_delta() -> None:
+    layer = LiteLinear(2, 2, bias=False, prefix="proj")
+    layer.weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+    manager = LoRAManager()
+    manager.add_adapter_weights(
+        "adapter-a",
+        {
+            "proj": LoRALayerWeights(
+                lora_name="adapter-a",
+                rank=1,
+                alpha=1,
+                lora_a=torch.tensor([[1.0], [0.0]]),
+                lora_b=torch.tensor([[10.0, 20.0]]),
+            )
+        },
+    )
+    manager.add_adapter_weights(
+        "adapter-b",
+        {
+            "proj": LoRALayerWeights(
+                lora_name="adapter-b",
+                rank=1,
+                alpha=1,
+                lora_a=torch.tensor([[0.0], [1.0]]),
+                lora_b=torch.tensor([[30.0, 40.0]]),
+            )
+        },
+    )
+    manager.bind_to_model(layer)
+
+    x = torch.tensor(
+        [
+            [[2.0, 3.0]],
+            [[5.0, 7.0]],
+            [[11.0, 13.0]],
+        ]
+    )
+
+    out = layer(x, ["adapter-a", "adapter-b", None])
+
+    assert torch.allclose(
+        out,
+        torch.tensor(
+            [
+                [[22.0, 43.0]],
+                [[215.0, 287.0]],
+                [[11.0, 13.0]],
+            ]
+        ),
+    )

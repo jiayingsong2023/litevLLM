@@ -9,6 +9,7 @@ from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.request_scheduler import RequestScheduler
 from vllm.engine.request_state import RequestState
+from vllm.lora.mapping import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
 
@@ -229,7 +230,7 @@ def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     assert attn_metadata2["seq_lens"].tolist() == [5]
 
 
-def test_input_batch_builder_rejects_mixed_lora_decode_batch() -> None:
+def test_input_batch_builder_allows_mixed_lora_decode_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -277,11 +278,15 @@ def test_input_batch_builder_rejects_mixed_lora_decode_batch() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    with pytest.raises(ValueError, match="mixed LoRA"):
-        builder.build_decode_batch(["r1", "r2"], scheduler)
+    _, _, attn_metadata, _ = builder.build_decode_batch(["r1", "r2"], scheduler)
+
+    assert isinstance(attn_metadata["lora_mapping"], LoRAMapping)
+    assert attn_metadata["lora_mapping"] == ["adapter-a", "adapter-b"]
+    assert attn_metadata["lora_adapter_count"] == 2
+    assert attn_metadata["mixed_lora_batch"] is True
 
 
-def test_input_batch_builder_rejects_base_and_lora_prefill_batch() -> None:
+def test_input_batch_builder_allows_base_and_lora_prefill_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -335,5 +340,9 @@ def test_input_batch_builder_rejects_base_and_lora_prefill_batch() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    with pytest.raises(ValueError, match="mixed LoRA"):
-        builder.build_prefill(["r1", "r2"], scheduler, 2)
+    _, _, attn_metadata, _, _ = builder.build_prefill(["r1", "r2"], scheduler, 2)
+
+    assert isinstance(attn_metadata["lora_mapping"], LoRAMapping)
+    assert attn_metadata["lora_mapping"] == ["adapter-a", None]
+    assert attn_metadata["lora_adapter_count"] == 1
+    assert attn_metadata["mixed_lora_batch"] is True

@@ -7,6 +7,7 @@ import torch
 
 from vllm.engine.request_state import RequestState
 from vllm.kernels.triton.compute_slot_mapping import compute_slot_mapping
+from vllm.lora.mapping import LoRAMapping
 
 
 class InputBatchBuilder:
@@ -112,8 +113,7 @@ class InputBatchBuilder:
         conv_carry_prefill = self._stack_per_layer_carries(
             req_dicts_prefill, self.num_layers, "linear_conv_carry"
         )
-        lora_mapping = [req.lora_id for req in req_dicts_prefill]
-        self._assert_single_lora_adapter(lora_mapping)
+        lora_mapping = self._lora_mapping(req_dicts_prefill)
         multimodal_flags = [
             self._is_multimodal_request(req) for req in req_dicts_prefill
         ]
@@ -223,8 +223,7 @@ class InputBatchBuilder:
         conv_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_conv_carry"
         )
-        lora_mapping = [req.lora_id for req in req_dicts]
-        self._assert_single_lora_adapter(lora_mapping)
+        lora_mapping = self._lora_mapping(req_dicts)
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
         max_seq_len_cpu = max(seq_lens_cpu_list) if seq_lens_cpu_list else 0
         attn_metadata = {
@@ -347,8 +346,7 @@ class InputBatchBuilder:
             slot_mapping,
             pad_id=-1,
         )
-        lora_mapping = [req.lora_id for req in req_dicts]
-        self._assert_single_lora_adapter(lora_mapping)
+        lora_mapping = self._lora_mapping(req_dicts)
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
         attn_carry_batch = self._stack_per_layer_carries(
             req_dicts, self.num_layers, "linear_attn_carry"
@@ -392,19 +390,16 @@ class InputBatchBuilder:
         return input_ids, positions, attn_metadata, req_dicts
 
     @staticmethod
-    def _lora_adapter_count(lora_mapping: list[str | None]) -> int:
-        return len({str(item) for item in lora_mapping if item})
+    def _lora_mapping(requests: list[RequestState]) -> LoRAMapping:
+        return LoRAMapping.from_ids([req.lora_id for req in requests])
+
+    @staticmethod
+    def _lora_adapter_count(lora_mapping: LoRAMapping) -> int:
+        return lora_mapping.adapter_count
 
     @classmethod
-    def _is_mixed_lora_batch(cls, lora_mapping: list[str | None]) -> bool:
-        active = {str(item) for item in lora_mapping if item}
-        has_base = any(not item for item in lora_mapping)
-        return len(active) > 1 or (bool(active) and has_base)
-
-    @classmethod
-    def _assert_single_lora_adapter(cls, lora_mapping: list[str | None]) -> None:
-        if cls._is_mixed_lora_batch(lora_mapping):
-            raise ValueError("Phase 1 does not support mixed LoRA batches")
+    def _is_mixed_lora_batch(cls, lora_mapping: LoRAMapping) -> bool:
+        return lora_mapping.is_mixed
 
     @staticmethod
     def _is_multimodal_request(request: RequestState) -> bool:
