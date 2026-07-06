@@ -11,18 +11,23 @@ than depending on upstream C++/CUDA LoRA extension stacks. Adapter-aware
 scheduling and observability counters are present in the runtime, and LoRA
 stats are included in benchmark/runtime summaries.
 
-## Phase 1 Boundary
+## Current Boundary
 
-Phase 1 is deliberately narrow:
+The maintained lite LoRA path is intentionally small:
 
 - PEFT `adapter_model.safetensors` only.
 - `adapter_config.json` must provide `r`, `lora_alpha`, and `target_modules`.
 - Supported target modules are `q_proj`, `k_proj`, `v_proj`, `o_proj`,
-  `gate_proj`, `up_proj`, and `down_proj`.
+  `gate_proj`, `up_proj`, `down_proj`, and Gemma4
+  `embed_vision.embedding_projection`.
 - `adapter_model.bin` is not supported.
 - `lm_head` LoRA is not supported.
-- Mixed LoRA batches are not supported. A runtime batch may contain only base
-  requests or requests for one adapter.
+- Mixed LoRA batches are supported through `LoRAMapping` and per-request or
+  per-token adapter selection.
+- Gemma4 multimodal LoRA supports text layers plus the vision projector /
+  connector. Qwen2VL visual-tower LoRA is not supported; Qwen2VL text-path
+  LoRA follows the normal text model `LiteLinear` path after image embedding
+  injection.
 - DeepSeek V4 Flash direct runtime rejects LoRA.
 
 ## Offline Smoke
@@ -86,6 +91,12 @@ Run scheduler and batch-contract tests:
 
 ```bash
 uv run --no-sync pytest tests/test_input_batch_builder.py tests/test_step_scheduler.py -q
+```
+
+Run multimodal + LoRA focused tests:
+
+```bash
+uv run --no-sync pytest tests/test_gemma4_multimodal.py tests/test_multimodal_processor.py tests/test_engine_executor_contracts.py -q
 ```
 
 Run the fast regression suite before publishing LoRA changes:

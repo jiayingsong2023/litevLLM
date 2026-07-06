@@ -12,7 +12,7 @@ short model-focused view of that matrix.
 | Qwen3.5-9B-AWQ | AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
 | Gemma4-26B-A4B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
 | Gemma4-31B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| Gemma4 single-image multimodal | AWQ 4-bit | Supported | Phase 2A: one request, one image, Gemma4 vision tower, and placeholder replacement. |
+| Gemma4 image multimodal | AWQ 4-bit | Supported | Image placeholder expansion, Gemma4 vision tower, placeholder replacement, multi-image requests, multi-request batching, and Gemma4 projector LoRA. |
 
 ## Experimental / Compatibility Surface
 
@@ -20,8 +20,9 @@ short model-focused view of that matrix.
 | :--- | :--- | :--- |
 | Llama-like fallback models | Experimental | Adapter fallback exists, but support should not be claimed without model-specific load, smoke, and correctness gates. |
 | DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target. Adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed-paged KV contracts, automatic Tier-B smoke when the local GGUF exists, and e2e direct benchmark coverage are present. Default validation uses 4K context; 8K is a code cap, not a default regression promise. The direct benchmark does not emit standard per-token streaming observer events, so `stream_visible=0%` is expected there. |
-| LoRA runtime | Experimental | Runtime and tests exist; production policy tuning remains workload dependent. |
-| Multimodal serving | Experimental | Gemma4 single-image support exists; multi-image, mixed multimodal batching, and non-Gemma4 vision models need broader hardening. |
+| Qwen2VL image multimodal | Experimental | Image preprocessing, `image_grid_thw`, mRoPE positions, real vision tower, and placeholder replacement are implemented. Vision-tower LoRA is unsupported. |
+| LoRA runtime | Experimental | Safetensors PEFT adapters, text-layer LoRA, mixed LoRA batches, and Gemma4 projector LoRA exist; production policy tuning remains workload dependent. |
+| Multimodal serving | Experimental | Gemma4 image support is maintained. Qwen2VL image support exists but still needs broader real-checkpoint smoke coverage. |
 | Legacy vLLM entrypoints | Compatibility | Kept for import and migration stability, not as a second runtime path. |
 
 ## Unsupported In Lite

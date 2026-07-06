@@ -1,14 +1,14 @@
 # Multimodal Inputs
 
-Gemma4 single-image multimodal serving is supported in the lite runtime. The
-supported path is Phase 2A: one request with one image, real `<image>`
-placeholder expansion, Gemma4 vision tower embeddings, and placeholder
-replacement during text prefill.
+Gemma4 image multimodal serving is supported in the lite runtime. The path uses
+real `<image>` placeholder expansion, Gemma4 vision tower embeddings, and
+placeholder replacement during text prefill. Multi-image requests and
+multi-request continuous batching are covered by the lite multimodal path.
 
-Broader multimodal serving remains experimental. Multi-image requests,
-multi-request continuous batching, Qwen2VL, audio, and video require
-model-specific implementation and validation before they should be treated as
-supported.
+Qwen2VL image serving is implemented but remains experimental. It includes
+Qwen2VL image preprocessing, `image_grid_thw`, mRoPE positions, real vision
+tower embeddings, and placeholder replacement. Audio and video remain
+unsupported.
 
 ## HTTP Request Shape
 
@@ -33,10 +33,14 @@ The server converts text blocks into the prompt and image blocks into
 
 ## Current Boundary
 
-- Gemma4 supports one image per request.
+- Gemma4 supports image requests, including multiple images per request and
+  multiple image requests in the same prefill batch.
+- Gemma4 multimodal LoRA supports text layers and the vision projector /
+  connector.
+- Qwen2VL supports image requests experimentally. Qwen2VL visual-tower LoRA is
+  not supported; text-path LoRA remains the normal `LiteLinear` LoRA path after
+  image embedding injection.
 - Multimodal scheduling and observer counters exist.
-- Multi-image and mixed multimodal batching remain outside the current support
-  claim.
 - Audio and video are unsupported unless model-specific code and tests are
   added. The upstream generic audio/parser helpers were removed during lite
   cleanup.
@@ -44,6 +48,6 @@ The server converts text blocks into the prompt and image blocks into
 ## Verification
 
 ```bash
-uv run pytest -q tests/smoke
+uv run --no-sync pytest tests/test_multimodal_processor.py tests/test_gemma4_multimodal.py tests/test_qwen2_vl_multimodal.py -q
 bash tests/run_regression_suite.sh
 ```

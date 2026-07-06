@@ -32,11 +32,12 @@ or feature status lists.
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
 | Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| Gemma4 single-image multimodal | Supported | Phase 2A path for one request with one image: prompt placeholder expansion, Gemma4 vision tower embedding, and placeholder replacement in text prefill. Multi-image and multi-request multimodal batching remain outside this support claim. |
+| Gemma4 image multimodal | Supported | Image request path with prompt placeholder expansion, Gemma4 vision tower embeddings, placeholder replacement in text prefill, multi-image requests, multi-request continuous batching, and Gemma4 projector LoRA. |
+| Qwen2VL image multimodal | Experimental | Qwen2VL image preprocessing, `image_grid_thw`, mRoPE positions, real vision tower, and placeholder replacement are implemented and covered by focused tests. Vision-tower LoRA is not supported. |
 | DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed KV cache (per-request pre-allocated raw, compressed, and indexer buffers; not managed by the lite runtime's flat block pool), opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. Recent measured warm-cache decode is in the 1.6-1.9 tok/s range after selected-expert, Q8, and indexer-QAT work; this is not a production-speed parity claim. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
-| LoRA runtime | Experimental | Runtime path and tests exist; production policy calibration is still workload dependent. |
-| Multimodal serving | Experimental | Gemma4 single-image support is maintained; broader multi-image, mixed multimodal batching, and non-Gemma4 model support still require model-specific implementation and hardening. |
+| LoRA runtime | Experimental | Safetensors PEFT adapters, text-layer LoRA, `LoRAMapping`, and mixed LoRA batches are implemented and tested. Production policy calibration is still workload dependent. |
+| Multimodal serving | Experimental | Gemma4 image serving is maintained; Qwen2VL image serving is implemented but remains experimental pending broader real-checkpoint smoke coverage. Audio and video are unsupported. |
 | Upstream Transformers modeling backend | Unsupported | The broken `vllm/model_executor/models/transformers/` wrappers were removed; maintained models live under `vllm/model_executor/models/` with adapter-owned policy. |
 | Generic upstream asset downloader | Unsupported | The `vllm/assets/` helper package was removed; tests and demos should use explicit local fixtures or model paths. |
 | Generic multimodal audio/video parser helpers | Unsupported | Lite multimodal support is image-request plumbing only unless a model-specific implementation and regression gate are added. |
@@ -60,6 +61,7 @@ or feature status lists.
 | Decode batch tensor reuse | Supported | Non-fast decode batch construction reuses `InputBatchBuilder` scratch tensors for core metadata tensors. |
 | Prefix cache | Experimental | Block-level prefix-cache capture/materialize is implemented in `KVBlockManager` for the standard PagedAttention path; default policy calibration remains workload dependent. |
 | Structured outputs | Experimental | Grammar-backed behavior is present and tested, but broad API compatibility should stay gated. |
+| Multimodal + LoRA | Experimental | Gemma4 text layers and vision projector/connector can receive LoRA in multimodal prefill. Qwen2VL text-path LoRA uses the normal `LiteLinear` path after image embedding injection; Qwen2VL visual tower LoRA is unsupported. |
 | Speculative decoding | Unsupported | Explicitly deferred. |
 | Full upstream OpenAI/vLLM compatibility | Unsupported | Only the lite-compatible serving surface should be treated as supported. |
 
