@@ -57,6 +57,7 @@ class LiteMultiModalProcessor:
         self.model = model
         self.device = device
         self.supports_multimodal = supports_multimodal(model)
+        self._qwen2_vl_image_processor: Any | None = None
         self.prepared_requests = 0
         self.prepared_images = 0
         self.prepare_failures = 0
@@ -73,29 +74,46 @@ class LiteMultiModalProcessor:
         if not self.supports_multimodal:
             raise ValueError("model does not support multimodal inputs")
         images = multi_modal_data.get("image")
-        if not isinstance(images, list) or len(images) != 1:
-            raise ValueError("Phase 2A supports exactly one image per request")
-        item = images[0]
-        if not isinstance(item, dict) or not isinstance(item.get("image"), str):
+        if not isinstance(images, list) or not images:
+            raise ValueError("multi_modal_data.image must be a non-empty list")
+        prompt_image_token = self._prompt_image_token()
+        model_image_token = self._image_token()
+        if prompt.count(prompt_image_token) != len(images):
             raise ValueError(
-                "multi_modal_data.image item must contain string image url"
+                f"prompt must contain one {prompt_image_token} placeholder per image"
             )
-        image_token = self._image_token()
-        if prompt.count(image_token) != 1:
-            raise ValueError(
-                f"prompt must contain exactly one {image_token} placeholder"
-            )
-        image = self._load_image(item["image"])
-        image_token_count = self._image_token_count()
-        expanded = prompt.replace(
-            image_token,
-            " ".join([image_token] * image_token_count),
-            1,
-        )
+        prepared_images = []
+        image_token_counts = []
+        prompt_parts = prompt.split(prompt_image_token)
+        expanded_parts = [prompt_parts[0]]
+        for idx, item in enumerate(images):
+            if not isinstance(item, dict) or not isinstance(item.get("image"), str):
+                raise ValueError(
+                    "multi_modal_data.image item must contain string image url"
+                )
+            image = self._load_image(item["image"])
+            if self._is_qwen2_vl():
+                prepared = self._prepare_qwen2_vl_image(image)
+                image_token_count = int(prepared["image_token_count"])
+            else:
+                prepared = {"prepared_image": image}
+                image_token_count = self._image_token_count()
+            prepared_images.append({
+                **item,
+                **prepared,
+            })
+            image_token_counts.append(image_token_count)
+            replacement = " ".join([model_image_token] * image_token_count)
+            expanded_parts.append(replacement)
+            expanded_parts.append(prompt_parts[idx + 1])
+        expanded = "".join(expanded_parts)
+        image_token_count = sum(image_token_counts)
         return expanded, {
             **multi_modal_data,
-            "image": [{**item, "prepared_image": image}],
+            "image": prepared_images,
+            "image_token": model_image_token,
             "image_token_count": image_token_count,
+            "image_token_counts": image_token_counts,
         }
 
 
@@ -110,24 +128,45 @@ class LiteMultiModalProcessor:
             if not isinstance(images, list) or not images:
                 raise ValueError("multi_modal_data.image must be a non-empty list")
             pixel_values_rows = []
+            image_grid_thw_rows = []
             for item in images:
                 if not isinstance(item, dict):
                     raise ValueError("multi_modal_data.image item must be a dict")
-                prepared_image = item.get("prepared_image")
-                if prepared_image is not None:
-                    image = prepared_image
+                prepared_pixel_values = item.get("prepared_pixel_values")
+                image_grid_thw = item.get("image_grid_thw")
+                if prepared_pixel_values is not None and image_grid_thw is not None:
+                    pixel_values_rows.append(prepared_pixel_values.to(self.device))
+                    image_grid_thw_rows.append(image_grid_thw.to(self.device))
+                    continue
+                if item.get("prepared_image") is not None:
+                    image = item["prepared_image"]
                 elif isinstance(item.get("image"), str):
                     image = self._load_image(item["image"])
                 else:
                     raise ValueError(
                         "multi_modal_data.image item must contain string image url"
                     )
-                pixel_values_rows.append(self._image_to_pixel_values(image))
-            request.multi_modal_inputs = {
+                if self._is_qwen2_vl():
+                    prepared = self._prepare_qwen2_vl_image(image)
+                    pixel_values_rows.append(
+                        prepared["prepared_pixel_values"].to(self.device)
+                    )
+                    image_grid_thw_rows.append(
+                        prepared["image_grid_thw"].to(self.device)
+                    )
+                else:
+                    pixel_values_rows.append(self._image_to_pixel_values(image))
+            multi_modal_inputs = {
                 "pixel_values": torch.cat(pixel_values_rows, dim=0),
                 "image_token_count": int(mm_data.get("image_token_count", 0) or 0),
                 "image_token_id": int(mm_data.get("image_token_id", -1)),
             }
+            if image_grid_thw_rows:
+                multi_modal_inputs["image_grid_thw"] = torch.cat(
+                    image_grid_thw_rows,
+                    dim=0,
+                )
+            request.multi_modal_inputs = multi_modal_inputs
             self.prepared_requests += 1
             self.prepared_images += len(images)
         except Exception:
@@ -140,20 +179,37 @@ class LiteMultiModalProcessor:
         mm_requests = [req for req in req_dicts if req.multi_modal_inputs]
         if not mm_requests:
             return {}
-        if len(req_dicts) != 1 or len(mm_requests) != 1:
-            raise ValueError(
-                "lite multimodal prefill currently supports "
-                "single-request image batches only"
-            )
-        mm_inputs = mm_requests[0].multi_modal_inputs or {}
-        pixel_values = mm_inputs.get("pixel_values")
-        if pixel_values is None:
+        pixel_values_rows = []
+        image_grid_thw_rows = []
+        image_token_counts = []
+        image_token_id: int | None = None
+        for req in mm_requests:
+            mm_inputs = req.multi_modal_inputs or {}
+            pixel_values = mm_inputs.get("pixel_values")
+            if pixel_values is None:
+                continue
+            pixel_values_rows.append(pixel_values)
+            image_grid_thw = mm_inputs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                image_grid_thw_rows.append(image_grid_thw)
+            image_token_counts.append(int(mm_inputs.get("image_token_count", 0) or 0))
+            current_image_token_id = int(mm_inputs.get("image_token_id", -1))
+            if image_token_id is None:
+                image_token_id = current_image_token_id
+            elif image_token_id != current_image_token_id:
+                raise ValueError("mixed image_token_id multimodal batch")
+        if not pixel_values_rows:
             return {}
-        return {
-            "pixel_values": pixel_values,
-            "image_token_count": int(mm_inputs.get("image_token_count", 0) or 0),
-            "image_token_id": int(mm_inputs.get("image_token_id", -1)),
+        total_image_token_count = sum(image_token_counts)
+        output = {
+            "pixel_values": torch.cat(pixel_values_rows, dim=0),
+            "image_token_count": total_image_token_count,
+            "image_token_counts": image_token_counts,
+            "image_token_id": int(image_token_id if image_token_id is not None else -1),
         }
+        if image_grid_thw_rows:
+            output["image_grid_thw"] = torch.cat(image_grid_thw_rows, dim=0)
+        return output
 
     def get_multimodal_embeddings(
         self,
@@ -221,7 +277,58 @@ class LiteMultiModalProcessor:
     def _image_token(self) -> str:
         config = getattr(self.model, "config", None)
         token = getattr(config, "image_token", None)
+        if token is None and self._is_qwen2_vl():
+            return "<|image_pad|>"
         return str(token or "<image>")
+
+    def _prompt_image_token(self) -> str:
+        if self._is_qwen2_vl():
+            return "<image>"
+        return self._image_token()
+
+    def _is_qwen2_vl(self) -> bool:
+        config = getattr(self.model, "config", None)
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        return (
+            model_type == "qwen2_vl"
+            or "qwen2vl" in type(self.model).__name__.lower()
+        )
+
+    def _prepare_qwen2_vl_image(self, image: Image.Image) -> dict[str, Any]:
+        processor = self._get_qwen2_vl_image_processor()
+        batch = processor(images=[image], return_tensors="pt")
+        pixel_values = batch["pixel_values"]
+        image_grid_thw = batch["image_grid_thw"].to(dtype=torch.long)
+        return {
+            "prepared_pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "image_token_count": self._qwen2_vl_image_token_count(image_grid_thw),
+        }
+
+    def _get_qwen2_vl_image_processor(self) -> Any:
+        if self._qwen2_vl_image_processor is None:
+            from transformers import Qwen2VLImageProcessor
+
+            config = getattr(self.model, "config", None)
+            model_path = str(getattr(config, "_name_or_path", "") or "")
+            if model_path:
+                try:
+                    self._qwen2_vl_image_processor = (
+                        Qwen2VLImageProcessor.from_pretrained(model_path)
+                    )
+                except Exception:
+                    self._qwen2_vl_image_processor = Qwen2VLImageProcessor()
+            else:
+                self._qwen2_vl_image_processor = Qwen2VLImageProcessor()
+        return self._qwen2_vl_image_processor
+
+    def _qwen2_vl_image_token_count(self, image_grid_thw: torch.Tensor) -> int:
+        vision_config = self._vision_config()
+        merge = int(getattr(vision_config, "spatial_merge_size", 2) or 2)
+        total = 0
+        for t, h, w in image_grid_thw.tolist():
+            total += int(t) * int(h) * int(w) // (merge * merge)
+        return total
 
     def _vision_config(self) -> Any:
         config = getattr(self.model, "config", None)

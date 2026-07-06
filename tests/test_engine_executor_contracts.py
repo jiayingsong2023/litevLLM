@@ -135,7 +135,9 @@ class _FakeMultimodalProcessor:
         assert req_dicts == [{"request_id": "prefill-1"}]
         return {
             "pixel_values": torch.ones((1, 1024)),
+            "image_grid_thw": torch.tensor([[1, 4, 4]], dtype=torch.long),
             "image_token_count": 4,
+            "image_token_counts": [4],
             "image_token_id": 77,
         }
 
@@ -158,7 +160,9 @@ def test_prefill_executor_passes_multimodal_placeholder_metadata() -> None:
 
     assert logits.tolist() == [[3.0, 4.0]]
     assert model.attn_metadata["image_token_count"] == 4
+    assert model.attn_metadata["image_token_counts"] == [4]
     assert model.attn_metadata["image_token_id"] == 77
+    assert model.attn_metadata["image_grid_thw"].tolist() == [[1, 4, 4]]
     assert tuple(model.attn_metadata["multimodal_embeddings"].shape) == (1, 4, 8)
     assert tuple(model.kwargs["multimodal_embeddings"].shape) == (1, 4, 8)
 

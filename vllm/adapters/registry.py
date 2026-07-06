@@ -13,6 +13,7 @@ from .base import ModelAdapter
 from .deepseek_v4_flash import DeepSeekV4FlashAdapter
 from .gemma4 import Gemma4Adapter
 from .llama import LlamaAdapter
+from .qwen2_vl import Qwen2VLAdapter
 from .qwen3_5 import Qwen35Adapter
 
 
@@ -65,6 +66,20 @@ def _looks_like_qwen35(model: Any, model_config: Any) -> bool:
     return False
 
 
+def _looks_like_qwen2_vl(model: Any, model_config: Any) -> bool:
+    name = type(model).__name__.lower()
+    if "qwen2vl" in name or "qwen2_vl" in name:
+        return True
+    for config in _hf_config_candidates(model_config):
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        archs = getattr(config, "architectures", [])
+        if model_type == "qwen2_vl":
+            return True
+        if any("qwen2vl" in str(a).lower() for a in (archs or [])):
+            return True
+    return False
+
+
 def _looks_like_gemma4(model: Any, model_config: Any) -> bool:
     name = type(model).__name__.lower()
     if "gemma4" in name:
@@ -110,6 +125,8 @@ def get_model_adapter(model: Any, model_config: Any) -> ModelAdapter:
         return DeepSeekV4FlashAdapter()
     if _looks_like_gemma4(model, model_config):
         return Gemma4Adapter()
+    if _looks_like_qwen2_vl(model, model_config):
+        return Qwen2VLAdapter()
     if _looks_like_qwen35(model, model_config):
         return Qwen35Adapter()
     return LlamaAdapter()

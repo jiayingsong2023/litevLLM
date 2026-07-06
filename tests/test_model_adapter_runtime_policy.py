@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.adapters.gemma4 import Gemma4Adapter
+from vllm.adapters.qwen2_vl import Qwen2VLAdapter
 from vllm.adapters.qwen3_5 import Qwen35Adapter
 from vllm.adapters.registry import get_model_adapter
 from vllm.engine.runtime_config import RuntimeConfig
@@ -147,6 +148,20 @@ def test_registry_detects_qwen35_text_config_before_model_load() -> None:
     adapter = get_model_adapter(None, model_config)
 
     assert isinstance(adapter, Qwen35Adapter)
+
+
+def test_registry_detects_qwen2_vl_config_before_model_load() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen2_vl",
+            architectures=["Qwen2VLForConditionalGeneration"],
+            text_config=None,
+        )
+    )
+
+    adapter = get_model_adapter(None, model_config)
+
+    assert isinstance(adapter, Qwen2VLAdapter)
 
 
 def test_runtime_planner_uses_policy_prefill_chunks(monkeypatch) -> None:

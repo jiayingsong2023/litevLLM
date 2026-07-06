@@ -267,6 +267,20 @@ class _PreTokenizeMultiModalProcessor:
         return "A B C", prepared
 
 
+class _MultiImagePreTokenizeMultiModalProcessor:
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        del prompt, multi_modal_data
+        return (
+            "A B C A B C",
+            {
+                "image": [{"prepared_image": "a"}, {"prepared_image": "b"}],
+                "image_token": "<image>",
+                "image_token_count": 6,
+                "image_token_counts": [3, 3],
+            },
+        )
+
+
 def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
     processor = _PreTokenizeMultiModalProcessor()
     builder = LiteRequestBuilder(
@@ -296,6 +310,35 @@ def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
         "image_token_count": 3,
     }
     assert request.is_multimodal is True
+
+
+def test_request_builder_preserves_multi_image_token_counts() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_hf_tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=_MultiImagePreTokenizeMultiModalProcessor(),
+    )
+
+    request = builder.build(
+        request_id="req-mm-expanded",
+        prompt="compare <image> and <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={
+            "image": [
+                {"image": "file:///tmp/a.png"},
+                {"image": "file:///tmp/b.png"},
+            ]
+        },
+    )
+
+    assert request.input_ids == [1, 2, 3, 1, 2, 3]
+    assert request.multi_modal_data["image_token_count"] == 6
+    assert request.multi_modal_data["image_token_counts"] == [3, 3]
+    assert request.multi_modal_data["image_token_id"] == 17
 
 
 def test_request_builder_rejects_unsupported_structured_output_type() -> None:

@@ -42,9 +42,14 @@ class PrefillExecutor:
                 attn_metadata["image_token_count"] = int(
                     mm_inputs.get("image_token_count", 0) or 0
                 )
+                attn_metadata["image_token_counts"] = list(
+                    mm_inputs.get("image_token_counts", [])
+                )
                 attn_metadata["image_token_id"] = int(
                     mm_inputs.get("image_token_id", -1)
                 )
+                if mm_inputs.get("image_grid_thw") is not None:
+                    attn_metadata["image_grid_thw"] = mm_inputs["image_grid_thw"]
                 multimodal_embeddings = (
                     self.multimodal_processor.get_multimodal_embeddings(mm_inputs)
                 )
