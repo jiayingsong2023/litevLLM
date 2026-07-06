@@ -131,6 +131,9 @@ class _FakeMultimodalModel:
 
 
 class _FakeMultimodalProcessor:
+    def __init__(self) -> None:
+        self.mm_inputs = None
+
     def build_prefill_inputs(self, req_dicts):
         assert req_dicts == [{"request_id": "prefill-1"}]
         return {
@@ -143,17 +146,19 @@ class _FakeMultimodalProcessor:
 
     def get_multimodal_embeddings(self, mm_inputs):
         assert mm_inputs["image_token_count"] == 4
+        self.mm_inputs = dict(mm_inputs)
         return torch.ones((1, 4, 8))
 
 
 def test_prefill_executor_passes_multimodal_placeholder_metadata() -> None:
     model = _FakeMultimodalModel()
     builder = _FakeBatchBuilder()
+    processor = _FakeMultimodalProcessor()
     executor = PrefillExecutor(
         model=model,
         input_batch_builder=builder,
         kv_caches=object(),
-        multimodal_processor=_FakeMultimodalProcessor(),
+        multimodal_processor=processor,
     )
 
     logits, _, _ = executor.execute(["prefill-1"], "scheduler", chunk_len=2)
@@ -165,6 +170,7 @@ def test_prefill_executor_passes_multimodal_placeholder_metadata() -> None:
     assert model.attn_metadata["image_grid_thw"].tolist() == [[1, 4, 4]]
     assert tuple(model.attn_metadata["multimodal_embeddings"].shape) == (1, 4, 8)
     assert tuple(model.kwargs["multimodal_embeddings"].shape) == (1, 4, 8)
+    assert processor.mm_inputs["lora_mapping"] == {"prefill-1": 0}
 
 
 def test_decode_executor_fast_path_is_thin_model_call_wrapper() -> None:

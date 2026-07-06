@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.lora.manager import LoRAManager
+from vllm.lora.weights import LoRALayerWeights
 from vllm.model_executor.models.gemma4.model import (
     Gemma4ForConditionalGeneration,
     Gemma4TextModel,
@@ -244,6 +246,42 @@ def test_gemma4_get_multimodal_embeddings_projects_and_truncates() -> None:
     )
 
     assert tuple(embeddings.shape) == (1, 3, 6)
+
+
+def test_gemma4_get_multimodal_embeddings_applies_projector_lora() -> None:
+    model = object.__new__(Gemma4ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    inner = torch.nn.Module()
+    inner.vision_tower = torch.nn.Identity()
+    inner.embed_vision = Gemma4VisionProjector(2, 2)
+    inner.embed_vision.embedding_projection.weight = torch.nn.Parameter(
+        torch.eye(2),
+        requires_grad=False,
+    )
+    manager = LoRAManager(inner)
+    manager.add_adapter_weights(
+        "adapter-a",
+        {
+            "embed_vision.embedding_projection": LoRALayerWeights(
+                lora_name="adapter-a",
+                rank=1,
+                alpha=1,
+                lora_a=torch.tensor([[1.0], [0.0]]),
+                lora_b=torch.tensor([[10.0, 20.0]]),
+            )
+        },
+    )
+    manager.bind_to_model()
+    model.model = inner
+
+    embeddings = Gemma4ForConditionalGeneration.get_multimodal_embeddings(
+        model,
+        pixel_values=torch.tensor([[[2.0, 3.0]]]),
+        image_token_count=1,
+        lora_mapping=["adapter-a"],
+    )
+
+    assert torch.allclose(embeddings, torch.tensor([[[22.0, 43.0]]]))
 
 
 def test_gemma4_get_multimodal_embeddings_flattens_multiple_images() -> None:

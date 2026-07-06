@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.models.lite_config import LiteConfig
 
 from .policy_utils import _get_eps
@@ -200,10 +201,12 @@ class Gemma4VisionTower(nn.Module):
 class Gemma4VisionProjector(nn.Module):
     def __init__(self, vision_hidden_size: int, text_hidden_size: int) -> None:
         super().__init__()
-        self.embedding_projection = Gemma4VisionDenseLinear(
+        self.embedding_projection = LiteLinear(
             vision_hidden_size,
             text_hidden_size,
+            bias=False,
+            prefix="embedding_projection",
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.embedding_projection(x)
+    def forward(self, x: torch.Tensor, lora_mapping: Any = None) -> torch.Tensor:
+        return self.embedding_projection(x, lora_mapping)

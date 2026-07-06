@@ -39,6 +39,7 @@ class PrefillExecutor:
                 req_dicts_prefill
             )
             if mm_inputs:
+                mm_inputs["lora_mapping"] = attn_metadata.get("lora_mapping")
                 attn_metadata["image_token_count"] = int(
                     mm_inputs.get("image_token_count", 0) or 0
                 )
