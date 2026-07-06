@@ -17,6 +17,7 @@ from vllm.model_executor.models.interfaces import supports_multimodal
 class NullMultiModalProcessor:
     """No-op multimodal processor for runtimes that reject multimodal input."""
 
+
     def prepare_request(self, request: RequestState) -> None:
         del request
 
@@ -63,6 +64,41 @@ class LiteMultiModalProcessor:
         self.embeddings_computed = 0
         self.embedding_feature_dim = 0
 
+
+    def prepare_before_tokenize(
+        self,
+        prompt: str,
+        multi_modal_data: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        if not self.supports_multimodal:
+            raise ValueError("model does not support multimodal inputs")
+        images = multi_modal_data.get("image")
+        if not isinstance(images, list) or len(images) != 1:
+            raise ValueError("Phase 2A supports exactly one image per request")
+        item = images[0]
+        if not isinstance(item, dict) or not isinstance(item.get("image"), str):
+            raise ValueError(
+                "multi_modal_data.image item must contain string image url"
+            )
+        image_token = self._image_token()
+        if prompt.count(image_token) != 1:
+            raise ValueError(
+                f"prompt must contain exactly one {image_token} placeholder"
+            )
+        image = self._load_image(item["image"])
+        image_token_count = self._image_token_count()
+        expanded = prompt.replace(
+            image_token,
+            " ".join([image_token] * image_token_count),
+            1,
+        )
+        return expanded, {
+            **multi_modal_data,
+            "image": [{**item, "prepared_image": image}],
+            "image_token_count": image_token_count,
+        }
+
+
     def prepare_request(self, request: RequestState) -> None:
         mm_data = request.multi_modal_data
         if not mm_data:
@@ -75,14 +111,22 @@ class LiteMultiModalProcessor:
                 raise ValueError("multi_modal_data.image must be a non-empty list")
             pixel_values_rows = []
             for item in images:
-                if not isinstance(item, dict) or not isinstance(item.get("image"), str):
+                if not isinstance(item, dict):
+                    raise ValueError("multi_modal_data.image item must be a dict")
+                prepared_image = item.get("prepared_image")
+                if prepared_image is not None:
+                    image = prepared_image
+                elif isinstance(item.get("image"), str):
+                    image = self._load_image(item["image"])
+                else:
                     raise ValueError(
                         "multi_modal_data.image item must contain string image url"
                     )
-                image = self._load_image(item["image"])
                 pixel_values_rows.append(self._image_to_pixel_values(image))
             request.multi_modal_inputs = {
                 "pixel_values": torch.cat(pixel_values_rows, dim=0),
+                "image_token_count": int(mm_data.get("image_token_count", 0) or 0),
+                "image_token_id": int(mm_data.get("image_token_id", -1)),
             }
             self.prepared_requests += 1
             self.prepared_images += len(images)
@@ -105,7 +149,11 @@ class LiteMultiModalProcessor:
         pixel_values = mm_inputs.get("pixel_values")
         if pixel_values is None:
             return {}
-        return {"pixel_values": pixel_values}
+        return {
+            "pixel_values": pixel_values,
+            "image_token_count": int(mm_inputs.get("image_token_count", 0) or 0),
+            "image_token_id": int(mm_inputs.get("image_token_id", -1)),
+        }
 
     def get_multimodal_embeddings(
         self,
@@ -116,7 +164,6 @@ class LiteMultiModalProcessor:
         self.embedding_requests += 1
         embeddings = self.model.get_multimodal_embeddings(**mm_inputs)
         if embeddings is not None:
-            embeddings = self._aggregate_request_embeddings(embeddings)
             self.embeddings_computed += 1
             if embeddings.dim() == 1:
                 self.embedding_feature_dim += int(embeddings.shape[0])
@@ -156,15 +203,54 @@ class LiteMultiModalProcessor:
             return embeddings.mean(dim=1)
         return embeddings
 
+
+    def _image_token_count(self) -> int:
+        vision_config = self._vision_config()
+        default_output_length = int(
+            getattr(vision_config, "default_output_length", 0) or 0
+        )
+        if default_output_length > 0:
+            return default_output_length
+        image_size = int(getattr(vision_config, "image_size", 32) or 32)
+        patch_size = int(getattr(vision_config, "patch_size", image_size) or image_size)
+        if image_size <= 0 or patch_size <= 0 or image_size % patch_size != 0:
+            raise ValueError("invalid fixed-grid vision_config for image tokens")
+        grid = image_size // patch_size
+        return grid * grid
+
+    def _image_token(self) -> str:
+        config = getattr(self.model, "config", None)
+        token = getattr(config, "image_token", None)
+        return str(token or "<image>")
+
+    def _vision_config(self) -> Any:
+        config = getattr(self.model, "config", None)
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            inner = getattr(self.model, "model", None)
+            inner_config = getattr(inner, "config", None)
+            vision_config = getattr(inner_config, "vision_config", None)
+        if vision_config is None:
+            raise ValueError("model vision_config is required for multimodal inputs")
+        return vision_config
+
     def _image_to_pixel_values(self, image: Image.Image) -> torch.Tensor:
-        rgb = image.convert("RGB").resize((32, 32))
-        flat = torch.tensor(list(rgb.getdata()), dtype=torch.float32)
-        flat = flat.view(-1) / 255.0
-        if flat.numel() < 1024:
-            flat = torch.nn.functional.pad(flat, (0, 1024 - flat.numel()))
-        else:
-            flat = flat[:1024]
-        return flat.unsqueeze(0).to(self.device)
+        vision_config = self._vision_config()
+        patch_size = int(getattr(vision_config, "patch_size", 16) or 16)
+        rows, cols = self._image_patch_grid()
+        rgb = image.convert("RGB").resize((cols * patch_size, rows * patch_size))
+        pixels = torch.tensor(list(rgb.getdata()), dtype=torch.float32)
+        pixels = pixels.view(rows * patch_size, cols * patch_size, 3)
+        pixels = pixels.permute(2, 0, 1).contiguous() / 255.0
+        return pixels.unsqueeze(0).to(self.device)
+
+    def _image_patch_grid(self) -> tuple[int, int]:
+        token_count = self._image_token_count()
+        rows = int(token_count**0.5)
+        while rows > 1 and token_count % rows != 0:
+            rows -= 1
+        cols = token_count // rows
+        return rows, cols
 
     @staticmethod
     def _load_image(image_url: str) -> Image.Image:

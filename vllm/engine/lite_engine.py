@@ -741,6 +741,7 @@ class LiteEngine:
                 max_model_len=self.max_model_len,
                 max_tokens_cap=self.execution_policy.max_tokens_cap,
                 default_min_new_tokens=self.runtime_config.default_min_new_tokens,
+                multimodal_processor=self.multimodal_processor,
             )
             self.execution_backend.sampling_driver = self.sampling_driver
             self.execution_backend.output_coordinator = self.output_pipeline

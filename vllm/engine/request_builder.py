@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -23,6 +23,7 @@ class LiteRequestBuilder:
         max_model_len: int,
         max_tokens_cap: int,
         default_min_new_tokens: int = 0,
+        multimodal_processor: Any | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.policies = policies
@@ -31,6 +32,7 @@ class LiteRequestBuilder:
         self.max_model_len = max_model_len
         self.max_tokens_cap = max_tokens_cap
         self.default_min_new_tokens = max(0, int(default_min_new_tokens))
+        self.multimodal_processor = multimodal_processor
 
     def build(
         self,
@@ -38,10 +40,10 @@ class LiteRequestBuilder:
         request_id: str,
         prompt: str,
         sampling_params: SamplingParams,
-        lora_id: Optional[str] = None,
-        lora_int_id: Optional[int] = None,
-        lora_path: Optional[str] = None,
-        multi_modal_data: Optional[dict[str, Any]] = None,
+        lora_id: str | None = None,
+        lora_int_id: int | None = None,
+        lora_path: str | None = None,
+        multi_modal_data: dict[str, Any] | None = None,
     ) -> RequestState:
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
@@ -54,14 +56,41 @@ class LiteRequestBuilder:
             )
 
         guarded_prompt = self.policies.normalize_prompt(prompt)
-        input_ids = self.tokenizer.encode(guarded_prompt)
+        prepared_multi_modal_data = copy.deepcopy(multi_modal_data)
+        tokenize_prompt = guarded_prompt
+        if prepared_multi_modal_data and self.multimodal_processor is not None:
+            prepare_before_tokenize = getattr(
+                self.multimodal_processor,
+                "prepare_before_tokenize",
+                None,
+            )
+            if prepare_before_tokenize is not None:
+                tokenize_prompt, prepared_multi_modal_data = prepare_before_tokenize(
+                    guarded_prompt,
+                    prepared_multi_modal_data,
+                )
+        input_ids = self.tokenizer.encode(tokenize_prompt)
+        if prepared_multi_modal_data:
+            image_token = prepared_multi_modal_data.get("image_token")
+            if image_token is not None:
+                image_token_text = str(image_token)
+                image_token_ids = self.tokenizer.encode(image_token_text)
+                if len(image_token_ids) == 1:
+                    image_token_id = int(image_token_ids[0])
+                elif hasattr(self.tokenizer, "convert_tokens_to_ids"):
+                    image_token_id = int(
+                        self.tokenizer.convert_tokens_to_ids(image_token_text)
+                    )
+                else:
+                    raise ValueError("image token must encode to exactly one token id")
+                prepared_multi_modal_data["image_token_id"] = image_token_id
         if len(input_ids) >= self.max_model_len:
             raise ValueError(
                 f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
                 f"({self.max_model_len}); leave at least one decode token slot."
             )
 
-        rng: Optional[torch.Generator] = None
+        rng: torch.Generator | None = None
         seed = getattr(effective_sampling_params, "seed", None)
         if seed is not None:
             rng = torch.Generator(device=self.device)
@@ -70,7 +99,7 @@ class LiteRequestBuilder:
         request_state = RequestState(
             request_id=request_id,
             prompt=prompt,
-            guarded_prompt=guarded_prompt,
+            guarded_prompt=tokenize_prompt,
             input_ids=input_ids,
             sampling_params=effective_sampling_params,
             lora_id=lora_id,
@@ -90,10 +119,10 @@ class LiteRequestBuilder:
                 getattr(effective_sampling_params, "service_class", "latency")
                 or "latency"
             ),
-            multi_modal_data=copy.deepcopy(multi_modal_data),
-            is_multimodal=bool((multi_modal_data or {}).get("image")),
+            multi_modal_data=prepared_multi_modal_data,
+            is_multimodal=bool((prepared_multi_modal_data or {}).get("image")),
             is_multimodal_lora=bool(lora_id)
-            and bool((multi_modal_data or {}).get("image")),
+            and bool((prepared_multi_modal_data or {}).get("image")),
         )
         request_state.structured_output_constraint = build_structured_output_constraint(
             self.tokenizer,

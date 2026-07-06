@@ -112,6 +112,45 @@ def test_input_batch_builder_rejects_zero_token_prefill() -> None:
         builder.build_prefill(["r1"], scheduler, 1)
 
 
+def test_input_batch_builder_rejects_image_placeholder_count_mismatch() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.add_request(
+        "r-mm",
+        RequestState(
+            request_id="r-mm",
+            prompt="",
+            slot_idx=0,
+            is_prefill=True,
+            seq_len=0,
+            input_ids=[11, 77, 12],
+            linear_attn_carry=[None],
+            linear_conv_carry=[None],
+            sampling_params=SamplingParams(),
+            is_multimodal=True,
+        ),
+    )
+    scheduler.get_request("r-mm").multi_modal_inputs = {
+        "image_token_id": 77,
+        "image_token_count": 2,
+    }
+    kv_block_manager = _make_kv_block_manager()
+    kv_block_manager.ensure_blocks("r-mm", 3)
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=kv_block_manager,
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    with pytest.raises(ValueError, match="image placeholder count"):
+        builder.build_prefill(["r-mm"], scheduler, 3)
+
+
 def test_input_batch_builder_build_decode_batch() -> None:
     scheduler = _scheduler_with_request()
     req = scheduler.get_request("r1")

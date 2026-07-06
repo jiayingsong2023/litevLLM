@@ -63,6 +63,7 @@ def _hf_tokenizer():
         "x": 14,
         "y": 15,
         '{"A":1}': 16,
+        "<image>": 17,
     }
     base = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
     base.pre_tokenizer = Whitespace()
@@ -250,6 +251,51 @@ def test_request_builder_adds_structured_constraint_for_multimodal() -> None:
     assert request.is_multimodal is True
     assert request.is_multimodal_lora is False
     assert request.structured_output_constraint is not None
+
+
+class _PreTokenizeMultiModalProcessor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        self.calls.append((prompt, multi_modal_data))
+        prepared = {
+            "image": [{"prepared_image": "prepared"}],
+            "image_token": "<image>",
+            "image_token_count": 3,
+        }
+        return "A B C", prepared
+
+
+def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
+    processor = _PreTokenizeMultiModalProcessor()
+    builder = LiteRequestBuilder(
+        tokenizer=_hf_tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=processor,
+    )
+
+    request = builder.build(
+        request_id="req-mm-expanded",
+        prompt="describe <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert processor.calls == [("guarded", {"image": [{"image": "file:///tmp/cat.png"}]})]
+    assert request.guarded_prompt == "A B C"
+    assert request.input_ids == [1, 2, 3]
+    assert request.multi_modal_data == {
+        "image": [{"prepared_image": "prepared"}],
+        "image_token": "<image>",
+        "image_token_id": 17,
+        "image_token_count": 3,
+    }
+    assert request.is_multimodal is True
 
 
 def test_request_builder_rejects_unsupported_structured_output_type() -> None:

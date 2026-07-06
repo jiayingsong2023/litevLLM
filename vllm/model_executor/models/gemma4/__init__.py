@@ -83,6 +83,17 @@ from .moe import (
 
 from .attention import Gemma4Attention
 
+from .vision import (
+    Gemma4VisionAttention,
+    Gemma4VisionEncoder,
+    Gemma4VisionEncoderLayer,
+    Gemma4VisionLinear,
+    Gemma4VisionMLP,
+    Gemma4VisionPatchEmbedder,
+    Gemma4VisionProjector,
+    Gemma4VisionTower,
+)
+
 from .layer import (
     _residual_add_fp32,
     Gemma4DecoderLayer,

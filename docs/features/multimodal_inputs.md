@@ -1,10 +1,14 @@
 # Multimodal Inputs
 
-Multimodal serving exists in the lite runtime and is currently experimental.
-The maintained path is image request plumbing for model-specific validation;
-generic upstream audio/video parser helpers are not part of the current code
-boundary. Validate model-specific behavior before treating it as
-production-supported.
+Gemma4 single-image multimodal serving is supported in the lite runtime. The
+supported path is Phase 2A: one request with one image, real `<image>`
+placeholder expansion, Gemma4 vision tower embeddings, and placeholder
+replacement during text prefill.
+
+Broader multimodal serving remains experimental. Multi-image requests,
+multi-request continuous batching, Qwen2VL, audio, and video require
+model-specific implementation and validation before they should be treated as
+supported.
 
 ## HTTP Request Shape
 
@@ -29,10 +33,10 @@ The server converts text blocks into the prompt and image blocks into
 
 ## Current Boundary
 
-- Image request plumbing is present.
+- Gemma4 supports one image per request.
 - Multimodal scheduling and observer counters exist.
-- Multi-image behavior has test coverage, but broad real-traffic hardening is
-  still required.
+- Multi-image and mixed multimodal batching remain outside the current support
+  claim.
 - Audio and video are unsupported unless model-specific code and tests are
   added. The upstream generic audio/parser helpers were removed during lite
   cleanup.

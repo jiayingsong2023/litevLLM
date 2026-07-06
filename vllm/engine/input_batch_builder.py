@@ -55,6 +55,7 @@ class InputBatchBuilder:
             req = scheduler.get_request(rid)
             slot_idx = int(req.slot_idx)
             all_input_ids = req.input_ids
+            self._assert_image_placeholder_count(req)
             processed_len = req.seq_len
             prefix_hit_len = int(req.prefix_hit_len or req._prefix_cache_hit_len or 0)
             start_pos = max(processed_len, prefix_hit_len)
@@ -410,6 +411,22 @@ class InputBatchBuilder:
         return bool(
             request.is_multimodal or (request.multi_modal_data or {}).get("image")
         )
+
+    @staticmethod
+    def _assert_image_placeholder_count(request: RequestState) -> None:
+        mm_inputs = request.multi_modal_inputs or {}
+        image_token_count = int(mm_inputs.get("image_token_count", 0) or 0)
+        if image_token_count <= 0:
+            return
+        image_token_id = int(mm_inputs.get("image_token_id", -1))
+        actual = sum(
+            1 for token_id in request.input_ids if int(token_id) == image_token_id
+        )
+        if actual != image_token_count:
+            raise ValueError(
+                "image placeholder count does not match image_token_count: "
+                f"actual={actual}, expected={image_token_count}"
+            )
 
     @classmethod
     def _is_multimodal_lora_request(cls, request: RequestState) -> bool:

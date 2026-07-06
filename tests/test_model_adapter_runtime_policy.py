@@ -100,6 +100,8 @@ def test_gemma4_detect_reports_moe_for_26b_a4b_like_config() -> None:
     caps = Gemma4Adapter().detect(SimpleNamespace(), model_config)
 
     assert caps.supports_moe is True
+    assert caps.supports_lora is True
+    assert caps.supports_multimodal is True
 
 
 def test_qwen_runtime_policy_owns_prefill_chunk_preference() -> None:
