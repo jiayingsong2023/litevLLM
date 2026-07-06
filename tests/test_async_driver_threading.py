@@ -43,6 +43,36 @@ async def test_async_driver_runs_step_in_background_thread() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_driver_serializes_step_with_shared_engine_lock() -> None:
+    step_started = threading.Event()
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.active_request_count = 1
+            self.calls = 0
+
+        def step(self) -> list[object]:
+            self.calls += 1
+            step_started.set()
+            self.active_request_count = 0
+            return []
+
+    engine = FakeEngine()
+    engine_lock = threading.RLock()
+    driver = AsyncDriver(engine, engine_lock=engine_lock)
+
+    with engine_lock:
+        driver.notify_new_work()
+        await asyncio.sleep(0.05)
+        assert step_started.is_set() is False
+
+    assert step_started.wait(timeout=2.0)
+    driver.shutdown()
+
+    assert engine.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_async_driver_does_not_block_event_loop_during_step() -> None:
     step_started = threading.Event()
     step_finished = threading.Event()

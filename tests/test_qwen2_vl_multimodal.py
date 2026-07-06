@@ -10,6 +10,7 @@ import torch
 from safetensors import safe_open
 from transformers import Qwen2VLConfig
 
+from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 from vllm.model_executor.models.qwen2_vl import (
     Qwen2VLForCausalLM,
     build_qwen2_vl_vision_tower,
@@ -111,6 +112,26 @@ def test_qwen2_vl_installs_mrope_on_decoder_layers() -> None:
     )
 
     assert type(model.model.layers[0].rotary_emb).__name__ == "MRotaryEmbedding"
+
+
+def test_qwen2_vl_mrope_accepts_batched_decode_layout() -> None:
+    rope = MRotaryEmbedding(
+        head_size=8,
+        rotary_dim=8,
+        max_position_embeddings=16,
+        base=10000.0,
+        is_neox_style=True,
+        dtype=torch.float32,
+        mrope_section=[1, 1, 2],
+    )
+    positions = torch.tensor([[[3], [5]], [[3], [5]], [[3], [5]]])
+    query = torch.randn(2, 1, 2, 8)
+    key = torch.randn(2, 1, 1, 8)
+
+    q_out, k_out = rope(positions, query, key)
+
+    assert q_out.shape == query.shape
+    assert k_out.shape == key.shape
 
 
 def test_qwen2_vl_visual_checkpoint_keys_match_vision_tower() -> None:

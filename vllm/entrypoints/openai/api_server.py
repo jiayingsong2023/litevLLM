@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+import uuid
 from collections.abc import AsyncGenerator
 
 import uvicorn
@@ -105,6 +106,7 @@ def _parse_chat_message_content(
                     status_code=400, detail="image_url block must include non-empty url"
                 )
             images.append({"image": url.strip()})
+            text_parts.append("<image>")
             continue
         raise HTTPException(
             status_code=400, detail=f"unsupported message content type: {block_type}"
@@ -113,6 +115,10 @@ def _parse_chat_message_content(
     prompt = "\n".join(part for part in text_parts if part)
     multi_modal_data = {"image": images} if images else None
     return prompt, multi_modal_data
+
+
+def _new_chat_request_id() -> str:
+    return f"chat-{uuid.uuid4().hex}"
 
 
 def _summarize_runtime_stats(stats: dict) -> dict:
@@ -434,7 +440,7 @@ async def create_chat_completion(request: Request):
         temperature=body.get("temperature", 0.7),
         structured_outputs=_parse_structured_outputs(body),
     )
-    request_id = f"chat-{int(time.time())}"
+    request_id = _new_chat_request_id()
 
     async def generate_stream() -> AsyncGenerator[str, None]:
         last_text = ""

@@ -162,9 +162,16 @@ class Gemma4ForConditionalGeneration(nn.Module):
         image_token_count = int(kwargs.get("image_token_count", 0) or 0)
         if image_token_count <= 0:
             return projected
-        if projected.shape[1] < image_token_count:
+        if projected.shape[0] == 1:
+            if projected.shape[1] < image_token_count:
+                raise ValueError(
+                    "Gemma4 vision embeddings shorter than image_token_count"
+                )
+            return projected[:, :image_token_count, :]
+        flattened = projected.reshape(-1, projected.shape[-1])
+        if flattened.shape[0] < image_token_count:
             raise ValueError("Gemma4 vision embeddings shorter than image_token_count")
-        return projected[:, :image_token_count, :]
+        return flattened[:image_token_count, :]
 
     def forward(
         self,

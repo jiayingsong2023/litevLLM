@@ -71,6 +71,46 @@ def test_replace_image_placeholders_inserts_batched_image_embeddings() -> None:
     ]
 
 
+def test_replace_image_placeholders_handles_mixed_text_and_image_batch() -> None:
+    input_ids = torch.tensor(
+        [
+            [10, 77, 77, 11],
+            [12, 13, 14, 15],
+            [16, 77, 77, 17],
+        ],
+        dtype=torch.long,
+    )
+    text_embeddings = torch.tensor(
+        [
+            [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]],
+            [[5.0, 5.0], [6.0, 6.0], [7.0, 7.0], [8.0, 8.0]],
+            [[9.0, 9.0], [10.0, 10.0], [11.0, 11.0], [12.0, 12.0]],
+        ]
+    )
+    image_embeddings = torch.tensor(
+        [
+            [20.0, 1.0],
+            [21.0, 2.0],
+            [22.0, 3.0],
+            [23.0, 4.0],
+        ]
+    )
+
+    replaced = _replace_image_placeholders(
+        input_ids=input_ids,
+        text_embeddings=text_embeddings,
+        multimodal_embeddings=image_embeddings,
+        image_token_id=77,
+        image_token_count=4,
+    )
+
+    assert replaced.tolist() == [
+        [[1.0, 1.0], [20.0, 1.0], [21.0, 2.0], [4.0, 4.0]],
+        [[5.0, 5.0], [6.0, 6.0], [7.0, 7.0], [8.0, 8.0]],
+        [[9.0, 9.0], [22.0, 3.0], [23.0, 4.0], [12.0, 12.0]],
+    ]
+
+
 def test_replace_image_placeholders_rejects_count_mismatch() -> None:
     input_ids = torch.tensor([[10, 77, 11]], dtype=torch.long)
     text_embeddings = torch.zeros((1, 3, 2))
@@ -204,3 +244,20 @@ def test_gemma4_get_multimodal_embeddings_projects_and_truncates() -> None:
     )
 
     assert tuple(embeddings.shape) == (1, 3, 6)
+
+
+def test_gemma4_get_multimodal_embeddings_flattens_multiple_images() -> None:
+    model = object.__new__(Gemma4ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    inner = torch.nn.Module()
+    inner.vision_tower = torch.nn.Identity()
+    inner.embed_vision = Gemma4VisionProjector(4, 6)
+    model.model = inner
+
+    embeddings = Gemma4ForConditionalGeneration.get_multimodal_embeddings(
+        model,
+        pixel_values=torch.ones((2, 5, 4)),
+        image_token_count=6,
+    )
+
+    assert tuple(embeddings.shape) == (6, 6)
