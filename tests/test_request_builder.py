@@ -27,6 +27,26 @@ class _Tokenizer:
         return list(mapping.get(text, [ord(c) for c in text]))
 
 
+class _GemmaLikeImageTokenizer:
+    eos_token_id = 99
+
+    def encode(self, text: str):
+        stripped = text.strip()
+        if stripped == "":
+            return []
+        mapping = {
+            "A": [1],
+            "B": [2],
+            "A <image> <image> B": [1, 30, 31, 32, 30, 31, 32, 2],
+            "<image>": [30, 31, 32],
+        }
+        return list(mapping.get(stripped, [ord(c) for c in stripped]))
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        del token
+        return 3
+
+
 class _Policies:
     def normalize_prompt(self, prompt: str) -> str:
         del prompt
@@ -281,6 +301,21 @@ class _MultiImagePreTokenizeMultiModalProcessor:
         )
 
 
+class _GemmaLikePreTokenizeMultiModalProcessor:
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        del prompt, multi_modal_data
+        return (
+            "A <image> <image> B",
+            {
+                "image": [{"prepared_image": "prepared"}],
+                "image_token": "<image>",
+                "image_token_id": 258880,
+                "image_token_count": 2,
+                "image_token_counts": [2],
+            },
+        )
+
+
 def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
     processor = _PreTokenizeMultiModalProcessor()
     builder = LiteRequestBuilder(
@@ -310,6 +345,29 @@ def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
         "image_token_count": 3,
     }
     assert request.is_multimodal is True
+
+
+def test_request_builder_inserts_config_image_token_id_after_pretokenize() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_GemmaLikeImageTokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=_GemmaLikePreTokenizeMultiModalProcessor(),
+    )
+
+    request = builder.build(
+        request_id="req-mm-gemma",
+        prompt="describe <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert request.guarded_prompt == "A <image> <image> B"
+    assert request.input_ids == [1, 258880, 258880, 2]
+    assert request.multi_modal_data["image_token_id"] == 258880
 
 
 def test_request_builder_preserves_multi_image_token_counts() -> None:

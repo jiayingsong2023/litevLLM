@@ -10,9 +10,9 @@ short model-focused view of that matrix.
 | :--- | :--- | :--- | :--- |
 | TinyLlama-1.1B | FP16/BF16 | Supported | Tier-B quality spotcheck and A-strict semantic integrity. |
 | Qwen3.5-9B-AWQ | AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
-| Gemma4-26B-A4B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
-| Gemma4-31B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| Gemma4 image multimodal | AWQ 4-bit | Supported | Image placeholder expansion, Gemma4 vision tower, placeholder replacement, multi-image requests, multi-request batching, and Gemma4 projector LoRA. |
+| Gemma4-26B-A4B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B, A-lite, default A-strict audit unless locally disabled, and image multimodal quality spotcheck. |
+| Gemma4-31B-it-AWQ-4bit | AWQ 4-bit | Supported | Tier-B, A-lite, and image multimodal quality spotcheck; A-strict remains manual/specialized. |
+| Gemma4 image multimodal | AWQ 4-bit | Supported | 26B/31B image quality gate, image placeholder expansion, official Gemma4 image patch preprocessing, Gemma4 vision tower, placeholder replacement, multi-image requests, multi-request batching, and Gemma4 projector LoRA. |
 
 ## Experimental / Compatibility Surface
 
@@ -23,6 +23,7 @@ short model-focused view of that matrix.
 | Qwen2VL image multimodal | Experimental | Image preprocessing, `image_grid_thw`, mRoPE positions, real vision tower, and placeholder replacement are implemented. Vision-tower LoRA is unsupported. |
 | LoRA runtime | Experimental | Safetensors PEFT adapters, text-layer LoRA, mixed LoRA batches, and Gemma4 projector LoRA exist; production policy tuning remains workload dependent. |
 | Multimodal serving | Experimental | Gemma4 image support is maintained. Qwen2VL image support exists but still needs broader real-checkpoint smoke coverage. |
+| Gemma4 E4B | Experimental | The local model can load, but it is not part of the supported regression surface and did not pass the Gemma4 image multimodal quality gate. |
 | Legacy vLLM entrypoints | Compatibility | Kept for import and migration stability, not as a second runtime path. |
 
 ## Unsupported In Lite

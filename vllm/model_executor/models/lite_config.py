@@ -19,7 +19,11 @@ class LiteConfig:
         # Some HF configs set rope_parameters explicitly to null; treat as empty dict.
         _rp = getattr(hf_config, "rope_parameters", None)
         self.rope_parameters = _rp if isinstance(_rp, dict) else {}
-        self.hidden_size = getattr(hf_config, "hidden_size", 4096)
+        self.hidden_size = getattr(
+            hf_config,
+            "hidden_size",
+            getattr(hf_config, "mm_embed_dim", 4096),
+        )
         self.intermediate_size = getattr(hf_config, "intermediate_size", 11008)
         self.num_attention_heads = getattr(hf_config, "num_attention_heads", 32)
         self.num_key_value_heads = getattr(
@@ -125,6 +129,9 @@ class LiteConfig:
 
         # Gemma4 vision config fields.
         self.patch_size = int(getattr(hf_config, "patch_size", 16) or 16)
+        self.pooling_kernel_size = int(
+            getattr(hf_config, "pooling_kernel_size", 1) or 1
+        )
         self.position_embedding_size = int(
             getattr(hf_config, "position_embedding_size", 10240) or 10240
         )

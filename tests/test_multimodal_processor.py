@@ -16,8 +16,8 @@ class _Gemma4LikeModel:
 
     def __init__(self) -> None:
         self.config = SimpleNamespace(
+            model_type="gemma4",
             vision_config=SimpleNamespace(image_size=8, patch_size=4),
-            image_token="<image>",
         )
         self.last_multimodal_kwargs = None
 
@@ -66,10 +66,42 @@ def test_multimodal_processor_expands_single_image_placeholder_before_tokenize()
         {"image": [{"image": _data_url_image()}]},
     )
 
-    assert prompt == "describe <image> <image> <image> <image> now"
+    assert prompt == "describe <|image><|image|><|image|><|image|><|image|><image|> now"
     assert prepared["image_token_count"] == 4
     assert len(prepared["image"]) == 1
-    assert prepared["image"][0]["prepared_image"].size == (8, 8)
+    assert tuple(prepared["image"][0]["prepared_pixel_values"].shape) == (1, 4, 48)
+    assert tuple(prepared["image"][0]["image_position_ids"].shape) == (1, 4, 2)
+
+
+def test_multimodal_processor_accepts_gemma_chat_template_image_marker() -> None:
+    processor = LiteMultiModalProcessor(
+        model=_Gemma4LikeModel(),
+        device=torch.device("cpu"),
+    )
+
+    prompt, prepared = processor.prepare_before_tokenize(
+        "<|image|>\ndescribe",
+        {"image": [{"image": _data_url_image()}]},
+    )
+
+    assert prompt == "<|image><|image|><|image|><|image|><|image|><image|>\ndescribe"
+    assert prepared["image_token_count"] == 4
+
+
+def test_multimodal_processor_carries_config_image_token_id_before_tokenize() -> None:
+    model = _Gemma4LikeModel()
+    model.config.image_token_id = 258880
+    processor = LiteMultiModalProcessor(
+        model=model,
+        device=torch.device("cpu"),
+    )
+
+    _, prepared = processor.prepare_before_tokenize(
+        "describe <image>",
+        {"image": [{"image": _data_url_image()}]},
+    )
+
+    assert prepared["image_token_id"] == 258880
 
 
 def test_multimodal_processor_prepare_request_uses_prepared_image() -> None:
@@ -99,7 +131,8 @@ def test_multimodal_processor_prepare_request_uses_prepared_image() -> None:
 
     assert request.multi_modal_inputs["image_token_count"] == 4
     assert request.multi_modal_inputs["image_token_id"] == 77
-    assert tuple(request.multi_modal_inputs["pixel_values"].shape) == (1, 3, 8, 8)
+    assert tuple(request.multi_modal_inputs["pixel_values"].shape) == (1, 4, 48)
+    assert tuple(request.multi_modal_inputs["image_position_ids"].shape) == (1, 4, 2)
     assert processor.prepared_requests == 1
     assert processor.prepared_images == 1
 
@@ -184,10 +217,8 @@ def test_multimodal_processor_expands_multiple_images_before_tokenize() -> None:
         {"image": [{"image": _data_url_image()}, {"image": _data_url_image()}]},
     )
 
-    assert prompt == (
-        "compare <image> <image> <image> <image> and "
-        "<image> <image> <image> <image>"
-    )
+    image_span = "<|image><|image|><|image|><|image|><|image|><image|>"
+    assert prompt == f"compare {image_span} and {image_span}"
     assert prepared["image_token_count"] == 8
     assert len(prepared["image"]) == 2
 
@@ -232,6 +263,30 @@ def test_multimodal_processor_prefers_gemma4_default_output_length() -> None:
         default_output_length=280,
         image_size=8,
         patch_size=4,
+    )
+    processor = LiteMultiModalProcessor(model=model, device=torch.device("cpu"))
+
+    assert processor._image_token_count() == 280
+
+
+def test_multimodal_processor_scales_pixel_grid_for_gemma4_pooling() -> None:
+    model = _Gemma4LikeModel()
+    model.config.vision_config = SimpleNamespace(
+        default_output_length=280,
+        image_size=8,
+        patch_size=16,
+        pooling_kernel_size=3,
+    )
+    processor = LiteMultiModalProcessor(model=model, device=torch.device("cpu"))
+
+    assert processor._image_patch_grid() == (42, 60)
+
+
+def test_multimodal_processor_prefers_gemma4_unified_num_soft_tokens() -> None:
+    model = _Gemma4LikeModel()
+    model.config.vision_config = SimpleNamespace(
+        num_soft_tokens=280,
+        patch_size=16,
     )
     processor = LiteMultiModalProcessor(model=model, device=torch.device("cpu"))
 

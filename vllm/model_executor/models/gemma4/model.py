@@ -157,7 +157,11 @@ class Gemma4ForConditionalGeneration(nn.Module):
                 device=vision_param.device,
                 dtype=vision_param.dtype,
             )
-        hidden = vision_tower(pixel_values)
+        image_position_ids = kwargs.get("image_position_ids")
+        if image_position_ids is None:
+            hidden = vision_tower(pixel_values)
+        else:
+            hidden = vision_tower(pixel_values, image_position_ids)
         projected = embed_vision(hidden, kwargs.get("lora_mapping"))
         image_token_count = int(kwargs.get("image_token_count", 0) or 0)
         if image_token_count <= 0:

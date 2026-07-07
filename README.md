@@ -117,7 +117,7 @@ SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 uv run python tests/e2e_full_benchmark.py
 ```
 
-`tests/run_inference_correctness_regression.sh` 覆盖 TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B；当 DeepSeek V4 Flash 目标 GGUF 文件存在时，还会运行实验性 Tier-B quality smoke。Gemma4 模型目录自动探测，优先本地路径。
+`tests/run_inference_correctness_regression.sh` 覆盖 TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B；Gemma4-26B/31B 还会运行真实端到端 image multimodal quality spotcheck。当 DeepSeek V4 Flash 目标 GGUF 文件存在时，还会运行实验性 Tier-B quality smoke。Gemma4 模型目录自动探测，优先本地路径。
 
 默认准确度策略为：`<=14B`：A-strict + B；`>14B`：A-lite + B（Gemma4-26B 例外，默认开启 A-strict + A-lite + B）。在 60GB 级 GPU 上可通过 `SKIP_A_TIER=1` 跳过 A-tier 测试以节省显存。
 

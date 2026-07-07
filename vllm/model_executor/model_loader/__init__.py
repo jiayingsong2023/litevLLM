@@ -939,20 +939,15 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                                 break
                             if "linear_attn" in k and k.endswith(f".{s}") and proj in k:
                                 if not any(x in k for x in ["packed", "scale", "zero"]): found_v = sd[k]; break
-                        elif idx is None and "layers." not in k:
-                            matched = False
-                            for suffix in alt_suffixes:
-                                if (
-                                    k.endswith(f".{proj}.{suffix}")
-                                    or k.endswith(f".{proj}_{suffix}")
-                                    or k == f"{m_name}.{suffix}"
-                                    or k.endswith(f".{m_name}.{suffix}")
-                                    or k == f"{m_name}_{suffix}"
-                                    or k.endswith(f".{m_name}_{suffix}")
-                                ):
-                                    matched = True
-                                    break
-                            if matched:
+                        elif idx is None:
+                            matched_key = _find_non_layer_module_attr_key(
+                                sd_keys,
+                                m_name=m_name,
+                                proj=proj,
+                                alt_suffixes=alt_suffixes,
+                            )
+                            if matched_key is not None and matched_key in sd:
+                                k = matched_key
                                 found_v = sd[k]
                                 break
                         if found_v is not None: break
@@ -966,7 +961,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                     loaded_count += 1
                     loaded_module_attrs.add(module_internal_key)
                     del sd[k]; torch.cuda.empty_cache()
-                elif internal == "qweight" and found_v.dtype in [torch.float16, torch.bfloat16]:
+                elif internal == "qweight" and _is_dense_safetensors_weight(found_v):
                     m.to("cuda")
                     if hasattr(m, "weight"): m.weight = None
                     m.weight = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
@@ -1137,6 +1132,45 @@ def _resolve_model_dtype_from_hf_config(hf_config: Any) -> torch.dtype:
         if ds is torch.bfloat16:
             return torch.bfloat16
     return torch.float16
+
+
+def _find_non_layer_module_attr_key(
+    sd_keys: list[str],
+    *,
+    m_name: str,
+    proj: str,
+    alt_suffixes: list[str],
+) -> str | None:
+    exact_names = [m_name]
+    if m_name.startswith("model."):
+        exact_names.append(f"model.language_model.{m_name[6:]}")
+
+    def exact_match(k: str, suffix: str) -> bool:
+        return any(
+            k == f"{name}.{suffix}"
+            or k.endswith(f".{name}.{suffix}")
+            or k == f"{name}_{suffix}"
+            or k.endswith(f".{name}_{suffix}")
+            for name in exact_names
+        )
+
+    def loose_match(k: str, suffix: str) -> bool:
+        return k.endswith(f".{proj}.{suffix}") or k.endswith(f".{proj}_{suffix}")
+
+    non_layer_keys = [k for k in sd_keys if "layers." not in k]
+    for suffix in alt_suffixes:
+        for k in non_layer_keys:
+            if exact_match(k, suffix):
+                return k
+    for suffix in alt_suffixes:
+        for k in non_layer_keys:
+            if loose_match(k, suffix):
+                return k
+    return None
+
+
+def _is_dense_safetensors_weight(tensor: torch.Tensor) -> bool:
+    return tensor.is_floating_point()
 
 
 def get_tokenizer(model: Union[str, Any], **kwargs: Any):

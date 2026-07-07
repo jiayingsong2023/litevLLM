@@ -28,6 +28,10 @@ class _ModelRegistry:
                 "gemma4",
                 "Gemma4ForConditionalGeneration",
             ),
+            "Gemma4UnifiedForConditionalGeneration": (
+                "gemma4",
+                "Gemma4ForConditionalGeneration",
+            ),
             "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
             "DeepSeekV4FlashForCausalLM": (
                 "deepseek_v4_flash",

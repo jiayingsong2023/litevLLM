@@ -42,6 +42,20 @@ def test_resolve_model_cls_uses_inferred_gemma4_arch_when_architectures_empty() 
     assert arch == "Gemma4ForConditionalGeneration"
 
 
+def test_resolve_model_cls_supports_gemma4_unified_architecture() -> None:
+    reg = _ModelRegistry()
+    model_cfg = _cfg_with_model_types("gemma4_unified", "gemma4_text")
+
+    model_cls, arch = reg.resolve_model_cls(
+        ["Gemma4UnifiedForConditionalGeneration"],
+        model_cfg,
+    )
+
+    assert issubclass(model_cls, nn.Module)
+    assert model_cls.__name__ == "Gemma4ForConditionalGeneration"
+    assert arch == "Gemma4UnifiedForConditionalGeneration"
+
+
 def test_resolve_model_cls_supports_qwen2_vl_official_architecture() -> None:
     reg = _ModelRegistry()
     model_cfg = _cfg_with_model_types("qwen2_vl", None)

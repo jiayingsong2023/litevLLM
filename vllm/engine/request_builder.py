@@ -69,21 +69,13 @@ class LiteRequestBuilder:
                     guarded_prompt,
                     prepared_multi_modal_data,
                 )
-        input_ids = self.tokenizer.encode(tokenize_prompt)
+        input_ids = self._encode_prompt(tokenize_prompt, prepared_multi_modal_data)
         if prepared_multi_modal_data:
             image_token = prepared_multi_modal_data.get("image_token")
             if image_token is not None:
-                image_token_text = str(image_token)
-                image_token_ids = self.tokenizer.encode(image_token_text)
-                if len(image_token_ids) == 1:
-                    image_token_id = int(image_token_ids[0])
-                elif hasattr(self.tokenizer, "convert_tokens_to_ids"):
-                    image_token_id = int(
-                        self.tokenizer.convert_tokens_to_ids(image_token_text)
-                    )
-                else:
-                    raise ValueError("image token must encode to exactly one token id")
-                prepared_multi_modal_data["image_token_id"] = image_token_id
+                prepared_multi_modal_data["image_token_id"] = (
+                    self._resolve_image_token_id(prepared_multi_modal_data)
+                )
         if len(input_ids) >= self.max_model_len:
             raise ValueError(
                 f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
@@ -132,3 +124,60 @@ class LiteRequestBuilder:
         request_state.admitted_at = None
         request_state.first_token_at = None
         return request_state
+
+    def _encode_prompt(
+        self,
+        prompt: str,
+        multi_modal_data: dict[str, Any] | None,
+    ) -> list[int]:
+        if not multi_modal_data:
+            return self.tokenizer.encode(prompt)
+        image_token = multi_modal_data.get("image_token")
+        image_token_count = int(multi_modal_data.get("image_token_count", 0) or 0)
+        if image_token is None or image_token_count <= 0:
+            return self.tokenizer.encode(prompt)
+
+        image_token_text = str(image_token)
+        parts = prompt.split(image_token_text)
+        occurrences = len(parts) - 1
+        if occurrences == 0:
+            return self.tokenizer.encode(prompt)
+        if occurrences != image_token_count:
+            raise ValueError(
+                "expanded image token count does not match image_token_count: "
+                f"actual={occurrences}, expected={image_token_count}"
+            )
+
+        image_token_id = self._resolve_image_token_id(multi_modal_data)
+        input_ids: list[int] = []
+        for idx, part in enumerate(parts):
+            if part.strip():
+                input_ids.extend(
+                    self._encode_text_part(part, add_special_tokens=idx == 0)
+                )
+            if idx < occurrences:
+                input_ids.append(image_token_id)
+        return input_ids
+
+    def _encode_text_part(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        try:
+            return list(
+                self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            )
+        except TypeError:
+            return list(self.tokenizer.encode(text))
+
+    def _resolve_image_token_id(self, multi_modal_data: dict[str, Any]) -> int:
+        existing = multi_modal_data.get("image_token_id")
+        if existing is not None:
+            return int(existing)
+        image_token = multi_modal_data.get("image_token")
+        if image_token is None:
+            raise ValueError("image token is required for multimodal input")
+        image_token_text = str(image_token)
+        image_token_ids = self.tokenizer.encode(image_token_text)
+        if len(image_token_ids) == 1:
+            return int(image_token_ids[0])
+        if hasattr(self.tokenizer, "convert_tokens_to_ids"):
+            return int(self.tokenizer.convert_tokens_to_ids(image_token_text))
+        raise ValueError("image token must encode to exactly one token id")

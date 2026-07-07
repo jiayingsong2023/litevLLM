@@ -228,7 +228,27 @@ def test_gemma4_vision_tower_outputs_patch_embeddings() -> None:
 
     embeddings = tower(torch.ones((1, 3, 4, 4)))
 
-    assert tuple(embeddings.shape) == (1, 4, 4)
+    assert tuple(embeddings.shape) == (4, 4)
+
+
+def test_gemma4_vision_tower_pools_patch_embeddings() -> None:
+    config = SimpleNamespace(
+        hidden_size=4,
+        intermediate_size=8,
+        num_attention_heads=2,
+        head_dim=2,
+        num_hidden_layers=0,
+        patch_size=2,
+        pooling_kernel_size=2,
+        position_embedding_size=16,
+        rms_norm_eps=1e-6,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+    tower = Gemma4VisionTower(config)
+
+    embeddings = tower(torch.ones((1, 3, 8, 8)))
+
+    assert tuple(embeddings.shape) == (4, 4)
 
 
 def test_gemma4_get_multimodal_embeddings_projects_and_truncates() -> None:

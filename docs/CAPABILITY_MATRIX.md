@@ -30,9 +30,9 @@ or feature status lists.
 | :--- | :--- | :--- |
 | TinyLlama-1.1B | Supported | Tier-B quality spotcheck and A-strict semantic integrity. |
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
-| Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, and default A-strict audit unless locally disabled. |
-| Gemma4-31B-it-AWQ-4bit | Supported | Tier-B and A-lite; A-strict remains manual/specialized. |
-| Gemma4 image multimodal | Supported | Image request path with prompt placeholder expansion, Gemma4 vision tower embeddings, placeholder replacement in text prefill, multi-image requests, multi-request continuous batching, and Gemma4 projector LoRA. |
+| Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, default A-strict audit unless locally disabled, and Gemma4 image multimodal quality spotcheck. |
+| Gemma4-31B-it-AWQ-4bit | Supported | Tier-B, A-lite, and Gemma4 image multimodal quality spotcheck. A-strict remains manual/specialized. |
+| Gemma4 image multimodal | Supported | Gemma4 26B/31B image quality is covered by the default correctness regression. The path includes prompt placeholder expansion, official Gemma4 image patch preprocessing, Gemma4 vision tower embeddings, placeholder replacement in text prefill, multi-image requests, multi-request continuous batching, and Gemma4 projector LoRA. Gemma4 E4B is not in the supported regression surface. |
 | Qwen2VL image multimodal | Experimental | Qwen2VL image preprocessing, `image_grid_thw`, mRoPE positions, real vision tower, and placeholder replacement are implemented and covered by focused tests. Vision-tower LoRA is not supported. |
 | DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed KV cache (per-request pre-allocated raw, compressed, and indexer buffers; not managed by the lite runtime's flat block pool), opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. Recent measured warm-cache decode is in the 1.6-1.9 tok/s range after selected-expert, Q8, and indexer-QAT work; this is not a production-speed parity claim. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
