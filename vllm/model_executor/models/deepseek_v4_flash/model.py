@@ -1874,6 +1874,16 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             == "1"
         )
 
+    @staticmethod
+    def _deepseek_async_prefetch_enabled() -> bool:
+        return (
+            os.environ.get(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH",
+                "0",
+            )
+            == "1"
+        )
+
     def pin_hot_experts_for_input_ids(
         self,
         input_ids: torch.Tensor,
