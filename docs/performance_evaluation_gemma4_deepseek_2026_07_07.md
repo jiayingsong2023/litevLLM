@@ -5,6 +5,8 @@
 > 目标硬件：AMD Ryzen AI MAX+ 395 / Radeon 8060S Graphics（gfx1151），96 GB 统一内存  
 > 运行环境：ROCm，Python 3.12，`uv` 虚拟环境
 
+> **更新（2026-07-08）**：DeepSeek V4 Flash 的后续实验与收敛结论已写入 `docs/performance_evaluation_deepseek_v4_flash_2026_07_08.md`。staging/cache/prefetch 优化已证明上限很低；下一步需对 warm-resident 路径做 ROCm kernel profile。
+
 ---
 
 ## 1. 执行摘要
