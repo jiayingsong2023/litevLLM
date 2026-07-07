@@ -97,6 +97,9 @@ class DeepSeekV4FlashGPUWeightStager:
         if max_staged_bytes is not None and max_staged_bytes < 0:
             raise ValueError("max staged bytes must be non-negative")
         self.max_staged_bytes = max_staged_bytes
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
         self._full_resident_enabled = False
         self._staged_bytes = 0
         self._grouped_cache: dict[DeepSeekV4FlashCacheKey, torch.Tensor] = {}
@@ -768,6 +771,38 @@ class DeepSeekV4FlashGPUWeightStager:
             return
         with torch.cuda.stream(stream):
             self._prefetch_grouped_experts(tensors, request)
+
+    def prefetch_grouped_experts_async(
+        self,
+        tensors: DeepSeekV4FlashGroupedExpertTensors,
+        request: DeepSeekV4FlashExpertPrefetchRequest,
+    ) -> torch.cuda.Event:
+        """Prefetch on a background stream and return an event for the compute stream.
+
+        The caller must call wait_for_prefetch(event) on the compute stream before
+        consuming the staged tensors. If the background stream is unavailable, the
+        prefetch runs synchronously on the current stream and an already-completed
+        event is still returned so callers can use a uniform wait path.
+        """
+        stream = self._prefetch_stream
+        if stream is None:
+            self._prefetch_grouped_experts(tensors, request)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            return event
+        with torch.cuda.stream(stream):
+            self._prefetch_grouped_experts(tensors, request)
+        event = torch.cuda.Event()
+        event.record(stream)
+        return event
+
+    def wait_for_prefetch(
+        self,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        """Make the current compute stream wait for a prefetch event."""
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
 
     def _prefetch_grouped_experts(
         self,

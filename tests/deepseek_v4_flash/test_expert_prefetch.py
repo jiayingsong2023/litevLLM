@@ -280,3 +280,42 @@ def test_model_best_effort_prefetch_skips_stream_only_experts() -> None:
     assert stager.requests == [
         DeepSeekV4FlashExpertPrefetchRequest(layer_idx=3, expert_ids=(0,))
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_prefetch_async_returns_event_and_hits_cache() -> None:
+    tensors = _grouped_expert_tensors()
+    store = _FakeRawPayloadStore()
+    payload = bytes(range(ggml_tensor_nbytes((256, 1), GGML_TYPE_Q2_K)))
+    for tensor in (tensors.gate, tensors.up, tensors.down):
+        store.payloads[(tensor.name, 0)] = payload
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    request = DeepSeekV4FlashExpertPrefetchRequest(layer_idx=3, expert_ids=(0,))
+
+    event = stager.prefetch_grouped_experts_async(tensors, request)
+
+    assert isinstance(event, torch.cuda.Event)
+    stager.wait_for_prefetch(event)
+    # Demand staging should now hit the cache loaded by async prefetch.
+    for tensor in (tensors.gate, tensors.up, tensors.down):
+        stager.stage_grouped_expert_payload(tensor, 0, layer_idx=3)
+    stats = stager.cache_stats()
+    assert store.raw_reads == 3
+    assert stats["grouped_hits"] == 3
+    assert stats["grouped_misses"] == 3
+    assert stats["prefetch_misses"] == 3
+    assert stats["prefetch_payload_misses"] == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_wait_for_prefetch_event_blocks_compute_stream() -> None:
+    store = _FakeRawPayloadStore()
+    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream())
+
+    # Should not raise and should be a no-op for an already-completed event.
+    stager.wait_for_prefetch(event)
+
+    # None event should also be a no-op.
+    stager.wait_for_prefetch(None)
