@@ -664,21 +664,36 @@ class DeepSeekV4FlashGPUWeightStager:
                 payload=cached,
             )
 
-        raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="The given buffer is not writable.*",
-                    category=UserWarning,
-                )
-                cpu_payload = torch.frombuffer(raw.payload, dtype=torch.uint8).clone()
-        finally:
-            raw.payload.release()
+        with self._profile_section(
+            "raw_payload_read_clone",
+            tensor=tensor.name,
+            expert_id=expert_id,
+            layer_idx=layer_idx,
+        ):
+            raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="The given buffer is not writable.*",
+                        category=UserWarning,
+                    )
+                    cpu_payload = torch.frombuffer(
+                        raw.payload, dtype=torch.uint8
+                    ).clone()
+            finally:
+                raw.payload.release()
         nbytes = cpu_payload.numel() * cpu_payload.element_size()
         if not should_cache or not self._prepare_cache_insert(nbytes):
             self._record_streamed_bytes(nbytes)
-            staged = cpu_payload.to(device=self.device, non_blocking=True)
+            with self._profile_section(
+                "h2d_copy_enqueue",
+                tensor=tensor.name,
+                expert_id=expert_id,
+                layer_idx=layer_idx,
+                cached=False,
+            ):
+                staged = cpu_payload.to(device=self.device, non_blocking=True)
             return DeepSeekV4FlashStagedQuantizedExpertPayload(
                 tensor_name=raw.tensor_name,
                 expert_id=raw.expert_id,
@@ -688,10 +703,23 @@ class DeepSeekV4FlashGPUWeightStager:
                 payload=staged,
             )
         self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
-        staged = cpu_payload.to(device=self.device, non_blocking=True)
-        pinned = self._is_pinned_grouped_expert(layer_idx, expert_id)
-        self._register_cached_entry(cache_key, staged, nbytes, pinned=pinned)
-        self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
+        with self._profile_section(
+            "h2d_copy_enqueue",
+            tensor=tensor.name,
+            expert_id=expert_id,
+            layer_idx=layer_idx,
+            cached=True,
+        ):
+            staged = cpu_payload.to(device=self.device, non_blocking=True)
+        with self._profile_section(
+            "cache_insert",
+            tensor=tensor.name,
+            expert_id=expert_id,
+            layer_idx=layer_idx,
+        ):
+            pinned = self._is_pinned_grouped_expert(layer_idx, expert_id)
+            self._register_cached_entry(cache_key, staged, nbytes, pinned=pinned)
+            self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
         return DeepSeekV4FlashStagedQuantizedExpertPayload(
             tensor_name=raw.tensor_name,
             expert_id=raw.expert_id,

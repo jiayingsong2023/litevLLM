@@ -582,13 +582,23 @@ Measured on the reference DeepSeek V4 Flash GGUF smoke configuration:
   - async off: `0.439` tok/s steady-state decode
   - async on: `0.525` tok/s steady-state decode
   - `layer_moe` phase time: `-13.8%`
+  - With the added staging profiler sections, the cold-cache run shows:
+    - `raw_payload_read_clone`: ~1.76 ms/payload (CPU `raw_grouped_expert_payload` + `torch.frombuffer(...).clone()`)
+    - `h2d_copy_enqueue`: ~0.19 ms/payload (the actual `cpu_payload.to(device, non_blocking=True)`)
+    - `cache_insert`: ~0.007 ms/payload (cache dict registration / LRU update)
+    - The CPU read/clone dominates the per-payload staging cost, not the H2D copy.
+  - Async prefetch coverage is very small:
+    - `deepseek_async_prefetch_scheduled_layers` = `32`
+    - `deepseek_async_prefetch_opportunities` = `672`
+    - Coverage ≈ **4.8%** of layers/tokens.
+  - The low coverage is because `_likely_hash_routed_expert_ids_for_token()` only returns experts for layers that have a static `expert_token_to_expert_ids` table. Most later MoE layers depend on router/hidden-state outputs and cannot be predicted from `token_id` alone.
 
 - **Warm-cache gate** (with kept-path envs `FASTINFERENCE_KV_TYPE=fp16`, `FASTINFERENCE_BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`):
   - async off: `1.60 / 1.69 / 1.83` tok/s steady-state (3-run repeat)
   - async on: `1.80 / 1.80 / 1.84` tok/s steady-state (3-run repeat)
   - No regression; warm gate comfortably clears the `1.5` tok/s threshold.
 
-- **Decision**: keep the default `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=0`. The feature is default-off and can be enabled explicitly for the measured cold-cache improvement.
+- **Decision**: keep the default `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=0`. The feature is default-off and can be enabled explicitly for the measured cold-cache improvement. The next optimization step is **not** more event tuning; it is either (a) expanding the set of predictably routable experts, or (b) moving the bulk routed-expert staging off the demand path.
 
 All 9 implementation-plan tasks are complete.
 

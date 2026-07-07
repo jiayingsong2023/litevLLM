@@ -403,6 +403,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         Returns None if there is nothing to prefetch or prefetch fails.
         """
+        self._deepseek_profiler.add_counter(
+            "deepseek_async_prefetch_opportunities", 1
+        )
         grouped_experts = getattr(next_layer, "grouped_experts", None)
         if grouped_experts is None:
             return None
@@ -426,13 +429,18 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         if not cacheable_expert_ids:
             return None
         try:
-            return stager.prefetch_grouped_experts_async(
+            event = stager.prefetch_grouped_experts_async(
                 grouped_experts,
                 DeepSeekV4FlashExpertPrefetchRequest(
                     layer_idx=next_layer.layer_index,
                     expert_ids=cacheable_expert_ids,
                 ),
             )
+            if event is not None:
+                self._deepseek_profiler.add_counter(
+                    "deepseek_async_prefetch_scheduled_layers", 1
+                )
+            return event
         except Exception:
             self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
             return None
