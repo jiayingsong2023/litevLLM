@@ -579,18 +579,17 @@ Expected: warm gate still reports `decode_tps_steady_state >= 1.5` (no regressio
 Measured on the reference DeepSeek V4 Flash GGUF smoke configuration:
 
 - **Cold-cache A/B** (`FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH` off vs. on):
-  - async off: `0.439` tok/s steady-state decode
-  - async on: `0.525` tok/s steady-state decode
-  - `layer_moe` phase time: `-13.8%`
+  - Single-run example: async off `0.439` tok/s, async on `0.525` tok/s; `layer_moe` phase time `-13.8%`.
+  - Repeat-3 median on the reference machine: async off `1.672` tok/s, async on `1.672` tok/s (run-to-run cold-cache variance is high; the consistent signal is `layer_moe` reduction and no regression).
   - With the added staging profiler sections, the cold-cache run shows:
-    - `raw_payload_read_clone`: ~1.76 ms/payload (CPU `raw_grouped_expert_payload` + `torch.frombuffer(...).clone()`)
-    - `h2d_copy_enqueue`: ~0.19 ms/payload (the actual `cpu_payload.to(device, non_blocking=True)`)
+    - `raw_payload_read_clone`: ~1.0–1.8 ms/payload (CPU `raw_grouped_expert_payload` + `torch.frombuffer(...).clone()`)
+    - `h2d_copy_enqueue`: ~0.15–0.19 ms/payload (the actual `cpu_payload.to(device, non_blocking=True)`)
     - `cache_insert`: ~0.007 ms/payload (cache dict registration / LRU update)
     - The CPU read/clone dominates the per-payload staging cost, not the H2D copy.
   - Async prefetch coverage is very small:
-    - `deepseek_async_prefetch_scheduled_layers` = `32`
-    - `deepseek_async_prefetch_opportunities` = `672`
-    - Coverage ≈ **4.8%** of layers/tokens.
+    - `deepseek_async_prefetch_scheduled_layers` = `32`–`96`
+    - `deepseek_async_prefetch_opportunities` = `672`–`2016`
+    - Coverage ≈ **4.8%** of opportunities.
   - The low coverage is because `_likely_hash_routed_expert_ids_for_token()` only returns experts for layers that have a static `expert_token_to_expert_ids` table. Most later MoE layers depend on router/hidden-state outputs and cannot be predicted from `token_id` alone.
 
 - **Warm-cache gate** (with kept-path envs `FASTINFERENCE_KV_TYPE=fp16`, `FASTINFERENCE_BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`):
@@ -601,6 +600,28 @@ Measured on the reference DeepSeek V4 Flash GGUF smoke configuration:
 - **Decision**: keep the default `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=0`. The feature is default-off and can be enabled explicitly for the measured cold-cache improvement. The next optimization step is **not** more event tuning; it is either (a) expanding the set of predictably routable experts, or (b) moving the bulk routed-expert staging off the demand path.
 
 All 9 implementation-plan tasks are complete.
+
+## Follow-up experiment: CPU payload cache
+
+**Goal:** Reduce the dominant `raw_payload_read_clone` cost by caching the cloned CPU payload bytes for each `(tensor, expert_id)` pair.
+
+**Implementation:**
+- Added an opt-in LRU CPU payload cache to `DeepSeekV4FlashGPUWeightStager`.
+- Controlled by `FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES` (default `0` = disabled).
+- Added counters `cpu_payload_cache_hits`, `cpu_payload_cache_misses`, `cpu_payload_cache_evictions`.
+- Added A/B script `tests/run_deepseek_v4_flash_cpu_payload_cache_ab.sh` with `--repeat 3` and median reporting.
+
+**Result (reference 96 GB UMA machine, default decode settings):**
+
+With the default UMA budget, the GPU staging cache is large enough to hold the entire 16-token working set, so every distinct `(tensor, expert_id)` payload is staged to the GPU exactly once:
+
+- `cpu_payload_cache_hits` = `0`
+- `cpu_payload_cache_misses` = `5703`
+- `cpu_payload_cache_evictions` = `4793`
+- `raw_payload_read_clone_ms` with cache on: **6249 ms** vs **1864 ms** with cache off (the cache-churn overhead makes it slower, not faster).
+- Steady-state decode TPS with cache on/off is effectively the same (median ~1.65 tok/s).
+
+**Decision:** Do **not** enable or default-on the CPU payload cache. Keep the implementation behind the env var so it can be revisited on memory-constrained GPUs where the GPU staging cache cannot hold the working set, but do not invest further unless `raw_payload_read_clone_ms` and TPS both improve in a realistic constrained scenario.
 
 ## Self-Review Checklist
 

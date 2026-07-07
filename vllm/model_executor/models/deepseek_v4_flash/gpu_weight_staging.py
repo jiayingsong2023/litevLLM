@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import warnings
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -127,7 +128,15 @@ class DeepSeekV4FlashGPUWeightStager:
             "prefetch_payload_streamed_bytes": 0,
             "streamed_bytes": 0,
             "batched_payload_stage_calls": 0,
+            "cpu_payload_cache_hits": 0,
+            "cpu_payload_cache_misses": 0,
+            "cpu_payload_cache_evictions": 0,
         }
+        self._cpu_payload_cache: OrderedDict[tuple[str, int], torch.Tensor] = (
+            OrderedDict()
+        )
+        self._cpu_payload_cache_bytes = 0
+        self._cpu_payload_cache_capacity = self._read_cpu_payload_cache_capacity()
 
     @property
     def full_resident_enabled(self) -> bool:
@@ -177,6 +186,66 @@ class DeepSeekV4FlashGPUWeightStager:
 
     def cache_stats(self) -> dict[str, int]:
         return dict(self._cache_stats)
+
+    @staticmethod
+    def _read_cpu_payload_cache_capacity() -> int:
+        """Return the CPU payload cache capacity in bytes (default 0 = disabled)."""
+        value = os.environ.get(
+            "FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES", "0"
+        )
+        try:
+            return max(0, int(value))
+        except ValueError:
+            warnings.warn(
+                f"Ignoring malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES "
+                f"value {value!r}; using 0",
+                stacklevel=2,
+            )
+            return 0
+
+    def _get_cpu_cached_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+    ) -> torch.Tensor | None:
+        if self._cpu_payload_cache_capacity <= 0:
+            return None
+        key = (tensor.name, expert_id)
+        payload = self._cpu_payload_cache.get(key)
+        if payload is None:
+            return None
+        self._cpu_payload_cache.move_to_end(key)
+        self._cache_stats["cpu_payload_cache_hits"] += 1
+        return payload
+
+    def _put_cpu_cached_payload(
+        self,
+        tensor: DeepSeekV4FlashTensor,
+        expert_id: int,
+        payload: torch.Tensor,
+    ) -> None:
+        if self._cpu_payload_cache_capacity <= 0:
+            return
+        nbytes = payload.numel() * payload.element_size()
+        if nbytes > self._cpu_payload_cache_capacity:
+            return
+        key = (tensor.name, expert_id)
+        if key in self._cpu_payload_cache:
+            self._cpu_payload_cache.move_to_end(key)
+            return
+        while (
+            self._cpu_payload_cache
+            and self._cpu_payload_cache_bytes + nbytes
+            > self._cpu_payload_cache_capacity
+        ):
+            _, evicted = self._cpu_payload_cache.popitem(last=False)
+            self._cpu_payload_cache_bytes -= (
+                evicted.numel() * evicted.element_size()
+            )
+            self._cache_stats["cpu_payload_cache_evictions"] += 1
+        self._cpu_payload_cache[key] = payload
+        self._cpu_payload_cache_bytes += nbytes
+        self._cache_stats["cpu_payload_cache_misses"] += 1
 
     def _record_prefetch_delta(self, before_stats: dict[str, int]) -> None:
         after_stats = self._cache_stats
@@ -664,25 +733,28 @@ class DeepSeekV4FlashGPUWeightStager:
                 payload=cached,
             )
 
-        with self._profile_section(
-            "raw_payload_read_clone",
-            tensor=tensor.name,
-            expert_id=expert_id,
-            layer_idx=layer_idx,
-        ):
-            raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message="The given buffer is not writable.*",
-                        category=UserWarning,
-                    )
-                    cpu_payload = torch.frombuffer(
-                        raw.payload, dtype=torch.uint8
-                    ).clone()
-            finally:
-                raw.payload.release()
+        cpu_payload = self._get_cpu_cached_payload(tensor, expert_id)
+        if cpu_payload is None:
+            with self._profile_section(
+                "raw_payload_read_clone",
+                tensor=tensor.name,
+                expert_id=expert_id,
+                layer_idx=layer_idx,
+            ):
+                raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
+                try:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message="The given buffer is not writable.*",
+                            category=UserWarning,
+                        )
+                        cpu_payload = torch.frombuffer(
+                            raw.payload, dtype=torch.uint8
+                        ).clone()
+                finally:
+                    raw.payload.release()
+            self._put_cpu_cached_payload(tensor, expert_id, cpu_payload)
         nbytes = cpu_payload.numel() * cpu_payload.element_size()
         if not should_cache or not self._prepare_cache_insert(nbytes):
             self._record_streamed_bytes(nbytes)
