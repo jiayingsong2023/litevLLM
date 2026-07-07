@@ -148,7 +148,7 @@ def test_prefetch_async_returns_event_and_hits_cache() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_wait_for_prefetch_event_blocks_compute_stream() -> None:
+def test_wait_for_prefetch_accepts_event_and_none() -> None:
     store = _FakeRawPayloadStore()
     stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
     event = torch.cuda.Event()
