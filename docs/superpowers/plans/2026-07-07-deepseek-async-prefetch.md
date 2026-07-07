@@ -452,9 +452,11 @@ for variant in ("off", "on"):
         print(f"{variant}: missing {path}")
         continue
     data = json.loads(path.read_text())
-    metrics = data.get("decode_metrics", {})
+    runs = data.get("runs", [])
+    metrics = runs[0] if runs else {}
     summary = data.get("profile_summary", {})
     print(f"{variant}: decode_tps_steady_state={metrics.get('decode_tps_steady_state', 0):.3f} "
+          f"decode_tps_agg={metrics.get('decode_tps_agg', 0):.3f} "
           f"layer_moe_ms={summary.get('phase_totals_ms', {}).get('layer_moe', 0):.3f}")
 PY
 ```
