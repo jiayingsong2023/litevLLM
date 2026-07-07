@@ -23,7 +23,12 @@ timeout 600 uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.
   --profile-json /tmp/ds_gate_cold_run.json
 
 echo "===== DeepSeek V4 Flash warm-cache gate ====="
-timeout 600 uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+# Tests the kept-path warm-cache configuration (pinned hot experts + small staging budget).
+timeout 600 \
+  FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
+  FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
+  FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
   --model "$MODEL" \
   --context-length 4096 \
   --prompt-length 32 \
