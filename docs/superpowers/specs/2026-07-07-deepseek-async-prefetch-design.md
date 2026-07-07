@@ -31,7 +31,7 @@ def prefetch_grouped_experts_async(
 ) -> torch.cuda.Event:
     """在 background stream 上 prefetch，返回 event 供 compute stream 同步。"""
     with torch.cuda.stream(self._prefetch_stream):
-        self.prefetch_grouped_experts(tensors, request, stream=self._prefetch_stream)
+        self._prefetch_grouped_experts(tensors, request)
     event = torch.cuda.Event()
     event.record(self._prefetch_stream)
     return event
