@@ -44,7 +44,7 @@
 
 **Rationale:** The kept-path warm-cache command already uses `--repeat 3` + warmup=max_new_tokens (16) + `FULL_RESIDENT=1/PIN_HOT_EXPERTS=1`. Passing the existing `--min-steady-decode-tps` gate makes the warm-cache 1.6–1.9 tok/s target a hard regression check.
 
-- [ ] **Step 1: Modify smoke command to include warm TPS gate**
+- [x] **Step 1: Modify smoke command to include warm TPS gate**
 
   In `tests/e2e_full_benchmark.py`, inside `_run_deepseek_v4_flash_direct_benchmark`, after the existing `--repeat 3` extend block, append:
 
@@ -59,13 +59,13 @@
   )
   ```
 
-  Exact location: after line 2863 (`"--repeat", "3",` block closes at line 2864).
+  Exact location: after line 2863 (`"--repeat", "3",` block closes at line 2864). **Already present in the file; verified.**
 
-- [ ] **Step 2: Verify the subprocess failure path still reports correctly**
+- [x] **Step 2: Verify the subprocess failure path still reports correctly**
 
   The existing `proc.returncode != 0` block at lines 2889–2893 already raises `RuntimeError` with stderr; no change needed.
 
-- [ ] **Step 3: Run DeepSeek e2e benchmark and confirm it passes**
+- [x] **Step 3: Run DeepSeek e2e benchmark and confirm it passes**
 
   Command:
   ```bash
@@ -75,14 +75,11 @@
     --json-out /tmp/ds_gate_test.json
   ```
 
-  Expected: exit code 0; stdout contains `decode_tps=1.60` or higher and no "steady-state decode TPS below threshold" error.
+  Result: exit code 0; stdout reports `decode_tps=1.79`, above the 1.5 gate. No "steady-state decode TPS below threshold" error.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
-  ```bash
-  git add tests/e2e_full_benchmark.py
-  git commit -m "feat(bench): add DeepSeek V4 Flash warm-cache decode TPS gate to e2e benchmark"
-  ```
+  No source change was required for this step; the gate was already wired. It will be committed together with the real-smoke gate changes.
 
 ---
 
@@ -98,18 +95,20 @@
 
 **Rationale:** `tests/run_deepseek_v4_flash_real_smoke.sh` is the maintained real-GPU smoke entrypoint. Adding the two gates there makes them discoverable and runnable in CI.
 
-- [ ] **Step 1: Append cold-cache and warm-cache gate commands to the smoke script**
+- [x] **Step 1: Append cold-cache and warm-cache gate commands to the smoke script**
 
-  Add the following block at the end of `tests/run_deepseek_v4_flash_real_smoke.sh`, after the existing pytest/http smoke blocks:
+  Final block in `tests/run_deepseek_v4_flash_real_smoke.sh` (after the pytest/http smoke blocks):
 
   ```bash
   MODEL=models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 
   echo "===== DeepSeek V4 Flash cold-cache gate ====="
+  # Cold-cache uses default staging budget and no full-resident, but keeps the
+  # same KV/block/hot-expert knobs as the warm gate for a stable baseline.
   FASTINFERENCE_KV_TYPE=fp16 \
   FASTINFERENCE_BLOCK_SIZE=32 \
   FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
-  uv run python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+    timeout 600 uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
     --model "$MODEL" \
     --context-length 4096 \
     --max-tokens 16 \
@@ -118,23 +117,28 @@
     --profile-json /tmp/ds_gate_cold_run.json
 
   echo "===== DeepSeek V4 Flash warm-cache gate ====="
+  # Warm-cache kept path: fp16 KV, 32-token blocks, full resident + pinned hot
+  # experts.  Don't pass --profile-json here; profiler sync overhead lowers the
+  # steady-state decode TPS below the 1.5 gate even when the actual decode path
+  # is healthy (~1.58 tok/s without profiling).
   FASTINFERENCE_KV_TYPE=fp16 \
   FASTINFERENCE_BLOCK_SIZE=32 \
   FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
   FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
   FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
-  uv run python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+    timeout 600 uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
     --model "$MODEL" \
     --context-length 4096 \
     --prompt-length 32 \
     --max-tokens 16 \
     --warmup-tokens 16 \
     --repeat 3 \
-    --min-steady-decode-tps 1.5 \
-    --profile-json /tmp/ds_gate_warm_run.json
+    --min-steady-decode-tps 1.5
   ```
 
-- [ ] **Step 2: Run the real-smoke script and confirm both gates pass**
+  Note: `uv run --no-sync` and `timeout` are used to match the existing pytest blocks in the script.
+
+- [x] **Step 2: Run the real-smoke script and confirm both gates pass**
 
   Command:
   ```bash
@@ -142,12 +146,12 @@
   bash tests/run_deepseek_v4_flash_real_smoke.sh
   ```
 
-  Expected: both gate commands exit 0; cold `decode_tps_steady_state >= 0.4`; warm `decode_tps_steady_state >= 1.5`.
+  Result: exit code 0; cold `decode_tps_steady_state = 0.56` (>= 0.4); warm 3-run steady-state samples were `1.60 / 1.69 / 1.83` (>= 1.5).
 
 - [ ] **Step 3: Commit**
 
   ```bash
-  git add tests/run_deepseek_v4_flash_real_smoke.sh
+  git add tests/run_deepseek_v4_flash_real_smoke.sh docs/superpowers/plans/2026-07-07-p0-perf-gates.md
   git commit -m "feat(smoke): add DeepSeek V4 Flash cold/warm decode TPS gates"
   ```
 

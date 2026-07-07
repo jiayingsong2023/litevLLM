@@ -583,10 +583,10 @@ Measured on the reference DeepSeek V4 Flash GGUF smoke configuration:
   - async on: `0.525` tok/s steady-state decode
   - `layer_moe` phase time: `-13.8%`
 
-- **Warm-cache gate** (with kept-path envs `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`):
-  - async off: `1.19` tok/s
-  - async on: `1.30` tok/s
-  - The kept-path envs were added to the warm gate so the historical `1.6–1.9` tok/s warm-cache result is reachable and the `1.5` tok/s threshold is achievable.
+- **Warm-cache gate** (with kept-path envs `FASTINFERENCE_KV_TYPE=fp16`, `FASTINFERENCE_BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`):
+  - async off: `1.60 / 1.69 / 1.83` tok/s steady-state (3-run repeat)
+  - async on: `1.80 / 1.80 / 1.84` tok/s steady-state (3-run repeat)
+  - No regression; warm gate comfortably clears the `1.5` tok/s threshold.
 
 - **Decision**: keep the default `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=0`. The feature is default-off and can be enabled explicitly for the measured cold-cache improvement.
 
