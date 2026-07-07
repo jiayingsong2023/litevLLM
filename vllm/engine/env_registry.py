@@ -242,8 +242,7 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_BENCH_POLICY_MODE": _removed(
         "FASTINFERENCE_BENCH_POLICY_MODE",
         description=(
-            "Experimental benchmark policy override removed from "
-            "e2e_full_benchmark.py"
+            "Experimental benchmark policy override removed from e2e_full_benchmark.py"
         ),
     ),
     "FASTINFERENCE_BENCH_PROFILE": _deprecated(
@@ -302,6 +301,9 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK"
     ),
+    "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH": _tool_only(
+        "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH"
+    ),
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT"
     ),
@@ -313,9 +315,6 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     ),
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS"
-    ),
-    "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH": _tool_only(
-        "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH"
     ),
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS"
