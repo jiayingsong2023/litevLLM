@@ -29,7 +29,7 @@ class NullMultiModalProcessor:
     def get_multimodal_embeddings(
         self,
         mm_inputs: dict[str, torch.Tensor],
-    ) -> None:
+    ) -> torch.Tensor | None:
         del mm_inputs
         return None
 
@@ -268,15 +268,6 @@ class LiteMultiModalProcessor:
         self.embedding_requests = 0
         self.embeddings_computed = 0
         self.embedding_feature_dim = 0
-
-    @staticmethod
-    def _aggregate_request_embeddings(embeddings: torch.Tensor) -> torch.Tensor:
-        if embeddings.dim() == 2:
-            return embeddings.mean(dim=0, keepdim=True)
-        if embeddings.dim() >= 3:
-            return embeddings.mean(dim=1)
-        return embeddings
-
 
     def _image_token_count(self) -> int:
         vision_config = self._vision_config()
