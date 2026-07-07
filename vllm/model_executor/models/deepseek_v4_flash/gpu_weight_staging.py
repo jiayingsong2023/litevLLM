@@ -715,6 +715,7 @@ class DeepSeekV4FlashGPUWeightStager:
             raise ValueError("DeepSeek V4 Flash expert staging requires a CUDA device")
         should_cache = self._should_cache_grouped_expert(layer_idx, expert_id)
         cache_key = self._grouped_payload_cache_key(tensor, expert_id)
+        input_size, output_size, _expert_count = tensor.dims
         cached = self._grouped_cache.get(cache_key) if should_cache else None
         if cached is not None:
             if layer_idx is not None:
@@ -723,7 +724,6 @@ class DeepSeekV4FlashGPUWeightStager:
                 self._pinned_cache_keys.add(cache_key)
             self._record_lru_hit(cache_key)
             self.record_cache_hit("grouped", tensor_name=tensor.name)
-            input_size, output_size, _expert_count = tensor.dims
             return DeepSeekV4FlashStagedQuantizedExpertPayload(
                 tensor_name=tensor.name,
                 expert_id=expert_id,
@@ -767,11 +767,11 @@ class DeepSeekV4FlashGPUWeightStager:
             ):
                 staged = cpu_payload.to(device=self.device, non_blocking=True)
             return DeepSeekV4FlashStagedQuantizedExpertPayload(
-                tensor_name=raw.tensor_name,
-                expert_id=raw.expert_id,
-                ggml_type=raw.ggml_type,
-                rows=raw.rows,
-                columns=raw.columns,
+                tensor_name=tensor.name,
+                expert_id=expert_id,
+                ggml_type=tensor.tensor_type,
+                rows=output_size,
+                columns=input_size,
                 payload=staged,
             )
         self.record_cache_miss("grouped", nbytes, tensor_name=tensor.name)
@@ -793,11 +793,11 @@ class DeepSeekV4FlashGPUWeightStager:
             self._register_cached_entry(cache_key, staged, nbytes, pinned=pinned)
             self._grouped_cache_experts[cache_key] = (layer_idx, expert_id)
         return DeepSeekV4FlashStagedQuantizedExpertPayload(
-            tensor_name=raw.tensor_name,
-            expert_id=raw.expert_id,
-            ggml_type=raw.ggml_type,
-            rows=raw.rows,
-            columns=raw.columns,
+            tensor_name=tensor.name,
+            expert_id=expert_id,
+            ggml_type=tensor.tensor_type,
+            rows=output_size,
+            columns=input_size,
             payload=staged,
         )
 
