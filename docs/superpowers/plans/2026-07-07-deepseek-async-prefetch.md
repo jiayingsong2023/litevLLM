@@ -144,7 +144,9 @@ def test_prefetch_async_returns_event_and_hits_cache() -> None:
     stats = stager.cache_stats()
     assert store.raw_reads == 3
     assert stats["grouped_hits"] == 3
-    assert stats["prefetch_hits"] == 3
+    assert stats["grouped_misses"] == 3
+    assert stats["prefetch_misses"] == 3
+    assert stats["prefetch_payload_misses"] == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
