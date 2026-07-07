@@ -2860,6 +2860,11 @@ def _run_deepseek_v4_flash_direct_benchmark(
                 str(spec.max_new_tokens),
                 "--repeat",
                 "3",
+                "--min-steady-decode-tps",
+                os.environ.get(
+                    "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS",
+                    "1.5",
+                ),
             ]
         )
     start = time.perf_counter()
