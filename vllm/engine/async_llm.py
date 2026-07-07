@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import threading
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -22,6 +23,8 @@ class AsyncLLM(EngineClient):
     def __init__(self, vllm_config: VllmConfig, **kwargs):
         self.vllm_config = vllm_config
         self.engine = LiteEngine(vllm_config)
+        self._engine_lock = threading.RLock()
+        self.engine._async_engine_lock = self._engine_lock
         self.engine.set_tokenizer(get_tokenizer(vllm_config.model_config))
         runtime_config = getattr(vllm_config, "runtime_config", None)
         min_step_interval_s = float(
@@ -49,28 +52,29 @@ class AsyncLLM(EngineClient):
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
-        try:
-            self.engine.add_request(
-                request_id,
-                prompt,
-                sampling_params,
-                lora_id=lora_id,
-                lora_request=lora_request,
-                multi_modal_data=multi_modal_data,
-            )
-        except TypeError as exc:
-            # Backward compatibility for engines/test doubles that don't yet accept
-            # the multi_modal_data keyword argument.
-            if "multi_modal_data" not in str(exc):
-                raise
-            self.engine.add_request(
-                request_id,
-                prompt,
-                sampling_params,
-                lora_id=lora_id,
-                lora_request=lora_request,
-            )
-        self.driver.notify_new_work()
+        with self._engine_lock:
+            try:
+                self.engine.add_request(
+                    request_id,
+                    prompt,
+                    sampling_params,
+                    lora_id=lora_id,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                )
+            except TypeError as exc:
+                # Backward compatibility for engines/test doubles that don't yet
+                # accept the multi_modal_data keyword argument.
+                if "multi_modal_data" not in str(exc):
+                    raise
+                self.engine.add_request(
+                    request_id,
+                    prompt,
+                    sampling_params,
+                    lora_id=lora_id,
+                    lora_request=lora_request,
+                )
+            self.driver.notify_new_work()
 
         # Stream results back to API
         async for output in self.engine.get_request_stream(request_id):

@@ -9,6 +9,10 @@ class _ModelRegistry:
         self.models: dict[str, tuple[str, str]] = {
             "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
             "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+            "Qwen2VLForConditionalGeneration": (
+                "qwen2_vl",
+                "Qwen2VLForConditionalGeneration",
+            ),
             "QWen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
             "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
             "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
@@ -21,6 +25,10 @@ class _ModelRegistry:
                 "Qwen3_5MoeForConditionalGeneration",
             ),
             "Gemma4ForConditionalGeneration": (
+                "gemma4",
+                "Gemma4ForConditionalGeneration",
+            ),
+            "Gemma4UnifiedForConditionalGeneration": (
                 "gemma4",
                 "Gemma4ForConditionalGeneration",
             ),
@@ -48,6 +56,8 @@ class _ModelRegistry:
 
         if any(c.startswith("gemma4") for c in candidates):
             return ["Gemma4ForConditionalGeneration"]
+        if "qwen2_vl" in candidates:
+            return ["Qwen2VLForConditionalGeneration"]
         if "qwen3_5_moe_text" in candidates:
             return ["Qwen3_5MoeForConditionalGeneration"]
         if "qwen3_5_text" in candidates or "qwen3_5" in candidates:

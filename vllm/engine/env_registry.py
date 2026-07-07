@@ -600,6 +600,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY": _tool_only(
         "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY"
     ),
+    "FASTINFERENCE_UV_NO_SYNC": _tool_only(
+        "FASTINFERENCE_UV_NO_SYNC",
+        description="Regression script switch to use uv run --no-sync.",
+    ),
     "FASTINFERENCE_USE_LEGACY_SAMPLING": _tool_only(
         "FASTINFERENCE_USE_LEGACY_SAMPLING",
         description="Temporary opt-out for the vectorized sampling rollout.",

@@ -8,6 +8,7 @@ import torch
 from vllm.model_executor.layers.lite_linear import LiteLinear
 
 from .loader import LoRALoader
+from .mapping import LoRAMapping
 from .weights import LoRALayerWeights
 
 
@@ -57,12 +58,30 @@ class LoRAManager:
         active = self._active_adapter_names(lora_mapping)
         if not active:
             return None
-        if len(active) != 1:
-            raise ValueError("Phase 1 does not support mixed LoRA batches")
-        adapter_name = active[0]
         if target_name is None:
             return None
-        weights = self._adapters.get(adapter_name, {}).get(str(target_name))
+        mapping = self._adapter_mapping(lora_mapping)
+        if len(active) == 1 and not any(item is None for item in mapping):
+            return self._compute_adapter_delta(active[0], str(target_name), x)
+
+        if x.ndim >= 3 and len(mapping) == x.shape[0]:
+            return self._compute_request_delta(mapping, str(target_name), x)
+
+        x2 = x.reshape(-1, x.shape[-1])
+        if len(mapping) == x2.shape[0]:
+            return self._compute_token_delta(mapping, str(target_name), x)
+
+        raise ValueError(
+            "LoRA mapping length must match batch size or flattened token count"
+        )
+
+    def _compute_adapter_delta(
+        self,
+        adapter_name: str,
+        target_name: str,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        weights = self._adapters.get(adapter_name, {}).get(target_name)
         if weights is None:
             return None
         x2 = x.reshape(-1, x.shape[-1])
@@ -72,10 +91,75 @@ class LoRAManager:
         delta = delta * weights.scaling
         return delta.reshape(*x.shape[:-1], -1)
 
+    def _compute_request_delta(
+        self,
+        mapping: list[str | None],
+        target_name: str,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        output: torch.Tensor | None = None
+        for row_idx, adapter_name in enumerate(mapping):
+            if not adapter_name:
+                continue
+            row_delta = self._compute_adapter_delta(
+                adapter_name,
+                target_name,
+                x[row_idx : row_idx + 1],
+            )
+            if row_delta is None:
+                continue
+            if output is None:
+                output = torch.zeros(
+                    (*x.shape[:-1], row_delta.shape[-1]),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            output[row_idx : row_idx + 1].copy_(row_delta)
+        return output
+
+    def _compute_token_delta(
+        self,
+        mapping: list[str | None],
+        target_name: str,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        x2 = x.reshape(-1, x.shape[-1])
+        output2: torch.Tensor | None = None
+        for token_idx, adapter_name in enumerate(mapping):
+            if not adapter_name:
+                continue
+            token_delta = self._compute_adapter_delta(
+                adapter_name,
+                target_name,
+                x2[token_idx : token_idx + 1],
+            )
+            if token_delta is None:
+                continue
+            if output2 is None:
+                output2 = torch.zeros(
+                    (x2.shape[0], token_delta.shape[-1]),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            output2[token_idx : token_idx + 1].copy_(token_delta.reshape(1, -1))
+        if output2 is None:
+            return None
+        return output2.reshape(*x.shape[:-1], -1)
+
     @staticmethod
     def _active_adapter_names(lora_mapping: Any) -> list[str]:
+        if isinstance(lora_mapping, LoRAMapping):
+            return lora_mapping.active_adapter_names
+        return sorted(
+            {str(item) for item in LoRAManager._adapter_mapping(lora_mapping) if item}
+        )
+
+    @staticmethod
+    def _adapter_mapping(lora_mapping: Any) -> list[str | None]:
         if lora_mapping is None:
             return []
+        if isinstance(lora_mapping, LoRAMapping):
+            return list(lora_mapping.adapter_ids)
         if isinstance(lora_mapping, str):
             return [lora_mapping] if lora_mapping else []
         if isinstance(lora_mapping, dict):
@@ -84,5 +168,4 @@ class LoRAManager:
             values = lora_mapping
         else:
             values = [lora_mapping]
-        names = sorted({str(item) for item in values if item})
-        return names
+        return [str(item) if item else None for item in values]

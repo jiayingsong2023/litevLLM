@@ -32,10 +32,12 @@ class AsyncDriver:
         *,
         min_step_interval_s: float = 0.001,
         sleep_fn: Callable[[float], None] = time.sleep,
+        engine_lock: Any | None = None,
     ):
         self.engine = engine
         self.min_step_interval_s = max(0.0, float(min_step_interval_s))
         self._sleep = sleep_fn
+        self._engine_lock = engine_lock or getattr(engine, "_async_engine_lock", None)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._work_queue: queue.Queue[bool] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -63,7 +65,9 @@ class AsyncDriver:
 
     def _run_loop(self) -> None:
         while self._running:
-            if self.engine.active_request_count == 0:
+            with self._locked_engine():
+                active_request_count = self.engine.active_request_count
+            if active_request_count == 0:
                 self._idle_waits += 1
                 try:
                     self._work_queue.get(timeout=1.0)
@@ -76,7 +80,9 @@ class AsyncDriver:
                 continue
 
             try:
-                self.engine.step()
+                with self._locked_engine():
+                    self.engine.step()
+                    active_request_count = self.engine.active_request_count
                 self._steps += 1
             except Exception as exc:
                 error = BackgroundLoopError(str(exc))
@@ -90,11 +96,16 @@ class AsyncDriver:
                 self._sleep(self.min_step_interval_s)
                 continue
 
-            if self.engine.active_request_count > 0:
+            if active_request_count > 0:
                 self._backpressure_sleeps += 1
                 self._sleep(self.min_step_interval_s)
 
         self._shutdown_event.set()
+
+    def _locked_engine(self):
+        if self._engine_lock is None:
+            return contextlib.nullcontext()
+        return self._engine_lock
 
     def stats(self) -> dict[str, int | float]:
         return {

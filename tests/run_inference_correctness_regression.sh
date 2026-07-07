@@ -405,6 +405,10 @@ GEMMA4_26B_A_STRICT_AUDIT=("${UV_RUN[@]}" python tests/tools/gemma4_prefill_stri
   --max-model-len 256
   --gpu-memory-utilization 0.80
   --max-num-batched-tokens 512)
+GEMMA4_MULTIMODAL_QUALITY=("${UV_RUN[@]}" python tests/tools/gemma4_multimodal_quality_spotcheck.py
+  --max-tokens 16
+  --max-model-len 1024
+  --gpu-memory-utilization 0.80)
 
 require_model_dir "$MODEL_TINYLLAMA" "TinyLlama"
 require_model_dir "$MODEL_QWEN35_9B_AWQ" "Qwen3.5-9B-AWQ"
@@ -448,6 +452,10 @@ if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
       env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_31B_Q4" --quant awq "${GEMMA4_PROMPT_ARGS[@]}"
     cleanup_after_model_step "Gemma4-31B Tier-B"
+    run_stage "Tier-B Gemma4-31B multimodal quality" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_31B_A_LITE}" \
+      "${GEMMA4_MULTIMODAL_QUALITY[@]}" --model "$MODEL_GEMMA4_31B_Q4"
+    cleanup_after_model_step "Gemma4-31B multimodal quality"
   else
     echo "[Warn] Gemma4 model dir not found, skipping: $MODEL_GEMMA4_31B_Q4"
   fi
@@ -468,6 +476,10 @@ if [[ "${RUN_GEMMA4_26B}" == "1" ]]; then
       env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B}" \
       "${GEMMA4_SPOTCHECK[@]}" --model "$MODEL_GEMMA4_26B_A4B" --quant awq "${GEMMA4_26B_PROMPT_ARGS[@]}"
     cleanup_after_model_step "Gemma4-26B Tier-B"
+    run_stage "Tier-B Gemma4-26B multimodal quality" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B_A_LITE}" \
+      "${GEMMA4_MULTIMODAL_QUALITY[@]}" --model "$MODEL_GEMMA4_26B_A4B"
+    cleanup_after_model_step "Gemma4-26B multimodal quality"
   else
     echo "[Warn] Gemma4-26B model dir not found, skipping: $MODEL_GEMMA4_26B_A4B"
   fi

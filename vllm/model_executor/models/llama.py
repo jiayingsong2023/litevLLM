@@ -244,7 +244,7 @@ class LlamaDecoderLayer(nn.Module):
             )
             out = attn_in.view(bs, seq, -1)
         else:
-            out = q.view(bs, seq, -1)
+            out = q.reshape(bs, seq, -1)
         hidden_states = x + self.self_attn.o_proj(out, lora_mapping)
         h = self.post_attention_layernorm(hidden_states)
         gate = self.mlp.gate_proj(h, lora_mapping)

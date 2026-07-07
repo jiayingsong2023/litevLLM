@@ -27,6 +27,26 @@ class _Tokenizer:
         return list(mapping.get(text, [ord(c) for c in text]))
 
 
+class _GemmaLikeImageTokenizer:
+    eos_token_id = 99
+
+    def encode(self, text: str):
+        stripped = text.strip()
+        if stripped == "":
+            return []
+        mapping = {
+            "A": [1],
+            "B": [2],
+            "A <image> <image> B": [1, 30, 31, 32, 30, 31, 32, 2],
+            "<image>": [30, 31, 32],
+        }
+        return list(mapping.get(stripped, [ord(c) for c in stripped]))
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        del token
+        return 3
+
+
 class _Policies:
     def normalize_prompt(self, prompt: str) -> str:
         del prompt
@@ -63,6 +83,7 @@ def _hf_tokenizer():
         "x": 14,
         "y": 15,
         '{"A":1}': 16,
+        "<image>": 17,
     }
     base = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
     base.pre_tokenizer = Whitespace()
@@ -250,6 +271,132 @@ def test_request_builder_adds_structured_constraint_for_multimodal() -> None:
     assert request.is_multimodal is True
     assert request.is_multimodal_lora is False
     assert request.structured_output_constraint is not None
+
+
+class _PreTokenizeMultiModalProcessor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        self.calls.append((prompt, multi_modal_data))
+        prepared = {
+            "image": [{"prepared_image": "prepared"}],
+            "image_token": "<image>",
+            "image_token_count": 3,
+        }
+        return "A B C", prepared
+
+
+class _MultiImagePreTokenizeMultiModalProcessor:
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        del prompt, multi_modal_data
+        return (
+            "A B C A B C",
+            {
+                "image": [{"prepared_image": "a"}, {"prepared_image": "b"}],
+                "image_token": "<image>",
+                "image_token_count": 6,
+                "image_token_counts": [3, 3],
+            },
+        )
+
+
+class _GemmaLikePreTokenizeMultiModalProcessor:
+    def prepare_before_tokenize(self, prompt, multi_modal_data):
+        del prompt, multi_modal_data
+        return (
+            "A <image> <image> B",
+            {
+                "image": [{"prepared_image": "prepared"}],
+                "image_token": "<image>",
+                "image_token_id": 258880,
+                "image_token_count": 2,
+                "image_token_counts": [2],
+            },
+        )
+
+
+def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
+    processor = _PreTokenizeMultiModalProcessor()
+    builder = LiteRequestBuilder(
+        tokenizer=_hf_tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=processor,
+    )
+
+    request = builder.build(
+        request_id="req-mm-expanded",
+        prompt="describe <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert processor.calls == [("guarded", {"image": [{"image": "file:///tmp/cat.png"}]})]
+    assert request.guarded_prompt == "A B C"
+    assert request.input_ids == [1, 2, 3]
+    assert request.multi_modal_data == {
+        "image": [{"prepared_image": "prepared"}],
+        "image_token": "<image>",
+        "image_token_id": 17,
+        "image_token_count": 3,
+    }
+    assert request.is_multimodal is True
+
+
+def test_request_builder_inserts_config_image_token_id_after_pretokenize() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_GemmaLikeImageTokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=_GemmaLikePreTokenizeMultiModalProcessor(),
+    )
+
+    request = builder.build(
+        request_id="req-mm-gemma",
+        prompt="describe <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
+    )
+
+    assert request.guarded_prompt == "A <image> <image> B"
+    assert request.input_ids == [1, 258880, 258880, 2]
+    assert request.multi_modal_data["image_token_id"] == 258880
+
+
+def test_request_builder_preserves_multi_image_token_counts() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_hf_tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=1,
+        max_model_len=64,
+        max_tokens_cap=16,
+        multimodal_processor=_MultiImagePreTokenizeMultiModalProcessor(),
+    )
+
+    request = builder.build(
+        request_id="req-mm-expanded",
+        prompt="compare <image> and <image>",
+        sampling_params=SamplingParams(max_tokens=4),
+        multi_modal_data={
+            "image": [
+                {"image": "file:///tmp/a.png"},
+                {"image": "file:///tmp/b.png"},
+            ]
+        },
+    )
+
+    assert request.input_ids == [1, 2, 3, 1, 2, 3]
+    assert request.multi_modal_data["image_token_count"] == 6
+    assert request.multi_modal_data["image_token_counts"] == [3, 3]
+    assert request.multi_modal_data["image_token_id"] == 17
 
 
 def test_request_builder_rejects_unsupported_structured_output_type() -> None:

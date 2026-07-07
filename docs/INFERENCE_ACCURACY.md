@@ -21,6 +21,7 @@ a generic GGUF correctness claim.
 | Tier | Goal | Entrypoint |
 |------|------|------------|
 | Tier-B | Output is readable, on-topic, and not structurally corrupted. | `tests/tools/quality_bar_spotcheck.py` |
+| Gemma4 image quality | 26B/31B image requests produce expected color answers on synthetic fixtures. | `tests/tools/gemma4_multimodal_quality_spotcheck.py` |
 | A-lite | Large-model smoke: model loads, generates, terminates, and produces non-empty text on fixed prompts. | `tests/tools/gemma4_single_prompt_smoke.py` |
 | A-strict | Prefill logits / greedy behavior align with a Hugging Face reference where feasible. | `tests/verify_semantic_integrity.py` and `tests/tools/gemma4_prefill_strict_audit.py` |
 
@@ -29,6 +30,9 @@ Default policy:
 - `<=14B`: Tier-B + A-strict.
 - `>14B`: Tier-B + A-lite.
 - Gemma4-26B keeps a default prefill-only A-strict audit unless locally disabled.
+- Gemma4-26B and Gemma4-31B run the image multimodal quality spotcheck by
+  default when their model directories are present. Gemma4 E4B is not part of
+  this supported regression surface.
 
 ## Main Command
 
@@ -111,6 +115,20 @@ uv run python tests/tools/gemma4_prefill_strict_audit.py \
 ```
 
 Gemma4 prompt and baseline fixtures live under `tests/tools/fixtures/`.
+
+Gemma4 image multimodal quality:
+
+```bash
+uv run python tests/tools/gemma4_multimodal_quality_spotcheck.py \
+  --model models/gemma-4-26B-A4B-it-AWQ-4bit
+
+uv run python tests/tools/gemma4_multimodal_quality_spotcheck.py \
+  --model models/gemma-4-31B-it-AWQ-4bit
+```
+
+The default correctness regression runs those two checks after the corresponding
+Gemma4 Tier-B text spotcheck. A passing result requires both synthetic image
+cases to answer the expected color.
 
 ## Performance Is Separate
 

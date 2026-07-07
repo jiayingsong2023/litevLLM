@@ -9,6 +9,7 @@ from vllm.engine.input_batch_builder import InputBatchBuilder
 from vllm.engine.kv_block_manager import KVBlockManager
 from vllm.engine.request_scheduler import RequestScheduler
 from vllm.engine.request_state import RequestState
+from vllm.lora.mapping import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
 
@@ -112,6 +113,45 @@ def test_input_batch_builder_rejects_zero_token_prefill() -> None:
         builder.build_prefill(["r1"], scheduler, 1)
 
 
+def test_input_batch_builder_rejects_image_placeholder_count_mismatch() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.add_request(
+        "r-mm",
+        RequestState(
+            request_id="r-mm",
+            prompt="",
+            slot_idx=0,
+            is_prefill=True,
+            seq_len=0,
+            input_ids=[11, 77, 12],
+            linear_attn_carry=[None],
+            linear_conv_carry=[None],
+            sampling_params=SamplingParams(),
+            is_multimodal=True,
+        ),
+    )
+    scheduler.get_request("r-mm").multi_modal_inputs = {
+        "image_token_id": 77,
+        "image_token_count": 2,
+    }
+    kv_block_manager = _make_kv_block_manager()
+    kv_block_manager.ensure_blocks("r-mm", 3)
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=kv_block_manager,
+        inf_config=type(
+            "Cfg", (), {"kv_type": "fp16", "k_scale": 1.0, "v_scale": 1.0}
+        )(),
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    with pytest.raises(ValueError, match="image placeholder count"):
+        builder.build_prefill(["r-mm"], scheduler, 3)
+
+
 def test_input_batch_builder_build_decode_batch() -> None:
     scheduler = _scheduler_with_request()
     req = scheduler.get_request("r1")
@@ -190,7 +230,7 @@ def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     assert attn_metadata2["seq_lens"].tolist() == [5]
 
 
-def test_input_batch_builder_rejects_mixed_lora_decode_batch() -> None:
+def test_input_batch_builder_allows_mixed_lora_decode_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -238,11 +278,15 @@ def test_input_batch_builder_rejects_mixed_lora_decode_batch() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    with pytest.raises(ValueError, match="mixed LoRA"):
-        builder.build_decode_batch(["r1", "r2"], scheduler)
+    _, _, attn_metadata, _ = builder.build_decode_batch(["r1", "r2"], scheduler)
+
+    assert isinstance(attn_metadata["lora_mapping"], LoRAMapping)
+    assert attn_metadata["lora_mapping"] == ["adapter-a", "adapter-b"]
+    assert attn_metadata["lora_adapter_count"] == 2
+    assert attn_metadata["mixed_lora_batch"] is True
 
 
-def test_input_batch_builder_rejects_base_and_lora_prefill_batch() -> None:
+def test_input_batch_builder_allows_base_and_lora_prefill_batch() -> None:
     scheduler = RequestScheduler(max_active_requests=2)
     scheduler.add_request(
         "r1",
@@ -296,5 +340,9 @@ def test_input_batch_builder_rejects_base_and_lora_prefill_batch() -> None:
         stack_per_layer_carries=_stack,
         split_per_layer_carries=_split,
     )
-    with pytest.raises(ValueError, match="mixed LoRA"):
-        builder.build_prefill(["r1", "r2"], scheduler, 2)
+    _, _, attn_metadata, _, _ = builder.build_prefill(["r1", "r2"], scheduler, 2)
+
+    assert isinstance(attn_metadata["lora_mapping"], LoRAMapping)
+    assert attn_metadata["lora_mapping"] == ["adapter-a", None]
+    assert attn_metadata["lora_adapter_count"] == 1
+    assert attn_metadata["mixed_lora_batch"] is True

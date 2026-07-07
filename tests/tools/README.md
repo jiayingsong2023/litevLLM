@@ -14,6 +14,7 @@ Run tools from the repository root with `uv run python`.
 | `gemma4_single_prompt_smoke.py` | `tests/run_inference_correctness_regression.sh` | Gemma4 A-lite fixed-prompt generation check. |
 | `gemma4_prefill_strict_audit.py` | `tests/run_inference_correctness_regression.sh`, warn-only tests | Gemma4 prefill-only strict audit with sequential HF reference. |
 | `gemma4_layer_drift_diagnostic.py` | warn-only Gemma4 diagnostic tests | Optional long-decode drift diagnostics. |
+| `gemma4_multimodal_quality_spotcheck.py` | `tests/run_inference_correctness_regression.sh` | Gemma4 26B/31B synthetic-image multimodal keyword spotcheck. |
 | `_gemma4_diag_utils.py` | warn-only Gemma4 diagnostic tests | Shared diagnostic helpers. |
 | `perf_grid_search.py` | `tests/test_perf_grid_search.py` | Small wrapper around `tests/e2e_full_benchmark.py` for guarded perf-grid behavior. |
 

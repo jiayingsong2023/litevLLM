@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -23,6 +23,7 @@ class LiteRequestBuilder:
         max_model_len: int,
         max_tokens_cap: int,
         default_min_new_tokens: int = 0,
+        multimodal_processor: Any | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.policies = policies
@@ -31,6 +32,7 @@ class LiteRequestBuilder:
         self.max_model_len = max_model_len
         self.max_tokens_cap = max_tokens_cap
         self.default_min_new_tokens = max(0, int(default_min_new_tokens))
+        self.multimodal_processor = multimodal_processor
 
     def build(
         self,
@@ -38,10 +40,10 @@ class LiteRequestBuilder:
         request_id: str,
         prompt: str,
         sampling_params: SamplingParams,
-        lora_id: Optional[str] = None,
-        lora_int_id: Optional[int] = None,
-        lora_path: Optional[str] = None,
-        multi_modal_data: Optional[dict[str, Any]] = None,
+        lora_id: str | None = None,
+        lora_int_id: int | None = None,
+        lora_path: str | None = None,
+        multi_modal_data: dict[str, Any] | None = None,
     ) -> RequestState:
         effective_sampling_params = copy.deepcopy(sampling_params)
         max_tokens = effective_sampling_params.max_tokens or 16
@@ -54,14 +56,33 @@ class LiteRequestBuilder:
             )
 
         guarded_prompt = self.policies.normalize_prompt(prompt)
-        input_ids = self.tokenizer.encode(guarded_prompt)
+        prepared_multi_modal_data = copy.deepcopy(multi_modal_data)
+        tokenize_prompt = guarded_prompt
+        if prepared_multi_modal_data and self.multimodal_processor is not None:
+            prepare_before_tokenize = getattr(
+                self.multimodal_processor,
+                "prepare_before_tokenize",
+                None,
+            )
+            if prepare_before_tokenize is not None:
+                tokenize_prompt, prepared_multi_modal_data = prepare_before_tokenize(
+                    guarded_prompt,
+                    prepared_multi_modal_data,
+                )
+        input_ids = self._encode_prompt(tokenize_prompt, prepared_multi_modal_data)
+        if prepared_multi_modal_data:
+            image_token = prepared_multi_modal_data.get("image_token")
+            if image_token is not None:
+                prepared_multi_modal_data["image_token_id"] = (
+                    self._resolve_image_token_id(prepared_multi_modal_data)
+                )
         if len(input_ids) >= self.max_model_len:
             raise ValueError(
                 f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
                 f"({self.max_model_len}); leave at least one decode token slot."
             )
 
-        rng: Optional[torch.Generator] = None
+        rng: torch.Generator | None = None
         seed = getattr(effective_sampling_params, "seed", None)
         if seed is not None:
             rng = torch.Generator(device=self.device)
@@ -70,7 +91,7 @@ class LiteRequestBuilder:
         request_state = RequestState(
             request_id=request_id,
             prompt=prompt,
-            guarded_prompt=guarded_prompt,
+            guarded_prompt=tokenize_prompt,
             input_ids=input_ids,
             sampling_params=effective_sampling_params,
             lora_id=lora_id,
@@ -90,10 +111,10 @@ class LiteRequestBuilder:
                 getattr(effective_sampling_params, "service_class", "latency")
                 or "latency"
             ),
-            multi_modal_data=copy.deepcopy(multi_modal_data),
-            is_multimodal=bool((multi_modal_data or {}).get("image")),
+            multi_modal_data=prepared_multi_modal_data,
+            is_multimodal=bool((prepared_multi_modal_data or {}).get("image")),
             is_multimodal_lora=bool(lora_id)
-            and bool((multi_modal_data or {}).get("image")),
+            and bool((prepared_multi_modal_data or {}).get("image")),
         )
         request_state.structured_output_constraint = build_structured_output_constraint(
             self.tokenizer,
@@ -103,3 +124,60 @@ class LiteRequestBuilder:
         request_state.admitted_at = None
         request_state.first_token_at = None
         return request_state
+
+    def _encode_prompt(
+        self,
+        prompt: str,
+        multi_modal_data: dict[str, Any] | None,
+    ) -> list[int]:
+        if not multi_modal_data:
+            return self.tokenizer.encode(prompt)
+        image_token = multi_modal_data.get("image_token")
+        image_token_count = int(multi_modal_data.get("image_token_count", 0) or 0)
+        if image_token is None or image_token_count <= 0:
+            return self.tokenizer.encode(prompt)
+
+        image_token_text = str(image_token)
+        parts = prompt.split(image_token_text)
+        occurrences = len(parts) - 1
+        if occurrences == 0:
+            return self.tokenizer.encode(prompt)
+        if occurrences != image_token_count:
+            raise ValueError(
+                "expanded image token count does not match image_token_count: "
+                f"actual={occurrences}, expected={image_token_count}"
+            )
+
+        image_token_id = self._resolve_image_token_id(multi_modal_data)
+        input_ids: list[int] = []
+        for idx, part in enumerate(parts):
+            if part.strip():
+                input_ids.extend(
+                    self._encode_text_part(part, add_special_tokens=idx == 0)
+                )
+            if idx < occurrences:
+                input_ids.append(image_token_id)
+        return input_ids
+
+    def _encode_text_part(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        try:
+            return list(
+                self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            )
+        except TypeError:
+            return list(self.tokenizer.encode(text))
+
+    def _resolve_image_token_id(self, multi_modal_data: dict[str, Any]) -> int:
+        existing = multi_modal_data.get("image_token_id")
+        if existing is not None:
+            return int(existing)
+        image_token = multi_modal_data.get("image_token")
+        if image_token is None:
+            raise ValueError("image token is required for multimodal input")
+        image_token_text = str(image_token)
+        image_token_ids = self.tokenizer.encode(image_token_text)
+        if len(image_token_ids) == 1:
+            return int(image_token_ids[0])
+        if hasattr(self.tokenizer, "convert_tokens_to_ids"):
+            return int(self.tokenizer.convert_tokens_to_ids(image_token_text))
+        raise ValueError("image token must encode to exactly one token id")

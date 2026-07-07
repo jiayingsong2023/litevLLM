@@ -111,6 +111,68 @@ def test_prefill_executor_is_thin_model_call_wrapper() -> None:
     ]
 
 
+class _FakeMultimodalModel:
+    def __init__(self) -> None:
+        self.kwargs = None
+        self.attn_metadata = None
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: object,
+        attn_metadata: dict,
+        **kwargs,
+    ) -> torch.Tensor:
+        del input_ids, positions, kv_caches
+        self.attn_metadata = dict(attn_metadata)
+        self.kwargs = dict(kwargs)
+        return torch.tensor([[3.0, 4.0]], dtype=torch.float32)
+
+
+class _FakeMultimodalProcessor:
+    def __init__(self) -> None:
+        self.mm_inputs = None
+
+    def build_prefill_inputs(self, req_dicts):
+        assert req_dicts == [{"request_id": "prefill-1"}]
+        return {
+            "pixel_values": torch.ones((1, 1024)),
+            "image_grid_thw": torch.tensor([[1, 4, 4]], dtype=torch.long),
+            "image_token_count": 4,
+            "image_token_counts": [4],
+            "image_token_id": 77,
+        }
+
+    def get_multimodal_embeddings(self, mm_inputs):
+        assert mm_inputs["image_token_count"] == 4
+        self.mm_inputs = dict(mm_inputs)
+        return torch.ones((1, 4, 8))
+
+
+def test_prefill_executor_passes_multimodal_placeholder_metadata() -> None:
+    model = _FakeMultimodalModel()
+    builder = _FakeBatchBuilder()
+    processor = _FakeMultimodalProcessor()
+    executor = PrefillExecutor(
+        model=model,
+        input_batch_builder=builder,
+        kv_caches=object(),
+        multimodal_processor=processor,
+    )
+
+    logits, _, _ = executor.execute(["prefill-1"], "scheduler", chunk_len=2)
+
+    assert logits.tolist() == [[3.0, 4.0]]
+    assert model.attn_metadata["image_token_count"] == 4
+    assert model.attn_metadata["image_token_counts"] == [4]
+    assert model.attn_metadata["image_token_id"] == 77
+    assert model.attn_metadata["image_grid_thw"].tolist() == [[1, 4, 4]]
+    assert tuple(model.attn_metadata["multimodal_embeddings"].shape) == (1, 4, 8)
+    assert tuple(model.kwargs["multimodal_embeddings"].shape) == (1, 4, 8)
+    assert processor.mm_inputs["lora_mapping"] == {"prefill-1": 0}
+
+
 def test_decode_executor_fast_path_is_thin_model_call_wrapper() -> None:
     model = _FakeModel()
     builder = _FakeBatchBuilder()

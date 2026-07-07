@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
-
 
 class PrefillExecutor:
     def __init__(
@@ -37,8 +35,22 @@ class PrefillExecutor:
             "lora_mapping": attn_metadata.get("lora_mapping"),
         }
         if self.multimodal_processor is not None:
-            mm_inputs = self.multimodal_processor.build_prefill_inputs(req_dicts_prefill)
+            mm_inputs = self.multimodal_processor.build_prefill_inputs(
+                req_dicts_prefill
+            )
             if mm_inputs:
+                mm_inputs["lora_mapping"] = attn_metadata.get("lora_mapping")
+                attn_metadata["image_token_count"] = int(
+                    mm_inputs.get("image_token_count", 0) or 0
+                )
+                attn_metadata["image_token_counts"] = list(
+                    mm_inputs.get("image_token_counts", [])
+                )
+                attn_metadata["image_token_id"] = int(
+                    mm_inputs.get("image_token_id", -1)
+                )
+                if mm_inputs.get("image_grid_thw") is not None:
+                    attn_metadata["image_grid_thw"] = mm_inputs["image_grid_thw"]
                 multimodal_embeddings = (
                     self.multimodal_processor.get_multimodal_embeddings(mm_inputs)
                 )
@@ -52,5 +64,7 @@ class PrefillExecutor:
             attn_metadata,
             **model_kwargs,
         )
-        self.input_batch_builder.split_per_layer_carries(attn_metadata, req_dicts_prefill)
+        self.input_batch_builder.split_per_layer_carries(
+            attn_metadata, req_dicts_prefill
+        )
         return logits, req_dicts_prefill, is_last_chunk_flags

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .base import RotaryEmbedding
+
 
 @triton.jit
 def _triton_mrope_forward(
@@ -179,7 +179,7 @@ def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.T
 def _apply_interleaved_mrope_hf(
     freqs: torch.Tensor, mrope_section: list[int]
 ) -> torch.Tensor:
-    """Match Hugging Face Qwen3_5TextRotaryEmbedding.apply_interleaved_mrope (text path)."""
+    """Match Hugging Face Qwen3_5TextRotaryEmbedding text mRoPE."""
     # freqs: (3, bs, seq_len, head_dim // 2)
     freqs_t = freqs[0].clone()
     for dim, offset in enumerate((1, 2), start=1):
@@ -237,16 +237,21 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Hugging Face Qwen3_5TextRotaryEmbedding path: position_ids shape (3, batch, seq).
-        query/key are passed as (1, batch*seq, num_heads, head_size) from Qwen3_5FullAttentionLayer.
+        Hugging Face MRoPE path: position_ids shape (3, batch, seq).
+        Qwen3.5 passes query/key as (1, batch*seq, heads, head_size), while
+        Qwen2VL reaches this layer through LlamaModel as (batch, seq, heads,
+        head_size).
         """
         device = position_ids.device
         dtype = query.dtype
         _, batch, seq_len = position_ids.shape
-        n_tok = query.shape[1]
-        if n_tok != batch * seq_len:
+        flat_layout = query.shape[0] == 1 and query.shape[1] == batch * seq_len
+        batch_first_layout = query.shape[0] == batch and query.shape[1] == seq_len
+        if not flat_layout and not batch_first_layout:
             raise RuntimeError(
-                f"MRoPE: expected n_tokens={batch * seq_len}, got query.shape[1]={n_tok}"
+                "MRoPE: expected query layout "
+                f"(1, {batch * seq_len}, heads, dim) or "
+                f"({batch}, {seq_len}, heads, dim), got {tuple(query.shape)}"
             )
 
         dim = self.rotary_dim
@@ -267,12 +272,23 @@ class MRotaryEmbedding(RotaryEmbedding):
         cos = emb.cos().to(dtype=dtype)
         sin = emb.sin().to(dtype=dtype)
 
-        # (1, B*L, nh, hd) -> (B, nh, L, hd)
-        q_4 = query.squeeze(0).view(batch, seq_len, -1, self.head_size).transpose(1, 2)
-        k_4 = key.squeeze(0).view(batch, seq_len, -1, self.head_size).transpose(1, 2)
-        q_out, k_out = _apply_rotary_pos_emb_qwen35_hf(q_4, k_4, cos, sin, unsqueeze_dim=1)
-        q_out = q_out.transpose(1, 2).reshape(1, n_tok, -1, self.head_size)
-        k_out = k_out.transpose(1, 2).reshape(1, n_tok, -1, self.head_size)
+        if flat_layout:
+            q_4 = query.squeeze(0).view(batch, seq_len, -1, self.head_size)
+            k_4 = key.squeeze(0).view(batch, seq_len, -1, self.head_size)
+        else:
+            q_4 = query
+            k_4 = key
+        q_4 = q_4.transpose(1, 2)
+        k_4 = k_4.transpose(1, 2)
+        q_out, k_out = _apply_rotary_pos_emb_qwen35_hf(
+            q_4, k_4, cos, sin, unsqueeze_dim=1
+        )
+        q_out = q_out.transpose(1, 2)
+        k_out = k_out.transpose(1, 2)
+        if flat_layout:
+            n_tok = batch * seq_len
+            q_out = q_out.reshape(1, n_tok, -1, self.head_size)
+            k_out = k_out.reshape(1, n_tok, -1, self.head_size)
         return q_out, k_out
 
     def forward(
@@ -287,10 +303,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         if positions.device != self.cos_cached.device:
             positions = positions.to(self.cos_cached.device)
-        if positions.ndim > 1:
-            positions_flat = positions.view(-1)
-        else:
-            positions_flat = positions
+        positions_flat = positions.view(-1) if positions.ndim > 1 else positions
 
         cos = self.cos_cached[positions_flat]
         sin = self.sin_cached[positions_flat]

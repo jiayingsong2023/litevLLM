@@ -6,7 +6,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="${PYTHONPATH:-.}"
-uv run pytest \
+UV_RUN=(uv run)
+if [[ "${FASTINFERENCE_UV_NO_SYNC:-0}" == "1" ]]; then
+  UV_RUN=(uv run --no-sync)
+fi
+env -u FASTINFERENCE_UV_NO_SYNC "${UV_RUN[@]}" pytest \
   tests/smoke \
   tests/test_project_governance.py \
   tests/test_kv_default_policy.py \

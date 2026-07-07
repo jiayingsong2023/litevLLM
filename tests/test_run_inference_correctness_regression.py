@@ -551,6 +551,7 @@ def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default
     assert "run python tests/tools/gemma4_prefill_strict_audit.py" in calls
     assert "--preset gemma4_26b_a4b" in calls
     assert "run python tests/tools/gemma4_single_prompt_smoke.py" in calls
+    assert "run python tests/tools/gemma4_multimodal_quality_spotcheck.py" in calls
     assert f"--model {gemma31_dir}" in calls
     assert f"--model {gemma26_dir}" in calls
     assert (
@@ -561,6 +562,8 @@ def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default
     assert "Skipping Gemma4 large-model A-tier" not in proc.stdout
     assert "Cleanup after Gemma4-31B A-lite" in proc.stdout
     assert "Cleanup after Gemma4-26B A-lite" in proc.stdout
+    assert "Cleanup after Gemma4-31B multimodal quality" in proc.stdout
+    assert "Cleanup after Gemma4-26B multimodal quality" in proc.stdout
 
 
 def test_run_inference_correctness_regression_requires_qwen35_fp16_reference(
@@ -670,9 +673,11 @@ def test_run_inference_correctness_regression_uses_config_for_gemma4_26b(
     assert log_path.exists()
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/tools/quality_bar_spotcheck.py" in calls
+    assert "run python tests/tools/gemma4_multimodal_quality_spotcheck.py" in calls
     assert str(gemma26_dir) in calls
     assert "CONFIG=/tmp/fastinference-correctness-config." in calls
     assert "gemma26b-benchmark-turbo.toml" in calls
+    assert "gemma26b-a-lite-latency.toml" in calls
 
 
 def test_run_inference_correctness_regression_uses_default_local_gemma_paths(

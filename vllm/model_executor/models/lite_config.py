@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-import torch
-from typing import Any, Dict, Optional
+from typing import Any
 
 
-def _normalize_layer_types(raw: Any) -> Optional[list[str]]:
+def _normalize_layer_types(raw: Any) -> list[str] | None:
     if isinstance(raw, list):
         return [str(x).lower() for x in raw]
     return None
@@ -20,11 +19,19 @@ class LiteConfig:
         # Some HF configs set rope_parameters explicitly to null; treat as empty dict.
         _rp = getattr(hf_config, "rope_parameters", None)
         self.rope_parameters = _rp if isinstance(_rp, dict) else {}
-        self.hidden_size = getattr(hf_config, "hidden_size", 4096)
+        self.hidden_size = getattr(
+            hf_config,
+            "hidden_size",
+            getattr(hf_config, "mm_embed_dim", 4096),
+        )
         self.intermediate_size = getattr(hf_config, "intermediate_size", 11008)
         self.num_attention_heads = getattr(hf_config, "num_attention_heads", 32)
-        self.num_key_value_heads = getattr(hf_config, "num_key_value_heads", self.num_attention_heads)
-        # Qwen3.5 / some checkpoints expose explicit head_dim (may differ from hidden/num_heads).
+        self.num_key_value_heads = getattr(
+            hf_config,
+            "num_key_value_heads",
+            self.num_attention_heads,
+        )
+        # Qwen3.5 / some checkpoints expose explicit head_dim.
         _hd = getattr(hf_config, "head_dim", None)
         if _hd is None:
             _hd = self.hidden_size // max(1, self.num_attention_heads)
@@ -46,8 +53,11 @@ class LiteConfig:
                                  self.rope_parameters.get("rope_theta", 10000.0)))
         
         # Qwen3.5 partial rotary
-        self.partial_rotary_factor = getattr(hf_config, "partial_rotary_factor", 
-                                     self.rope_parameters.get("partial_rotary_factor", 1.0))
+        self.partial_rotary_factor = getattr(
+            hf_config,
+            "partial_rotary_factor",
+            self.rope_parameters.get("partial_rotary_factor", 1.0),
+        )
         
         # 4. Multi-modal / Specialized (DeepSeek/MLA)
         self.q_lora_rank = getattr(hf_config, "q_lora_rank", None)
@@ -67,7 +77,11 @@ class LiteConfig:
             "hidden_act",
             getattr(hf_config, "hidden_activation", "silu"),
         )
-        self.hidden_activation = getattr(hf_config, "hidden_activation", self.hidden_act)
+        self.hidden_activation = getattr(
+            hf_config,
+            "hidden_activation",
+            self.hidden_act,
+        )
 
         # Qwen3.5 MoE text (e.g. Qwen3_5MoeTextConfig / qwen3_5_moe_text)
         self.model_type = getattr(hf_config, "model_type", "") or ""
@@ -80,14 +94,18 @@ class LiteConfig:
             )
             or 0
         )
-        self.moe_intermediate_size = int(getattr(hf_config, "moe_intermediate_size", 0) or 0)
+        self.moe_intermediate_size = int(
+            getattr(hf_config, "moe_intermediate_size", 0) or 0
+        )
         self.shared_expert_intermediate_size = int(
             getattr(hf_config, "shared_expert_intermediate_size", 0) or 0
         )
         self.num_shared_experts = int(getattr(hf_config, "num_shared_experts", 0) or 0)
         _lt = getattr(hf_config, "layer_types", None)
-        self.layer_types: Optional[list[str]] = _normalize_layer_types(_lt)
-        self.full_attention_interval = int(getattr(hf_config, "full_attention_interval", 4) or 4)
+        self.layer_types: list[str] | None = _normalize_layer_types(_lt)
+        self.full_attention_interval = int(
+            getattr(hf_config, "full_attention_interval", 4) or 4
+        )
         self.num_global_key_value_heads = int(
             getattr(hf_config, "num_global_key_value_heads", self.num_key_value_heads)
             or self.num_key_value_heads
@@ -98,10 +116,25 @@ class LiteConfig:
         self.sliding_window = getattr(hf_config, "sliding_window", None)
         self.hybrid_attention_enabled = bool(self.layer_types)
         self.attn_logit_softcapping = getattr(hf_config, "attn_logit_softcapping", None)
-        self.final_logit_softcapping = getattr(hf_config, "final_logit_softcapping", None)
+        self.final_logit_softcapping = getattr(
+            hf_config,
+            "final_logit_softcapping",
+            None,
+        )
         self.query_pre_attn_scalar = getattr(hf_config, "query_pre_attn_scalar", None)
         self.use_qk_norm = bool(getattr(hf_config, "use_qk_norm", False))
-        self.tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", False))
+        self.tie_word_embeddings = bool(
+            getattr(hf_config, "tie_word_embeddings", False)
+        )
+
+        # Gemma4 vision config fields.
+        self.patch_size = int(getattr(hf_config, "patch_size", 16) or 16)
+        self.pooling_kernel_size = int(
+            getattr(hf_config, "pooling_kernel_size", 1) or 1
+        )
+        self.position_embedding_size = int(
+            getattr(hf_config, "position_embedding_size", 10240) or 10240
+        )
 
     @classmethod
     def from_model_config(cls, model_config: Any) -> "LiteConfig":
@@ -110,4 +143,8 @@ class LiteConfig:
         return cls(model_config)
 
     def __repr__(self):
-        return f"LiteConfig(hidden={self.hidden_size}, layers={self.num_hidden_layers}, heads={self.num_attention_heads})"
+        return (
+            f"LiteConfig(hidden={self.hidden_size}, "
+            f"layers={self.num_hidden_layers}, "
+            f"heads={self.num_attention_heads})"
+        )

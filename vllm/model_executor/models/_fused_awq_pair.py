@@ -33,6 +33,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.lora.mapping import LoRAMapping
 from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.layers.quantization.tensor import (
     AWQWeight,
@@ -49,10 +50,10 @@ def _lora_is_active(lora_mapping: Any) -> bool:
     disable fusion."""
     if lora_mapping is None:
         return False
+    if isinstance(lora_mapping, LoRAMapping):
+        return lora_mapping.adapter_count > 0
     if isinstance(lora_mapping, (list, tuple)):
         return any(x is not None for x in lora_mapping)
-    # Some callers pass dedicated LoraMapping dataclass instances; treat
-    # anything truthy-but-non-empty as active to stay on the safe side.
     return bool(lora_mapping)
 
 
