@@ -392,6 +392,51 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             layer_idx=next_layer.layer_index,
         )
 
+    def _schedule_next_layer_expert_prefetch_async(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        next_layer: Any,
+        *,
+        token_id: int | None,
+    ) -> torch.cuda.Event | None:
+        """Enqueue an async prefetch for the next layer and return its event.
+
+        Returns None if there is nothing to prefetch or prefetch fails.
+        """
+        grouped_experts = getattr(next_layer, "grouped_experts", None)
+        if grouped_experts is None:
+            return None
+        expert_ids = self._likely_hash_routed_expert_ids_for_token(
+            stager,
+            next_layer,
+            token_id=token_id,
+        )
+        if not expert_ids:
+            return None
+        cache_admission_policy = getattr(stager, "cache_admission_policy", None)
+        cacheable_expert_ids = tuple(
+            expert_id
+            for expert_id in dict.fromkeys(expert_ids)
+            if cache_admission_policy is None
+            or cache_admission_policy.should_cache_grouped_expert(
+                layer_idx=next_layer.layer_index,
+                expert_id=expert_id,
+            )
+        )
+        if not cacheable_expert_ids:
+            return None
+        try:
+            return stager.prefetch_grouped_experts_async(
+                grouped_experts,
+                DeepSeekV4FlashExpertPrefetchRequest(
+                    layer_idx=next_layer.layer_index,
+                    expert_ids=cacheable_expert_ids,
+                ),
+            )
+        except Exception:
+            self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
+            return None
+
     def forward(
         self,
         input_ids: torch.Tensor,
