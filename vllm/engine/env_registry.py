@@ -239,6 +239,10 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_BENCH_COMPILE_CACHE_DIR": _tool_only(
         "FASTINFERENCE_BENCH_COMPILE_CACHE_DIR"
     ),
+    "FASTINFERENCE_BENCH_POLICY_MODE": _removed(
+        "FASTINFERENCE_BENCH_POLICY_MODE",
+        description="Experimental benchmark policy override removed from e2e_full_benchmark.py",
+    ),
     "FASTINFERENCE_BENCH_PROFILE": _deprecated(
         "FASTINFERENCE_BENCH_PROFILE",
         replacement="FastInference config field: benchmark.profile",
