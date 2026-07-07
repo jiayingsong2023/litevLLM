@@ -46,11 +46,11 @@ def wait_for_prefetch(self, event: torch.cuda.Event | None) -> None:
 
 核心改动在 `vllm/model_executor/models/deepseek_v4_flash/model.py` 的单 token greedy decode layer loop：
 
-1. **进入 layer N compute 之前**，先等待并消费 `layer N` 的 prefetch event（即上一层结束时发起的 `layer N` prefetch）。
-2. **进入 layer N compute 之后、离开 layer N 之前**，用 `_schedule_next_layer_expert_prefetch()` 计算 `layer N+1` 的专家需求，并调用 `stager.prefetch_grouped_experts_async()` 在 background stream 上发起 prefetch。
+1. **进入 layer N compute 之前**，先等待并消费 `layer N` 的 prefetch event（即上一次迭代发起的 `layer N` prefetch）。
+2. **layer N forward 返回后立即 enqueue `layer N+1` prefetch**：在单 token greedy decode 的外层 layer loop 中，调用 `layer.forward()` 后马上调用 `_schedule_next_layer_expert_prefetch()` 计算 `layer N+1` 的专家需求，并调用 `stager.prefetch_grouped_experts_async()` 在 background stream 上发起 prefetch。overlap 依赖 CUDA kernel 的异步执行以及 default stream 队列仍在运行；实现时必须确认这段路径没有 `torch.cuda.synchronize()` 或隐式同步。
 3. 返回的 `torch.cuda.Event` 不存为 model 级状态，而是作为 **本次 layer loop 的局部变量**传给下一次迭代。
 
-这样 `layer N+1` 的 H2D copy 与 `layer N` 的 compute 重叠，而不是在 `layer N` 结束后立即等待。
+这样 `layer N+1` 的 H2D copy 与 `layer N` 在 default stream 上尚未完成的 compute 重叠，而不是在 `layer N` 结束后立即等待。
 
 ### 3.3 范围与开关
 
@@ -116,6 +116,7 @@ pass E_{N+1} to next iteration
 ## 8. 成功标准
 
 - 在 `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=1` 的 cold-cache A/B 中，`decode_tps_steady_state` 相对 `=0` 有 **可测量的提升**（目标 ≥0.2 tok/s 或相对提升 ≥30%）。
+- A/B 必须保存 profile JSON，并对比 `layer_moe` phase time、staging `streamed_bytes`、prefetch hit/miss counters；如收益不达预期，这些指标用于区分是 H2D 未 overlap，还是 CPU payload materialization 成了瓶颈。
 - warm-cache gate 不下降。
 - 所有回归测试通过。
 - 默认行为不变（`ASYNC_PREFETCH=0`），收益验证通过后再决策是否默认开启。
