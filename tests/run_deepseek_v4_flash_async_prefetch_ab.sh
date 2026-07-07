@@ -23,7 +23,7 @@ run_variant "off" "0"
 run_variant "on" "1"
 
 echo "===== A/B summary ====="
-python3 - <<'PY'
+uv run python - <<'PY'
 import json, pathlib
 for variant in ("off", "on"):
     path = pathlib.Path(f"/tmp/ds_async_prefetch_ab_{variant}.json")
