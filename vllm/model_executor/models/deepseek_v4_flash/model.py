@@ -692,7 +692,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         if layers is None:
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
         layers = list(layers)
+        async_prefetch_enabled = self._deepseek_async_prefetch_enabled()
+        pending_prefetch_event: torch.cuda.Event | None = None
         for layer_offset, layer in enumerate(layers):
+            if pending_prefetch_event is not None:
+                with self._deepseek_profiler.section(
+                    f"layer_{layer.layer_index}_prefetch_wait",
+                    layer_idx=layer.layer_index,
+                    token_idx=token_idx,
+                ):
+                    stager.wait_for_prefetch(pending_prefetch_event)
+                pending_prefetch_event = None
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -729,11 +739,21 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         else None,
                     )
             if layer_offset + 1 < len(layers):
-                self._schedule_next_layer_expert_prefetch(
-                    stager,
-                    layers[layer_offset + 1],
-                    token_id=token_id,
-                )
+                next_layer = layers[layer_offset + 1]
+                if async_prefetch_enabled:
+                    pending_prefetch_event = (
+                        self._schedule_next_layer_expert_prefetch_async(
+                            stager,
+                            next_layer,
+                            token_id=token_id,
+                        )
+                    )
+                else:
+                    self._schedule_next_layer_expert_prefetch(
+                        stager,
+                        next_layer,
+                        token_id=token_id,
+                    )
 
         return store, stager, hidden
 
@@ -1288,9 +1308,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
         state = (
-            self._gpu_request_states.get(request_id)
-            if request_id is not None
-            else None
+            self._gpu_request_states.get(request_id) if request_id is not None else None
         )
         if state is None:
             state = self._new_gpu_request_state(
