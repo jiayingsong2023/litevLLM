@@ -1308,7 +1308,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
         state = (
-            self._gpu_request_states.get(request_id) if request_id is not None else None
+            self._gpu_request_states.get(request_id)
+            if request_id is not None
+            else None
         )
         if state is None:
             state = self._new_gpu_request_state(
