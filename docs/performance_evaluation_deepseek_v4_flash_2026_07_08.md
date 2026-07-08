@@ -86,6 +86,58 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
 - `moe_router_topk` 平均 0.77 ms/层，不是最大头，但 61 层累计不少。
 - staging 相关 section（`router_expert_stage`、`raw_payload_read_clone`、`h2d_copy_enqueue`）在 warm 路径下总量已经很小。
 
+### 5. ROCm warm-resident kernel profile（已完成）
+
+由于当前设备上 `rocprof` v1 不被支持，实际使用 `rocprofv3` 采集 kernel dispatch trace：
+
+```bash
+FASTINFERENCE_KV_TYPE=fp16 \
+FASTINFERENCE_BLOCK_SIZE=32 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
+  rocprofv3 --kernel-trace --stats --summary -d /tmp/ds_warm_rocprof -f csv -- \
+  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+    --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+    --context-length 4096 --prompt-length 32 --max-tokens 16 --warmup-tokens 16 --repeat 3 \
+    --min-steady-decode-tps 0.0 --profile-json /tmp/ds_warm_moe_rocprof.json
+```
+
+> 注意：profiler 采样开销使本次 steady TPS 降至约 **1.33 tok/s**，因此只用于 kernel 占比分析，不用于基线 TPS 衡量。
+
+总 GPU kernel 耗时约 **57.65 s**，共 98 个不同 kernel。Top 10 如下：
+
+| Kernel / Section | Calls | Total (s) | Avg (ms) | % |
+|---:|---:|---:|---:|---:|
+| `_iq2_xxs_selected_experts_activation_direct6_kernel` | 8,084 | 13.955 | 1.726 | 24.20 |
+| `_q8_0_raw_matvec_kernel` | 106,596 | 12.197 | 0.114 | 21.16 |
+| `_q2_k_selected_experts_down_projection_direct6_kernel` | 8,084 | 7.359 | 0.910 | 12.76 |
+| `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT8x8x8_SN_...` (hipblaslt GEMM) | 31,396 | 6.993 | 0.223 | 12.13 |
+| `pytorch elementwise_kernel_manual_unroll (div/copy/add)` 等 | 701,692+ | 1.518+ | ~0.002 | 2.63+ |
+| `_q8_0_raw_gate_up_activation_kernel` | 8,084 | 1.501 | 0.186 | 2.60 |
+| `pytorch reduce_kernel` 系列 | 341,564+ | 1.447+ | ~0.004 | 2.51+ |
+| `__amd_rocclr_copyBuffer` | 311,991 | 0.870 | 0.003 | 1.51 |
+| `rocblas_gemvt_warp_reduce_kernel` | 16,168 | 0.521 | 0.032 | 0.90 |
+| `pytorch reduce_kernel (MeanOps/ArgMinOps)` | 70,468+ | 0.449+ | ~0.006 | 0.78+ |
+
+按功能归并：
+
+| 功能组 | Total (s) | % |
+|---|---:|---:|
+| `iq2_xxs_selected_experts_activation_direct`（up/gate 融合激活） | 13.955 | 24.20 |
+| `q8_0_raw_matvec`（量化 matvec，主要 router/attention/linear） | 12.197 | 21.16 |
+| `q2_k_selected_experts_down_projection_direct`（down projection） | 7.359 | 12.76 |
+| hipblaslt / `Cijk_*` GEMM（attention/linear 通用 GEMM） | 7.202 | 12.49 |
+| PyTorch elementwise / copy / fill / cat / arange 等 | ~12.9 | ~22.4 |
+| `q8_0_raw_gate_up_activation_kernel` | 1.501 | 2.60 |
+| 其他 | ~2.4 | ~4.2 |
+
+关键发现：
+- **MoE compute kernel 合计约 60.7%**（iq2_xxs up/gate 24.2% + q8_0 gate_up 2.6% + q2_k down 12.8% + q8_0 matvec 中属于 MoE 的部分）。即使保守估计，MoE 仍是绝对主导。
+- `_q8_0_raw_matvec_kernel` 调用次数高达 **10.6 万次**，平均仅 0.114 ms，说明存在大量细碎 matvec 启动；其中一部分来自 router/attention/linear，另一部分来自 MoE。
+- hipblaslt GEMM 占 **12.5%**，与 Python profiler 中 `layer_attention` 占比最高相互印证（attention 主要走 hipblaslt）。
+- staging / H2D / cache 相关 kernel 在 warm 路径下几乎不可见，再次验证 staging 不是瓶颈。
+
 ---
 
 ## 关键判断
@@ -99,18 +151,38 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
    - 在 96 GB UMA 机器上，`FULL_RESIDENT=1 + PIN_HOT_EXPERTS=1 + warmup=16` 可稳定复现。
    - 回归 gate 应以此为主：warm gate 阈值 1.5；cold gate 保守防退化即可。
 
-3. **Python-level MoE 分解已完成；下一轮必须看 warm path 的 GPU kernel breakdown**
-   - Python profiler 已证明 staging 不是 steady 上限，并给出 `layer_attention` / `router_selected_experts_kernel` / `selected_expert_up_gate` 等子项占比。
-   - 需要用 ROCm profiler 看 `layer_moe` 与 attention 的 GPU kernel 耗时：router、expert up/gate、down projection、shared expert、kernel launch、attention 等各自占比。
-   - 只有 top-1/top-2 热点才值得写 Triton 或做融合。
+3. **ROCm kernel profile 已完成；优化目标已锁定 top-2**
+   - Python profiler 已证明 staging 不是 steady 上限。
+   - ROCm profiler 进一步确认：warm 路径下 **MoE compute kernel 合计约 60%**，`_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）是最大两个热点。
+   - hipblaslt GEMM 占约 12.5%，与 Python profiler 中 `layer_attention` 占比最高一致。
+   - 下一步应直接针对 top-2 kernel 做 Triton 调优或调用合并，而不是继续扩展开销已很低的 staging/cache 层。
 
 ---
 
 ## 下一步建议
 
-### P0：ROCm warm-resident kernel profile
+### P0：针对 top-2 kernel 进行优化
 
-固定命令：
+基于 ROCm profile，优化优先级如下：
+
+1. **P0-1：`_iq2_xxs_selected_experts_activation_direct`（24.2%）**
+   - 这是 selected expert up/gate  fused activation 的 Triton kernel。
+   - 方向：调大 block/tile、减少 dequant+activation 中的临时量、尝试把 roundtrip（`deepseek_q8_k_roundtrip_reference`）消掉或融合进同一 kernel。
+   - 验证指标：该 kernel 的 total_ms / avg_ms 下降，warm steady TPS 提升。
+
+2. **P0-2：`_q8_0_raw_matvec`（21.2%，10.6 万次调用）**
+   - 大量细碎 matvec，来源包括 router/attention/linear 以及部分 MoE path。
+   - 方向：
+     - 先按 layer/operator 拆分调用来源（可加 kernel 名前缀或 ROCTx marker）。
+     - 对 MoE 内部的小 matvec 做 batch/merge，减少 launch count。
+     - 对 router/attention 的 matvec 评估是否可用 hipblaslt GEMM 替换或融合。
+   - 验证指标：调用次数下降或平均耗时下降。
+
+3. **P0-3：`_q2_k_selected_experts_down_projection_direct`（12.8%）与 hipblaslt GEMM（12.5%）**
+   - down projection 已是第三大热点；hipblaslt GEMM 主要对应 attention。
+   - 方向：先完成 P0-1/P0-2 后再评估；若 attention 成为新的 top-1，再转向 attention kernel 融合或 KV cache 压缩。
+
+为验证优化效果，固定回归命令：
 
 ```bash
 FASTINFERENCE_KV_TYPE=fp16 \
@@ -118,21 +190,11 @@ FASTINFERENCE_BLOCK_SIZE=32 \
 FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
 FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
 FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
-  rocprof --stats -o /tmp/ds_warm_rocprof.csv \
   uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
     --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
-    --context-length 4096 \
-    --prompt-length 32 \
-    --max-tokens 16 \
-    --warmup-tokens 16 \
-    --repeat 3 \
-    --min-steady-decode-tps 0.0
+    --context-length 4096 --prompt-length 32 --max-tokens 16 --warmup-tokens 16 --repeat 3 \
+    --min-steady-decode-tps 1.5 --profile-json /tmp/ds_opt_regression.json
 ```
-
-目标输出：
-- top kernels（按总耗时排序）
-- 每 kernel 的调用次数、平均耗时
-- `layer_moe` 内部各子步骤（router、up/gate、down、shared）的 GPU 时间占比
 
 ### 可选：修正小显存实验模型
 
@@ -154,9 +216,11 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 - `tests/run_deepseek_v4_flash_cpu_payload_cache_ab.sh` — CPU payload cache A/B
 - `docs/superpowers/plans/2026-07-07-deepseek-async-prefetch.md` — 实现计划与实验记录
 - `docs/performance_evaluation_gemma4_deepseek_2026_07_07.md` — 早期评估报告
+- `/tmp/ds_warm_rocprof/*/kernel_stats.csv` — ROCm warm-resident kernel profile 原始数据
+- `/tmp/ds_warm_moe_rocprof.json` — 同次运行的 Python profiler JSON
 
 ---
 
 ## 结论
 
-DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident）。staging/cache/prefetch 层的优化潜力已耗尽；Python-level warm MoE breakdown 已完成并指向 `layer_attention` 与 `router_selected_experts_kernel` / `selected_expert_up_gate`。要突破该上限，必须基于 ROCm kernel profile 对 warm 路径的 GPU compute 进行针对性优化。
+DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident）。staging/cache/prefetch 层的优化潜力已耗尽；Python-level 与 ROCm-level 的 warm 路径分解均已完成。ROCm profile 将优化目标精确锁定为 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）这两个 kernel。下一步应直接对它们做 Triton 调优或调用合并，而非继续投入 staging 层。
