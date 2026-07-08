@@ -35,7 +35,7 @@ def _reference_moe(
 
     m, hidden = x.shape
     top_k = topk_ids.shape[1]
-    out = torch.zeros(m, hidden, dtype=x.dtype, device=x.device)
+    out = torch.zeros(m, hidden, dtype=torch.float32, device=x.device)
     for tok in range(m):
         for k in range(top_k):
             eid = int(topk_ids[tok, k])
@@ -43,18 +43,18 @@ def _reference_moe(
                 qweight_gu[eid : eid + 1].to(torch.int32),
                 scales_gu[eid : eid + 1],
                 group_size=hidden // scales_gu.shape[2],
-            )[0, : 2 * intermediate_dim, :hidden].to(x.dtype)
+            )[0, : 2 * intermediate_dim, :hidden].to(torch.float32)
             w2e = dequantize_symmetric_packed_int4_pytorch(
                 qweight_d[eid : eid + 1].to(torch.int32),
                 scales_d[eid : eid + 1],
                 group_size=intermediate_dim // scales_d.shape[2],
-            )[0, :hidden, :intermediate_dim].to(x.dtype)
+            )[0, :hidden, :intermediate_dim].to(torch.float32)
 
-            h = x[tok : tok + 1]
+            h = x[tok : tok + 1].to(torch.float32)
             gu = torch.matmul(h, w1e.t())
             g, u = gu.chunk(2, dim=-1)
             h = torch.nn.functional.silu(g) * u
-            y = torch.matmul(h, w2e.t()) * topk_weights[tok, k]
+            y = torch.matmul(h, w2e.t()) * topk_weights[tok, k].to(torch.float32)
             out[tok] += y.squeeze(0)
     return out
 
@@ -140,9 +140,16 @@ def benchmark_strategy(
                 scales_d,
                 intermediate_dim,
             )
-            max_err = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
-            if max_err > 0.1:
-                print(f"WARN {strategy} M={m} max_err={max_err}")
+            max_err = (out.to(torch.float32) - ref).abs().max().item()
+            try:
+                torch.testing.assert_close(
+                    out.to(torch.float32), ref, rtol=3e-2, atol=3e-2
+                )
+            except AssertionError as exc:
+                print(
+                    f"WARN {strategy} M={m} numerical check failed "
+                    f"(max_err={max_err}): {exc}"
+                )
 
         torch.cuda.synchronize()
         start = time.perf_counter()
