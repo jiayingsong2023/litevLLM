@@ -2670,6 +2670,8 @@ def _run_sliding_moe(
     token_id_tensor: torch.Tensor | None = None,
     router_top_k: int,
 ) -> torch.Tensor:
+    if isinstance(backend, DeepSeekV4FlashGPUBackend):
+        backend.profiler = getattr(stager, "profiler", None)
     with _stager_profile_section(
         stager,
         "moe_hash_router",
@@ -2843,23 +2845,39 @@ def _run_staged_shared_expert(
         and len(tensors.down.dims) == 2
     ):
         columns, rows = tensors.gate.dims
-        activated = q8_0_raw_gate_up_activation(
-            _stage_q8_0_raw_tensor(tensors.gate, stager),
-            _stage_q8_0_raw_tensor(tensors.up, stager),
-            hidden,
-            rows=rows,
-            columns=columns,
-            block_size=_Q8_0_BLOCK_SIZE,
-        )
-        if _can_project_q8_0(activated, tensors.down):
-            return _project_tensor(activated, tensors.down, stager).to(torch.float32)
+        with _stager_profile_section(
+            stager,
+            "moe_shared_expert_gate_up",
+            tensor=tensors.gate.name,
+        ):
+            activated = q8_0_raw_gate_up_activation(
+                _stage_q8_0_raw_tensor(tensors.gate, stager),
+                _stage_q8_0_raw_tensor(tensors.up, stager),
+                hidden,
+                rows=rows,
+                columns=columns,
+                block_size=_Q8_0_BLOCK_SIZE,
+            )
+        with _stager_profile_section(
+            stager,
+            "moe_shared_expert_down",
+            tensor=tensors.down.name,
+        ):
+            if _can_project_q8_0(activated, tensors.down):
+                projected = _project_tensor(activated, tensors.down, stager)
+                return projected.to(torch.float32)
 
-    return backend.routed_expert_gemm(
-        hidden=hidden,
-        gate_weight=stager.stage_matrix(tensors.gate),
-        up_weight=stager.stage_matrix(tensors.up),
-        down_weight=stager.stage_matrix(tensors.down),
-    ).to(torch.float32)
+    with _stager_profile_section(
+        stager,
+        "moe_shared_expert_kernel",
+        tensor=tensors.gate.name,
+    ):
+        return backend.routed_expert_gemm(
+            hidden=hidden,
+            gate_weight=stager.stage_matrix(tensors.gate),
+            up_weight=stager.stage_matrix(tensors.up),
+            down_weight=stager.stage_matrix(tensors.down),
+        ).to(torch.float32)
 
 
 def _run_staged_routed_experts(
@@ -2992,9 +3010,14 @@ def _run_staged_routed_experts(
                 "routed expert outputs must share one shape; "
                 f"got {tuple(output.shape)} and {tuple(expert_output.shape)}"
             )
-        output = output + expert_weight.to(torch.float32) * expert_output.to(
-            torch.float32
-        )
+        with _stager_profile_section(
+            stager,
+            "moe_routed_expert_combine",
+            layer_idx=layer_idx,
+        ):
+            output = output + expert_weight.to(torch.float32) * expert_output.to(
+                torch.float32
+            )
     if output is None:
         raise ValueError("DeepSeek V4 Flash routed MoE selected no experts")
     return output
@@ -3051,9 +3074,14 @@ def _run_dense_staged_routed_experts(
                 "routed expert outputs must share one shape; "
                 f"got {tuple(output.shape)} and {tuple(expert_output.shape)}"
             )
-        output = output + expert_weight.to(torch.float32) * expert_output.to(
-            torch.float32
-        )
+        with _stager_profile_section(
+            stager,
+            "moe_routed_expert_combine",
+            layer_idx=layer_idx,
+        ):
+            output = output + expert_weight.to(torch.float32) * expert_output.to(
+                torch.float32
+            )
     if output is None:
         raise ValueError("DeepSeek V4 Flash routed MoE selected no experts")
     return output

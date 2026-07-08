@@ -44,10 +44,12 @@ for variant in ("off", "on"):
         return agg.get(name, {}).get("count", 0)
     sched = counters.get("deepseek_async_prefetch_scheduled_layers", 0)
     opp = counters.get("deepseek_async_prefetch_opportunities", 0)
+    first = steady[0] if steady else 0.0
+    steady_after = steady[1:] if len(steady) > 1 else steady
     print(f"{variant}: "
-          f"steady_tps=[{', '.join(f'{v:.3f}' for v in steady)}] "
-          f"median={statistics.median(steady):.3f} "
-          f"min={min(steady):.3f} max={max(steady):.3f} | "
+          f"first_run(cold)_tps={first:.3f} | "
+          f"steady_after_warmup_median={statistics.median(steady_after):.3f} "
+          f"[{', '.join(f'{v:.3f}' for v in steady_after)}] | "
           f"agg_tps_median={statistics.median(agg_tps):.3f} | "
           f"layer_moe_ms={summary.get('phase_totals_ms', {}).get('layer_moe', 0):.1f} | "
           f"async_scheduled={sched}/{opp} | "

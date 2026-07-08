@@ -62,11 +62,13 @@ for variant in ("off", "on"):
     agg_tps = [r.get("decode_tps_agg", 0.0) for r in runs]
     summary = data.get("profile_summary", {})
     counters = data.get("profile", {}).get("counters", {})
+    first = steady[0] if steady else 0.0
+    steady_after = steady[1:] if len(steady) > 1 else steady
     print(
         f"{variant}: "
-        f"steady_tps=[{', '.join(f'{v:.3f}' for v in steady)}] "
-        f"median={statistics.median(steady):.3f} "
-        f"min={min(steady):.3f} max={max(steady):.3f} | "
+        f"first_run(cold)_tps={first:.3f} | "
+        f"steady_after_warmup_median={statistics.median(steady_after):.3f} "
+        f"[{', '.join(f'{v:.3f}' for v in steady_after)}] | "
         f"agg_tps_median={statistics.median(agg_tps):.3f} | "
         f"layer_moe_ms={summary.get('phase_totals_ms', {}).get('layer_moe', 0):.1f} | "
         f"cpu_cache_hits={counters.get('cpu_payload_cache_hits', 0)} "

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -105,6 +107,15 @@ class DeepSeekV4FlashGPUBackend:
             "cpu_token_sync_points": 0,
             "fused_sliding_attention_api_calls": 0,
         }
+        self.profiler: Any | None = None
+
+    def _profile_section(self, name: str, **metadata: Any) -> Iterator[None]:
+        if self.profiler is None:
+            return nullcontext()
+        section = getattr(self.profiler, "section", None)
+        if not callable(section):
+            return nullcontext()
+        return section(name, **metadata)
 
     @property
     def is_ready(self) -> bool:
@@ -386,13 +397,16 @@ class DeepSeekV4FlashGPUBackend:
                 "DeepSeek V4 Flash routed expert GEMM inputs must be CUDA tensors"
             )
         hidden_f32 = hidden.to(torch.float32)
-        gate = gate_weight.to(torch.float32).matmul(hidden_f32)
-        up = up_weight.to(torch.float32).matmul(hidden_f32)
-        clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
-        if clamp > 1.0e-6:
-            gate = torch.clamp(gate, max=clamp)
-            up = torch.clamp(up, min=-clamp, max=clamp)
-        return down_weight.to(torch.float32).matmul(F.silu(gate) * up)
+        with self._profile_section("selected_expert_up_gate"):
+            gate = gate_weight.to(torch.float32).matmul(hidden_f32)
+            up = up_weight.to(torch.float32).matmul(hidden_f32)
+            clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
+            if clamp > 1.0e-6:
+                gate = torch.clamp(gate, max=clamp)
+                up = torch.clamp(up, min=-clamp, max=clamp)
+            activated = F.silu(gate) * up
+        with self._profile_section("selected_expert_down"):
+            return down_weight.to(torch.float32).matmul(activated)
 
     def quantized_expert_gemm(
         self,
@@ -418,47 +432,49 @@ class DeepSeekV4FlashGPUBackend:
         up_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
         down_payload: DeepSeekV4FlashQuantizedExpertPayloadLike,
     ) -> torch.Tensor:
-        if (
-            gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
-            and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
-            and gate_payload.rows == up_payload.rows
-            and gate_payload.columns == up_payload.columns
-            and gate_payload.columns % 256 == 0
-        ):
-            self._stats["iq2_xxs_gate_up_fused_calls"] += 1
-            activated = deepseek_v4_iq2_xxs_gate_up_activation(
-                gate_payload.payload,
-                up_payload.payload,
-                expert_input,
-                rows=gate_payload.rows,
-                columns=gate_payload.columns,
-            )
-            activated = deepseek_q8_k_roundtrip_reference(activated)
+        with self._profile_section("selected_expert_up_gate"):
+            if (
+                gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
+                and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
+                and gate_payload.rows == up_payload.rows
+                and gate_payload.columns == up_payload.columns
+                and gate_payload.columns % 256 == 0
+            ):
+                self._stats["iq2_xxs_gate_up_fused_calls"] += 1
+                activated = deepseek_v4_iq2_xxs_gate_up_activation(
+                    gate_payload.payload,
+                    up_payload.payload,
+                    expert_input,
+                    rows=gate_payload.rows,
+                    columns=gate_payload.columns,
+                )
+                activated = deepseek_q8_k_roundtrip_reference(activated)
+            else:
+                if (
+                    gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
+                    and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
+                    and gate_payload.rows == up_payload.rows
+                    and gate_payload.columns == up_payload.columns
+                ):
+                    self._stats["iq2_xxs_triton_calls"] += 2
+                    gate, up = deepseek_v4_iq2_xxs_gate_up(
+                        gate_payload.payload,
+                        up_payload.payload,
+                        expert_input,
+                        rows=gate_payload.rows,
+                        columns=gate_payload.columns,
+                    )
+                else:
+                    gate = self._quantized_expert_matvec(gate_payload, expert_input)
+                    up = self._quantized_expert_matvec(up_payload, expert_input)
+                clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
+                if clamp > 1.0e-6:
+                    gate = torch.clamp(gate, max=clamp)
+                    up = torch.clamp(up, min=-clamp, max=clamp)
+                activated = F.silu(gate) * up
+                activated = deepseek_q8_k_roundtrip_reference(activated)
+        with self._profile_section("selected_expert_down"):
             return self._quantized_expert_matvec(down_payload, activated)
-        if (
-            gate_payload.ggml_type == GGML_TYPE_IQ2_XXS
-            and up_payload.ggml_type == GGML_TYPE_IQ2_XXS
-            and gate_payload.rows == up_payload.rows
-            and gate_payload.columns == up_payload.columns
-        ):
-            self._stats["iq2_xxs_triton_calls"] += 2
-            gate, up = deepseek_v4_iq2_xxs_gate_up(
-                gate_payload.payload,
-                up_payload.payload,
-                expert_input,
-                rows=gate_payload.rows,
-                columns=gate_payload.columns,
-            )
-        else:
-            gate = self._quantized_expert_matvec(gate_payload, expert_input)
-            up = self._quantized_expert_matvec(up_payload, expert_input)
-        clamp = float(DEEPSEEK_V4_FLASH_SHAPE.swiglu_clamp)
-        if clamp > 1.0e-6:
-            gate = torch.clamp(gate, max=clamp)
-            up = torch.clamp(up, min=-clamp, max=clamp)
-        activated = F.silu(gate) * up
-        activated = deepseek_q8_k_roundtrip_reference(activated)
-        return self._quantized_expert_matvec(down_payload, activated)
 
     def _quantized_expert_matvec(
         self,
@@ -527,7 +543,10 @@ class DeepSeekV4FlashGPUBackend:
             ).to(torch.float32)
             if output is None:
                 output = torch.zeros_like(expert_output, dtype=torch.float32)
-            output = output + weights[payload_index].to(torch.float32) * expert_output
+            with self._profile_section("selected_expert_combine"):
+                output = (
+                    output + weights[payload_index].to(torch.float32) * expert_output
+                )
         if output is None:
             raise ValueError("DeepSeek V4 Flash selected expert GEMM got no payloads")
         return output
@@ -566,24 +585,26 @@ class DeepSeekV4FlashGPUBackend:
             down_payloads.append(down.payload)
         rows = payloads[0][1].rows
         columns = payloads[0][1].columns
-        deepseek_v4_iq2_xxs_selected_experts_activation_direct(
-            hidden=hidden.to(torch.float32),
-            payloads=list(zip(gate_payloads, up_payloads)),
-            workspace=workspace,
-            rows=rows,
-            columns=columns,
-        )
+        with self._profile_section("selected_expert_up_gate"):
+            deepseek_v4_iq2_xxs_selected_experts_activation_direct(
+                hidden=hidden.to(torch.float32),
+                payloads=list(zip(gate_payloads, up_payloads)),
+                workspace=workspace,
+                rows=rows,
+                columns=columns,
+            )
         down_rows = payloads[0][3].rows
         down_columns = payloads[0][3].columns
         output = torch.empty((down_rows,), dtype=torch.float32, device=hidden.device)
-        deepseek_v4_q2_k_selected_experts_down_projection_direct(
-            workspace=workspace,
-            down_payloads=down_payloads,
-            expert_weights=expert_weights.reshape(-1),
-            output=output,
-            rows=down_rows,
-            columns=down_columns,
-        )
+        with self._profile_section("selected_expert_down"):
+            deepseek_v4_q2_k_selected_experts_down_projection_direct(
+                workspace=workspace,
+                down_payloads=down_payloads,
+                expert_weights=expert_weights.reshape(-1),
+                output=output,
+                rows=down_rows,
+                columns=down_columns,
+            )
         return output
 
     def stage_selected_expert_payloads(
