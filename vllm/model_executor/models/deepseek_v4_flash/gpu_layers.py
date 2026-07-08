@@ -394,33 +394,45 @@ def _run_sliding_attention_for_slot(
         DEEPSEEK_V4_FLASH_SHAPE.num_attention_heads,
         DEEPSEEK_V4_FLASH_SHAPE.head_dim,
     )
-    query = per_head_rms_norm_reference(query)
-    if use_reference_rope or state is None:
-        query = apply_deepseek_layer_rope_to_tail_reference(
-            query,
-            token_idx=token_idx,
-            layer_idx=layer.layer_index,
-            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-        )
-    else:
-        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
-        query = apply_precomputed_rope_to_tail(query, cos, sin)
+    with _stager_profile_section(
+        stager,
+        "attn_backend_query_rope",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        query = per_head_rms_norm_reference(query)
+        if use_reference_rope or state is None:
+            query = apply_deepseek_layer_rope_to_tail_reference(
+                query,
+                token_idx=token_idx,
+                layer_idx=layer.layer_index,
+                rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+            )
+        else:
+            cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+            query = apply_precomputed_rope_to_tail(query, cos, sin)
 
-    if use_reference_rope or state is None:
-        current_kv = apply_deepseek_layer_rope_to_tail_reference(
+    with _stager_profile_section(
+        stager,
+        "attn_backend_kv_rope_qat",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        if use_reference_rope or state is None:
+            current_kv = apply_deepseek_layer_rope_to_tail_reference(
+                current_kv,
+                token_idx=token_idx,
+                layer_idx=layer.layer_index,
+                rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+            )
+        else:
+            cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+            current_kv = apply_precomputed_rope_to_tail(current_kv, cos, sin)
+        current_kv = deepseek_fp8_kv_qat_reference(
             current_kv,
-            token_idx=token_idx,
-            layer_idx=layer.layer_index,
+            head_dim=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
             rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
         )
-    else:
-        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
-        current_kv = apply_precomputed_rope_to_tail(current_kv, cos, sin)
-    current_kv = deepseek_fp8_kv_qat_reference(
-        current_kv,
-        head_dim=DEEPSEEK_V4_FLASH_SHAPE.head_dim,
-        rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-    )
     if current_kv.shape != (DEEPSEEK_V4_FLASH_SHAPE.head_dim,):
         raise ValueError(
             "DeepSeek V4 Flash sliding KV latent shape must be "
@@ -464,46 +476,64 @@ def _run_sliding_attention_for_slot(
 
     staged_sinks = stager.stage_vector(attn_sinks)
     fused_attn = getattr(backend, "fused_sliding_window_attention", None)
-    context: torch.Tensor | None = None
-    if callable(fused_attn):
-        try:
-            context = fused_attn(
-                query=query,
-                kv_rows=kv_rows,
-                attn_sinks=staged_sinks,
-                token_idx=token_idx,
+    with _stager_profile_section(
+        stager,
+        "attn_backend_attention_core",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        context: torch.Tensor | None = None
+        if callable(fused_attn):
+            try:
+                context = fused_attn(
+                    query=query,
+                    kv_rows=kv_rows,
+                    attn_sinks=staged_sinks,
+                    token_idx=token_idx,
+                )
+            except (RuntimeError, NotImplementedError, ValueError):
+                context = None
+        if context is None:
+            context = shared_kv_swa_attention_reference(
+                query,
+                kv_rows,
+                staged_sinks,
             )
-        except (RuntimeError, NotImplementedError, ValueError):
-            context = None
-    if context is None:
-        context = shared_kv_swa_attention_reference(
-            query,
-            kv_rows,
-            staged_sinks,
+    with _stager_profile_section(
+        stager,
+        "attn_backend_inv_rope",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        if use_reference_rope or state is None:
+            context = apply_deepseek_layer_rope_to_tail_reference(
+                context,
+                token_idx=token_idx,
+                layer_idx=layer.layer_index,
+                rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
+                inverse=True,
+            )
+        else:
+            cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
+            context = apply_precomputed_rope_to_tail(
+                context,
+                cos,
+                sin,
+                inverse=True,
+            )
+    with _stager_profile_section(
+        stager,
+        "attn_backend_outproj",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        return _project_sliding_attention_output(
+            context.reshape(-1),
+            None,
+            attention_output_a=layer.attention_output_a,
+            attention_output_b=layer.attention_output_b,
+            stager=stager,
         )
-    if use_reference_rope or state is None:
-        context = apply_deepseek_layer_rope_to_tail_reference(
-            context,
-            token_idx=token_idx,
-            layer_idx=layer.layer_index,
-            rotary_dim=DEEPSEEK_V4_FLASH_SHAPE.rotary_dim,
-            inverse=True,
-        )
-    else:
-        cos, sin = state.rope_tables_for(layer.layer_index, token_idx)
-        context = apply_precomputed_rope_to_tail(
-            context,
-            cos,
-            sin,
-            inverse=True,
-        )
-    return _project_sliding_attention_output(
-        context.reshape(-1),
-        None,
-        attention_output_a=layer.attention_output_a,
-        attention_output_b=layer.attention_output_b,
-        stager=stager,
-    )
 
 
 def _run_real_sliding_attention(
@@ -532,31 +562,49 @@ def _run_real_sliding_attention(
         "attention_key_value_a_norm",
     )
 
-    q_latent = _project_tensor(attn_input, query_a, stager)
-    q_latent = deepseek_v4_flash_rms_norm(
-        q_latent,
-        stager.stage_vector(query_a_norm),
-    )
-    query = _project_tensor(q_latent, query_b, stager)
+    with _stager_profile_section(
+        stager,
+        "attn_qkv_proj",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        q_latent = _project_tensor(attn_input, query_a, stager)
+        q_latent = deepseek_v4_flash_rms_norm(
+            q_latent,
+            stager.stage_vector(query_a_norm),
+        )
+        query = _project_tensor(q_latent, query_b, stager)
 
-    current_kv = _project_tensor(attn_input, kv_tensor, stager)
-    current_kv = deepseek_v4_flash_rms_norm(
-        current_kv,
-        stager.stage_vector(kv_norm),
-    )
+    with _stager_profile_section(
+        stager,
+        "attn_kv_update",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        current_kv = _project_tensor(attn_input, kv_tensor, stager)
+        current_kv = deepseek_v4_flash_rms_norm(
+            current_kv,
+            stager.stage_vector(kv_norm),
+        )
 
-    return _run_sliding_attention_for_slot(
-        query,
-        current_kv,
-        layer=layer,
-        stager=stager,
-        backend=backend,
-        state=state,
-        token_idx=token_idx,
-        kv_rows=kv_rows,
-        extra_kv_rows=extra_kv_rows,
-        use_reference_rope=use_reference_rope,
-    )
+    with _stager_profile_section(
+        stager,
+        "attn_backend_compute",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        return _run_sliding_attention_for_slot(
+            query,
+            current_kv,
+            layer=layer,
+            stager=stager,
+            backend=backend,
+            state=state,
+            token_idx=token_idx,
+            kv_rows=kv_rows,
+            extra_kv_rows=extra_kv_rows,
+            use_reference_rope=use_reference_rope,
+        )
 
 
 def deepseek_v4_flash_residual_hyper_connection(
@@ -661,6 +709,9 @@ def deepseek_v4_flash_sliding_layer_forward(
     if extra_kv_rows is None and extra_kv_rows_by_layer is not None:
         extra_kv_rows = extra_kv_rows_by_layer.get(layer.layer_index)
 
+    if isinstance(backend, DeepSeekV4FlashGPUBackend):
+        backend.profiler = getattr(stager, "profiler", None)
+
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
     )
@@ -733,60 +784,86 @@ def deepseek_v4_flash_sliding_layer_forward(
                 use_reference_rope=use_reference_rope,
             )
         else:
-            query = _project_tensor(
-                attn_input,
-                _required_tensor(layer.attention_query, "attention_query"),
+            with _stager_profile_section(
                 stager,
-            )
-            if layer.attention_query_a_norm is not None:
-                query = deepseek_v4_flash_rms_norm(
-                    query,
-                    stager.stage_vector(layer.attention_query_a_norm),
+                "attn_qkv_proj",
+                layer_idx=layer.layer_index,
+                layer_type="sliding",
+            ):
+                query = _project_tensor(
+                    attn_input,
+                    _required_tensor(layer.attention_query, "attention_query"),
+                    stager,
                 )
-            if layer.attention_query_b is not None:
-                query = _project_tensor(query, layer.attention_query_b, stager)
-            if kv_rows is None:
-                kv_rows = query.reshape(1, query.numel())
-            if not kv_rows.is_cuda:
-                raise ValueError(
-                    "DeepSeek V4 Flash sliding attention KV rows must be CUDA"
+                if layer.attention_query_a_norm is not None:
+                    query = deepseek_v4_flash_rms_norm(
+                        query,
+                        stager.stage_vector(layer.attention_query_a_norm),
+                    )
+                if layer.attention_query_b is not None:
+                    query = _project_tensor(query, layer.attention_query_b, stager)
+                if kv_rows is None:
+                    kv_rows = query.reshape(1, query.numel())
+                if not kv_rows.is_cuda:
+                    raise ValueError(
+                        "DeepSeek V4 Flash sliding attention KV rows must be CUDA"
+                    )
+            with _stager_profile_section(
+                stager,
+                "attn_backend_compute",
+                layer_idx=layer.layer_index,
+                layer_type="sliding",
+            ):
+                attn_sinks = (
+                    stager.stage_vector(layer.attention_sinks)
+                    if layer.attention_sinks is not None
+                    else None
                 )
-            attn_sinks = (
-                stager.stage_vector(layer.attention_sinks)
-                if layer.attention_sinks is not None
-                else None
-            )
-            attn_update = backend.sliding_attention(
-                query=query,
-                kv_rows=kv_rows,
-                attn_sinks=attn_sinks,
-                token_idx=token_idx,
-            )
-            attn_update = _project_sliding_attention_output(
-                attn_update,
-                attention_output,
-                attention_output_a=layer.attention_output_a,
-                attention_output_b=layer.attention_output_b,
-                stager=stager,
-            )
-    if uses_hyper_connection:
-        if attention_residual_streams is None:
-            raise AssertionError("attention residual streams were not initialized")
-        if attention_hc_state is None:
-            hidden_after_attn = attention_residual_streams + attn_update.reshape(1, -1)
+                attn_update = backend.sliding_attention(
+                    query=query,
+                    kv_rows=kv_rows,
+                    attn_sinks=attn_sinks,
+                    token_idx=token_idx,
+                )
+            with _stager_profile_section(
+                stager,
+                "attn_output_proj",
+                layer_idx=layer.layer_index,
+                layer_type="sliding",
+            ):
+                attn_update = _project_sliding_attention_output(
+                    attn_update,
+                    attention_output,
+                    attention_output_a=layer.attention_output_a,
+                    attention_output_b=layer.attention_output_b,
+                    stager=stager,
+                )
+    with _stager_profile_section(
+        stager,
+        "attn_post_norm_residual",
+        layer_idx=layer.layer_index,
+        layer_type="sliding",
+    ):
+        if uses_hyper_connection:
+            if attention_residual_streams is None:
+                raise AssertionError("attention residual streams were not initialized")
+            if attention_hc_state is None:
+                hidden_after_attn = attention_residual_streams + attn_update.reshape(
+                    1, -1
+                )
+            else:
+                hidden_after_attn = _hyper_connection_post_cuda(
+                    attn_update,
+                    attention_residual_streams,
+                    attention_hc_state,
+                )
         else:
-            hidden_after_attn = _hyper_connection_post_cuda(
+            hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+                attn_source,
                 attn_update,
-                attention_residual_streams,
-                attention_hc_state,
+                stager=stager,
+                hyper_connection=None,
             )
-    else:
-        hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
-            attn_source,
-            attn_update,
-            stager=stager,
-            hyper_connection=None,
-        )
 
     if uses_hyper_connection:
         if hidden_after_attn.ndim != 2:
@@ -1203,6 +1280,9 @@ def deepseek_v4_flash_compressed_layer_forward(
         )
     state.require_capacity(token_idx)
 
+    if isinstance(backend, DeepSeekV4FlashGPUBackend):
+        backend.profiler = getattr(stager, "profiler", None)
+
     attention_norm = stager.stage_vector(
         _required_tensor(layer.attention_norm, "attention_norm")
     )
@@ -1388,45 +1468,84 @@ def deepseek_v4_flash_compressed_layer_forward(
                 attention_rows = (
                     candidate_row if emitted_row is None else emitted_row
                 ).reshape(1, -1)
-            query = _compressed_attention_query(attn_input, layer=layer, stager=stager)
-            context = backend.compressed_attention(
-                query=query,
-                compressed_rows=attention_rows,
-                selected_rows=selected_rows,
-            )
-            context = _expand_shared_attention_context_for_output(
-                context,
-                layer=layer,
-                stager=stager,
-            )
-            attn_update = _project_sliding_attention_output(
-                context,
-                None
-                if layer.attention_output_a is not None
-                and layer.attention_output_b is not None
-                else _required_tensor(layer.attention_output, "attention_output"),
-                attention_output_a=layer.attention_output_a,
-                attention_output_b=layer.attention_output_b,
-                stager=stager,
-            )
-    if uses_hyper_connection:
-        if attention_residual_streams is None:
-            raise AssertionError("attention residual streams were not initialized")
-        if attention_hc_state is None:
-            hidden_after_attn = attention_residual_streams + attn_update.reshape(1, -1)
+            with _stager_profile_section(
+                stager,
+                "attn_qkv_proj",
+                layer_idx=layer.layer_index,
+                layer_type="compressed",
+                ratio=ratio,
+            ):
+                query = _compressed_attention_query(
+                    attn_input, layer=layer, stager=stager
+                )
+            with _stager_profile_section(
+                stager,
+                "attn_backend_compute",
+                layer_idx=layer.layer_index,
+                layer_type="compressed",
+                ratio=ratio,
+            ):
+                context = backend.compressed_attention(
+                    query=query,
+                    compressed_rows=attention_rows,
+                    selected_rows=selected_rows,
+                )
+            with _stager_profile_section(
+                stager,
+                "attn_backend_expand",
+                layer_idx=layer.layer_index,
+                layer_type="compressed",
+                ratio=ratio,
+            ):
+                context = _expand_shared_attention_context_for_output(
+                    context,
+                    layer=layer,
+                    stager=stager,
+                )
+            with _stager_profile_section(
+                stager,
+                "attn_output_proj",
+                layer_idx=layer.layer_index,
+                layer_type="compressed",
+                ratio=ratio,
+            ):
+                attn_update = _project_sliding_attention_output(
+                    context,
+                    None
+                    if layer.attention_output_a is not None
+                    and layer.attention_output_b is not None
+                    else _required_tensor(layer.attention_output, "attention_output"),
+                    attention_output_a=layer.attention_output_a,
+                    attention_output_b=layer.attention_output_b,
+                    stager=stager,
+                )
+    with _stager_profile_section(
+        stager,
+        "attn_post_norm_residual",
+        layer_idx=layer.layer_index,
+        layer_type="compressed",
+        ratio=ratio,
+    ):
+        if uses_hyper_connection:
+            if attention_residual_streams is None:
+                raise AssertionError("attention residual streams were not initialized")
+            if attention_hc_state is None:
+                hidden_after_attn = attention_residual_streams + attn_update.reshape(
+                    1, -1
+                )
+            else:
+                hidden_after_attn = _hyper_connection_post_cuda(
+                    attn_update,
+                    attention_residual_streams,
+                    attention_hc_state,
+                )
         else:
-            hidden_after_attn = _hyper_connection_post_cuda(
+            hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
+                attn_source,
                 attn_update,
-                attention_residual_streams,
-                attention_hc_state,
+                stager=stager,
+                hyper_connection=None,
             )
-    else:
-        hidden_after_attn = deepseek_v4_flash_residual_hyper_connection(
-            attn_source,
-            attn_update,
-            stager=stager,
-            hyper_connection=None,
-        )
 
     if uses_hyper_connection:
         if hidden_after_attn.ndim != 2:

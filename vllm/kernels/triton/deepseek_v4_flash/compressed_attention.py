@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
 import torch
@@ -109,6 +111,8 @@ def _deepseek_v4_compressed_attention_reference(
 
 def deepseek_v4_compressed_attention(
     inputs: DeepSeekV4CompressedAttentionTensorInputs,
+    *,
+    section: Callable[[str], AbstractContextManager[None]] | None = None,
 ) -> torch.Tensor:
     tensors = (inputs.query, inputs.compressed_rows, inputs.selected_rows)
     if any(not tensor.is_cuda for tensor in tensors):
@@ -125,4 +129,5 @@ def deepseek_v4_compressed_attention(
         inputs.query,
         inputs.compressed_rows,
         inputs.selected_rows,
+        section=section,
     )

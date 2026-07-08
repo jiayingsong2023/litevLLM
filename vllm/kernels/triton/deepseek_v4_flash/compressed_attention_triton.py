@@ -1,9 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+
+def _attn_section(
+    section: Callable[[str], AbstractContextManager[None]] | None, name: str
+) -> AbstractContextManager[None]:
+    if section is None:
+        return nullcontext()
+    return section(name)
 
 
 @triton.jit
@@ -79,6 +90,8 @@ def deepseek_v4_compressed_attention_triton(
     query: torch.Tensor,
     compressed_rows: torch.Tensor,
     selected_rows: torch.Tensor,
+    *,
+    section: Callable[[str], AbstractContextManager[None]] | None = None,
 ) -> torch.Tensor:
     """Fused compressed attention: softmax(selected_rows @ query) @ selected_rows.
 
@@ -117,26 +130,28 @@ def deepseek_v4_compressed_attention_triton(
     block_dim = 512  # HEAD_DIM is 512 in DS4 Flash
 
     scores = torch.empty((n_selected,), dtype=torch.float32, device=query.device)
-    _compressed_attention_scores_kernel[(n_selected,)](
-        query_f32,
-        rows_f32,
-        selected,
-        scores,
-        HEAD_DIM=head_dim,
-        BLOCK_DIM=block_dim,
-    )
+    with _attn_section(section, "attn_backend_scores"):
+        _compressed_attention_scores_kernel[(n_selected,)](
+            query_f32,
+            rows_f32,
+            selected,
+            scores,
+            HEAD_DIM=head_dim,
+            BLOCK_DIM=block_dim,
+        )
 
-    probs = torch.softmax(scores, dim=0)
+    with _attn_section(section, "attn_backend_softmax_reduce"):
+        probs = torch.softmax(scores, dim=0)
 
-    output = torch.empty((head_dim,), dtype=torch.float32, device=query.device)
-    grid = ((head_dim + block_dim - 1) // block_dim,)
-    _compressed_attention_reduce_kernel[grid](
-        rows_f32,
-        selected,
-        probs,
-        output,
-        HEAD_DIM=head_dim,
-        BLOCK_DIM=block_dim,
-        N_SELECTED=n_selected,
-    )
+        output = torch.empty((head_dim,), dtype=torch.float32, device=query.device)
+        grid = ((head_dim + block_dim - 1) // block_dim,)
+        _compressed_attention_reduce_kernel[grid](
+            rows_f32,
+            selected,
+            probs,
+            output,
+            HEAD_DIM=head_dim,
+            BLOCK_DIM=block_dim,
+            N_SELECTED=n_selected,
+        )
     return output

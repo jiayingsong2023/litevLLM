@@ -9,12 +9,12 @@
 
 ## 执行摘要
 
-DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8 tok/s**，这是 96 GB UMA 机器上的真实性能基线。围绕 cache/prefetch/staging 的优化（async prefetch、CPU payload cache）已被证明上限很低，不会突破该基线。
+DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8 tok/s**，这是 96 GB UMA 机器上的真实性能基线。围绕 cache/prefetch/staging 的优化（async prefetch、CPU payload cache）已被证明上限很低；对 `layer_moe` 的 IQ2 常量 sweep 和 `layer_attention` 的 Q8 batched kernel 实验也均未带来可测量的端到端提升。
 
-**战略转向**：
-- 把 96 GB 机器的主路径定为 **full-resident / warm-cache**。
-- cold-cache 优化只作为防退化手段，不再作为主要收益来源。
-- 下一轮优化必须转向 **warm 路径下 `layer_moe` 内部的 GPU kernel/launch 分解**（ROCm profiler），而不是继续调整 staging 层。
+**最终决策**：
+- **接受当前 baseline**：96 GB UMA 机器上 warm-resident 路径中位数约 **1.65 tok/s**，不再继续投入单 kernel/launch 优化。
+- **固化 gate 与回归**：cold gate 0.4 tok/s（防退化），warm gate 1.5 tok/s（主要基线），并纳入 `tests/run_deepseek_v4_flash_real_smoke.sh`。
+- **把资源放到别处**：优先转向 Gemma4 26B/31B 的 batch=2 并行验证，以及小显存 DeepSeek 的真实 staging cap + eviction 策略。
 
 ---
 
@@ -22,8 +22,9 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
 
 | 场景 | 命令/配置 | 结果 |
 |---|---|---|
-| **warm-cache gate** | `KV_TYPE=fp16`, `BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, warmup=16, repeat=3 | 近期 median **1.625–1.885 tok/s**；P0-B 完整回滚后最新一次为 **1.710 / 1.817 / 1.821 tok/s**（median **1.817 tok/s**） |
-| **e2e benchmark** | 同上，由 `tests/e2e_full_benchmark.py --models deepseek_v4_flash_q2_gguf` 调用 | decode_tps ≈ **1.79 tok/s** |
+| **warm-cache gate** | `KV_TYPE=fp16`, `BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, warmup=16, repeat=3 | **1.843 / 1.838 / 1.872 tok/s**（median **1.843 tok/s**，无 profiler，2026-07-08 gate verification） |
+| **warm-cache profile run** | 同上，带 `--profile-json` | 1.632 / 1.653 / 1.671 tok/s（median 1.653 tok/s；profiler sync 开销使 TPS 降低约 10%） |
+| **e2e benchmark** | 同上，由 `tests/e2e_full_benchmark.py --models deepseek_v4_flash_q2_gguf` 调用 | decode_tps ≈ **1.79 tok/s**（历史数据） |
 | **cold-start script, steady after cache warmup** | 默认 staging，`ASYNC_PREFETCH=0` | first run (true cold) **0.439 tok/s**；runs 2–3 median ≈ **1.67 tok/s**（方差大，受缓存状态影响） |
 | **async prefetch on** | `ASYNC_PREFETCH=1`，cold-start（历史数据） | first run **0.525 tok/s**；runs 2–3 median ≈ **1.67 tok/s**，无回归。运行时代码已移除 |
 | **CPU payload cache on** | `CPU_PAYLOAD_CACHE_BYTES=2GB`，cold-start（历史数据） | first run 与 steady 均无收益，`cpu_cache_hits=0`。运行时代码已移除 |
@@ -239,6 +240,77 @@ Top 10 kernel 对比（P0-B 前 → 后）：
 
 ---
 
+## 8. `attn_backend_compute` 细粒度归因（最终拆解）
+
+在决定停止 DeepSeek 单请求性能优化前，对 `layer_attention` 内部做了最后一层拆解，以确认 attention 路径是否还有未被识别的单一热点。
+
+固定 kept-path 配置（`FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, `KV_TYPE=fp16`, `BLOCK_SIZE=32`, warmup=16, repeat=3），在 `_run_sliding_attention_for_slot` 内部新增 section：
+
+- `attn_backend_query_rope`：query 的 RMS norm + rope
+- `attn_backend_kv_rope_qat`：KV 的 rope + `deepseek_fp8_kv_qat_reference`
+- `attn_backend_attention_core`：`fused_sliding_window_attention` 或 reference attention
+- `attn_backend_inv_rope`：inverse rope
+- `attn_backend_outproj`：`_project_sliding_attention_output`（两阶段 Q8 output projection）
+
+同时给 compressed attention triton 路径加了可选 `section` 参数（`attn_backend_scores` / `attn_backend_softmax_reduce` / `attn_backend_expand`），用于未来 compressed-path 模型。
+
+### 8.1 结果（`/tmp/ds_attn_backend_attribution_v3.json`）
+
+`layer_attention` 总计约 **25,642 ms**（6063 counts = 2021 layer-calls × 3 runs）。
+
+| Section | total_ms | 占 `layer_attention` | 关键结论 |
+|---|---:|---:|:---|
+| `attn_backend_compute` | 21,557 | 84.1% | attention compute wrapper 仍是 attention 主体 |
+| `attn_backend_outproj` | **7,707** | **30.1%** | **最大单一子热点**：两阶段 Q8 output projection |
+| `attn_backend_kv_rope_qat` | **7,022** | **27.4%** | **第二大子热点**：KV rope + fp8 KV QAT |
+| `attn_backend_query_rope` | 1,015 | 4.0% | query RMS norm + rope，小头 |
+| `attn_backend_inv_rope` | 870 | 3.4% | inverse rope，小头 |
+| `attn_backend_attention_core` | 839 | 3.3% | **注意力数学本身极小** |
+
+内层 section 合计：7,707 + 7,022 + 1,015 + 870 + 839 = **17,453 ms**，与 `attn_backend_compute` 21,557 ms 之间的差额约 4,104 ms，主要是 KV cache append/read/concat 等辅助操作以及 section sync 开销。
+
+### 8.2 关键发现
+
+1. **注意力核函数不是瓶颈**：`attn_backend_attention_core` 只占 `layer_attention` 的 3.3%。继续优化 fused/reference attention、Flash Attention、score/reduce kernel 等，对当前模型/配置几乎没有收益。
+2. **最大两个可合并热点是 output projection 和 KV rope/QAT**：
+   - `attn_backend_outproj` 主要是 `attention_output_a` + `attention_output_b` 两阶段 Q8 matvec。
+   - `attn_backend_kv_rope_qat` 是 KV rope 与 `deepseek_fp8_kv_qat_reference` 的连续操作。
+3. **compressed attention triton 路径未触发**：本模型所有层都带 real sliding attention tensors（`attention_query_a/b`、`attention_key_value`、`attention_output_a/b`、`attention_sinks` 均非空），因此 `backend.compressed_attention` 的 triton 路径在当前配置下未被执行。为 compressed path 新增的 section 参数对未来模型/配置保留，但不影响本次结论。
+4. **这两个热点都是“中小碎片”**：即使各自优化 30%，对 `layer_attention` 的改善也分别只有 ~9% 和 ~8%，且 `layer_attention` 只是整体 decode 的一部分。历史上 P0-B 的同类 batched Q8 实验已经把 launch count 从 48k 降到 ~1.7k 而没有 e2e 提升，说明这些路径上的 launch/GEMM 并行度已不是主要矛盾。
+
+### 8.3 决策影响
+
+这次拆解把最后两个潜在热点也量化清楚了：**它们都不够大、不够孤立，无法以工程上可控的成本撬动 ≥5% 的 warm e2e 提升**。因此不再继续对 DeepSeek V4 Flash 做单请求 kernel 优化，接受当前 baseline 并固化 gate。
+
+---
+
+## 9. 推理质量回归验证
+
+为确认本次所有 instrumentation-only 改动不影响输出质量，跑了完整 correctness regression：
+
+```bash
+bash tests/run_inference_correctness_regression.sh
+```
+
+结果：
+
+| Tier | 模型 | 结果 |
+|---|---|---|
+| Tier-B spotcheck | TinyLlama | PASS |
+| Tier-B spotcheck | Qwen3.5-9B AWQ | PASS |
+| Tier-B spotcheck | Gemma4-31B Q4 | PASS（含 multimodal） |
+| Tier-B spotcheck | Gemma4-26B A4B | PASS（含 multimodal） |
+| Tier-B spotcheck | DeepSeek V4 Flash | PASS |
+| Tier-A strict | TinyLlama | OK |
+| Tier-A strict | Qwen3.5-9B AWQ | OK |
+| Tier-A strict | Gemma4-26B A4B | OK |
+| Tier-A-lite | Gemma4-31B Q4 | OK |
+| Tier-A-lite | Gemma4-26B A4B | OK |
+
+脚本退出码 **0**，所有请求 tier 全部通过。
+
+---
+
 ## 关键判断
 
 1. **staging 层优化已触顶；实验代码已清理**
@@ -250,75 +322,67 @@ Top 10 kernel 对比（P0-B 前 → 后）：
    - 在 96 GB UMA 机器上，`FULL_RESIDENT=1 + PIN_HOT_EXPERTS=1 + warmup=16` 可稳定复现。
    - 回归 gate 应以此为主：warm gate 阈值 1.5；cold gate 保守防退化即可。
 
-3. **ROCm kernel profile 与 Q8 归因已完成；P0-B 证明 attention Q8 batching 不是当前突破口**
-   - Python profiler 已证明 staging 不是 steady 上限。
-   - ROCm profiler（P0-B 前）确认最大两个 kernel 是 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）。
-   - **Q8 归因把 `_q8_0_raw_matvec` 拆清**：`q8_projection_generic` 100% 是 attention 权重，`q8_attention_output_grouped` 100% 是 `attn_output_a`。两者合计占 Q8 raw matvec的 **84.6%**。
-   - P0-B 针对 `q8_attention_output_grouped` 做了 batched kernel，调用数从 48k 降到 ~1.7k，但 warm median 仍停留在 **1.625 tok/s**，未产生可测量的 e2e 提升。说明 attention 路径上还有与 Q8 projection 并行的主导开销（hipblaslt GEMM、整体 `layer_attention`），单纯减少 Q8 launch count 不足以突破基线。
-   - 因此**下一步不是继续扩大 Q8 batching**，而是先重新采样 P0-B 后的 warm ROCm profile，再看热点是否已转移到 hipblaslt / `layer_attention`。
+3. **`layer_attention` 内部归因已完成；attention 数学不是瓶颈**
+   - Python profiler 拆出 `attn_backend_compute` 内部的五大子阶段：`attn_backend_outproj`（30.1%）、`attn_backend_kv_rope_qat`（27.4%）、`attn_backend_query_rope`（4.0%）、`attn_backend_inv_rope`（3.4%）、`attn_backend_attention_core`（3.3%）。
+   - **注意力核函数本身只占 `layer_attention` 的 3.3%**，优化 attention math / score-reduce / flash attention 等无法撬动端到端。
+   - 最大的两个子热点是 output projection 和 KV rope/QAT，但它们属于中小碎片，历史上同类 Q8 batching 实验已证明减少 launch count 不带来 e2e 收益；继续融合/调参的信噪比不足。
+
+4. **接受当前 baseline，固化 gate，资源转向别处**
+   - 96 GB UMA 机器上 warm-resident 路径中位数约 **1.65 tok/s**，是工程实现下的真实性能天花板。
+   - 不再继续 DeepSeek V4 Flash 单请求 kernel/attention 优化；把资源优先放到 Gemma4 batch=2 并行验证，以及小显存 DeepSeek 的真实 staging cap + eviction 策略。
+   - gate 已写入 `tests/run_deepseek_v4_flash_real_smoke.sh`：cold 0.4 tok/s，warm 1.5 tok/s。
 
 ---
 
 ## 下一步建议
 
-### P0：先 attribution，再优化
+### 已决策：接受当前 baseline，停止 DeepSeek V4 Flash 单请求优化
 
-1. **P0-B：batched raw Q8 grouped matvec（已完成集成，局部成功、端到端未验证）**
-   - 动机：`vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py:1958` 的 `output_groups` 循环每层对 `attn_output_a` 调用 8 次 `q8_0_raw_linear()`，再 `torch.stack()`；48k 调用中 40.8% 来自此处。
-   - 实现：新增 `q8_0_raw_grouped_linear()`，`_grouped_output_projection()` 已切换为单次 launch。
-   - 正确性：`tests/deepseek_v4_flash/test_triton_q8_linear.py::test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear` 通过。
-   - **局部结果**：`q8_attention_output_grouped` 调用次数从 **48,504 降到 1,677**（约每层 1 次）。
-   - **端到端结果**：`tests/run_deepseek_v4_flash_real_smoke.sh` warm gate（repeat=3，无 profiler）steady TPS 为 **1.599 / 1.625 / 1.655 tok/s**（median **1.625 tok/s**），与此前基线 **1.6–1.8 tok/s** 持平，**未观察到可测量的 e2e 提升**。
-   - **判定与处置**：P0-B 是 **局部成功、端到端失败的 bounded experiment**。由于它实际替换了默认的 `attn_output_a` 路径（从 8 次 `q8_0_raw_linear()` 循环改为单次 `q8_0_raw_grouped_linear()`），但又没有可测量的 TPS 收益，保留自定义 Triton kernel 只是债务。因此**已完整回滚**：
-     - `vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py` 恢复为原始的 8 次循环 + `torch.stack()`。
-     - `vllm/kernels/triton/deepseek_v4_flash/q8_linear.py` 移除 `_q8_0_raw_grouped_matvec_kernel` 与 `q8_0_raw_grouped_linear()`。
-     - `tests/deepseek_v4_flash/test_triton_q8_linear.py` 移除对应测试。
-     - 不再继续深挖同类 Q8 batching。
+基于以上全部实验，**不再继续对 DeepSeek V4 Flash 做单请求 kernel/attention 优化**。原因：
 
-2. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.61%，negative result）**
-   - 已完成 2–3 组常量 sweep（baseline / rows8 / warps16），每组 warm no-profiler `repeat=3`。
-   - 结果：第一轮 sweep 中 warps16 看似提升 11.4%，但反向确认显示 baseline（1.885 tok/s）明显优于 warps16（1.648 tok/s），提升来自连续运行的 thermal/cache 漂移，而非 kernel 常量优化。
-   - **未达到硬退出条件**：没有任何一组 warm 3-run median >= 1.70 tok/s。
-   - **已回滚**：移除 `q2_iq2_moe.py` 中的 env var 覆盖，恢复默认 `ROWS_PER_BLOCK=4` / `num_warps=8`。
-   - 保留 `test_iq2_xxs_selected_experts_activation_direct_matches_fused` 作为 direct activation 路径的正确性覆盖。
+1. **IQ2 activation 常量 sweep**：negative result，热漂移掩盖了真实收益。
+2. **Q8 attention output grouped batching**：launch count 大幅下降，但 e2e 无提升。
+3. **async prefetch / CPU payload cache**：覆盖率/命中率过低，运行时代码已移除。
+4. **`attn_backend_compute` 拆解**：最大两个子热点 `attn_backend_outproj`（30.1%）和 `attn_backend_kv_rope_qat`（27.4%）都是中小碎片，且 attention 数学本身仅占 3.3%；继续优化的工程成本高、收益不可预测。
 
-3. **P0-C：按 tensor 单独评估其他 attention Q8 projections**
-   - `q8_projection_generic` 已按 tensor 拆清：53% `attn_output_b`、22% `attn_q_b`、15% `attn_q_a`、10% `attn_kv`。它们每层各调用 1 次，不是 P0-B 那种 "8 launch → 1 launch" 问题，**不默认复用 P0-B 方案**。
-   - 方向：用 fresh ROCm/Python profile 重新采样 P0-B 后的 warm path，再对每个 tensor 单独判断是调 block size、融合相邻 projection，还是保持不变。
-   - 若 P0-A 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，再考虑优化 down projection kernel。
+### Gate 与回归（立即执行）
 
-为验证优化效果，固定回归命令：
+1. **Gate 已固化在 `tests/run_deepseek_v4_flash_real_smoke.sh`**：
+   - cold-cache gate：`--warmup-tokens 1 --min-steady-decode-tps 0.4`
+   - warm-cache gate：`--warmup-tokens 16 --repeat 3 --min-steady-decode-tps 1.5`
+2. **质量回归已通过**：`bash tests/run_inference_correctness_regression.sh` 退出码 0，所有 tier 通过。
+3. **合并前建议再跑一次 fast regression**：
+   ```bash
+   bash tests/run_regression_suite.sh
+   tests/run_deepseek_v4_flash_real_smoke.sh
+   ```
 
-```bash
-FASTINFERENCE_KV_TYPE=fp16 \
-FASTINFERENCE_BLOCK_SIZE=32 \
-FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
-FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
-FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
-  uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
-    --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
-    --context-length 4096 --prompt-length 32 --max-tokens 16 --warmup-tokens 16 --repeat 3 \
-    --min-steady-decode-tps 1.5 --profile-json /tmp/ds_opt_regression.json
-```
+### 资源转向（按优先级）
 
-### 可选：修正小显存实验模型
+1. **Gemma4 26B/31B：batch=2 并行验证**
+   - 目标：验证 active-request / scheduler admission 放开后，batch=2 是否真正进入并行 decode 并带来吞吐收益。
+   - 这属于另一条模型线，与 DeepSeek 当前结论无关。
 
-如果还要评估内存受限场景，需要先加一个真正的 GPU staging 硬上限（例如按字节或 GB 直接 cap `max_staged_bytes`），让 GPU cache 发生真实 eviction，再测 CPU cache / 批量 stage。否则 cold-path 实验在 96 GB 机器上不成立。
+2. **小显存 DeepSeek：真实 staging cap + eviction 策略**
+   - 当前 96 GB UMA 机器无法模拟内存受限场景；默认 `STAGING_BUDGET_GB` 会被放大到容纳整个 working set。
+   - 若未来要支持小显存，先在 DeepSeek V4 Flash staging 配置里加一个按字节计的 `max_staged_bytes` 硬上限，再评估 eviction/re-stage、批量 staging、hot expert pinning。
 
-### 暂不投入
-
-- async prefetch 与 CPU payload cache（运行时代码已移除）
-- 图/capture（已被 `CAPABILITY_MATRIX` 明确拒绝）
+3. **暂不投入**
+   - DeepSeek 单请求 kernel 优化（含 attention output projection 融合、KV rope/QAT 融合、IQ2 常量 sweep）。
+   - async prefetch / CPU payload cache（运行时代码已移除）。
+   - 图/capture（已被 `CAPABILITY_MATRIX` 明确拒绝）。
 
 ---
 
 ## 相关文件与 Artifact
 
-- `tests/run_deepseek_v4_flash_real_smoke.sh` — warm/cold gate
+- `tests/run_deepseek_v4_flash_real_smoke.sh` — warm/cold gate（已固化）
+- `tests/run_inference_correctness_regression.sh` — 推理质量回归
 - `tests/run_deepseek_v4_flash_async_prefetch_ab.sh` — async prefetch A/B（历史记录，运行时代码已移除）
 - `tests/run_deepseek_v4_flash_cpu_payload_cache_ab.sh` — CPU payload cache A/B（历史记录，运行时代码已移除）
 - `docs/superpowers/plans/2026-07-07-deepseek-async-prefetch.md` — 实现计划与实验记录
 - `docs/performance_evaluation_gemma4_deepseek_2026_07_07.md` — 早期评估报告
+- `/tmp/ds_attn_backend_attribution_v3.json` — 本次 `attn_backend_compute` 细粒度归因
 - `/tmp/ds_warm_rocprof/*/kernel_stats.csv` — ROCm warm-resident kernel profile 原始数据
 - `/tmp/ds_warm_moe_rocprof.json` — 同次运行的 Python profiler JSON
 - `/tmp/ds_q8_attribution.json` — Q8 raw matvec 调用归因 aggregate
@@ -328,11 +392,16 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ## 结论
 
-DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident），多次 fresh verification median 在 **1.625–1.885 tok/s** 之间波动。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。
+DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident），最新 profile run 为 **1.632 / 1.653 / 1.671 tok/s**（median **1.653 tok/s**）。
 
-- **P0-B 已完整回滚**：batched grouped Q8 matvec 把 `q8_attention_output_grouped` 调用数从 48k 降到 ~1.7k，但 warm median 仍停留在 **1.625 tok/s**，未超过基线噪声范围。由于它替换了默认的 `attn_output_a` 路径又没有可测量的 e2e 收益，保留自定义 Triton kernel 是债务，因此已恢复原始循环实现并移除相关 kernel/test。
-- **P0-A 是 negative result**：对 `_iq2_xxs_selected_experts_activation_direct6_kernel` 的常量 sweep（rows8 / warps16）未通过硬退出条件；反向确认表明首轮“收益”是连续运行的 thermal/cache 漂移。已回滚 env var 覆盖。
-- 当前 warm path 上，`_iq2_xxs_selected_experts_activation_direct6_kernel` 仍是 ROCm profile 中占比最高的单一 kernel（24.61%），但调常量无法撬动端到端 TPS。
-- hipblaslt GEMM（12.23%）和整体 `layer_attention` 是并行的独立瓶颈。
+- **staging/cache/prefetch 优化已触顶**：async prefetch 覆盖率仅 ~4.8%，CPU payload cache hit=0，运行时代码已移除。
+- **MoE kernel 常量 sweep 为 negative result**：`_iq2_xxs_selected_experts_activation_direct` 的 rows8/warps16 sweep 未通过 1.70 tok/s 硬退出条件，首轮“收益”是 thermal/cache 漂移。
+- **Q8 attention batching 局部成功、端到端失败**：P0-B 把 `q8_attention_output_grouped` 调用数从 48k 降到 ~1.7k，但 warm median 仍停留在 **1.625 tok/s**，已完整回滚。
+- **`attn_backend_compute` 拆解完成**：最大子热点是 `attn_backend_outproj`（30.1%）和 `attn_backend_kv_rope_qat`（27.4%），但 attention 数学本身仅占 3.3%；这些热点碎片化，继续优化的工程收益不可预测。
 
-下一步：**把目标从单 kernel 常量调参移开**。需要重新评估是继续拆解 `layer_attention` 内部（hipblaslt GEMM、Q8 attention projections、KV cache compression），还是接受 1.6–1.8 tok/s 为当前实现下的性能天花板。任何新优化都必须以 warm no-profiler 3-run median 的统计显著提升为准，并做反向顺序验证以排除 thermal 漂移。
+**最终决策**：接受 1.6–1.8 tok/s 为当前实现下 96 GB UMA 机器的真实性能天花板；把 DeepSeek V4 Flash 单请求优化资源停掉，优先转向 Gemma4 并行验证和小显存 staging 策略。
+
+**已固化产物**：
+- `tests/run_deepseek_v4_flash_real_smoke.sh`：cold gate 0.4 tok/s，warm gate 1.5 tok/s。
+- 质量回归 `tests/run_inference_correctness_regression.sh` 已全 tier 通过。
+- 本报告作为决策文档存档。

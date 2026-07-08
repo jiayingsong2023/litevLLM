@@ -638,5 +638,6 @@ class DeepSeekV4FlashGPUBackend:
                 query=query,
                 compressed_rows=compressed_rows,
                 selected_rows=selected_rows,
-            )
+            ),
+            section=self._profile_section,
         )
