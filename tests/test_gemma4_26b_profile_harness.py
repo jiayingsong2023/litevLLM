@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from pathlib import Path
-
 from tests.tools.gemma4_26b_profile import run_e2e_baseline
 
 

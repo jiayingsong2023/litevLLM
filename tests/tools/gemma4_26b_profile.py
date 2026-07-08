@@ -10,7 +10,11 @@ import sys
 from pathlib import Path
 
 
-def _run(cmd: list[str], env: dict[str, str] | None = None, capture: bool = False) -> str:
+def _run(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    capture: bool = False,
+) -> str:
     print("+ " + " ".join(cmd), flush=True)
     result = subprocess.run(
         cmd,
@@ -100,7 +104,10 @@ def main() -> None:
         "kernel_stats_csv": str(kernel_stats_csv),
         "awq_audit_log": str(audit_log),
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
     print("Profile complete.")
     for k, v in summary.items():
         print(f"  {k}: {v}")
