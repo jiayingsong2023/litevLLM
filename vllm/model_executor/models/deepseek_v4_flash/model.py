@@ -403,9 +403,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
 
         Returns None if there is nothing to prefetch or prefetch fails.
         """
-        self._deepseek_profiler.add_counter(
-            "deepseek_async_prefetch_opportunities", 1
-        )
+        self._deepseek_profiler.add_counter("deepseek_async_prefetch_opportunities", 1)
         grouped_experts = getattr(next_layer, "grouped_experts", None)
         if grouped_experts is None:
             return None
@@ -1316,9 +1314,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.pin_hot_experts_for_input_ids(input_ids, device)
         self.gpu_backend.require_ready()
         state = (
-            self._gpu_request_states.get(request_id)
-            if request_id is not None
-            else None
+            self._gpu_request_states.get(request_id) if request_id is not None else None
         )
         if state is None:
             state = self._new_gpu_request_state(
@@ -2420,13 +2416,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     row_end=row_end,
                     row_bytes=row_bytes,
                 )
-                chunk_logits = q8_0_raw_linear(
-                    chunk_raw,
-                    output_hidden,
-                    rows=chunk_rows,
-                    columns=columns,
-                    block_size=_Q8_0_BLOCK_SIZE,
-                )
+                with self._deepseek_profiler.section(
+                    "q8_output_projection_chunk",
+                    tensor=tensor.name,
+                ):
+                    chunk_logits = q8_0_raw_linear(
+                        chunk_raw,
+                        output_hidden,
+                        rows=chunk_rows,
+                        columns=columns,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    )
                 if not chunk_logits.is_cuda:
                     raise RuntimeError(
                         "DeepSeek V4 Flash raw output chunk returned CPU logits"
@@ -2554,13 +2554,17 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                     row_end=row_end,
                     row_bytes=row_bytes,
                 )
-                chunk_logits = q8_0_raw_linear(
-                    chunk_raw,
-                    output_hidden,
-                    rows=chunk_rows,
-                    columns=columns,
-                    block_size=_Q8_0_BLOCK_SIZE,
-                ).reshape(-1)
+                with self._deepseek_profiler.section(
+                    "q8_output_projection_chunk",
+                    tensor=tensor.name,
+                ):
+                    chunk_logits = q8_0_raw_linear(
+                        chunk_raw,
+                        output_hidden,
+                        rows=chunk_rows,
+                        columns=columns,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    ).reshape(-1)
                 if not chunk_logits.is_cuda:
                     raise RuntimeError(
                         "DeepSeek V4 Flash raw output chunk returned CPU logits"

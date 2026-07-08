@@ -189,6 +189,8 @@ def deepseek_v4_flash_q8_0_tensor_projection(
     tensor: DeepSeekV4FlashTensor,
     stager: DeepSeekV4FlashGPUWeightStager,
     staged_raw_tensor: torch.Tensor | None = None,
+    *,
+    section_name: str = "q8_projection_generic",
 ) -> torch.Tensor:
     """Project a vector with a raw GGUF Q8_0 tensor without fp32 matrix decode.
 
@@ -223,13 +225,14 @@ def deepseek_v4_flash_q8_0_tensor_projection(
             f"got {raw_payload.numel()} bytes, expected {expected_bytes}"
         )
 
-    return q8_0_raw_linear(
-        raw_payload,
-        hidden,
-        rows=rows,
-        columns=columns,
-        block_size=_Q8_0_BLOCK_SIZE,
-    )
+    with _stager_profile_section(stager, section_name, tensor=tensor.name):
+        return q8_0_raw_linear(
+            raw_payload,
+            hidden,
+            rows=rows,
+            columns=columns,
+            block_size=_Q8_0_BLOCK_SIZE,
+        )
 
 
 def _stage_q8_0_raw_tensor(
@@ -255,6 +258,8 @@ def _project_tensor(
     hidden: torch.Tensor,
     tensor: DeepSeekV4FlashTensor,
     stager: DeepSeekV4FlashGPUWeightStager,
+    *,
+    section_name: str = "q8_projection_generic",
 ) -> torch.Tensor:
     if hidden.ndim == 2 and _can_project_q8_0(hidden, tensor):
         # Stage the raw Q8 payload once, then project each batch element.
@@ -262,7 +267,11 @@ def _project_tensor(
         return torch.stack(
             [
                 deepseek_v4_flash_q8_0_tensor_projection(
-                    hidden[b], tensor, stager, staged_raw_tensor=staged
+                    hidden[b],
+                    tensor,
+                    stager,
+                    staged_raw_tensor=staged,
+                    section_name=section_name,
                 )
                 for b in range(hidden.shape[0])
             ]
@@ -277,7 +286,9 @@ def _project_tensor(
             ]
         )
     if _can_project_q8_0(hidden, tensor):
-        return deepseek_v4_flash_q8_0_tensor_projection(hidden, tensor, stager)
+        return deepseek_v4_flash_q8_0_tensor_projection(
+            hidden, tensor, stager, section_name=section_name
+        )
     return deepseek_v4_flash_staged_matrix_projection(
         hidden,
         stager.stage_matrix(tensor),
@@ -1953,15 +1964,20 @@ def _grouped_output_projection(
             row_end = row_start + rank_per_group
             byte_start = row_start * row_bytes
             byte_end = row_end * row_bytes
-            low_rank_rows.append(
-                q8_0_raw_linear(
-                    raw_payload[byte_start:byte_end],
-                    grouped[group_idx],
-                    rows=rank_per_group,
-                    columns=group_input,
-                    block_size=_Q8_0_BLOCK_SIZE,
+            with _stager_profile_section(
+                stager,
+                "q8_attention_output_grouped",
+                tensor=output_a.name,
+            ):
+                low_rank_rows.append(
+                    q8_0_raw_linear(
+                        raw_payload[byte_start:byte_end],
+                        grouped[group_idx],
+                        rows=rank_per_group,
+                        columns=group_input,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    )
                 )
-            )
         low_rank = torch.stack(low_rank_rows, dim=0)
     else:
         output_a_weight = stager.stage_matrix(output_a)
@@ -2864,7 +2880,12 @@ def _run_staged_shared_expert(
             tensor=tensors.down.name,
         ):
             if _can_project_q8_0(activated, tensors.down):
-                projected = _project_tensor(activated, tensors.down, stager)
+                projected = _project_tensor(
+                    activated,
+                    tensors.down,
+                    stager,
+                    section_name="q8_shared_expert_down",
+                )
                 return projected.to(torch.float32)
 
     with _stager_profile_section(

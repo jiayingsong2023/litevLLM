@@ -125,16 +125,27 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 | 功能组 | Total (s) | % |
 |---|---:|---:|
 | `iq2_xxs_selected_experts_activation_direct`（up/gate 融合激活） | 13.955 | 24.20 |
-| `q8_0_raw_matvec`（量化 matvec，主要 router/attention/linear） | 12.197 | 21.16 |
+| `q8_0_raw_matvec`（量化 matvec，来源待拆分） | 12.197 | 21.16 |
 | `q2_k_selected_experts_down_projection_direct`（down projection） | 7.359 | 12.76 |
 | hipblaslt / `Cijk_*` GEMM（attention/linear 通用 GEMM） | 7.202 | 12.49 |
 | PyTorch elementwise / copy / fill / cat / arange 等 | ~12.9 | ~22.4 |
 | `q8_0_raw_gate_up_activation_kernel` | 1.501 | 2.60 |
 | 其他 | ~2.4 | ~4.2 |
 
+#### Q8 raw matvec 调用归因
+
+为拆分 `_q8_0_raw_matvec_kernel` 的 10.6 万次调用，在 4 个主要调用点外加 Python profiler section 后重跑 warm path（profiler section 本身带来额外开销，本次 steady TPS 约 **1.09 tok/s**，只看相对分布）：
+
+| Section | Calls | Total (ms) | Avg (ms) | 占 Q8 matvec 比例 |
+|---:|---:|---:|---:|---:|
+| `q8_projection_generic` | 24,252 | 6,762.4 | 0.279 | 47.0% |
+| `q8_attention_output_grouped` | 48,504 | 5,869.5 | 0.121 | 40.8% |
+| `q8_output_projection_chunk` | 1,128 | 1,071.7 | 0.950 | 7.4% |
+| `q8_shared_expert_down` | 6,063 | 680.8 | 0.112 | 4.7% |
+
 关键发现：
-- **MoE compute kernel 合计约 60.7%**（iq2_xxs up/gate 24.2% + q8_0 gate_up 2.6% + q2_k down 12.8% + q8_0 matvec 中属于 MoE 的部分）。即使保守估计，MoE 仍是绝对主导。
-- `_q8_0_raw_matvec_kernel` 调用次数高达 **10.6 万次**，平均仅 0.114 ms，说明存在大量细碎 matvec 启动；其中一部分来自 router/attention/linear，另一部分来自 MoE。
+- `_q8_0_raw_matvec` 的大头不是 MoE，而是 **通用 Q8 projection（47%）** 和 **attention output 分组低秩投影（41%）**。
+- `q8_output_projection_chunk` 与 `q8_shared_expert_down` 合计仅约 12%，短期内不是 Q8 路径的首要目标。
 - hipblaslt GEMM 占 **12.5%**，与 Python profiler 中 `layer_attention` 占比最高相互印证（attention 主要走 hipblaslt）。
 - staging / H2D / cache 相关 kernel 在 warm 路径下几乎不可见，再次验证 staging 不是瓶颈。
 
@@ -151,36 +162,36 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
    - 在 96 GB UMA 机器上，`FULL_RESIDENT=1 + PIN_HOT_EXPERTS=1 + warmup=16` 可稳定复现。
    - 回归 gate 应以此为主：warm gate 阈值 1.5；cold gate 保守防退化即可。
 
-3. **ROCm kernel profile 已完成；优化目标已锁定 top-2**
+3. **ROCm kernel profile 与 Q8 归因已完成；优化目标需要分两条线**
    - Python profiler 已证明 staging 不是 steady 上限。
-   - ROCm profiler 进一步确认：warm 路径下 **MoE compute kernel 合计约 60%**，`_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）是最大两个热点。
-   - hipblaslt GEMM 占约 12.5%，与 Python profiler 中 `layer_attention` 占比最高一致。
-   - 下一步应直接针对 top-2 kernel 做 Triton 调优或调用合并，而不是继续扩展开销已很低的 staging/cache 层。
+   - ROCm profiler 确认最大两个 kernel 是 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）。
+   - **Q8 归因把 `_q8_0_raw_matvec` 拆清**：47% 来自通用 Q8 projection，41% 来自 attention output 分组低秩投影，MoE/输出 chunk/shared expert 仅占约 12%。因此不能直接对 MoE 做 batch/merge，必须先评估 generic 与 attention output 路径。
+   - hipblaslt GEMM 占约 12.5%，与 Python profiler 中 `layer_attention` 占比最高一致，attention 线是独立热点。
 
 ---
 
 ## 下一步建议
 
-### P0：针对 top-2 kernel 进行优化
-
-基于 ROCm profile，优化优先级如下：
+### P0：先 attribution，再优化
 
 1. **P0-1：`_iq2_xxs_selected_experts_activation_direct`（24.2%）**
-   - 这是 selected expert up/gate  fused activation 的 Triton kernel。
-   - 方向：调大 block/tile、减少 dequant+activation 中的临时量、尝试把 roundtrip（`deepseek_q8_k_roundtrip_reference`）消掉或融合进同一 kernel。
+   - 这是 selected expert up/gate fused activation 的 Triton kernel。
+   - 方向：sweep `BLOCK_SIZE_M/N`、`num_warps`、register pressure，验证 avg_ms 是否下降。当前 avg 1.73 ms，先以降到 1.5 ms 以下为目标。
    - 验证指标：该 kernel 的 total_ms / avg_ms 下降，warm steady TPS 提升。
 
-2. **P0-2：`_q8_0_raw_matvec`（21.2%，10.6 万次调用）**
-   - 大量细碎 matvec，来源包括 router/attention/linear 以及部分 MoE path。
+2. **P0-2：拆分并决定 `_q8_0_raw_matvec` 的优化方向（21.2%，10.6 万次调用）**
+   - 归因已完成，大头是：
+     - `q8_projection_generic`（47%）——通用 Q8 projection（router/MLP/output 等）。
+     - `q8_attention_output_grouped`（41%）——attention output 分组低秩投影。
    - 方向：
-     - 先按 layer/operator 拆分调用来源（可加 kernel 名前缀或 ROCTx marker）。
-     - 对 MoE 内部的小 matvec 做 batch/merge，减少 launch count。
-     - 对 router/attention 的 matvec 评估是否可用 hipblaslt GEMM 替换或融合。
-   - 验证指标：调用次数下降或平均耗时下降。
+     - 先评估 `q8_attention_output_grouped` 是否能合并成一次 hipblaslt GEMM 或更大的 raw matvec，减少 48k 次调用。
+     - 再评估 `q8_projection_generic` 内部哪些 operator 调用最碎，是否可用 hipblaslt GEMM 替换部分路径。
+     - `q8_output_projection_chunk`（7.4%）和 `q8_shared_expert_down`（4.7%）暂不优先。
+   - 验证指标：Q8 matvec 总调用次数下降，或平均耗时下降。
 
-3. **P0-3：`_q2_k_selected_experts_down_projection_direct`（12.8%）与 hipblaslt GEMM（12.5%）**
-   - down projection 已是第三大热点；hipblaslt GEMM 主要对应 attention。
-   - 方向：先完成 P0-1/P0-2 后再评估；若 attention 成为新的 top-1，再转向 attention kernel 融合或 KV cache 压缩。
+3. **P0-3：根据 P0-2 结果决定 attention 还是 down projection 优先**
+   - 若 P0-2 把 Q8 attention output 优化后，`layer_attention` / hipblaslt GEMM 仍占主导，则转向 attention kernel 融合或 KV cache 压缩。
+   - 若 P0-1 把 selected expert activation 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，则再优化 down projection kernel。
 
 为验证优化效果，固定回归命令：
 
@@ -218,9 +229,15 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 - `docs/performance_evaluation_gemma4_deepseek_2026_07_07.md` — 早期评估报告
 - `/tmp/ds_warm_rocprof/*/kernel_stats.csv` — ROCm warm-resident kernel profile 原始数据
 - `/tmp/ds_warm_moe_rocprof.json` — 同次运行的 Python profiler JSON
+- `/tmp/ds_q8_attribution.json` — Q8 raw matvec 调用归因 profile
 
 ---
 
 ## 结论
 
-DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident）。staging/cache/prefetch 层的优化潜力已耗尽；Python-level 与 ROCm-level 的 warm 路径分解均已完成。ROCm profile 将优化目标精确锁定为 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）这两个 kernel。下一步应直接对它们做 Triton 调优或调用合并，而非继续投入 staging 层。
+DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident）。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。优化目标已精确锁定：
+
+- `_iq2_xxs_selected_experts_activation_direct`（24.2%）——直接 Triton 调参。
+- `_q8_0_raw_matvec`（21.2%）——其中 47% 来自通用 Q8 projection，41% 来自 attention output 分组低秩投影，需要分别评估合并/替换方案。
+
+下一步按 P0 顺序执行：先调 selected expert activation kernel，再优化 Q8 attention output 路径，最后根据结果决定 attention 还是 down projection。
