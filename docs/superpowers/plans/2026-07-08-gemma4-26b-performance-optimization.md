@@ -129,7 +129,6 @@ def run_awq_audit(out_dir: Path, max_new_tokens: int = 24) -> Path:
     env.update({
         "FASTINFERENCE_KV_TYPE": "turbo_int4",
         "FASTINFERENCE_GEMMA4_ALLOW_INT4_KV": "0",
-        "FASTINFERENCE_AWQ_AUDIT": "1",
     })
     stdout = _run([
         sys.executable, "tests/e2e_full_benchmark.py",

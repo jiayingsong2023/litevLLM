@@ -91,8 +91,7 @@ rocprofv3 --kernel-trace --stats \
     --gemma26b-max-new-tokens 8 \
     --json-out /tmp/gemma26b_rocprof.json
 
-# 3. AWQ fast-path coverage audit（产出 stdout audit events）
-FASTINFERENCE_AWQ_AUDIT=1 \
+# 3. AWQ fast-path coverage audit（AWQ audit 事件默认记录，无需额外开关）
 uv run python tests/e2e_full_benchmark.py \
   --models gemma4_26b_a4b \
   --gemma26b-concurrent 1 \
@@ -116,14 +115,14 @@ uv run python tests/e2e_full_benchmark.py \
 `vllm/model_executor/models/gemma4/profiling.py` 已提供 `_gemma4_profile_span`。先确认 section timer 的启用方式：
 
 ```bash
-# 方式 1（待确认）：检查 FASTINFERENCE_GEMMA4_PROFILE=1 是否真实有效
-FASTINFERENCE_GEMMA4_PROFILE=1 uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b
+# 方式 1：使用真实存在的 Gemma4 layer profile 开关
+FASTINFERENCE_GEMMA4_LAYER_PROFILE=1 uv run python tests/e2e_full_benchmark.py --models gemma4_26b_a4b
 
-# 方式 2：若方式 1 无效，临时在 vllm/model_executor/models/gemma4/layer.py 中
+# 方式 2：若方式 1 不够细，临时在 vllm/model_executor/models/gemma4/layer.py 中
 # 将 Gemma4LayerConfig 实例的 profile_enabled 设为 True（P0 阶段专用，不提交）
 ```
 
-> P0 第一步需验证 `FASTINFERENCE_GEMMA4_PROFILE=1` 是否真实触发 profile 输出；若无效，改用方式 2 或修改 profiling 开关。
+> P0 第一步使用 `FASTINFERENCE_GEMMA4_LAYER_PROFILE=1`；若该开关不够细，改用方式 2 或修改 profiling 开关。
 
 重点观察 section：
 
@@ -137,7 +136,6 @@ FASTINFERENCE_GEMMA4_PROFILE=1 uv run python tests/e2e_full_benchmark.py --model
 #### 3.2.3 AWQ Fast-Path Coverage Audit
 
 ```bash
-FASTINFERENCE_AWQ_AUDIT=1 \
 uv run python tests/e2e_full_benchmark.py \
   --models gemma4_26b_a4b \
   --gemma26b-concurrent 1 \
