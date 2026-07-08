@@ -106,6 +106,7 @@ def test_moe_int4_numerical_small_shape() -> None:
     )
     assert used, f"Fast path not used: {reason}"
     assert out.shape == (m, hidden_dim)
+    assert out.dtype == x.dtype
 
     ref = _reference_moe_single(
         x,

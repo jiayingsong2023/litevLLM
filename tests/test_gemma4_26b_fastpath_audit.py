@@ -19,7 +19,9 @@ def _parse_awq_audit_log(log_text: str) -> dict[str, int]:
         elif "moe_int4_decode_used" in line:
             counts["moe_int4_decode_used"] = counts.get("moe_int4_decode_used", 0) + 1
         elif "moe_int4_decode_fallback" in line:
-            counts["moe_int4_decode_fallback"] = counts.get("moe_int4_decode_fallback", 0) + 1
+            counts["moe_int4_decode_fallback"] = (
+                counts.get("moe_int4_decode_fallback", 0) + 1
+            )
     return counts
 
 

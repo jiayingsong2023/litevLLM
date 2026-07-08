@@ -59,6 +59,11 @@ def _reference_moe(
     return out
 
 
+def _sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def benchmark_strategy(
     strategy: str,
     hidden_dim: int,
@@ -151,7 +156,7 @@ def benchmark_strategy(
                     f"(max_err={max_err}): {exc}"
                 )
 
-        torch.cuda.synchronize()
+        _sync(device)
         start = time.perf_counter()
         iterations = 100 if m == 1 else 50
         for _ in range(iterations):
@@ -166,7 +171,7 @@ def benchmark_strategy(
                 intermediate_dim=intermediate_dim,
                 activation="silu",
             )
-        torch.cuda.synchronize()
+        _sync(device)
         elapsed = time.perf_counter() - start
 
         results.append(
