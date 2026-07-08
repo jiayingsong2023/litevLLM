@@ -96,47 +96,6 @@ def _q8_0_raw_gate_up_activation_kernel(
     tl.store(out_ptr + row, activated)
 
 
-@triton.jit
-def _q8_0_raw_grouped_matvec_kernel(
-    raw_ptr,
-    hidden_ptr,
-    out_ptr,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCKS_PER_ROW: tl.constexpr,
-    Q8_BLOCK_BYTES: tl.constexpr,
-    ROWS_PER_GROUP: tl.constexpr,
-    COLUMNS: tl.constexpr,
-) -> None:
-    # Memory layout:
-    # - raw_ptr stores row-major GGUF Q8_0 blocks for all groups:
-    #   [group_0_rows ..., group_1_rows ..., ...].
-    # - hidden_ptr is [groups, columns], row-major per group.
-    # - out_ptr is [groups, rows_per_group].
-    # Tiling:
-    # - one Triton program computes one output row (one row inside one group).
-    # - grid is (groups * rows_per_group,).
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    total = tl.full((), 0.0, tl.float32)
-    row_offset = row * BLOCKS_PER_ROW * Q8_BLOCK_BYTES
-    group_idx = row // ROWS_PER_GROUP
-    hidden_group_offset = group_idx * COLUMNS
-    for block_idx in tl.static_range(0, BLOCKS_PER_ROW):
-        block_offset = row_offset + block_idx * Q8_BLOCK_BYTES
-        scale_lo = tl.load(raw_ptr + block_offset).to(tl.uint32)
-        scale_hi = tl.load(raw_ptr + block_offset + 1).to(tl.uint32)
-        scale_bits = ((scale_hi << 8) | scale_lo).to(tl.uint16)
-        scale = scale_bits.to(tl.float16, bitcast=True).to(tl.float32)
-        values = (
-            tl.load(raw_ptr + block_offset + 2 + offsets).to(tl.int8).to(tl.float32)
-        )
-        hidden = tl.load(
-            hidden_ptr + hidden_group_offset + block_idx * BLOCK_SIZE + offsets
-        ).to(tl.float32)
-        total += tl.sum(values * scale * hidden, axis=0)
-    tl.store(out_ptr + row, total)
-
-
 def _q8_0_raw_matvec_triton_cuda(
     raw_payload: torch.Tensor,
     hidden: torch.Tensor,
@@ -201,53 +160,6 @@ def _q8_0_raw_gate_up_activation_triton_cuda(
         BLOCK_SIZE=block_size,
         BLOCKS_PER_ROW=blocks_per_row,
         Q8_BLOCK_BYTES=q8_block_bytes,
-        num_warps=1,
-    )
-    return out
-
-
-def _q8_0_raw_grouped_matvec_triton_cuda(
-    raw_payload: torch.Tensor,
-    hidden: torch.Tensor,
-    *,
-    groups: int,
-    rows_per_group: int,
-    columns: int,
-    block_size: int,
-) -> torch.Tensor:
-    if block_size != 32:
-        raise ValueError("DeepSeek V4 raw Q8_0 kernel requires block_size=32")
-    if columns % block_size != 0:
-        raise ValueError(
-            "grouped Q8_0 columns must be divisible by block_size; "
-            f"got columns={columns}, block_size={block_size}"
-        )
-    blocks_per_row = columns // block_size
-    q8_block_bytes = 2 + block_size
-    expected_bytes = groups * rows_per_group * blocks_per_row * q8_block_bytes
-    if raw_payload.numel() != expected_bytes:
-        raise ValueError(
-            "raw grouped Q8_0 payload byte length must match "
-            "groups * rows_per_group * blocks_per_row; "
-            f"got {raw_payload.numel()} bytes, expected {expected_bytes}"
-        )
-    if hidden.shape != (groups, columns):
-        raise ValueError(
-            f"grouped Q8_0 hidden must be [groups, columns]; got {hidden.shape}"
-        )
-    total_rows = groups * rows_per_group
-    out = torch.empty(
-        (groups, rows_per_group), dtype=torch.float32, device=hidden.device
-    )
-    _q8_0_raw_grouped_matvec_kernel[(total_rows,)](
-        raw_payload.contiguous(),
-        hidden.contiguous(),
-        out,
-        BLOCK_SIZE=block_size,
-        BLOCKS_PER_ROW=blocks_per_row,
-        Q8_BLOCK_BYTES=q8_block_bytes,
-        ROWS_PER_GROUP=rows_per_group,
-        COLUMNS=columns,
         num_warps=1,
     )
     return out
@@ -337,64 +249,6 @@ def q8_0_raw_linear(
         raw_payload,
         vector.to(torch.float32),
         rows=rows,
-        columns=columns,
-        block_size=block_size,
-    )
-
-
-def q8_0_raw_grouped_linear(
-    raw_payload: torch.Tensor,
-    hidden: torch.Tensor,
-    *,
-    groups: int,
-    rows_per_group: int,
-    columns: int,
-    block_size: int = 32,
-) -> torch.Tensor:
-    """Q8_0 grouped matrix-vector product over raw GGUF block bytes.
-
-    Memory layout:
-    - raw_payload is a contiguous uint8 tensor containing row-major GGUF Q8_0
-      blocks for all groups: group_0 rows, then group_1 rows, etc.
-    - hidden is [groups, columns], one vector per group.
-    - output is [groups, rows_per_group].
-
-    Tiling:
-    - GPU path launches one Triton program per (group, row) and reduces one
-      32-value Q8_0 block per loop iteration.
-    """
-    if raw_payload.ndim != 1:
-        raise ValueError(
-            f"raw grouped Q8_0 payload must be 1-D; got {raw_payload.ndim}-D"
-        )
-    if raw_payload.dtype != torch.uint8:
-        raise ValueError(
-            f"raw grouped Q8_0 payload must be uint8; got {raw_payload.dtype}"
-        )
-    if hidden.ndim != 2:
-        raise ValueError(f"raw grouped Q8_0 hidden must be 2-D; got {hidden.ndim}-D")
-    if groups <= 0 or rows_per_group <= 0:
-        raise ValueError(
-            "raw grouped Q8_0 groups and rows_per_group must be positive; "
-            f"got groups={groups}, rows_per_group={rows_per_group}"
-        )
-    if columns <= 0 or columns % block_size != 0:
-        raise ValueError(
-            "raw grouped Q8_0 columns must be positive and divisible by block_size; "
-            f"got columns={columns}, block_size={block_size}"
-        )
-    if hidden.shape != (groups, columns):
-        raise ValueError(
-            "raw grouped Q8_0 hidden shape must be (groups, columns); "
-            f"got {hidden.shape}, expected ({groups}, {columns})"
-        )
-    if not raw_payload.is_cuda or not hidden.is_cuda:
-        raise ValueError("raw grouped Q8_0 linear inputs must be CUDA tensors")
-    return _q8_0_raw_grouped_matvec_triton_cuda(
-        raw_payload,
-        hidden.to(torch.float32),
-        groups=groups,
-        rows_per_group=rows_per_group,
         columns=columns,
         block_size=block_size,
     )

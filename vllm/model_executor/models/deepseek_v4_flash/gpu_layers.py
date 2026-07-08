@@ -18,7 +18,6 @@ from vllm.kernels.triton.deepseek_v4_flash.indexer_qat import (
 )
 from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
     q8_0_raw_gate_up_activation,
-    q8_0_raw_grouped_linear,
     q8_0_raw_linear,
 )
 
@@ -1958,19 +1957,28 @@ def _grouped_output_projection(
         and output_a.dims[0] % _Q8_0_BLOCK_SIZE == 0
     ):
         raw_payload = _stage_q8_0_raw_tensor(output_a, stager)
-        with _stager_profile_section(
-            stager,
-            "q8_attention_output_grouped",
-            tensor=output_a.name,
-        ):
-            low_rank = q8_0_raw_grouped_linear(
-                raw_payload,
-                grouped,
-                groups=output_groups,
-                rows_per_group=rank_per_group,
-                columns=group_input,
-                block_size=_Q8_0_BLOCK_SIZE,
-            )
+        row_bytes = (output_a.dims[0] // _Q8_0_BLOCK_SIZE) * _Q8_0_BLOCK_BYTES
+        low_rank_rows = []
+        for group_idx in range(output_groups):
+            row_start = group_idx * rank_per_group
+            row_end = row_start + rank_per_group
+            byte_start = row_start * row_bytes
+            byte_end = row_end * row_bytes
+            with _stager_profile_section(
+                stager,
+                "q8_attention_output_grouped",
+                tensor=output_a.name,
+            ):
+                low_rank_rows.append(
+                    q8_0_raw_linear(
+                        raw_payload[byte_start:byte_end],
+                        grouped[group_idx],
+                        rows=rank_per_group,
+                        columns=group_input,
+                        block_size=_Q8_0_BLOCK_SIZE,
+                    )
+                )
+        low_rank = torch.stack(low_rank_rows, dim=0)
     else:
         output_a_weight = stager.stage_matrix(output_a)
         a_by_group = output_a_weight.to(torch.float32).reshape(

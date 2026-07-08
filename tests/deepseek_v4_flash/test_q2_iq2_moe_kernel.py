@@ -12,6 +12,7 @@ from vllm.kernels.triton.deepseek_v4_flash.q2_iq2_moe import (
     deepseek_v4_iq2_xxs_gate_up_activation,
     deepseek_v4_iq2_xxs_matvec,
     deepseek_v4_iq2_xxs_selected_experts_activation,
+    deepseek_v4_iq2_xxs_selected_experts_activation_direct,
     deepseek_v4_q2_k_matvec,
     deepseek_v4_q2_k_selected_experts_down_projection,
 )
@@ -589,6 +590,44 @@ def test_fused_iq2_xxs_selected_experts_activation() -> None:
     )
     for i in range(num_experts):
         torch.testing.assert_close(workspace[i], expected[i], rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 5, 9])
+def test_iq2_xxs_selected_experts_activation_direct_matches_fused(
+    rows: int,
+) -> None:
+    """Direct pointer path must match the stacked-payload fused path."""
+    columns = 2048
+    num_experts = 6
+    hidden = torch.linspace(-0.5, 0.5, columns, dtype=torch.float32, device="cuda")
+    workspace_direct = torch.empty(
+        (num_experts, rows), dtype=torch.float32, device="cuda"
+    )
+    workspace_fused = torch.empty(
+        (num_experts, rows), dtype=torch.float32, device="cuda"
+    )
+    payloads: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for _ in range(num_experts):
+        gate = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        up = _iq2_xxs_deterministic_payload_blocks(rows, columns // 256)
+        payloads.append((_cuda_payload(gate), _cuda_payload(up)))
+
+    deepseek_v4_iq2_xxs_selected_experts_activation_direct(
+        hidden=hidden,
+        payloads=payloads,
+        workspace=workspace_direct,
+        rows=rows,
+        columns=columns,
+    )
+    deepseek_v4_iq2_xxs_selected_experts_activation(
+        hidden=hidden,
+        payloads=payloads,
+        workspace=workspace_fused,
+        rows=rows,
+        columns=columns,
+    )
+    torch.testing.assert_close(workspace_direct, workspace_fused, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

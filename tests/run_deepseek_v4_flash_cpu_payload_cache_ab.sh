@@ -9,10 +9,12 @@ MODEL=models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8
 # 96 GB UMA machine.
 CACHE_BYTES="${FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES:-2147483648}"
 
-# Pin the GPU staging budget to a small value so that the working set does not
-# fit in the GPU cache and repeated staging misses occur.  Without this, the
-# default UMA budget on a 96 GB machine is large enough to keep every payload
-# resident, and the CPU cache gets no hits.
+# NOTE: STAGING_BUDGET_GB=1 does NOT create true memory pressure on a 96 GB
+# UMA machine. The runtime budget logic still allows the full working set to
+# stay resident (observed staged_bytes ~18.9 GB, max_staged_bytes >> budget),
+# so this A/B cannot simulate a memory-constrained GPU. It is kept only as a
+# historical record of the CPU payload cache experiment. To evaluate CPU cache
+# value, first add a hard MAX_STAGING_BYTES cap that forces real eviction.
 STAGING_BUDGET_GB=1
 
 echo "CPU payload cache capacity: ${CACHE_BYTES} bytes"

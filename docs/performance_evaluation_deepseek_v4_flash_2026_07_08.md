@@ -22,7 +22,7 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
 
 | 场景 | 命令/配置 | 结果 |
 |---|---|---|
-| **warm-cache gate** | `KV_TYPE=fp16`, `BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, warmup=16, repeat=3 | steady-state decode **1.60 / 1.69 / 1.83 tok/s**（median **1.69 tok/s**） |
+| **warm-cache gate** | `KV_TYPE=fp16`, `BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, warmup=16, repeat=3 | 近期 median **1.625–1.885 tok/s**；P0-B 完整回滚后最新一次为 **1.710 / 1.817 / 1.821 tok/s**（median **1.817 tok/s**） |
 | **e2e benchmark** | 同上，由 `tests/e2e_full_benchmark.py --models deepseek_v4_flash_q2_gguf` 调用 | decode_tps ≈ **1.79 tok/s** |
 | **cold-start script, steady after cache warmup** | 默认 staging，`ASYNC_PREFETCH=0` | first run (true cold) **0.439 tok/s**；runs 2–3 median ≈ **1.67 tok/s**（方差大，受缓存状态影响） |
 | **async prefetch on** | `ASYNC_PREFETCH=1`，cold-start | first run **0.525 tok/s**；runs 2–3 median ≈ **1.67 tok/s**，无回归 |
@@ -161,6 +161,82 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 - hipblaslt GEMM 占 **12.5%**，是 attention 路径上另一条独立热点，与 Q8 attention projection 不重叠。
 - staging / H2D / cache 相关 kernel 在 warm 路径下几乎不可见，再次验证 staging 不是瓶颈。
 
+### 6. P0-B 后的 fresh warm ROCm profile
+
+固定 kept-path 配置，在 P0-B 代码合并后重跑 `rocprofv3`（profiler 开销使本次 steady TPS 降至约 **1.24–1.34 tok/s**，只看 kernel 占比）：
+
+```bash
+FASTINFERENCE_KV_TYPE=fp16 \
+FASTINFERENCE_BLOCK_SIZE=32 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT=1 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
+FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
+  rocprofv3 --kernel-trace --stats --summary \
+    -d /tmp/ds_warm_rocprof_after_p0b -f csv -- \
+    uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
+      --model models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+      --context-length 4096 --prompt-length 32 --max-tokens 16 --warmup-tokens 16 --repeat 3 \
+      --min-steady-decode-tps 0.0 --profile-json /tmp/ds_warm_after_p0b_profile.json
+```
+
+Top 10 kernel 对比（P0-B 前 → 后）：
+
+| Rank | Kernel | P0-B 前 Calls / Total / % | P0-B 后 Calls / Total / % |
+|---:|---|---:|---:|
+| 1 | `_iq2_xxs_selected_experts_activation_direct6_kernel` | 8,084 / 13.955 s / 24.20% | 8,084 / 14.121 s / **24.61%** |
+| 2 | `_q8_0_raw_matvec_kernel` | 106,596 / 12.197 s / 21.16% | **41,924 / 8.107 s / 14.13%** |
+| 3 | `_q2_k_selected_experts_down_projection_direct6_kernel` | 8,084 / 7.359 s / 12.76% | 8,084 / 7.448 s / 12.98% |
+| 4 | hipblaslt `Cijk_Alik_Bljk_*` GEMM | 31,396 / 7.202 s / 12.49% | 31,396 / 7.015 s / **12.23%** |
+| 5 | `_q8_0_raw_grouped_matvec_kernel` | — | **8,084 / 3.444 s / 6.00%** |
+| 6 | PyTorch div elementwise | ~701k / 1.501 s / 2.63% | 701,692 / 1.548 s / 2.70% |
+| 7 | `_q8_0_raw_gate_up_activation_kernel` | 8,084 / 1.501 s / 2.60% | 8,084 / 1.519 s / 2.65% |
+
+关键发现：
+- **`_iq2_xxs_selected_experts_activation_direct6_kernel` 仍是 top-1**，占比 24.61%，绝对耗时与 P0-B 前基本持平。
+- **`_q8_0_raw_matvec_kernel` 调用数从 106,596 降到 41,924**，占比从 21.16% 降到 14.13%；新增 `_q8_0_raw_grouped_matvec_kernel` 占 6.00%。两者合计约 20.13%，与 P0-B 前的 21.16% 基本持平，说明 P0-B 只是把 8 次 launch 合并，没有显著降低总 Q8 attention compute 时间。
+- **hipblaslt GEMM 仍是 #4**，占比 12.23%，没有超过 MoE 成为主导。
+- Python profiler 同期显示 `layer_attention`（33.0 s）> `layer_moe`（29.0 s），但 ROCm 视角下单个 `_iq2_xxs_selected_experts_activation_direct6_kernel` 仍是最大热点；`layer_attention` 的热是多个中小 kernel 叠加的结果。
+
+结论：P0-B 后的 warm path 上，**`_iq2_xxs_selected_experts_activation_direct6_kernel` 仍是唯一占比 >20% 的独立热点**，满足 P0-A sweep 的前置条件。后续 P0-B 代码已完整回滚，本节 profile 仅作为当时实验证据保留。
+
+### 7. P0-A 常量 sweep（negative result）
+
+针对 `_iq2_xxs_selected_experts_activation_direct6_kernel` 做了窄范围常量 sweep。在 `deepseek_v4_iq2_xxs_selected_experts_activation_direct()` 中通过临时 env var 覆盖 `ROWS_PER_BLOCK` 和 `num_warps`，每组跑 warm no-profiler `repeat=3`。
+
+测试配置：
+
+| Config | ROWS_PER_BLOCK | num_warps |
+|---|---|---|
+| baseline | 4 | 8 |
+| rows8 | 8 | 8 |
+| warps16 | 4 | 16 |
+
+第一轮 sweep 结果（顺序 baseline → rows8 → warps16）：
+
+| Config | steady median | agg median |
+|---|---|---|
+| baseline | 1.436 tok/s | 1.429 tok/s |
+| rows8 | 1.481 tok/s | 1.476 tok/s |
+| warps16 | 1.600 tok/s | 1.600 tok/s |
+
+第二轮反向确认（顺序 warps16 → baseline）：
+
+| Config | steady median | agg median |
+|---|---|---|
+| warps16 | 1.648 tok/s | 1.641 tok/s |
+| baseline | **1.885 tok/s** | **1.876 tok/s** |
+
+分析：
+- 第一轮 sweep 中 warps16 看似比 baseline 快 11.4%，但第二轮反向运行显示 **baseline（1.885）明显快于 warps16（1.648）**。
+- 第一轮的结果更符合 **连续运行后的 thermal/cache 漂移**（数值单调上升 1.436 → 1.481 → 1.600），而非 kernel 常量本身的收益。
+- 两次独立 run 中，baseline 本身波动很大（1.436 vs 1.885），说明在当前测试环境下，single-session 3-run median 受运行状态影响显著；常量 sweep 的信噪比不足以支撑结论。
+- **没有任何一组达到硬退出条件**（warm 3-run median >= 1.70 tok/s）。
+
+处置：
+- **回滚 sweep 代码**：移除 `q2_iq2_moe.py` 中的 env var 覆盖，恢复 `_SELECTED_IQ2_ROWS_PER_BLOCK=4` 和 `num_warps=8`。
+- 保留新增的 `test_iq2_xxs_selected_experts_activation_direct_matches_fused`，为 direct activation 路径提供正确性覆盖。
+- 在报告中记录本次 negative result，不再继续调该 kernel 常量。
+
 ---
 
 ## 关键判断
@@ -174,12 +250,12 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
    - 在 96 GB UMA 机器上，`FULL_RESIDENT=1 + PIN_HOT_EXPERTS=1 + warmup=16` 可稳定复现。
    - 回归 gate 应以此为主：warm gate 阈值 1.5；cold gate 保守防退化即可。
 
-3. **ROCm kernel profile 与 Q8 归因已完成；attention 是最大共同主题**
+3. **ROCm kernel profile 与 Q8 归因已完成；P0-B 证明 attention Q8 batching 不是当前突破口**
    - Python profiler 已证明 staging 不是 steady 上限。
-   - ROCm profiler 确认最大两个 kernel 是 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）。
-   - **Q8 归因把 `_q8_0_raw_matvec` 拆清**：`q8_projection_generic` 100% 是 attention 权重（`attn_output_b/q_b/q_a/kv`），`q8_attention_output_grouped` 100% 是 `attn_output_a`。两者合计占 Q8 raw matvec 的 **84.6%**。
-   - hipblaslt GEMM 占约 12.5%，与 Python profiler 中 `layer_attention` 占比最高一致，attention 存在 Q8 projection + hipblaslt GEMM 两条独立热点。
-   - 因此下一步不是 generic Q8 batch/merge，而是 **attention 相关的 batched Q8 matvec**。
+   - ROCm profiler（P0-B 前）确认最大两个 kernel 是 `_iq2_xxs_selected_experts_activation_direct`（24.2%）与 `_q8_0_raw_matvec`（21.2%）。
+   - **Q8 归因把 `_q8_0_raw_matvec` 拆清**：`q8_projection_generic` 100% 是 attention 权重，`q8_attention_output_grouped` 100% 是 `attn_output_a`。两者合计占 Q8 raw matvec的 **84.6%**。
+   - P0-B 针对 `q8_attention_output_grouped` 做了 batched kernel，调用数从 48k 降到 ~1.7k，但 warm median 仍停留在 **1.625 tok/s**，未产生可测量的 e2e 提升。说明 attention 路径上还有与 Q8 projection 并行的主导开销（hipblaslt GEMM、整体 `layer_attention`），单纯减少 Q8 launch count 不足以突破基线。
+   - 因此**下一步不是继续扩大 Q8 batching**，而是先重新采样 P0-B 后的 warm ROCm profile，再看热点是否已转移到 hipblaslt / `layer_attention`。
 
 ---
 
@@ -187,28 +263,29 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ### P0：先 attribution，再优化
 
-1. **P0-B：实现 batched raw Q8 grouped matvec（第一实现项，已完成集成）**
-   - 热点在 `vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py:1958` 的 `output_groups` 循环：每层对 `attn_output_a` 调用 8 次 `q8_0_raw_linear()`，再 `torch.stack()`。
-   - 方向：**新增一个 batched/grouped raw Q8 matvec Triton kernel**，一次 launch 处理所有 groups，grid 维度带 `group_idx` 与 row。目标是把每层 8 次 launch 降到 1 次，48k 调用降到 ~6k。
-   - hipblaslt 只在愿意把 Q8 权重解码为 fp16 并常驻显存时才评估；否则不要走这条路。
-   - **预期收益保守**：`q8_attention_output_grouped` 占 Q8 raw matvec 的 40.8%，Q8 raw matvec 又占总 kernel 的 21.2%，理论上限约 **8.6% 总 kernel time**；实际 steady TPS 提升可能是低个位数到中个位数。
-   - **实现与验证**：
-     - 新增 `q8_0_raw_grouped_linear()`（`vllm/kernels/triton/deepseek_v4_flash/q8_linear.py`），`_grouped_output_projection()` 已切换。
-     - 正确性测试：`tests/deepseek_v4_flash/test_triton_q8_linear.py::test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear` 通过。
-     - 集成验证：8-token warm run 中 `q8_attention_output_grouped` 调用次数从 **48,504 降到 1,677**（即每层 1 次）。
-     - **端到端 TPS 实测**：`tests/run_deepseek_v4_flash_real_smoke.sh` warm gate（repeat=3，无 profiler）结果 steady TPS 为 **1.61 / 1.61 / 1.60 tok/s**（median **1.61 tok/s**），与此前基线 **1.6–1.8 tok/s** 持平，未观察到可测量的 e2e 提升。说明 attention 内部的其他开销（如 hipblaslt GEMM、layer_attention 整体）仍是瓶颈，P0-B 的 launch-count 收益被淹没。
+1. **P0-B：batched raw Q8 grouped matvec（已完成集成，局部成功、端到端未验证）**
+   - 动机：`vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py:1958` 的 `output_groups` 循环每层对 `attn_output_a` 调用 8 次 `q8_0_raw_linear()`，再 `torch.stack()`；48k 调用中 40.8% 来自此处。
+   - 实现：新增 `q8_0_raw_grouped_linear()`，`_grouped_output_projection()` 已切换为单次 launch。
+   - 正确性：`tests/deepseek_v4_flash/test_triton_q8_linear.py::test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear` 通过。
+   - **局部结果**：`q8_attention_output_grouped` 调用次数从 **48,504 降到 1,677**（约每层 1 次）。
+   - **端到端结果**：`tests/run_deepseek_v4_flash_real_smoke.sh` warm gate（repeat=3，无 profiler）steady TPS 为 **1.599 / 1.625 / 1.655 tok/s**（median **1.625 tok/s**），与此前基线 **1.6–1.8 tok/s** 持平，**未观察到可测量的 e2e 提升**。
+   - **判定与处置**：P0-B 是 **局部成功、端到端失败的 bounded experiment**。由于它实际替换了默认的 `attn_output_a` 路径（从 8 次 `q8_0_raw_linear()` 循环改为单次 `q8_0_raw_grouped_linear()`），但又没有可测量的 TPS 收益，保留自定义 Triton kernel 只是债务。因此**已完整回滚**：
+     - `vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py` 恢复为原始的 8 次循环 + `torch.stack()`。
+     - `vllm/kernels/triton/deepseek_v4_flash/q8_linear.py` 移除 `_q8_0_raw_grouped_matvec_kernel` 与 `q8_0_raw_grouped_linear()`。
+     - `tests/deepseek_v4_flash/test_triton_q8_linear.py` 移除对应测试。
+     - 不再继续深挖同类 Q8 batching。
 
-2. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.2%）**
-   - 这是 selected expert up/gate fused activation 的 Triton kernel。
-   - 方向：sweep `BLOCK_SIZE_M/N`、`num_warps`、register pressure，验证 avg_ms 是否下降。当前 avg 1.73 ms，先以降到 1.5 ms 以下为目标。
-   - **约束**：如果 2–3 组配置都没有稳定收益，立刻停，不要继续深挖。
-   - 可与 P0-B 并行，但只选一个时优先 P0-B。
-   - 验证指标：该 kernel 的 total_ms / avg_ms 下降，warm steady TPS 提升。
+2. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.61%，negative result）**
+   - 已完成 2–3 组常量 sweep（baseline / rows8 / warps16），每组 warm no-profiler `repeat=3`。
+   - 结果：第一轮 sweep 中 warps16 看似提升 11.4%，但反向确认显示 baseline（1.885 tok/s）明显优于 warps16（1.648 tok/s），提升来自连续运行的 thermal/cache 漂移，而非 kernel 常量优化。
+   - **未达到硬退出条件**：没有任何一组 warm 3-run median >= 1.70 tok/s。
+   - **已回滚**：移除 `q2_iq2_moe.py` 中的 env var 覆盖，恢复默认 `ROWS_PER_BLOCK=4` / `num_warps=8`。
+   - 保留 `test_iq2_xxs_selected_experts_activation_direct_matches_fused` 作为 direct activation 路径的正确性覆盖。
 
 3. **P0-C：按 tensor 单独评估其他 attention Q8 projections**
    - `q8_projection_generic` 已按 tensor 拆清：53% `attn_output_b`、22% `attn_q_b`、15% `attn_q_a`、10% `attn_kv`。它们每层各调用 1 次，不是 P0-B 那种 "8 launch → 1 launch" 问题，**不默认复用 P0-B 方案**。
-   - 方向：P0-B 完成后重新采样 ROCm/Python profile，再对每个 tensor 单独判断是调 block size、融合相邻 projection，还是保持不变。
-   - 若 P0-A/P0-B 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，再考虑优化 down projection kernel。
+   - 方向：用 fresh ROCm/Python profile 重新采样 P0-B 后的 warm path，再对每个 tensor 单独判断是调 block size、融合相邻 projection，还是保持不变。
+   - 若 P0-A 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，再考虑优化 down projection kernel。
 
 为验证优化效果，固定回归命令：
 
@@ -253,10 +330,11 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ## 结论
 
-DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident），P0-B 实施后实测 median **1.61 tok/s**，与基线持平。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。
+DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident），多次 fresh verification median 在 **1.625–1.885 tok/s** 之间波动。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。
 
-- `_iq2_xxs_selected_experts_activation_direct`（24.2%）——常量 sweep，没收益立刻停。
-- `_q8_0_raw_matvec`（21.2%）中 attention Q8 projection 占 84.6%；P0-B 的 batched kernel 已把 `q8_attention_output_grouped` 调用数从 48k 降到 ~1.7k，但端到端 TPS 未提升，说明 attention 内部还有其他主导开销。
-- hipblaslt GEMM（12.5%）和整体 `layer_attention` 仍是独立瓶颈。
+- **P0-B 已完整回滚**：batched grouped Q8 matvec 把 `q8_attention_output_grouped` 调用数从 48k 降到 ~1.7k，但 warm median 仍停留在 **1.625 tok/s**，未超过基线噪声范围。由于它替换了默认的 `attn_output_a` 路径又没有可测量的 e2e 收益，保留自定义 Triton kernel 是债务，因此已恢复原始循环实现并移除相关 kernel/test。
+- **P0-A 是 negative result**：对 `_iq2_xxs_selected_experts_activation_direct6_kernel` 的常量 sweep（rows8 / warps16）未通过硬退出条件；反向确认表明首轮“收益”是连续运行的 thermal/cache 漂移。已回滚 env var 覆盖。
+- 当前 warm path 上，`_iq2_xxs_selected_experts_activation_direct6_kernel` 仍是 ROCm profile 中占比最高的单一 kernel（24.61%），但调常量无法撬动端到端 TPS。
+- hipblaslt GEMM（12.23%）和整体 `layer_attention` 是并行的独立瓶颈。
 
-下一步：**先执行 P0-A（iq2_xxs sweep），同时用 ROCm profile 重新采样 P0-B 后的 warm path，确认 hipblaslt GEMM / layer_attention 是否已成为新的 top-1**。若 P0-A 也无收益，则需把目标从 Q8 matvec 转到 hipblaslt attention GEMM 或 KV cache 压缩。
+下一步：**把目标从单 kernel 常量调参移开**。需要重新评估是继续拆解 `layer_attention` 内部（hipblaslt GEMM、Q8 attention projections、KV cache compression），还是接受 1.6–1.8 tok/s 为当前实现下的性能天花板。任何新优化都必须以 warm no-profiler 3-run median 的统计显著提升为准，并做反向顺序验证以排除 thermal 漂移。
