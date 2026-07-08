@@ -2,82 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-MODEL=models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+cat <<'EOF'
+================================================================================
+NOTE: This A/B script is kept as a historical record only.
 
-# Capacity in bytes. 2 GiB is enough to hold the working set of selected experts
-# for a 16-token cold-cache decode pass on this model while staying small on a
-# 96 GB UMA machine.
-CACHE_BYTES="${FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES:-2147483648}"
+The CPU payload cache runtime code was removed from the product branch
+because it produced zero cache hits on the 96 GB UMA test machine (the default
+GPU staging budget already held the entire working set) and added eviction
+churn without end-to-end TPS improvement.
 
-# NOTE: STAGING_BUDGET_GB=1 does NOT create true memory pressure on a 96 GB
-# UMA machine. The runtime budget logic still allows the full working set to
-# stay resident (observed staged_bytes ~18.9 GB, max_staged_bytes >> budget),
-# so this A/B cannot simulate a memory-constrained GPU. It is kept only as a
-# historical record of the CPU payload cache experiment. To evaluate CPU cache
-# value, first add a hard MAX_STAGING_BYTES cap that forces real eviction.
-STAGING_BUDGET_GB=1
+The FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES environment
+variable is no longer recognized by the runtime.
 
-echo "CPU payload cache capacity: ${CACHE_BYTES} bytes"
-echo "GPU staging budget: ${STAGING_BUDGET_GB} GB"
-
-run_variant() {
-  local variant="$1"
-  local cache_value="$2"
-  local out_json="/tmp/ds_cpu_payload_cache_ab_${variant}.json"
-
-  echo "===== DeepSeek V4 Flash CPU payload cache A/B: ${variant} (CPU_CACHE_BYTES=${cache_value}) ====="
-  FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH=0 \
-  FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB="${STAGING_BUDGET_GB}" \
-  FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES="${cache_value}" \
-    timeout 900 uv run --no-sync python tests/tools/run_deepseek_v4_flash_gpu_smoke.py \
-      --model "$MODEL" \
-      --context-length 4096 \
-      --max-tokens 16 \
-      --warmup-tokens 1 \
-      --repeat 3 \
-      --min-steady-decode-tps 0.0 \
-      --profile-json "$out_json"
-}
-
-run_variant "off" "0"
-run_variant "on" "$CACHE_BYTES"
-
-echo "===== A/B summary ====="
-uv run --no-sync python - <<'PY'
-import json, pathlib, statistics
-
-def agg(data, name):
-    return data.get("profile", {}).get("aggregate_by_name", {}).get(name, {})
-
-def fmt_ms(name, data):
-    a = agg(data, name)
-    return f"{a.get('total_ms', 0.0):.1f}({a.get('count', 0)})"
-
-for variant in ("off", "on"):
-    path = pathlib.Path(f"/tmp/ds_cpu_payload_cache_ab_{variant}.json")
-    if not path.exists():
-        print(f"{variant}: missing {path}")
-        continue
-    data = json.loads(path.read_text())
-    runs = data.get("runs", [])
-    steady = [r.get("decode_tps_steady_state", 0.0) for r in runs]
-    agg_tps = [r.get("decode_tps_agg", 0.0) for r in runs]
-    summary = data.get("profile_summary", {})
-    counters = data.get("profile", {}).get("counters", {})
-    first = steady[0] if steady else 0.0
-    steady_after = steady[1:] if len(steady) > 1 else steady
-    print(
-        f"{variant}: "
-        f"first_run(cold)_tps={first:.3f} | "
-        f"steady_after_warmup_median={statistics.median(steady_after):.3f} "
-        f"[{', '.join(f'{v:.3f}' for v in steady_after)}] | "
-        f"agg_tps_median={statistics.median(agg_tps):.3f} | "
-        f"layer_moe_ms={summary.get('phase_totals_ms', {}).get('layer_moe', 0):.1f} | "
-        f"cpu_cache_hits={counters.get('cpu_payload_cache_hits', 0)} "
-        f"misses={counters.get('cpu_payload_cache_misses', 0)} "
-        f"evictions={counters.get('cpu_payload_cache_evictions', 0)} | "
-        f"read_clone_ms={fmt_ms('raw_payload_read_clone', data)} "
-        f"h2d_ms={fmt_ms('h2d_copy_enqueue', data)} "
-        f"cache_insert_ms={fmt_ms('cache_insert', data)}"
-    )
-PY
+To reproduce the original experiment, check out the commit that introduced the
+CPU payload cache feature (see docs/performance_evaluation_deepseek_v4_flash_
+2026_07_08.md).
+================================================================================
+EOF
+exit 0

@@ -16,9 +16,6 @@ from vllm.model_executor.models.deepseek_v4_flash.config import (
 from vllm.model_executor.models.deepseek_v4_flash.decode_graph import (
     DeepSeekV4FlashDecodeGraph,
 )
-from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
-    DeepSeekV4FlashExpertPrefetchRequest,
-)
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
     GGML_TYPE_F16,
     GGML_TYPE_Q8_0,
@@ -593,7 +590,7 @@ def test_model_profile_records_layer_output_sections_and_syncs(
     assert sync_calls >= 2 * len(event_names)
 
 
-def test_forward_kernel_schedules_next_layer_prefetch_before_demand(
+def test_forward_kernel_token_hidden_does_not_prefetch_next_layer_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _fake_model()
@@ -620,14 +617,6 @@ def test_forward_kernel_schedules_next_layer_prefetch_before_demand(
             table = torch.full((2, 16), -1, dtype=torch.int32)
             table[:, 5] = torch.tensor([2, 0], dtype=torch.int32)
             return table
-
-        def prefetch_grouped_experts(
-            self,
-            tensors: DeepSeekV4FlashGroupedExpertTensors,
-            request: DeepSeekV4FlashExpertPrefetchRequest,
-        ) -> None:
-            assert tensors is model.weight_store.bindings.layers[1].grouped_experts
-            events.append(("prefetch", request.layer_idx, request.expert_ids))
 
     def fake_sliding(hidden: object, **kwargs: object) -> object:
         layer = kwargs["layer"]
@@ -666,12 +655,11 @@ def test_forward_kernel_schedules_next_layer_prefetch_before_demand(
 
     assert events == [
         ("demand", 0, None),
-        ("prefetch", 1, (0, 2)),
         ("demand", 1, None),
     ]
 
 
-def test_warm_decode_token_experts_pins_and_prefetches_hash_routed_payloads(
+def test_warm_decode_token_experts_pins_hash_routed_payloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _fake_model()
@@ -687,7 +675,6 @@ def test_warm_decode_token_experts_pins_and_prefetches_hash_routed_payloads(
         def __init__(self) -> None:
             self.store = self
             self.pinned: list[tuple[int, int]] = []
-            self.prefetches: list[tuple[int, tuple[int, ...]]] = []
 
         def tensor_to_torch(
             self,
@@ -704,14 +691,6 @@ def test_warm_decode_token_experts_pins_and_prefetches_hash_routed_payloads(
         def pin_grouped_expert(self, layer_idx: int, expert_id: int) -> None:
             self.pinned.append((layer_idx, expert_id))
 
-        def prefetch_grouped_experts(
-            self,
-            tensors: DeepSeekV4FlashGroupedExpertTensors,
-            request: DeepSeekV4FlashExpertPrefetchRequest,
-        ) -> None:
-            assert tensors is grouped_experts
-            self.prefetches.append((request.layer_idx, request.expert_ids))
-
         def memory_stats(self) -> dict[str, int | None]:
             return {"pinned_entries": len(self.pinned) * 3}
 
@@ -721,7 +700,6 @@ def test_warm_decode_token_experts_pins_and_prefetches_hash_routed_payloads(
     model.warm_decode_token_experts(torch.tensor([2, 5], dtype=torch.long))
 
     assert stager.pinned == [(1, 1), (1, 3)]
-    assert stager.prefetches == [(1, (1, 3))]
     assert stager.memory_stats()["pinned_entries"] == 6
 
 

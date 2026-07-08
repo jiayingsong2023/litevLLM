@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 import warnings
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -14,7 +13,6 @@ import torch
 from .expert_cache import (
     DeepSeekV4FlashCacheAdmissionPolicy,
     DeepSeekV4FlashCacheKey,
-    DeepSeekV4FlashExpertPrefetchRequest,
     DeepSeekV4FlashHotExpertPolicy,
 )
 from .gguf_reader import DeepSeekV4FlashTensor
@@ -98,9 +96,6 @@ class DeepSeekV4FlashGPUWeightStager:
         if max_staged_bytes is not None and max_staged_bytes < 0:
             raise ValueError("max staged bytes must be non-negative")
         self.max_staged_bytes = max_staged_bytes
-        self._prefetch_stream: torch.cuda.Stream | None = None
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            self._prefetch_stream = torch.cuda.Stream(device=self.device)
         self._full_resident_enabled = False
         self._staged_bytes = 0
         self._grouped_cache: dict[DeepSeekV4FlashCacheKey, torch.Tensor] = {}
@@ -120,23 +115,9 @@ class DeepSeekV4FlashGPUWeightStager:
             "grouped_misses": 0,
             "loaded_bytes": 0,
             "lru_evictions": 0,
-            "prefetch_failures": 0,
-            "prefetch_hits": 0,
-            "prefetch_misses": 0,
-            "prefetch_payload_hits": 0,
-            "prefetch_payload_misses": 0,
-            "prefetch_payload_streamed_bytes": 0,
             "streamed_bytes": 0,
             "batched_payload_stage_calls": 0,
-            "cpu_payload_cache_hits": 0,
-            "cpu_payload_cache_misses": 0,
-            "cpu_payload_cache_evictions": 0,
         }
-        self._cpu_payload_cache: OrderedDict[tuple[str, int], torch.Tensor] = (
-            OrderedDict()
-        )
-        self._cpu_payload_cache_bytes = 0
-        self._cpu_payload_cache_capacity = self._read_cpu_payload_cache_capacity()
 
     @property
     def full_resident_enabled(self) -> bool:
@@ -186,77 +167,6 @@ class DeepSeekV4FlashGPUWeightStager:
 
     def cache_stats(self) -> dict[str, int]:
         return dict(self._cache_stats)
-
-    @staticmethod
-    def _read_cpu_payload_cache_capacity() -> int:
-        """Return the CPU payload cache capacity in bytes (default 0 = disabled)."""
-        value = os.environ.get(
-            "FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES", "0"
-        )
-        try:
-            return max(0, int(value))
-        except ValueError:
-            warnings.warn(
-                f"Ignoring malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES "
-                f"value {value!r}; using 0",
-                stacklevel=2,
-            )
-            return 0
-
-    def _get_cpu_cached_payload(
-        self,
-        tensor: DeepSeekV4FlashTensor,
-        expert_id: int,
-    ) -> torch.Tensor | None:
-        if self._cpu_payload_cache_capacity <= 0:
-            return None
-        key = (tensor.name, expert_id)
-        payload = self._cpu_payload_cache.get(key)
-        if payload is None:
-            return None
-        self._cpu_payload_cache.move_to_end(key)
-        self._cache_stats["cpu_payload_cache_hits"] += 1
-        return payload
-
-    def _put_cpu_cached_payload(
-        self,
-        tensor: DeepSeekV4FlashTensor,
-        expert_id: int,
-        payload: torch.Tensor,
-    ) -> None:
-        if self._cpu_payload_cache_capacity <= 0:
-            return
-        nbytes = payload.numel() * payload.element_size()
-        if nbytes > self._cpu_payload_cache_capacity:
-            return
-        key = (tensor.name, expert_id)
-        if key in self._cpu_payload_cache:
-            self._cpu_payload_cache.move_to_end(key)
-            return
-        while (
-            self._cpu_payload_cache
-            and self._cpu_payload_cache_bytes + nbytes
-            > self._cpu_payload_cache_capacity
-        ):
-            _, evicted = self._cpu_payload_cache.popitem(last=False)
-            self._cpu_payload_cache_bytes -= (
-                evicted.numel() * evicted.element_size()
-            )
-            self._cache_stats["cpu_payload_cache_evictions"] += 1
-        self._cpu_payload_cache[key] = payload
-        self._cpu_payload_cache_bytes += nbytes
-        self._cache_stats["cpu_payload_cache_misses"] += 1
-
-    def _record_prefetch_delta(self, before_stats: dict[str, int]) -> None:
-        after_stats = self._cache_stats
-        grouped_hits = after_stats["grouped_hits"] - before_stats["grouped_hits"]
-        grouped_misses = after_stats["grouped_misses"] - before_stats["grouped_misses"]
-        streamed_bytes = after_stats["streamed_bytes"] - before_stats["streamed_bytes"]
-        self._cache_stats["prefetch_hits"] += grouped_hits
-        self._cache_stats["prefetch_misses"] += grouped_misses
-        self._cache_stats["prefetch_payload_hits"] += grouped_hits
-        self._cache_stats["prefetch_payload_misses"] += grouped_misses
-        self._cache_stats["prefetch_payload_streamed_bytes"] += streamed_bytes
 
     @staticmethod
     def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -733,28 +643,25 @@ class DeepSeekV4FlashGPUWeightStager:
                 payload=cached,
             )
 
-        cpu_payload = self._get_cpu_cached_payload(tensor, expert_id)
-        if cpu_payload is None:
-            with self._profile_section(
-                "raw_payload_read_clone",
-                tensor=tensor.name,
-                expert_id=expert_id,
-                layer_idx=layer_idx,
-            ):
-                raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
-                try:
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            "ignore",
-                            message="The given buffer is not writable.*",
-                            category=UserWarning,
-                        )
-                        cpu_payload = torch.frombuffer(
-                            raw.payload, dtype=torch.uint8
-                        ).clone()
-                finally:
-                    raw.payload.release()
-            self._put_cpu_cached_payload(tensor, expert_id, cpu_payload)
+        with self._profile_section(
+            "raw_payload_read_clone",
+            tensor=tensor.name,
+            expert_id=expert_id,
+            layer_idx=layer_idx,
+        ):
+            raw = self.store.raw_grouped_expert_payload(tensor, expert_id)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="The given buffer is not writable.*",
+                        category=UserWarning,
+                    )
+                    cpu_payload = torch.frombuffer(
+                        raw.payload, dtype=torch.uint8
+                    ).clone()
+            finally:
+                raw.payload.release()
         nbytes = cpu_payload.numel() * cpu_payload.element_size()
         if not should_cache or not self._prepare_cache_insert(nbytes):
             self._record_streamed_bytes(nbytes)
@@ -858,87 +765,6 @@ class DeepSeekV4FlashGPUWeightStager:
             expert_ids,
             layer_idx=layer_idx,
         )
-
-    def prefetch_grouped_experts(
-        self,
-        tensors: DeepSeekV4FlashGroupedExpertTensors,
-        request: DeepSeekV4FlashExpertPrefetchRequest,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        if stream is None:
-            self._prefetch_grouped_experts(tensors, request)
-            return
-        with torch.cuda.stream(stream):
-            self._prefetch_grouped_experts(tensors, request)
-
-    def prefetch_grouped_experts_async(
-        self,
-        tensors: DeepSeekV4FlashGroupedExpertTensors,
-        request: DeepSeekV4FlashExpertPrefetchRequest,
-    ) -> torch.cuda.Event:
-        """Prefetch on a background stream and return an event for the compute stream.
-
-        The caller must call wait_for_prefetch(event) on the compute stream before
-        consuming the staged tensors. If the background stream is unavailable, the
-        prefetch runs synchronously on the current stream and an already-completed
-        event is still returned so callers can use a uniform wait path.
-        """
-        stream = self._prefetch_stream
-        if stream is None:
-            self._prefetch_grouped_experts(tensors, request)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            return event
-        with torch.cuda.stream(stream):
-            self._prefetch_grouped_experts(tensors, request)
-        event = torch.cuda.Event()
-        event.record(stream)
-        return event
-
-    def wait_for_prefetch(
-        self,
-        event: torch.cuda.Event | None,
-    ) -> None:
-        """Make the current compute stream wait for a prefetch event."""
-        if event is not None:
-            torch.cuda.current_stream().wait_event(event)
-
-    def _prefetch_grouped_experts(
-        self,
-        tensors: DeepSeekV4FlashGroupedExpertTensors,
-        request: DeepSeekV4FlashExpertPrefetchRequest,
-    ) -> None:
-        try:
-            for expert_id in request.expert_ids:
-                before_stats = self.cache_stats()
-                try:
-                    self.stage_grouped_expert_payload(
-                        tensors.gate,
-                        expert_id,
-                        layer_idx=request.layer_idx,
-                    )
-                    self.stage_grouped_expert_payload(
-                        tensors.up,
-                        expert_id,
-                        layer_idx=request.layer_idx,
-                    )
-                    self.stage_grouped_expert_payload(
-                        tensors.down,
-                        expert_id,
-                        layer_idx=request.layer_idx,
-                    )
-                except (AttributeError, NotImplementedError):
-                    self.stage_grouped_expert(
-                        tensors,
-                        expert_id,
-                        layer_idx=request.layer_idx,
-                    )
-                finally:
-                    self._record_prefetch_delta(before_stats)
-        except Exception:
-            self._cache_stats["prefetch_failures"] += 1
-            raise
 
     def stage_grouped_expert(
         self,

@@ -25,8 +25,8 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
 | **warm-cache gate** | `KV_TYPE=fp16`, `BLOCK_SIZE=32`, `FULL_RESIDENT=1`, `PIN_HOT_EXPERTS=1`, `STAGING_BUDGET_GB=1`, warmup=16, repeat=3 | 近期 median **1.625–1.885 tok/s**；P0-B 完整回滚后最新一次为 **1.710 / 1.817 / 1.821 tok/s**（median **1.817 tok/s**） |
 | **e2e benchmark** | 同上，由 `tests/e2e_full_benchmark.py --models deepseek_v4_flash_q2_gguf` 调用 | decode_tps ≈ **1.79 tok/s** |
 | **cold-start script, steady after cache warmup** | 默认 staging，`ASYNC_PREFETCH=0` | first run (true cold) **0.439 tok/s**；runs 2–3 median ≈ **1.67 tok/s**（方差大，受缓存状态影响） |
-| **async prefetch on** | `ASYNC_PREFETCH=1`，cold-start | first run **0.525 tok/s**；runs 2–3 median ≈ **1.67 tok/s**，无回归 |
-| **CPU payload cache on** | `CPU_PAYLOAD_CACHE_BYTES=2GB`，cold-start | first run 与 steady 均无收益，`cpu_cache_hits=0` |
+| **async prefetch on** | `ASYNC_PREFETCH=1`，cold-start（历史数据） | first run **0.525 tok/s**；runs 2–3 median ≈ **1.67 tok/s**，无回归。运行时代码已移除 |
+| **CPU payload cache on** | `CPU_PAYLOAD_CACHE_BYTES=2GB`，cold-start（历史数据） | first run 与 steady 均无收益，`cpu_cache_hits=0`。运行时代码已移除 |
 
 > 说明：cold-start 的第一次运行才是真正的 cold-cache 指标；由于 UMA 机器的默认 staging budget 足够容纳整个 21.6 GB working set，第一次运行后很快就进入“准 warm”状态。因此 **cold path 不宜作为主要优化目标**，只用于防退化。
 
@@ -34,19 +34,19 @@ DeepSeek V4 Flash 在当前实现下，**warm-resident 路径稳定在 1.6–1.8
 
 ## 已完成的实验与结论
 
-### 1. Async expert prefetch
+### 1. Async expert prefetch（已移除运行时代码）
 
 - **实现**：在独立 CUDA stream 上预取下一层可静态预测的专家权重，与当前层 compute 重叠。
 - **覆盖率**：`deepseek_async_prefetch_scheduled_layers / opportunities` ≈ **4.8%**（例如 96/2016）。
 - **瓶颈**：`_likely_hash_routed_expert_ids_for_token()` 只能对带 `expert_token_to_expert_ids` 表的层做静态预测；多数 MoE 层的路由依赖 router/hidden-state 输出，无法提前预测。
-- **结论**：实现有效但上限低。保持 `ASYNC_PREFETCH=0` 默认，仅作为实验开关保留。
+- **结论**：实现有效但上限低。产品分支已**移除 async prefetch 运行时代码**和相关环境变量 `FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH`；相关 A/B 脚本仅作为历史记录保留。
 
-### 2. CPU payload cache
+### 2. CPU payload cache（已移除运行时代码）
 
 - **实现**：在 `stage_grouped_expert_payload()` 中对 `raw_grouped_expert_payload()` + `torch.frombuffer(...).clone()` 的结果做 LRU CPU 缓存。
 - **实测**：`cpu_payload_cache_hits=0`，`misses=5703`，`evictions=4793`。
 - **原因**：默认 UMA staging budget 已足够大，GPU cache 能装下整个 working set，每个 payload 只被 stage 一次，CPU 缓存没有第二次命中机会。
-- **结论**：在 96 GB 机器上无收益，反而因 churn 略慢。保持 `CPU_PAYLOAD_CACHE_BYTES=0` 默认，不再调参。
+- **结论**：在 96 GB 机器上无收益，反而因 churn 略慢。产品分支已**移除 CPU payload cache 运行时代码**和相关环境变量 `FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES`；相关 A/B 脚本仅作为历史记录保留。
 
 ### 3. Staging 耗时分解
 
@@ -241,9 +241,9 @@ Top 10 kernel 对比（P0-B 前 → 后）：
 
 ## 关键判断
 
-1. **staging 层优化已触顶**
+1. **staging 层优化已触顶；实验代码已清理**
    - warm path 已经把 staging 绕开（full resident + pinned hot experts）。
-   - cold path 的 async prefetch / CPU cache 实验上限很低。
+   - cold path 的 async prefetch / CPU cache 实验上限很低，且运行时代码已从产品分支移除。
    - 继续调 event/stream/cache 只会改善冷启动/抖动，不会突破 1.6–1.8 tok/s 的 steady 上限。
 
 2. **1.6–1.8 tok/s 是当前真实基线**
@@ -307,9 +307,7 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ### 暂不投入
 
-- 继续调 async prefetch event / stream
-- 继续扩大 CPU payload cache 容量或策略
-- 默认启用 async prefetch 或 CPU cache
+- async prefetch 与 CPU payload cache（运行时代码已移除）
 - 图/capture（已被 `CAPABILITY_MATRIX` 明确拒绝）
 
 ---
@@ -317,8 +315,8 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 ## 相关文件与 Artifact
 
 - `tests/run_deepseek_v4_flash_real_smoke.sh` — warm/cold gate
-- `tests/run_deepseek_v4_flash_async_prefetch_ab.sh` — async prefetch A/B（3-run median）
-- `tests/run_deepseek_v4_flash_cpu_payload_cache_ab.sh` — CPU payload cache A/B
+- `tests/run_deepseek_v4_flash_async_prefetch_ab.sh` — async prefetch A/B（历史记录，运行时代码已移除）
+- `tests/run_deepseek_v4_flash_cpu_payload_cache_ab.sh` — CPU payload cache A/B（历史记录，运行时代码已移除）
 - `docs/superpowers/plans/2026-07-07-deepseek-async-prefetch.md` — 实现计划与实验记录
 - `docs/performance_evaluation_gemma4_deepseek_2026_07_07.md` — 早期评估报告
 - `/tmp/ds_warm_rocprof/*/kernel_stats.csv` — ROCm warm-resident kernel profile 原始数据

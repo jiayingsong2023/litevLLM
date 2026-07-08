@@ -8,7 +8,6 @@ import torch
 
 from vllm.model_executor.models.deepseek_v4_flash.expert_cache import (
     DeepSeekV4FlashCacheAdmissionPolicy,
-    DeepSeekV4FlashExpertPrefetchRequest,
     DeepSeekV4FlashHotExpertPolicy,
 )
 from vllm.model_executor.models.deepseek_v4_flash.gguf_reader import (
@@ -201,12 +200,6 @@ def test_gpu_weight_stager_records_cache_hits_and_misses_without_gpu() -> None:
         "grouped_misses": 1,
         "loaded_bytes": 48,
         "lru_evictions": 0,
-        "prefetch_failures": 0,
-        "prefetch_hits": 0,
-        "prefetch_misses": 0,
-        "prefetch_payload_hits": 0,
-        "prefetch_payload_misses": 0,
-        "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
         "batched_payload_stage_calls": 0,
     }
@@ -649,12 +642,6 @@ def test_gpu_weight_stager_tracks_staged_bytes_once_per_cache_key() -> None:
         "loaded_bytes": 24,
         "lru_evictions": 0,
         "pinned_entries": 0,
-        "prefetch_failures": 0,
-        "prefetch_hits": 0,
-        "prefetch_misses": 0,
-        "prefetch_payload_hits": 0,
-        "prefetch_payload_misses": 0,
-        "prefetch_payload_streamed_bytes": 0,
         "streamed_bytes": 0,
         "batched_payload_stage_calls": 0,
     }
@@ -780,37 +767,6 @@ def test_gpu_weight_stager_manual_pinned_grouped_entry_survives_eviction() -> No
     assert pinned.data_ptr() == cached_pinned.data_ptr()
     assert stager.memory_stats()["pinned_entries"] == 1
     assert stager.memory_stats()["lru_evictions"] == 1
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_gpu_weight_stager_prefetch_keeps_pinned_hash_routed_payloads() -> None:
-    store = _FakeGroupedExpertStore()
-    grouped_experts = _hot_grouped_experts(6)
-    for tensor in (
-        grouped_experts.gate,
-        grouped_experts.up,
-        grouped_experts.down,
-    ):
-        for expert_id in (1, 3):
-            store.raw_payloads[(tensor.name, expert_id)] = bytes(
-                [expert_id, expert_id + 1, expert_id + 2, expert_id + 3]
-            )
-    stager = DeepSeekV4FlashGPUWeightStager(store, device="cuda")
-
-    stager.pin_grouped_expert(6, 1)
-    stager.pin_grouped_expert(6, 3)
-    stager.prefetch_grouped_experts(
-        grouped_experts,
-        DeepSeekV4FlashExpertPrefetchRequest(
-            layer_idx=6,
-            expert_ids=(1, 3),
-        ),
-    )
-
-    stats = stager.memory_stats()
-    assert stats["pinned_entries"] == 6
-    assert stats["grouped_entries"] == 6
-    assert stats["prefetch_payload_misses"] == 6
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

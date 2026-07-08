@@ -14,18 +14,6 @@ class DeepSeekV4FlashCacheKey:
 
 
 @dataclass(frozen=True)
-class DeepSeekV4FlashExpertPrefetchRequest:
-    layer_idx: int
-    expert_ids: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if self.layer_idx < 0:
-            raise ValueError("layer_idx must be non-negative")
-        if any(expert_id < 0 for expert_id in self.expert_ids):
-            raise ValueError("expert_ids must be non-negative")
-
-
-@dataclass(frozen=True)
 class DeepSeekV4FlashCacheAdmissionPolicy:
     min_reuse_score: int = 1
     stream_experts: frozenset[tuple[int, int]] = frozenset()

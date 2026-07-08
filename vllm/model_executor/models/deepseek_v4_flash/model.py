@@ -22,7 +22,6 @@ from .config import (
     DeepSeekV4FlashShape,
     layer_compress_ratio,
 )
-from .expert_cache import DeepSeekV4FlashExpertPrefetchRequest
 from .gguf_reader import (
     GGML_TYPE_F16,
     GGML_TYPE_F32,
@@ -309,140 +308,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    def _prefetch_grouped_experts_best_effort(
-        self,
-        stager: DeepSeekV4FlashGPUWeightStager,
-        layer: DeepSeekV4FlashGroupedExpertTensors,
-        expert_ids: tuple[int, ...],
-        *,
-        layer_idx: int,
-    ) -> None:
-        cache_admission_policy = getattr(stager, "cache_admission_policy", None)
-        cacheable_expert_ids = tuple(
-            expert_id
-            for expert_id in dict.fromkeys(expert_ids)
-            if cache_admission_policy is None
-            or cache_admission_policy.should_cache_grouped_expert(
-                layer_idx=layer_idx,
-                expert_id=expert_id,
-            )
-        )
-        if not cacheable_expert_ids:
-            return
-        try:
-            stager.prefetch_grouped_experts(
-                layer,
-                DeepSeekV4FlashExpertPrefetchRequest(
-                    layer_idx=layer_idx,
-                    expert_ids=cacheable_expert_ids,
-                ),
-            )
-        except Exception:
-            self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
-
-    def _likely_hash_routed_expert_ids_for_token(
-        self,
-        stager: DeepSeekV4FlashGPUWeightStager,
-        layer: Any,
-        *,
-        token_id: int | None,
-    ) -> tuple[int, ...]:
-        if token_id is None:
-            return ()
-        expert_token_table = getattr(layer, "expert_token_to_expert_ids", None)
-        if expert_token_table is None:
-            return ()
-        table = stager.store.tensor_to_torch(expert_token_table, dtype=torch.int32)
-        if table.ndim != 2:
-            raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
-        if table.is_cuda:
-            return ()
-        if token_id < 0 or token_id >= table.shape[1]:
-            raise ValueError(
-                f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
-            )
-        expert_ids = {
-            int(expert_id)
-            for expert_id in table[:, token_id].tolist()
-            if int(expert_id) >= 0
-        }
-        return tuple(sorted(expert_ids))
-
-    def _schedule_next_layer_expert_prefetch(
-        self,
-        stager: DeepSeekV4FlashGPUWeightStager,
-        next_layer: Any,
-        *,
-        token_id: int | None,
-    ) -> None:
-        grouped_experts = getattr(next_layer, "grouped_experts", None)
-        if grouped_experts is None:
-            return
-        expert_ids = self._likely_hash_routed_expert_ids_for_token(
-            stager,
-            next_layer,
-            token_id=token_id,
-        )
-        if not expert_ids:
-            return
-        self._prefetch_grouped_experts_best_effort(
-            stager,
-            grouped_experts,
-            expert_ids,
-            layer_idx=next_layer.layer_index,
-        )
-
-    def _schedule_next_layer_expert_prefetch_async(
-        self,
-        stager: DeepSeekV4FlashGPUWeightStager,
-        next_layer: Any,
-        *,
-        token_id: int | None,
-    ) -> torch.cuda.Event | None:
-        """Enqueue an async prefetch for the next layer and return its event.
-
-        Returns None if there is nothing to prefetch or prefetch fails.
-        """
-        self._deepseek_profiler.add_counter("deepseek_async_prefetch_opportunities", 1)
-        grouped_experts = getattr(next_layer, "grouped_experts", None)
-        if grouped_experts is None:
-            return None
-        expert_ids = self._likely_hash_routed_expert_ids_for_token(
-            stager,
-            next_layer,
-            token_id=token_id,
-        )
-        if not expert_ids:
-            return None
-        cache_admission_policy = getattr(stager, "cache_admission_policy", None)
-        cacheable_expert_ids = tuple(
-            expert_id
-            for expert_id in dict.fromkeys(expert_ids)
-            if cache_admission_policy is None
-            or cache_admission_policy.should_cache_grouped_expert(
-                layer_idx=next_layer.layer_index,
-                expert_id=expert_id,
-            )
-        )
-        if not cacheable_expert_ids:
-            return None
-        try:
-            event = stager.prefetch_grouped_experts_async(
-                grouped_experts,
-                DeepSeekV4FlashExpertPrefetchRequest(
-                    layer_idx=next_layer.layer_index,
-                    expert_ids=cacheable_expert_ids,
-                ),
-            )
-            if event is not None:
-                self._deepseek_profiler.add_counter(
-                    "deepseek_async_prefetch_scheduled_layers", 1
-                )
-            return event
-        except Exception:
-            self._deepseek_profiler.add_counter("deepseek_prefetch_failures", 1)
-            return None
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -698,17 +563,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         if layers is None:
             raise RuntimeError("DeepSeek V4 Flash GPU forward requires layer bindings")
         layers = list(layers)
-        async_prefetch_enabled = self._deepseek_async_prefetch_enabled()
-        pending_prefetch_event: torch.cuda.Event | None = None
         for layer_offset, layer in enumerate(layers):
-            if pending_prefetch_event is not None:
-                with self._deepseek_profiler.section(
-                    f"layer_{layer.layer_index}_prefetch_wait",
-                    layer_idx=layer.layer_index,
-                    token_idx=token_idx,
-                ):
-                    stager.wait_for_prefetch(pending_prefetch_event)
-                pending_prefetch_event = None
             if layer.layer_index < 2:
                 with self._deepseek_profiler.section(
                     f"layer_{layer.layer_index}_sliding",
@@ -744,23 +599,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         if compressed_counts_by_layer is not None
                         else None,
                     )
-            if layer_offset + 1 < len(layers):
-                next_layer = layers[layer_offset + 1]
-                if async_prefetch_enabled:
-                    pending_prefetch_event = (
-                        self._schedule_next_layer_expert_prefetch_async(
-                            stager,
-                            next_layer,
-                            token_id=token_id,
-                        )
-                    )
-                else:
-                    self._schedule_next_layer_expert_prefetch(
-                        stager,
-                        next_layer,
-                        token_id=token_id,
-                    )
-
         return store, stager, hidden
 
     def _forward_kernel_token_hidden_token_tensor(
@@ -858,13 +696,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         extra_kv_rows_by_layer=extra_kv_rows_by_layer,
                         compressed_count=compressed_count,
                     )
-            if layer_offset + 1 < len(layers):
-                self._schedule_next_layer_expert_prefetch(
-                    stager,
-                    layers[layer_offset + 1],
-                    token_id=None,
-                )
-
         return store, stager, hidden
 
     def forward_full(
@@ -1189,13 +1020,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                         token_indices=token_indices,
                         token_id_tensors=token_id_tensor,
                     )
-            if layer_offset + 1 < len(layers):
-                self._schedule_next_layer_expert_prefetch(
-                    stager,
-                    layers[layer_offset + 1],
-                    token_id=None,
-                )
-
         return store, stager, hidden
 
     def _stage_token_embedding_batch_cuda(
@@ -1943,16 +1767,6 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             == "1"
         )
 
-    @staticmethod
-    def _deepseek_async_prefetch_enabled() -> bool:
-        return (
-            os.environ.get(
-                "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH",
-                "0",
-            )
-            == "1"
-        )
-
     def pin_hot_experts_for_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -2146,6 +1960,33 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         stager = self._get_gpu_weight_stager(device)
         stager.warm_static_decode_weights(output_weight=output_head)
 
+    def _hash_routed_expert_ids_for_token(
+        self,
+        stager: DeepSeekV4FlashGPUWeightStager,
+        layer: Any,
+        *,
+        token_id: int,
+    ) -> tuple[int, ...]:
+        """Return expert ids mapped to a token for hash-routed layers."""
+        expert_token_table = getattr(layer, "expert_token_to_expert_ids", None)
+        if expert_token_table is None:
+            return ()
+        table = stager.store.tensor_to_torch(expert_token_table, dtype=torch.int32)
+        if table.ndim != 2:
+            raise ValueError(f"expert token table must be 2-D; got {table.ndim}-D")
+        if table.is_cuda:
+            return ()
+        if token_id < 0 or token_id >= table.shape[1]:
+            raise ValueError(
+                f"token_id out of range: {token_id}; expected [0, {table.shape[1]})"
+            )
+        expert_ids = {
+            int(expert_id)
+            for expert_id in table[:, token_id].tolist()
+            if int(expert_id) >= 0
+        }
+        return tuple(sorted(expert_ids))
+
     def warm_decode_token_experts(self, input_ids: torch.Tensor) -> None:
         store = self._require_weight_store()
         stager = self._get_gpu_weight_stager(input_ids.device)
@@ -2154,21 +1995,13 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             grouped_experts = getattr(layer, "grouped_experts", None)
             if grouped_experts is None:
                 continue
-            expert_ids = self._likely_hash_routed_expert_ids_for_token(
+            expert_ids = self._hash_routed_expert_ids_for_token(
                 stager,
                 layer,
                 token_id=token_id,
             )
             for expert_id in expert_ids:
                 stager.pin_grouped_expert(layer.layer_index, expert_id)
-            if expert_ids:
-                stager.prefetch_grouped_experts(
-                    grouped_experts,
-                    DeepSeekV4FlashExpertPrefetchRequest(
-                        layer_idx=layer.layer_index,
-                        expert_ids=expert_ids,
-                    ),
-                )
 
     def _stage_token_embedding_cuda(
         self,
