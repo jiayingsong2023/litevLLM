@@ -24,7 +24,7 @@
 
 | 文件 | 责任 |
 |---|---|
-| `tests/tools/gemma4_26b_profile.py` | P0：26B 专属端到端 profile 工具，产出 kernel_stats.csv + AWQ audit + section timer JSON |
+| `tests/tools/gemma4_26b_profile.py` | P0：26B 专属端到端 profile 工具，产出 kernel_stats.csv + AWQ audit log + baseline JSON；section timer 汇总从 harness stdout/artifact 人工提取 |
 | `tests/test_gemma4_26b_fastpath_audit.py` | P0：轻量 AWQ audit log 解析器单元测试（不加载模型） |
 | `benchmarks/kernels/benchmark_gemma4_moe_26b.py` | P1：26B 形状 MoE int4 decode microbench，扫策略和 tile |
 | `tests/test_gemma4_moe_26b_tile.py` | P1：验证 MoE int4 kernel 在 26B 形状下的数值正确性（对比 reference） |
@@ -35,7 +35,7 @@
 
 ## Out of Scope
 
-- **P3 speculative decoding**：不添加占位符代码。若 P0–P2 完成后 BS=1 仍不达标，再单独立项评估 n-gram / prompt-lookup draft。
+- **P3 speculative decoding**：完全不属于本计划范围。不添加任何占位符代码，不参与 P0–P2 完成判断。若 P0–P2 完成后 BS=1 仍不达标，由独立计划评估 n-gram / prompt-lookup draft。
 - **Task 4 router/top-k 优化**：暂不实施。除非 P0 profiling 证明 router 是真实热点，否则不引入每个 token 的检查。
 - **Model-side M=2/M=4 wiring**：暂不实施。仅在 `benchmark_awq_fused_gemm_batched.py` 证明 M=2/M=4 有收益后，再设计 kernel API 并连接模型。
 
@@ -49,7 +49,7 @@
 
 **Interfaces:**
 - Consumes: `subprocess.run`, `rocprofv3`, `tests/e2e_full_benchmark.py`
-- Produces: `/tmp/gemma26b_profile/kernel_stats.csv`, `/tmp/gemma26b_profile/awq_audit.log`, `/tmp/gemma26b_profile/section_timer.json`
+- Produces: `/tmp/gemma26b_profile/kernel_stats.csv`, `/tmp/gemma26b_profile/awq_audit.log`, `/tmp/gemma26b_profile/baseline.json`, `/tmp/gemma26b_profile/summary.json`; section timer 汇总从 harness stdout/artifact 人工提取
 
 - [ ] **Step 1: Write the harness script**
 
@@ -392,6 +392,7 @@ def benchmark_strategy(
     top_k: int,
     batch_sizes: list[int],
     device: torch.device,
+    check_correctness: bool = False,
 ) -> list[dict[str, float]]:
     kernel_map = {
         "two_stage": gemma4_moe_int4_decode,
@@ -435,14 +436,16 @@ def benchmark_strategy(
         if not used:
             continue
 
-        ref = _reference_moe(
-            x, topk_ids, topk_weights,
-            qweight_gu, scales_gu, qweight_d, scales_d,
-            intermediate_dim,
-        )
-        max_err = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
-        if max_err > 0.1:
-            print(f"WARN {strategy} M={m} max_err={max_err}")
+        max_err = float("nan")
+        if check_correctness:
+            ref = _reference_moe(
+                x, topk_ids, topk_weights,
+                qweight_gu, scales_gu, qweight_d, scales_d,
+                intermediate_dim,
+            )
+            max_err = (out.to(torch.float32) - ref.to(torch.float32)).abs().max().item()
+            if max_err > 0.1:
+                print(f"WARN {strategy} M={m} max_err={max_err}")
 
         torch.cuda.synchronize()
         start = time.perf_counter()
@@ -474,6 +477,7 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--batch-sizes", default="1,2,4")
+    parser.add_argument("--check-correctness", action="store_true")
     parser.add_argument("--out", default="/tmp/gemma26b_moe_microbench.csv")
     args = parser.parse_args()
 
@@ -486,6 +490,7 @@ def main() -> None:
         all_results.extend(benchmark_strategy(
             strategy, args.hidden, args.intermediate,
             args.num_experts, args.top_k, batch_sizes, device,
+            check_correctness=args.check_correctness,
         ))
 
     out_path = args.out
@@ -615,10 +620,14 @@ Expected: PASS on GPU，SKIP on CPU-only host。
 - [ ] **Step 4: Run the microbench**
 
 ```bash
+# Default: performance only (fast)
 uv run python benchmarks/kernels/benchmark_gemma4_moe_26b.py
+
+# Optional: also verify full-shape numerical correctness (slower)
+uv run python benchmarks/kernels/benchmark_gemma4_moe_26b.py --check-correctness
 ```
 
-Expected: CSV written to `/tmp/gemma26b_moe_microbench.csv` with all strategies and `max_err` column.
+Expected: CSV written to `/tmp/gemma26b_moe_microbench.csv` with all strategies. `max_err` is `nan` unless `--check-correctness` is passed.
 
 - [ ] **Step 5: Commit**
 
