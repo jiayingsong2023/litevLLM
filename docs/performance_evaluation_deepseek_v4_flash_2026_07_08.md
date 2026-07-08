@@ -196,6 +196,7 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
      - 新增 `q8_0_raw_grouped_linear()`（`vllm/kernels/triton/deepseek_v4_flash/q8_linear.py`），`_grouped_output_projection()` 已切换。
      - 正确性测试：`tests/deepseek_v4_flash/test_triton_q8_linear.py::test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear` 通过。
      - 集成验证：8-token warm run 中 `q8_attention_output_grouped` 调用次数从 **48,504 降到 1,677**（即每层 1 次）。
+     - **端到端 TPS 实测**：`tests/run_deepseek_v4_flash_real_smoke.sh` warm gate（repeat=3，无 profiler）结果 steady TPS 为 **1.61 / 1.61 / 1.60 tok/s**（median **1.61 tok/s**），与此前基线 **1.6–1.8 tok/s** 持平，未观察到可测量的 e2e 提升。说明 attention 内部的其他开销（如 hipblaslt GEMM、layer_attention 整体）仍是瓶颈，P0-B 的 launch-count 收益被淹没。
 
 2. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.2%）**
    - 这是 selected expert up/gate fused activation 的 Triton kernel。
@@ -252,10 +253,10 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ## 结论
 
-DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident）。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。优化目标已精确锁定：
+DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 tok/s**（warm-resident），P0-B 实施后实测 median **1.61 tok/s**，与基线持平。staging/cache/prefetch 层的优化潜力已耗尽；Python-level、ROCm-level 以及 Q8 raw matvec 调用归因均已完成。
 
 - `_iq2_xxs_selected_experts_activation_direct`（24.2%）——常量 sweep，没收益立刻停。
-- `_q8_0_raw_matvec`（21.2%）——其中 **84.6% 来自 attention 相关 Q8 projection**（`attn_output_a` 分组 + `attn_output_b/q_b/q_a/kv`），最明确的工程点是 `q8_attention_output_grouped` 的 batched kernel。
-- hipblaslt GEMM（12.5%）是 attention 另一条独立热点，留到 Q8 attention 优化后再评估。
+- `_q8_0_raw_matvec`（21.2%）中 attention Q8 projection 占 84.6%；P0-B 的 batched kernel 已把 `q8_attention_output_grouped` 调用数从 48k 降到 ~1.7k，但端到端 TPS 未提升，说明 attention 内部还有其他主导开销。
+- hipblaslt GEMM（12.5%）和整体 `layer_attention` 仍是独立瓶颈。
 
-下一步按 **P0-B → P0-A → P0-C** 执行。
+下一步：**先执行 P0-A（iq2_xxs sweep），同时用 ROCm profile 重新采样 P0-B 后的 warm path，确认 hipblaslt GEMM / layer_attention 是否已成为新的 top-1**。若 P0-A 也无收益，则需把目标从 Q8 matvec 转到 hipblaslt attention GEMM 或 KV cache 压缩。
