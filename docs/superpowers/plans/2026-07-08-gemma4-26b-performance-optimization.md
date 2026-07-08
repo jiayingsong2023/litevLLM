@@ -12,7 +12,7 @@
 
 - Python 3.12 only；使用 `uv run` 执行所有命令。
 - 所有新 Triton kernel 必须包含 ASCII 注释描述 memory layout 和 thread/block tiling（AGENTS.md HPC 规则）。
-- 禁止新增 `os.environ` 读取；最终 tuning 参数通过 `RuntimeConfig` / TOML `[tuning_keyvals]` 暴露。
+- Runtime 代码禁止新增 `os.environ` 读取；最终 tuning 参数通过 `RuntimeConfig` / TOML `[tuning_keyvals]` 暴露。`tests/tools/` 和 A/B 实验脚本可为 subprocess 设置环境变量。
 - 禁止引入 C++ 代码。
 - 任何 kernel 数值变更必须通过 `tests/run_regression_suite.sh` 和 `SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh`（Gemma4-26B 部分）。
 - 优先保持 M=1 路径不变；batched kernel 失败时自动 fallback 到现有路径。
@@ -212,6 +212,8 @@ git commit -m "feat(tools): add Gemma4-26B profiling harness"
 - Consumes: AWQ audit log format, regex parsing
 - Produces: Structured coverage report dictionary
 
+**Scope note:** This task provides a brittle log-parser starting point only. The authoritative fast-path coverage comes from the P0 harness artifacts (section timer + AWQ audit log produced by `tests/tools/gemma4_26b_profile.py`).
+
 - [ ] **Step 1: Write the audit parser and its unit test**
 
 Create `tests/test_gemma4_26b_fastpath_audit.py`:
@@ -283,6 +285,8 @@ def test_26b_fastpath_coverage(tmp_path: Path) -> None:
     log_text = log_path.read_text(encoding="utf-8")
     counts = _parse_awq_audit_log(log_text)
     # In default BS=1 decode, fused QKV and MoE int4 should dominate.
+    # NOTE: this parser is a starting point only; authoritative coverage is
+    # derived from the P0 harness artifacts, not from this brittle regex.
     assert counts.get("qkv_fused_decode", 0) > counts.get("qkv_separate_decode", 0)
     assert counts.get("moe_int4_decode_used", 0) > 0
 ```
@@ -549,17 +553,20 @@ def _reference_moe_single(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires GPU")
-def test_moe_int4_26b_shape_numerical() -> None:
+def test_moe_int4_numerical_small_shape() -> None:
+    # Use a small shape for fast reference comparison. The microbench script
+    # uses the real 26B shape (hidden=2816, intermediate=704); this test only
+    # verifies numerical correctness of the kernel path.
     device = torch.device("cuda")
-    hidden_dim = 2816
-    intermediate_dim = 704
-    num_experts = 128
-    top_k = 8
+    hidden_dim = 256
+    intermediate_dim = 64
+    num_experts = 16
+    top_k = 4
     m = 2
 
     torch.manual_seed(42)
     x = torch.randn(m, hidden_dim, dtype=torch.bfloat16, device=device)
-    topk_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]], device=device)
+    topk_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device=device)
     topk_weights = torch.full((m, top_k), 1.0 / top_k, dtype=torch.bfloat16, device=device)
 
     qweight_gu = torch.randint(
@@ -600,7 +607,7 @@ def test_moe_int4_26b_shape_numerical() -> None:
 - [ ] **Step 3: Run the correctness test**
 
 ```bash
-uv run pytest tests/test_gemma4_moe_26b_tile.py -v
+uv run pytest tests/test_gemma4_moe_26b_tile.py::test_moe_int4_numerical_small_shape -v
 ```
 
 Expected: PASS on GPU，SKIP on CPU-only host。
@@ -622,14 +629,16 @@ git commit -m "feat(kernels): add Gemma4-26B MoE int4 microbench + numerical cor
 
 ---
 
-## Task 4: P2 Decision Gate — Batched AWQ Microbench Before Kernel Implementation
+## Task 4: P2 Baseline Only — Measure M=1 AWQ Fast Path for Future Batched Decision Gate
 
 **Files:**
 - Create: `benchmarks/kernels/benchmark_awq_fused_gemm_batched.py`
 
 **Interfaces:**
 - Consumes: Existing `packed_int4_symmetric_fused_qkv_m1_safe` and `packed_int4_symmetric_fused_gate_up_m1_safe`
-- Produces: Decision report on whether M=2/M=4 batched AWQ is worth implementing
+- Produces: M=1 baseline throughput artifact for future M=2/M=4 comparison
+
+**Scope note:** This task only establishes the M=1 baseline. It does not implement or decide on batched kernels. A future plan will extend this microbench with M=2/M=4 variants and compare against the baseline before any model-side wiring is changed.
 
 - [ ] **Step 1: Write the microbench for M=1 baseline only**
 
@@ -764,11 +773,11 @@ uv run python benchmarks/kernels/benchmark_awq_fused_gemm_batched.py
 
 Expected: CSV written to `/tmp/gemma26b_awq_baseline_microbench.csv`.
 
-- [ ] **Step 3: Document the decision gate**
+- [ ] **Step 3: Document the baseline artifact**
 
-Append a section to the plan file (or a separate `docs/superpowers/notes/2026-07-08-gemma4-26b-p2-gate.md`) stating:
+Append a note to `docs/superpowers/notes/2026-07-08-gemma4-26b-p2-baseline.md` (create the directory if needed):
 
-> P2 proceeds to actual batched kernel implementation **only if** microbench shows M=2/M=4 batched throughput >= 80% of 2× M=1 throughput. Until then, no model-side wiring changes.
+> M=1 AWQ baseline for QKV and gate-up recorded at `/tmp/gemma26b_awq_baseline_microbench.csv`. A future batched-AWQ plan will extend this microbench with M=2/M=4 variants and proceed to kernel implementation **only if** batched throughput >= 80% of 2× M=1 throughput. No model-side wiring changes until then.
 
 - [ ] **Step 4: Commit**
 
@@ -788,7 +797,7 @@ git commit -m "feat(kernels): add M=1 AWQ baseline microbench for P2 gate"
 | P0 profiling + fixed commands + artifacts | Task 1 |
 | P0 fast-path coverage audit | Task 2 |
 | P1 MoE strategy confirmation + tile tuning | Task 3 |
-| P2 batched AWQ decision gate | Task 4 |
+| P2 batched AWQ baseline artifact | Task 4 |
 | P3 speculative viability | Out of scope |
 | Router/top-k optimization | Deferred until P0 proves hotspot |
 
