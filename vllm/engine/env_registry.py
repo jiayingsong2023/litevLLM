@@ -301,6 +301,14 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_COMPRESSED_ATTN_FALLBACK"
     ),
+    # Historical env vars from removed experiments; kept registered because
+    # docs/superpowers/ and A/B scripts still reference them as records.
+    "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH": _tool_only(
+        "FASTINFERENCE_DEEPSEEK_V4_FLASH_ASYNC_PREFETCH"
+    ),
+    "FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES": _tool_only(
+        "FASTINFERENCE_DEEPSEEK_V4_FLASH_CPU_PAYLOAD_CACHE_BYTES"
+    ),
     "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": _tool_only(
         "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT"
     ),
