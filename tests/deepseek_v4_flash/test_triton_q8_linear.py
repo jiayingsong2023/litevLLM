@@ -7,6 +7,7 @@ from vllm.kernels.triton.deepseek_v4_flash import q8_linear
 from vllm.kernels.triton.deepseek_v4_flash.q8_linear import (
     q8_0_linear,
     q8_0_raw_gate_up_activation,
+    q8_0_raw_grouped_linear,
     q8_0_raw_linear,
 )
 from vllm.model_executor.models.deepseek_v4_flash.quant import (
@@ -122,5 +123,53 @@ def test_q8_0_raw_gate_up_activation_matches_raw_linear_composition() -> None:
         min=-10.0,
         max=10.0,
     )
+
+    torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear() -> None:
+    groups = 8
+    rows_per_group = 4
+    columns = 64
+    total_rows = groups * rows_per_group
+    payload = b"".join(
+        _pack_q8_0_block(
+            0.125 * (row + block_idx + 1),
+            tuple(((row * 13 + block_idx * 7 + col) % 17) - 8 for col in range(32)),
+        )
+        for row in range(total_rows)
+        for block_idx in range(columns // 32)
+    )
+    raw = torch.tensor(tuple(payload), dtype=torch.uint8, device="cuda")
+    hidden = torch.linspace(
+        -0.5, 0.5, groups * columns, dtype=torch.float32, device="cuda"
+    ).reshape(groups, columns)
+
+    got = q8_0_raw_grouped_linear(
+        raw,
+        hidden,
+        groups=groups,
+        rows_per_group=rows_per_group,
+        columns=columns,
+    )
+
+    blocks_per_row = columns // 32
+    row_bytes = blocks_per_row * (2 + 32)
+    expected_rows = []
+    for group_idx in range(groups):
+        row_start = group_idx * rows_per_group
+        row_end = row_start + rows_per_group
+        byte_start = row_start * row_bytes
+        byte_end = row_end * row_bytes
+        expected_rows.append(
+            q8_0_raw_linear(
+                raw[byte_start:byte_end],
+                hidden[group_idx],
+                rows=rows_per_group,
+                columns=columns,
+            )
+        )
+    expected = torch.stack(expected_rows, dim=0)
 
     torch.testing.assert_close(got, expected, atol=1e-4, rtol=1e-4)

@@ -187,21 +187,27 @@ FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
 
 ### P0：先 attribution，再优化
 
-1. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.2%）**
-   - 这是 selected expert up/gate fused activation 的 Triton kernel。
-   - 方向：sweep `BLOCK_SIZE_M/N`、`num_warps`、register pressure，验证 avg_ms 是否下降。当前 avg 1.73 ms，先以降到 1.5 ms 以下为目标。
-   - **约束**：如果 2–3 组配置都没有稳定收益，立刻停，不要继续深挖。
-   - 验证指标：该 kernel 的 total_ms / avg_ms 下降，warm steady TPS 提升。
-
-2. **P0-B：实现 batched raw Q8 grouped matvec（attention output_a，40.8% Q8 raw matvec）**
+1. **P0-B：实现 batched raw Q8 grouped matvec（第一实现项，已完成集成）**
    - 热点在 `vllm/model_executor/models/deepseek_v4_flash/gpu_layers.py:1958` 的 `output_groups` 循环：每层对 `attn_output_a` 调用 8 次 `q8_0_raw_linear()`，再 `torch.stack()`。
    - 方向：**新增一个 batched/grouped raw Q8 matvec Triton kernel**，一次 launch 处理所有 groups，grid 维度带 `group_idx` 与 row。目标是把每层 8 次 launch 降到 1 次，48k 调用降到 ~6k。
    - hipblaslt 只在愿意把 Q8 权重解码为 fp16 并常驻显存时才评估；否则不要走这条路。
-   - 验证指标：`q8_attention_output_grouped` 的调用次数与 total_ms 下降，warm steady TPS 提升。
+   - **预期收益保守**：`q8_attention_output_grouped` 占 Q8 raw matvec 的 40.8%，Q8 raw matvec 又占总 kernel 的 21.2%，理论上限约 **8.6% 总 kernel time**；实际 steady TPS 提升可能是低个位数到中个位数。
+   - **实现与验证**：
+     - 新增 `q8_0_raw_grouped_linear()`（`vllm/kernels/triton/deepseek_v4_flash/q8_linear.py`），`_grouped_output_projection()` 已切换。
+     - 正确性测试：`tests/deepseek_v4_flash/test_triton_q8_linear.py::test_q8_0_raw_grouped_linear_matches_loop_of_raw_linear` 通过。
+     - 集成验证：8-token warm run 中 `q8_attention_output_grouped` 调用次数从 **48,504 降到 1,677**（即每层 1 次）。
 
-3. **P0-C：根据 P0-B 收益决定 attention Q8 projections 是否跟进**
-   - `q8_projection_generic` 已按 tensor 拆清：53% `attn_output_b`、22% `attn_q_b`、15% `attn_q_a`、10% `attn_kv`。如果 P0-B 的 batched kernel 收益明显，把同样思路扩展到这些 attention projection，进一步降低 Q8 matvec 调用次数。
-   - 若 P0-A 把 selected expert activation 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，再考虑优化 down projection kernel。
+2. **P0-A：`_iq2_xxs_selected_experts_activation_direct` 常量 sweep（24.2%）**
+   - 这是 selected expert up/gate fused activation 的 Triton kernel。
+   - 方向：sweep `BLOCK_SIZE_M/N`、`num_warps`、register pressure，验证 avg_ms 是否下降。当前 avg 1.73 ms，先以降到 1.5 ms 以下为目标。
+   - **约束**：如果 2–3 组配置都没有稳定收益，立刻停，不要继续深挖。
+   - 可与 P0-B 并行，但只选一个时优先 P0-B。
+   - 验证指标：该 kernel 的 total_ms / avg_ms 下降，warm steady TPS 提升。
+
+3. **P0-C：按 tensor 单独评估其他 attention Q8 projections**
+   - `q8_projection_generic` 已按 tensor 拆清：53% `attn_output_b`、22% `attn_q_b`、15% `attn_q_a`、10% `attn_kv`。它们每层各调用 1 次，不是 P0-B 那种 "8 launch → 1 launch" 问题，**不默认复用 P0-B 方案**。
+   - 方向：P0-B 完成后重新采样 ROCm/Python profile，再对每个 tensor 单独判断是调 block size、融合相邻 projection，还是保持不变。
+   - 若 P0-A/P0-B 优化后，`_q2_k_selected_experts_down_projection_direct`（12.8%）成为新瓶颈，再考虑优化 down projection kernel。
 
 为验证优化效果，固定回归命令：
 
@@ -252,4 +258,4 @@ DeepSeek V4 Flash 在 96 GB UMA 机器上的当前稳态性能为 **1.6–1.8 to
 - `_q8_0_raw_matvec`（21.2%）——其中 **84.6% 来自 attention 相关 Q8 projection**（`attn_output_a` 分组 + `attn_output_b/q_b/q_a/kv`），最明确的工程点是 `q8_attention_output_grouped` 的 batched kernel。
 - hipblaslt GEMM（12.5%）是 attention 另一条独立热点，留到 Q8 attention 优化后再评估。
 
-下一步按 P0-A → P0-B → P0-C 执行。
+下一步按 **P0-B → P0-A → P0-C** 执行。
