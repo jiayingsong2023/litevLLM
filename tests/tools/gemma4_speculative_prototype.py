@@ -89,14 +89,84 @@ def run_target_logits(llm, input_ids: torch.Tensor) -> torch.Tensor:
     return logits
 
 
+def _looks_like_preformatted_chat(text: str) -> bool:
+    s = text.lstrip()
+    if len(s) >= 12 and "<|im_start|>" in s[:400]:
+        return True
+    return s.startswith("<|") and "user" in s[:120].lower()
+
+
+def _apply_chat_template(tokenizer: Any, text: str) -> str:
+    """Wrap a raw user prompt in the model's chat template when one exists."""
+    if _looks_like_preformatted_chat(text):
+        return text
+    tpl = getattr(tokenizer, "chat_template", None)
+    if not tpl:
+        return text
+    try:
+        try:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+    except Exception:
+        return text
+
+
 def baseline_greedy(
     llm: LLM, prompt_text: str, max_new_tokens: int
 ) -> tuple[list[int], list[int]]:
-    """Greedy baseline run. Returns (prompt_token_ids, generated_token_ids)."""
-    sp = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
-    outputs = llm.generate([prompt_text], sp)
-    output = outputs[0]
-    return list(output.prompt_token_ids), list(output.outputs[0].token_ids)
+    """Greedy baseline run. Returns (prompt_token_ids, generated_token_ids).
+
+    Uses the engine's step loop directly (rather than ``LLM.generate``) so that
+    Gemma4's prefill-only first step, which produces no outputs, does not abort
+    the run.
+    """
+    tokenizer = getattr(llm, "tokenizer", None)
+    wrapped_prompt = _apply_chat_template(tokenizer, prompt_text)
+    sp = SamplingParams(
+        temperature=0.0, max_tokens=max_new_tokens, min_tokens=1, top_p=1.0
+    )
+
+    req_id = f"baseline_greedy_{time.time_ns()}"
+    llm.engine.add_request(req_id, wrapped_prompt, sp)
+
+    prompt_tokens: list[int] = []
+    if tokenizer is not None:
+        try:
+            prompt_tokens = tokenizer.encode(wrapped_prompt)
+        except Exception:
+            prompt_tokens = []
+    step_budget = max(64, (len(prompt_tokens) + max_new_tokens) * 4)
+
+    final_output: Any | None = None
+    step_count = 0
+    while llm.engine.active_request_count > 0 and step_count < step_budget:
+        step_count += 1
+        outs = llm.engine.step()
+        for out in outs:
+            if out.request_id != req_id:
+                continue
+            if out.finished:
+                final_output = out
+
+    if final_output is None:
+        raise RuntimeError(
+            f"baseline greedy did not finish within step_budget={step_budget}; "
+            f"active_request_count={llm.engine.active_request_count}"
+        )
+
+    return list(final_output.prompt_token_ids), list(
+        final_output.outputs[0].token_ids
+    )
 
 
 def speculative_decode(
