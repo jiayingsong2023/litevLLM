@@ -251,6 +251,33 @@ def test_speculative_decode_stops_at_eos(
     assert result["proposed_total"] == 2
 
 
+def test_speculative_decode_truncates_to_max_new_tokens(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A step that accepts all drafts plus a bonus must not exceed the budget."""
+    reference = [10, 11, 12, 13]
+    prompt = [1, 2, 3]
+    mock_llm = _make_mock_llm(reference)
+    monkeypatch.setattr(
+        proto_mod, "run_target_logits", _mock_run_target_logits(reference, len(prompt))
+    )
+
+    def draft_proposer(prefix: list[int], generated: list[int], k: int) -> list[int]:
+        start = len(generated)
+        return reference[start : start + k]
+
+    result = proto_mod.speculative_decode(
+        mock_llm,
+        draft_proposer,
+        prompt_token_ids=prompt,
+        max_new_tokens=3,
+        num_draft_tokens=3,
+    )
+
+    assert len(result["token_ids"]) == 3
+    assert result["token_ids"] == [10, 11, 12]
+
+
 def test_cli_help_exits_zero(
     proto_mod: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

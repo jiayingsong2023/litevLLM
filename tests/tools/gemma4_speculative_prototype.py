@@ -286,8 +286,12 @@ def speculative_decode(
                 stop_generation = True
                 break
 
-        if len(generated) >= max_new_tokens and not stop_generation:
+        # Always enforce the generation budget, even if an EOS was produced in
+        # the same step that crossed max_new_tokens.
+        if len(generated) > max_new_tokens:
             generated = generated[:max_new_tokens]
+
+        if len(generated) >= max_new_tokens or stop_generation:
             break
     elapsed = time.perf_counter() - start_time
 
