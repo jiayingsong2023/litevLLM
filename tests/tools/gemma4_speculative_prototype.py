@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import torch
+
 
 def propose_ngram(
     prefix_token_ids: list[int],
@@ -27,3 +29,49 @@ def propose_ngram(
                 start = i + n
                 return full[start : start + k]
     return []
+
+
+def run_target_logits(llm, input_ids: torch.Tensor) -> torch.Tensor:
+    """Return per-position target logits for greedy speculative verification.
+
+    This bypasses LLM.generate() and runs the inner model on the full sequence
+    with no KV cache.  For greedy decoding this is mathematically equivalent to
+    the engine's decode path, just slower because attention is recomputed from
+    scratch each call.
+    """
+    inner = llm.model.model
+    device = next(inner.parameters()).device
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    input_ids = input_ids.to(device)
+
+    batch_size, seq_len = input_ids.shape
+    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    kv_caches = [None] * len(inner.layers)
+    attn_metadata = {
+        "config": llm.engine.inf_config,
+        "is_prefill": True,
+        "positions_cpu": list(range(seq_len)),
+        "max_seq_len_cpu": seq_len,
+    }
+
+    with torch.inference_mode():
+        hidden = inner(
+            input_ids,
+            positions,
+            kv_caches,
+            attn_metadata,
+            lora_mapping=None,
+        )
+
+        if getattr(inner.config, "tie_word_embeddings", False):
+            logits = torch.nn.functional.linear(hidden, inner.embed_tokens.weight)
+        else:
+            logits = llm.model.lm_head(hidden, lora_mapping=None)
+
+        final_softcap = getattr(inner.config, "final_logit_softcapping", None)
+        if final_softcap is not None and float(final_softcap) > 0:
+            logits = torch.tanh(logits / float(final_softcap)) * float(final_softcap)
+
+    return logits
