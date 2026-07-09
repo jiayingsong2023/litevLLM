@@ -1,0 +1,1 @@
+M=1 AWQ baseline for QKV and gate-up recorded at `/tmp/gemma26b_awq_baseline_microbench.csv`. A future batched-AWQ plan will extend this microbench with M=2/M=4 variants and proceed to kernel implementation **only if** batched throughput >= 80% of 2× M=1 throughput. No model-side wiring changes until then.
