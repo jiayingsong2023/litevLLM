@@ -84,7 +84,7 @@ class Gemma4DecoderLayer(nn.Module):
                 runtime_config=runtime_config,
             )
         else:
-            self.mlp = Gemma4MLP(config, quant_config, prefix)
+            self.mlp = Gemma4MLP(config, quant_config, prefix, layer_idx=layer_idx)
         self._layer_config = Gemma4LayerConfig()
 
     def set_config(self, config: Gemma4LayerConfig) -> None:

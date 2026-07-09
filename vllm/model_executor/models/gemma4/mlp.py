@@ -15,28 +15,34 @@ from .policy_utils import _gemma4_kernel_policy_truthy, _gemma4_model_policy_tru
 
 
 class Gemma4MLP(nn.Module):
-    def __init__(self, config: LiteConfig, quant_config: Any, prefix: str):
+    def __init__(
+        self,
+        config: LiteConfig,
+        quant_config: Any,
+        prefix: str,
+        layer_idx: int | None = None,
+    ):
         super().__init__()
         self.hidden_act = str(
             getattr(config, "hidden_activation", getattr(config, "hidden_act", "silu"))
         ).lower()
-        self.intermediate_size = int(config.intermediate_size)
+        self.intermediate_size = int(config.effective_intermediate_size(layer_idx))
         self.gate_proj = LiteLinear(
             config.hidden_size,
-            config.intermediate_size,
+            self.intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.gate_proj",
         )
         self.up_proj = LiteLinear(
             config.hidden_size,
-            config.intermediate_size,
+            self.intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.up_proj",
         )
         self.down_proj = LiteLinear(
-            config.intermediate_size,
+            self.intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
