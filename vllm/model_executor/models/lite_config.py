@@ -14,6 +14,7 @@ class LiteConfig:
     Normalizes different attribute names from HuggingFace/GGUF/AWQ configs
     into a unified schema used by LiteDecoderLayer.
     """
+
     def __init__(self, hf_config: Any):
         self.hf_config = hf_config
         # Some HF configs set rope_parameters explicitly to null; treat as empty dict.
@@ -39,26 +40,33 @@ class LiteConfig:
         self.global_head_dim = int(getattr(hf_config, "global_head_dim", self.head_dim))
         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", 32)
         self.vocab_size = getattr(hf_config, "vocab_size", 32000)
-        
+
         # 2. Precision & Norm
-        self.rms_norm_eps = getattr(hf_config, "rms_norm_eps", 
-                            getattr(hf_config, "layer_norm_epsilon", 1e-6))
-        
+        self.rms_norm_eps = getattr(
+            hf_config, "rms_norm_eps", getattr(hf_config, "layer_norm_epsilon", 1e-6)
+        )
+
         # 3. Context & RoPE
-        self.max_position_embeddings = getattr(hf_config, "max_position_embeddings", 
-                                       getattr(hf_config, "max_model_len", 2048))
-        
+        self.max_position_embeddings = getattr(
+            hf_config,
+            "max_position_embeddings",
+            getattr(hf_config, "max_model_len", 2048),
+        )
+
         # Qwen3.5 / Llama3 often hide rope_theta inside rope_parameters dict
-        self.rope_theta = float(getattr(hf_config, "rope_theta", 
-                                 self.rope_parameters.get("rope_theta", 10000.0)))
-        
+        self.rope_theta = float(
+            getattr(
+                hf_config, "rope_theta", self.rope_parameters.get("rope_theta", 10000.0)
+            )
+        )
+
         # Qwen3.5 partial rotary
         self.partial_rotary_factor = getattr(
             hf_config,
             "partial_rotary_factor",
             self.rope_parameters.get("partial_rotary_factor", 1.0),
         )
-        
+
         # 4. Multi-modal / Specialized (DeepSeek/MLA)
         self.q_lora_rank = getattr(hf_config, "q_lora_rank", None)
         self.kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
@@ -127,6 +135,21 @@ class LiteConfig:
             getattr(hf_config, "tie_word_embeddings", False)
         )
 
+        # Gemma4 E2B/E4B small-variant features
+        self.use_double_wide_mlp = bool(
+            getattr(hf_config, "use_double_wide_mlp", False)
+        )
+        self.num_kv_shared_layers = int(
+            getattr(hf_config, "num_kv_shared_layers", 0) or 0
+        )
+        self.hidden_size_per_layer_input = int(
+            getattr(hf_config, "hidden_size_per_layer_input", 0) or 0
+        )
+        self.vocab_size_per_layer_input = int(
+            getattr(hf_config, "vocab_size_per_layer_input", self.vocab_size)
+            or self.vocab_size
+        )
+
         # Gemma4 vision config fields.
         self.patch_size = int(getattr(hf_config, "patch_size", 16) or 16)
         self.pooling_kernel_size = int(
@@ -135,6 +158,23 @@ class LiteConfig:
         self.position_embedding_size = int(
             getattr(hf_config, "position_embedding_size", 10240) or 10240
         )
+
+    def ple_enabled(self) -> bool:
+        return int(self.hidden_size_per_layer_input or 0) > 0
+
+    def is_kv_shared_layer(self, layer_idx: int) -> bool:
+        n_shared = int(self.num_kv_shared_layers or 0)
+        if n_shared <= 0:
+            return False
+        first_shared = int(self.num_hidden_layers) - n_shared
+        return int(layer_idx) >= first_shared > 0
+
+    def effective_intermediate_size(self, layer_idx: int | None) -> int:
+        if layer_idx is None:
+            return int(self.intermediate_size)
+        if self.use_double_wide_mlp and self.is_kv_shared_layer(layer_idx):
+            return int(self.intermediate_size) * 2
+        return int(self.intermediate_size)
 
     @classmethod
     def from_model_config(cls, model_config: Any) -> "LiteConfig":
