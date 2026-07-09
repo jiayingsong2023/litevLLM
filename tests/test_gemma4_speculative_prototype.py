@@ -345,6 +345,8 @@ def test_cli_writes_json(
     assert data["bit_exact"] is True
     assert "acceptance_rate" in data
     assert "projected_tps" in data
+    assert "effective_tps" in data
+    assert data["draft_model"] is None
 
 
 def test_cli_returns_error_on_mismatch(
@@ -434,6 +436,67 @@ def test_cli_allows_mismatch_when_fail_flag_disabled(
             "2",
             "--fail-on-mismatch",
             "false",
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 0
+
+
+def test_cli_with_draft_model_computes_effective_tps(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target_dir = tmp_path / "fake-target"
+    draft_dir = tmp_path / "fake-draft"
+    target_dir.mkdir()
+    draft_dir.mkdir()
+
+    def _mock_baseline(*args, **kwargs):
+        return [1, 2, 3], [10, 11]
+
+    def _mock_speculate(*args, **kwargs):
+        return {
+            "token_ids": [10, 11],
+            "baseline_token_ids": [],
+            "bit_exact": True,
+            "accepted_total": 1,
+            "proposed_total": 2,
+            "acceptance_rate": 0.5,
+            "target_forwards": 1,
+            "verify_time_s": 0.1,
+            "baseline_tps": 10.0,
+            "speculative_tps": 5.0,
+            "projected_tps": 15.0,
+        }
+
+    monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
+    monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+    monkeypatch.setattr(
+        proto_mod, "generate_draft_tokens", lambda *args, **kwargs: [20, 21]
+    )
+    fake_tokenizer = SimpleNamespace(
+        decode=lambda ids, skip_special_tokens=False: "decoded text"
+    )
+    monkeypatch.setattr(
+        proto_mod,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(
+            shutdown=lambda: None, tokenizer=fake_tokenizer
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(target_dir),
+            "--draft-model",
+            str(draft_dir),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
         ],
     )
 

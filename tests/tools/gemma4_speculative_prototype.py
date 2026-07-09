@@ -214,6 +214,44 @@ def baseline_greedy(
     return list(final_output.prompt_token_ids), list(final_output.outputs[0].token_ids)
 
 
+def generate_draft_tokens(draft_llm: LLM, prompt_text: str, k: int) -> list[int]:
+    """Greedy-decode up to k tokens from the draft model.
+
+    Uses the engine step loop directly so that Gemma4's prefill-only first step
+    does not abort the run.
+    """
+    sp = SamplingParams(temperature=0.0, max_tokens=k)
+    req_id = f"draft_generate_{time.time_ns()}"
+    draft_llm.engine.add_request(req_id, prompt_text, sp)
+
+    final_output: Any | None = None
+    step_count = 0
+    step_budget = max(64, k * 4)
+    try:
+        while draft_llm.engine.active_request_count > 0 and step_count < step_budget:
+            step_count += 1
+            outs = draft_llm.engine.step()
+            for out in outs:
+                if out.request_id != req_id:
+                    continue
+                if out.finished or (
+                    final_output is None and len(out.outputs[0].token_ids) >= k
+                ):
+                    final_output = out
+
+        if final_output is None:
+            raise RuntimeError(
+                f"draft generation did not finish within step_budget={step_budget}; "
+                f"active_request_count={draft_llm.engine.active_request_count}"
+            )
+    finally:
+        if final_output is None:
+            with suppress(Exception):
+                draft_llm.engine.abort_request(req_id)
+
+    return list(final_output.outputs[0].token_ids)[:k]
+
+
 def speculative_decode(
     llm: LLM,
     draft_proposer: Callable[[list[int], list[int], int], list[int]],
@@ -237,6 +275,7 @@ def speculative_decode(
     accepted_total = 0
     proposed_total = 0
     target_forwards = 0
+    verify_time_s = 0.0
 
     start_time = time.perf_counter()
     stop_generation = False
@@ -246,7 +285,9 @@ def speculative_decode(
         remaining = max_new_tokens - len(generated)
         proposed = draft_proposer(prefix, generated, min(num_draft_tokens, remaining))
         full_input = current + proposed
+        verify_start = time.perf_counter()
         logits = run_target_logits(llm, torch.tensor([full_input], dtype=torch.long))
+        verify_time_s += time.perf_counter() - verify_start
 
         accept_start = len(current)
         accepted: list[int] = []
@@ -300,6 +341,7 @@ def speculative_decode(
         "proposed_total": proposed_total,
         "acceptance_rate": acceptance_rate,
         "target_forwards": target_forwards,
+        "verify_time_s": verify_time_s,
         "baseline_tps": 0.0,  # filled by CLI caller
         "speculative_tps": speculative_tps,
         "projected_tps": 0.0,  # filled by CLI caller
@@ -315,6 +357,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Offline n-gram speculative decoding prototype for Gemma4.",
     )
     parser.add_argument("--target-model", default=_default_model_path())
+    parser.add_argument(
+        "--draft-model",
+        default=None,
+        help="Optional draft model path. If set, use a small LLM instead of n-grams.",
+    )
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--prompt-file", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -364,10 +411,42 @@ def main(argv: list[str] | None = None) -> int:
         )
         baseline_elapsed = time.perf_counter() - baseline_start
 
-        def draft_proposer(
-            prefix: list[int], generated: list[int], k: int
-        ) -> list[int]:
-            return propose_ngram(prefix, generated, k, args.ngram_min, args.ngram_max)
+        draft_llm: LLM | None = None
+        draft_total_time_s = 0.0
+        if args.draft_model:
+            if not os.path.isdir(args.draft_model):
+                print(
+                    f"[ERROR] draft model directory not found: {args.draft_model}",
+                    file=sys.stderr,
+                )
+                return 2
+            draft_llm = LLM(
+                model=args.draft_model,
+                max_model_len=args.max_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_num_batched_tokens=1024,
+            )
+            tokenizer = target_llm.tokenizer
+
+            def draft_proposer(
+                prefix: list[int], generated: list[int], k: int
+            ) -> list[int]:
+                nonlocal draft_total_time_s
+                context_text = tokenizer.decode(
+                    prefix + generated, skip_special_tokens=True
+                )
+                start = time.perf_counter()
+                tokens = generate_draft_tokens(draft_llm, context_text, k)
+                draft_total_time_s += time.perf_counter() - start
+                return tokens
+        else:
+
+            def draft_proposer(
+                prefix: list[int], generated: list[int], k: int
+            ) -> list[int]:
+                return propose_ngram(
+                    prefix, generated, k, args.ngram_min, args.ngram_max
+                )
 
         spec_result = speculative_decode(
             target_llm,
@@ -391,9 +470,21 @@ def main(argv: list[str] | None = None) -> int:
             theoretical_speedup = 1.0
         spec_result["projected_tps"] = baseline_tps * theoretical_speedup
 
+        if args.draft_model:
+            total_decode_tokens = spec_result["accepted_total"] + target_forwards
+            total_decode_time = draft_total_time_s + spec_result["verify_time_s"]
+            effective_tps = (
+                total_decode_tokens / total_decode_time
+                if total_decode_time > 0
+                else 0.0
+            )
+        else:
+            effective_tps = 0.0
+
         output = {
             "prompt_text": prompt_text,
             "target_model": target_model_path,
+            "draft_model": args.draft_model,
             "num_draft_tokens": args.num_draft_tokens,
             "ngram_min": args.ngram_min,
             "ngram_max": args.ngram_max,
@@ -406,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             "baseline_tps": spec_result["baseline_tps"],
             "speculative_tps": spec_result["speculative_tps"],
             "projected_tps": spec_result["projected_tps"],
+            "effective_tps": effective_tps,
         }
 
         print(json.dumps(output, indent=2, sort_keys=True))
@@ -421,6 +513,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         target_llm.shutdown()
+        if draft_llm is not None:
+            draft_llm.shutdown()
 
 
 if __name__ == "__main__":
