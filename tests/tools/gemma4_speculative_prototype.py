@@ -93,10 +93,11 @@ def run_target_logits(llm, input_ids: torch.Tensor) -> torch.Tensor:
 def _get_eos_token_ids(llm: LLM) -> set[int]:
     """Return the set of EOS token IDs used by the model.
 
-    Tries the tokenizer first, then falls back to the HF model config (e.g.
-    Gemma4 exposes extra turn/EOS ids in ``generation_config.json`` that the
-    tokenizer does not surface).  If neither source is available, returns an
-    empty set so generation is only bounded by ``max_new_tokens``.
+    Loads ``generation_config.json`` from the model directory (when available)
+    and merges any ``eos_token_id`` it declares into the EOS set. Also checks
+    the tokenizer and the HF model config for backwards compatibility.
+    If loading fails or no source is available, returns an empty set so
+    generation is only bounded by ``max_new_tokens``.
     """
     eos_ids: set[int] = set()
 
@@ -115,16 +116,24 @@ def _get_eos_token_ids(llm: LLM) -> set[int]:
 
     # The engine's greedy baseline also honors eos_token_id from the HF config.
     engine = getattr(llm, "engine", None)
-    model_config = (
-        getattr(engine, "model_config", None) if engine is not None else None
-    )
+    model_config = getattr(engine, "model_config", None) if engine is not None else None
     hf_config = (
-        getattr(model_config, "hf_config", None)
-        if model_config is not None
-        else None
+        getattr(model_config, "hf_config", None) if model_config is not None else None
     )
     if hf_config is not None:
         _add(getattr(hf_config, "eos_token_id", None))
+
+    # generation_config.json may declare extra EOS ids not surfaced elsewhere.
+    model_path = getattr(llm, "model_path", None)
+    if model_path is not None:
+        try:
+            gen_cfg_path = Path(model_path) / "generation_config.json"
+            if gen_cfg_path.is_file():
+                with gen_cfg_path.open("r", encoding="utf-8") as f:
+                    gen_cfg = json.load(f)
+                _add(gen_cfg.get("eos_token_id", None))
+        except Exception:
+            pass
 
     return eos_ids
 
@@ -189,24 +198,27 @@ def baseline_greedy(
 
     final_output: Any | None = None
     step_count = 0
-    while llm.engine.active_request_count > 0 and step_count < step_budget:
-        step_count += 1
-        outs = llm.engine.step()
-        for out in outs:
-            if out.request_id != req_id:
-                continue
-            if out.finished:
-                final_output = out
+    try:
+        while llm.engine.active_request_count > 0 and step_count < step_budget:
+            step_count += 1
+            outs = llm.engine.step()
+            for out in outs:
+                if out.request_id != req_id:
+                    continue
+                if out.finished:
+                    final_output = out
 
-    if final_output is None:
-        raise RuntimeError(
-            f"baseline greedy did not finish within step_budget={step_budget}; "
-            f"active_request_count={llm.engine.active_request_count}"
-        )
+        if final_output is None:
+            raise RuntimeError(
+                f"baseline greedy did not finish within step_budget={step_budget}; "
+                f"active_request_count={llm.engine.active_request_count}"
+            )
+    finally:
+        if final_output is None:
+            with suppress(Exception):
+                llm.engine.abort_request(req_id)
 
-    return list(final_output.prompt_token_ids), list(
-        final_output.outputs[0].token_ids
-    )
+    return list(final_output.prompt_token_ids), list(final_output.outputs[0].token_ids)
 
 
 def speculative_decode(
