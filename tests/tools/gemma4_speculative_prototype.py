@@ -153,10 +153,6 @@ def speculative_decode(
         )
         proposed_total += len(proposed)
 
-        if rejected:
-            # The recovered token was already appended as the last accepted token.
-            pass
-
         if len(generated) >= max_new_tokens:
             generated = generated[:max_new_tokens]
             break
