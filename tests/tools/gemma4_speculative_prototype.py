@@ -91,13 +91,18 @@ def run_target_logits(llm, input_ids: torch.Tensor) -> torch.Tensor:
 
 
 def _get_eos_token_ids(llm: LLM) -> set[int]:
-    """Return the set of EOS token IDs used by the model.
+    """Return the EOS token IDs used by the engine baseline.
 
-    Loads ``generation_config.json`` from the model directory (when available)
-    and merges any ``eos_token_id`` it declares into the EOS set. Also checks
-    the tokenizer and the HF model config for backwards compatibility.
-    If loading fails or no source is available, returns an empty set so
-    generation is only bounded by ``max_new_tokens``.
+    Uses exactly the same sources the engine's greedy baseline uses:
+    ``llm.tokenizer.eos_token_id`` and
+    ``llm.engine.model_config.hf_config.eos_token_id``.
+    ``generation_config.json`` is intentionally *not* loaded, because it can
+    declare extra EOS ids (e.g. Gemma4 26B's ``<|tool_response|>``) that are not
+    part of the engine baseline's EOS set and would cause the speculative path
+    to stop early, breaking ``bit_exact``.
+
+    If neither source is available, returns an empty set so generation is only
+    bounded by ``max_new_tokens``.
     """
     eos_ids: set[int] = set()
 
@@ -114,7 +119,7 @@ def _get_eos_token_ids(llm: LLM) -> set[int]:
     if tokenizer is not None:
         _add(getattr(tokenizer, "eos_token_id", None))
 
-    # The engine's greedy baseline also honors eos_token_id from the HF config.
+    # The engine's greedy baseline honors eos_token_id from the HF config.
     engine = getattr(llm, "engine", None)
     model_config = getattr(engine, "model_config", None) if engine is not None else None
     hf_config = (
@@ -122,18 +127,6 @@ def _get_eos_token_ids(llm: LLM) -> set[int]:
     )
     if hf_config is not None:
         _add(getattr(hf_config, "eos_token_id", None))
-
-    # generation_config.json may declare extra EOS ids not surfaced elsewhere.
-    model_path = getattr(llm, "model_path", None)
-    if model_path is not None:
-        try:
-            gen_cfg_path = Path(model_path) / "generation_config.json"
-            if gen_cfg_path.is_file():
-                with gen_cfg_path.open("r", encoding="utf-8") as f:
-                    gen_cfg = json.load(f)
-                _add(gen_cfg.get("eos_token_id", None))
-        except Exception:
-            pass
 
     return eos_ids
 
