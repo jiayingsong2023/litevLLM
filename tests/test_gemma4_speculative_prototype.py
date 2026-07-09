@@ -345,3 +345,97 @@ def test_cli_writes_json(
     assert data["bit_exact"] is True
     assert "acceptance_rate" in data
     assert "projected_tps" in data
+
+
+def test_cli_returns_error_on_mismatch(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+
+    def _mock_baseline(*args, **kwargs):
+        return [1, 2, 3], [10, 11]
+
+    def _mock_speculate(*args, **kwargs):
+        return {
+            "token_ids": [99, 100],
+            "baseline_token_ids": [],
+            "bit_exact": False,
+            "accepted_total": 0,
+            "proposed_total": 2,
+            "acceptance_rate": 0.0,
+            "target_forwards": 1,
+            "baseline_tps": 0.0,
+            "speculative_tps": 0.0,
+            "projected_tps": 0.0,
+        }
+
+    monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
+    monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+    monkeypatch.setattr(
+        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(model_dir),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 1
+
+
+def test_cli_allows_mismatch_when_fail_flag_disabled(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+
+    def _mock_baseline(*args, **kwargs):
+        return [1, 2, 3], [10, 11]
+
+    def _mock_speculate(*args, **kwargs):
+        return {
+            "token_ids": [99, 100],
+            "baseline_token_ids": [],
+            "bit_exact": False,
+            "accepted_total": 0,
+            "proposed_total": 2,
+            "acceptance_rate": 0.0,
+            "target_forwards": 1,
+            "baseline_tps": 0.0,
+            "speculative_tps": 0.0,
+            "projected_tps": 0.0,
+        }
+
+    monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
+    monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+    monkeypatch.setattr(
+        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(model_dir),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
+            "--fail-on-mismatch",
+            "false",
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 0

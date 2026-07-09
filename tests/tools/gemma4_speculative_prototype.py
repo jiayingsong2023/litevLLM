@@ -243,7 +243,8 @@ def speculative_decode(
     while len(generated) < max_new_tokens and not stop_generation:
         target_forwards += 1
         current = prefix + generated
-        proposed = draft_proposer(prefix, generated, num_draft_tokens)
+        remaining = max_new_tokens - len(generated)
+        proposed = draft_proposer(prefix, generated, min(num_draft_tokens, remaining))
         full_input = current + proposed
         logits = run_target_logits(llm, torch.tensor([full_input], dtype=torch.long))
 
@@ -259,8 +260,8 @@ def speculative_decode(
                 rejected = True
                 break
 
-        if proposed and not rejected:
-            # All drafts accepted: take one bonus target token.
+        if proposed and not rejected and len(proposed) < remaining:
+            # All drafts accepted and budget remains: take one bonus target token.
             bonus_pos = accept_start + len(proposed) - 1
             accepted.append(int(torch.argmax(logits[0, bonus_pos]).item()))
         elif not accepted:
@@ -323,6 +324,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--json-out", default=None)
+    parser.add_argument(
+        "--fail-on-mismatch",
+        type=lambda x: x.lower() in ("1", "true", "yes"),
+        default=True,
+        help="Exit with code 1 when bit_exact is false (default: true).",
+    )
     return parser
 
 
@@ -350,63 +357,70 @@ def main(argv: list[str] | None = None) -> int:
         max_num_batched_tokens=1024,
     )
 
-    baseline_start = time.perf_counter()
-    prompt_token_ids, baseline_token_ids = baseline_greedy(
-        target_llm, prompt_text, args.max_new_tokens
-    )
-    baseline_elapsed = time.perf_counter() - baseline_start
+    try:
+        baseline_start = time.perf_counter()
+        prompt_token_ids, baseline_token_ids = baseline_greedy(
+            target_llm, prompt_text, args.max_new_tokens
+        )
+        baseline_elapsed = time.perf_counter() - baseline_start
 
-    def draft_proposer(prefix: list[int], generated: list[int], k: int) -> list[int]:
-        return propose_ngram(prefix, generated, k, args.ngram_min, args.ngram_max)
+        def draft_proposer(
+            prefix: list[int], generated: list[int], k: int
+        ) -> list[int]:
+            return propose_ngram(prefix, generated, k, args.ngram_min, args.ngram_max)
 
-    spec_result = speculative_decode(
-        target_llm,
-        draft_proposer,
-        prompt_token_ids,
-        max_new_tokens=args.max_new_tokens,
-        num_draft_tokens=args.num_draft_tokens,
-    )
-
-    baseline_tps = (
-        len(baseline_token_ids) / baseline_elapsed if baseline_elapsed > 0 else 0.0
-    )
-    spec_result["baseline_token_ids"] = baseline_token_ids
-    spec_result["bit_exact"] = spec_result["token_ids"] == baseline_token_ids
-    spec_result["baseline_tps"] = baseline_tps
-
-    target_forwards = spec_result["target_forwards"]
-    if target_forwards > 0:
-        theoretical_speedup = 1.0 + spec_result["accepted_total"] / target_forwards
-    else:
-        theoretical_speedup = 1.0
-    spec_result["projected_tps"] = baseline_tps * theoretical_speedup
-
-    output = {
-        "prompt_text": prompt_text,
-        "target_model": target_model_path,
-        "num_draft_tokens": args.num_draft_tokens,
-        "ngram_min": args.ngram_min,
-        "ngram_max": args.ngram_max,
-        "baseline_tokens": baseline_token_ids,
-        "speculative_tokens": spec_result["token_ids"],
-        "bit_exact": spec_result["bit_exact"],
-        "accepted_total": spec_result["accepted_total"],
-        "proposed_total": spec_result["proposed_total"],
-        "acceptance_rate": spec_result["acceptance_rate"],
-        "baseline_tps": spec_result["baseline_tps"],
-        "speculative_tps": spec_result["speculative_tps"],
-        "projected_tps": spec_result["projected_tps"],
-    }
-
-    print(json.dumps(output, indent=2, sort_keys=True))
-
-    if args.json_out:
-        Path(args.json_out).write_text(
-            json.dumps(output, indent=2, sort_keys=True) + "\n"
+        spec_result = speculative_decode(
+            target_llm,
+            draft_proposer,
+            prompt_token_ids,
+            max_new_tokens=args.max_new_tokens,
+            num_draft_tokens=args.num_draft_tokens,
         )
 
-    target_llm.shutdown()
-    return 0
+        baseline_tps = (
+            len(baseline_token_ids) / baseline_elapsed if baseline_elapsed > 0 else 0.0
+        )
+        spec_result["baseline_token_ids"] = baseline_token_ids
+        spec_result["bit_exact"] = spec_result["token_ids"] == baseline_token_ids
+        spec_result["baseline_tps"] = baseline_tps
+
+        target_forwards = spec_result["target_forwards"]
+        if target_forwards > 0:
+            theoretical_speedup = 1.0 + spec_result["accepted_total"] / target_forwards
+        else:
+            theoretical_speedup = 1.0
+        spec_result["projected_tps"] = baseline_tps * theoretical_speedup
+
+        output = {
+            "prompt_text": prompt_text,
+            "target_model": target_model_path,
+            "num_draft_tokens": args.num_draft_tokens,
+            "ngram_min": args.ngram_min,
+            "ngram_max": args.ngram_max,
+            "baseline_tokens": baseline_token_ids,
+            "speculative_tokens": spec_result["token_ids"],
+            "bit_exact": spec_result["bit_exact"],
+            "accepted_total": spec_result["accepted_total"],
+            "proposed_total": spec_result["proposed_total"],
+            "acceptance_rate": spec_result["acceptance_rate"],
+            "baseline_tps": spec_result["baseline_tps"],
+            "speculative_tps": spec_result["speculative_tps"],
+            "projected_tps": spec_result["projected_tps"],
+        }
+
+        print(json.dumps(output, indent=2, sort_keys=True))
+
+        if args.json_out:
+            Path(args.json_out).write_text(
+                json.dumps(output, indent=2, sort_keys=True) + "\n"
+            )
+
+        if args.fail_on_mismatch and not spec_result["bit_exact"]:
+            print("[ERROR] speculative output does not match baseline", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        target_llm.shutdown()
 
 
 if __name__ == "__main__":
