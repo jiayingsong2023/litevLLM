@@ -91,15 +91,15 @@ def test_propose_ngram_finds_repeated_suffix(proto_mod: Any) -> None:
     prefix = [1, 2, 3, 4, 5]
     generated = [2, 3]
     # The suffix [2, 3] appeared earlier starting at index 1 in [1,2,3,4,5,2,3].
-    # The 3 tokens after that earlier occurrence are [3, 4, 5].
-    assert proto_mod.propose_ngram(prefix, generated, k=3, ngram_min=2, ngram_max=4) == [3, 4, 5]
+    # The 3 tokens after that earlier occurrence are [4, 5, 2].
+    assert proto_mod.propose_ngram(prefix, generated, k=3, ngram_min=2, ngram_max=4) == [4, 5, 2]
 
 
 def test_propose_ngram_prefers_longer_needle(proto_mod: Any) -> None:
     prefix = [10, 20, 30, 40]
     generated = [10, 20, 30]
-    # n=3 needle [10,20,30] matches at index 0; return [40].
-    assert proto_mod.propose_ngram(prefix, generated, k=2, ngram_min=2, ngram_max=3) == [40]
+    # n=3 needle [10,20,30] matches at index 0; return [40, 10].
+    assert proto_mod.propose_ngram(prefix, generated, k=2, ngram_min=2, ngram_max=3) == [40, 10]
 
 
 def test_propose_ngram_returns_empty_when_no_match(proto_mod: Any) -> None:

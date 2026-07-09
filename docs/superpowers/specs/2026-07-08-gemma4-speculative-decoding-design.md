@@ -201,7 +201,7 @@ P0/P1 use CLI arguments only; no public API changes.
 
 | Phase | Test | Pass Criteria |
 |---|---|---|
-| P0 | `tests/tools/gemma4_speculative_prototype.py --method ngram` | `bit_exact == true` for `temperature=0`; acceptance rate reported. |
+| P0 | `tests/tools/gemma4_speculative_prototype.py` | `bit_exact == true` for `temperature=0`; acceptance rate reported. |
 | P0 | Run on repetitive and non-repetitive prompts | Tool does not crash; results are recorded. |
 | P1 | `--draft-model models/gemma-4-E2B-it` | Effective TPS ≥ baseline * 1.2 on representative prompts. |
 | P1 | `--draft-model models/gemma-4-E4B-it` | Compared against E2B; best model chosen. |
