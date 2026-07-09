@@ -20,7 +20,7 @@ from typing import Any
 from vllm.model_executor.model_loader import get_tokenizer
 
 DEFAULT_TARGET_MODEL = "models/gemma-4-26B-A4B-it-AWQ-4bit"
-DEFAULT_DRAFT_MODEL = "models/gemma-4-E4B-it"
+DEFAULT_DRAFT_MODEL = "models/gemma-4-E2B-it-AWQ-INT4"
 
 DEFAULT_PROMPTS: list[str] = [
     "The capital of France is",
