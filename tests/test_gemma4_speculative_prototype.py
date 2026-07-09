@@ -222,6 +222,35 @@ def test_speculative_decode_recovers_on_mismatch(
     assert result["accepted_total"] < result["proposed_total"]
 
 
+def test_speculative_decode_stops_at_eos(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = [10, 999, 11, 12]
+    prompt = [1, 2, 3]
+    mock_llm = _make_mock_llm(reference)
+    monkeypatch.setattr(
+        proto_mod, "run_target_logits", _mock_run_target_logits(reference, len(prompt))
+    )
+    monkeypatch.setattr(proto_mod, "_get_eos_token_ids", lambda llm: {999})
+
+    def draft_proposer(prefix: list[int], generated: list[int], k: int) -> list[int]:
+        start = len(generated)
+        return reference[start : start + k]
+
+    result = proto_mod.speculative_decode(
+        mock_llm,
+        draft_proposer,
+        prompt_token_ids=prompt,
+        max_new_tokens=len(reference),
+        num_draft_tokens=2,
+    )
+
+    assert result["token_ids"] == [10, 999]
+    assert 999 in result["token_ids"]
+    assert result["accepted_total"] == 2
+    assert result["proposed_total"] == 2
+
+
 def test_cli_help_exits_zero(
     proto_mod: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
