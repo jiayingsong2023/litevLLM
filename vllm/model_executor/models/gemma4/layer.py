@@ -5,8 +5,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.models.lite_config import LiteConfig
 
 from .attention import Gemma4Attention
@@ -66,7 +68,31 @@ class Gemma4DecoderLayer(nn.Module):
         self._fp32_residual_guard_enabled = bool(fp32_residual_guard_enabled)
         self._fp32_residual_guard_start = int(fp32_residual_guard_start)
         self._fp32_residual_guard_span = max(1, int(fp32_residual_guard_span))
+        self.hidden_act = str(
+            getattr(config, "hidden_activation", getattr(config, "hidden_act", "silu"))
+        ).lower()
         self.use_moe = _is_gemma4_moe_layer(config, layer_idx)
+        self.per_layer_input_gate: LiteLinear | None = None
+        self.per_layer_projection: LiteLinear | None = None
+        self.post_per_layer_input_norm: RMSNorm | None = None
+        if config.ple_enabled():
+            self.per_layer_input_gate = LiteLinear(
+                config.hidden_size,
+                config.hidden_size_per_layer_input,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.per_layer_input_gate",
+            )
+            self.per_layer_projection = LiteLinear(
+                config.hidden_size_per_layer_input,
+                config.hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.per_layer_projection",
+            )
+            self.post_per_layer_input_norm = RMSNorm(
+                config.hidden_size, eps=_get_eps(config)
+            )
         if self.use_moe:
             # Gemma4-26B-A4B checkpoints expose dual pre-FFN norms and dual
             # branch post-FFN norms at layer root.
@@ -103,6 +129,7 @@ class Gemma4DecoderLayer(nn.Module):
         kv_cache: Any,
         attn_metadata: Any,
         lora_mapping: Any = None,
+        per_layer_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         inf_config = _meta_get(attn_metadata, "config", None)
         residual = x
@@ -158,4 +185,16 @@ class Gemma4DecoderLayer(nn.Module):
                 h = self.mlp(h_dense, lora_mapping, inf_config=inf_config)
         h = self.post_feedforward_layernorm(h)
         x = _residual_add_fp32(residual, h) if guard_hit else residual + h
+        if per_layer_input is not None and self.per_layer_input_gate is not None:
+            gate = self.per_layer_input_gate(x, lora_mapping, inf_config=inf_config)
+            if self.hidden_act in ("gelu", "gelu_pytorch_tanh"):
+                gate = F.gelu(gate, approximate="tanh")
+            else:
+                gate = F.silu(gate)
+            gated = gate * per_layer_input
+            ple_out = self.per_layer_projection(
+                gated, lora_mapping, inf_config=inf_config
+            )
+            ple_out = self.post_per_layer_input_norm(ple_out)
+            x = x + ple_out
         return x * self.layer_scalar

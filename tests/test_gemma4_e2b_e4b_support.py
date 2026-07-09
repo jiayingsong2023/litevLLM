@@ -92,3 +92,21 @@ def test_kv_shared_donor_selection(e2b_text_config):
     assert model.layers[19].self_attn.kv_scale_cache_idx == 14
     # Non-shared layer points at itself.
     assert model.layers[10].self_attn.kv_scale_cache_idx == 10
+
+
+def test_ple_shape(e2b_text_config):
+    import torch
+
+    from vllm.model_executor.models.gemma4.model import Gemma4TextModel
+
+    cfg = LiteConfig(e2b_text_config)
+    model = Gemma4TextModel(e2b_text_config, None)
+    assert model.embed_tokens_per_layer is not None
+    assert model.per_layer_model_projection is not None
+    assert model.per_layer_projection_norm is not None
+
+    B, S = 1, 5
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S), dtype=torch.long)
+    inputs_embeds = torch.randn(B, S, cfg.hidden_size, dtype=torch.float16)
+    ple = model._compute_per_layer_inputs(input_ids, inputs_embeds)
+    assert ple.shape == (B, S, cfg.num_hidden_layers, cfg.hidden_size_per_layer_input)

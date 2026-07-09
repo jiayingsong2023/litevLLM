@@ -55,6 +55,51 @@ class Gemma4TextModel(nn.Module):
             self.config.hidden_size,
             padding_idx=padding_idx,
         )
+        # Per-Layer Embeddings (PLE) for Gemma4 E2B/E4B.
+        self.hidden_size_per_layer_input = int(
+            getattr(self.config, "hidden_size_per_layer_input", 0) or 0
+        )
+        if self.config.ple_enabled():
+            total_ple_dim = (
+                self.config.num_hidden_layers * self.hidden_size_per_layer_input
+            )
+            self.embed_tokens_per_layer = nn.Embedding(
+                self.config.vocab_size_per_layer_input,
+                total_ple_dim,
+            )
+            self.per_layer_model_projection = LiteLinear(
+                self.config.hidden_size,
+                total_ple_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix="model.per_layer_model_projection",
+            )
+            self.per_layer_projection_norm = RMSNorm(
+                self.hidden_size_per_layer_input,
+                eps=_get_eps(self.config),
+            )
+            self.register_buffer(
+                "embed_scale_per_layer",
+                torch.tensor(self.hidden_size_per_layer_input**0.5),
+                persistent=False,
+            )
+            self.register_buffer(
+                "per_layer_input_scale",
+                torch.rsqrt(torch.tensor(2.0)),
+                persistent=False,
+            )
+            self.register_buffer(
+                "per_layer_projection_scale",
+                torch.tensor(self.config.hidden_size**-0.5),
+                persistent=False,
+            )
+        else:
+            self.embed_tokens_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+            self.embed_scale_per_layer = None
+            self.per_layer_input_scale = None
+            self.per_layer_projection_scale = None
         layers: list[Gemma4DecoderLayer] = []
         for i in range(self.config.num_hidden_layers):
             donor_attn = None
@@ -108,6 +153,31 @@ class Gemma4TextModel(nn.Module):
                 int(self.config.hidden_size),
             )
 
+    def _compute_per_layer_inputs(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.config.ple_enabled():
+            return None
+        if input_ids.dtype != torch.long:
+            return None
+        bsz, seqlen = input_ids.shape
+        num_layers = self.config.num_hidden_layers
+        ple_dim = self.hidden_size_per_layer_input
+
+        # Token-identity component.
+        token_part = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
+        token_part = token_part.view(bsz, seqlen, num_layers, ple_dim)
+
+        # Context-aware projection component.
+        proj = self.per_layer_model_projection(inputs_embeds)
+        proj = proj * self.per_layer_projection_scale
+        proj = proj.view(bsz, seqlen, num_layers, ple_dim)
+        proj = self.per_layer_projection_norm(proj)
+
+        return (token_part + proj) * self.per_layer_input_scale
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -129,9 +199,20 @@ class Gemma4TextModel(nn.Module):
                 )
         else:
             x = input_ids
+        per_layer_inputs = self._compute_per_layer_inputs(input_ids, x)
         for i, layer in enumerate(self.layers):
             kv_cache = kv_caches[layer.self_attn.kv_scale_cache_idx]
-            x = layer(x, positions, kv_cache, attn_metadata, lora_mapping)
+            ple_input = (
+                per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+            )
+            x = layer(
+                x,
+                positions,
+                kv_cache,
+                attn_metadata,
+                lora_mapping,
+                per_layer_input=ple_input,
+            )
         return self.norm(x)
 
 
