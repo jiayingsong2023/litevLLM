@@ -55,8 +55,36 @@ class Gemma4TextModel(nn.Module):
             self.config.hidden_size,
             padding_idx=padding_idx,
         )
-        self.layers = nn.ModuleList(
-            [
+        layers: list[Gemma4DecoderLayer] = []
+        for i in range(self.config.num_hidden_layers):
+            donor_attn = None
+            if self.config.is_kv_shared_layer(i):
+                layer_types = self.config.layer_types
+                own_type = layer_types[i] if layer_types else "global"
+                # Find offset of this layer within its attention group.
+                group_start = 0
+                if layer_types:
+                    for j in range(i - 1, -1, -1):
+                        if layer_types[j] == "full_attention":
+                            group_start = j + 1
+                            break
+                offset = i - group_start
+                for j in range(i - 1, -1, -1):
+                    if (
+                        not self.config.is_kv_shared_layer(j)
+                        and layer_types
+                        and layer_types[j] == own_type
+                    ):
+                        # Match the same position within the donor group.
+                        donor_group_start = 0
+                        for k in range(j - 1, -1, -1):
+                            if layer_types[k] == "full_attention":
+                                donor_group_start = k + 1
+                                break
+                        if j - donor_group_start == offset:
+                            donor_attn = layers[j].self_attn
+                            break
+            layers.append(
                 Gemma4DecoderLayer(
                     self.config,
                     quant_config,
@@ -66,10 +94,10 @@ class Gemma4TextModel(nn.Module):
                     fp32_residual_guard_start=fp32_residual_guard_start,
                     fp32_residual_guard_span=fp32_residual_guard_span,
                     runtime_config=runtime_config,
+                    kv_shared_with=donor_attn,
                 )
-                for i in range(self.config.num_hidden_layers)
-            ]
-        )
+            )
+        self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(self.config.hidden_size, eps=_get_eps(self.config))
         vision_config = getattr(hf_config, "vision_config", None)
         if vision_config is not None:
@@ -102,7 +130,8 @@ class Gemma4TextModel(nn.Module):
         else:
             x = input_ids
         for i, layer in enumerate(self.layers):
-            x = layer(x, positions, kv_caches[i], attn_metadata, lora_mapping)
+            kv_cache = kv_caches[layer.self_attn.kv_scale_cache_idx]
+            x = layer(x, positions, kv_cache, attn_metadata, lora_mapping)
         return self.norm(x)
 
 

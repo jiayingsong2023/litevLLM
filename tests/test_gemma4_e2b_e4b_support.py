@@ -77,3 +77,18 @@ def test_mlp_double_wide_shape(e2b_text_config):
         x = torch.randn(1, 12, cfg.hidden_size, dtype=torch.float16)
         out = mlp(x)
         assert out.shape == (1, 12, cfg.hidden_size)
+
+
+def test_kv_shared_donor_selection(e2b_text_config):
+    from vllm.model_executor.models.gemma4.model import Gemma4TextModel
+
+    # Need a minimal quant_config; None works for shape tests because layers
+    # don't build weights until load.
+    model = Gemma4TextModel(e2b_text_config, None)
+    assert model.layers[15].self_attn.k_proj is model.layers[10].self_attn.k_proj
+    assert model.layers[15].self_attn.v_proj is model.layers[10].self_attn.v_proj
+    assert model.layers[15].self_attn.kv_scale_cache_idx == 10
+    # Layer 19 is full_attention; donor is layer 14.
+    assert model.layers[19].self_attn.kv_scale_cache_idx == 14
+    # Non-shared layer points at itself.
+    assert model.layers[10].self_attn.kv_scale_cache_idx == 10

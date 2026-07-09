@@ -120,10 +120,12 @@ class Gemma4Attention(nn.Module):
         prefix: str,
         layer_idx: int,
         runtime_config: Any = None,
+        kv_shared_with: Gemma4Attention | None = None,
     ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.kv_scale_cache_idx = layer_idx
         self.layer_type = _layer_type_for_idx(config, layer_idx)
         self.is_sliding = _is_local_layer(self.layer_type)
         self.num_heads = int(config.num_attention_heads)
@@ -188,6 +190,11 @@ class Gemma4Attention(nn.Module):
             runtime_config=runtime_config,
             layer_config=self._layer_config,
         )
+        if kv_shared_with is not None:
+            self.k_proj = kv_shared_with.k_proj
+            if self.v_proj is not None:
+                self.v_proj = kv_shared_with.v_proj
+            self.kv_scale_cache_idx = kv_shared_with.kv_scale_cache_idx
 
     @staticmethod
     def _apply_head_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -319,7 +326,7 @@ class Gemma4Attention(nn.Module):
             k_cache, v_cache = kv_cache
             kv_scale_cache = _meta_get(attn_metadata, "kv_scale_cache", None)
             if kv_scale_cache is not None:
-                k_scale_cache, v_scale_cache = kv_scale_cache[self.layer_idx]
+                k_scale_cache, v_scale_cache = kv_scale_cache[self.kv_scale_cache_idx]
             else:
                 k_scale_cache, v_scale_cache = (None, None)
 
