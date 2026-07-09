@@ -50,11 +50,19 @@ class LLM:
         self,
         prompts: list[str],
         sampling_params: SamplingParams | None = None,
+        **kwargs: Any,
     ) -> Any:
         if isinstance(prompts, str):
             prompts = [prompts]
         if sampling_params is None:
-            sampling_params = SamplingParams()
+            sampling_params = SamplingParams(**kwargs)
+        elif kwargs:
+            sampling_params = copy.deepcopy(sampling_params)
+            for key, value in kwargs.items():
+                if hasattr(sampling_params, key):
+                    setattr(sampling_params, key, value)
+                else:
+                    raise TypeError(f"SamplingParams has no field {key!r}")
 
         outputs: list[RequestOutput] = []
         batch_capacity = max(1, int(getattr(self.engine, "max_active_requests", 1)))
@@ -73,7 +81,7 @@ class LLM:
             unfinished = set(request_ids)
             while unfinished:
                 step_outputs = self.engine.step()
-                if not step_outputs:
+                if not step_outputs and self.engine.active_request_count == 0:
                     raise RuntimeError(
                         "LiteEngine made no progress while requests were still active."
                     )

@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -110,3 +111,27 @@ def test_ple_shape(e2b_text_config):
     inputs_embeds = torch.randn(B, S, cfg.hidden_size, dtype=torch.float16)
     ple = model._compute_per_layer_inputs(input_ids, inputs_embeds)
     assert ple.shape == (B, S, cfg.num_hidden_layers, cfg.hidden_size_per_layer_input)
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_GEMMA4_E2B_SMOKE") != "1",
+    reason="Set RUN_GEMMA4_E2B_SMOKE=1 to load the E2B model",
+)
+def test_e2b_awq_q4_generates():
+    import os
+
+    os.environ.setdefault("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV", "1")
+    from vllm import LLM
+
+    llm = LLM(
+        model="models/gemma-4-E2B-it-AWQ-INT4",
+        max_model_len=256,
+        gpu_memory_utilization=0.85,
+        max_num_batched_tokens=512,
+    )
+    outputs = llm.generate("The capital of France is", max_tokens=8)
+    assert outputs
+    text = outputs[0].outputs[0].text
+    assert isinstance(text, str) and len(text) > 0
+    print("E2B output:", text)
+    llm.shutdown()
