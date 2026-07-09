@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,45 @@ def run_target_logits(llm, input_ids: torch.Tensor) -> torch.Tensor:
             logits = torch.tanh(logits / float(final_softcap)) * float(final_softcap)
 
     return logits
+
+
+def _get_eos_token_ids(llm: LLM) -> set[int]:
+    """Return the set of EOS token IDs used by the model.
+
+    Tries the tokenizer first, then falls back to the HF model config (e.g.
+    Gemma4 exposes extra turn/EOS ids in ``generation_config.json`` that the
+    tokenizer does not surface).  If neither source is available, returns an
+    empty set so generation is only bounded by ``max_new_tokens``.
+    """
+    eos_ids: set[int] = set()
+
+    def _add(eos: Any) -> None:
+        if eos is None:
+            return
+        if isinstance(eos, int):
+            eos_ids.add(eos)
+        else:
+            with suppress(Exception):
+                eos_ids.update(int(x) for x in eos)
+
+    tokenizer = getattr(llm, "tokenizer", None)
+    if tokenizer is not None:
+        _add(getattr(tokenizer, "eos_token_id", None))
+
+    # The engine's greedy baseline also honors eos_token_id from the HF config.
+    engine = getattr(llm, "engine", None)
+    model_config = (
+        getattr(engine, "model_config", None) if engine is not None else None
+    )
+    hf_config = (
+        getattr(model_config, "hf_config", None)
+        if model_config is not None
+        else None
+    )
+    if hf_config is not None:
+        _add(getattr(hf_config, "eos_token_id", None))
+
+    return eos_ids
 
 
 def _looks_like_preformatted_chat(text: str) -> bool:
@@ -186,6 +226,7 @@ def speculative_decode(
     ``baseline_token_ids`` and ``bit_exact`` are caller-filled placeholders;
     the offline CLI populates them after the baseline run.
     """
+    eos_ids = _get_eos_token_ids(llm)
     prefix = list(prompt_token_ids)
     generated: list[int] = []
     accepted_total = 0
@@ -193,7 +234,8 @@ def speculative_decode(
     target_forwards = 0
 
     start_time = time.perf_counter()
-    while len(generated) < max_new_tokens:
+    stop_generation = False
+    while len(generated) < max_new_tokens and not stop_generation:
         target_forwards += 1
         current = prefix + generated
         proposed = draft_proposer(prefix, generated, num_draft_tokens)
@@ -220,13 +262,19 @@ def speculative_decode(
             # No drafts proposed: take exactly one target token.
             accepted.append(int(torch.argmax(logits[0, accept_start - 1]).item()))
 
-        generated.extend(accepted)
-        accepted_total += sum(
-            1 for tok, draft in zip(accepted[: len(proposed)], proposed) if tok == draft
-        )
-        proposed_total += len(proposed)
+        # Append tokens one at a time so we can stop as soon as an EOS token
+        # is emitted, matching the greedy baseline behavior.
+        for i, tok in enumerate(accepted):
+            generated.append(tok)
+            if i < len(proposed):
+                proposed_total += 1
+                if tok == proposed[i]:
+                    accepted_total += 1
+            if tok in eos_ids:
+                stop_generation = True
+                break
 
-        if len(generated) >= max_new_tokens:
+        if len(generated) >= max_new_tokens and not stop_generation:
             generated = generated[:max_new_tokens]
             break
     elapsed = time.perf_counter() - start_time
