@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -218,3 +220,72 @@ def test_speculative_decode_recovers_on_mismatch(
 
     assert result["token_ids"] == reference
     assert result["accepted_total"] < result["proposed_total"]
+
+
+def test_cli_help_exits_zero(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["gemma4_speculative_prototype.py", "--help"])
+    with pytest.raises(SystemExit) as exc_info:
+        proto_mod.main()
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert "--target-model" in captured.out
+    assert "--num-draft-tokens" in captured.out
+
+
+def test_cli_writes_json(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    json_out = tmp_path / "out.json"
+
+    reference = [10, 11]
+    prompt = [1, 2, 3]
+
+    def _mock_baseline(*args, **kwargs):
+        return prompt, list(reference)
+
+    def _mock_speculate(*args, **kwargs):
+        return {
+            "token_ids": list(reference),
+            "baseline_token_ids": list(reference),
+            "bit_exact": True,
+            "accepted_total": 2,
+            "proposed_total": 2,
+            "acceptance_rate": 1.0,
+            "target_forwards": 1,
+            "baseline_tps": 0.0,
+            "speculative_tps": 0.0,
+            "projected_tps": 0.0,
+        }
+
+    monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
+    monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+    monkeypatch.setattr(
+        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(model_dir),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
+            "--json-out",
+            str(json_out),
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 0
+    assert json_out.exists()
+    data = json.loads(json_out.read_text())
+    assert data["bit_exact"] is True
+    assert "acceptance_rate" in data
+    assert "projected_tps" in data

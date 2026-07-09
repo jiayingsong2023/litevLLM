@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -171,3 +176,111 @@ def speculative_decode(
         "speculative_tps": speculative_tps,
         "projected_tps": 0.0,  # filled by CLI caller
     }
+
+
+def _default_model_path() -> str:
+    return "models/gemma-4-26B-A4B-it-AWQ-4bit"
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Offline n-gram speculative decoding prototype for Gemma4.",
+    )
+    parser.add_argument("--target-model", default=_default_model_path())
+    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--prompt-file", default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--num-draft-tokens", type=int, default=5)
+    parser.add_argument("--ngram-min", type=int, default=2)
+    parser.add_argument("--ngram-max", type=int, default=4)
+    parser.add_argument("--max-model-len", type=int, default=512)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--json-out", default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.prompt_file:
+        prompt_text = Path(args.prompt_file).read_text()
+    else:
+        prompt_text = args.prompt
+
+    target_model_path = args.target_model
+    if not os.path.isdir(target_model_path):
+        print(
+            f"[ERROR] target model directory not found: {target_model_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    target_llm = LLM(
+        model=target_model_path,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_num_batched_tokens=1024,
+    )
+
+    baseline_start = time.perf_counter()
+    prompt_token_ids, baseline_token_ids = baseline_greedy(
+        target_llm, prompt_text, args.max_new_tokens
+    )
+    baseline_elapsed = time.perf_counter() - baseline_start
+
+    def draft_proposer(prefix: list[int], generated: list[int], k: int) -> list[int]:
+        return propose_ngram(prefix, generated, k, args.ngram_min, args.ngram_max)
+
+    spec_result = speculative_decode(
+        target_llm,
+        draft_proposer,
+        prompt_token_ids,
+        max_new_tokens=args.max_new_tokens,
+        num_draft_tokens=args.num_draft_tokens,
+    )
+
+    baseline_tps = (
+        len(baseline_token_ids) / baseline_elapsed if baseline_elapsed > 0 else 0.0
+    )
+    spec_result["baseline_token_ids"] = baseline_token_ids
+    spec_result["bit_exact"] = spec_result["token_ids"] == baseline_token_ids
+    spec_result["baseline_tps"] = baseline_tps
+
+    target_forwards = spec_result["target_forwards"]
+    if target_forwards > 0:
+        theoretical_speedup = 1.0 + spec_result["accepted_total"] / target_forwards
+    else:
+        theoretical_speedup = 1.0
+    spec_result["projected_tps"] = baseline_tps * theoretical_speedup
+
+    output = {
+        "prompt_text": prompt_text,
+        "target_model": target_model_path,
+        "num_draft_tokens": args.num_draft_tokens,
+        "ngram_min": args.ngram_min,
+        "ngram_max": args.ngram_max,
+        "baseline_tokens": baseline_token_ids,
+        "speculative_tokens": spec_result["token_ids"],
+        "bit_exact": spec_result["bit_exact"],
+        "accepted_total": spec_result["accepted_total"],
+        "proposed_total": spec_result["proposed_total"],
+        "acceptance_rate": spec_result["acceptance_rate"],
+        "baseline_tps": spec_result["baseline_tps"],
+        "speculative_tps": spec_result["speculative_tps"],
+        "projected_tps": spec_result["projected_tps"],
+    }
+
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+    if args.json_out:
+        Path(args.json_out).write_text(
+            json.dumps(output, indent=2, sort_keys=True) + "\n"
+        )
+
+    target_llm.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
