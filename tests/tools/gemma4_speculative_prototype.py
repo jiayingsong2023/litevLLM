@@ -100,7 +100,6 @@ def speculative_decode(
     prompt_token_ids: list[int],
     max_new_tokens: int,
     num_draft_tokens: int,
-    baseline_token_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """Offline speculative decode loop using n-gram (or any) draft tokens.
 
@@ -109,9 +108,8 @@ def speculative_decode(
     is used instead.  If all draft tokens are accepted, one bonus target token
     is sampled from the logit past the last accepted draft.
 
-    ``baseline_token_ids`` is optional; when supplied, ``bit_exact`` is computed
-    against it.  The remaining caller-filled fields stay at their defaults so
-    the offline CLI can populate them after the baseline run.
+    ``baseline_token_ids`` and ``bit_exact`` are caller-filled placeholders;
+    the offline CLI populates them after the baseline run.
     """
     prefix = list(prompt_token_ids)
     generated: list[int] = []
@@ -160,18 +158,11 @@ def speculative_decode(
 
     acceptance_rate = accepted_total / proposed_total if proposed_total > 0 else 0.0
     speculative_tps = len(generated) / elapsed if elapsed > 0 else 0.0
-    bit_exact = (
-        list(generated) == list(baseline_token_ids)
-        if baseline_token_ids is not None
-        else False
-    )
 
     return {
         "token_ids": generated,
-        "baseline_token_ids": baseline_token_ids
-        if baseline_token_ids is not None
-        else [],
-        "bit_exact": bit_exact,
+        "baseline_token_ids": [],  # caller-filled placeholder
+        "bit_exact": False,  # caller-filled placeholder
         "accepted_total": accepted_total,
         "proposed_total": proposed_total,
         "acceptance_rate": acceptance_rate,

@@ -144,7 +144,8 @@ def _make_mock_llm(reference_generated: list[int]) -> Any:
 def _mock_run_target_logits(reference: list[int], prompt_len: int):
     """Return logits whose argmax matches the reference at each generated position.
 
-    Sets logits for every input position plus one extra position so that the
+    Sets the target logit at index p-1 for every input position p in
+    [prompt_len, L], using reference[p-prompt_len] when within range, so the
     bonus token past the last proposed draft is also defined.
     """
 
@@ -152,9 +153,10 @@ def _mock_run_target_logits(reference: list[int], prompt_len: int):
         ids = input_ids[0].tolist()
         vocab_size = max(reference + ids) + 10
         logits = torch.full((1, len(ids), vocab_size), -1e9)
-        for pos in range(prompt_len, min(len(ids) + 1, prompt_len + len(reference))):
-            token = reference[pos - prompt_len]
-            logits[0, pos - 1, token] = 1e6
+        for p in range(prompt_len, len(ids) + 1):
+            ref_idx = p - prompt_len
+            if ref_idx < len(reference):
+                logits[0, p - 1, reference[ref_idx]] = 1e6
         return logits
 
     return _run
@@ -181,11 +183,9 @@ def test_speculative_decode_bit_exact_when_drafts_match(
         prompt_token_ids=prompt,
         max_new_tokens=len(reference),
         num_draft_tokens=2,
-        baseline_token_ids=reference,
     )
 
     assert result["token_ids"] == reference
-    assert result["bit_exact"] is True
     assert result["acceptance_rate"] == 1.0
     assert result["accepted_total"] <= len(reference)
 
@@ -214,9 +214,7 @@ def test_speculative_decode_recovers_on_mismatch(
         prompt_token_ids=prompt,
         max_new_tokens=len(reference),
         num_draft_tokens=2,
-        baseline_token_ids=reference,
     )
 
     assert result["token_ids"] == reference
-    assert result["bit_exact"] is True
     assert result["accepted_total"] < result["proposed_total"]
