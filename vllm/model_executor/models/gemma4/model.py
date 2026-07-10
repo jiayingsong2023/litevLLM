@@ -106,29 +106,17 @@ class Gemma4TextModel(nn.Module):
             if self.config.is_kv_shared_layer(i):
                 layer_types = self.config.layer_types
                 own_type = layer_types[i] if layer_types else "global"
-                # Find offset of this layer within its attention group.
-                group_start = 0
-                if layer_types:
-                    for j in range(i - 1, -1, -1):
-                        if layer_types[j] == "full_attention":
-                            group_start = j + 1
-                            break
-                offset = i - group_start
+                # HF Gemma4 shares KV states by layer type: the last non-shared
+                # layer of the same type computes and stores the full-length K/V
+                # tensor that all subsequent shared layers reuse.
                 for j in range(i - 1, -1, -1):
                     if (
-                        not self.config.is_kv_shared_layer(j)
-                        and layer_types
+                        layer_types
                         and layer_types[j] == own_type
+                        and not self.config.is_kv_shared_layer(j)
                     ):
-                        # Match the same position within the donor group.
-                        donor_group_start = 0
-                        for k in range(j - 1, -1, -1):
-                            if layer_types[k] == "full_attention":
-                                donor_group_start = k + 1
-                                break
-                        if j - donor_group_start == offset:
-                            donor_attn = layers[j].self_attn
-                            break
+                        donor_attn = layers[j].self_attn
+                        break
             layers.append(
                 Gemma4DecoderLayer(
                     self.config,

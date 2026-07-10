@@ -77,16 +77,20 @@ class Gemma4LayerRotaryEmbedding(nn.Module):
 
     def _build_inv_freq(self) -> torch.Tensor:
         if self.rope_type == "proportional":
-            rope_angles = int(self.partial_rotary_factor * self.head_size // 2)
-            rope_angles = max(0, min(self.head_size // 2, rope_angles))
+            # Match HF proportional RoPE: inverse frequencies are computed over
+            # the rotated sub-dimension (head_dim * partial_rotary_factor) but
+            # the denominator is the full head_dim, then padded with zeros so
+            # the non-rotated tail sees cos=1/sin=0.
+            rot_dim = int(self.partial_rotary_factor * self.head_size)
+            rot_dim = max(0, min(self.head_size, rot_dim))
             inv_rot = 1.0 / (
                 self.base
                 ** (
-                    torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32)
+                    torch.arange(0, rot_dim, 2, dtype=torch.float32)
                     / float(self.head_size)
                 )
             )
-            no_rot = self.head_size // 2 - rope_angles
+            no_rot = self.head_size // 2 - inv_rot.shape[0]
             if no_rot > 0:
                 inv_freq = torch.cat(
                     (inv_rot, torch.zeros(no_rot, dtype=torch.float32)), dim=0

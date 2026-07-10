@@ -190,11 +190,16 @@ class Gemma4Attention(nn.Module):
             runtime_config=runtime_config,
             layer_config=self._layer_config,
         )
-        if kv_shared_with is not None:
-            self.k_proj = kv_shared_with.k_proj
-            if self.v_proj is not None:
-                self.v_proj = kv_shared_with.v_proj
+        self.is_kv_shared_layer = kv_shared_with is not None
+        if self.is_kv_shared_layer:
+            # KV-shared layers do not compute their own keys/values; they reuse
+            # the donor layer's KV cache state (same kv_scale_cache_idx).  Leave
+            # k/v projection and normalization modules undefined so the sharing
+            # is explicit and we cannot accidentally overwrite the donor state.
             self.kv_scale_cache_idx = kv_shared_with.kv_scale_cache_idx
+            self.k_proj = None
+            self.v_proj = None
+            self.k_norm = None
 
     @staticmethod
     def _apply_head_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -227,78 +232,97 @@ class Gemma4Attention(nn.Module):
             "<unknown>.self_attn.q_proj",
         ).rsplit(".", 1)[0]
         fused_qkv = None
-        if (not is_prefill_for_audit) and is_decode_m1:
-            fused_qkv = _try_fused_awq_qkv_decode(
-                x,
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                inf_config=inf_config,
-            )
-        if fused_qkv is not None:
-            q, k, v = fused_qkv
-            event = "qk_fused_decode" if self.v_proj is None else "qkv_fused_decode"
-            record_awq_audit_event(
-                attn_prefix,
-                event,
-                shape={
-                    "m": 1,
-                    "hidden": int(x.shape[-1]),
-                    "q": int(self.q_size),
-                    "k": int(self.kv_size),
-                    "v": 0 if self.v_proj is None else int(self.kv_size),
-                },
-                reason="packed_int4_symmetric_fused_qkv_m1_safe",
-            )
+        if self.is_kv_shared_layer:
+            # KV-shared layers reuse the donor layer's KV cache state.  Only the
+            # query is computed here; the keys/values are read from the donor's
+            # cache slot during attention.
+            with _gemma4_profile_span("attn_q_proj", self._layer_config):
+                q = self.q_proj(x, lora_mapping, inf_config=inf_config)
         else:
             if (not is_prefill_for_audit) and is_decode_m1:
-                event = (
-                    "qk_separate_decode"
-                    if self.v_proj is None
-                    else "qkv_separate_decode"
+                fused_qkv = _try_fused_awq_qkv_decode(
+                    x,
+                    self.q_proj,
+                    self.k_proj,
+                    self.v_proj,
+                    inf_config=inf_config,
                 )
-                shape = {
-                    "m": 1,
-                    "hidden": int(x.shape[-1]),
-                    "q": int(self.q_size),
-                    "k": int(self.kv_size),
-                }
-                if self.v_proj is not None:
-                    shape["v"] = int(self.kv_size)
+            if fused_qkv is not None:
+                q, k, v = fused_qkv
+                event = "qk_fused_decode" if self.v_proj is None else "qkv_fused_decode"
                 record_awq_audit_event(
                     attn_prefix,
                     event,
-                    shape=shape,
-                    reason="gemma4_attention_forward_uses_separate_litelinears",
+                    shape={
+                        "m": 1,
+                        "hidden": int(x.shape[-1]),
+                        "q": int(self.q_size),
+                        "k": int(self.kv_size),
+                        "v": 0 if self.v_proj is None else int(self.kv_size),
+                    },
+                    reason="packed_int4_symmetric_fused_qkv_m1_safe",
                 )
-            with _gemma4_profile_span("attn_q_proj", self._layer_config):
-                q = self.q_proj(x, lora_mapping, inf_config=inf_config)
-            with _gemma4_profile_span("attn_k_proj", self._layer_config):
-                k = self.k_proj(x, lora_mapping, inf_config=inf_config)
-            if self.v_proj is not None:
-                with _gemma4_profile_span("attn_v_proj", self._layer_config):
-                    v = self.v_proj(x, lora_mapping, inf_config=inf_config)
             else:
-                v = k
+                if (not is_prefill_for_audit) and is_decode_m1:
+                    event = (
+                        "qk_separate_decode"
+                        if self.v_proj is None
+                        else "qkv_separate_decode"
+                    )
+                    shape = {
+                        "m": 1,
+                        "hidden": int(x.shape[-1]),
+                        "q": int(self.q_size),
+                        "k": int(self.kv_size),
+                    }
+                    if self.v_proj is not None:
+                        shape["v"] = int(self.kv_size)
+                    record_awq_audit_event(
+                        attn_prefix,
+                        event,
+                        shape=shape,
+                        reason="gemma4_attention_forward_uses_separate_litelinears",
+                    )
+                with _gemma4_profile_span("attn_q_proj", self._layer_config):
+                    q = self.q_proj(x, lora_mapping, inf_config=inf_config)
+                with _gemma4_profile_span("attn_k_proj", self._layer_config):
+                    k = self.k_proj(x, lora_mapping, inf_config=inf_config)
+                if self.v_proj is not None:
+                    with _gemma4_profile_span("attn_v_proj", self._layer_config):
+                        v = self.v_proj(x, lora_mapping, inf_config=inf_config)
+                else:
+                    v = k
         bsz, seqlen = x.shape[:2]
         q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = self._apply_head_norm(self.q_norm, q)
-        k = self._apply_head_norm(self.k_norm, k)
-        v = self._apply_head_norm_noscale(v, self.v_norm_eps)
+        if not self.is_kv_shared_layer:
+            k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            k = self._apply_head_norm(self.k_norm, k)
+            v = self._apply_head_norm_noscale(v, self.v_norm_eps)
         # Surface the max position upper bound from the engine-side builder so
         # rotary_emb can extend its cache without a per-layer D->H sync.
         max_pos_plus_one_cpu = _resolve_max_position_plus_one_cpu(
             attn_metadata, positions
         )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            max_position_plus_one_cpu=max_pos_plus_one_cpu,
-            inf_config=inf_config,
-        )
+        if self.is_kv_shared_layer:
+            # Only the query needs rotary encoding; the donor keys were already
+            # rotated when they were written to the KV cache.
+            q, _ = self.rotary_emb(
+                positions,
+                q,
+                q,
+                max_position_plus_one_cpu=max_pos_plus_one_cpu,
+                inf_config=inf_config,
+            )
+        else:
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                max_position_plus_one_cpu=max_pos_plus_one_cpu,
+                inf_config=inf_config,
+            )
         is_local = self.is_sliding
         local_window = (
             int(getattr(self.config, "sliding_window", 0) or 0) if is_local else None
@@ -330,39 +354,46 @@ class Gemma4Attention(nn.Module):
             else:
                 k_scale_cache, v_scale_cache = (None, None)
 
-            if (
-                _use_legacy_full_precision_kv_write(inf_config)
-                and _should_use_full_decode_reference(inf_config, str(kv_cache_dtype))
-                and (not _is_packed_or_quantized_kv_cache(str(kv_cache_dtype)))
-            ):
-                with _gemma4_profile_span(
-                    "kv_write_full_precision", self._layer_config
-                ):
-                    _write_full_precision_kv_cache(
-                        k,
-                        v,
-                        k_cache,
-                        v_cache,
-                        slot_mapping,
-                        self.num_kv_heads,
-                        self.head_dim,
+            if not self.is_kv_shared_layer:
+                if (
+                    _use_legacy_full_precision_kv_write(inf_config)
+                    and _should_use_full_decode_reference(
+                        inf_config, str(kv_cache_dtype)
                     )
-            else:
-                with _gemma4_profile_span(
-                    "kv_write_reshape_and_cache", self._layer_config
+                    and (not _is_packed_or_quantized_kv_cache(str(kv_cache_dtype)))
                 ):
-                    reshape_and_cache(
-                        k.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                        v.reshape(-1, self.num_kv_heads, self.head_dim).contiguous(),
-                        k_cache,
-                        v_cache,
-                        slot_mapping,
-                        kv_cache_dtype,
-                        k_scale,
-                        v_scale,
-                        k_scale_cache=k_scale_cache,
-                        v_scale_cache=v_scale_cache,
-                    )
+                    with _gemma4_profile_span(
+                        "kv_write_full_precision", self._layer_config
+                    ):
+                        _write_full_precision_kv_cache(
+                            k,
+                            v,
+                            k_cache,
+                            v_cache,
+                            slot_mapping,
+                            self.num_kv_heads,
+                            self.head_dim,
+                        )
+                else:
+                    with _gemma4_profile_span(
+                        "kv_write_reshape_and_cache", self._layer_config
+                    ):
+                        reshape_and_cache(
+                            k.reshape(
+                                -1, self.num_kv_heads, self.head_dim
+                            ).contiguous(),
+                            v.reshape(
+                                -1, self.num_kv_heads, self.head_dim
+                            ).contiguous(),
+                            k_cache,
+                            v_cache,
+                            slot_mapping,
+                            kv_cache_dtype,
+                            k_scale,
+                            v_scale,
+                            k_scale_cache=k_scale_cache,
+                            v_scale_cache=v_scale_cache,
+                        )
 
             is_prefill = bool(_meta_get(attn_metadata, "is_prefill", False))
             if is_local and is_prefill and seqlen > 1:
@@ -717,6 +748,11 @@ class Gemma4Attention(nn.Module):
                         )
                     out = attn_out.view(bsz, seqlen, -1)
         else:
+            if self.is_kv_shared_layer:
+                raise RuntimeError(
+                    "KV-shared Gemma4 attention layers require a KV cache to "
+                    "reuse the donor layer's key/value states."
+                )
             with _gemma4_profile_span("attn_nocache", self._layer_config):
                 out = _causal_attention_ref(
                     q.transpose(1, 2),

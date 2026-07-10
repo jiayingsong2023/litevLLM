@@ -66,7 +66,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer.scales = nn.Parameter(
             torch.zeros((1, 1), dtype=torch.float16), requires_grad=False
         )
-        layer.qzeros = None
+        # Register a dummy qzeros Parameter so the atomic aligner can match
+        # checkpoints that ship asymmetric zero-points (e.g. Gemma4-E2B/E4B
+        # compressed-tensors pack-quantized weights under `weight_zero_point`).
+        layer.qzeros = nn.Parameter(
+            torch.zeros((1, 1), dtype=torch.int32), requires_grad=False
+        )
         layer.weight_shape = None
         layer.group_size = self.group_size
         layer._quant_weight = None
@@ -136,7 +141,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 layer.scales = nn.Parameter(
                     loaded_weight.contiguous(), requires_grad=False
                 )
-            elif key in ("weight_zero", "qzeros", "zeros"):
+            elif key in ("weight_zero", "weight_zero_point", "qzeros", "zeros"):
                 layer.qzeros = nn.Parameter(
                     loaded_weight.contiguous().to(torch.int32), requires_grad=False
                 )

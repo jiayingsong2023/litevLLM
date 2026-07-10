@@ -3,13 +3,10 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
 from vllm.utils.text_utils import truthy
-
-from vllm.model_executor.models.lite_config import LiteConfig
 
 _GEMMA4_ALLOWED_TUNING_ENV = frozenset(
     {
@@ -83,9 +80,11 @@ def _apply_global_tuning_config(config: Gemma4LayerConfig) -> None:
     Deprecated: new code should pass the config to Gemma4DecoderLayer
     via ``set_config()``.
     """
-    global _GEMMA4_TUNING, _GEMMA4_TUNING_LOCKED
+    global _GEMMA4_TUNING_LOCKED
     global _GEMMA4_PROFILE_ENABLED, _GEMMA4_ROCTX_PROFILE_ENABLED
-    _GEMMA4_TUNING = dict(config.tuning)
+    # Mutate in place so re-exported module-level references stay valid.
+    _GEMMA4_TUNING.clear()
+    _GEMMA4_TUNING.update(config.tuning)
     _GEMMA4_TUNING_LOCKED = config.tuning_locked
     _GEMMA4_PROFILE_ENABLED = config.profile_enabled
     _GEMMA4_ROCTX_PROFILE_ENABLED = config.roctx_profile_enabled

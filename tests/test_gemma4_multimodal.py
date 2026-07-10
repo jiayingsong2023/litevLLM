@@ -20,9 +20,7 @@ from vllm.model_executor.models.gemma4.vision import (
 
 def test_replace_image_placeholders_inserts_image_embeddings() -> None:
     input_ids = torch.tensor([[10, 77, 77, 11]], dtype=torch.long)
-    text_embeddings = torch.tensor(
-        [[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]]
-    )
+    text_embeddings = torch.tensor([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]])
     image_embeddings = torch.tensor([[[8.0, 1.0], [9.0, 2.0]]])
 
     replaced = _replace_image_placeholders(
@@ -33,9 +31,7 @@ def test_replace_image_placeholders_inserts_image_embeddings() -> None:
         image_token_count=2,
     )
 
-    assert replaced.tolist() == [
-        [[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]
-    ]
+    assert replaced.tolist() == [[[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]]
 
 
 def test_replace_image_placeholders_inserts_batched_image_embeddings() -> None:
@@ -135,7 +131,11 @@ def test_replace_image_placeholders_rejects_count_mismatch() -> None:
 def test_gemma4_text_model_forward_replaces_multimodal_embeddings(monkeypatch) -> None:
     model = object.__new__(Gemma4TextModel)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(hidden_size=2, tie_word_embeddings=False)
+    model.config = SimpleNamespace(
+        hidden_size=2,
+        tie_word_embeddings=False,
+        ple_enabled=lambda: False,
+    )
     model.embed_scale = 1.0
     model.embed_tokens = torch.nn.Embedding(100, 2)
     with torch.no_grad():
@@ -154,9 +154,7 @@ def test_gemma4_text_model_forward_replaces_multimodal_embeddings(monkeypatch) -
         multimodal_embeddings=torch.tensor([[[8.0, 1.0], [9.0, 2.0]]]),
     )
 
-    assert output.tolist() == [
-        [[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]
-    ]
+    assert output.tolist() == [[[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]]
 
 
 def test_gemma4_forward_accepts_multimodal_embeddings() -> None:

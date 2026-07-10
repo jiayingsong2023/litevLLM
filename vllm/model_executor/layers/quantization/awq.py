@@ -22,7 +22,9 @@ class AWQConfig(QuantizationConfig):
         # AWQ weights and zeros MUST be integers for bitwise shifts
         layer.qweight = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
         layer.scales = nn.Parameter(torch.zeros((1, 1), dtype=torch.float16), requires_grad=False)
-        layer.qzeros = None
+        # Dummy qzeros so the atomic aligner can populate asymmetric checkpoints
+        # that use names like `weight_zero_point`.
+        layer.qzeros = nn.Parameter(torch.zeros((1, 1), dtype=torch.int32), requires_grad=False)
         layer.weight_shape = None
         # Propagate default group size so that layout checks and kernels can use it.
         if not hasattr(layer, "group_size"):
@@ -89,7 +91,7 @@ class AWQConfig(QuantizationConfig):
         for name, loaded_weight in weights_iter:
             if "qweight" in name: layer.qweight = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
             elif "scales" in name: layer.scales = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
-            elif "qzeros" in name: layer.qzeros = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+            elif "qzeros" in name or "weight_zero_point" in name: layer.qzeros = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
             elif "weight_shape" in name: layer.weight_shape = tuple(int(x) for x in loaded_weight.view(-1).tolist())
             elif "bias" in name: layer.bias = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
 

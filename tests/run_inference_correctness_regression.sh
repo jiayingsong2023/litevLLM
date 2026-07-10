@@ -95,6 +95,7 @@ MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-models/gemma-4-31B-it-AWQ-4bit}"
 MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-models/gemma-4-26B-A4B-it-AWQ-4bit}"
+MODEL_GEMMA4_E2B="${MODEL_GEMMA4_E2B:-models/gemma-4-E2B-it-AWQ-INT4}"
 MODEL_DEEPSEEK_V4_FLASH_GGUF="${MODEL_DEEPSEEK_V4_FLASH_GGUF:-models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
 TINYLLAMA_PROMPTS_FILE="${TINYLLAMA_PROMPTS_FILE:-tests/tools/fixtures/tinyllama_correctness_prompts_default.json}"
 GEMMA4_PROMPTS_FILE="${GEMMA4_PROMPTS_FILE:-tests/tools/fixtures/gemma4_correctness_prompts_default.json}"
@@ -106,6 +107,7 @@ RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
 RUN_GEMMA4_26B="${RUN_GEMMA4_26B:-1}"
+RUN_GEMMA4_E2B="${RUN_GEMMA4_E2B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"  # compatibility no-op; Gemma4-31B uses A-lite only.
 RUN_GEMMA4_A_STRICT="${RUN_GEMMA4_A_STRICT:-0}"  # compatibility no-op; Gemma4-31B strict audit is disabled.
 RUN_GEMMA4_A_LITE="${RUN_GEMMA4_A_LITE:-1}"
@@ -432,6 +434,19 @@ print_model_separator "Qwen3.5-9B AWQ Tier-B"
 run_stage "Tier-B Qwen3.5-9B AWQ spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
   "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
+
+if [[ "${RUN_GEMMA4_E2B}" == "1" ]]; then
+  if [[ -d "$MODEL_GEMMA4_E2B" ]] || is_hf_repo_id "$MODEL_GEMMA4_E2B"; then
+    print_model_separator "Gemma4-E2B AWQ-INT4 Tier-B"
+    require_model_ref "$MODEL_GEMMA4_E2B" "Gemma4-E2B-AWQ-INT4"
+    run_stage "Tier-B Gemma4-E2B AWQ-INT4 coherence smoke" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
+      env RUN_GEMMA4_E2B_SMOKE=1 FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1 \
+      "${UV_RUN[@]}" pytest tests/test_gemma4_e2b_e4b_support.py::test_e2b_awq_q4_generates -q -s
+    cleanup_after_model_step "Gemma4-E2B Tier-B"
+  else
+    echo "[Warn] Gemma4-E2B model dir not found, skipping: $MODEL_GEMMA4_E2B"
+  fi
+fi
 
 GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then

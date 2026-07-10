@@ -858,7 +858,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
     attr_map = {
         "qweight": ["weight_packed", "qweight", "weight"],
         "scales": ["weight_scale", "scales"],
-        "qzeros": ["qzeros", "weight_zero"],
+        "qzeros": ["qzeros", "weight_zero", "weight_zero_point"],
         "bias": ["bias"],
         "weight_shape": ["weight_shape"],
     }

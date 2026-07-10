@@ -660,6 +660,19 @@ def should_use_awq_fused_path(
         return False, scope_reason
     if not resolved_policy.prefer_fused:
         return False, "fused_disabled"
+    is_asym = qzeros is not None and _is_packed_int4_asymmetric_layout(
+        qweight, scales, qzeros, int(group_size)
+    )
+    if is_asym:
+        print(f">>>> DEBUG rejecting fused for {prefix}: asymmetric layout qweight={tuple(qweight.shape)} scales={tuple(scales.shape)} qzeros={tuple(qzeros.shape)} gs={group_size}")
+        return False, "packed_int4_asymmetric_layout"
+    allow_by_scope, scope_reason = should_allow_awq_fused(prefix, resolved_policy)
+    if not allow_by_scope:
+        return False, scope_reason
+    if not resolved_policy.prefer_fused:
+        return False, "fused_disabled"
+    if is_asym:
+        return False, "packed_int4_asymmetric_layout"
 
     try:
         from vllm.model_executor.layers.quantization.awq_triton import (
@@ -831,6 +844,83 @@ def dequantize_q6k_pytorch(
         )
 
 
+def _is_packed_int4_asymmetric_layout(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+) -> bool:
+    """
+    Detect compressed-tensors "pack-quantized" asymmetric layout.
+
+    In this layout (used by Gemma4-E2B AWQ-INT4) the weight is packed along the
+    input dimension, scales are per (output_row, k_group), and zero-points are
+    packed along the output dimension:
+        qweight: [out_features, in_features // 8]
+        scales:  [out_features, in_features // group_size]
+        qzeros:  [out_features // 8, in_features // group_size]
+    Standard AWQ stores scales/qzeros transposed (groups along the input axis),
+    so this layout is unambiguous.
+    """
+    if qweight.dim() != 2 or scales.dim() != 2 or qzeros.dim() != 2:
+        return False
+    n_rows, n_cols_packed = qweight.shape
+    n_cols = n_cols_packed * 8
+    if n_cols % group_size != 0:
+        return False
+    n_groups = n_cols // group_size
+    return (
+        scales.shape == (n_rows, n_groups)
+        and qzeros.shape == (n_rows // 8, n_groups)
+    )
+
+
+def dequantize_asymmetric_packed_int4_pytorch(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    """
+    Dequantize compressed-tensors pack-quantized asymmetric int4 weights.
+
+    The checkpoint stores unsigned packed nibbles.  compressed-tensors unpacks
+    them to signed int8 (q - 8) and applies (q - zero_point) * scale, where the
+    zero_point is also stored in the signed quantized space.  This matches the
+    reference `PackedQuantizationCompressor.decompress_weight` implementation.
+    """
+    try:
+        n_rows, n_cols_packed = qweight.shape
+        n_cols = n_cols_packed * 8
+        n_groups = n_cols // group_size
+        shifts = torch.arange(0, 32, 4, device=qweight.device)
+
+        # Unpack weights to signed int8 and reshape to [n_rows, n_groups, group_size]
+        qs = (
+            ((qweight.unsqueeze(-1) >> shifts) & 0x0F)
+            .view(n_rows, n_cols)
+            .to(torch.float32)
+            - 8.0
+        )
+        qs = qs.view(n_rows, n_groups, group_size)
+
+        # Unpack zero-points packed along the output dimension.
+        # qzeros shape is [n_rows // 8, n_groups]; each int32 packs 8 row zero
+        # points for the same group.  Permute so rows are interleaved, not groups.
+        zs = (
+            ((qzeros.unsqueeze(-1) >> shifts) & 0x0F)
+            .permute(0, 2, 1)
+            .reshape(n_rows, n_groups)
+            .to(torch.float32)
+            - 8.0
+        )
+
+        res = (qs - zs.unsqueeze(-1)) * scales.to(torch.float32).unsqueeze(-1)
+        return res.view(n_rows, n_cols).to(torch.float16)
+    except Exception as e:
+        raise RuntimeError(f"Asymmetric packed int4 PyTorch dequant error: {e}")
+
+
 def dequantize_awq_pytorch(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -838,6 +928,11 @@ def dequantize_awq_pytorch(
     group_size: int = 128,
 ) -> torch.Tensor:
     try:
+        if _is_packed_int4_asymmetric_layout(qweight, scales, qzeros, group_size):
+            return dequantize_asymmetric_packed_int4_pytorch(
+                qweight, scales, qzeros, group_size
+            )
+
         n_rows, n_cols_packed = qweight.shape
         n_cols = n_cols_packed * 8
         shifts = torch.arange(0, 32, 4, device=qweight.device)
@@ -1126,18 +1221,29 @@ class AWQWeight(QuantizedLinearWeight):
             _awq_stat_inc("awq_cache_hits")
             _awq_prefix_stat_inc(self.prefix, "cache_hit")
             return _apply_linear_with_cached_weight(x, cached_w, bias)
-        try:
-            from vllm.model_executor.layers.quantization.awq_triton import (
-                awq_dequantize_triton,
-            )
 
-            dense_weight = awq_dequantize_triton(
-                self.qweight, self.scales, self.qzeros, self.group_size
-            )
-        except Exception:
+        # The Triton AWQ dequant kernel assumes standard AWQ layout.  For
+        # compressed-tensors pack-quantized asymmetric weights (e.g. Gemma4-E2B)
+        # go straight to the PyTorch reference path.
+        if _is_packed_int4_asymmetric_layout(
+            self.qweight, self.scales, self.qzeros, int(self.group_size)
+        ):
             dense_weight = dequantize_awq_pytorch(
                 self.qweight, self.scales, self.qzeros, self.group_size
             )
+        else:
+            try:
+                from vllm.model_executor.layers.quantization.awq_triton import (
+                    awq_dequantize_triton,
+                )
+
+                dense_weight = awq_dequantize_triton(
+                    self.qweight, self.scales, self.qzeros, self.group_size
+                )
+            except Exception:
+                dense_weight = dequantize_awq_pytorch(
+                    self.qweight, self.scales, self.qzeros, self.group_size
+                )
         _awq_cache_put(self.weight_id, dense_weight)
         _awq_stat_inc("awq_cache_misses")
         _awq_stat_inc("awq_dense_builds")

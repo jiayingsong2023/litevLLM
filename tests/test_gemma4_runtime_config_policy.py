@@ -24,7 +24,7 @@ def test_gemma4_profile_flags_are_derived_from_tuning_env(monkeypatch) -> None:
 
 
 def test_gemma4_tuning_config_rejects_migrated_production_policy_names() -> None:
-    gemma4.set_gemma4_tuning_config(
+    config = gemma4.set_gemma4_tuning_config(
         {
             "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
             "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON": "0",
@@ -33,6 +33,7 @@ def test_gemma4_tuning_config_rejects_migrated_production_policy_names() -> None
         },
         locked=True,
     )
+    gemma4._apply_global_tuning_config(config)
 
     assert gemma4._GEMMA4_TUNING == {
         "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
@@ -267,16 +268,16 @@ def test_gemma4_model_policy_covers_all_runtime_config_fields() -> None:
     model_policy key from Gemma4Adapter."""
     from vllm.adapters.policy_keys import (
         GEMMA4_FP32_RESIDUAL_GUARD_ENABLED,
-        GEMMA4_FP32_RESIDUAL_GUARD_START,
         GEMMA4_FP32_RESIDUAL_GUARD_SPAN,
-        GEMMA4_MOE_EXPERT_CACHE_SIZE,
+        GEMMA4_FP32_RESIDUAL_GUARD_START,
+        GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         GEMMA4_MOE_COMPUTE_DTYPE,
+        GEMMA4_MOE_EXPERT_CACHE_SIZE,
         GEMMA4_MOE_INT4_KERNEL_ENABLED,
         GEMMA4_MOE_INT4_KERNEL_STRATEGY,
         GEMMA4_MOE_PREFILL_GROUPED_ENABLED,
         GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS,
         GEMMA4_MOE_PREFILL_GROUPED_STRATEGY,
-        GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         GEMMA4_ROPE_CACHE_MAX_POS,
         GEMMA4_ROPE_CACHE_POOL_MAX,
     )
@@ -295,7 +296,8 @@ def test_gemma4_model_policy_covers_all_runtime_config_fields() -> None:
         "gemma4_moe_batch_materialize_enabled": GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         "gemma4_rope_cache_max_pos": GEMMA4_ROPE_CACHE_MAX_POS,
         "gemma4_rope_cache_pool_max": GEMMA4_ROPE_CACHE_POOL_MAX,
-        "gemma4_c1_preset": None,  # special case: kernel tuning flag, not in model_policy
+        # gemma4_c1_preset is a kernel tuning flag, not in model_policy.
+        "gemma4_c1_preset": None,
     }
 
     # Verify all gemma4_* RuntimeConfig fields have a mapping
