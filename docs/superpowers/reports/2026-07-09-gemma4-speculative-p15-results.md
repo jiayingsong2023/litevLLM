@@ -75,6 +75,8 @@ KeyError: 'draft_prefill_<nanosecond_timestamp>'
 
 This is a tool-side bug, not a model-loading failure. Because the draft model is already ruled out by P1, no further E2B P1.5 debugging was warranted.
 
+*Post-measurement note:* the `_prefill_draft_persistent` helper was later fixed by passing `ignore_eos=True` in the draft `SamplingParams`, preventing the draft request from finishing during prefill and becoming unretrievable. The E2B draft model remains no-go because of the P1 bit-exact failure.
+
 ### E4B P1.5
 
 Completed both K values. Bit-exact held, but performance regressed significantly below baseline.
