@@ -1,6 +1,7 @@
 # Gemma4 Speculative Decoding P1/P1.5 Report — E2B/E4B Draft Models
 
-**Date:** 2026-07-10  
+**Date:** 2026-07-10 (run date)  
+**Filename date:** 2026-07-09 (plan deliverable date)  
 **Target model:** `models/gemma-4-26B-A4B-it-AWQ-4bit`  
 **Draft models tested:** `models/gemma-4-E2B-it-AWQ-INT4`, `models/gemma-4-E4B-it`  
 **Hardware:** AMD Radeon 8060S Graphics, 96 GiB VRAM  
@@ -22,6 +23,8 @@ The brief commands were executed with reduced scope to fit the interactive sessi
 - P1 acceptance sweep used a single 128-token prompt (`en_fact_128`) and `--num-draft-tokens 1` instead of the full fixture.
 - P1.5 microbench used the same single prompt, `--k-values 1` (and `3` for E4B), and `--tokens-per-repetition 8`/`16`.
 - Full-fixture / multi-K runs were attempted first but exceeded the practical foreground timeout (5 min) because the P1 prototype recomputes full attention on every verification step.
+
+Because of the reduced scope, this report does not include a full K/context matrix; only the single 128-token prompt and the K values listed above were measured.
 
 All reported numbers are real measurements from the actual target and draft models; no results were fabricated.
 
@@ -65,7 +68,7 @@ Same divergence pattern as E2B at the third token.
 Crashed during draft prefill with:
 
 ```text
-KeyError: 'draft_prefill_...'
+KeyError: 'draft_prefill_<nanosecond_timestamp>'
   File ".../gemma4_speculative_verifier_microbench.py", line 327, in _prefill_draft_persistent
     req = llm.engine.scheduler.get_request(req_id)
 ```
@@ -79,7 +82,7 @@ Completed both K values. Bit-exact held, but performance regressed significantly
 | K | Baseline TPS | Predicted TPS | Speedup | Bit-exact | Passed |
 |---|---|---|---|---|---|
 | 1 | 11.60 | 3.81 | 0.33× | true | false |
-| 3 | 11.67 | 3.21 | 0.28× | true | true |
+| 3 | 11.67 | 3.21 | 0.28× | true | false |
 
 Observations:
 - Every repetition required catch-up forwards (2) after partial rejection, indicating low draft acceptance.
