@@ -40,6 +40,7 @@ class FakeTokenizer:
         eos_token_id: int | list[int] | None = 1,
         pad_token_id: int | list[int] | None = 0,
         encode_map: dict[str, list[int]] | None = None,
+        added_tokens_encoder: dict[str, int] | None = None,
         chat_template: str
         | None = "{% for m in messages %}{{ m['role'] }}{% endfor %}",
         chat_output: str = "<chat output>",
@@ -49,8 +50,12 @@ class FakeTokenizer:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.chat_template = chat_template
+        self.added_tokens_encoder = added_tokens_encoder or {}
         self._encode_map = encode_map or {}
         self._chat_output = chat_output
+
+    def get_vocab(self) -> dict[str, int]:
+        return {chr(i): i for i in range(self.vocab_size)}
 
     def encode(
         self, text: str, *, add_special_tokens: bool = False, **_: Any
@@ -82,9 +87,12 @@ def test_all_checks_pass_when_tokenizers_identical(gate_mod: Any) -> None:
     report = gate_mod.build_report("target", "draft", target, draft, ["hello", "world"])
 
     assert report["vocab_size_match"] is True
+    assert report["full_vocab_match"] is True
+    assert report["added_tokens_match"] is True
     assert report["special_tokens_match"] is True
     assert report["encode_match"] is True
     assert report["chat_template_match"] is True
+    assert report["chat_template_token_ids_match"] is True
     assert report["passed"] is True
 
 
@@ -94,6 +102,25 @@ def test_vocab_size_mismatch_fails(gate_mod: Any) -> None:
     report = gate_mod.build_report("target", "draft", target, draft, ["hello"])
 
     assert report["vocab_size_match"] is False
+    assert report["full_vocab_match"] is False
+    assert report["passed"] is False
+
+
+def test_full_vocab_mismatch_fails(gate_mod: Any) -> None:
+    target, draft = _identical_tokenizers()
+    draft.vocab_size = target.vocab_size + 1
+    report = gate_mod.build_report("target", "draft", target, draft, ["hello"])
+
+    assert report["full_vocab_match"] is False
+    assert report["passed"] is False
+
+
+def test_added_token_mismatch_fails(gate_mod: Any) -> None:
+    target = FakeTokenizer(added_tokens_encoder={"<extra>": 999})
+    draft = FakeTokenizer(added_tokens_encoder={"<extra>": 1000})
+    report = gate_mod.build_report("target", "draft", target, draft, ["hello"])
+
+    assert report["added_tokens_match"] is False
     assert report["passed"] is False
 
 
@@ -123,13 +150,14 @@ def test_encode_mismatch_fails(gate_mod: Any) -> None:
     assert report["passed"] is False
 
 
-def test_chat_template_mismatch_fails(gate_mod: Any) -> None:
+def test_chat_template_mismatch_is_diagnostic(gate_mod: Any) -> None:
     target = FakeTokenizer(chat_output="target_chat")
     draft = FakeTokenizer(chat_output="draft_chat")
     report = gate_mod.build_report("target", "draft", target, draft, ["hello"])
 
     assert report["chat_template_match"] is False
-    assert report["passed"] is False
+    assert report["chat_template_token_ids_match"] is False
+    assert report["passed"] is True
 
 
 def test_chat_template_absent_returns_none(gate_mod: Any) -> None:
@@ -138,6 +166,7 @@ def test_chat_template_absent_returns_none(gate_mod: Any) -> None:
     report = gate_mod.build_report("target", "draft", target, draft, ["hello"])
 
     assert report["chat_template_match"] is None
+    assert report["chat_template_token_ids_match"] is None
     assert report["passed"] is True
 
 

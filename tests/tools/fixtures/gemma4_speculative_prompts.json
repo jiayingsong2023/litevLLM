@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "prompts": [
+    {
+      "id": "en_fact_128",
+      "text": "The capital of France is Paris and it is located in the north-central part of the country along the Seine River.",
+      "context_len": 128,
+      "max_new_tokens": 32
+    },
+    {
+      "id": "zh_fact_128",
+      "text": "法国的首都是巴黎，位于法国北部巴黎盆地，是法国的政治、经济、文化和商业中心。",
+      "context_len": 128,
+      "max_new_tokens": 32
+    },
+    {
+      "id": "code_repeat_512",
+      "text": "def fibonacci(n): if n <= 1: return n return fibonacci(n-1) + fibonacci(n-2) # compute recursively",
+      "context_len": 512,
+      "max_new_tokens": 128
+    },
+    {
+      "id": "en_explain_512",
+      "text": "Explain how a transformer language model processes input text. The model first tokenizes the input into subword units, then maps each token to a dense vector embedding. Positional encodings are added to provide order information. The embeddings pass through multiple layers of self-attention and feed-forward networks, producing contextualized representations. Finally a linear projection and softmax produce probabilities over the vocabulary for the next token.",
+      "context_len": 512,
+      "max_new_tokens": 128
+    },
+    {
+      "id": "chat_en_2048",
+      "text": "User: Hello, how are you? Assistant: I am doing well, thank you for asking. User: Can you tell me about the history of artificial intelligence? Assistant: Artificial intelligence as a field began in the mid-twentieth century, with foundational work by Turing, McCarthy, Minsky, and others. Early systems relied on symbolic reasoning and expert knowledge. Machine learning later enabled systems to improve from data. Deep learning, powered by large datasets and compute, has driven recent advances in language, vision, and robotics.",
+      "context_len": 2048,
+      "max_new_tokens": 32
+    },
+    {
+      "id": "chat_zh_2048",
+      "text": "用户：你好，请介绍一下人工智能的发展历史。助手：人工智能作为一门学科始于二十世纪中期，图灵、麦卡锡、明斯基等学者做出了奠基性贡献。早期系统依赖符号推理和专家知识。后来机器学习使系统能够从数据中改进。深度学习借助大数据和计算能力，推动了语言、视觉和机器人等领域的最新进展。",
+      "context_len": 2048,
+      "max_new_tokens": 32
+    }
+  ]
+}
