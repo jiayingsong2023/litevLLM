@@ -294,12 +294,17 @@ class Gemma4ForConditionalGeneration(nn.Module):
             lora_mapping,
             multimodal_embeddings=multimodal_embeddings,
         )
+        return_all = bool(
+            isinstance(attn_metadata, dict)
+            and attn_metadata.get("verifier_return_all_logits", False)
+        )
+        hidden_slice = hidden if return_all else hidden[:, -1:, :]
         if getattr(self.model.config, "tie_word_embeddings", False):
             logits = torch.nn.functional.linear(
-                hidden[:, -1:, :], self.model.embed_tokens.weight
+                hidden_slice, self.model.embed_tokens.weight
             )
         else:
-            logits = self.lm_head(hidden[:, -1:, :], lora_mapping)
+            logits = self.lm_head(hidden_slice, lora_mapping)
         final_softcap = getattr(self.model.config, "final_logit_softcapping", None)
         if final_softcap is not None and float(final_softcap) > 0:
             logits = torch.tanh(logits / float(final_softcap)) * float(final_softcap)
