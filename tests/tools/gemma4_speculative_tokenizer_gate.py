@@ -73,6 +73,13 @@ def _added_tokens(tokenizer: Any) -> dict[str, int]:
 
 def _expand_to_token_ids(tokenizer: Any, seed: str, target_len: int) -> list[int]:
     tokens = tokenizer.encode(seed)
+    if len(tokens) == 0:
+        if target_len == 0:
+            return []
+        raise ValueError(
+            f"Seed {seed!r} encoded to an empty token list; "
+            f"cannot expand to {target_len} tokens"
+        )
     if len(tokens) >= target_len:
         return tokens[:target_len]
     repeated = (seed + " ") * ((target_len // len(tokens)) + 2)
@@ -117,18 +124,34 @@ def check_special_tokens(target: Any, draft: Any) -> tuple[bool, dict[str, Any]]
 
 
 def check_encode(
-    target: Any, draft: Any, prompts: list[str]
+    target: Any, draft: Any, prompts: list[str] | list[tuple[str, list[int]]]
 ) -> tuple[bool, dict[str, Any]]:
-    """Compare encoded token IDs for every prompt, ignoring special tokens."""
+    """Compare encoded token IDs for every prompt, ignoring special tokens.
+
+    Each entry may be either a text string or a ``(text, expected_ids)`` pair.
+    When expected IDs are provided, both tokenizers must reproduce them exactly.
+    """
     per_prompt: list[dict[str, Any]] = []
     mismatches: list[str] = []
-    for prompt in prompts:
+    for entry in prompts:
+        if isinstance(entry, tuple):
+            prompt, expected_ids = entry
+        else:
+            prompt = entry
+            expected_ids = None
+
         target_ids = target.encode(prompt, add_special_tokens=False)
         draft_ids = draft.encode(prompt, add_special_tokens=False)
-        prompt_match = target_ids == draft_ids
+
+        if expected_ids is not None:
+            prompt_match = target_ids == expected_ids and draft_ids == expected_ids
+        else:
+            prompt_match = target_ids == draft_ids
+
         per_prompt.append(
             {
                 "prompt": prompt,
+                "expected_ids": expected_ids,
                 "target_ids": target_ids,
                 "draft_ids": draft_ids,
                 "match": prompt_match,
@@ -208,7 +231,7 @@ def build_report(
     draft_model: str,
     target: Any,
     draft: Any,
-    prompts: list[str],
+    prompts: list[str] | list[tuple[str, list[int]]],
     messages: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Run all tokenizer compatibility checks and assemble the report."""
@@ -250,10 +273,17 @@ def build_report(
     }
 
 
-def _load_prompts_from_fixture(tokenizer: Any, fixture_path: Path) -> list[str]:
-    """Load seed prompts from a fixture and expand them to exact token lengths."""
+def _load_prompts_from_fixture(
+    tokenizer: Any, fixture_path: Path
+) -> list[tuple[str, list[int]]]:
+    """Load seed prompts from a fixture and expand them to exact token lengths.
+
+    Returns a list of ``(text, token_ids)`` pairs.  The decoded ``text`` is kept
+    only for reporting; the token IDs are carried through and compared directly
+    by the encode check.
+    """
     data = json.loads(fixture_path.read_text())
-    expanded_prompts: list[str] = []
+    expanded_prompts: list[tuple[str, list[int]]] = []
     for item in data["prompts"]:
         token_ids = _expand_to_token_ids(tokenizer, item["text"], item["context_len"])
         actual_len = len(token_ids)
@@ -262,7 +292,7 @@ def _load_prompts_from_fixture(tokenizer: Any, fixture_path: Path) -> list[str]:
                 f"Prompt {item['id']!r}: expected {item['context_len']} tokens, "
                 f"got {actual_len}"
             )
-        expanded_prompts.append(tokenizer.decode(token_ids))
+        expanded_prompts.append((tokenizer.decode(token_ids), token_ids))
     return expanded_prompts
 
 

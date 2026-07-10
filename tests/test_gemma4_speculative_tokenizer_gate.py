@@ -150,6 +150,48 @@ def test_encode_mismatch_fails(gate_mod: Any) -> None:
     assert report["passed"] is False
 
 
+def test_direct_token_id_comparison_passes(gate_mod: Any) -> None:
+    target, draft = _identical_tokenizers()
+    expected_ids = [ord(c) for c in "hello"]
+    report = gate_mod.build_report(
+        "target", "draft", target, draft, [("hello", expected_ids)]
+    )
+
+    assert report["encode_match"] is True
+    assert report["passed"] is True
+    prompt_detail = report["details"]["encode"]["prompts"][0]
+    assert prompt_detail["expected_ids"] == expected_ids
+    assert prompt_detail["match"] is True
+
+
+def test_direct_token_id_comparison_fails_when_draft_differs(gate_mod: Any) -> None:
+    target = FakeTokenizer(encode_map={"hello": [10, 20, 30]})
+    draft = FakeTokenizer(encode_map={"hello": [10, 21, 30]})
+    report = gate_mod.build_report(
+        "target", "draft", target, draft, [("hello", [10, 20, 30])]
+    )
+
+    assert report["encode_match"] is False
+    assert report["passed"] is False
+
+
+def test_direct_token_id_comparison_fails_when_target_differs(gate_mod: Any) -> None:
+    target = FakeTokenizer(encode_map={"hello": [10, 20, 30]})
+    draft = FakeTokenizer(encode_map={"hello": [10, 20, 30]})
+    report = gate_mod.build_report(
+        "target", "draft", target, draft, [("hello", [99, 99, 99])]
+    )
+
+    assert report["encode_match"] is False
+    assert report["passed"] is False
+
+
+def test_expand_to_token_ids_guards_empty_seed(gate_mod: Any) -> None:
+    tokenizer = FakeTokenizer(encode_map={"empty": []})
+    with pytest.raises(ValueError, match="empty token list"):
+        gate_mod._expand_to_token_ids(tokenizer, "empty", 5)
+
+
 def test_chat_template_mismatch_is_diagnostic(gate_mod: Any) -> None:
     target = FakeTokenizer(chat_output="target_chat")
     draft = FakeTokenizer(chat_output="draft_chat")
