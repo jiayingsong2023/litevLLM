@@ -207,7 +207,11 @@ def baseline_greedy(llm: LLM, prompt_text: str, max_new_tokens: int) -> dict[str
             for out in outs:
                 if out.request_id != req_id:
                     continue
-                if first_decode_start is None and len(out.outputs[0].token_ids) > 0:
+                if (
+                    first_decode_start is None
+                    and out.outputs
+                    and len(out.outputs[0].token_ids) > 0
+                ):
                     first_decode_start = time.perf_counter()
                 if out.finished:
                     final_output = out
@@ -289,8 +293,9 @@ def generate_draft_tokens_from_ids(
             for out in outs:
                 if out.request_id != req_id:
                     continue
-                if out.finished or (
-                    final_output is None and len(out.outputs[0].token_ids) >= k
+                if out.outputs and (
+                    out.finished
+                    or (final_output is None and len(out.outputs[0].token_ids) >= k)
                 ):
                     final_output = out
 
@@ -422,7 +427,7 @@ def _expand_prompts_for_gate(
     for item in prompts:
         seed = item["text"]
         target_len = item["context_len"]
-        tokens = tokenizer.encode(seed)
+        tokens = tokenizer.encode(seed, add_special_tokens=False)
         if len(tokens) == 0:
             if target_len == 0:
                 expanded.append((seed, []))
@@ -435,7 +440,7 @@ def _expand_prompts_for_gate(
             tokens = tokens[:target_len]
         else:
             repeated = (seed + " ") * ((target_len // len(tokens)) + 2)
-            tokens = tokenizer.encode(repeated)[:target_len]
+            tokens = tokenizer.encode(repeated, add_special_tokens=False)[:target_len]
         actual_len = len(tokens)
         if actual_len != target_len:
             raise ValueError(
@@ -461,7 +466,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-model", default=_default_model_path())
     parser.add_argument(
         "--draft-model",
-        default=_default_draft_model_path(),
+        default=None,
         help="Optional draft model path. If unset, n-gram drafting is used.",
     )
     parser.add_argument(
@@ -520,11 +525,20 @@ def main(argv: list[str] | None = None) -> int:
     raw_prompts = _load_prompts(args.prompt_file)
 
     target_tok = _load_tokenizer(args.target_model)
-    draft_tok = _load_tokenizer(args.draft_model)
-    gate_prompts = _expand_prompts_for_gate(target_tok, raw_prompts)
-    gate = build_report(
-        args.target_model, args.draft_model, target_tok, draft_tok, gate_prompts
-    )
+    if args.draft_model is not None:
+        if not os.path.isdir(args.draft_model):
+            print(
+                f"[ERROR] draft model directory not found: {args.draft_model}",
+                file=sys.stderr,
+            )
+            return 2
+        draft_tok = _load_tokenizer(args.draft_model)
+        gate_prompts = _expand_prompts_for_gate(target_tok, raw_prompts)
+        gate = build_report(
+            args.target_model, args.draft_model, target_tok, draft_tok, gate_prompts
+        )
+    else:
+        gate = {"passed": True, "details": {}}
     if not gate["passed"]:
         print(json.dumps({"tokenizer_gate": gate}, indent=2), file=sys.stderr)
         return 2
@@ -534,7 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     max_k = 8
     needed_model_len = max_context + max_new_tokens + max_k + 32
 
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     target_llm = LLM(
         model=args.target_model,
         max_model_len=needed_model_len,
@@ -545,7 +560,8 @@ def main(argv: list[str] | None = None) -> int:
 
     draft_llm: LLM | None = None
     try:
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         draft_llm = LLM(
             model=args.draft_model,
             max_model_len=needed_model_len,
@@ -574,14 +590,20 @@ def main(argv: list[str] | None = None) -> int:
             draft_llm.shutdown()
         return 2
 
+    draft_total_time_s = 0.0
+
     try:
         if args.draft_model and os.path.isdir(args.draft_model):
 
             def draft_proposer(
                 prefix: list[int], generated: list[int], k: int
             ) -> list[int]:
+                nonlocal draft_total_time_s
                 context_ids = prefix + generated
-                return generate_draft_tokens_from_ids(draft_llm, context_ids, k)
+                start = time.perf_counter()
+                tokens = generate_draft_tokens_from_ids(draft_llm, context_ids, k)
+                draft_total_time_s += time.perf_counter() - start
+                return tokens
         else:
 
             def draft_proposer(
@@ -662,6 +684,9 @@ def main(argv: list[str] | None = None) -> int:
                     "projected_tps": spec_result["projected_tps"],
                 }
             )
+
+        if args.draft_model and os.path.isdir(args.draft_model):
+            total_decode_time += draft_total_time_s
 
         aggregate_acceptance_rate = (
             total_accepted / total_proposed if total_proposed > 0 else 0.0

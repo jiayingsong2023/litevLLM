@@ -748,7 +748,10 @@ def test_cli_with_draft_model_computes_effective_tps(
             "decode_tps": 10.0,
         }
 
-    def _mock_speculate(*args, **kwargs):
+    def _mock_speculate(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        # Exercise the draft proposer so draft-generation time is recorded.
+        draft_proposer = args[1]
+        draft_proposer([1, 2, 3], [], kwargs.get("num_draft_tokens", 2))
         return {
             "token_ids": [10, 11],
             "baseline_token_ids": [],
@@ -766,10 +769,15 @@ def test_cli_with_draft_model_computes_effective_tps(
     _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+
+    def _mock_generate_draft(*args: Any, **kwargs: Any) -> list[int]:
+        time.sleep(0.05)
+        return [20, 21]
+
     monkeypatch.setattr(
         proto_mod,
         "generate_draft_tokens_from_ids",
-        lambda *args, **kwargs: [20, 21],
+        _mock_generate_draft,
     )
     json_out = tmp_path / "out.json"
     monkeypatch.setattr(
@@ -796,14 +804,19 @@ def test_cli_with_draft_model_computes_effective_tps(
     rc = proto_mod.main()
     assert rc == 0
     data = json.loads(json_out.read_text())
-    assert data["summary"]["effective_tps"] == pytest.approx(2.0 / 0.1)
+    # effective_tps must include both verify (0.1) and draft generation (~0.05).
+    assert data["summary"]["effective_tps"] == pytest.approx(
+        2.0 / (0.1 + 0.05), rel=0.15
+    )
 
 
 def test_cli_tokenizer_gate_failure_returns_two(
     proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     target_dir = tmp_path / "fake-target"
+    draft_dir = tmp_path / "fake-draft"
     target_dir.mkdir()
+    draft_dir.mkdir()
     fixture_path = tmp_path / "fixture.json"
     fixture_path.write_text(
         _make_fixture(
@@ -842,6 +855,8 @@ def test_cli_tokenizer_gate_failure_returns_two(
             "gemma4_speculative_prototype.py",
             "--target-model",
             str(target_dir),
+            "--draft-model",
+            str(draft_dir),
             "--prompt-file",
             str(fixture_path),
         ],
