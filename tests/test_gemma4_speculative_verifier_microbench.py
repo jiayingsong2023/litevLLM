@@ -346,3 +346,66 @@ def test_step_state_machine_k_zero_terminating_tail(
     assert state.catchup_forwards == 0
     assert target_req.seq_len == 11
     assert draft_req.seq_len == 10
+
+
+def test_prefill_draft_persistent_keeps_request_alive(
+    verifier_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Draft prefill must keep the scheduler request alive for manual decode."""
+
+    class _FakeRequest:
+        def __init__(self, request_id: str) -> None:
+            self.request_id = request_id
+            self.slot_idx = 0
+            self.seq_len = 5
+            self.generated_ids: list[int] = [42]
+            self.is_prefill = True
+
+    class _FakeScheduler:
+        def __init__(self) -> None:
+            self._requests: dict[str, _FakeRequest] = {}
+
+        def get_request(self, request_id: str) -> _FakeRequest:
+            return self._requests[request_id]
+
+        def add_request(self, request_id: str, req: _FakeRequest) -> None:
+            self._requests[request_id] = req
+
+    class _FakeOutput:
+        def __init__(self, request_id: str) -> None:
+            self.request_id = request_id
+            self.outputs = [SimpleNamespace(token_ids=[1])]
+            self.finished = False
+
+    class _FakeEngine:
+        def __init__(self, scheduler: _FakeScheduler) -> None:
+            self.scheduler = scheduler
+
+        def step(self) -> list[Any]:
+            return [_FakeOutput(captured["request_id"])]
+
+    scheduler = _FakeScheduler()
+    captured: dict[str, Any] = {"request_id": None, "sampling_params": None}
+
+    def fake_add_request(
+        llm: Any,
+        request_id: str,
+        input_ids: list[int],
+        sampling_params: Any,
+    ) -> None:
+        captured["request_id"] = request_id
+        captured["sampling_params"] = sampling_params
+        scheduler.add_request(request_id, _FakeRequest(request_id))
+
+    monkeypatch.setattr(verifier_mod, "_add_request_with_token_ids", fake_add_request)
+
+    fake_llm = SimpleNamespace(engine=_FakeEngine(scheduler))
+    req_id = verifier_mod._prefill_draft_persistent(fake_llm, [10, 20, 30])
+
+    assert req_id == captured["request_id"]
+    assert captured["sampling_params"].ignore_eos is True
+
+    req = scheduler.get_request(req_id)
+    assert req.seq_len == 3
+    assert req.generated_ids == []
+    assert req.is_prefill is False

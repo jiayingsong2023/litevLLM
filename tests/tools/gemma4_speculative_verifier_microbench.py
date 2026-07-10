@@ -303,7 +303,7 @@ def _prefill_draft_persistent(llm: LLM, prompt_ids: list[int]) -> str:
         llm,
         req_id,
         prompt_ids,
-        SamplingParams(temperature=0.0, max_tokens=999999),
+        SamplingParams(temperature=0.0, max_tokens=999999, ignore_eos=True),
     )
     saw_output = False
     step_budget = max(64, len(prompt_ids) * 2)
