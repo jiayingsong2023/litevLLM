@@ -553,11 +553,14 @@ def test_cli_writes_json(
     _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
-    monkeypatch.setattr(
-        proto_mod,
-        "LLM",
-        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
-    )
+
+    llm_calls: list[str | None] = []
+
+    def fake_llm(**kwargs):
+        llm_calls.append(kwargs.get("model"))
+        return SimpleNamespace(shutdown=lambda: None)
+
+    monkeypatch.setattr(proto_mod, "LLM", fake_llm)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -580,6 +583,85 @@ def test_cli_writes_json(
     assert "acceptance_rate" in data["prompts"][0]
     assert "projected_tps" in data["prompts"][0]
     assert data["summary"]["mean_baseline_decode_tps"] == 20.0
+    assert llm_calls == [str(model_dir)]
+
+
+def test_cli_omitted_draft_model_uses_ngram(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When --draft-model is omitted the prototype must not load a draft LLM."""
+    model_dir = tmp_path / "fake-model"
+    model_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [
+                {
+                    "id": "p1",
+                    "text": "hello",
+                    "context_len": 3,
+                    "max_new_tokens": 2,
+                }
+            ]
+        )
+    )
+    json_out = tmp_path / "out.json"
+
+    def _mock_baseline(*args, **kwargs):
+        return {
+            "prompt_token_ids": [1, 2, 3],
+            "token_ids": [10, 11],
+            "prefill_time_s": 0.1,
+            "decode_time_s": 0.05,
+            "decode_tps": 20.0,
+        }
+
+    def _mock_speculate(*args, **kwargs):
+        return {
+            "token_ids": [10, 11],
+            "baseline_token_ids": [],
+            "bit_exact": True,
+            "accepted_total": 0,
+            "proposed_total": 0,
+            "acceptance_rate": 0.0,
+            "target_forwards": 2,
+            "verify_time_s": 0.1,
+            "baseline_tps": 0.0,
+            "speculative_tps": 0.0,
+            "projected_tps": 0.0,
+        }
+
+    llm_calls: list[str | None] = []
+
+    def fake_llm(**kwargs):
+        llm_calls.append(kwargs.get("model"))
+        return SimpleNamespace(shutdown=lambda: None)
+
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
+    monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
+    monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
+    monkeypatch.setattr(proto_mod, "LLM", fake_llm)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(model_dir),
+            "--prompt-file",
+            str(fixture_path),
+            "--json-out",
+            str(json_out),
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 0
+    assert json_out.exists()
+    assert llm_calls == [str(model_dir)]
+    data = json.loads(json_out.read_text())
+    assert data["draft_model"] is None
+    assert data["summary"]["effective_tps"] > 0
 
 
 def test_cli_returns_error_on_mismatch(

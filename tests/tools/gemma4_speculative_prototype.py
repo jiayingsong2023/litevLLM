@@ -455,10 +455,6 @@ def _default_model_path() -> str:
     return "models/gemma-4-26B-A4B-it-AWQ-4bit"
 
 
-def _default_draft_model_path() -> str:
-    return "models/gemma-4-E2B-it-AWQ-INT4"
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Offline speculative decoding prototype for Gemma4.",
@@ -559,28 +555,29 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     draft_llm: LLM | None = None
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        draft_llm = LLM(
-            model=args.draft_model,
-            max_model_len=needed_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_num_seqs=1,
-            max_num_batched_tokens=1024,
-        )
-    except torch.cuda.OutOfMemoryError as e:
-        memory_report = {
-            "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
-            "free_gb": 0.0,
-            "total_gb": 0.0,
-            "free_ratio": 0.0,
-            "memory_gate_passed": False,
-            "error": str(e),
-        }
-        print(json.dumps({"memory_gate": memory_report}, indent=2), file=sys.stderr)
-        target_llm.shutdown()
-        return 2
+    if args.draft_model is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            draft_llm = LLM(
+                model=args.draft_model,
+                max_model_len=needed_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                max_num_seqs=1,
+                max_num_batched_tokens=1024,
+            )
+        except torch.cuda.OutOfMemoryError as e:
+            memory_report = {
+                "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+                "free_gb": 0.0,
+                "total_gb": 0.0,
+                "free_ratio": 0.0,
+                "memory_gate_passed": False,
+                "error": str(e),
+            }
+            print(json.dumps({"memory_gate": memory_report}, indent=2), file=sys.stderr)
+            target_llm.shutdown()
+            return 2
 
     memory_report = _build_memory_report()
     if not memory_report["memory_gate_passed"]:
@@ -659,10 +656,9 @@ def main(argv: list[str] | None = None) -> int:
                 theoretical_speedup = 1.0
             spec_result["projected_tps"] = baseline_tps * theoretical_speedup
 
-            if args.draft_model and os.path.isdir(args.draft_model):
-                # Effective TPS is accumulated globally, not per prompt.
-                total_decode_tokens += spec_result["accepted_total"] + target_forwards
-                total_decode_time += spec_result["verify_time_s"]
+            # Effective TPS is accumulated globally, not per prompt.
+            total_decode_tokens += spec_result["accepted_total"] + target_forwards
+            total_decode_time += spec_result["verify_time_s"]
 
             prompt_results.append(
                 {
