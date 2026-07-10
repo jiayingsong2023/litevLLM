@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +27,10 @@ def _load_module() -> Any:
 @pytest.fixture(scope="module")
 def proto_mod() -> Any:
     return _load_module()
+
+
+def _make_fixture(prompts: list[dict[str, Any]]) -> str:
+    return json.dumps({"version": 1, "prompts": prompts})
 
 
 def test_propose_ngram_finds_repeated_suffix(proto_mod: Any) -> None:
@@ -278,6 +283,195 @@ def test_speculative_decode_truncates_to_max_new_tokens(
     assert result["token_ids"] == [10, 11, 12]
 
 
+def test_baseline_greedy_splits_prefill_decode_timings(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """baseline_greedy should report separate prefill and decode timings."""
+
+    class FakeOutput:
+        def __init__(self, request_id: str, token_ids: list[int]) -> None:
+            self.request_id = request_id
+            self.finished = True
+            self.outputs = [SimpleNamespace(token_ids=list(token_ids))]
+            self.prompt_token_ids = [1, 2, 3]
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self._active = 1
+            self._request_id: str = ""
+
+        @property
+        def active_request_count(self) -> int:
+            return self._active
+
+        def add_request(self, request_id: str, *args: Any, **kwargs: Any) -> None:
+            self._request_id = request_id
+
+        def step(self) -> list[Any]:
+            time.sleep(0.005)
+            self._active = 0
+            return [FakeOutput(self._request_id, [10, 11, 12])]
+
+        def abort_request(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    fake_engine = FakeEngine()
+    fake_tokenizer = SimpleNamespace(
+        encode=lambda text: [1, 2, 3],
+        chat_template=None,
+    )
+    fake_llm = SimpleNamespace(
+        engine=fake_engine,
+        tokenizer=fake_tokenizer,
+    )
+
+    result = proto_mod.baseline_greedy(fake_llm, "hello", max_new_tokens=3)
+
+    assert result["prompt_token_ids"] == [1, 2, 3]
+    assert result["token_ids"] == [10, 11, 12]
+    assert result["prefill_time_s"] > 0
+    assert result["decode_time_s"] >= 0
+    # Three generated tokens; decode TPS excludes the first prefill-produced token.
+    assert result["decode_tps"] == pytest.approx(2.0 / result["decode_time_s"], rel=0.1)
+
+
+def test_add_request_with_token_ids_builds_and_enqueues(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_add_request_with_token_ids initializes the builder and enqueues the request."""
+    built_request = SimpleNamespace(input_ids=[], guarded_prompt="wrong")
+    requests: list[Any] = []
+
+    def fake_build(*, request_id: str, prompt: str, sampling_params: Any) -> Any:
+        return built_request
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.admitted: list[str] = []
+
+        def enqueue_request(self, request_id: str, req: Any) -> None:
+            requests.append((request_id, req))
+
+        def admit_queued_requests(self, max_new: int) -> list[str]:
+            self.admitted = ["draft_1"]
+            return self.admitted
+
+    fake_scheduler = FakeScheduler()
+    fake_engine = SimpleNamespace(
+        request_builder=SimpleNamespace(build=fake_build),
+        scheduler=fake_scheduler,
+    )
+    fake_llm = SimpleNamespace(engine=fake_engine)
+
+    proto_mod._add_request_with_token_ids(
+        fake_llm,
+        "draft_1",
+        [1, 2, 3],
+        SimpleNamespace(),
+    )
+
+    assert len(requests) == 1
+    assert requests[0][0] == "draft_1"
+    assert requests[0][1].input_ids == [1, 2, 3]
+    assert requests[0][1].guarded_prompt == ""
+
+
+def test_add_request_with_token_ids_initializes_lazy_builder(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When request_builder is None, the helper initializes it with a dummy request."""
+    built_request = SimpleNamespace(input_ids=[], guarded_prompt="")
+
+    def fake_build(*, request_id: str, prompt: str, sampling_params: Any) -> Any:
+        return built_request
+
+    class FakeScheduler:
+        def enqueue_request(self, request_id: str, req: Any) -> None:
+            pass
+
+        def admit_queued_requests(self, max_new: int) -> list[str]:
+            return ["draft_2"]
+
+    added_requests: list[tuple[str, str, Any]] = []
+    aborted_requests: list[str] = []
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.request_builder: Any | None = None
+
+        def add_request(self, request_id: str, prompt: str, sp: Any) -> None:
+            added_requests.append((request_id, prompt, sp))
+            self.request_builder = SimpleNamespace(build=fake_build)
+
+        def abort_request(self, request_id: str) -> None:
+            aborted_requests.append(request_id)
+
+    fake_engine = FakeEngine()
+    fake_engine.scheduler = FakeScheduler()
+    fake_llm = SimpleNamespace(engine=fake_engine)
+
+    proto_mod._add_request_with_token_ids(
+        fake_llm,
+        "draft_2",
+        [4, 5, 6],
+        SimpleNamespace(),
+    )
+
+    assert len(added_requests) == 1
+    assert added_requests[0][0] == "__init_request_builder__"
+    assert aborted_requests == ["__init_request_builder__"]
+    assert built_request.input_ids == [4, 5, 6]
+
+
+def test_generate_draft_tokens_from_ids_returns_expected_tokens(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_draft_tokens_from_ids drives the engine until k tokens are produced."""
+
+    class FakeOutput:
+        def __init__(self, request_id: str, step_count: int) -> None:
+            self.request_id = request_id
+            self.outputs = [SimpleNamespace(token_ids=[10, 11][:step_count])]
+            self.finished = step_count >= 2
+            self.prompt_token_ids = [1, 2, 3]
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.last_request_id: str | None = None
+
+        def enqueue_request(self, request_id: str, req: Any) -> None:
+            self.last_request_id = request_id
+
+        def admit_queued_requests(self, max_new: int) -> list[str]:
+            assert self.last_request_id is not None
+            return [self.last_request_id]
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.scheduler = FakeScheduler()
+            self.request_builder = SimpleNamespace(
+                build=lambda **kwargs: SimpleNamespace(input_ids=[], guarded_prompt="")
+            )
+
+        @property
+        def active_request_count(self) -> int:
+            return 1 if self.calls < 2 else 0
+
+        def step(self) -> list[Any]:
+            self.calls += 1
+            return [FakeOutput(self.scheduler.last_request_id or "", self.calls)]
+
+        def abort_request(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    fake_llm = SimpleNamespace(engine=FakeEngine())
+
+    result = proto_mod.generate_draft_tokens_from_ids(fake_llm, [1, 2, 3], k=2)
+
+    assert result == [10, 11]
+
+
 def test_cli_help_exits_zero(
     proto_mod: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -290,37 +484,79 @@ def test_cli_help_exits_zero(
     assert "--num-draft-tokens" in captured.out
 
 
+def _patch_tokenizer_gate(proto_mod: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_tokenizer = SimpleNamespace(
+        encode=lambda text, add_special_tokens=False: [1, 2, 3],
+        decode=lambda ids: "hello",
+        get_vocab=lambda: {"a": 0, "b": 1},
+        added_tokens_encoder={},
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+        chat_template=None,
+    )
+    monkeypatch.setattr(proto_mod, "_load_tokenizer", lambda model_path: fake_tokenizer)
+    monkeypatch.setattr(
+        proto_mod,
+        "build_report",
+        lambda *args, **kwargs: {"passed": True, "details": {}},
+    )
+
+
 def test_cli_writes_json(
     proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     model_dir = tmp_path / "fake-model"
     model_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [
+                {
+                    "id": "p1",
+                    "text": "hello",
+                    "context_len": 3,
+                    "max_new_tokens": 2,
+                }
+            ]
+        )
+    )
     json_out = tmp_path / "out.json"
 
     reference = [10, 11]
     prompt = [1, 2, 3]
 
     def _mock_baseline(*args, **kwargs):
-        return prompt, list(reference)
+        return {
+            "prompt_token_ids": list(prompt),
+            "token_ids": list(reference),
+            "prefill_time_s": 0.1,
+            "decode_time_s": 0.05,
+            "decode_tps": 20.0,
+        }
 
     def _mock_speculate(*args, **kwargs):
         return {
             "token_ids": list(reference),
-            "baseline_token_ids": list(reference),
-            "bit_exact": True,
+            "baseline_token_ids": [],
+            "bit_exact": False,
             "accepted_total": 2,
             "proposed_total": 2,
             "acceptance_rate": 1.0,
             "target_forwards": 1,
+            "verify_time_s": 0.0,
             "baseline_tps": 0.0,
             "speculative_tps": 0.0,
             "projected_tps": 0.0,
         }
 
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
     monkeypatch.setattr(
-        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+        proto_mod,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
     )
     monkeypatch.setattr(
         sys,
@@ -329,10 +565,8 @@ def test_cli_writes_json(
             "gemma4_speculative_prototype.py",
             "--target-model",
             str(model_dir),
-            "--prompt",
-            "hello",
-            "--max-new-tokens",
-            "2",
+            "--prompt-file",
+            str(fixture_path),
             "--json-out",
             str(json_out),
         ],
@@ -342,11 +576,10 @@ def test_cli_writes_json(
     assert rc == 0
     assert json_out.exists()
     data = json.loads(json_out.read_text())
-    assert data["bit_exact"] is True
-    assert "acceptance_rate" in data
-    assert "projected_tps" in data
-    assert "effective_tps" in data
-    assert data["draft_model"] is None
+    assert data["summary"]["bit_exact_all"] is True
+    assert "acceptance_rate" in data["prompts"][0]
+    assert "projected_tps" in data["prompts"][0]
+    assert data["summary"]["mean_baseline_decode_tps"] == 20.0
 
 
 def test_cli_returns_error_on_mismatch(
@@ -354,9 +587,28 @@ def test_cli_returns_error_on_mismatch(
 ) -> None:
     model_dir = tmp_path / "fake-model"
     model_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [
+                {
+                    "id": "p1",
+                    "text": "hello",
+                    "context_len": 3,
+                    "max_new_tokens": 2,
+                }
+            ]
+        )
+    )
 
     def _mock_baseline(*args, **kwargs):
-        return [1, 2, 3], [10, 11]
+        return {
+            "prompt_token_ids": [1, 2, 3],
+            "token_ids": [10, 11],
+            "prefill_time_s": 0.1,
+            "decode_time_s": 0.05,
+            "decode_tps": 20.0,
+        }
 
     def _mock_speculate(*args, **kwargs):
         return {
@@ -367,15 +619,19 @@ def test_cli_returns_error_on_mismatch(
             "proposed_total": 2,
             "acceptance_rate": 0.0,
             "target_forwards": 1,
+            "verify_time_s": 0.0,
             "baseline_tps": 0.0,
             "speculative_tps": 0.0,
             "projected_tps": 0.0,
         }
 
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
     monkeypatch.setattr(
-        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+        proto_mod,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
     )
     monkeypatch.setattr(
         sys,
@@ -384,10 +640,8 @@ def test_cli_returns_error_on_mismatch(
             "gemma4_speculative_prototype.py",
             "--target-model",
             str(model_dir),
-            "--prompt",
-            "hello",
-            "--max-new-tokens",
-            "2",
+            "--prompt-file",
+            str(fixture_path),
         ],
     )
 
@@ -400,9 +654,28 @@ def test_cli_allows_mismatch_when_fail_flag_disabled(
 ) -> None:
     model_dir = tmp_path / "fake-model"
     model_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [
+                {
+                    "id": "p1",
+                    "text": "hello",
+                    "context_len": 3,
+                    "max_new_tokens": 2,
+                }
+            ]
+        )
+    )
 
     def _mock_baseline(*args, **kwargs):
-        return [1, 2, 3], [10, 11]
+        return {
+            "prompt_token_ids": [1, 2, 3],
+            "token_ids": [10, 11],
+            "prefill_time_s": 0.1,
+            "decode_time_s": 0.05,
+            "decode_tps": 20.0,
+        }
 
     def _mock_speculate(*args, **kwargs):
         return {
@@ -413,15 +686,19 @@ def test_cli_allows_mismatch_when_fail_flag_disabled(
             "proposed_total": 2,
             "acceptance_rate": 0.0,
             "target_forwards": 1,
+            "verify_time_s": 0.0,
             "baseline_tps": 0.0,
             "speculative_tps": 0.0,
             "projected_tps": 0.0,
         }
 
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
     monkeypatch.setattr(
-        proto_mod, "LLM", lambda **kwargs: SimpleNamespace(shutdown=lambda: None)
+        proto_mod,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
     )
     monkeypatch.setattr(
         sys,
@@ -430,10 +707,8 @@ def test_cli_allows_mismatch_when_fail_flag_disabled(
             "gemma4_speculative_prototype.py",
             "--target-model",
             str(model_dir),
-            "--prompt",
-            "hello",
-            "--max-new-tokens",
-            "2",
+            "--prompt-file",
+            str(fixture_path),
             "--fail-on-mismatch",
             "false",
         ],
@@ -450,9 +725,28 @@ def test_cli_with_draft_model_computes_effective_tps(
     draft_dir = tmp_path / "fake-draft"
     target_dir.mkdir()
     draft_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [
+                {
+                    "id": "p1",
+                    "text": "hello",
+                    "context_len": 3,
+                    "max_new_tokens": 2,
+                }
+            ]
+        )
+    )
 
     def _mock_baseline(*args, **kwargs):
-        return [1, 2, 3], [10, 11]
+        return {
+            "prompt_token_ids": [1, 2, 3],
+            "token_ids": [10, 11],
+            "prefill_time_s": 0.1,
+            "decode_time_s": 0.05,
+            "decode_tps": 10.0,
+        }
 
     def _mock_speculate(*args, **kwargs):
         return {
@@ -469,20 +763,19 @@ def test_cli_with_draft_model_computes_effective_tps(
             "projected_tps": 15.0,
         }
 
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
     monkeypatch.setattr(proto_mod, "baseline_greedy", _mock_baseline)
     monkeypatch.setattr(proto_mod, "speculative_decode", _mock_speculate)
     monkeypatch.setattr(
-        proto_mod, "generate_draft_tokens", lambda *args, **kwargs: [20, 21]
+        proto_mod,
+        "generate_draft_tokens_from_ids",
+        lambda *args, **kwargs: [20, 21],
     )
-    fake_tokenizer = SimpleNamespace(
-        decode=lambda ids, skip_special_tokens=False: "decoded text"
-    )
+    json_out = tmp_path / "out.json"
     monkeypatch.setattr(
         proto_mod,
         "LLM",
-        lambda **kwargs: SimpleNamespace(
-            shutdown=lambda: None, tokenizer=fake_tokenizer
-        ),
+        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
     )
     monkeypatch.setattr(
         sys,
@@ -493,12 +786,118 @@ def test_cli_with_draft_model_computes_effective_tps(
             str(target_dir),
             "--draft-model",
             str(draft_dir),
-            "--prompt",
-            "hello",
-            "--max-new-tokens",
-            "2",
+            "--prompt-file",
+            str(fixture_path),
+            "--json-out",
+            str(json_out),
         ],
     )
 
     rc = proto_mod.main()
     assert rc == 0
+    data = json.loads(json_out.read_text())
+    assert data["summary"]["effective_tps"] == pytest.approx(2.0 / 0.1)
+
+
+def test_cli_tokenizer_gate_failure_returns_two(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target_dir = tmp_path / "fake-target"
+    target_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [{"id": "p1", "text": "hello", "context_len": 3, "max_new_tokens": 2}]
+        )
+    )
+
+    fake_tokenizer = SimpleNamespace(
+        encode=lambda text, add_special_tokens=False: [1, 2, 3],
+        decode=lambda ids: "hello",
+        get_vocab=lambda: {"a": 0},
+        added_tokens_encoder={},
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=2,
+        chat_template=None,
+    )
+    monkeypatch.setattr(proto_mod, "_load_tokenizer", lambda model_path: fake_tokenizer)
+    monkeypatch.setattr(
+        proto_mod,
+        "build_report",
+        lambda *args, **kwargs: {
+            "passed": False,
+            "details": {"reason": "vocab mismatch"},
+        },
+    )
+    monkeypatch.setattr(
+        proto_mod,
+        "LLM",
+        lambda **kwargs: SimpleNamespace(shutdown=lambda: None),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(target_dir),
+            "--prompt-file",
+            str(fixture_path),
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 2
+
+
+def test_cli_memory_gate_failure_on_oom(
+    proto_mod: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target_dir = tmp_path / "fake-target"
+    draft_dir = tmp_path / "fake-draft"
+    target_dir.mkdir()
+    draft_dir.mkdir()
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        _make_fixture(
+            [{"id": "p1", "text": "hello", "context_len": 3, "max_new_tokens": 2}]
+        )
+    )
+
+    calls: list[str] = []
+
+    def fake_llm(**kwargs):
+        calls.append(kwargs.get("model"))
+        return SimpleNamespace(shutdown=lambda: None)
+
+    _patch_tokenizer_gate(proto_mod, monkeypatch)
+    monkeypatch.setattr(proto_mod, "LLM", fake_llm)
+
+    class OOMError(Exception):
+        pass
+
+    monkeypatch.setattr(torch.cuda, "OutOfMemoryError", OOMError)
+
+    def raise_oom(**kwargs):
+        if kwargs.get("model") == str(draft_dir):
+            raise OOMError("fake oom")
+        return SimpleNamespace(shutdown=lambda: None)
+
+    monkeypatch.setattr(proto_mod, "LLM", raise_oom)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gemma4_speculative_prototype.py",
+            "--target-model",
+            str(target_dir),
+            "--draft-model",
+            str(draft_dir),
+            "--prompt-file",
+            str(fixture_path),
+        ],
+    )
+
+    rc = proto_mod.main()
+    assert rc == 2

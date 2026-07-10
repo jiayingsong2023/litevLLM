@@ -13,8 +13,16 @@ from typing import Any
 
 import torch
 
+from tests.tools.gemma4_speculative_tokenizer_gate import (
+    _load_tokenizer,
+    build_report,
+)
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
+
+DEFAULT_PROMPT_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "gemma4_speculative_prompts.json"
+)
 
 
 def propose_ngram(
@@ -163,14 +171,13 @@ def _apply_chat_template(tokenizer: Any, text: str) -> str:
         return text
 
 
-def baseline_greedy(
-    llm: LLM, prompt_text: str, max_new_tokens: int
-) -> tuple[list[int], list[int]]:
-    """Greedy baseline run. Returns (prompt_token_ids, generated_token_ids).
+def baseline_greedy(llm: LLM, prompt_text: str, max_new_tokens: int) -> dict[str, Any]:
+    """Greedy baseline run.
 
-    Uses the engine's step loop directly (rather than ``LLM.generate``) so that
-    Gemma4's prefill-only first step, which produces no outputs, does not abort
-    the run.
+    Returns a dict with prompt token IDs, generated token IDs, and split
+    prefill/decode timings.  Uses the engine's step loop directly (rather than
+    ``LLM.generate``) so that Gemma4's prefill-only first step, which produces
+    no outputs, does not abort the run.
     """
     tokenizer = getattr(llm, "tokenizer", None)
     wrapped_prompt = _apply_chat_template(tokenizer, prompt_text)
@@ -191,6 +198,8 @@ def baseline_greedy(
 
     final_output: Any | None = None
     step_count = 0
+    first_decode_start: float | None = None
+    baseline_start = time.perf_counter()
     try:
         while llm.engine.active_request_count > 0 and step_count < step_budget:
             step_count += 1
@@ -198,6 +207,8 @@ def baseline_greedy(
             for out in outs:
                 if out.request_id != req_id:
                     continue
+                if first_decode_start is None and len(out.outputs[0].token_ids) > 0:
+                    first_decode_start = time.perf_counter()
                 if out.finished:
                     final_output = out
 
@@ -211,18 +222,62 @@ def baseline_greedy(
             with suppress(Exception):
                 llm.engine.abort_request(req_id)
 
-    return list(final_output.prompt_token_ids), list(final_output.outputs[0].token_ids)
+    baseline_end = time.perf_counter()
+    first_decode_start = first_decode_start or baseline_end
+
+    prefill_elapsed = first_decode_start - baseline_start
+    decode_elapsed = baseline_end - first_decode_start
+    baseline_token_ids = list(final_output.outputs[0].token_ids)
+    # The first token is produced by the prefill step and is not part of decode TPS.
+    decode_tokens = max(0, len(baseline_token_ids) - 1)
+    baseline_decode_tps = decode_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
+
+    return {
+        "prompt_token_ids": list(final_output.prompt_token_ids),
+        "token_ids": baseline_token_ids,
+        "prefill_time_s": prefill_elapsed,
+        "decode_time_s": decode_elapsed,
+        "decode_tps": baseline_decode_tps,
+    }
 
 
-def generate_draft_tokens(draft_llm: LLM, prompt_text: str, k: int) -> list[int]:
-    """Greedy-decode up to k tokens from the draft model.
+def _add_request_with_token_ids(
+    llm: LLM,
+    request_id: str,
+    input_ids: list[int],
+    sampling_params: SamplingParams,
+) -> None:
+    """Enqueue a request using exact token IDs, bypassing text tokenization."""
+    engine = llm.engine
+    # The request_builder is lazily created on the first public add_request.
+    if engine.request_builder is None:
+        # Trigger initialization with a prompt that is immediately aborted.
+        engine.add_request(
+            "__init_request_builder__",
+            "",
+            SamplingParams(temperature=0.0, max_tokens=1),
+        )
+        engine.abort_request("__init_request_builder__")
+    assert engine.request_builder is not None
+    req = engine.request_builder.build(
+        request_id=request_id,
+        prompt="",
+        sampling_params=sampling_params,
+    )
+    req.input_ids = list(input_ids)
+    req.guarded_prompt = ""
+    engine.scheduler.enqueue_request(request_id, req)
+    admitted = engine.scheduler.admit_queued_requests(max_new=1)
+    assert request_id in admitted, f"draft request {request_id} was not admitted"
 
-    Uses the engine step loop directly so that Gemma4's prefill-only first step
-    does not abort the run.
-    """
-    sp = SamplingParams(temperature=0.0, max_tokens=k)
+
+def generate_draft_tokens_from_ids(
+    draft_llm: LLM, context_ids: list[int], k: int
+) -> list[int]:
+    """Greedy-decode up to k draft tokens from the draft model using token IDs."""
+    sp = SamplingParams(temperature=0.0, max_tokens=k, min_tokens=1)
     req_id = f"draft_generate_{time.time_ns()}"
-    draft_llm.engine.add_request(req_id, prompt_text, sp)
+    _add_request_with_token_ids(draft_llm, req_id, context_ids, sp)
 
     final_output: Any | None = None
     step_count = 0
@@ -249,7 +304,12 @@ def generate_draft_tokens(draft_llm: LLM, prompt_text: str, k: int) -> list[int]
             with suppress(Exception):
                 draft_llm.engine.abort_request(req_id)
 
-    return list(final_output.outputs[0].token_ids)[:k]
+    generated = list(final_output.outputs[0].token_ids)
+    # Sanity check: the engine consumed exactly the token IDs we provided.
+    assert list(final_output.prompt_token_ids) == context_ids, (
+        "draft engine prompt token IDs do not match input token IDs"
+    )
+    return generated[:k]
 
 
 def speculative_decode(
@@ -348,97 +408,180 @@ def speculative_decode(
     }
 
 
+def _load_prompts(prompt_file: str) -> list[dict[str, Any]]:
+    """Load the prompt fixture as a list of prompt entries."""
+    data = json.loads(Path(prompt_file).read_text())
+    return list(data["prompts"])
+
+
+def _expand_prompts_for_gate(
+    tokenizer: Any, prompts: list[dict[str, Any]]
+) -> list[tuple[str, list[int]]]:
+    """Expand fixture prompts to exact context lengths for the tokenizer gate."""
+    expanded: list[tuple[str, list[int]]] = []
+    for item in prompts:
+        seed = item["text"]
+        target_len = item["context_len"]
+        tokens = tokenizer.encode(seed)
+        if len(tokens) == 0:
+            if target_len == 0:
+                expanded.append((seed, []))
+                continue
+            raise ValueError(
+                f"Prompt {item.get('id', seed)!r} encoded to an empty token list; "
+                f"cannot expand to {target_len} tokens"
+            )
+        if len(tokens) >= target_len:
+            tokens = tokens[:target_len]
+        else:
+            repeated = (seed + " ") * ((target_len // len(tokens)) + 2)
+            tokens = tokenizer.encode(repeated)[:target_len]
+        actual_len = len(tokens)
+        if actual_len != target_len:
+            raise ValueError(
+                f"Prompt {item.get('id', seed)!r}: expected {target_len} tokens, "
+                f"got {actual_len}"
+            )
+        expanded.append((tokenizer.decode(tokens), tokens))
+    return expanded
+
+
 def _default_model_path() -> str:
     return "models/gemma-4-26B-A4B-it-AWQ-4bit"
 
 
+def _default_draft_model_path() -> str:
+    return "models/gemma-4-E2B-it-AWQ-INT4"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Offline n-gram speculative decoding prototype for Gemma4.",
+        description="Offline speculative decoding prototype for Gemma4.",
     )
     parser.add_argument("--target-model", default=_default_model_path())
     parser.add_argument(
         "--draft-model",
-        default=None,
-        help="Optional draft model path. If set, use a small LLM instead of n-grams.",
+        default=_default_draft_model_path(),
+        help="Optional draft model path. If unset, n-gram drafting is used.",
     )
-    parser.add_argument("--prompt", default="The capital of France is")
-    parser.add_argument("--prompt-file", default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument(
+        "--prompt-file",
+        default=str(DEFAULT_PROMPT_FIXTURE),
+        help="Path to the JSON prompt fixture.",
+    )
     parser.add_argument("--num-draft-tokens", type=int, default=5)
     parser.add_argument("--ngram-min", type=int, default=2)
     parser.add_argument("--ngram-max", type=int, default=4)
-    parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--json-out", default=None)
     parser.add_argument(
         "--fail-on-mismatch",
         type=lambda x: x.lower() in ("1", "true", "yes"),
         default=True,
-        help="Exit with code 1 when bit_exact is false (default: true).",
+        help="Exit with code 1 when any prompt is not bit_exact (default: true).",
     )
     return parser
+
+
+def _build_memory_report() -> dict[str, Any]:
+    """Measure GPU memory and return a structured memory gate report."""
+    if not torch.cuda.is_available():
+        return {
+            "peak_reserved_gb": 0.0,
+            "free_gb": 0.0,
+            "total_gb": 0.0,
+            "free_ratio": 1.0,
+            "memory_gate_passed": True,
+        }
+
+    peak_reserved_bytes = torch.cuda.max_memory_reserved()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    memory_ok = (free_bytes / total_bytes) >= 0.05
+    return {
+        "peak_reserved_gb": peak_reserved_bytes / 1e9,
+        "free_gb": free_bytes / 1e9,
+        "total_gb": total_bytes / 1e9,
+        "free_ratio": free_bytes / total_bytes,
+        "memory_gate_passed": memory_ok,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.prompt_file:
-        prompt_text = Path(args.prompt_file).read_text()
-    else:
-        prompt_text = args.prompt
-
-    target_model_path = args.target_model
-    if not os.path.isdir(target_model_path):
+    if not os.path.isdir(args.target_model):
         print(
-            f"[ERROR] target model directory not found: {target_model_path}",
+            f"[ERROR] target model directory not found: {args.target_model}",
             file=sys.stderr,
         )
         return 2
 
+    raw_prompts = _load_prompts(args.prompt_file)
+
+    target_tok = _load_tokenizer(args.target_model)
+    draft_tok = _load_tokenizer(args.draft_model)
+    gate_prompts = _expand_prompts_for_gate(target_tok, raw_prompts)
+    gate = build_report(
+        args.target_model, args.draft_model, target_tok, draft_tok, gate_prompts
+    )
+    if not gate["passed"]:
+        print(json.dumps({"tokenizer_gate": gate}, indent=2), file=sys.stderr)
+        return 2
+
+    max_context = max(p["context_len"] for p in raw_prompts)
+    max_new_tokens = max(p["max_new_tokens"] for p in raw_prompts)
+    max_k = 8
+    needed_model_len = max_context + max_new_tokens + max_k + 32
+
+    torch.cuda.reset_peak_memory_stats()
     target_llm = LLM(
-        model=target_model_path,
-        max_model_len=args.max_model_len,
+        model=args.target_model,
+        max_model_len=needed_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_num_seqs=1,
         max_num_batched_tokens=1024,
     )
 
+    draft_llm: LLM | None = None
     try:
-        baseline_start = time.perf_counter()
-        prompt_token_ids, baseline_token_ids = baseline_greedy(
-            target_llm, prompt_text, args.max_new_tokens
+        torch.cuda.reset_peak_memory_stats()
+        draft_llm = LLM(
+            model=args.draft_model,
+            max_model_len=needed_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_seqs=1,
+            max_num_batched_tokens=1024,
         )
-        baseline_elapsed = time.perf_counter() - baseline_start
+    except torch.cuda.OutOfMemoryError as e:
+        memory_report = {
+            "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+            "free_gb": 0.0,
+            "total_gb": 0.0,
+            "free_ratio": 0.0,
+            "memory_gate_passed": False,
+            "error": str(e),
+        }
+        print(json.dumps({"memory_gate": memory_report}, indent=2), file=sys.stderr)
+        target_llm.shutdown()
+        return 2
 
-        draft_llm: LLM | None = None
-        draft_total_time_s = 0.0
-        if args.draft_model:
-            if not os.path.isdir(args.draft_model):
-                print(
-                    f"[ERROR] draft model directory not found: {args.draft_model}",
-                    file=sys.stderr,
-                )
-                return 2
-            draft_llm = LLM(
-                model=args.draft_model,
-                max_model_len=args.max_model_len,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                max_num_batched_tokens=1024,
-            )
-            tokenizer = target_llm.tokenizer
+    memory_report = _build_memory_report()
+    if not memory_report["memory_gate_passed"]:
+        print(json.dumps({"memory_gate": memory_report}, indent=2), file=sys.stderr)
+        target_llm.shutdown()
+        if draft_llm is not None:
+            draft_llm.shutdown()
+        return 2
+
+    try:
+        if args.draft_model and os.path.isdir(args.draft_model):
 
             def draft_proposer(
                 prefix: list[int], generated: list[int], k: int
             ) -> list[int]:
-                nonlocal draft_total_time_s
-                context_text = tokenizer.decode(
-                    prefix + generated, skip_special_tokens=True
-                )
-                start = time.perf_counter()
-                tokens = generate_draft_tokens(draft_llm, context_text, k)
-                draft_total_time_s += time.perf_counter() - start
-                return tokens
+                context_ids = prefix + generated
+                return generate_draft_tokens_from_ids(draft_llm, context_ids, k)
         else:
 
             def draft_proposer(
@@ -448,56 +591,106 @@ def main(argv: list[str] | None = None) -> int:
                     prefix, generated, k, args.ngram_min, args.ngram_max
                 )
 
-        spec_result = speculative_decode(
-            target_llm,
-            draft_proposer,
-            prompt_token_ids,
-            max_new_tokens=args.max_new_tokens,
-            num_draft_tokens=args.num_draft_tokens,
-        )
+        prompt_results: list[dict[str, Any]] = []
+        all_bit_exact = True
+        total_accepted = 0
+        total_proposed = 0
+        total_decode_tokens = 0
+        total_decode_time = 0.0
 
-        baseline_tps = (
-            len(baseline_token_ids) / baseline_elapsed if baseline_elapsed > 0 else 0.0
-        )
-        spec_result["baseline_token_ids"] = baseline_token_ids
-        spec_result["bit_exact"] = spec_result["token_ids"] == baseline_token_ids
-        spec_result["baseline_tps"] = baseline_tps
+        for prompt_item in raw_prompts:
+            prompt_text = prompt_item["text"]
+            per_prompt_max_new_tokens = prompt_item["max_new_tokens"]
 
-        target_forwards = spec_result["target_forwards"]
-        if target_forwards > 0:
-            theoretical_speedup = 1.0 + spec_result["accepted_total"] / target_forwards
-        else:
-            theoretical_speedup = 1.0
-        spec_result["projected_tps"] = baseline_tps * theoretical_speedup
-
-        if args.draft_model:
-            total_decode_tokens = spec_result["accepted_total"] + target_forwards
-            total_decode_time = draft_total_time_s + spec_result["verify_time_s"]
-            effective_tps = (
-                total_decode_tokens / total_decode_time
-                if total_decode_time > 0
-                else 0.0
+            baseline_result = baseline_greedy(
+                target_llm, prompt_text, per_prompt_max_new_tokens
             )
-        else:
-            effective_tps = 0.0
+            prompt_token_ids = baseline_result["prompt_token_ids"]
+            baseline_token_ids = baseline_result["token_ids"]
+
+            spec_result = speculative_decode(
+                target_llm,
+                draft_proposer,
+                prompt_token_ids,
+                max_new_tokens=per_prompt_max_new_tokens,
+                num_draft_tokens=args.num_draft_tokens,
+            )
+
+            spec_result["baseline_token_ids"] = baseline_token_ids
+            bit_exact = spec_result["token_ids"] == baseline_token_ids
+            spec_result["bit_exact"] = bit_exact
+            if not bit_exact:
+                all_bit_exact = False
+
+            total_accepted += spec_result["accepted_total"]
+            total_proposed += spec_result["proposed_total"]
+
+            baseline_tps = baseline_result["decode_tps"]
+            spec_result["baseline_tps"] = baseline_tps
+
+            target_forwards = spec_result["target_forwards"]
+            if target_forwards > 0:
+                theoretical_speedup = (
+                    1.0 + spec_result["accepted_total"] / target_forwards
+                )
+            else:
+                theoretical_speedup = 1.0
+            spec_result["projected_tps"] = baseline_tps * theoretical_speedup
+
+            if args.draft_model and os.path.isdir(args.draft_model):
+                # Effective TPS is accumulated globally, not per prompt.
+                total_decode_tokens += spec_result["accepted_total"] + target_forwards
+                total_decode_time += spec_result["verify_time_s"]
+
+            prompt_results.append(
+                {
+                    "id": prompt_item["id"],
+                    "prompt_text": prompt_text,
+                    "context_len": prompt_item["context_len"],
+                    "max_new_tokens": per_prompt_max_new_tokens,
+                    "baseline_tokens": baseline_token_ids,
+                    "speculative_tokens": spec_result["token_ids"],
+                    "bit_exact": bit_exact,
+                    "accepted_total": spec_result["accepted_total"],
+                    "proposed_total": spec_result["proposed_total"],
+                    "acceptance_rate": spec_result["acceptance_rate"],
+                    "target_forwards": spec_result["target_forwards"],
+                    "baseline_prefill_time_s": baseline_result["prefill_time_s"],
+                    "baseline_decode_time_s": baseline_result["decode_time_s"],
+                    "baseline_decode_tps": baseline_result["decode_tps"],
+                    "speculative_tps": spec_result["speculative_tps"],
+                    "projected_tps": spec_result["projected_tps"],
+                }
+            )
+
+        aggregate_acceptance_rate = (
+            total_accepted / total_proposed if total_proposed > 0 else 0.0
+        )
+        mean_baseline_decode_tps = (
+            sum(p["baseline_decode_tps"] for p in prompt_results) / len(prompt_results)
+            if prompt_results
+            else 0.0
+        )
+        effective_tps = (
+            total_decode_tokens / total_decode_time if total_decode_time > 0 else 0.0
+        )
 
         output = {
-            "prompt_text": prompt_text,
-            "target_model": target_model_path,
+            "target_model": args.target_model,
             "draft_model": args.draft_model,
             "num_draft_tokens": args.num_draft_tokens,
             "ngram_min": args.ngram_min,
             "ngram_max": args.ngram_max,
-            "baseline_tokens": baseline_token_ids,
-            "speculative_tokens": spec_result["token_ids"],
-            "bit_exact": spec_result["bit_exact"],
-            "accepted_total": spec_result["accepted_total"],
-            "proposed_total": spec_result["proposed_total"],
-            "acceptance_rate": spec_result["acceptance_rate"],
-            "baseline_tps": spec_result["baseline_tps"],
-            "speculative_tps": spec_result["speculative_tps"],
-            "projected_tps": spec_result["projected_tps"],
-            "effective_tps": effective_tps,
+            "memory_report": memory_report,
+            "tokenizer_gate": gate,
+            "summary": {
+                "total_prompts": len(prompt_results),
+                "bit_exact_all": all_bit_exact,
+                "mean_acceptance_rate": aggregate_acceptance_rate,
+                "mean_baseline_decode_tps": mean_baseline_decode_tps,
+                "effective_tps": effective_tps,
+            },
+            "prompts": prompt_results,
         }
 
         print(json.dumps(output, indent=2, sort_keys=True))
@@ -507,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(output, indent=2, sort_keys=True) + "\n"
             )
 
-        if args.fail_on_mismatch and not spec_result["bit_exact"]:
+        if args.fail_on_mismatch and not all_bit_exact:
             print("[ERROR] speculative output does not match baseline", file=sys.stderr)
             return 1
         return 0
