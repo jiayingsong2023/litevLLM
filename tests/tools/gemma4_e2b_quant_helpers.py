@@ -3,7 +3,9 @@
 import torch
 
 
-def pack_asymmetric_int4(weights: torch.Tensor, zeros: torch.Tensor) -> tuple:
+def pack_asymmetric_int4(
+    weights: torch.Tensor, zeros: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack signed int4 weights and zeros into uint32 tensors."""
     n, k = weights.shape
     assert k % 8 == 0 and n % 8 == 0
@@ -21,7 +23,9 @@ def pack_asymmetric_int4(weights: torch.Tensor, zeros: torch.Tensor) -> tuple:
     return qweight, qzeros
 
 
-def make_asymmetric_packed_int4(n: int, k: int, group_size: int = 32):
+def make_asymmetric_packed_int4(
+    n: int, k: int, group_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert k % group_size == 0 and n % 8 == 0
     n_groups = k // group_size
     weights = torch.randint(-8, 8, (n, k), dtype=torch.int8, device="cuda")

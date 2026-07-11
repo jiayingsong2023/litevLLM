@@ -41,9 +41,6 @@ class LiteLinear(nn.Module):
     ):
         """Delegate to the quantization config's loader if available."""
         if self.quant_config is not None and hasattr(self.quant_config, "load_weights"):
-            for name, w in weights_iter:
-                if "zero_point" in name:
-                    print(f">>>> DEBUG LiteLinear.load_weights prefix={self.prefix} name={name} shape={tuple(w.shape)}")
             self.quant_config.load_weights(self, weights_iter, expert_idx, part)
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:

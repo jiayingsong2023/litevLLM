@@ -671,16 +671,6 @@ def should_use_awq_fused_path(
         qweight, scales, qzeros, int(group_size)
     )
     if is_asym:
-        print(
-            f">>>> DEBUG rejecting fused for {prefix}: asymmetric layout qweight={tuple(qweight.shape)} scales={tuple(scales.shape)} qzeros={tuple(qzeros.shape)} gs={group_size}"
-        )
-        return False, "packed_int4_asymmetric_layout"
-    allow_by_scope, scope_reason = should_allow_awq_fused(prefix, resolved_policy)
-    if not allow_by_scope:
-        return False, scope_reason
-    if not resolved_policy.prefer_fused:
-        return False, "fused_disabled"
-    if is_asym:
         return False, "packed_int4_asymmetric_layout"
 
     try:
@@ -1549,10 +1539,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 use_fused, _ = packed_int4_fused_capability_check(
                     x, self.qweight, self.scales, int(self.group_size)
                 )
-            except Exception as e:
-                print(
-                    f">>>> DEBUG: PackedInt4 capability check EXCEPTION for {self.prefix}: {e}"
-                )
+            except Exception:
                 _awq_prefix_stat_inc(self.prefix, "capability_check_exception")
         self._cached_fused_decision = bool(use_fused)
         if self._cached_fused_decision:

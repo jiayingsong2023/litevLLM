@@ -12,7 +12,9 @@ def main() -> None:
     for ctx in BUCKETS:
         b = json.loads(Path(f"/tmp/e2b_baseline_{ctx}.json").read_text())
         o = json.loads(Path(f"/tmp/e2b_optimized_{ctx}.json").read_text())
-        speedup = o["perf_run"]["median_decode_tps"] / b["perf_run"]["median_decode_tps"]
+        b_tps = b["perf_run"]["median_decode_tps"]
+        o_tps = o["perf_run"]["median_decode_tps"]
+        speedup = o_tps / b_tps
         tokens_match = o["perf_run"]["token_ids"] == b["perf_run"]["token_ids"]
         bit_exact = bit_exact and tokens_match
         results.append({
@@ -30,7 +32,10 @@ def main() -> None:
 
     median_speedup = sorted(r["speedup"] for r in results)[len(results) // 2]
     min_speedup = min(r["speedup"] for r in results)
-    print(f"median_speedup={median_speedup:.3f}x min_speedup={min_speedup:.3f}x bit_exact={bit_exact}")
+    print(
+        f"median_speedup={median_speedup:.3f}x "
+        f"min_speedup={min_speedup:.3f}x bit_exact={bit_exact}"
+    )
 
     passed = (
         bit_exact

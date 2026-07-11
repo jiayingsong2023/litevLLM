@@ -189,16 +189,19 @@ def run_audit(
         trust_remote_code=True,
         fastinference_config=fastinference_config,
     )
-    tokenizer = llm.tokenizer
-    prompt_ids = build_prompt_of_length(tokenizer, text_seed, context_bucket)
+    try:
+        tokenizer = llm.tokenizer
+        prompt_ids = build_prompt_of_length(tokenizer, text_seed, context_bucket)
 
-    return {
-        "context_bucket": context_bucket,
-        "actual_context_tokens": len(prompt_ids),
-        "kernel_policy": policy,
-        "cold_audit": run_cold_audit(llm, prompt_ids, max_new_tokens),
-        "perf_run": run_perf(llm, prompt_ids, max_new_tokens, repetitions),
-    }
+        return {
+            "context_bucket": context_bucket,
+            "actual_context_tokens": len(prompt_ids),
+            "kernel_policy": policy,
+            "cold_audit": run_cold_audit(llm, prompt_ids, max_new_tokens),
+            "perf_run": run_perf(llm, prompt_ids, max_new_tokens, repetitions),
+        }
+    finally:
+        llm.shutdown()
 
 
 def main() -> None:
