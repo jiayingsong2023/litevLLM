@@ -210,6 +210,8 @@ def main() -> None:
     parser.add_argument("--kernel-policy", default="{}")
     parser.add_argument("--out", default="/tmp/gemma4_e2b_audit.json")
     args = parser.parse_args()
+    if args.repetitions <= 0:
+        parser.error("--repetitions must be positive")
 
     text_seed = "The capital of France is Paris. "
     result = run_audit(
