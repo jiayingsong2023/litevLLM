@@ -686,7 +686,7 @@ class Gemma4Attention(nn.Module):
                             )
                             outs.append(out_i)
                         out = torch.cat(outs, dim=0)
-                        return self.o_proj(out, lora_mapping)
+                        return self.o_proj(out, lora_mapping, inf_config=inf_config)
                     seq_lens_ext, block_tables_ext = (
                         expand_metadata_for_paged_attention(
                             bsz,
@@ -763,4 +763,4 @@ class Gemma4Attention(nn.Module):
                     softcap=softcap,
                 ).view(bsz, seqlen, -1)
         with _gemma4_profile_span("attn_o_proj", self._layer_config):
-            return self.o_proj(out, lora_mapping)
+            return self.o_proj(out, lora_mapping, inf_config=inf_config)

@@ -12,7 +12,11 @@ from vllm.model_executor.models.lite_config import LiteConfig
 from vllm.model_executor.models.multimodal_utils import replace_image_placeholders
 
 from .layer import Gemma4DecoderLayer
-from .policy_utils import _gemma4_fp32_residual_guard_policy, _get_eps
+from .policy_utils import (
+    _gemma4_fp32_residual_guard_policy,
+    _get_eps,
+    _meta_get,
+)
 from .vision import Gemma4VisionProjector, Gemma4VisionTower
 
 
@@ -145,6 +149,7 @@ class Gemma4TextModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
+        inf_config: Any = None,
     ) -> torch.Tensor | None:
         if not self.config.ple_enabled():
             return None
@@ -159,7 +164,7 @@ class Gemma4TextModel(nn.Module):
         token_part = token_part.view(bsz, seqlen, num_layers, ple_dim)
 
         # Context-aware projection component.
-        proj = self.per_layer_model_projection(inputs_embeds)
+        proj = self.per_layer_model_projection(inputs_embeds, inf_config=inf_config)
         proj = proj * self.per_layer_projection_scale
         proj = proj.view(bsz, seqlen, num_layers, ple_dim)
         proj = self.per_layer_projection_norm(proj)
@@ -175,6 +180,7 @@ class Gemma4TextModel(nn.Module):
         lora_mapping: Any = None,
         multimodal_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        inf_config = _meta_get(attn_metadata, "config", None)
         if input_ids.dtype == torch.long:
             x = self.embed_tokens(input_ids) * self.embed_scale
             if multimodal_embeddings is not None:
@@ -187,7 +193,9 @@ class Gemma4TextModel(nn.Module):
                 )
         else:
             x = input_ids
-        per_layer_inputs = self._compute_per_layer_inputs(input_ids, x)
+        per_layer_inputs = self._compute_per_layer_inputs(
+            input_ids, x, inf_config=inf_config
+        )
         for i, layer in enumerate(self.layers):
             kv_cache = kv_caches[layer.self_attn.kv_scale_cache_idx]
             ple_input = (

@@ -22,7 +22,14 @@ from vllm.model_executor.layers.quantization.tensor import (  # noqa: E402
     dequantize_asymmetric_packed_int4_pytorch,
 )
 
-SHAPES = [(2048, 1536), (6144, 1536), (1536, 6144)]
+SHAPES = [
+    (2048, 1536),
+    (6144, 1536),
+    (1536, 6144),
+    (1536, 2048),
+    # Actual E2B PLE projection shape: N=num_layers*ple_dim, K=hidden_size.
+    (35 * 256, 1536),
+]
 
 
 def bench():
