@@ -660,7 +660,6 @@ def should_use_awq_fused_path(
         config=config,
     )
     if awq_fused_gemm_force_enabled(config):
-        # print(f">>>> DEBUG: Fused path FORCED for {prefix}")
         return True, "force_on"
     allow_by_scope, scope_reason = should_allow_awq_fused(prefix, resolved_policy)
     if not allow_by_scope:
@@ -910,7 +909,7 @@ def dequantize_asymmetric_packed_int4_pytorch(
         res = (qs - zs.unsqueeze(-1)) * scales.to(torch.float32).unsqueeze(-1)
         return res.view(n_rows, n_cols).to(torch.float16)
     except Exception as e:
-        raise RuntimeError(f"Asymmetric packed int4 PyTorch dequant error: {e}")
+        raise RuntimeError(f"Asymmetric packed int4 PyTorch dequant error: {e}") from e
 
 
 def dequantize_awq_pytorch(
