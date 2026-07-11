@@ -213,6 +213,9 @@ FASTINFERENCE_ENV_REGISTRY: dict[str, FastInferenceEnvSpec] = {
     "FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV": _tool_only(
         "FASTINFERENCE_AWQ_O_PROJ_SPLITK_GEMV"
     ),
+    "FASTINFERENCE_AWQ_ASYMMETRIC_GEMV": _tool_only(
+        "FASTINFERENCE_AWQ_ASYMMETRIC_GEMV"
+    ),
     "FASTINFERENCE_AWQ_POLICY_MATRIX": _deprecated(
         "FASTINFERENCE_AWQ_POLICY_MATRIX",
         replacement="RuntimeProfile or structured RuntimeConfig policy",

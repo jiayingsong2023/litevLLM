@@ -5,6 +5,7 @@ from vllm.utils.text_utils import truthy
 
 from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 from .policy_keys import (
+    GEMMA4_AWQ_ASYMMETRIC_GEMV,
     GEMMA4_AWQ_DECODE_GEMV,
     GEMMA4_AWQ_FUSED_GATE_UP,
     GEMMA4_AWQ_FUSED_GEMM,
@@ -67,6 +68,9 @@ class Gemma4Adapter(ModelAdapter):
         runtime_config: Any,
     ) -> RuntimeModelPolicy:
         tuning_env = dict(getattr(runtime_config, "tuning_env", None) or {})
+        asymmetric_gemv = truthy(
+            tuning_env.get("FASTINFERENCE_AWQ_ASYMMETRIC_GEMV", "0")
+        )
         default_stage = "all"
         fused_stage = (
             str(tuning_env.get("FASTINFERENCE_GEMMA4_FUSED_STAGE", default_stage))
@@ -150,6 +154,7 @@ class Gemma4Adapter(ModelAdapter):
             GEMMA4_AWQ_FUSED_GEMM_FORCE: False,
             GEMMA4_AWQ_DECODE_GEMV: True,
             GEMMA4_AWQ_FUSED_GATE_UP: True,
+            GEMMA4_AWQ_ASYMMETRIC_GEMV: asymmetric_gemv,
         }
         if not is_moe:
             kernel_policy.update(
@@ -164,6 +169,7 @@ class Gemma4Adapter(ModelAdapter):
             "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE": "0",
             "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
             "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
+            "FASTINFERENCE_AWQ_ASYMMETRIC_GEMV": "1" if asymmetric_gemv else "0",
         }
         if not is_moe:
             tuning_env_overrides.update(

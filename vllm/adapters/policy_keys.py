@@ -33,6 +33,7 @@ GEMMA4_AWQ_FUSED_GEMM_FORCE = "awq_fused_gemm_force"
 GEMMA4_AWQ_DECODE_GEMV = "awq_decode_gemv"
 GEMMA4_AWQ_FUSED_GATE_UP = "awq_fused_gate_up"
 GEMMA4_AWQ_GROUP32_GEMV_ALL = "awq_group32_gemv_all"
+GEMMA4_AWQ_ASYMMETRIC_GEMV = "awq_asymmetric_gemv"
 GEMMA4_DENSE_DOWN_PROJ = "gemma4_dense_down_proj"
 
 # -- Qwen3.5 model_policy keys --

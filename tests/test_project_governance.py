@@ -621,6 +621,7 @@ def test_awq_tensor_production_env_reads_are_tool_only() -> None:
             "FASTINFERENCE_AWQ_FUSED_GEMM",
             "FASTINFERENCE_AWQ_FUSED_GEMM_FORCE",
             "FASTINFERENCE_AWQ_DECODE_GEMV",
+            "FASTINFERENCE_AWQ_ASYMMETRIC_GEMV",
             "FASTINFERENCE_AWQ_CACHE_SCOPE",
             "FASTINFERENCE_AWQ_POLICY_MATRIX",
             "FASTINFERENCE_AWQ_FUSED_SCOPE",

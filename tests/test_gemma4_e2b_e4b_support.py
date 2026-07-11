@@ -219,3 +219,32 @@ def test_e2b_awq_q4_generates():
     assert "Paris" in text, f"E2B output was incoherent: {text!r}"
     print("E2B output:", text)
     llm.shutdown()
+
+
+def test_e2b_asymmetric_matmul_dispatches_to_gemv():
+    import torch
+
+    from tests.tools.gemma4_e2b_quant_helpers import make_asymmetric_packed_int4
+    from vllm.model_executor.layers.quantization.tensor import (
+        AWQWeight,
+        dequantize_asymmetric_packed_int4_pytorch,
+        get_awq_runtime_stats,
+        reset_awq_runtime_stats,
+    )
+
+    qweight, scales, qzeros = make_asymmetric_packed_int4(2048, 1536)
+    w = AWQWeight(qweight, scales, qzeros, group_size=32, prefix="test")
+    x = torch.randn(1, 1, 1536, dtype=torch.float16, device="cuda")
+
+    class FakeConfig:
+        kernel_policy = {"awq_asymmetric_gemv": True}
+
+    reset_awq_runtime_stats()
+    out = w.matmul(x, config=FakeConfig())
+
+    dense = dequantize_asymmetric_packed_int4_pytorch(qweight, scales, qzeros, 32)
+    ref = torch.nn.functional.linear(x, dense)
+    torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
+
+    stats = get_awq_runtime_stats()
+    assert stats.get("awq_asymmetric_gemv_success", 0) >= 1, stats

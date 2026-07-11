@@ -391,6 +391,13 @@ def awq_decode_gemv_enabled(config: object | None = None) -> bool:
     return _bool_like(_kernel_policy_value(config, "awq_decode_gemv", False), False)
 
 
+def awq_asymmetric_gemv_enabled(config: object | None = None) -> bool:
+    return _bool_like(
+        _kernel_policy_value(config, "awq_asymmetric_gemv", False),
+        False,
+    )
+
+
 def awq_group32_gemv_all_enabled(config: object | None = None) -> bool:
     return _bool_like(
         _kernel_policy_value(config, "awq_group32_gemv_all", False),
@@ -664,7 +671,9 @@ def should_use_awq_fused_path(
         qweight, scales, qzeros, int(group_size)
     )
     if is_asym:
-        print(f">>>> DEBUG rejecting fused for {prefix}: asymmetric layout qweight={tuple(qweight.shape)} scales={tuple(scales.shape)} qzeros={tuple(qzeros.shape)} gs={group_size}")
+        print(
+            f">>>> DEBUG rejecting fused for {prefix}: asymmetric layout qweight={tuple(qweight.shape)} scales={tuple(scales.shape)} qzeros={tuple(qzeros.shape)} gs={group_size}"
+        )
         return False, "packed_int4_asymmetric_layout"
     allow_by_scope, scope_reason = should_allow_awq_fused(prefix, resolved_policy)
     if not allow_by_scope:
@@ -869,9 +878,9 @@ def _is_packed_int4_asymmetric_layout(
     if n_cols % group_size != 0:
         return False
     n_groups = n_cols // group_size
-    return (
-        scales.shape == (n_rows, n_groups)
-        and qzeros.shape == (n_rows // 8, n_groups)
+    return scales.shape == (n_rows, n_groups) and qzeros.shape == (
+        n_rows // 8,
+        n_groups,
     )
 
 
@@ -896,24 +905,17 @@ def dequantize_asymmetric_packed_int4_pytorch(
         shifts = torch.arange(0, 32, 4, device=qweight.device)
 
         # Unpack weights to signed int8 and reshape to [n_rows, n_groups, group_size]
-        qs = (
-            ((qweight.unsqueeze(-1) >> shifts) & 0x0F)
-            .view(n_rows, n_cols)
-            .to(torch.float32)
-            - 8.0
-        )
+        qs = ((qweight.unsqueeze(-1) >> shifts) & 0x0F).view(n_rows, n_cols).to(
+            torch.float32
+        ) - 8.0
         qs = qs.view(n_rows, n_groups, group_size)
 
         # Unpack zero-points packed along the output dimension.
         # qzeros shape is [n_rows // 8, n_groups]; each int32 packs 8 row zero
         # points for the same group.  Permute so rows are interleaved, not groups.
-        zs = (
-            ((qzeros.unsqueeze(-1) >> shifts) & 0x0F)
-            .permute(0, 2, 1)
-            .reshape(n_rows, n_groups)
-            .to(torch.float32)
-            - 8.0
-        )
+        zs = ((qzeros.unsqueeze(-1) >> shifts) & 0x0F).permute(0, 2, 1).reshape(
+            n_rows, n_groups
+        ).to(torch.float32) - 8.0
 
         res = (qs - zs.unsqueeze(-1)) * scales.to(torch.float32).unsqueeze(-1)
         return res.view(n_rows, n_cols).to(torch.float16)
@@ -1122,6 +1124,46 @@ class AWQWeight(QuantizedLinearWeight):
     def matmul(self, x, bias=None, *, config: object | None = None):
         _awq_stat_inc("awq_matmul_calls")
         _awq_prefix_stat_inc(self.prefix, "matmul_calls")
+
+        x2 = x.reshape(-1, x.shape[-1])
+        if (
+            x2.shape[0] == 1
+            and self.qzeros is not None
+            and int(self.group_size) == 32
+            and awq_asymmetric_gemv_enabled(config)
+            and _is_packed_int4_asymmetric_layout(
+                self.qweight, self.scales, self.qzeros, int(self.group_size)
+            )
+            and not getattr(self, "_asymmetric_gemv_disabled", False)
+        ):
+            from vllm.kernels.triton.awq_fused_gemm import (
+                packed_int4_asymmetric_group32_gemv_m1,
+            )
+
+            try:
+                out = packed_int4_asymmetric_group32_gemv_m1(
+                    x2,
+                    self.qweight,
+                    self.scales,
+                    self.qzeros,
+                    group_size=int(self.group_size),
+                )
+                if bias is not None:
+                    out = out + bias
+                _awq_stat_inc("awq_asymmetric_gemv_success")
+                _awq_prefix_stat_inc(self.prefix, "asymmetric_gemv_success")
+                return out.view(*x.shape[:-1], out.shape[-1])
+            except Exception as exc:
+                self._asymmetric_gemv_disabled = True
+                record_awq_audit_event(
+                    self.prefix,
+                    "asymmetric_gemv_m1_exception_fallback",
+                    shape=_shape_for_matmul(x, self.qweight, int(self.group_size)),
+                    dtypes=_dtypes_for_quant_matmul(
+                        x, self.qweight, self.scales, self.qzeros
+                    ),
+                    reason=type(exc).__name__,
+                )
 
         # FAST PATH: Cached Decision
         if hasattr(self, "_cached_fused_decision"):
@@ -1396,9 +1438,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
                     _awq_prefix_stat_inc(self.prefix, "fused_success")
-                    _awq_prefix_stat_inc(
-                        self.prefix, "decision_fused_gemma4_down_proj"
-                    )
+                    _awq_prefix_stat_inc(self.prefix, "decision_fused_gemma4_down_proj")
                     return out.view(*x.shape[:-1], out.shape[-1])
             except Exception:
                 _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")
