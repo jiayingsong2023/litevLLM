@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests.tools.gemma4_e2b_quant_helpers import make_asymmetric_packed_int4
 from vllm.kernels.triton.awq_fused_gemm import (
     _fused_gemm_autotune_enabled,
     _gemma4_down_proj_group32_gemv_launch_config,
@@ -20,6 +21,7 @@ from vllm.kernels.triton.awq_fused_gemm import (
     awq_o_proj_splitk_gemv_enabled,
     awq_qo_proj_exact_gemv_enabled,
     pack_awq_group32_interleaved_qweight_scales,
+    packed_int4_asymmetric_group32_gemv_m1,
     packed_int4_symmetric_fused_gemm,
     packed_int4_symmetric_fused_qkv_m1_safe,
     packed_int4_symmetric_group32_interleaved_gemv_m1_safe,
@@ -27,6 +29,7 @@ from vllm.kernels.triton.awq_fused_gemm import (
 )
 from vllm.model_executor.layers.quantization.tensor import (
     PackedInt4Weight,
+    dequantize_asymmetric_packed_int4_pytorch,
     dequantize_symmetric_packed_int4_pytorch,
 )
 
@@ -67,9 +70,7 @@ def test_o_proj_splitk_gemv_default_disabled_and_policy_overridable() -> None:
 def test_mlp_streaming_fusion_default_disabled_and_policy_overridable() -> None:
     assert awq_mlp_streaming_fusion_enabled() is False
     assert (
-        awq_mlp_streaming_fusion_enabled(
-            policy={"awq_mlp_streaming_fusion": True}
-        )
+        awq_mlp_streaming_fusion_enabled(policy={"awq_mlp_streaming_fusion": True})
         is True
     )
 
@@ -178,15 +179,27 @@ def test_mlp_streaming_recompute_candidate_matches_dense_reference() -> None:
     down_q = torch.randint(
         0, 255, (hidden, intermediate // 8), device=device, dtype=torch.int32
     )
-    gate_s = torch.rand(
-        (intermediate, hidden // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
-    up_s = torch.rand(
-        (intermediate, hidden // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
-    down_s = torch.rand(
-        (hidden, intermediate // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
+    gate_s = (
+        torch.rand(
+            (intermediate, hidden // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
+    up_s = (
+        torch.rand(
+            (intermediate, hidden // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
+    down_s = (
+        torch.rand(
+            (hidden, intermediate // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
 
     y, used, reason = packed_int4_symmetric_mlp_streaming_m1_recompute_safe(
         x, gate_q, up_q, down_q, gate_s, up_s, down_s, group_size
@@ -669,3 +682,84 @@ def test_gemma4_down_proj_decode_bypasses_dense_fallback_when_gemv_enabled(
     y = weight.matmul(x, config=config)
     assert y.shape == (1, 5376)
     assert torch.equal(y, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+@pytest.mark.parametrize("n,k", [(2048, 1536), (6144, 1536), (1536, 6144)])
+def test_packed_int4_asymmetric_group32_gemv_m1_matches_reference_fp16(n, k):
+    group_size = 32
+    qweight, scales, qzeros = make_asymmetric_packed_int4(n, k, group_size)
+    x = torch.randn(1, k, dtype=torch.float16, device="cuda")
+
+    out = packed_int4_asymmetric_group32_gemv_m1(
+        x, qweight, scales, qzeros, group_size=group_size
+    )
+    dense = dequantize_asymmetric_packed_int4_pytorch(
+        qweight, scales, qzeros, group_size
+    )
+    ref = torch.nn.functional.linear(x, dense)
+    torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+@pytest.mark.parametrize("n,k", [(2048, 1536)])
+def test_packed_int4_asymmetric_group32_gemv_m1_matches_reference_bf16(n, k):
+    group_size = 32
+    qweight, scales, qzeros = make_asymmetric_packed_int4(n, k, group_size)
+    x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+
+    out = packed_int4_asymmetric_group32_gemv_m1(
+        x, qweight, scales, qzeros, group_size=group_size
+    )
+    dense = dequantize_asymmetric_packed_int4_pytorch(
+        qweight, scales, qzeros, group_size
+    ).to(dtype=x.dtype)
+    ref = torch.nn.functional.linear(x, dense)
+    torch.testing.assert_close(out, ref, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+def test_packed_int4_asymmetric_group32_gemv_m1_rejects_non_m1():
+    qweight, scales, qzeros = make_asymmetric_packed_int4(2048, 1536)
+    x = torch.randn(2, 1536, dtype=torch.float16, device="cuda")
+    with pytest.raises(AssertionError):
+        packed_int4_asymmetric_group32_gemv_m1(x, qweight, scales, qzeros)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+def test_packed_int4_asymmetric_group32_gemv_m1_real_e2b_checkpoint():
+    """Load the real E2B model and test the first asymmetric LiteLinear."""
+    from vllm import LLM
+    from vllm.model_executor.layers.lite_linear import LiteLinear
+
+    llm = LLM(
+        model="models/gemma-4-E2B-it-AWQ-INT4",
+        max_model_len=256,
+        max_num_seqs=1,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=True,
+    )
+    model = llm.model
+
+    target: LiteLinear | None = None
+    for module in model.modules():
+        if isinstance(module, LiteLinear):
+            qz = getattr(module, "qzeros", None)
+            if qz is not None and qz.numel() > 1:
+                target = module
+                break
+    assert target is not None, "no asymmetric LiteLinear found in E2B model"
+
+    qweight = target.qweight
+    scales = target.scales
+    qzeros = target.qzeros
+    n, k_div_8 = qweight.shape
+    k = k_div_8 * 8
+    x = torch.randn(1, k, dtype=torch.float16, device="cuda")
+
+    out = packed_int4_asymmetric_group32_gemv_m1(
+        x, qweight, scales, qzeros, group_size=32
+    )
+    dense = dequantize_asymmetric_packed_int4_pytorch(qweight, scales, qzeros, 32)
+    ref = torch.nn.functional.linear(x, dense)
+    torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)

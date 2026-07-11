@@ -1053,6 +1053,142 @@ def _packed_int4_symmetric_group32_gemv_m1(
 
 
 @triton.jit
+def _packed_int4_asymmetric_group32_gemv_m1(
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    z_ptr,
+    c_ptr,
+    N,
+    K,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_zn,
+    stride_zk,
+    stride_cn,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+):
+    """
+    M=1 asymmetric packed-int4 GEMV specialized for group_size=32.
+
+    Memory layout:
+      a:        [K]                input activations (fp16/bf16)
+      b:        [N, K // 8]        uint32 packed weights along K
+      s:        [N, K // 32]       fp16/bf16 per-row-per-group scales
+      z:        [N // 8, K // 32]  uint32 packed zero points along N
+      c:        [N]                output (fp16/bf16)
+
+    Tiling:
+      One program per BLOCK_N output rows.
+      Outer loop over quant groups (32 elements each).
+      Inner loop consumes 4 packed uint32 per group (32 weights).
+      Zero points are packed along N: each uint32 holds 8 row zeros for one group.
+      Dequant: (q_unsigned - z_unsigned) * scale, because the +8 offsets cancel.
+    """
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    num_groups = tl.cdiv(K, 32)
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    z_row = offs_n // 8
+    z_shift = (offs_n % 8) * 4
+
+    for group_base in range(0, tl.cdiv(num_groups, BLOCK_GROUPS)):
+        group_idx = group_base * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < num_groups
+
+        scale = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + group_idx[None, :] * stride_sk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        zero_packed = tl.load(
+            z_ptr + z_row[:, None] * stride_zn + group_idx[None, :] * stride_zk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0,
+        ).to(tl.int32)
+        zero = ((zero_packed >> z_shift[:, None]) & 0x0F).to(tl.float32)
+
+        group_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group_idx * 4 + pack_in_group
+            packed = tl.load(
+                b_ptr + offs_n[:, None] * stride_bn + pack_idx[None, :] * stride_bk,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                aval = tl.load(
+                    a_ptr + k_idx * stride_ak,
+                    mask=mask_g & (k_idx < K),
+                    other=0.0,
+                )
+                q = ((packed >> (nibble * 4)) & 0x0F).to(tl.float32)
+                group_partial += aval[None, :].to(tl.float32) * (q - zero) * scale
+
+        acc += tl.sum(group_partial, axis=1)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out, mask=mask_n)
+
+
+def packed_int4_asymmetric_group32_gemv_m1(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int = 32,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert group_size == 32, "only group_size=32 is supported"
+    assert x.ndim == 2 and x.shape[0] == 1, "M=1 only"
+    n_rows, n_cols_packed = qweight.shape
+    k = n_cols_packed * 8
+    n = n_rows
+    assert x.shape[1] == k
+    assert scales.shape == (n, k // group_size)
+    assert qzeros.shape == (n // 8, k // group_size)
+
+    if out is None:
+        out = torch.empty(1, n, dtype=x.dtype, device=x.device)
+
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_N"]),)
+    _packed_int4_asymmetric_group32_gemv_m1[grid](
+        x,
+        qweight,
+        scales,
+        qzeros,
+        out,
+        n,
+        k,
+        x.stride(1),
+        qweight.stride(0),
+        qweight.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        qzeros.stride(0),
+        qzeros.stride(1),
+        out.stride(1),
+        BLOCK_GROUPS=4,
+        BLOCK_N=128,
+        USE_BF16_OUTPUT=(x.dtype == torch.bfloat16),
+    )
+    return out
+
+
+@triton.jit
 def _packed_int4_symmetric_group32_gemv_m1_exact(
     a_ptr,
     b_ptr,
@@ -1547,9 +1683,7 @@ def _packed_int4_symmetric_mlp_streaming_m1_recompute(
             other=0.0,
         ).to(tl.float32)
         down_packed = tl.load(
-            down_ptr
-            + offs_n[:, None] * stride_dn
-            + down_pack[None, :] * stride_dk,
+            down_ptr + offs_n[:, None] * stride_dn + down_pack[None, :] * stride_dk,
             mask=mask_n[:, None] & mask_i[None, :],
             other=0,
         ).to(tl.int32)
