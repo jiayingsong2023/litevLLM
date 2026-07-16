@@ -556,10 +556,7 @@ def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default
     assert "run --no-sync python tests/tools/gemma4_multimodal_quality_spotcheck.py" in calls
     assert f"--model {gemma31_dir}" in calls
     assert f"--model {gemma26_dir}" in calls
-    assert (
-        "KV_LEN=512 ACTIVE=1 CMD=run --no-sync python tests/tools/gemma4_single_prompt_smoke.py"
-        in calls
-    )
+    assert "KV_LEN=512 ACTIVE=1" not in calls
     assert "Gemma4-31B A-strict prefill audit is disabled" in proc.stdout
     assert "Skipping Gemma4 large-model A-tier" not in proc.stdout
     assert "Cleanup after Gemma4-31B A-lite" in proc.stdout

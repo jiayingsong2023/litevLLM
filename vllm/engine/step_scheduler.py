@@ -14,10 +14,7 @@ from vllm.engine.scheduling_helpers import (
     lora_adapter_key,
     max_abs_share_gap,
     normalize_quotas,
-    normalized_share_map,
     percentile,
-    rotate_candidates,
-    share_gap_map,
 )
 from vllm.engine.step_plan import (
     DecodePlan,
@@ -129,11 +126,11 @@ class StepScheduler:
                 service_class_weights or self.DEFAULT_SERVICE_CLASS_WEIGHTS
             ).items()
         }
-        self.admission_service_class_quotas = self._normalize_quotas(
+        self.admission_service_class_quotas = normalize_quotas(
             admission_service_class_quotas
             or self.DEFAULT_ADMISSION_SERVICE_CLASS_QUOTAS
         )
-        self.decode_service_class_quotas = self._normalize_quotas(
+        self.decode_service_class_quotas = normalize_quotas(
             decode_service_class_quotas or self.DEFAULT_DECODE_SERVICE_CLASS_QUOTAS
         )
         self.fairness_guardrail_queue_wait_s = max(
@@ -670,10 +667,6 @@ class StepScheduler:
         else:
             self._decode_only_streak = 0
 
-    @staticmethod
-    def _rotate_candidates(request_ids: list[str], cursor: int) -> list[str]:
-        return rotate_candidates(request_ids, cursor)
-
     def _compute_queued_metrics(
         self,
         scheduler,
@@ -709,13 +702,15 @@ class StepScheduler:
         for rid in queued_ids:
             request = scheduler.get_request(rid)
             service_class = str(request.service_class or "latency")
-            lora_id = self._lora_adapter_key(request)
+            lora_id = lora_adapter_key(
+                request, base_lora_adapter=self.BASE_LORA_ADAPTER
+            )
             queue_wait_s = max(0.0, now - float(request.queued_at or now))
             counts[service_class] = counts.get(service_class, 0) + 1
             lora_counts[lora_id] = lora_counts.get(lora_id, 0) + 1
-            if self._is_multimodal(request):
+            if is_multimodal(request):
                 multimodal_waits.append(queue_wait_s)
-                if self._is_multimodal_lora(request):
+                if is_multimodal_lora(request):
                     multimodal_lora_requests += 1
             wait_sums[service_class] = wait_sums.get(service_class, 0.0) + queue_wait_s
             wait_max[service_class] = max(
@@ -732,27 +727,22 @@ class StepScheduler:
             "lora_adapters": lora_counts,
             "avg_wait_s": total_wait / max(1, len(queued_ids)),
             "max_wait_s": max_wait,
-            "p95_wait_s": self._percentile(all_waits, 0.95),
+            "p95_wait_s": percentile(all_waits, 0.95),
             "multimodal_avg_wait_s": (
                 sum(multimodal_waits) / max(1, len(multimodal_waits))
                 if multimodal_waits
                 else 0.0
             ),
             "multimodal_max_wait_s": max(multimodal_waits) if multimodal_waits else 0.0,
-            "multimodal_p95_wait_s": self._percentile(multimodal_waits, 0.95),
+            "multimodal_p95_wait_s": percentile(multimodal_waits, 0.95),
             "service_class_avg_wait_s": {
                 key: wait_sums[key] / max(1, counts[key]) for key in counts
             },
             "service_class_max_wait_s": wait_max,
             "service_class_p95_wait_s": {
-                key: self._percentile(values, 0.95)
-                for key, values in wait_values.items()
+                key: percentile(values, 0.95) for key, values in wait_values.items()
             },
         }
-
-    @staticmethod
-    def _normalize_quotas(quotas: dict[str, int]) -> dict[str, int]:
-        return normalize_quotas(quotas)
 
     def _is_fairness_guardrail_triggered(
         self,
@@ -770,10 +760,6 @@ class StepScheduler:
             float(per_class_p95.get(service_class, 0.0) or 0.0) >= threshold
             for service_class in self.fairness_guardrail_service_classes
         )
-
-    @staticmethod
-    def _percentile(values: list[float], q: float) -> float:
-        return percentile(values, q)
 
     @staticmethod
     def _count_service_classes(
@@ -812,39 +798,8 @@ class StepScheduler:
         return self._lora_constraint.count_lora_adapters(scheduler, request_ids)
 
     @staticmethod
-    def _is_multimodal(request) -> bool:
-        return is_multimodal(request)
-
-    @classmethod
-    def _is_multimodal_lora(cls, request) -> bool:
-        return is_multimodal_lora(request)
-
-    @classmethod
-    def _is_multimodal_request(cls, scheduler, request_id: str) -> bool:
-        return is_multimodal(scheduler.get_request(request_id))
-
-    @classmethod
-    def _is_multimodal_lora_request(cls, scheduler, request_id: str) -> bool:
-        return is_multimodal_lora(scheduler.get_request(request_id))
-
-    @staticmethod
-    def _normalized_share_map(counts: dict[str, int]) -> dict[str, float]:
-        return normalized_share_map(counts)
-
-    @staticmethod
-    def _share_gap_map(
-        target_share: dict[str, float],
-        baseline_share: dict[str, float],
-    ) -> dict[str, float]:
-        return share_gap_map(target_share, baseline_share)
-
-    @staticmethod
     def _max_abs_share_gap(gaps: dict[str, float]) -> float:
         return max_abs_share_gap(gaps)
-
-    @classmethod
-    def _lora_adapter_key(cls, request) -> str:
-        return lora_adapter_key(request, base_lora_adapter=cls.BASE_LORA_ADAPTER)
 
     def _update_prefill_deferrals(
         self,

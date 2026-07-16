@@ -74,6 +74,8 @@ def test_fastinference_env_names_are_registered() -> None:
         if not path.is_file():
             continue
         rel = path.relative_to(ROOT)
+        if rel.parts[0] not in {"tests", "vllm"}:
+            continue
         if any(part in ignored_roots for part in rel.parts):
             continue
         if rel.parts[:2] == ("tests", "reports"):

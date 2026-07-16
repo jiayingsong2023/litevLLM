@@ -24,6 +24,25 @@ or feature status lists.
 | Multi-GPU distributed runtime | Unsupported | `vllm/distributed/` is not part of the current code tree or execution path. |
 | C++/CUDA extension source | Unsupported | Enforced by pre-commit outside allowed third-party code. |
 
+## Supported Python And Service Surface
+
+Only the following import and service entrypoints are compatibility promises.
+Everything else under `vllm/` is an internal implementation detail and may be
+removed once it is outside this surface's import closure and has no regression
+consumer.
+
+| Surface | Status | Contract |
+| :--- | :--- | :--- |
+| `vllm.LLM`, `SamplingParams`, `PoolingParams`, `TextPrompt`, `TokensPrompt`, `clear_cache` | Supported | Public single-GPU Python inference API exported by `vllm.__all__`. |
+| `vllm.engine.async_llm.AsyncLLM` | Supported | Async engine used by serving; direct use is supported for the lite runtime only. |
+| `vllm.serving.config_builder.build_vllm_config` | Compatibility | Programmatic construction of the lite runtime configuration. |
+| `vllm.entrypoints.openai.api_server` | Supported | OpenAI-compatible REST server: `/v1/models` and `/v1/chat/completions`. |
+| `vllm.entrypoints.api_server` | Compatibility | Legacy import that re-exports the supported OpenAI server. |
+| `vllm.entrypoints.serve.tokenize` | Compatibility | Router attachment only; not a standalone server contract. |
+
+No other upstream `vllm.*` imports, CLI surfaces, model families, distributed
+features, or plugin interfaces are compatibility promises.
+
 ## Model Support
 
 | Model / Family | Status | Regression Basis |
@@ -42,6 +61,7 @@ or feature status lists.
 | Upstream Transformers modeling backend | Unsupported | The broken `vllm/model_executor/models/transformers/` wrappers were removed; maintained models live under `vllm/model_executor/models/` with adapter-owned policy. |
 | Generic upstream asset downloader | Unsupported | The `vllm/assets/` helper package was removed; tests and demos should use explicit local fixtures or model paths. |
 | Generic multimodal audio/video parser helpers | Unsupported | Lite multimodal support is image-request plumbing only unless a model-specific implementation and regression gate are added. |
+| Upstream elastic scaling middleware and certificate hot reload | Unsupported | `vllm.entrypoints.serve.elastic_ep` and `vllm.entrypoints.ssl` are not part of the lite server and are removed. |
 | Legacy upstream vLLM model surface | Unsupported | This project no longer aims to preserve full upstream model compatibility. |
 
 ## Feature Support
