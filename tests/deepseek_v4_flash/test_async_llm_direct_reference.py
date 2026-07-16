@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncGenerator
 
 import torch
@@ -87,6 +88,14 @@ class _BridgeDriver:
         return {"driver": True}
 
 
+def _bridge_llm() -> AsyncLLM:
+    llm = AsyncLLM.__new__(AsyncLLM)
+    llm.engine = _BridgeEngine()
+    llm.driver = _BridgeDriver()
+    llm._engine_lock = threading.RLock()
+    return llm
+
+
 def _generate_greedy_reference_chat(
     engine: _FakeEngine,
     prompt: str,
@@ -123,9 +132,7 @@ def test_direct_reference_chat_helper_is_local_to_the_test_module() -> None:
 
 
 def test_async_llm_generate_bridges_request_stream() -> None:
-    llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _BridgeEngine()
-    llm.driver = _BridgeDriver()
+    llm = _bridge_llm()
 
     async def run() -> list[str]:
         from vllm.sampling_params import SamplingParams
@@ -145,10 +152,8 @@ def test_async_llm_generate_bridges_request_stream() -> None:
     assert llm.stats() == {"bridge": True, "async_driver": {"driver": True}}
 
 
-def test_async_llm_generate_does_not_use_direct_runtime_shortcut() -> None:
-    llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _BridgeEngine()
-    llm.driver = _BridgeDriver()
+def test_async_llm_generate_uses_the_engine_request_path() -> None:
+    llm = _bridge_llm()
 
     async def run() -> list[str]:
         outputs: list[str] = []
@@ -166,9 +171,7 @@ def test_async_llm_generate_does_not_use_direct_runtime_shortcut() -> None:
 
 
 def test_async_llm_generate_forwards_multimodal_to_engine() -> None:
-    llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _BridgeEngine()
-    llm.driver = _BridgeDriver()
+    llm = _bridge_llm()
     image = object()
 
     async def run() -> None:
@@ -186,9 +189,7 @@ def test_async_llm_generate_forwards_multimodal_to_engine() -> None:
 
 
 def test_async_llm_abort_forwards_request_ids() -> None:
-    llm = AsyncLLM.__new__(AsyncLLM)
-    llm.engine = _BridgeEngine()
-    llm.driver = _BridgeDriver()
+    llm = _bridge_llm()
 
     asyncio.run(llm.abort(["req-a", "req-b"]))
 

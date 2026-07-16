@@ -180,7 +180,10 @@ class LiteEngine:
             paged_attn_num_stages_global=self.runtime_config.paged_attn_num_stages_global,
             paged_attn_num_warps_local=self.runtime_config.paged_attn_num_warps_local,
             paged_attn_num_stages_local=self.runtime_config.paged_attn_num_stages_local,
-            gemma4_c1_preset=self.runtime_config.gemma4_c1_preset,
+            gemma4_c1_preset=(
+                self.runtime_config.gemma4_c1_preset
+                or bool(self.runtime_policy.model_policy.get("gemma4_c1_preset"))
+            ),
             tuning_env=self._active_tuning_env,
             model_policy=dict(self.runtime_policy.model_policy),
             kernel_policy=dict(self.runtime_policy.kernel_policy),
@@ -381,12 +384,14 @@ class LiteEngine:
         self.prefill_executor = runtime_components["prefill_executor"]
         self.decode_executor = runtime_components["decode_executor"]
         self.step_scheduler = runtime_components["step_scheduler"]
+        self.step_scheduler.set_verified_decode_batch_sizes(
+            self.runtime_policy.verified_decode_batch_sizes
+        )
         self.execution_backend = runtime_components["execution_backend"]
         self.runtime_controller = runtime_components["runtime_controller"]
 
     def set_tokenizer(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
-
 
     def _apply_deepseek_admission_cap(self) -> None:
         if bool(getattr(self.model_capabilities, "supports_chunked_prefill", True)):

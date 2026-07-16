@@ -110,13 +110,14 @@ def _fused_gemm_dot_bf16_tool_override() -> str | None:
     return _tool_override_get("FASTINFERENCE_AWQ_FUSED_GEMM_DOT_BF16")
 
 
-def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
+def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int, k: int) -> bool:
     """
     Whether to use bf16 operands in tl.dot (vs fp16).
 
     On ROCm, bf16 dot can be slower than fp16 dot for narrow decode
-    (small M, moderate N); microbench: use fp16 dot there but still write
-    bf16 output (USE_BF16_OUTPUT).
+    (small M, moderate N). Keep that fast path for shallow projections, but
+    do not narrow deep MLP activations: BF16 values can exceed FP16 range
+    before a K=15360 down projection.
 
     Tool tuning override:
       - unset or "auto": heuristic (ROCm narrow decode -> fp16 dot;
@@ -133,7 +134,7 @@ def _resolve_use_bf16_dot(a: torch.Tensor, m: int, n: int) -> bool:
         return True
     # auto
     if getattr(torch.version, "hip", None) is not None:  # noqa: SIM102
-        if m <= 4 and n <= 8192:
+        if m <= 4 and n <= 8192 and k < 8192:
             return False
     return True
 
@@ -515,6 +516,15 @@ def awq_fused_gate_up_enabled(
     policy: dict[str, object] | None = None,
 ) -> bool:
     raw = _kernel_policy_value(config, policy, "awq_fused_gate_up", False)
+    return raw if isinstance(raw, bool) else truthy(raw)
+
+
+def awq_fused_gate_up_group32_enabled(
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    raw = _kernel_policy_value(config, policy, "awq_fused_gate_up_group32", False)
     return raw if isinstance(raw, bool) else truthy(raw)
 
 
@@ -1053,6 +1063,87 @@ def _packed_int4_symmetric_group32_gemv_m1(
 
 
 @triton.jit
+def _packed_int4_symmetric_group32_gemv_rows_exact_msmall(
+    a_ptr,
+    b_ptr,
+    s_ptr,
+    c_ptr,
+    bias_ptr,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_cn,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Row-exact group32 packed-int4 GEMV for a small decode batch.
+
+    Memory layout matches ``_packed_int4_symmetric_group32_gemv_m1``:
+    activations are [M, K], qweight is [N, K / 8], scales are
+    [N, K / 32], and output is [M, N]. The second launch dimension assigns
+    one independent M=1-equivalent program to each row; it must not use a
+    two-dimensional dot reduction because the verified batch contract needs
+    identical accumulation and output rounding for every row.
+    """
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    num_groups = tl.cdiv(K, 32)
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for group_base in range(0, tl.cdiv(num_groups, BLOCK_GROUPS)):
+        group_idx = group_base * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < num_groups
+        scale = tl.load(
+            s_ptr + offs_n[:, None] * stride_sn + group_idx[None, :] * stride_sk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        group_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group_idx * 4 + pack_in_group
+            packed = tl.load(
+                b_ptr + offs_n[:, None] * stride_bn + pack_idx[None, :] * stride_bk,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                aval = tl.load(
+                    a_ptr + pid_m * stride_am + k_idx * stride_ak,
+                    mask=mask_g & (k_idx < K),
+                    other=0.0,
+                )
+                q = (packed >> (nibble * 4)) & 0xF
+                group_partial += (
+                    aval[None, :].to(tl.float32) * (q.to(tl.float32) - 8.0) * scale
+                )
+        acc += tl.sum(group_partial, axis=1)
+
+    if HAS_BIAS:
+        bias_vals = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+        acc += bias_vals.to(tl.float32)
+
+    out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
+    tl.store(
+        c_ptr + pid_m * stride_cm + offs_n * stride_cn,
+        out,
+        mask=mask_n,
+    )
+
+
+@triton.jit
 def _packed_int4_symmetric_group32_gemv_m1_exact(
     a_ptr,
     b_ptr,
@@ -1192,7 +1283,7 @@ def _packed_int4_symmetric_group32_o_proj_splitk_reduce_m1(
 
 
 @triton.jit
-def _packed_int4_symmetric_group32_qkv_m1(
+def _packed_int4_symmetric_group32_qkv(
     a_ptr,
     q_ptr,
     k_ptr,
@@ -1205,6 +1296,8 @@ def _packed_int4_symmetric_group32_qkv_m1(
     KN: tl.constexpr,
     VN: tl.constexpr,
     K: tl.constexpr,
+    M: tl.constexpr,
+    stride_am,
     stride_ak,
     stride_qn,
     stride_qk,
@@ -1218,6 +1311,7 @@ def _packed_int4_symmetric_group32_qkv_m1(
     stride_ksk,
     stride_vsn,
     stride_vsk,
+    stride_cm,
     stride_cn,
     BLOCK_GROUPS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1225,7 +1319,7 @@ def _packed_int4_symmetric_group32_qkv_m1(
     USE_BF16_OUTPUT: tl.constexpr,
 ):
     """
-    M=1 fused q/k/v packed-int4 GEMV for Gemma4 decode.
+    Small-M fused q/k/v packed-int4 GEMV for Gemma4 decode.
 
     Q, K and optional V share the same activation row and group_size=32. This
     stores [q | k | v] into one contiguous output buffer, reducing three GEMV
@@ -1233,6 +1327,7 @@ def _packed_int4_symmetric_group32_qkv_m1(
     """
     total_n = QN + KN + VN
     pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
     offs_t = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_t = offs_t < total_n
 
@@ -1293,7 +1388,9 @@ def _packed_int4_symmetric_group32_qkv_m1(
             for nibble in tl.static_range(0, 8):
                 k_idx = group_idx * 32 + pack_in_group * 8 + nibble
                 aval = tl.load(
-                    a_ptr + k_idx * stride_ak, mask=mask_g & (k_idx < K), other=0.0
+                    a_ptr + pid_m * stride_am + k_idx * stride_ak,
+                    mask=mask_g & (k_idx < K),
+                    other=0.0,
                 )
                 q = (packed >> (nibble * 4)) & 0xF
                 group_partial += (
@@ -1302,7 +1399,7 @@ def _packed_int4_symmetric_group32_qkv_m1(
         acc += tl.sum(group_partial, axis=1)
 
     out = acc.to(tl.bfloat16) if USE_BF16_OUTPUT else acc.to(tl.float16)
-    tl.store(c_ptr + offs_t * stride_cn, out, mask=mask_t)
+    tl.store(c_ptr + pid_m * stride_cm + offs_t * stride_cn, out, mask=mask_t)
 
 
 @triton.jit
@@ -1404,6 +1501,101 @@ def _packed_int4_symmetric_fused_gate_up_m1(
         act = gate_acc / (1.0 + tl.exp(-gate_acc))
     out = act * up_acc
 
+    out_cast = out.to(tl.bfloat16) if USE_BF16_OUTPUT else out.to(tl.float16)
+    tl.store(c_ptr + offs_n * stride_cn, out_cast, mask=mask_n)
+
+
+@triton.jit
+def _packed_int4_symmetric_fused_gate_up_group32_m1(
+    a_ptr,
+    gate_ptr,
+    up_ptr,
+    gate_s_ptr,
+    up_s_ptr,
+    c_ptr,
+    N,
+    K,
+    stride_ak,
+    stride_gn,
+    stride_gk,
+    stride_un,
+    stride_uk,
+    stride_gsn,
+    stride_gsk,
+    stride_usn,
+    stride_usk,
+    stride_cn,
+    BLOCK_GROUPS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ACT_KIND: tl.constexpr,
+    USE_BF16_OUTPUT: tl.constexpr,
+):
+    # Layout: weights are [N, K/8] packed int4 and scales are [N, K/32].
+    # One program owns BLOCK_N outputs and processes BLOCK_GROUPS quant groups.
+    # Group scales are loaded once, then reused for the four packed words.
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_g = tl.arange(0, BLOCK_GROUPS)
+    gate_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for group_base in range(0, tl.cdiv(K // 32, BLOCK_GROUPS)):
+        group_idx = group_base * BLOCK_GROUPS + offs_g
+        mask_g = group_idx < (K // 32)
+        gate_scale = tl.load(
+            gate_s_ptr + offs_n[:, None] * stride_gsn + group_idx[None, :] * stride_gsk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        up_scale = tl.load(
+            up_s_ptr + offs_n[:, None] * stride_usn + group_idx[None, :] * stride_usk,
+            mask=mask_n[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gate_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+        up_partial = tl.zeros((BLOCK_N, BLOCK_GROUPS), dtype=tl.float32)
+        for pack_in_group in tl.static_range(0, 4):
+            pack_idx = group_idx * 4 + pack_in_group
+            gate_packed = tl.load(
+                gate_ptr + offs_n[:, None] * stride_gn + pack_idx[None, :] * stride_gk,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+            up_packed = tl.load(
+                up_ptr + offs_n[:, None] * stride_un + pack_idx[None, :] * stride_uk,
+                mask=mask_n[:, None] & mask_g[None, :],
+                other=0,
+            ).to(tl.int32)
+            for nibble in tl.static_range(0, 8):
+                k_idx = group_idx * 32 + pack_in_group * 8 + nibble
+                activation = tl.load(
+                    a_ptr + k_idx * stride_ak,
+                    mask=mask_g & (k_idx < K),
+                    other=0.0,
+                )
+                gate_q = (gate_packed >> (nibble * 4)) & 0xF
+                up_q = (up_packed >> (nibble * 4)) & 0xF
+                gate_partial += (
+                    activation[None, :].to(tl.float32)
+                    * (gate_q.to(tl.float32) - 8.0)
+                    * gate_scale
+                )
+                up_partial += (
+                    activation[None, :].to(tl.float32)
+                    * (up_q.to(tl.float32) - 8.0)
+                    * up_scale
+                )
+        gate_acc += tl.sum(gate_partial, axis=1)
+        up_acc += tl.sum(up_partial, axis=1)
+
+    if ACT_KIND == 1:
+        x3 = gate_acc * gate_acc * gate_acc
+        inner = 0.7978845608028654 * (gate_acc + 0.044715 * x3)
+        act = gate_acc / (1.0 + tl.exp(-2.0 * inner))
+    else:
+        act = gate_acc / (1.0 + tl.exp(-gate_acc))
+    out = act * up_acc
     out_cast = out.to(tl.bfloat16) if USE_BF16_OUTPUT else out.to(tl.float16)
     tl.store(c_ptr + offs_n * stride_cn, out_cast, mask=mask_n)
 
@@ -1547,9 +1739,7 @@ def _packed_int4_symmetric_mlp_streaming_m1_recompute(
             other=0.0,
         ).to(tl.float32)
         down_packed = tl.load(
-            down_ptr
-            + offs_n[:, None] * stride_dn
-            + down_pack[None, :] * stride_dk,
+            down_ptr + offs_n[:, None] * stride_dn + down_pack[None, :] * stride_dk,
             mask=mask_n[:, None] & mask_i[None, :],
             other=0,
         ).to(tl.int32)
@@ -2230,7 +2420,7 @@ def awq_fused_gemm(
             raise ValueError(f"awq_fused_gemm: unsupported bias dtype {bias.dtype}")
     bias_ptr_arg = bias if has_bias else a
 
-    use_bf16_dot = _resolve_use_bf16_dot(a, M, N)
+    use_bf16_dot = _resolve_use_bf16_dot(a, M, N, K)
     use_bf16_output = a.dtype == torch.bfloat16
     bf16_dot = 1 if use_bf16_dot else 0
     out_bf16 = 1 if use_bf16_output else 0
@@ -2392,7 +2582,7 @@ def packed_int4_symmetric_fused_gemm(
             )
     bias_ptr_arg = bias if has_bias else a
 
-    use_bf16_dot = _resolve_use_bf16_dot(a, m, n)
+    use_bf16_dot = _resolve_use_bf16_dot(a, m, n, k)
     use_bf16_output = a.dtype == torch.bfloat16
     bf16_dot = 1 if use_bf16_dot else 0
     out_bf16 = 1 if use_bf16_output else 0
@@ -2729,6 +2919,90 @@ def packed_int4_symmetric_fused_gemm(
     return c
 
 
+def packed_int4_symmetric_group32_rows_exact_msmall_safe(
+    a: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, bool, str]:
+    """Run the M=2/4 row-exact counterpart of the group32 M=1 GEMV.
+
+    This is intentionally narrow. It is the only batched packed-int4 path
+    eligible for the verified Gemma4-12B decode envelope. Unsupported layouts
+    return a reason so the caller can split into independent M=1 calls rather
+    than selecting the generic tiled GEMM path.
+    """
+    if a.dim() != 2 or int(a.shape[0]) not in (2, 4):
+        return a, False, "input_not_m2_or_m4_2d"
+    if qweight.dim() != 2 or scales.dim() != 2:
+        return a, False, "weight_or_scales_not_2d"
+    m, k = int(a.shape[0]), int(a.shape[1])
+    n = int(qweight.shape[0])
+    if int(group_size) != 32 or k % 32 != 0:
+        return a, False, "unsupported_group_layout"
+    if k != int(qweight.shape[1]) * 8:
+        return a, False, "k_mismatch"
+    if tuple(scales.shape) != (n, k // 32):
+        return a, False, "scales_shape_mismatch"
+    if (
+        a.device != qweight.device
+        or a.device != scales.device
+        or a.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return a, False, "tensor_device_or_dtype"
+    if bias is not None and (
+        bias.dim() != 1
+        or int(bias.numel()) != n
+        or bias.device != a.device
+        or bias.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        return a, False, "bias_layout_or_dtype"
+    if not (a.is_contiguous() and qweight.is_contiguous() and scales.is_contiguous()):
+        return a, False, "noncontiguous_input"
+    if out is not None and (
+        tuple(out.shape) != (m, n) or out.device != a.device or out.dtype != a.dtype
+    ):
+        return a, False, "bad_output"
+
+    try:
+        c = torch.empty((m, n), device=a.device, dtype=a.dtype) if out is None else out
+        _, block_groups = _group32_gemv_all_launch_config_tool_override()
+        # The M=4 12B MLP shape exceeds the ROCm register budget with the
+        # normal 128-wide tile. A 64-wide tile preserves the row arithmetic
+        # while keeping this verified path resident and deterministic.
+        block_n = 64
+        bias_ptr = bias.contiguous() if bias is not None else a
+        grid = (triton.cdiv(n, block_n), m)
+        _packed_int4_symmetric_group32_gemv_rows_exact_msmall[grid](
+            a,
+            qweight,
+            scales,
+            c,
+            bias_ptr,
+            n,
+            k,
+            a.stride(0),
+            a.stride(1),
+            qweight.stride(0),
+            qweight.stride(1),
+            scales.stride(0),
+            scales.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_GROUPS=block_groups,
+            BLOCK_N=block_n,
+            USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+            HAS_BIAS=bias is not None,
+            num_warps=8 if block_n >= 128 else 4,
+            num_stages=1,
+        )
+        return c, True, "ok"
+    except Exception:
+        return a, False, "kernel_exception"
+
+
 def packed_int4_symmetric_fused_gate_up_m1(
     a: torch.Tensor,
     gate_qweight: torch.Tensor,
@@ -2789,6 +3063,62 @@ def packed_int4_symmetric_fused_gate_up_m1(
         ACT_KIND=act_kind,
         USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
         num_warps=8 if block_n >= 128 else 4,
+        num_stages=1,
+    )
+    return c
+
+
+def packed_int4_symmetric_fused_gate_up_group32_m1(
+    a: torch.Tensor,
+    gate_qweight: torch.Tensor,
+    up_qweight: torch.Tensor,
+    gate_scales: torch.Tensor,
+    up_scales: torch.Tensor,
+    group_size: int,
+    *,
+    activation: str = "silu",
+    out: torch.Tensor | None = None,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> torch.Tensor:
+    """Group-oriented M=1 fused gate/up candidate for group32 AWQ."""
+    m, k = a.shape
+    n = int(gate_qweight.shape[0])
+    if m != 1 or int(group_size) != 32 or k % 32 != 0:
+        raise ValueError("group32 fused gate/up requires M=1 and aligned group32 K")
+    if tuple(gate_qweight.shape) != tuple(up_qweight.shape):
+        raise ValueError("group32 fused gate/up qweight shape mismatch")
+    if tuple(gate_scales.shape) != tuple(up_scales.shape):
+        raise ValueError("group32 fused gate/up scale shape mismatch")
+    if int(gate_qweight.shape[1]) * 8 != k:
+        raise ValueError("group32 fused gate/up K mismatch")
+    del config, policy
+    c = torch.empty((1, n), device=a.device, dtype=a.dtype) if out is None else out
+    act_kind = 1 if str(activation).lower() in ("gelu", "gelu_pytorch_tanh") else 0
+    _packed_int4_symmetric_fused_gate_up_group32_m1[(triton.cdiv(n, 128),)](
+        a,
+        gate_qweight,
+        up_qweight,
+        gate_scales,
+        up_scales,
+        c,
+        n,
+        k,
+        a.stride(1),
+        gate_qweight.stride(0),
+        gate_qweight.stride(1),
+        up_qweight.stride(0),
+        up_qweight.stride(1),
+        gate_scales.stride(0),
+        gate_scales.stride(1),
+        up_scales.stride(0),
+        up_scales.stride(1),
+        c.stride(1),
+        BLOCK_GROUPS=8,
+        BLOCK_N=128,
+        ACT_KIND=act_kind,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        num_warps=8,
         num_stages=1,
     )
     return c
@@ -3050,7 +3380,7 @@ def packed_int4_symmetric_fused_qkv_m1(
         has_v=has_v,
     )
     grid = (triton.cdiv(total_n, block_n),)
-    _packed_int4_symmetric_group32_qkv_m1[grid](
+    _packed_int4_symmetric_group32_qkv[grid](
         a,
         q_qweight,
         k_qweight,
@@ -3063,6 +3393,8 @@ def packed_int4_symmetric_fused_qkv_m1(
         KN=kn,
         VN=vn,
         K=k,
+        M=m,
+        stride_am=a.stride(0),
         stride_ak=a.stride(1),
         stride_qn=q_qweight.stride(0),
         stride_qk=q_qweight.stride(1),
@@ -3076,6 +3408,107 @@ def packed_int4_symmetric_fused_qkv_m1(
         stride_ksk=k_scales.stride(1),
         stride_vsn=v_scales.stride(0),
         stride_vsk=v_scales.stride(1),
+        stride_cm=c.stride(0),
+        stride_cn=c.stride(1),
+        BLOCK_GROUPS=block_groups,
+        BLOCK_N=block_n,
+        HAS_V=has_v,
+        USE_BF16_OUTPUT=a.dtype == torch.bfloat16,
+        num_warps=8 if block_n >= 128 else 4,
+        num_stages=1,
+    )
+    return c
+
+
+def packed_int4_symmetric_fused_qkv_m2(
+    a: torch.Tensor,
+    q_qweight: torch.Tensor,
+    k_qweight: torch.Tensor,
+    v_qweight: torch.Tensor | None,
+    q_scales: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor | None,
+    group_size: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> torch.Tensor:
+    if int(a.shape[0]) != 2:
+        raise ValueError("packed_int4_symmetric_fused_qkv_m2: requires M == 2")
+    return _packed_int4_symmetric_fused_qkv_msmall(
+        a,
+        q_qweight,
+        k_qweight,
+        v_qweight,
+        q_scales,
+        k_scales,
+        v_scales,
+        group_size,
+        config=config,
+        policy=policy,
+    )
+
+
+def _packed_int4_symmetric_fused_qkv_msmall(
+    a: torch.Tensor,
+    q_qweight: torch.Tensor,
+    k_qweight: torch.Tensor,
+    v_qweight: torch.Tensor | None,
+    q_scales: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor | None,
+    group_size: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> torch.Tensor:
+    m, k = a.shape
+    qn = int(q_qweight.shape[0])
+    kn = int(k_qweight.shape[0])
+    has_v = v_qweight is not None and v_scales is not None
+    vn = int(v_qweight.shape[0]) if has_v else 0
+    total_n = qn + kn + vn
+    if v_qweight is None:
+        v_qweight = q_qweight
+    if v_scales is None:
+        v_scales = q_scales
+    del config, policy
+    c = torch.empty((m, total_n), device=a.device, dtype=a.dtype)
+    block_n, block_groups = _qkv_group32_gemv_launch_config(
+        total_n=total_n,
+        k=k,
+        has_v=has_v,
+    )
+    grid = (triton.cdiv(total_n, block_n), m)
+    _packed_int4_symmetric_group32_qkv[grid](
+        a,
+        q_qweight,
+        k_qweight,
+        v_qweight,
+        q_scales,
+        k_scales,
+        v_scales,
+        c,
+        QN=qn,
+        KN=kn,
+        VN=vn,
+        K=k,
+        M=m,
+        stride_am=a.stride(0),
+        stride_ak=a.stride(1),
+        stride_qn=q_qweight.stride(0),
+        stride_qk=q_qweight.stride(1),
+        stride_kn=k_qweight.stride(0),
+        stride_kk=k_qweight.stride(1),
+        stride_vn=v_qweight.stride(0),
+        stride_vk=v_qweight.stride(1),
+        stride_qsn=q_scales.stride(0),
+        stride_qsk=q_scales.stride(1),
+        stride_ksn=k_scales.stride(0),
+        stride_ksk=k_scales.stride(1),
+        stride_vsn=v_scales.stride(0),
+        stride_vsk=v_scales.stride(1),
+        stride_cm=c.stride(0),
         stride_cn=c.stride(1),
         BLOCK_GROUPS=block_groups,
         BLOCK_N=block_n,
@@ -3153,6 +3586,61 @@ def packed_int4_symmetric_fused_qkv_m1_safe(
         return a, False, "kernel_exception"
 
 
+def packed_int4_symmetric_fused_qkv_m2_safe(
+    a: torch.Tensor,
+    q_qweight: torch.Tensor,
+    k_qweight: torch.Tensor,
+    v_qweight: torch.Tensor | None,
+    q_scales: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor | None,
+    group_size: int,
+    *,
+    config: Any | None = None,
+    policy: dict[str, object] | None = None,
+) -> tuple[torch.Tensor, bool, str]:
+    if not awq_decode_gemv_enabled(config=config, policy=policy):
+        return a, False, "decode_gemv_disabled"
+    if a.dim() != 2 or int(a.shape[0]) != 2:
+        return a, False, "input_not_m2_2d"
+    if int(group_size) != 32 or int(a.shape[1]) % 32 != 0:
+        return a, False, "unsupported_group_layout"
+    tensors = [q_qweight, k_qweight, q_scales, k_scales]
+    if v_qweight is not None or v_scales is not None:
+        if v_qweight is None or v_scales is None:
+            return a, False, "v_bad_shape"
+        tensors.extend([v_qweight, v_scales])
+    if any(t.dim() != 2 or t.device != a.device for t in tensors):
+        return a, False, "tensor_layout_or_device"
+    if any(int(a.shape[1]) != int(weight.shape[1]) * 8 for weight in tensors[:2]):
+        return a, False, "qk_k_mismatch"
+    if v_qweight is not None and int(a.shape[1]) != int(v_qweight.shape[1]) * 8:
+        return a, False, "v_k_mismatch"
+    try:
+        c = packed_int4_symmetric_fused_qkv_m2(
+            a.contiguous(),
+            q_qweight.contiguous(),
+            k_qweight.contiguous(),
+            v_qweight.contiguous() if v_qweight is not None else None,
+            q_scales.contiguous(),
+            k_scales.contiguous(),
+            v_scales.contiguous() if v_scales is not None else None,
+            int(group_size),
+            config=config,
+            policy=policy,
+        )
+        expected_n = (
+            int(q_qweight.shape[0])
+            + int(k_qweight.shape[0])
+            + (int(v_qweight.shape[0]) if v_qweight is not None else 0)
+        )
+        if c.shape != (2, expected_n):
+            return c, False, "bad_output_shape"
+        return c, True, "ok"
+    except Exception:
+        return a, False, "kernel_exception"
+
+
 def packed_int4_symmetric_fused_gate_up_m1_safe(
     a: torch.Tensor,
     gate_qweight: torch.Tensor,
@@ -3195,7 +3683,12 @@ def packed_int4_symmetric_fused_gate_up_m1_safe(
     ):
         return a, False, "device_mismatch"
     try:
-        c = packed_int4_symmetric_fused_gate_up_m1(
+        runner = (
+            packed_int4_symmetric_fused_gate_up_group32_m1
+            if awq_fused_gate_up_group32_enabled(config=config, policy=policy)
+            else packed_int4_symmetric_fused_gate_up_m1
+        )
+        c = runner(
             a.contiguous(),
             gate_qweight.contiguous(),
             up_qweight.contiguous(),

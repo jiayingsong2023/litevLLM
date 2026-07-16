@@ -116,6 +116,13 @@ _GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
     "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
 }
 
+_GEMMA4_12B_BATCH_ENV: dict[str, str] = {
+    "FASTINFERENCE_KV_TYPE": "fp8",
+    "FASTINFERENCE_FUSION_LEVEL": "2",
+    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "4",
+    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+}
+
 _DEEPSEEK_V4_FLASH_GGUF_PATH = (
     "models/DeepSeek-V4-Flash-ds4/"
     "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
@@ -157,6 +164,21 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
     ),
+    "gemma4_12b_awq": ModelSpec(
+        key="gemma4_12b_awq",
+        model_path=os.environ.get(
+            "MODEL_GEMMA4_12B_AWQ", "models/gemma-4-12B-it-AWQ-INT4"
+        ),
+        display_name="Gemma4-12B (AWQ INT4, M=4)",
+        quant="awq",
+        concurrent_reqs=4,
+        prompt_tokens_target=128,
+        max_new_tokens=32,
+        gpu_memory_utilization=0.80,
+        max_model_len=512,
+        max_run_seconds=1200,
+        stable_env=dict(_GEMMA4_12B_BATCH_ENV),
+    ),
     "gemma4_31b_q4": ModelSpec(
         key="gemma4_31b_q4",
         model_path=os.environ.get(
@@ -196,7 +218,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         display_name="DeepSeek V4 Flash Q2 GGUF",
         quant="deepseek-v4-flash-gguf",
         concurrent_reqs=1,
-        # DeepSeek direct prefill is currently sequential token replay.
+        # DeepSeek GGUF prefill is currently sequential token replay.
         # Keep the default smoke short; use --deepseek-prompt-tokens for long runs.
         prompt_tokens_target=32,
         max_new_tokens=16,
@@ -2254,7 +2276,6 @@ async def run_benchmark(
     warmup_config: WarmupConfig | None = None,
     fixed_decode_len: bool = True,
     clear_prefix_cache_after_warmup: bool = True,
-    deepseek_batched_engine: bool = False,
 ) -> Dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
@@ -2278,10 +2299,7 @@ async def run_benchmark(
     print(f"{'=' * 72}")
 
     if spec.quant == "deepseek-v4-flash-gguf":
-        return _run_deepseek_v4_flash_direct_benchmark(
-            spec,
-            batched_engine=deepseek_batched_engine,
-        )
+        return _run_deepseek_v4_flash_gguf_benchmark(spec)
 
     if not os.path.isdir(spec.model_path) and not _is_hf_repo_id(spec.model_path):
         print("  [Skip] Model directory not found.")
@@ -2790,7 +2808,7 @@ def _deepseek_smoke_payload_to_benchmark_result(
         "awq_runtime_stats": {},
         "awq_metrics": {},
         "workload": {
-            "kind": "deepseek_v4_flash_direct_gguf",
+            "kind": "deepseek_v4_flash_gguf",
             "context_length": int(payload.get("context_length", spec.max_model_len)),
             "prompt_length": int(prompt_length),
             "max_tokens": int(max_tokens),
@@ -2813,26 +2831,14 @@ def _deepseek_smoke_payload_to_benchmark_result(
     }
 
 
-def _run_deepseek_v4_flash_direct_benchmark(
-    spec: ModelSpec,
-    *,
-    batched_engine: bool = False,
-) -> dict[str, Any]:
-    if batched_engine:
-        print("  [DeepSeek] Running batched-engine direct GGUF GPU smoke benchmark.")
-    else:
-        print("  [DeepSeek] Running direct GGUF GPU smoke benchmark.")
+def _run_deepseek_v4_flash_gguf_benchmark(spec: ModelSpec) -> dict[str, Any]:
+    print("  [DeepSeek] Running GGUF GPU smoke benchmark.")
     if not os.path.isfile(spec.model_path):
         print("  [Skip] DeepSeek V4 Flash GGUF file not found.")
         return {"skipped": 1.0, "skip_reason": "model_file_not_found"}
-    script = (
-        "tests/tools/run_deepseek_v4_flash_gpu_smoke_batched.py"
-        if batched_engine
-        else "tests/tools/run_deepseek_v4_flash_gpu_smoke.py"
-    )
     command = [
         sys.executable,
-        script,
+        "tests/tools/run_deepseek_v4_flash_gpu_smoke.py",
         "--model",
         spec.model_path,
         "--context-length",
@@ -2840,36 +2846,24 @@ def _run_deepseek_v4_flash_direct_benchmark(
         "--max-tokens",
         str(spec.max_new_tokens),
     ]
-    if batched_engine:
-        command.extend(
-            [
-                "--batch-size",
-                str(spec.concurrent_reqs),
-                "--prompt-length",
-                "1",
-                "--repeat",
-                "1",
-            ]
-        )
-    else:
-        command.extend(
-            [
-                "--prompt-length",
-                str(spec.prompt_tokens_target),
-                "--warmup-tokens",
-                str(spec.max_new_tokens),
-                "--repeat",
-                "3",
-                "--min-steady-decode-tps",
-                os.environ.get(
-                    "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS",
-                    "1.5",
-                ),
-            ]
-        )
+    command.extend(
+        [
+            "--prompt-length",
+            str(spec.prompt_tokens_target),
+            "--warmup-tokens",
+            str(spec.max_new_tokens),
+            "--repeat",
+            "3",
+            "--min-steady-decode-tps",
+            os.environ.get(
+                "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS",
+                "1.5",
+            ),
+        ]
+    )
     start = time.perf_counter()
     # Use the same optimal env knobs that give the best single-request
-    # direct decode throughput on DeepSeek V4 Flash.
+    # decode throughput on DeepSeek V4 Flash.
     deepseek_env = os.environ.copy()
     deepseek_env.update(
         {
@@ -3008,8 +3002,8 @@ def _format_perf_regression_warnings(warnings: list[dict[str, object]]) -> list[
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "End-to-end performance benchmark for Gemma4 26B/31B, Qwen3.5, "
-            "TinyLlama, and DeepSeek V4 Flash Q2 GGUF direct-path models."
+            "End-to-end performance benchmark for Gemma4 12B/26B/31B, Qwen3.5, "
+            "TinyLlama, and DeepSeek V4 Flash Q2 GGUF models."
         )
     )
     parser.add_argument(
@@ -3019,7 +3013,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated model keys. Default: "
             "gemma4_26b_a4b,gemma4_31b_q4,deepseek_v4_flash_q2_gguf. "
-            "Available: tinyllama, qwen35_9b_awq, gemma4_31b_q4, "
+            "Available: tinyllama, qwen35_9b_awq, gemma4_12b_awq, gemma4_31b_q4, "
             "gemma4_26b_a4b, deepseek_v4_flash_q2_gguf."
         ),
     )
@@ -3355,15 +3349,6 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Disable per-model child-process isolation even when auto-isolation would apply.",
     )
-    parser.add_argument(
-        "--deepseek-batched-engine",
-        action="store_true",
-        default=False,
-        help=(
-            "For DeepSeek V4 Flash, run the batched engine method "
-            "(generate_deepseek_v4_flash_greedy_batched) instead of one request at a time."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -3543,7 +3528,6 @@ async def main() -> None:
                     clear_prefix_cache_after_warmup=_clear_prefix_cache_after_warmup(
                         args
                     ),
-                    deepseek_batched_engine=args.deepseek_batched_engine,
                 )
                 runtime_stats_summary[spec.key] = dict(
                     summary[spec.key].get("runtime_stats", {})

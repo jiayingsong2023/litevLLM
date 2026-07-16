@@ -90,6 +90,27 @@ def test_gemma4_adapter_exposes_production_model_and_kernel_policy() -> None:
     assert policy.kernel_policy["gemma4_dense_down_proj"] is True
 
 
+def test_gemma4_12b_adapter_selects_verified_m1_fast_paths() -> None:
+    runtime_config = SimpleNamespace(tuning_env={}, kv_cache_dtype="fp8")
+    text_config = SimpleNamespace(
+        hidden_size=3840,
+        num_hidden_layers=48,
+        intermediate_size=15360,
+        num_attention_heads=16,
+    )
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(text_config=text_config))
+
+    policy = Gemma4Adapter().runtime_policy(model_config, runtime_config)
+
+    assert "awq_rows_exact_msmall" not in policy.kernel_policy
+    assert policy.kernel_policy["awq_fused_gate_up"] is True
+    assert policy.kernel_policy["awq_fused_gate_up_group32"] is True
+    assert policy.kernel_policy["gemma4_dense_down_proj"] is True
+    assert policy.model_policy["mlp_pair_fusion"] is True
+    assert policy.model_policy["gemma4_c1_preset"] is True
+    assert policy.verified_decode_batch_sizes == (1,)
+
+
 def test_gemma4_local_decode_triton_reads_attn_config_model_policy(
     monkeypatch,
 ) -> None:
@@ -266,17 +287,18 @@ def test_gemma4_model_policy_covers_all_runtime_config_fields() -> None:
     """Every RuntimeConfig.gemma4_* field should have a corresponding
     model_policy key from Gemma4Adapter."""
     from vllm.adapters.policy_keys import (
+        GEMMA4_C1_PRESET,
         GEMMA4_FP32_RESIDUAL_GUARD_ENABLED,
-        GEMMA4_FP32_RESIDUAL_GUARD_START,
         GEMMA4_FP32_RESIDUAL_GUARD_SPAN,
-        GEMMA4_MOE_EXPERT_CACHE_SIZE,
+        GEMMA4_FP32_RESIDUAL_GUARD_START,
+        GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         GEMMA4_MOE_COMPUTE_DTYPE,
+        GEMMA4_MOE_EXPERT_CACHE_SIZE,
         GEMMA4_MOE_INT4_KERNEL_ENABLED,
         GEMMA4_MOE_INT4_KERNEL_STRATEGY,
         GEMMA4_MOE_PREFILL_GROUPED_ENABLED,
         GEMMA4_MOE_PREFILL_GROUPED_MIN_TOKENS,
         GEMMA4_MOE_PREFILL_GROUPED_STRATEGY,
-        GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         GEMMA4_ROPE_CACHE_MAX_POS,
         GEMMA4_ROPE_CACHE_POOL_MAX,
     )
@@ -295,7 +317,7 @@ def test_gemma4_model_policy_covers_all_runtime_config_fields() -> None:
         "gemma4_moe_batch_materialize_enabled": GEMMA4_MOE_BATCH_MATERIALIZE_ENABLED,
         "gemma4_rope_cache_max_pos": GEMMA4_ROPE_CACHE_MAX_POS,
         "gemma4_rope_cache_pool_max": GEMMA4_ROPE_CACHE_POOL_MAX,
-        "gemma4_c1_preset": None,  # special case: kernel tuning flag, not in model_policy
+        "gemma4_c1_preset": GEMMA4_C1_PRESET,
     }
 
     # Verify all gemma4_* RuntimeConfig fields have a mapping

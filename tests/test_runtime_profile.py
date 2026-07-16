@@ -27,6 +27,7 @@ def _caps(model_type: str = "llama") -> SimpleNamespace:
 def test_supported_profile_names_are_stable() -> None:
     assert SUPPORTED_PROFILE_NAMES == (
         "auto",
+        "balanced",
         "latency",
         "throughput",
         "accuracy",
@@ -43,7 +44,7 @@ def test_auto_profile_resolves_to_named_effective_profile(monkeypatch) -> None:
     )
 
     assert profile.requested_name == "auto"
-    assert profile.effective_name == "benchmark"
+    assert profile.effective_name == "balanced"
     assert profile.kv_cache_dtype == "turbo_int4"
     assert profile.block_size == 16
     assert profile.backend_policy.gpu_greedy_sampling is True
@@ -100,6 +101,17 @@ def test_throughput_profile_uses_batched_defaults() -> None:
     assert profile.effective_name == "throughput"
     assert profile.kv_max_active_requests == 16
     assert profile.prefill_microbatch_size == 4
+
+
+def test_balanced_profile_is_the_default_service_policy() -> None:
+    profile = RuntimeProfileRegistry.resolve(
+        requested_profile="balanced",
+        model_capabilities=_caps("llama"),
+        gpu_total_gb=24.0,
+    )
+
+    assert profile.effective_name == "balanced"
+    assert profile.backend_policy.gpu_greedy_sampling is True
 
 
 def test_benchmark_profile_uses_turbo_int4_and_gpu_greedy() -> None:

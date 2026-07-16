@@ -83,6 +83,8 @@ Lower-ILP fallback:
 
 from __future__ import annotations
 
+import json
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -192,17 +194,16 @@ def _select_paged_attention_launch_config(
             return 4, 4
         return 4, 2
 
-    # Decode-heavy Gemma4-31B path: head_size=256, block_size=16.
+    # Decode-heavy Gemma4 path: global attention must keep the M=1 2/2
+    # reduction launch for row-exact batch decode. Changing warp count changes
+    # ROCm's reduction order at head_size=512.
     # Scope-aware bucket:
-    # - global/full attention: low concurrency often benefits from leaner launch (2/2),
-    #   while >=3 concurrency is more stable with 4/2.
+    # - global/full attention: always 2/2 for row-equivalent reductions.
     # - local/sliding attention: use lighter c1 stage depth, 4/2 otherwise.
     # Fallback keeps stable default and env override remains available.
     if head_size >= 256:
         if scope == "global":
-            if num_seqs <= 2:
-                return 2, 2
-            return 4, 2
+            return 2, 2
         if scope == "local":
             if num_seqs <= 1:
                 return 4, 1
@@ -217,6 +218,91 @@ def _select_paged_attention_launch_config(
     if block_size >= 32:
         return 4, 2
     return 2, 2
+
+
+def _paged_attention_debug_snapshot(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    scope: object,
+    layer_type: object,
+) -> dict[str, object]:
+    """Synchronously validate paged-KV addressing for one diagnostic launch."""
+    torch.cuda.synchronize(query.device)
+    seq_lens_cpu = [int(value) for value in seq_lens.detach().cpu().tolist()]
+    table_cpu = block_tables.detach().cpu()
+    required = [(length + block_size - 1) // block_size for length in seq_lens_cpu]
+    table_cols = int(block_tables.shape[1])
+    used_ids = [
+        int(block_id)
+        for row, count in enumerate(required)
+        for block_id in table_cpu[row, :count].tolist()
+    ]
+    invalid_lengths = [
+        row for row, count in enumerate(required) if count > table_cols
+    ]
+    invalid_ids = [
+        block_id
+        for block_id in used_ids
+        if block_id < 0 or block_id >= int(key_cache.shape[0])
+    ]
+    # Decode diagnostics need all rows; flattened prefill launches can contain
+    # thousands of rows and must remain readable enough to reach decode.
+    if len(seq_lens_cpu) <= 8:
+        seq_lens_value: object = seq_lens_cpu
+        required_value: object = required
+        block_rows_value: object = [
+            [int(block_id) for block_id in table_cpu[row, :count].tolist()]
+            for row, count in enumerate(required)
+        ]
+    else:
+        seq_lens_value = {
+            "count": len(seq_lens_cpu),
+            "min": min(seq_lens_cpu, default=None),
+            "max": max(seq_lens_cpu, default=None),
+        }
+        required_value = {
+            "min": min(required, default=None),
+            "max": max(required, default=None),
+        }
+        block_rows_value = "omitted_for_prefill"
+
+    snapshot: dict[str, object] = {
+        "scope": str(scope),
+        "layer_type": str(layer_type),
+        "query_shape": list(query.shape),
+        "seq_lens": seq_lens_value,
+        "required_blocks": required_value,
+        "block_table_shape": list(block_tables.shape),
+        "used_block_ids_by_row": block_rows_value,
+        "kv_cache_shape": list(key_cache.shape),
+        "kv_cache_strides": list(key_cache.stride()),
+        "block_id_min": min(used_ids) if used_ids else None,
+        "block_id_max": max(used_ids) if used_ids else None,
+        "kv_blocks": int(key_cache.shape[0]),
+        "invalid_length_rows": invalid_lengths,
+        "invalid_block_ids": invalid_ids[:8],
+    }
+    if invalid_lengths or invalid_ids:
+        raise RuntimeError(f"paged attention metadata out of bounds: {snapshot}")
+    return snapshot
+
+
+def _paged_attention_debug_enabled(config: object | None) -> bool:
+    policy = getattr(config, "kernel_policy", None)
+    if not isinstance(policy, dict):
+        return False
+    return bool(policy.get("paged_attention_debug", False))
+
+
+def _paged_attention_debug_decode_only(config: object | None) -> bool:
+    policy = getattr(config, "kernel_policy", None)
+    if not isinstance(policy, dict):
+        return False
+    return bool(policy.get("paged_attention_debug_decode_only", False))
 
 
 @triton.jit
@@ -510,6 +596,22 @@ def paged_attention_v1(
     is_int4 = "int4" in str(kv_cache_dtype).lower()
     is_cached = k_ptrs is not None
     has_row_scale = k_scale_ptrs is not None
+    config = kwargs.get("config")
+    debug_enabled = _paged_attention_debug_enabled(config)
+    if _paged_attention_debug_decode_only(config) and num_seqs > 4:
+        debug_enabled = False
+    debug_snapshot: dict[str, object] | None = None
+    if debug_enabled:
+        debug_snapshot = _paged_attention_debug_snapshot(
+            query=query,
+            key_cache=key_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            block_size=int(block_size),
+            scope=kwargs.get("attn_scope"),
+            layer_type=kwargs.get("layer_type"),
+        )
+        print(f"PAGED_ATTN_DEBUG before={json.dumps(debug_snapshot, sort_keys=True)}")
 
     # KV Block Selective Attention: convert ratio to stride.
     # select_ratio=0.0 → disabled, 0.25 → stride 4, 0.5 → stride 2, 1.0 → stride 1.
@@ -559,6 +661,17 @@ def paged_attention_v1(
         layer_type=kwargs.get("layer_type"),
         config=kwargs.get("config"),
     )
+    if debug_snapshot is not None:
+        debug_snapshot["launch"] = {
+            "grid": [num_seqs * num_heads],
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "block_size": int(block_size),
+            "is_cached": is_cached,
+            "kv_dtype": str(kv_cache_dtype),
+        }
 
     grid = (num_seqs * num_heads,)
     _paged_attention_kernel[grid](
@@ -620,3 +733,6 @@ def paged_attention_v1(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if debug_enabled:
+        torch.cuda.synchronize(query.device)
+        print(f"PAGED_ATTN_DEBUG after={json.dumps(debug_snapshot, sort_keys=True)}")

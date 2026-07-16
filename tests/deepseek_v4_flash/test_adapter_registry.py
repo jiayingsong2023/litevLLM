@@ -83,18 +83,6 @@ def test_deepseek_adapter_builds_custom_runtime_components() -> None:
         num_layers=lambda: 43,
     )
 
-    assert (
-        adapter.build_direct_runtime(
-            model=model,
-            model_config=_model_config(),
-            runtime_config=SimpleNamespace(queue_timeout_s=30.0),
-            tokenizer=object(),
-            device="cpu",
-            observer=None,
-        )
-        is None
-    )
-
     components = adapter.build_executors(
         model=model,
         model_config=_model_config(),

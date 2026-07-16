@@ -11,8 +11,14 @@ from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.models.lite_config import LiteConfig
 from vllm.model_executor.models.multimodal_utils import replace_image_placeholders
 
+from .config import set_gemma4_tuning_config
 from .layer import Gemma4DecoderLayer
-from .policy_utils import _gemma4_fp32_residual_guard_policy, _get_eps
+from .policy_utils import (
+    _gemma4_fp32_residual_guard_policy,
+    _gemma4_kernel_policy_truthy,
+    _get_eps,
+)
+from .profiling import _gemma4_profile_span
 from .vision import Gemma4VisionProjector, Gemma4VisionTower
 
 
@@ -133,6 +139,13 @@ class Gemma4ForConditionalGeneration(nn.Module):
             prefix="model",
             runtime_config=getattr(vllm_config, "runtime_config", None),
         )
+        runtime_config = getattr(vllm_config, "runtime_config", None)
+        layer_config = set_gemma4_tuning_config(
+            getattr(runtime_config, "tuning_env", None), locked=True
+        )
+        self._layer_config = layer_config
+        for layer in self.model.layers:
+            layer.set_config(layer_config)
         self.lm_head = LiteLinear(
             self.model.config.hidden_size,
             self.model.config.vocab_size,
@@ -196,12 +209,31 @@ class Gemma4ForConditionalGeneration(nn.Module):
             lora_mapping,
             multimodal_embeddings=multimodal_embeddings,
         )
-        if getattr(self.model.config, "tie_word_embeddings", False):
-            logits = torch.nn.functional.linear(
-                hidden[:, -1:, :], self.model.embed_tokens.weight
-            )
-        else:
-            logits = self.lm_head(hidden[:, -1:, :], lora_mapping)
+        with _gemma4_profile_span("lm_head", self._layer_config):
+            if getattr(self.model.config, "tie_word_embeddings", False):
+                last_hidden = hidden[:, -1:, :]
+                if _gemma4_kernel_policy_truthy(
+                    attn_metadata.get("config"), "awq_rows_exact_msmall", default=False
+                ) and int(last_hidden.shape[0]) in (2, 4):
+                    # HIP BLAS is allowed to choose a different reduction for a
+                    # batched BF16 GEMM. The verified envelope requires every
+                    # lm-head row to use the same M=1 reduction and rounding.
+                    logits = torch.cat(
+                        [
+                            torch.nn.functional.linear(
+                                last_hidden[row : row + 1],
+                                self.model.embed_tokens.weight,
+                            )
+                            for row in range(int(last_hidden.shape[0]))
+                        ],
+                        dim=0,
+                    )
+                else:
+                    logits = torch.nn.functional.linear(
+                        last_hidden, self.model.embed_tokens.weight
+                    )
+            else:
+                logits = self.lm_head(hidden[:, -1:, :], lora_mapping)
         final_softcap = getattr(self.model.config, "final_logit_softcapping", None)
         if final_softcap is not None and float(final_softcap) > 0:
             logits = torch.tanh(logits / float(final_softcap)) * float(final_softcap)

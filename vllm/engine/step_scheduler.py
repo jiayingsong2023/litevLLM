@@ -261,6 +261,12 @@ class StepScheduler:
         self._multimodal_constraint = MultiModalConstraint()
         self._multimodal_lora_constraint = MultiModalLoRAConstraint()
 
+    def set_verified_decode_batch_sizes(
+        self, batch_sizes: tuple[int, ...] | None
+    ) -> None:
+        """Install a model-specific exact decode envelope after assembly."""
+        self._decode_prefill_planner.set_verified_decode_batch_sizes(batch_sizes)
+
     def update_runtime_feedback(self, stats: dict[str, object] | None) -> None:
         observer = stats.get("observer") if isinstance(stats, dict) else None
         multimodal = observer.get("multimodal") if isinstance(observer, dict) else None

@@ -2,12 +2,46 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
 from vllm.engine.errors import RequestRejectedError
+from vllm.engine.step_plan import StepPlan
+from vllm.engine.step_scheduler import StepScheduler
 from vllm.outputs import RequestOutput
+
+
+class ExecutionBackend(Protocol):
+    """Control-plane contract for the single-GPU execution backend."""
+
+    def maybe_preempt(self, step_plan: StepPlan, scheduler: Any) -> StepPlan: ...
+
+    def ensure_kv_blocks(self, step_plan: StepPlan) -> None: ...
+
+    def maybe_apply_prefix_cache(self, request: Any) -> None: ...
+
+    def decode_step_sync(self, request_ids: list[str]) -> list[RequestOutput]: ...
+
+    def run_prefills(
+        self, step_plan: StepPlan, results: list[RequestOutput]
+    ) -> None: ...
+
+    def run_decodes(
+        self, step_plan: StepPlan, results: list[RequestOutput]
+    ) -> None: ...
+
+    def stats(self) -> dict[str, object]: ...
+
+    def reset_stats(self, *, clear_prefix_cache: bool = False) -> None: ...
+
+
+class RuntimeObserverPort(Protocol):
+    """Control-plane contract for step observers."""
+
+    def stats(self) -> dict[str, Any]: ...
+
+    def reset_stats(self) -> None: ...
 
 
 class RuntimeController:
@@ -17,9 +51,9 @@ class RuntimeController:
         self,
         *,
         scheduler: Any,
-        step_scheduler: Any,
-        observer: Any,
-        backend: Any,
+        step_scheduler: StepScheduler,
+        observer: RuntimeObserverPort,
+        backend: ExecutionBackend,
         queue_timeout_s: float,
         lora_registry: Any | None = None,
     ) -> None:
@@ -43,10 +77,7 @@ class RuntimeController:
         if self.scheduler.active_request_count == 0:
             return []
 
-        if hasattr(self.step_scheduler, "update_runtime_feedback") and hasattr(
-            self.observer, "stats"
-        ):
-            self.step_scheduler.update_runtime_feedback(self.observer.stats())
+        self.step_scheduler.update_runtime_feedback(self.observer.stats())
 
         step_plan = self.step_scheduler.build_plan(self.scheduler)
         if not (
@@ -107,9 +138,7 @@ class RuntimeController:
             )
 
     def stats(self) -> dict[str, Any]:
-        observer_stats: dict[str, Any] = {}
-        if hasattr(self.observer, "stats"):
-            observer_stats = dict(self.observer.stats())
+        observer_stats = dict(self.observer.stats())
         observed_at_unix_s = time.time()
         return {
             "observed_at_unix_s": observed_at_unix_s,
@@ -165,13 +194,10 @@ class RuntimeController:
                 runtime_config, "fusion_level", out.get("fusion_level")
             )
             return out
-        if hasattr(self.backend, "profile_stats"):
-            return dict(self.backend.profile_stats())
         return {}
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
-        if hasattr(self.observer, "reset_stats"):
-            self.observer.reset_stats()
+        self.observer.reset_stats()
         self.backend.reset_stats(clear_prefix_cache=clear_prefix_cache)
         self._stats_reset_at_unix_s = time.time()
         self._stats_reset_at_monotonic_s = time.perf_counter()

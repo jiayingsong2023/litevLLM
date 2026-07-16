@@ -22,6 +22,7 @@ from vllm.kernels.triton.awq_fused_gemm import (
     pack_awq_group32_interleaved_qweight_scales,
     packed_int4_symmetric_fused_gemm,
     packed_int4_symmetric_fused_qkv_m1_safe,
+    packed_int4_symmetric_fused_qkv_m2_safe,
     packed_int4_symmetric_group32_interleaved_gemv_m1_safe,
     packed_int4_symmetric_mlp_streaming_m1_recompute_safe,
 )
@@ -67,9 +68,7 @@ def test_o_proj_splitk_gemv_default_disabled_and_policy_overridable() -> None:
 def test_mlp_streaming_fusion_default_disabled_and_policy_overridable() -> None:
     assert awq_mlp_streaming_fusion_enabled() is False
     assert (
-        awq_mlp_streaming_fusion_enabled(
-            policy={"awq_mlp_streaming_fusion": True}
-        )
+        awq_mlp_streaming_fusion_enabled(policy={"awq_mlp_streaming_fusion": True})
         is True
     )
 
@@ -178,15 +177,27 @@ def test_mlp_streaming_recompute_candidate_matches_dense_reference() -> None:
     down_q = torch.randint(
         0, 255, (hidden, intermediate // 8), device=device, dtype=torch.int32
     )
-    gate_s = torch.rand(
-        (intermediate, hidden // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
-    up_s = torch.rand(
-        (intermediate, hidden // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
-    down_s = torch.rand(
-        (hidden, intermediate // group_size), device=device, dtype=torch.float16
-    ) * 0.02 + 0.001
+    gate_s = (
+        torch.rand(
+            (intermediate, hidden // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
+    up_s = (
+        torch.rand(
+            (intermediate, hidden // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
+    down_s = (
+        torch.rand(
+            (hidden, intermediate // group_size), device=device, dtype=torch.float16
+        )
+        * 0.02
+        + 0.001
+    )
 
     y, used, reason = packed_int4_symmetric_mlp_streaming_m1_recompute_safe(
         x, gate_q, up_q, down_q, gate_s, up_s, down_s, group_size
@@ -560,6 +571,39 @@ def test_packed_int4_m1_qkv_group32_gemv_matches_three_gemvs(monkeypatch) -> Non
     diff = (y_fused.float() - y_ref.float()).abs()
     assert float(diff.mean().item()) < 0.001
     assert float(diff.max().item()) <= 4.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")
+def test_packed_int4_m2_qkv_group32_gemv_matches_three_gemvs(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_AWQ_DECODE_GEMV", "1")
+    device = torch.device("cuda")
+    torch.manual_seed(8)
+
+    m, k = 2, 256
+    qn, kn, vn = 128, 64, 64
+    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    weights = [
+        torch.randint(0, 255, (n, k // 8), device=device, dtype=torch.int32)
+        for n in (qn, kn, vn)
+    ]
+    scales = [
+        torch.rand((n, k // 32), device=device, dtype=torch.float16) * 0.02 + 0.01
+        for n in (qn, kn, vn)
+    ]
+
+    fused, used, reason = packed_int4_symmetric_fused_qkv_m2_safe(
+        x, *weights, *scales, 32, policy={"awq_decode_gemv": True}
+    )
+    assert used, reason
+    reference = torch.cat(
+        [
+            packed_int4_symmetric_fused_gemm(x, weight, scale, 32)
+            for weight, scale in zip(weights, scales)
+        ],
+        dim=1,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(fused, reference, rtol=0.02, atol=1.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm")

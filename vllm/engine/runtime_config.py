@@ -2,6 +2,7 @@
 import os
 from dataclasses import dataclass, field
 
+from vllm.engine.env_registry import collect_runtime_tuning_env
 from vllm.engine.fastinference_config import resolve_fastinference_config
 from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import RuntimeProfile, RuntimeProfileRegistry
@@ -94,7 +95,8 @@ class RuntimeConfig:
             model_capabilities=getattr(vllm_config, "model_capabilities", None),
             gpu_total_gb=get_total_gpu_memory_gb(),
         )
-        tuning_env = dict(fastinference_config.tuning_keyvals)
+        tuning_env = collect_runtime_tuning_env(os.environ)
+        tuning_env.update(fastinference_config.tuning_keyvals)
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name
         use_legacy_sampling = (
             os.environ.get("FASTINFERENCE_USE_LEGACY_SAMPLING", "0") == "1"

@@ -72,7 +72,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 Create a TOML file and point `FASTINFERENCE_CONFIG` at it:
 
 ```toml
-profile = "benchmark"
+profile = "balanced"
 kv_type = "turbo_int4"
 
 [tuning_keyvals]
@@ -86,9 +86,9 @@ uv run python -m vllm.entrypoints.openai.api_server \
   --model models/gemma-4-31B-it-AWQ-4bit
 ```
 
-Supported profiles are `auto`, `benchmark`, `latency`, `throughput`, and
-`accuracy`. `auto` currently resolves to the benchmark-recommended stable
-profile.
+Production service profiles are `balanced`, `latency`, and `throughput`.
+`auto` resolves to `balanced`; `benchmark` and `accuracy` are diagnostic
+profiles for measurement and correctness work.
 
 ## Regression Commands
 

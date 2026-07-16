@@ -101,7 +101,7 @@ def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     assert spec.max_new_tokens == 16
 
 
-def test_deepseek_v4_flash_direct_benchmark_enables_full_resident(
+def test_deepseek_v4_flash_gguf_benchmark_enables_full_resident(
     monkeypatch,
 ) -> None:
     captured_env: dict[str, str] = {}
@@ -124,7 +124,7 @@ def test_deepseek_v4_flash_direct_benchmark_enables_full_resident(
     monkeypatch.setattr(bench.os.path, "isfile", lambda _path: True)
     monkeypatch.setattr(bench.subprocess, "run", fake_run)
 
-    result = bench._run_deepseek_v4_flash_direct_benchmark(
+    result = bench._run_deepseek_v4_flash_gguf_benchmark(
         bench.MODEL_SPECS["deepseek_v4_flash_q2_gguf"]
     )
 

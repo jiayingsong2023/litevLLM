@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import torch
 
-from vllm.kernels.triton.awq_fused_gemm import packed_int4_symmetric_fused_gemm
+from vllm.kernels.triton.awq_fused_gemm import (
+    packed_int4_symmetric_fused_gemm,
+    packed_int4_symmetric_group32_rows_exact_msmall_safe,
+)
 from vllm.model_executor.layers.quantization.tensor import (
     dequantize_symmetric_packed_int4_pytorch,
 )
@@ -100,3 +103,59 @@ def test_packed_int4_fused_matches_dense_when_block_spans_multiple_groups(
     assert cos > 0.995
     assert mae < 0.2
     assert max_err < 2.0
+
+
+def test_packed_int4_deep_bf16_m2_does_not_narrow_activations() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    m, n, k = 2, 64, 8192
+    x = torch.full((m, k), 1e5, device=device, dtype=torch.bfloat16)
+    qweight = torch.zeros((n, k // 8), device=device, dtype=torch.int32)
+    scales = torch.full((n, k // 32), 0.01, device=device, dtype=torch.bfloat16)
+
+    fused = packed_int4_symmetric_fused_gemm(x, qweight, scales, group_size=32)
+    dense = torch.nn.functional.linear(
+        x,
+        dequantize_symmetric_packed_int4_pytorch(qweight, scales, 32).to(x.dtype),
+    )
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(fused).all()
+    torch.testing.assert_close(fused, dense, rtol=0.03, atol=128.0)
+
+
+@torch.inference_mode()
+def test_group32_rows_exact_msmall_matches_independent_m1_bitwise() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    n, k = 128, 128
+    qweight = torch.randint(
+        -(2**31), 2**31 - 1, (n, k // 8), device=device, dtype=torch.int32
+    )
+    scales = torch.rand((n, k // 32), device=device, dtype=torch.bfloat16)
+    config = {
+        "kernel_policy": {
+            "awq_decode_gemv": True,
+            "awq_group32_gemv_all": True,
+        }
+    }
+    for m in (2, 4):
+        x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+        batched, used, reason = packed_int4_symmetric_group32_rows_exact_msmall_safe(
+            x, qweight, scales, group_size=32
+        )
+        assert used, reason
+        rows = torch.cat(
+            [
+                packed_int4_symmetric_fused_gemm(
+                    x[row : row + 1], qweight, scales, group_size=32, config=config
+                )
+                for row in range(m)
+            ],
+            dim=0,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(batched, rows)

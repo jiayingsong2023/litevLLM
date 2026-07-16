@@ -372,7 +372,7 @@ def test_runtime_controller_profile_stats_use_effective_runtime_config() -> None
     }
 
 
-def test_runtime_controller_profile_stats_backend_fallback_and_empty() -> None:
+def test_runtime_controller_profile_stats_are_empty_without_runtime_config() -> None:
     scheduler = SimpleNamespace(
         active_request_count=0,
         running_request_count=0,
@@ -384,16 +384,6 @@ def test_runtime_controller_profile_stats_backend_fallback_and_empty() -> None:
         def stats(self) -> dict[str, object]:
             return {}
 
-    class BackendWithProfile:
-        def stats(self) -> dict[str, object]:
-            return {"backend_type": "fake"}
-
-        def profile_stats(self) -> dict[str, object]:
-            return {"requested": "backend", "kv_cache_dtype": "fp16"}
-
-        def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
-            del clear_prefix_cache
-
     class BackendWithoutProfile:
         def stats(self) -> dict[str, object]:
             return {"backend_type": "fake"}
@@ -401,13 +391,6 @@ def test_runtime_controller_profile_stats_backend_fallback_and_empty() -> None:
         def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
             del clear_prefix_cache
 
-    fallback_controller = RuntimeController(
-        scheduler=scheduler,
-        step_scheduler=object(),
-        observer=FakeObserver(),
-        backend=BackendWithProfile(),
-        queue_timeout_s=15.0,
-    )
     empty_controller = RuntimeController(
         scheduler=scheduler,
         step_scheduler=object(),
@@ -416,10 +399,6 @@ def test_runtime_controller_profile_stats_backend_fallback_and_empty() -> None:
         queue_timeout_s=15.0,
     )
 
-    assert fallback_controller.stats()["profile"] == {
-        "requested": "backend",
-        "kv_cache_dtype": "fp16",
-    }
     assert empty_controller.stats()["profile"] == {}
 
 

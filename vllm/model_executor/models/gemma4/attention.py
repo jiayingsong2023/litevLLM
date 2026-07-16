@@ -24,6 +24,7 @@ from .kv_utils import (
     _write_full_precision_kv_cache,
 )
 from .policy_utils import (
+    _gemma4_kernel_policy_truthy,
     _gemma4_model_policy_truthy,
     _get_eps,
     _meta_cpu_max_seq_len,
@@ -49,7 +50,12 @@ def _try_fused_awq_qkv_decode(
     inf_config: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     x2 = x.reshape(-1, x.shape[-1])
-    if int(x2.shape[0]) != 1:
+    m = int(x2.shape[0])
+    # The M=2 fused QKV kernel is numerically close but does not preserve the
+    # independent M=1 reduction contract required by the exact batch path.
+    if _gemma4_kernel_policy_truthy(inf_config, "awq_rows_exact_msmall", default=False):
+        return None
+    if m not in (1, 2):
         return None
     q_qweight = _linear_quant_attr(q_proj, "qweight")
     k_qweight = _linear_quant_attr(k_proj, "qweight")
@@ -81,9 +87,15 @@ def _try_fused_awq_qkv_decode(
     try:
         from vllm.kernels.triton.awq_fused_gemm import (
             packed_int4_symmetric_fused_qkv_m1_safe,
+            packed_int4_symmetric_fused_qkv_m2_safe,
         )
 
-        fused, used, _ = packed_int4_symmetric_fused_qkv_m1_safe(
+        runner = (
+            packed_int4_symmetric_fused_qkv_m1_safe
+            if m == 1
+            else packed_int4_symmetric_fused_qkv_m2_safe
+        )
+        fused, used, _ = runner(
             x2.contiguous(),
             q_qweight,
             k_qweight,
@@ -221,13 +233,14 @@ class Gemma4Attention(nn.Module):
         ).rsplit(".", 1)[0]
         fused_qkv = None
         if (not is_prefill_for_audit) and is_decode_m1:
-            fused_qkv = _try_fused_awq_qkv_decode(
-                x,
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                inf_config=inf_config,
-            )
+            with _gemma4_profile_span("attn_fused_qkv", self._layer_config):
+                fused_qkv = _try_fused_awq_qkv_decode(
+                    x,
+                    self.q_proj,
+                    self.k_proj,
+                    self.v_proj,
+                    inf_config=inf_config,
+                )
         if fused_qkv is not None:
             q, k, v = fused_qkv
             event = "qk_fused_decode" if self.v_proj is None else "qkv_fused_decode"
@@ -235,13 +248,13 @@ class Gemma4Attention(nn.Module):
                 attn_prefix,
                 event,
                 shape={
-                    "m": 1,
+                    "m": int(x.reshape(-1, x.shape[-1]).shape[0]),
                     "hidden": int(x.shape[-1]),
                     "q": int(self.q_size),
                     "k": int(self.kv_size),
                     "v": 0 if self.v_proj is None else int(self.kv_size),
                 },
-                reason="packed_int4_symmetric_fused_qkv_m1_safe",
+                reason="packed_int4_symmetric_fused_qkv_small_m_safe",
             )
         else:
             if (not is_prefill_for_audit) and is_decode_m1:
@@ -277,21 +290,22 @@ class Gemma4Attention(nn.Module):
         q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        q = self._apply_head_norm(self.q_norm, q)
-        k = self._apply_head_norm(self.k_norm, k)
-        v = self._apply_head_norm_noscale(v, self.v_norm_eps)
         # Surface the max position upper bound from the engine-side builder so
         # rotary_emb can extend its cache without a per-layer D->H sync.
         max_pos_plus_one_cpu = _resolve_max_position_plus_one_cpu(
             attn_metadata, positions
         )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            max_position_plus_one_cpu=max_pos_plus_one_cpu,
-            inf_config=inf_config,
-        )
+        with _gemma4_profile_span("attn_norm_rope", self._layer_config):
+            v = self._apply_head_norm_noscale(v, self.v_norm_eps)
+            q = self._apply_head_norm(self.q_norm, q)
+            k = self._apply_head_norm(self.k_norm, k)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                max_position_plus_one_cpu=max_pos_plus_one_cpu,
+                inf_config=inf_config,
+            )
         is_local = self.is_sliding
         local_window = (
             int(getattr(self.config, "sliding_window", 0) or 0) if is_local else None
@@ -648,7 +662,7 @@ class Gemma4Attention(nn.Module):
                             )
                             outs.append(out_i)
                         out = torch.cat(outs, dim=0)
-                        return self.o_proj(out, lora_mapping)
+                        return self.o_proj(out, lora_mapping, inf_config=inf_config)
                     seq_lens_ext, block_tables_ext = (
                         expand_metadata_for_paged_attention(
                             bsz,
@@ -720,4 +734,4 @@ class Gemma4Attention(nn.Module):
                     softcap=softcap,
                 ).view(bsz, seqlen, -1)
         with _gemma4_profile_span("attn_o_proj", self._layer_config):
-            return self.o_proj(out, lora_mapping)
+            return self.o_proj(out, lora_mapping, inf_config=inf_config)

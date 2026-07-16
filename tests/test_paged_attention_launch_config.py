@@ -84,7 +84,7 @@ def test_launch_config_global_bucket_by_concurrency():
         attn_scope="global",
     )
     assert (warps_low, stages_low) == (2, 2)
-    assert (warps_high, stages_high) == (4, 2)
+    assert (warps_high, stages_high) == (2, 2)
 
 
 def test_launch_config_local_bucket_by_concurrency():

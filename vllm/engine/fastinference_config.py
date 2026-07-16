@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_CONFIG_PROFILES = frozenset(
-    {"auto", "latency", "throughput", "accuracy", "benchmark"}
+    {"auto", "balanced", "latency", "throughput", "accuracy", "benchmark"}
 )
 SUPPORTED_KV_TYPES = frozenset({"auto", "fp16", "fp8", "turbo_int4"})
 _TOP_LEVEL_FIELDS = frozenset(
