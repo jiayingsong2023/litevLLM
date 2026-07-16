@@ -368,7 +368,12 @@ def test_step_scheduler_prefers_shorter_queued_requests_for_admission() -> None:
         prefill_microbatch_size=2,
         max_admit_per_step=1,
     )
-    plan = step_scheduler.build_plan(scheduler)
+    original_perf_counter = time.perf_counter
+    try:
+        time.perf_counter = lambda: 2.5
+        plan = step_scheduler.build_plan(scheduler)
+    finally:
+        time.perf_counter = original_perf_counter
     assert plan.admissions is not None
     assert plan.admissions.request_ids == ["short"]
 
@@ -1770,10 +1775,50 @@ def test_step_scheduler_admission_service_class_quota_reserves_slots() -> None:
         admission_service_class_quotas={"latency": 1, "background": 1},
         queue_aging_threshold_s=1000000.0,
     )
-    plan = step_scheduler.build_plan(scheduler)
+    original_perf_counter = time.perf_counter
+    try:
+        time.perf_counter = lambda: 10.0
+        plan = step_scheduler.build_plan(scheduler)
+    finally:
+        time.perf_counter = original_perf_counter
     assert plan.admissions is not None
     assert set(plan.admissions.request_ids) == {"latency-0", "background-0"}
     assert plan.metrics.admitted_service_classes == {"latency": 1, "background": 1}
+
+
+def test_step_scheduler_admits_oldest_aged_request_first() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    for request_id, queued_at in (("older", 1.0), ("newer", 2.0)):
+        scheduler.enqueue_request(
+            request_id,
+            RequestState(
+                request_id=request_id,
+                prompt="",
+                is_prefill=True,
+                input_ids=[1, 2],
+                sampling_params=SamplingParams(),
+                queued_at=queued_at,
+            ),
+        )
+    step_scheduler = StepScheduler(
+        step_token_budget=8,
+        decode_priority_enabled=True,
+        prefill_chunk_size=4,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=1,
+        max_admit_per_step=1,
+        queue_aging_threshold_s=1.0,
+    )
+    original_perf_counter = time.perf_counter
+    try:
+        time.perf_counter = lambda: 10.0
+        plan = step_scheduler.build_plan(scheduler)
+    finally:
+        time.perf_counter = original_perf_counter
+    assert plan.admissions is not None
+    assert plan.admissions.request_ids == ["older"]
 
 
 def test_step_scheduler_decode_service_class_quota_reserves_budget() -> None:

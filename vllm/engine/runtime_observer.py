@@ -10,6 +10,17 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+class _BoundedList(list[Any]):
+    def __init__(self, limit: int, values: list[Any] | None = None) -> None:
+        self._limit = max(1, int(limit))
+        super().__init__((values or [])[-self._limit :])
+
+    def append(self, value: Any) -> None:
+        if len(self) >= self._limit:
+            del self[0]
+        super().append(value)
+
+
 class RuntimeObserver:
     def on_request_added(self, request_id: str, request: RequestState) -> None:
         pass
@@ -102,6 +113,7 @@ class NullRuntimeObserver(RuntimeObserver):
 
 @dataclass
 class InMemoryRuntimeObserver(RuntimeObserver):
+    history_limit: int = 4096
     added: list[str] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
     rejection_reason_counts: dict[str, int] = field(default_factory=dict)
@@ -199,6 +211,24 @@ class InMemoryRuntimeObserver(RuntimeObserver):
     multimodal_lora_decode_max_fairness_gap_sum: float = 0.0
     multimodal_max_queue_wait_s: float = 0.0
     multimodal_queue_wait_samples_s: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "added",
+            "rejected",
+            "admitted",
+            "prefix_cache_events",
+            "preemption_events",
+            "queue_wait_samples_s",
+            "finished",
+            "first_tokens",
+            "aborted",
+            "background_errors",
+            "model_surface_events",
+            "multimodal_queue_wait_samples_s",
+        ):
+            values = getattr(self, name)
+            setattr(self, name, _BoundedList(self.history_limit, values))
 
     def on_request_added(self, request_id: str, request: RequestState) -> None:
         mm_data = request.multi_modal_data or {}
@@ -919,13 +949,14 @@ class InMemoryRuntimeObserver(RuntimeObserver):
             target_sum[key] = target_sum.get(key, 0.0) + (avg_value * int(count))
             target_count[key] = target_count.get(key, 0) + int(count)
 
-    @staticmethod
     def _merge_wait_samples(
+        self,
         target: dict[str, list[float]],
         delta: dict[str, float],
     ) -> None:
         for key, value in delta.items():
-            target.setdefault(key, []).append(float(value))
+            samples = target.setdefault(key, _BoundedList(self.history_limit))
+            samples.append(float(value))
 
     @staticmethod
     def _percentile(values: list[float], q: float) -> float:
@@ -975,7 +1006,9 @@ class LoggingRuntimeObserver(RuntimeObserver):
         exact: bool,
         prefix_len: int,
         saved_prefill_tokens: int,
+        is_multimodal: bool = False,
     ) -> None:
+        del is_multimodal
         logger.debug(
             "runtime prefix cache id=%s hit=%s exact=%s "
             "prefix_len=%s saved_prefill_tokens=%s",

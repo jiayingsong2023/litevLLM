@@ -61,24 +61,17 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
 
     runtime_components = LiteRuntimeFactory.build(context)
 
-    assert set(runtime_components) == {
-        "kv_block_manager",
-        "input_batch_builder",
-        "multimodal_processor",
-        "prefill_executor",
-        "decode_executor",
-        "step_scheduler",
-        "execution_backend",
-        "runtime_controller",
-    }
+    assert runtime_components.kv_block_manager is not None
+    assert runtime_components.input_batch_builder is not None
+    assert runtime_components.runtime_controller is not None
 
-    step_scheduler = runtime_components["step_scheduler"]
+    step_scheduler = runtime_components.step_scheduler
     assert step_scheduler.max_decode_streak == 9
     assert step_scheduler.min_prefill_chunk_size == 4
     assert step_scheduler.max_prefill_chunk_size == 8
     assert step_scheduler.prefill_sla_ttft_ms == 1500.0
 
-    backend = runtime_components["execution_backend"]
+    backend = runtime_components.execution_backend
     stats = backend.stats()
     assert stats["prefix_cache"]["capacity"] == 11
     assert stats["preemption_mode"] == "off"

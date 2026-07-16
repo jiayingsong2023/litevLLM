@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import time
 from typing import Any
 
 from vllm.engine.scheduling_helpers import (
@@ -48,7 +47,7 @@ class ServiceClassSelector:
                 grouped_ids,
                 key=lambda rid: (
                     request_meta[rid][1] if prefer_short_prompts else 0,
-                    -request_meta[rid][2],
+                    request_meta[rid][2],
                     rid,
                 ),
             )
@@ -148,7 +147,7 @@ class ServiceClassSelector:
 
 
 class LoRAConstraint:
-    """Encapsulates LoRA batch limit checking, adapter rotation, and fairness gap calculations."""
+    """Applies LoRA batch limits, rotation, and fairness accounting."""
 
     def shape_lora_batch(
         self,
@@ -252,7 +251,7 @@ class LoRAConstraint:
 
 
 class MultiModalConstraint:
-    """Encapsulates multimodal limit checking, batch shaping, and prefix cache feedback heuristics."""
+    """Applies multimodal limits, batch shaping, and prefix-cache feedback."""
 
     def shape_multimodal_prefill_batch(
         self,
@@ -347,7 +346,7 @@ class MultiModalConstraint:
 
 
 class MultiModalLoRAConstraint:
-    """Encapsulates multimodal LoRA limit checking, self-adaptive limit adjustments, and state updates."""
+    """Applies multimodal LoRA limits and adaptive state updates."""
 
     def apply_multimodal_lora_request_limit(
         self,

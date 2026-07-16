@@ -86,11 +86,7 @@ write_fastinference_config "$CONFIG_GEMMA_31B" "benchmark" "turbo_int4" "false" 
   FASTINFERENCE_GPU_GREEDY_SAMPLING 1 \
   FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY 1 \
   FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES 1
-write_fastinference_config "$CONFIG_GEMMA_26B" "benchmark" "turbo_int4" "false" \
-  FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS 1 \
-  FASTINFERENCE_KV_MAX_MODEL_LEN 512 \
-  FASTINFERENCE_AWQ_DECODE_GEMV 1 \
-  FASTINFERENCE_AWQ_FUSED_GATE_UP 1
+write_fastinference_config "$CONFIG_GEMMA_26B" "benchmark" "turbo_int4" "false"
 write_fastinference_config "$CONFIG_GEMMA_31B_A_LITE" "latency" "fp8" "false"
 write_fastinference_config "$CONFIG_GEMMA_26B_A_LITE" "latency" "fp8" "false"
 
@@ -530,17 +526,11 @@ if [[ "${RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE}" != "0" ]]; then
     fi
   else
     DEEPSEEK_QUALITY_JSON="$(mktemp "${TMPDIR:-/tmp}/fastinference-deepseek-quality.XXXXXX.json")"
-    # Use the same optimal DeepSeek V4 Flash env as tests/e2e_full_benchmark.py
-    # so correctness is validated at the throughput-maximizing settings.
     run_stage "Tier-B DeepSeek V4 Flash quality smoke" "$FI_CORRECTNESS_DEEPSEEK_STAGE_TIMEOUT" \
-      env \
-        FASTINFERENCE_KV_TYPE=fp16 \
-        FASTINFERENCE_BLOCK_SIZE=32 \
-        FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS=1 \
-        FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB=1 \
       "${UV_RUN[@]}" python tests/tools/deepseek_v4_flash_quality_smoke.py \
         --model "$MODEL_DEEPSEEK_V4_FLASH_GGUF" \
         --context-length 4096 \
+        --staging-budget-gb 1 \
         --max-tokens 8 \
         --min-output-chars 8 \
         --json-out "$DEEPSEEK_QUALITY_JSON"
@@ -642,10 +632,6 @@ if [[ "${GEMMA4_26B_AVAILABLE}" == "1" && "${RUN_GEMMA4_26B_A_LITE}" == "1" ]]; 
   print_gemma4_profile "Gemma4-26B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_26B_A_LITE}"
   run_stage "Tier-A-lite Gemma4-26B audit" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
     env FASTINFERENCE_CONFIG="${CONFIG_GEMMA_26B_A_LITE}" \
-    FASTINFERENCE_KV_MAX_MODEL_LEN=512 \
-    FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS=1 \
-    FASTINFERENCE_AWQ_DECODE_GEMV=1 \
-    FASTINFERENCE_AWQ_FUSED_GATE_UP=1 \
     "${GEMMA4_A_LITE_SMOKE[@]}" --model "$MODEL_GEMMA4_26B_A4B"
   cleanup_after_model_step "Gemma4-26B A-lite"
 fi

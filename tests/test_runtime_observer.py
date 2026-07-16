@@ -593,3 +593,11 @@ def test_inmemory_runtime_observer_reset_stats() -> None:
             "decode_locality_rate": 0.0,
         },
     }
+def test_in_memory_observer_bounds_event_history() -> None:
+    observer = InMemoryRuntimeObserver(history_limit=2)
+
+    observer.on_request_aborted("first")
+    observer.on_request_aborted("second")
+    observer.on_request_aborted("third")
+
+    assert observer.aborted == ["second", "third"]

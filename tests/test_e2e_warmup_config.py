@@ -101,10 +101,20 @@ def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     assert spec.max_new_tokens == 16
 
 
-def test_deepseek_v4_flash_gguf_benchmark_enables_full_resident(
-    monkeypatch,
-) -> None:
-    captured_env: dict[str, str] = {}
+def test_gemma4_26b_does_not_inject_legacy_runtime_env() -> None:
+    spec = bench.MODEL_SPECS["gemma4_26b_a4b"]
+
+    assert spec.stable_env == {}
+
+
+def test_gemma4_31b_does_not_inject_legacy_runtime_env() -> None:
+    spec = bench.MODEL_SPECS["gemma4_31b_q4"]
+
+    assert spec.stable_env == {}
+
+
+def test_deepseek_v4_flash_gguf_benchmark_requests_full_resident(monkeypatch) -> None:
+    captured_command: list[str] = []
 
     class FakeProc:
         returncode = 0
@@ -118,7 +128,7 @@ def test_deepseek_v4_flash_gguf_benchmark_enables_full_resident(
         )
 
     def fake_run(*_args, **kwargs):
-        captured_env.update(kwargs["env"])
+        captured_command.extend(_args[0])
         return FakeProc()
 
     monkeypatch.setattr(bench.os.path, "isfile", lambda _path: True)
@@ -129,7 +139,7 @@ def test_deepseek_v4_flash_gguf_benchmark_enables_full_resident(
     )
 
     assert result["skipped"] == 0.0
-    assert captured_env["FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT"] == "1"
+    assert "--full-resident" in captured_command
 
 
 def test_deepseek_v4_flash_gguf_is_in_default_e2e_models(monkeypatch) -> None:
@@ -293,3 +303,10 @@ def test_evaluate_perf_regressions_warns_without_failing() -> None:
         line.startswith("PERF WARNING:")
         for line in bench._format_perf_regression_warnings(warnings)
     )
+
+
+def test_perf_gate_is_opt_in() -> None:
+    regressions = [{"metric": "aggregate_tps"}]
+
+    assert not bench._perf_gate_failed(regressions, fail_on_regression=False)
+    assert bench._perf_gate_failed(regressions, fail_on_regression=True)

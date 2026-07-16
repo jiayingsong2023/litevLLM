@@ -16,11 +16,13 @@ class RequestScheduler:
         self,
         max_active_requests: int,
         max_queued_requests: int | None = None,
+        runtime_config: object | None = None,
     ) -> None:
         self.max_active_requests = max_active_requests
         self.max_queued_requests = max_queued_requests or max(
             1, max_active_requests * 4
         )
+        self.runtime_config = runtime_config
         self._requests: dict[str, RequestState] = {}
         self._running_ids: list[str] = []
         self._running_ids_set: set[str] = set()

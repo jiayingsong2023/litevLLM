@@ -24,7 +24,7 @@ def test_gemma4_profile_flags_are_derived_from_tuning_env(monkeypatch) -> None:
 
 
 def test_gemma4_tuning_config_rejects_migrated_production_policy_names() -> None:
-    gemma4.set_gemma4_tuning_config(
+    config = gemma4.set_gemma4_tuning_config(
         {
             "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
             "FASTINFERENCE_GEMMA4_LOCAL_DECODE_TRITON": "0",
@@ -34,7 +34,7 @@ def test_gemma4_tuning_config_rejects_migrated_production_policy_names() -> None
         locked=True,
     )
 
-    assert gemma4._GEMMA4_TUNING == {
+    assert config.tuning == {
         "FASTINFERENCE_GEMMA4_LAYER_PROFILE": "1",
     }
 

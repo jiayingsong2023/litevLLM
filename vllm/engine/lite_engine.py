@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -102,12 +102,15 @@ def expand_metadata_for_paged_attention(
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
+        self._async_engine_lock: Any | None = None
         self.model_config = vllm_config.model_config
         self.device = torch.device("cuda:0")
-        self.runtime_config = getattr(
-            vllm_config, "runtime_config", None
-        ) or RuntimeConfig.from_vllm_config(vllm_config)
-        self.vllm_config.runtime_config = self.runtime_config
+        self.runtime_config: RuntimeConfig = cast(
+            RuntimeConfig,
+            getattr(vllm_config, "runtime_config", None)
+            or RuntimeConfig.from_vllm_config(vllm_config),
+        )
+        object.__setattr__(self.vllm_config, "runtime_config", self.runtime_config)
         requested_policy_mode = self.runtime_config.policy_mode
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
@@ -119,7 +122,7 @@ class LiteEngine:
         )
         self._apply_runtime_model_policy()
         self._install_runtime_policy_on_runtime_config(self.runtime_policy)
-        self.vllm_config.runtime_config = self.runtime_config
+        object.__setattr__(self.vllm_config, "runtime_config", self.runtime_config)
         self._install_tuning_configs_for_model(self.runtime_policy)
 
         # 1. Load Model
@@ -138,7 +141,9 @@ class LiteEngine:
             model_name=str(getattr(self.model_config, "model", "")),
             capabilities=self.model_capabilities,
         )
-        self.vllm_config.model_capabilities = self.model_capabilities
+        object.__setattr__(
+            self.vllm_config, "model_capabilities", self.model_capabilities
+        )
         self.num_attention_heads = self.model_capabilities.num_attention_heads
         self.num_kv_heads = self.model_capabilities.num_kv_heads
         self.head_size = self.model_capabilities.head_dim
@@ -220,7 +225,7 @@ class LiteEngine:
         self._prefill_reserve_backlog = execution_plan.prefill_reserve_backlog
         self._prefill_catchup_ratio = execution_plan.prefill_catchup_ratio
         self._prefill_microbatch_size = execution_plan.prefill_microbatch_size
-        self._apply_deepseek_admission_cap()
+        self._apply_adapter_admission_cap()
 
         print(
             ">>>> LiteEngine: Step scheduler "
@@ -241,8 +246,10 @@ class LiteEngine:
             max_active_requests=self.max_active_requests,
         )
         if custom_runtime_components is not None:
-            self.kv_caches = []
-            self.kv_scale_caches = []
+            self.kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+            self.kv_scale_caches: list[
+                tuple[torch.Tensor | None, torch.Tensor | None]
+            ] = []
             block_allocator = None
             self.block_size = custom_runtime_components.kv_block_manager.block_size
             self.num_blocks_per_seq = (
@@ -286,7 +293,10 @@ class LiteEngine:
             block_allocator = BlockAllocator(num_total_blocks=self.num_total_blocks)
             print(">>>> LiteEngine: KV Cache allocated successfully.")
             mem_after_kv = int(torch.cuda.memory_allocated(self.device))
-            auditor = MemoryAuditor(device=self.device)
+            auditor = MemoryAuditor(
+                device=self.device,
+                topn=self.runtime_config.memory_audit_topn,
+            )
             audit = auditor.audit(self.model)
             self._print_startup_memory_audit(
                 kv_plan=kv_plan,
@@ -297,15 +307,16 @@ class LiteEngine:
             )
 
         # slot_mapping maps batch tokens to physical indices
-        self.scheduler = RequestScheduler(self.max_active_requests)
-        self.scheduler.runtime_config = self.runtime_config
+        self.scheduler = RequestScheduler(
+            self.max_active_requests, runtime_config=self.runtime_config
+        )
         self.lora_registry = LoRARuntimeRegistry()
         self.lora_manager = LoRAManager(self.model)
         self.lora_manager.bind_to_model(self.model)
-        self.policies = None
-        self.sampling_driver = None
-        self.output_pipeline = None
-        self.request_builder = None
+        self.policies: Any | None = None
+        self.sampling_driver: SamplingDriver | None = None
+        self.output_pipeline: OutputPipeline | None = None
+        self.request_builder: LiteRequestBuilder | None = None
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
         )
@@ -378,45 +389,32 @@ class LiteEngine:
             queue_timeout_s=self._queue_timeout_s,
             custom_runtime_components=custom_runtime_components,
         )
-        self.kv_block_manager = runtime_components["kv_block_manager"]
-        self.input_batch_builder = runtime_components["input_batch_builder"]
-        self.multimodal_processor = runtime_components["multimodal_processor"]
-        self.prefill_executor = runtime_components["prefill_executor"]
-        self.decode_executor = runtime_components["decode_executor"]
-        self.step_scheduler = runtime_components["step_scheduler"]
+        self.kv_block_manager = runtime_components.kv_block_manager
+        self.input_batch_builder = runtime_components.input_batch_builder
+        self.multimodal_processor = runtime_components.multimodal_processor
+        self.prefill_executor = runtime_components.prefill_executor
+        self.decode_executor = runtime_components.decode_executor
+        self.step_scheduler = runtime_components.step_scheduler
         self.step_scheduler.set_verified_decode_batch_sizes(
             self.runtime_policy.verified_decode_batch_sizes
         )
-        self.execution_backend = runtime_components["execution_backend"]
-        self.runtime_controller = runtime_components["runtime_controller"]
+        self.execution_backend = runtime_components.execution_backend
+        self.runtime_controller = runtime_components.runtime_controller
 
     def set_tokenizer(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
 
-    def _apply_deepseek_admission_cap(self) -> None:
-        if bool(getattr(self.model_capabilities, "supports_chunked_prefill", True)):
+    def _apply_adapter_admission_cap(self) -> None:
+        admission_cap = getattr(self.adapter, "admission_cap", None)
+        if not callable(admission_cap):
             return
-        budget = int(
-            (getattr(self.runtime_config, "model_policy", {}) or {}).get(
-                "runtime_budget_bytes", 0
+        capped = int(
+            admission_cap(
+                current_max_active_requests=self.max_active_requests,
+                max_model_len=self.max_model_len,
+                runtime_config=self.runtime_config,
             )
-            or 0
         )
-        if budget <= 0:
-            return
-        estimate_kv = getattr(self.adapter, "estimate_kv_bytes", None)
-        estimate_staging = getattr(self.adapter, "estimate_staging_bytes", None)
-        if not callable(estimate_kv) or not callable(estimate_staging):
-            return
-        per_request = int(
-            estimate_kv(
-                max_active_requests=1,
-                context_length=self.max_model_len,
-            )
-        ) + int(estimate_staging(max_active_requests=1))
-        if per_request <= 0:
-            return
-        capped = max(1, min(self.max_active_requests, budget // per_request))
         if capped < self.max_active_requests:
             self.max_active_requests = capped
             self.num_total_blocks = self.num_blocks_per_seq * capped
@@ -482,7 +480,7 @@ class LiteEngine:
                 set_awq_fused_tuning_config,
             )
 
-            set_awq_fused_tuning_config(tuning_env, locked=True)
+            set_awq_fused_tuning_config(dict(tuning_env), locked=True)
         except Exception:
             logger.debug("Unable to install AWQ fused tuning config", exc_info=True)
         try:
@@ -490,7 +488,7 @@ class LiteEngine:
                 set_awq_tensor_tuning_config,
             )
 
-            set_awq_tensor_tuning_config(tuning_env, locked=True)
+            set_awq_tensor_tuning_config(dict(tuning_env), locked=True)
         except Exception:
             logger.debug("Unable to install AWQ tensor tuning config", exc_info=True)
         try:
@@ -793,6 +791,8 @@ class LiteEngine:
                     lora_name=resolved_lora.lora_name,
                     lora_path=resolved_lora.lora_path,
                 )
+            if self.request_builder is None:
+                raise RuntimeError("request builder was not initialized")
             request_state = self.request_builder.build(
                 request_id=request_id,
                 prompt=prompt,
@@ -845,6 +845,8 @@ class LiteEngine:
             req = self.scheduler.get_request(request_id)
         except KeyError:
             return
+        if self.output_pipeline is None:
+            raise RuntimeError("output pipeline was not initialized")
         output = self.output_pipeline.build_abort_output(request_id, req)
         self.scheduler.publish_output(request_id, output)
         self.scheduler.abort_request(request_id)

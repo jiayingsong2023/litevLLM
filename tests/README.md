@@ -119,6 +119,7 @@ uv run python tests/e2e_full_benchmark.py --no-model-process-isolation ...
 - `--perf-baseline-json <path>`
 - `--perf-warn-min-tps-ratio RATIO`，默认 `0.85`
 - `--perf-warn-max-latency-ratio RATIO`，默认 `1.25`
+- `--perf-fail-on-regression`，将性能基线回归转为非零退出码
 
 性能 baseline 用法示例：
 
@@ -129,7 +130,8 @@ uv run python tests/e2e_full_benchmark.py \
   --json-out /tmp/next.json
 ```
 
-`perf_regressions` 只记录吞吐下降或延迟上升的 warning，适合写入 PR 说明；是否阻断由人工根据改动范围判断。
+`perf_regressions` 默认只记录吞吐下降或延迟上升的 warning。对已建立稳定基线的
+发布或 CI，配合 `--perf-fail-on-regression` 阻断回归。
 
 ## `tests/tools/` 边界
 

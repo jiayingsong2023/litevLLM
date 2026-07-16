@@ -124,6 +124,20 @@ class _CustomAdapter:
     def estimate_staging_bytes(self, *, max_active_requests):
         return int(max_active_requests) * 50
 
+    def admission_cap(
+        self,
+        *,
+        current_max_active_requests,
+        max_model_len,
+        runtime_config,
+    ):
+        budget = int(runtime_config.model_policy["runtime_budget_bytes"])
+        per_request = self.estimate_kv_bytes(
+            max_active_requests=1,
+            context_length=max_model_len,
+        ) + self.estimate_staging_bytes(max_active_requests=1)
+        return max(1, min(current_max_active_requests, budget // per_request))
+
     def validate_request(self, **kwargs):
         del kwargs
 

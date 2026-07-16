@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -86,12 +85,18 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         weight_store: DeepSeekV4FlashWeightStore | None = None,
         runtime_budget: DeepSeekV4FlashRuntimeBudget | None = None,
         gpu_backend: DeepSeekV4FlashGPUBackend | None = None,
+        full_resident: bool = False,
+        staging_budget_gb: float = 0.0,
     ) -> None:
         super().__init__()
         self.config = config
         self.shape = shape
         self.weight_store = weight_store
         self.runtime_budget = runtime_budget
+        if staging_budget_gb < 0:
+            raise ValueError("staging_budget_gb must be non-negative")
+        self.full_resident = full_resident
+        self.staging_budget_gb = staging_budget_gb
         self.gpu_backend = gpu_backend or DeepSeekV4FlashGPUBackend()
         self.limited_forward_smoke_only = True
         self.reference_execution_available = True
@@ -1507,11 +1512,11 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 device=device,
                 max_staged_bytes=(
                     None
-                    if self._deepseek_full_resident_enabled()
+                    if self.full_resident
                     else self._gpu_staging_budget_bytes()
                 ),
             )
-            if self._deepseek_full_resident_enabled():
+            if self.full_resident:
                 self._gpu_weight_stager.enable_full_resident_mode()
             self._gpu_weight_stager_store_id = store_id
             self._gpu_weight_stager_device = device
@@ -1538,19 +1543,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self.runtime_budget.available_headroom_bytes
             - self.runtime_budget.min_system_headroom_bytes,
         )
-        extra_gb_str = os.environ.get(
-            "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB",
-            "0",
-        )
-        try:
-            extra_gb = float(extra_gb_str)
-        except ValueError:
-            warnings.warn(
-                f"Ignoring malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB "
-                f"value {extra_gb_str!r}; using 0",
-                stacklevel=2,
-            )
-            extra_gb = 0.0
+        extra_gb = self.staging_budget_gb
         if extra_gb <= 0:
             return base
         extra_bytes = int(extra_gb * 1024 * 1024 * 1024)
@@ -1559,30 +1552,12 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             self.runtime_budget.available_headroom_bytes,
         )
 
-    @staticmethod
-    def _deepseek_full_resident_enabled() -> bool:
-        return (
-            os.environ.get(
-                "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT",
-                "0",
-            )
-            == "1"
-        )
-
     def pin_hot_experts_for_input_ids(
         self,
         input_ids: torch.Tensor,
         device: torch.device,
     ) -> None:
         """Pin experts mapped from the prompt tokens for all hash-routed layers."""
-        if (
-            os.environ.get(
-                "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS",
-                "1",
-            )
-            != "1"
-        ):
-            return
         store = self._require_weight_store()
         stager = self._get_gpu_weight_stager(device)
         layers = getattr(store.bindings, "layers", None)
@@ -1620,7 +1595,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             return {
                 "staged_bytes": 0,
                 "max_staged_bytes": self._gpu_staging_budget_bytes(),
-                "full_resident_enabled": int(self._deepseek_full_resident_enabled()),
+                "full_resident_enabled": int(self.full_resident),
                 "dynamic_entries": 0,
                 "grouped_entries": 0,
             }

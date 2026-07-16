@@ -134,10 +134,10 @@ def test_runtime_factory_uses_custom_components_with_null_multimodal() -> None:
         _context(custom_runtime_components=components)
     )
 
-    assert components_out["prefill_executor"] is prefill
-    assert components_out["decode_executor"] is decode
-    assert components_out["input_batch_builder"] is None
-    assert isinstance(components_out["multimodal_processor"], NullMultiModalProcessor)
+    assert components_out.prefill_executor is prefill
+    assert components_out.decode_executor is decode
+    assert components_out.input_batch_builder is None
+    assert isinstance(components_out.multimodal_processor, NullMultiModalProcessor)
 
 
 def test_runtime_factory_rejects_standard_runtime_without_block_allocator() -> None:

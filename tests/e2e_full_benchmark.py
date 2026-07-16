@@ -87,35 +87,6 @@ _GEMMA31B_SCHEDULER_PROFILES: dict[str, dict[str, str]] = {
     },
 }
 
-_GEMMA4_31B_RECOMMENDED_ENV: dict[str, str] = {
-    "FASTINFERENCE_KV_TYPE": "turbo_int4",
-    "FASTINFERENCE_FUSION_LEVEL": "2",
-    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
-    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
-    "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ": "1",
-    "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
-    "FASTINFERENCE_AWQ_GROUP32_GEMV_ALL": "1",
-    "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
-    "FASTINFERENCE_GPU_GREEDY_SAMPLING": "1",
-    "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY": "1",
-    "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
-}
-
-_GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
-    "FASTINFERENCE_KV_TYPE": "turbo_int4",
-    "FASTINFERENCE_FUSION_LEVEL": "2",
-    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "1",
-    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
-    "FASTINFERENCE_AWQ_DECODE_GEMV": "1",
-    "FASTINFERENCE_AWQ_FUSED_GATE_UP": "1",
-    "FASTINFERENCE_GEMMA4_MOE_EXPERT_CACHE_SIZE": "32",
-    "FASTINFERENCE_GEMMA4_MOE_COMPUTE_DTYPE": "auto",
-    "FASTINFERENCE_GEMMA4_MOE_INT4_KERNEL": "1",
-    "FASTINFERENCE_GPU_GREEDY_SAMPLING": "1",
-    "FASTINFERENCE_GPU_GREEDY_MAX_TOKENS_ONLY": "1",
-    "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
-}
-
 _GEMMA4_12B_BATCH_ENV: dict[str, str] = {
     "FASTINFERENCE_KV_TYPE": "fp8",
     "FASTINFERENCE_FUSION_LEVEL": "2",
@@ -192,7 +163,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.90,
         max_model_len=512,
         max_run_seconds=1200,
-        stable_env=dict(_GEMMA4_31B_RECOMMENDED_ENV),
+        stable_env={},
     ),
     "gemma4_26b_a4b": ModelSpec(
         key="gemma4_26b_a4b",
@@ -207,7 +178,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         gpu_memory_utilization=0.90,
         max_model_len=512,
         max_run_seconds=1200,
-        stable_env=dict(_GEMMA4_26B_RECOMMENDED_ENV),
+        stable_env={},
     ),
     "deepseek_v4_flash_q2_gguf": ModelSpec(
         key="deepseek_v4_flash_q2_gguf",
@@ -452,6 +423,7 @@ _CLI_OPTS_WITH_VALUES = {
     "--perf-baseline-json",
     "--perf-warn-min-tps-ratio",
     "--perf-warn-max-latency-ratio",
+    "--perf-fail-on-regression",
 }
 
 
@@ -2859,28 +2831,16 @@ def _run_deepseek_v4_flash_gguf_benchmark(spec: ModelSpec) -> dict[str, Any]:
                 "FASTINFERENCE_DEEPSEEK_V4_FLASH_MIN_STEADY_DECODE_TPS",
                 "1.5",
             ),
+            "--full-resident",
         ]
     )
     start = time.perf_counter()
-    # Use the same optimal env knobs that give the best single-request
-    # decode throughput on DeepSeek V4 Flash.
-    deepseek_env = os.environ.copy()
-    deepseek_env.update(
-        {
-            "FASTINFERENCE_KV_TYPE": "fp16",
-            "FASTINFERENCE_BLOCK_SIZE": "32",
-            "FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": "1",
-            "FASTINFERENCE_DEEPSEEK_V4_FLASH_PIN_HOT_EXPERTS": "1",
-            "FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB": "1",
-        }
-    )
     try:
         proc = subprocess.run(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=deepseek_env,
             check=False,
             timeout=spec.max_run_seconds,
         )
@@ -2997,6 +2957,12 @@ def _format_perf_regression_warnings(warnings: list[dict[str, object]]) -> list[
             f"threshold={_fmt_float(float(item.get('threshold', float('nan'))), '.3f')}"
         )
     return lines
+
+
+def _perf_gate_failed(
+    regressions: list[dict[str, object]], *, fail_on_regression: bool
+) -> bool:
+    return bool(fail_on_regression and regressions)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -3335,6 +3301,11 @@ def _parse_args() -> argparse.Namespace:
         help="Warn when current latency metric exceeds this multiple of baseline.",
     )
     parser.add_argument(
+        "--perf-fail-on-regression",
+        action="store_true",
+        help="Exit nonzero when --perf-baseline-json detects a regression.",
+    )
+    parser.add_argument(
         "--model-process-isolation",
         action="store_true",
         default=False,
@@ -3663,6 +3634,12 @@ async def main() -> None:
         with open(args.runtime_stats_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
         print(f"Runtime stats written to: {args.runtime_stats_out}")
+
+    if _perf_gate_failed(
+        perf_regression_warnings,
+        fail_on_regression=bool(args.perf_fail_on_regression),
+    ):
+        raise SystemExit("performance regression gate failed")
 
 
 if __name__ == "__main__":

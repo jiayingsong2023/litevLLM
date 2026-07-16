@@ -28,12 +28,15 @@ if TYPE_CHECKING:
     from vllm.engine.runtime_observer import RuntimeObserver
     from vllm.engine.sampling_driver import SamplingDriver
 
+KVCache = tuple[torch.Tensor, torch.Tensor]
+KVScaleCache = tuple[torch.Tensor | None, torch.Tensor | None]
+
 
 @dataclass(frozen=True)
 class RuntimeAssemblyContext:
     block_allocator: BlockAllocator | None
-    kv_caches: list[torch.Tensor]
-    kv_scale_caches: list[torch.Tensor]
+    kv_caches: list[KVCache]
+    kv_scale_caches: list[KVScaleCache]
     num_blocks_per_seq: int
     block_size: int
     device: torch.device
@@ -63,15 +66,27 @@ class RuntimeAssemblyContext:
     scheduler: RequestScheduler
     observer: RuntimeObserver
     lora_registry: LoRARuntimeRegistry
-    sampling_driver: SamplingDriver
-    output_pipeline: OutputPipeline
+    sampling_driver: SamplingDriver | None
+    output_pipeline: OutputPipeline | None
     queue_timeout_s: float
     custom_runtime_components: Any | None = None
 
 
+@dataclass(frozen=True)
+class RuntimeComponents:
+    kv_block_manager: Any
+    input_batch_builder: InputBatchBuilder | None
+    multimodal_processor: LiteMultiModalProcessor | NullMultiModalProcessor
+    prefill_executor: Any
+    decode_executor: Any
+    step_scheduler: StepScheduler
+    execution_backend: LiteSingleGpuBackend
+    runtime_controller: RuntimeController
+
+
 class LiteRuntimeFactory:
     @classmethod
-    def build(cls, context: RuntimeAssemblyContext) -> dict[str, Any]:
+    def build(cls, context: RuntimeAssemblyContext) -> RuntimeComponents:
         scheduler_policy = context.scheduler_policy
         backend_policy = context.backend_policy
         custom = context.custom_runtime_components
@@ -169,16 +184,18 @@ class LiteRuntimeFactory:
             max_decode_streak=scheduler_policy.max_decode_streak,
             queue_aging_threshold_s=scheduler_policy.queue_aging_threshold_s,
             max_prefill_deferrals=scheduler_policy.max_prefill_deferrals,
-            service_class_weights=scheduler_policy.service_class_weights,
+            service_class_weights=dict(scheduler_policy.service_class_weights or {}),
             admission_service_class_quotas=(
-                scheduler_policy.admission_service_class_quotas
+                dict(scheduler_policy.admission_service_class_quotas or {})
             ),
-            decode_service_class_quotas=scheduler_policy.decode_service_class_quotas,
+            decode_service_class_quotas=dict(
+                scheduler_policy.decode_service_class_quotas or {}
+            ),
             fairness_guardrail_queue_wait_s=(
                 scheduler_policy.fairness_guardrail_queue_wait_s
             ),
             fairness_guardrail_service_classes=(
-                scheduler_policy.fairness_guardrail_service_classes
+                set(scheduler_policy.fairness_guardrail_service_classes or ())
             ),
             lora_params=lora_params,
             multimodal_params=multimodal_params,
@@ -197,7 +214,9 @@ class LiteRuntimeFactory:
             preemption_min_backlog=backend_policy.preemption_min_backlog,
             preemption_min_decodes=backend_policy.preemption_min_decodes,
             preemption_max_queue_wait_s=backend_policy.preemption_max_queue_wait_s,
-            preemptible_service_classes=backend_policy.preemptible_service_classes,
+            preemptible_service_classes=set(
+                backend_policy.preemptible_service_classes or ()
+            ),
             preempt_multimodal_prefills=backend_policy.preempt_multimodal_prefills,
             preempt_multimodal_max_queue_wait_s=(
                 backend_policy.preempt_multimodal_max_queue_wait_s
@@ -220,13 +239,13 @@ class LiteRuntimeFactory:
             queue_timeout_s=context.queue_timeout_s,
             lora_registry=context.lora_registry,
         )
-        return {
-            "kv_block_manager": kv_block_manager,
-            "input_batch_builder": input_batch_builder,
-            "multimodal_processor": multimodal_processor,
-            "prefill_executor": prefill_executor,
-            "decode_executor": decode_executor,
-            "step_scheduler": step_scheduler,
-            "execution_backend": execution_backend,
-            "runtime_controller": runtime_controller,
-        }
+        return RuntimeComponents(
+            kv_block_manager=kv_block_manager,
+            input_batch_builder=input_batch_builder,
+            multimodal_processor=multimodal_processor,
+            prefill_executor=prefill_executor,
+            decode_executor=decode_executor,
+            step_scheduler=step_scheduler,
+            execution_backend=execution_backend,
+            runtime_controller=runtime_controller,
+        )
