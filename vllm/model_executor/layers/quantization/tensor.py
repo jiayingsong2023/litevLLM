@@ -398,6 +398,14 @@ def awq_group32_gemv_all_enabled(config: object | None = None) -> bool:
     )
 
 
+def awq_rows_exact_msmall_enabled(config: object | None = None) -> bool:
+    """Whether M=2/4 must retain the per-row M=1 AWQ arithmetic path."""
+    return _bool_like(
+        _kernel_policy_value(config, "awq_rows_exact_msmall", False),
+        False,
+    )
+
+
 def awq_group32_interleaved_down_proj_enabled(config: object | None = None) -> bool:
     return _bool_like(
         _kernel_policy_value(config, "awq_group32_interleaved_down_proj", False),
@@ -1195,6 +1203,45 @@ class PackedInt4Weight(QuantizedLinearWeight):
             return torch.nn.functional.linear(
                 x, _match_weight_dtype(dense_weight, x), bias
             )
+
+        x2 = x.reshape(-1, x.shape[-1])
+        if (
+            awq_rows_exact_msmall_enabled(config)
+            and int(x2.shape[0]) in (2, 4)
+        ):
+            try:
+                from vllm.kernels.triton.awq_fused_gemm import (
+                    packed_int4_symmetric_group32_rows_exact_msmall_safe,
+                )
+
+                out, used, reason = (
+                    packed_int4_symmetric_group32_rows_exact_msmall_safe(
+                        x2.contiguous(),
+                        self.qweight,
+                        self.scales,
+                        int(self.group_size),
+                        bias=bias,
+                    )
+                )
+                if used:
+                    _awq_stat_inc("awq_rows_exact_msmall_success")
+                    _awq_prefix_stat_inc(self.prefix, "rows_exact_msmall_success")
+                    return out.view(*x.shape[:-1], out.shape[-1])
+                _awq_prefix_stat_inc(
+                    self.prefix, f"rows_exact_msmall_fallback:{reason}"
+                )
+            except Exception as exc:
+                _awq_prefix_stat_inc(
+                    self.prefix, f"rows_exact_msmall_exception:{type(exc).__name__}"
+                )
+
+            # A rejected row-exact layout must not silently switch to generic
+            # GEMM. Re-enter M=1 for each row, preserving its production path.
+            rows = [
+                self.matmul(x2[row : row + 1], bias, config=config)
+                for row in range(int(x2.shape[0]))
+            ]
+            return torch.cat(rows, dim=0).view(*x.shape[:-1], rows[0].shape[-1])
 
         if _should_try_gemma4_down_proj_interleaved(
             self.prefix,

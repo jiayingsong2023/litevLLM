@@ -7,10 +7,12 @@ from .base import ModelAdapter, ModelCapabilities, RuntimeModelPolicy
 from .policy_keys import (
     GEMMA4_AWQ_DECODE_GEMV,
     GEMMA4_AWQ_FUSED_GATE_UP,
+    GEMMA4_AWQ_FUSED_GATE_UP_GROUP32,
     GEMMA4_AWQ_FUSED_GEMM,
     GEMMA4_AWQ_FUSED_GEMM_FORCE,
     GEMMA4_AWQ_FUSED_SCOPE,
     GEMMA4_AWQ_GROUP32_GEMV_ALL,
+    GEMMA4_C1_PRESET,
     GEMMA4_DENSE_DOWN_PROJ,
     GEMMA4_FORCE_FULL_REF_ATTN,
     GEMMA4_FP32_RESIDUAL_GUARD_ENABLED,
@@ -58,6 +60,17 @@ def _supports_moe(hf_config: Any) -> bool:
     return num_experts > 0 and top_k > 0 and moe_intermediate > 0
 
 
+def _is_gemma4_12b_batch_target(hf_config: Any) -> bool:
+    """Identify the one checkpoint covered by the verified batch envelope."""
+    text = getattr(hf_config, "text_config", hf_config)
+    return (
+        _int_or(getattr(text, "hidden_size", 0), 0) == 3840
+        and _int_or(getattr(text, "num_hidden_layers", 0), 0) == 48
+        and _int_or(getattr(text, "intermediate_size", 0), 0) == 15360
+        and _int_or(getattr(text, "num_attention_heads", 0), 0) == 16
+    )
+
+
 class Gemma4Adapter(ModelAdapter):
     model_type = "gemma4"
 
@@ -83,7 +96,9 @@ class Gemma4Adapter(ModelAdapter):
         ):
             force_kv_dtype = "fp8"
 
-        is_moe = _supports_moe(getattr(model_config, "hf_config", None))
+        hf_config = getattr(model_config, "hf_config", None)
+        is_moe = _supports_moe(hf_config)
+        is_12b_batch_target = _is_gemma4_12b_batch_target(hf_config)
         model_policy: Gemma4ModelPolicy = cast(
             Gemma4ModelPolicy,
             {
@@ -172,7 +187,11 @@ class Gemma4Adapter(ModelAdapter):
                     "FASTINFERENCE_GEMMA4_DENSE_DOWN_PROJ": "1",
                 }
             )
-
+        if is_12b_batch_target:
+            model_policy[GEMMA4_C1_PRESET] = True
+            # The group-oriented kernel was validated end-to-end at 128, 512,
+            # and 2048 token contexts for this exact checkpoint shape only.
+            kernel_policy[GEMMA4_AWQ_FUSED_GATE_UP_GROUP32] = True
         return RuntimeModelPolicy(
             force_kv_cache_dtype=force_kv_dtype,
             force_kv_cache_dtype_when=("turbo_int4", "int4"),
@@ -183,6 +202,9 @@ class Gemma4Adapter(ModelAdapter):
             tuning_env_overrides=tuning_env_overrides,
             model_policy=model_policy,  # type: ignore[arg-type]
             kernel_policy=kernel_policy,
+            # M>1 remains experimental until it passes both token parity and
+            # per-agent latency gates; do not schedule an unverified shape.
+            verified_decode_batch_sizes=(1,) if is_12b_batch_target else None,
         )
 
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:

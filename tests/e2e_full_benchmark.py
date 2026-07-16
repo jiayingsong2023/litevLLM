@@ -116,6 +116,13 @@ _GEMMA4_26B_RECOMMENDED_ENV: dict[str, str] = {
     "FASTINFERENCE_GPU_GREEDY_BYPASS_CPU_POLICIES": "1",
 }
 
+_GEMMA4_12B_BATCH_ENV: dict[str, str] = {
+    "FASTINFERENCE_KV_TYPE": "fp8",
+    "FASTINFERENCE_FUSION_LEVEL": "2",
+    "FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS": "4",
+    "FASTINFERENCE_KV_MAX_MODEL_LEN": "512",
+}
+
 _DEEPSEEK_V4_FLASH_GGUF_PATH = (
     "models/DeepSeek-V4-Flash-ds4/"
     "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
@@ -156,6 +163,21 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
             # Prefill: SDPA on first full-attn chunk (faster than eager HF matmul; set "0" for strict HF parity).
             "FASTINFERENCE_QWEN35_FULLATTN_USE_SDP_PREFILL": "1",
         },
+    ),
+    "gemma4_12b_awq": ModelSpec(
+        key="gemma4_12b_awq",
+        model_path=os.environ.get(
+            "MODEL_GEMMA4_12B_AWQ", "models/gemma-4-12B-it-AWQ-INT4"
+        ),
+        display_name="Gemma4-12B (AWQ INT4, M=4)",
+        quant="awq",
+        concurrent_reqs=4,
+        prompt_tokens_target=128,
+        max_new_tokens=32,
+        gpu_memory_utilization=0.80,
+        max_model_len=512,
+        max_run_seconds=1200,
+        stable_env=dict(_GEMMA4_12B_BATCH_ENV),
     ),
     "gemma4_31b_q4": ModelSpec(
         key="gemma4_31b_q4",
@@ -3008,7 +3030,7 @@ def _format_perf_regression_warnings(warnings: list[dict[str, object]]) -> list[
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "End-to-end performance benchmark for Gemma4 26B/31B, Qwen3.5, "
+            "End-to-end performance benchmark for Gemma4 12B/26B/31B, Qwen3.5, "
             "TinyLlama, and DeepSeek V4 Flash Q2 GGUF direct-path models."
         )
     )
@@ -3019,7 +3041,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated model keys. Default: "
             "gemma4_26b_a4b,gemma4_31b_q4,deepseek_v4_flash_q2_gguf. "
-            "Available: tinyllama, qwen35_9b_awq, gemma4_31b_q4, "
+            "Available: tinyllama, qwen35_9b_awq, gemma4_12b_awq, gemma4_31b_q4, "
             "gemma4_26b_a4b, deepseek_v4_flash_q2_gguf."
         ),
     )

@@ -676,6 +676,7 @@ class LiteSingleGpuBackend:
             request_state,
         )
         request_state.generated_ids.append(next_token)
+        self.scheduler.transition_to_decode(request_id)
         results: list[RequestOutput] = []
         self._process_completion(request_id, next_token, results)
 

@@ -35,6 +35,9 @@ class RuntimeModelPolicy:
     tuning_env_overrides: dict[str, str] = field(default_factory=dict)
     model_policy: dict[str, object] = field(default_factory=dict)
     kernel_policy: dict[str, object] = field(default_factory=dict)
+    # Decode batch sizes proven bit-exact for this model/KV contract. ``None``
+    # leaves the generic scheduler behavior unchanged.
+    verified_decode_batch_sizes: tuple[int, ...] | None = None
 
 
 class ModelAdapter(Protocol):

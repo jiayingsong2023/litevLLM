@@ -95,6 +95,7 @@ class DecodePrefillPlanner:
         self.prefill_microbatch_size = prefill_microbatch_size
 
         self._multimodal_prefix_cache_hit_rate_feedback = 0.0
+        self._verified_decode_batch_sizes: tuple[int, ...] | None = None
         self._prefill_rr_cursor = 0
         self._prefill_lora_cursor = 0
         self._prefill_multimodal_cursor = 0
@@ -109,6 +110,18 @@ class DecodePrefillPlanner:
         self._lora_constraint = LoRAConstraint()
         self._multimodal_constraint = MultiModalConstraint()
         self._multimodal_lora_constraint = MultiModalLoRAConstraint()
+
+    def set_verified_decode_batch_sizes(
+        self, batch_sizes: tuple[int, ...] | None
+    ) -> None:
+        """Restrict decode execution to independently verified batch sizes."""
+        if batch_sizes is None:
+            self._verified_decode_batch_sizes = None
+            return
+        normalized = tuple(sorted({int(size) for size in batch_sizes if int(size) > 0}))
+        if not normalized or normalized[0] != 1:
+            raise ValueError("verified decode batch sizes must include M=1")
+        self._verified_decode_batch_sizes = normalized
 
     def update_runtime_feedback(self, feedback: dict[str, Any] | None) -> None:
         """Consume runtime feedback to adjust future planning decisions.
@@ -468,6 +481,13 @@ class DecodePrefillPlanner:
             max_multimodal_requests=self.max_decode_multimodal_requests_per_batch,
             cursor_attr="_decode_multimodal_cursor",
         )
+        if self._verified_decode_batch_sizes is not None and request_ids:
+            max_verified = max(
+                size
+                for size in self._verified_decode_batch_sizes
+                if size <= len(request_ids)
+            )
+            request_ids = request_ids[:max_verified]
         if not request_ids:
             return DecodePlanResult(
                 plan=None,

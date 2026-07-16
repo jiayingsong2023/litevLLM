@@ -74,9 +74,11 @@ class LLM:
             while unfinished:
                 step_outputs = self.engine.step()
                 if not step_outputs:
-                    raise RuntimeError(
-                        "LiteEngine made no progress while requests were still active."
-                    )
+                    if self.engine.active_request_count == 0:
+                        raise RuntimeError(
+                            "LiteEngine stopped before all requests completed."
+                        )
+                    continue
                 for out in step_outputs:
                     latest_outputs[out.request_id] = out
                     if out.finished:

@@ -3,6 +3,7 @@
 # Inference correctness regression for:
 #   - TinyLlama-1.1B-Chat-v1.0
 #   - Qwen3.5-9B-AWQ
+#   - Gemma4-12B-it-AWQ-INT4 batch parity
 #   - Gemma4-31B-it-AWQ-4bit
 #   - Gemma4-26B-A4B-it-AWQ-4bit
 #
@@ -20,7 +21,7 @@
 #   SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh   # B-tier only (faster)
 #   FASTINFERENCE_AWQ_POLICY_MATRIX=throughput bash tests/run_inference_correctness_regression.sh
 #     # AWQ matrix presets: safe | balanced | throughput | strict
-#   RUN_GEMMA4_31B=0 or RUN_GEMMA4_26B=0 can disable one large-model family explicitly.
+#   RUN_GEMMA4_12B_BATCH=0, RUN_GEMMA4_31B=0, or RUN_GEMMA4_26B=0 disables one Gemma4 stage.
 #   RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=auto runs the real GGUF DeepSeek Tier-B quality smoke when the model exists.
 #     Set 0 to disable, or 1 to require the model file and fail if it is missing.
 #
@@ -67,12 +68,14 @@ EOF
 
 CONFIG_TINY_FP8="${FI_REGRESSION_CONFIG_DIR}/tiny-fp8.toml"
 CONFIG_QWEN_ACCURACY_TURBO="${FI_REGRESSION_CONFIG_DIR}/qwen-accuracy-turbo.toml"
+CONFIG_GEMMA_12B="${FI_REGRESSION_CONFIG_DIR}/gemma12b-batch-fp8.toml"
 CONFIG_GEMMA_31B="${FI_REGRESSION_CONFIG_DIR}/gemma31b-benchmark-turbo.toml"
 CONFIG_GEMMA_26B="${FI_REGRESSION_CONFIG_DIR}/gemma26b-benchmark-turbo.toml"
 CONFIG_GEMMA_31B_A_LITE="${FI_REGRESSION_CONFIG_DIR}/gemma31b-a-lite-latency.toml"
 CONFIG_GEMMA_26B_A_LITE="${FI_REGRESSION_CONFIG_DIR}/gemma26b-a-lite-latency.toml"
 write_fastinference_config "$CONFIG_TINY_FP8" "auto" "fp8" "false"
 write_fastinference_config "$CONFIG_QWEN_ACCURACY_TURBO" "accuracy" "turbo_int4" "false"
+write_fastinference_config "$CONFIG_GEMMA_12B" "accuracy" "fp8" "false"
 write_fastinference_config "$CONFIG_GEMMA_31B" "benchmark" "turbo_int4" "false" \
   FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS 1 \
   FASTINFERENCE_KV_MAX_MODEL_LEN 512 \
@@ -93,6 +96,7 @@ write_fastinference_config "$CONFIG_GEMMA_26B_A_LITE" "latency" "fp8" "false"
 
 MODEL_TINYLLAMA="${MODEL_TINYLLAMA:-models/TinyLlama-1.1B-Chat-v1.0}"
 MODEL_QWEN35_9B_AWQ="${MODEL_QWEN35_9B_AWQ:-models/Qwen3.5-9B-AWQ}"
+MODEL_GEMMA4_12B_AWQ="${MODEL_GEMMA4_12B_AWQ:-models/gemma-4-12B-it-AWQ-INT4}"
 MODEL_GEMMA4_31B_Q4="${MODEL_GEMMA4_31B_Q4:-models/gemma-4-31B-it-AWQ-4bit}"
 MODEL_GEMMA4_26B_A4B="${MODEL_GEMMA4_26B_A4B:-models/gemma-4-26B-A4B-it-AWQ-4bit}"
 MODEL_DEEPSEEK_V4_FLASH_GGUF="${MODEL_DEEPSEEK_V4_FLASH_GGUF:-models/DeepSeek-V4-Flash-ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
@@ -104,6 +108,7 @@ HF_GEMMA4_31B="${HF_GEMMA4_31B:-}"
 HF_GEMMA4_26B="${HF_GEMMA4_26B:-}"
 RUN_PERF_DIAG="${RUN_PERF_DIAG:-0}"
 RUN_AWQ_FUSED_AB="${RUN_AWQ_FUSED_AB:-0}"
+RUN_GEMMA4_12B_BATCH="${RUN_GEMMA4_12B_BATCH:-1}"
 RUN_GEMMA4_31B="${RUN_GEMMA4_31B:-1}"
 RUN_GEMMA4_26B="${RUN_GEMMA4_26B:-1}"
 RUN_GEMMA4_A_TIER="${RUN_GEMMA4_A_TIER:-0}"  # compatibility no-op; Gemma4-31B uses A-lite only.
@@ -433,6 +438,31 @@ run_stage "Tier-B Qwen3.5-9B AWQ spotcheck" "$FI_CORRECTNESS_STAGE_TIMEOUT" \
   env FASTINFERENCE_CONFIG="$CONFIG_QWEN_ACCURACY_TURBO" \
   "${SPOTCHECK[@]}" --model "$MODEL_QWEN35_9B_AWQ" --quant awq
 
+GEMMA4_12B_BATCH_AVAILABLE=0
+if [[ "${RUN_GEMMA4_12B_BATCH}" == "1" ]]; then
+  if [[ -d "$MODEL_GEMMA4_12B_AWQ" ]]; then
+    GEMMA4_12B_BATCH_AVAILABLE=1
+    print_model_separator "Gemma4-12B AWQ M=4 batch parity"
+    GEMMA4_12B_M1_JSON="${FI_REGRESSION_CONFIG_DIR}/gemma4-12b-llm-m1.json"
+    GEMMA4_12B_M4_JSON="${FI_REGRESSION_CONFIG_DIR}/gemma4-12b-llm-m4.json"
+    print_gemma4_profile "Gemma4-12B" "FASTINFERENCE_CONFIG=${CONFIG_GEMMA_12B}"
+    run_stage "Tier-B Gemma4-12B M=1 public API reference" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="$CONFIG_GEMMA_12B" \
+      "${UV_RUN[@]}" python tests/tools/gemma4_12b_exact_batch_baseline.py \
+        --model "$MODEL_GEMMA4_12B_AWQ" --surface llm --batch-size 1 --max-new-tokens 32 \
+        --out "$GEMMA4_12B_M1_JSON"
+    cleanup_after_model_step "Gemma4-12B M=1 public API reference"
+    run_stage "Tier-B Gemma4-12B M=4 public API parity" "$FI_CORRECTNESS_GEMMA_STAGE_TIMEOUT" \
+      env FASTINFERENCE_CONFIG="$CONFIG_GEMMA_12B" \
+      "${UV_RUN[@]}" python tests/tools/gemma4_12b_exact_batch_baseline.py \
+        --model "$MODEL_GEMMA4_12B_AWQ" --surface llm --batch-size 4 --max-new-tokens 32 \
+        --reference "$GEMMA4_12B_M1_JSON" --min-speedup 1.05 --out "$GEMMA4_12B_M4_JSON"
+    cleanup_after_model_step "Gemma4-12B M=4 public API parity"
+  else
+    echo "[Warn] Gemma4-12B model dir not found, skipping: $MODEL_GEMMA4_12B_AWQ"
+  fi
+fi
+
 GEMMA4_AVAILABLE=0
 if [[ "${RUN_GEMMA4_31B}" == "1" ]]; then
   if [[ -d "$MODEL_GEMMA4_31B_Q4" ]] || is_hf_repo_id "$MODEL_GEMMA4_31B_Q4"; then
@@ -524,6 +554,9 @@ if [[ "$RUN_PERF_DIAG" == "1" ]]; then
   echo ""
   echo "=== Optional Perf Diagnostics (RUN_PERF_DIAG=1) ==="
   PERF_MODELS="tinyllama,qwen35_9b_awq"
+  if [[ "${GEMMA4_12B_BATCH_AVAILABLE}" == "1" ]]; then
+    PERF_MODELS="${PERF_MODELS},gemma4_12b_awq"
+  fi
   if [[ "${GEMMA4_AVAILABLE}" == "1" ]]; then
     PERF_MODELS="${PERF_MODELS},gemma4_31b_q4"
   fi

@@ -12,6 +12,7 @@ from vllm.model_executor.models.lite_config import LiteConfig
 
 from .config import Gemma4LayerConfig
 from .policy_utils import _gemma4_kernel_policy_truthy, _gemma4_model_policy_truthy
+from .profiling import _gemma4_profile_span
 
 
 class Gemma4MLP(nn.Module):
@@ -61,16 +62,18 @@ class Gemma4MLP(nn.Module):
             try_fused_awq_mlp_streaming,
         )
 
-        streamed = try_fused_awq_mlp_streaming(
-            x,
-            self.gate_proj,
-            self.up_proj,
-            self.down_proj,
-            activation=self.hidden_act,
-            lora_mapping=lora_mapping,
-            inf_config=inf_config,
-            prefix=getattr(self.gate_proj, "prefix", "").rsplit(".mlp.", 1)[0] + ".mlp",
-        )
+        with _gemma4_profile_span("mlp_streaming_attempt", self._layer_config):
+            streamed = try_fused_awq_mlp_streaming(
+                x,
+                self.gate_proj,
+                self.up_proj,
+                self.down_proj,
+                activation=self.hidden_act,
+                lora_mapping=lora_mapping,
+                inf_config=inf_config,
+                prefix=getattr(self.gate_proj, "prefix", "").rsplit(".mlp.", 1)[0]
+                + ".mlp",
+            )
         if streamed is not None:
             return streamed
 
@@ -91,37 +94,47 @@ class Gemma4MLP(nn.Module):
                 try_fused_awq_gate_up_activation,
             )
 
-            h = try_fused_awq_gate_up_activation(
-                x,
-                self.gate_proj,
-                self.up_proj,
-                activation=self.hidden_act,
-                lora_mapping=lora_mapping,
-                inf_config=inf_config,
-            )
+            with _gemma4_profile_span("mlp_fused_gate_up", self._layer_config):
+                h = try_fused_awq_gate_up_activation(
+                    x,
+                    self.gate_proj,
+                    self.up_proj,
+                    activation=self.hidden_act,
+                    lora_mapping=lora_mapping,
+                    inf_config=inf_config,
+                )
             if h is not None:
-                return self.down_proj(h, lora_mapping, inf_config=inf_config)
+                with _gemma4_profile_span("mlp_down_proj", self._layer_config):
+                    return self.down_proj(h, lora_mapping, inf_config=inf_config)
 
         if _gemma4_model_policy_truthy(inf_config, "mlp_pair_fusion", default=True):
             from vllm.model_executor.models._fused_awq_pair import (
                 try_fused_awq_pair_matmul,
             )
 
-            gu = try_fused_awq_pair_matmul(
-                x,
-                self.gate_proj,
-                self.up_proj,
-                self,
-                "mlp_gate_up",
-                lora_mapping=lora_mapping,
-                inf_config=inf_config,
-            )
+            with _gemma4_profile_span("mlp_pair_gate_up", self._layer_config):
+                gu = try_fused_awq_pair_matmul(
+                    x,
+                    self.gate_proj,
+                    self.up_proj,
+                    self,
+                    "mlp_gate_up",
+                    lora_mapping=lora_mapping,
+                    inf_config=inf_config,
+                )
             if gu is not None:
                 gate, up = torch.split(gu, self.intermediate_size, dim=-1)
-                act = self._apply_activation(gate)
-                return self.down_proj(act * up, lora_mapping, inf_config=inf_config)
+                with _gemma4_profile_span("mlp_activation", self._layer_config):
+                    act = self._apply_activation(gate)
+                    h = act * up
+                with _gemma4_profile_span("mlp_down_proj", self._layer_config):
+                    return self.down_proj(h, lora_mapping, inf_config=inf_config)
 
-        gate = self.gate_proj(x, lora_mapping, inf_config=inf_config)
-        up = self.up_proj(x, lora_mapping, inf_config=inf_config)
-        act = self._apply_activation(gate)
-        return self.down_proj(act * up, lora_mapping, inf_config=inf_config)
+        with _gemma4_profile_span("mlp_gate_proj", self._layer_config):
+            gate = self.gate_proj(x, lora_mapping, inf_config=inf_config)
+        with _gemma4_profile_span("mlp_up_proj", self._layer_config):
+            up = self.up_proj(x, lora_mapping, inf_config=inf_config)
+        with _gemma4_profile_span("mlp_activation", self._layer_config):
+            h = self._apply_activation(gate) * up
+        with _gemma4_profile_span("mlp_down_proj", self._layer_config):
+            return self.down_proj(h, lora_mapping, inf_config=inf_config)

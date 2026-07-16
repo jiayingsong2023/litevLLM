@@ -82,6 +82,15 @@ def test_runtime_config_reads_tuning_keyvals_from_config(
     assert cfg.tuning_env["FASTINFERENCE_PROFILE"] == "auto"
 
 
+def test_runtime_config_reads_opted_in_legacy_tuning_env(monkeypatch) -> None:
+    monkeypatch.setenv("FASTINFERENCE_ALLOW_LEGACY_ENV", "1")
+    monkeypatch.setenv("FASTINFERENCE_GEMMA4_LAYER_PROFILE", "1")
+
+    cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
+
+    assert cfg.tuning_env["FASTINFERENCE_GEMMA4_LAYER_PROFILE"] == "1"
+
+
 def test_runtime_config_accuracy_profile_defaults_to_fp8(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
     monkeypatch.delenv("FASTINFERENCE_KV_TYPE", raising=False)

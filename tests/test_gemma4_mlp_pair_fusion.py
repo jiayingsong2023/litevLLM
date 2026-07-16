@@ -20,10 +20,11 @@ device and auto-skip otherwise (matmul dispatch through PackedInt4Weight
 requires either the Triton fused path or the dequant fallback which both
 prefer GPU).
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -32,7 +33,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.quantization.tensor import (
-    PackedInt4Weight,
     dequantize_symmetric_packed_int4_pytorch,
 )
 from vllm.model_executor.models._fused_awq_pair import (
@@ -51,7 +51,7 @@ def _make_stub_litelinear(
     group_size: int = 64,
     prefix: str = "stub",
     force_high_fidelity: bool = False,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
 ) -> nn.Module:
     """Build a minimal object with just the attributes the pair-fusion
     helper inspects. We deliberately avoid constructing a full
@@ -144,9 +144,7 @@ class TestHelperStructuralGuards:
             is None
         )
         assert (
-            try_fused_awq_pair_matmul(
-                x, a, b, owner, "k", lora_mapping={"fake": True}
-            )
+            try_fused_awq_pair_matmul(x, a, b, owner, "k", lora_mapping={"fake": True})
             is None
         )
 
@@ -211,12 +209,8 @@ class TestHelperNumericEquivalence:
     ) -> tuple[Any, Any, torch.Tensor]:
         qa, sa = _synth_int4_weights(n, k, group_size, seed=101, device=device)
         qb, sb = _synth_int4_weights(n, k, group_size, seed=202, device=device)
-        a = _make_stub_litelinear(
-            qa, sa, k, n, group_size=group_size, prefix="pair.a"
-        )
-        b = _make_stub_litelinear(
-            qb, sb, k, n, group_size=group_size, prefix="pair.b"
-        )
+        a = _make_stub_litelinear(qa, sa, k, n, group_size=group_size, prefix="pair.a")
+        b = _make_stub_litelinear(qb, sb, k, n, group_size=group_size, prefix="pair.b")
         x = torch.randn((2, k), device=device, dtype=torch.bfloat16)
         return a, b, x
 
@@ -288,7 +282,9 @@ class TestHelperNumericEquivalence:
             up.qweight.to(torch.int32), up.scales, group_size=group_size
         ).to(x.dtype)
         ref = F.silu(F.linear(x, w_gate)) * F.linear(x, w_up)
-        cos = F.cosine_similarity(fused.float().reshape(-1), ref.float().reshape(-1), dim=0).item()
+        cos = F.cosine_similarity(
+            fused.float().reshape(-1), ref.float().reshape(-1), dim=0
+        ).item()
         diff = (fused.float() - ref.float()).abs()
         rel_mae = (diff.mean() / ref.float().abs().mean().clamp_min(1e-6)).item()
         assert cos > 0.999, f"cosine similarity {cos} too low"
@@ -319,11 +315,41 @@ class TestHelperNumericEquivalence:
             up.qweight.to(torch.int32), up.scales, group_size=group_size
         ).to(x.dtype)
         ref = F.gelu(F.linear(x, w_gate), approximate="tanh") * F.linear(x, w_up)
-        cos = F.cosine_similarity(fused.float().reshape(-1), ref.float().reshape(-1), dim=0).item()
+        cos = F.cosine_similarity(
+            fused.float().reshape(-1), ref.float().reshape(-1), dim=0
+        ).item()
         diff = (fused.float() - ref.float()).abs()
         rel_mae = (diff.mean() / ref.float().abs().mean().clamp_min(1e-6)).item()
         assert cos > 0.999, f"cosine similarity {cos} too low"
         assert rel_mae < 0.02, f"relative mae {rel_mae} too high"
+
+    def test_group32_fused_gate_up_matches_dense_silu(self) -> None:
+        device = torch.device("cuda")
+        n, k, group_size = 257, 288, 32
+        gate, up, _ = self._build_pair(n, k, group_size, device)
+        x = torch.randn((1, k), device=device, dtype=torch.bfloat16)
+
+        fused = try_fused_awq_gate_up_activation(
+            x,
+            gate,
+            up,
+            activation="silu",
+            inf_config=_mk_inf_config(gate_up="1", gate_up_group32="1"),
+        )
+        assert fused is not None
+        torch.cuda.synchronize()
+
+        w_gate = dequantize_symmetric_packed_int4_pytorch(
+            gate.qweight.to(torch.int32), gate.scales, group_size=group_size
+        ).to(x.dtype)
+        w_up = dequantize_symmetric_packed_int4_pytorch(
+            up.qweight.to(torch.int32), up.scales, group_size=group_size
+        ).to(x.dtype)
+        ref = F.silu(F.linear(x, w_gate)) * F.linear(x, w_up)
+        cos = F.cosine_similarity(
+            fused.float().reshape(-1), ref.float().reshape(-1), dim=0
+        ).item()
+        assert cos > 0.999, f"cosine similarity {cos} too low"
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +383,7 @@ def _mk_inf_config(
     *,
     pair_fusion: str | None = None,
     gate_up: str | None = None,
+    gate_up_group32: str | None = None,
 ) -> SimpleNamespace:
     kernel_policy: dict[str, object] = {}
     model_policy: dict[str, object] = {}
@@ -364,6 +391,8 @@ def _mk_inf_config(
         model_policy["mlp_pair_fusion"] = pair_fusion == "1"
     if gate_up is not None:
         kernel_policy["awq_fused_gate_up"] = gate_up == "1"
+    if gate_up_group32 is not None:
+        kernel_policy["awq_fused_gate_up_group32"] = gate_up_group32 == "1"
     return SimpleNamespace(
         tuning_env={},
         kernel_policy=kernel_policy,
@@ -426,7 +455,7 @@ class TestGemma4MLPRouting:
             _ = mlp(x, inf_config=_mk_inf_config())
             assert helper.call_count == 1
             args, kwargs = helper.call_args
-            # Signature contract: (x, gate_proj, up_proj, owner, "mlp_gate_up", lora_mapping=None)
+            # Signature: x, gate_proj, up_proj, owner, "mlp_gate_up", lora_mapping.
             assert args[1] is mlp.gate_proj
             assert args[2] is mlp.up_proj
             assert args[3] is mlp
@@ -442,13 +471,16 @@ class TestGemma4MLPRouting:
         monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "0")
         monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
 
-        with mock.patch(
-            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
-            return_value=direct,
-        ) as direct_helper, mock.patch(
-            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
-            return_value=None,
-        ) as pair_helper:
+        with (
+            mock.patch(
+                "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
+                return_value=direct,
+            ) as direct_helper,
+            mock.patch(
+                "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
+                return_value=None,
+            ) as pair_helper,
+        ):
             out = mlp(x, inf_config=_mk_inf_config(gate_up="1"))
         assert out.shape == x.shape
         assert direct_helper.call_count == 1
@@ -465,13 +497,16 @@ class TestGemma4MLPRouting:
         monkeypatch.setenv("FASTINFERENCE_AWQ_FUSED_GATE_UP", "1")
         monkeypatch.delenv("FASTINFERENCE_GEMMA4_MLP_PAIR_FUSION", raising=False)
 
-        with mock.patch(
-            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
-            return_value=None,
-        ) as direct_helper, mock.patch(
-            "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
-            return_value=None,
-        ) as pair_helper:
+        with (
+            mock.patch(
+                "vllm.model_executor.models._fused_awq_pair.try_fused_awq_gate_up_activation",
+                return_value=None,
+            ) as direct_helper,
+            mock.patch(
+                "vllm.model_executor.models._fused_awq_pair.try_fused_awq_pair_matmul",
+                return_value=None,
+            ) as pair_helper,
+        ):
             out = mlp(x, inf_config=_mk_inf_config(pair_fusion="0", gate_up="0"))
         assert out.shape == x.shape
         direct_helper.assert_not_called()

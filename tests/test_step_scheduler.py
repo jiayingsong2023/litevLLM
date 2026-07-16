@@ -97,6 +97,71 @@ def test_step_scheduler_decode_fast_path_when_only_decodes() -> None:
     assert plan.decodes.request_ids == ["r0", "r1"]
 
 
+def test_step_scheduler_decode_fast_path_accepts_four_ready_requests() -> None:
+    scheduler = _scheduler_with_requests(
+        [{"is_prefill": False, "seq_len": index + 4} for index in range(4)]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=4,
+        decode_priority_enabled=True,
+        prefill_chunk_size=8,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+    )
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.prefills is None
+    assert plan.decodes is not None
+    assert plan.decodes.use_fast_path is True
+    assert plan.decodes.request_ids == ["r0", "r1", "r2", "r3"]
+
+
+def test_step_scheduler_exact_envelope_never_selects_unverified_tail_batch() -> None:
+    scheduler = _scheduler_with_requests(
+        [
+            {"is_prefill": False, "seq_len": 4},
+            {"is_prefill": False, "seq_len": 5},
+            {"is_prefill": False, "seq_len": 6},
+        ]
+    )
+    step_scheduler = StepScheduler(
+        step_token_budget=4,
+        decode_priority_enabled=True,
+        prefill_chunk_size=8,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+    )
+    step_scheduler.set_verified_decode_batch_sizes((1, 4))
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.decodes is not None
+    assert len(plan.decodes.request_ids) == 1
+
+
+def test_step_scheduler_exact_envelope_allows_empty_decode_candidates() -> None:
+    scheduler = _scheduler_with_requests([{"is_prefill": True, "seq_len": 0}])
+    step_scheduler = StepScheduler(
+        step_token_budget=4,
+        decode_priority_enabled=True,
+        prefill_chunk_size=8,
+        prefill_reserved_tokens=0,
+        prefill_reserve_backlog=2,
+        prefill_catchup_ratio=0.25,
+        prefill_microbatch_size=2,
+    )
+    step_scheduler.set_verified_decode_batch_sizes((1, 2, 4))
+
+    plan = step_scheduler.build_plan(scheduler)
+
+    assert plan.decodes is None
+
+
 def test_step_scheduler_reserves_prefill_budget_on_backlog() -> None:
     scheduler = _scheduler_with_requests(
         [
