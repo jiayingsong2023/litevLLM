@@ -10,163 +10,7 @@ from vllm.engine.custom_runtime_components import CustomRuntimeComponents
 from vllm.engine.executor_result import TokenDecodeResult, TokenPrefillResult
 from vllm.engine.lite_engine import LiteEngine
 from vllm.engine.runtime_config import RuntimeConfig
-from vllm.model_executor.models.deepseek_v4_flash.direct_runtime import (
-    DeepSeekV4FlashDirectRuntime,
-)
-from vllm.model_executor.models.deepseek_v4_flash.model import (
-    DeepSeekV4FlashForCausalLM,
-)
 from vllm.sampling_params import SamplingParams
-
-
-class _FakeTokenizer:
-    eos_token_id = 0
-
-    def encode(self, prompt: str) -> list[int]:
-        assert prompt == "hello"
-        return [3, 7]
-
-    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
-        assert ids == [11, 12]
-        assert skip_special_tokens is True
-        return "world"
-
-
-class _FakeDeepSeekModel(DeepSeekV4FlashForCausalLM):
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls: list[tuple[str, list[int] | None, int, str | None]] = []
-        self.prepared: tuple[int, str] | None = None
-
-    def prepare_for_serving(
-        self,
-        *,
-        context_length: int,
-        device: torch.device,
-    ) -> dict[str, int | None]:
-        self.prepared = (context_length, device.type)
-        return {}
-
-    def prefill_greedy_kernel(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        max_tokens: int,
-    ) -> object:
-        self.calls.append(
-            (
-                "prefill",
-                input_ids.detach().cpu().tolist(),
-                max_tokens,
-                input_ids.device.type,
-            )
-        )
-        return {"device": input_ids.device, "input_ids": input_ids}
-
-    def decode_greedy_kernel(
-        self,
-        session: object,
-        *,
-        max_tokens: int,
-        use_graph: bool = False,
-    ) -> torch.Tensor:
-        sess = session if isinstance(session, dict) else {}
-        self.calls.append(("decode", None, max_tokens, str(use_graph)))
-        assert max_tokens == 2
-        return torch.tensor(
-            [3, 7, 11, 12],
-            dtype=torch.long,
-            device=sess["device"],
-        )
-
-    def generate_greedy_kernel(
-        self,
-        input_ids: torch.Tensor,
-        *,
-        max_tokens: int = 1,
-        use_graph: bool = False,
-    ) -> torch.Tensor:
-        raise AssertionError("direct runtime should use explicit prefill/decode stages")
-
-
-def _deepseek_direct_runtime() -> tuple[
-    DeepSeekV4FlashDirectRuntime,
-    _FakeDeepSeekModel,
-]:
-    model = _FakeDeepSeekModel()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return (
-        DeepSeekV4FlashDirectRuntime(
-            model=model,
-            model_config=SimpleNamespace(max_model_len=4096),
-            runtime_config=SimpleNamespace(queue_timeout_s=30.0),
-            tokenizer=_FakeTokenizer(),
-            device=device,
-            observer=None,
-        ),
-        model,
-    )
-
-
-def test_lite_engine_deepseek_direct_greedy_uses_kernel_generate() -> None:
-    runtime, model = _deepseek_direct_runtime()
-
-    output = runtime.generate(
-        request_id="req-1",
-        prompt="hello",
-        sampling_params=SamplingParams(max_tokens=2, temperature=0.0),
-    )
-
-    assert output.request_id == "req-1"
-    assert output.prompt == "hello"
-    assert output.prompt_token_ids == [3, 7]
-    assert output.finished is True
-    assert output.outputs[0].text == "world"
-    assert output.outputs[0].token_ids == [11, 12]
-    assert model.calls == [
-        ("prefill", [3, 7], 2, runtime.device.type),
-        ("decode", None, 2, "False"),
-    ]
-
-
-def test_lite_engine_deepseek_direct_rejects_non_greedy_sampling() -> None:
-    runtime, _model = _deepseek_direct_runtime()
-
-    with pytest.raises(ValueError, match="greedy"):
-        runtime.generate(
-            request_id="req-1",
-            prompt="hello",
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.7),
-        )
-
-
-def test_lite_engine_deepseek_direct_rejects_batch_outputs() -> None:
-    runtime, _model = _deepseek_direct_runtime()
-
-    with pytest.raises(ValueError, match="n=1"):
-        runtime.generate(
-            request_id="req-1",
-            prompt="hello",
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0, n=2),
-        )
-
-
-def test_deepseek_adapter_does_not_build_direct_runtime() -> None:
-    from vllm.adapters.deepseek_v4_flash import DeepSeekV4FlashAdapter
-
-    adapter = DeepSeekV4FlashAdapter()
-
-    assert (
-        adapter.build_direct_runtime(
-            model=object(),
-            model_config=SimpleNamespace(max_model_len=4096),
-            runtime_config=SimpleNamespace(queue_timeout_s=30.0),
-            tokenizer=_FakeTokenizer(),
-            device=torch.device("cpu"),
-            observer=None,
-        )
-        is None
-    )
 
 
 class _CustomTokenizer:
@@ -234,6 +78,9 @@ class _CustomAdapter:
 
     def __init__(self, kv: _CustomKV) -> None:
         self.kv = kv
+
+    def named_modules(self):
+        return []
 
     def runtime_policy(self, model_config, runtime_config):
         del model_config, runtime_config

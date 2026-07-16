@@ -33,7 +33,7 @@ def test_runtime_config_uses_profile_defaults(monkeypatch) -> None:
     cfg = RuntimeConfig.from_vllm_config(_mock_vllm_config())
 
     assert cfg.profile.requested_name == "auto"
-    assert cfg.profile.effective_name == "benchmark"
+    assert cfg.profile.effective_name == "balanced"
     assert cfg.kv_cache_dtype == "turbo_int4"
     assert cfg.block_size == 16
     assert cfg.fusion_level == 2

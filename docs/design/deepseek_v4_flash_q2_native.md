@@ -43,12 +43,12 @@ Primary references:
 - <https://huggingface.co/antirez/deepseek-v4-gguf>
 - <https://huggingface.co/docs/transformers/v5.8.0/en/model_doc/deepseek_v4>
 
-## Implemented State As Of 2026-06-30
+## Implemented State As Of 2026-07-16
 
-The branch currently has an experimental batch=1 greedy GPU direct path for the
-target GGUF. It is REST-callable through the lite OpenAI-compatible chat path
-and is included in the correctness and performance entrypoints when the local
-GGUF file is present. It is still an experimental model-specific path, not a
+The branch currently has an experimental greedy GPU data plane for the target
+GGUF. It is REST-callable through the lite OpenAI-compatible chat path and
+uses the shared LiteEngine control plane with DeepSeek-specific executors and
+compressed KV lifecycle components. It remains a model-specific path, not a
 generic GGUF loader or tuned production serving path.
 
 Current target file:
@@ -63,10 +63,9 @@ Current code path summary:
 
 ```text
 OpenAI REST / AsyncLLM
-  -> DeepSeekV4FlashAdapter.build_direct_runtime()
-  -> LiteEngine direct_runtime
-  -> deepseek_v4_flash/direct_runtime.py
-  -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
+  -> LiteEngine -> RuntimeController -> StepScheduler
+  -> DeepSeekPrefillExecutor / DeepSeekDecodeExecutor
+  -> DeepSeekV4FlashForCausalLM
   -> gpu_runtime.py + compressed_kv.py
   -> gpu_layers.py / gpu_backend.py
   -> kernels/triton/deepseek_v4_flash/*
@@ -127,12 +126,11 @@ Implemented:
   allocation contracts.
 - Attention, mHC, compressor/indexer, routing, and grouped expert reference
   helpers used for isolated unit coverage.
-- Full 43-layer GPU direct decode for batch=1 through real GGUF weights,
+- Full 43-layer GPU decode for batch=1 through real GGUF weights,
   returning finite `[1, vocab]` logits.
 - Greedy GPU generation through `generate_greedy_kernel()`.
-- LiteEngine direct runtime for the target DeepSeek model, with
-  `AsyncLLM.generate()` and OpenAI-compatible REST using the same engine-facing
-  boundary.
+- Shared LiteEngine control plane for the target DeepSeek model, with
+  `AsyncLLM.generate()` and OpenAI-compatible REST using the same request path.
 - GPU staging memory accounting and budget guardrails for decoded GGUF tensors.
 - Current model execution boundaries:
   `forward_full_reference()` remains the CPU correctness oracle, while
@@ -152,13 +150,13 @@ Not implemented or not claimed:
 - Continuous batching for DeepSeek V4 Flash.
 - Generic GGUF or arbitrary DeepSeek GGUF support.
 - Non-greedy sampling, structured outputs, speculative decoding, or distributed
-  execution for this direct path.
+  execution for this model path.
 - Full production-speed parity with DS4/C++ runtimes. The active target is
   warm-cache decode above 1 token/s on the local ROCm UMA machine.
 - Default 8K correctness/benchmark regression. The first-release code cap is
   8192, while default automated DeepSeek runs use 4096 context.
 
-The GPU direct path still uses correctness-first Python/Triton orchestration for
+The GPU data plane still uses correctness-first Python/Triton orchestration for
 some operators. It should be treated as an experimental bring-up path until the
 remaining MoE, compressed attention, staging, and launch-overhead bottlenecks
 are reduced further.
@@ -654,7 +652,7 @@ vllm/kernels/triton/deepseek_v4_flash/
 
 The model package should stay vertical and explicit, but not monolithic.
 `model.py` wires layers together and owns the reference/kernel dispatch
-boundary. Format parsing, quantized math, attention, direct runtime, and MoE
+boundary. Format parsing, quantized math, attention, executor orchestration, and MoE
 execution stay in separate modules so they can be tested independently. The
 OpenAI API server, `AsyncLLM`, `LiteEngine`, and prefill/decode executors remain
 control-plane code and must not grow DeepSeek-specific math or model-name

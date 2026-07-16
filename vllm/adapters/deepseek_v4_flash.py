@@ -45,19 +45,6 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
     def install_tuning_config(self, tuning_env: dict[str, str]) -> None:
         return None
 
-    def build_direct_runtime(
-        self,
-        *,
-        model: Any,
-        model_config: Any,
-        runtime_config: Any,
-        tokenizer: Any | None,
-        device: Any,
-        observer: Any | None,
-    ) -> None:
-        del model, model_config, runtime_config, tokenizer, device, observer
-        return None
-
     def build_executors(
         self,
         *,

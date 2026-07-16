@@ -112,7 +112,7 @@ uv run python tests/e2e_full_benchmark.py --no-model-process-isolation ...
 - `--gemma26b-concurrent 1`
 - `--gemma31b-prompt-tokens N`
 - `--gemma26b-prompt-tokens N`
-- `--deepseek-prompt-tokens N`（DeepSeek direct path 默认使用短 prompt 真实 prefill；4096-token 长上下文需显式指定）
+- `--deepseek-prompt-tokens N`（DeepSeek GGUF path 默认使用短 prompt 真实 prefill；4096-token 长上下文需显式指定）
 - `--warmup-preset default|off|cold`
 - `--json-out <path>`
 - `--runtime-stats-out <path>`

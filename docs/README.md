@@ -55,7 +55,7 @@ Production configuration is resolved through `FastInferenceConfig` and
 which points at a TOML file:
 
 ```toml
-profile = "benchmark"
+profile = "balanced"
 kv_type = "turbo_int4"
 
 [tuning_keyvals]
@@ -63,8 +63,9 @@ FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
 FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
 ```
 
-Supported profile names are `auto`, `benchmark`, `latency`, `throughput`, and
-`accuracy`. Legacy `FASTINFERENCE_*` switches may still exist for tests,
+Production profile names are `balanced`, `latency`, and `throughput`; `auto`
+resolves to `balanced`. `benchmark` and `accuracy` remain diagnostic profiles.
+Legacy `FASTINFERENCE_*` switches may still exist for tests,
 benchmarks, or compatibility, but they are not the preferred production
 configuration surface.
 
@@ -93,7 +94,7 @@ When the target GGUF exists at `MODEL_DEEPSEEK_V4_FLASH_GGUF` or the default
 experimental DeepSeek Tier-B smoke by default. Set
 `RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=0` to skip it.
 
-Run the default end-to-end benchmark set, including the DeepSeek direct-GGUF
+Run the default end-to-end benchmark set, including the DeepSeek GGUF
 smoke when the model file is present, with:
 
 ```bash

@@ -16,7 +16,7 @@ uv run python -m vllm.entrypoints.openai.api_server \
 Minimal TOML:
 
 ```toml
-profile = "benchmark"
+profile = "balanced"
 kv_type = "turbo_int4"
 ```
 

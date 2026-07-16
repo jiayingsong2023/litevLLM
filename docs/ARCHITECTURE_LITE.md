@@ -28,9 +28,8 @@ LLM / AsyncLLM / OpenAI API Server
 use. Legacy upstream concepts such as workers, block managers, and distributed
 executors are not a second supported runtime.
 
-Model-specific direct runtimes are owned by adapters. `LiteEngine` may install
-an adapter-provided direct runtime, but generic engine code should not branch on
-model class names.
+Model-specific adapters may install custom executors and KV lifecycle
+components, but generic engine code must not branch on model class names.
 
 ```mermaid
 flowchart TD
@@ -270,31 +269,31 @@ Every new Triton kernel must document memory layout and program tiling in ASCII
 comments, use `vllm/triton_utils/` for Triton imports, and include correctness
 coverage against a PyTorch reference.
 
-## DeepSeek V4 Flash Direct GGUF Path
+## DeepSeek V4 Flash Custom GGUF Data Plane
 
-DeepSeek V4 Flash is an experimental exception to the standard paged-KV model
-path. It still enters through `AsyncLLM` and the OpenAI-compatible REST server,
-but its adapter installs a direct batch=1 greedy runtime instead of the generic
-step scheduler.
+DeepSeek V4 Flash is an experimental exception to the standard paged-KV data
+plane. It still enters through `AsyncLLM` and the OpenAI-compatible REST server,
+then uses the standard controller and scheduler with adapter-owned executors
+and KV lifecycle components.
 
 ```text
 OpenAI REST / AsyncLLM
-  -> LiteEngine direct_runtime
-  -> deepseek_v4_flash/direct_runtime.py
-  -> DeepSeekV4FlashForCausalLM.generate_greedy_kernel()
+  -> LiteEngine -> RuntimeController -> StepScheduler
+  -> DeepSeekPrefillExecutor / DeepSeekDecodeExecutor
+  -> DeepSeekV4FlashForCausalLM
   -> deepseek_v4_flash/gpu_layers.py
   -> kernels/triton/deepseek_v4_flash/*
 ```
 
-The direct GGUF benchmark reports decode throughput but does not use the
-standard per-token streaming observer; `stream_visible=0%` is expected for that
-benchmark path.
+The standalone GGUF GPU smoke benchmark reports decode throughput without the
+standard per-token streaming observer; `stream_visible=0%` is expected there.
 
 Current limits are explicit in code and docs:
 
-- batch size is 1; `n > 1` is rejected.
+- greedy candidate count is 1; `n > 1` is rejected. The shared engine may run
+  multiple active requests within the adapter's admission cap.
 - sampling is greedy only; non-zero temperature, top-p, top-k, and structured
-  outputs are rejected for this direct path.
+  outputs are rejected for this model path.
 - first-release context is capped at 8192, with default benchmark/correctness
   coverage at 4096.
 - this is target-file support for the DS4 Q2/IQ2 GGUF, not generic GGUF model
@@ -311,7 +310,7 @@ The model-local package owns the heavy work:
 | `kernels/triton/deepseek_v4_flash/` | Q8 linear, Q2/IQ2 MoE matvec, attention/cache/output kernels. |
 
 Architecturally, DeepSeek does not use the generic PagedAttention algorithm or
-the lite engine's flat KV pool. Its direct GPU path uses a model-level
+the lite engine's flat KV pool. Its model-local GPU data plane uses a
 `DeepSeekV4PagedKVCache` shared by request states. The pool owns separate lazy
 physical row families for raw sliding-window rows, compressed rows, and ratio-4
 indexer rows; each family uses `BlockAllocator` for block IDs sized by the

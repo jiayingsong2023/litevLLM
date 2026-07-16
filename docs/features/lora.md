@@ -28,7 +28,7 @@ The maintained lite LoRA path is intentionally small:
   connector. Qwen2VL visual-tower LoRA is not supported; Qwen2VL text-path
   LoRA follows the normal text model `LiteLinear` path after image embedding
   injection.
-- DeepSeek V4 Flash direct runtime rejects LoRA.
+- DeepSeek V4 Flash model path rejects LoRA.
 
 ## Offline Smoke
 

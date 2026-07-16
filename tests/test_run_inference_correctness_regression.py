@@ -482,7 +482,7 @@ def test_run_inference_correctness_regression_perf_diag_includes_deepseek(
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     calls = log_path.read_text(encoding="utf-8")
     assert "run python tests/e2e_full_benchmark.py" in calls
-    assert "--models tinyllama,qwen35_9b_awq,deepseek_v4_flash_q2_gguf" in calls
+    assert "deepseek_v4_flash_q2_gguf" in calls
 
 
 def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default(

@@ -34,7 +34,7 @@ task decomposition, and the decision to escalate to a cloud model.
   Triton PagedAttention.
 - AMD ROCm-first AWQ execution, FP8 KV guardrails for Gemma4, and model-specific
   GEMV, QKV, gate/up, and MoE kernels.
-- Adapter-owned model policy and direct runtime installation. Model-specific
+- Adapter-owned model policy and custom component installation. Model-specific
   data planes can remain local while the request lifecycle stays shared.
 - OpenAI-compatible chat subset, streaming, LoRA, structured-output support,
   runtime metrics, and image support for the maintained Gemma4 path.
@@ -50,7 +50,7 @@ task decomposition, and the decision to escalate to a cloud model.
 - Scheduler policy has many service-class, fairness, LoRA, multimodal, and
   prefix-cache controls. Additional policy dimensions require evidence from
   actual multi-agent workloads, not speculative configurability.
-- DeepSeek GGUF is an experimental adapter-owned direct runtime with its own KV
+- DeepSeek GGUF is an experimental adapter-owned data plane with its own KV
   representation. It must not widen the standard Safetensors/AWQ runtime.
 - The measured Gemma4 12B dense AWQ M=1 path is about 10 decode tok/s at a
   512-token context. It is not sufficient evidence that 12B-14B models can be

@@ -49,8 +49,8 @@ targets.
 - Runtime policy flows through `FastInferenceConfig`, runtime profiles, and
   `RuntimeConfig`.
 - Model capability decisions are centralized under `vllm/adapters/`.
-- DeepSeek V4 Flash direct GGUF serving is installed by its adapter-owned
-  direct runtime, not by a model-name branch in `LiteEngine`.
+- DeepSeek V4 Flash GGUF serving uses adapter-owned executors and compressed KV
+  lifecycle components, not a model-name branch in `LiteEngine`.
 - Gemma4 model code has been split from a large monolithic module into the
   `vllm/model_executor/models/gemma4/` package.
 - `FlatKVCacheAllocator` allocates all per-layer K/V caches (and optional scale
@@ -82,7 +82,7 @@ The public production configuration entrypoint is `FASTINFERENCE_CONFIG`,
 pointing at a TOML file:
 
 ```toml
-profile = "benchmark"
+profile = "balanced"
 kv_type = "turbo_int4"
 
 [tuning_keyvals]
@@ -90,8 +90,9 @@ FASTINFERENCE_KV_MAX_ACTIVE_REQUESTS = "1"
 FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
 ```
 
-Supported profiles are `auto`, `benchmark`, `latency`, `throughput`, and
-`accuracy`. Deprecated or tool-only `FASTINFERENCE_*` names remain registered
+Production profiles are `balanced`, `latency`, and `throughput`; `auto`
+resolves to `balanced`. `benchmark` and `accuracy` remain diagnostic. Deprecated
+or tool-only `FASTINFERENCE_*` names remain registered
 for compatibility, but new production policy should be expressed through
 config/profile fields.
 
@@ -111,6 +112,6 @@ config/profile fields.
 ## Onboarding Rule
 
 New model support should be implemented through adapter, loader, model, policy,
-and, only when needed, an adapter-owned direct runtime module. Do not add
+and, only when needed, adapter-owned runtime components. Do not add
 model-name conditionals to `LiteEngine`, `step_scheduler.py`, executor modules,
 or generic hot-path loader code.

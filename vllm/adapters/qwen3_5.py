@@ -63,18 +63,6 @@ class Qwen35Adapter(ModelAdapter):
         # tuning env remains after migrating full-attention and FLA controls.
         return None
 
-    def build_direct_runtime(
-        self,
-        *,
-        model: Any,
-        model_config: Any,
-        runtime_config: Any,
-        tokenizer: Any | None,
-        device: Any,
-        observer: Any | None,
-    ) -> None:
-        return None
-
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)
         inner_model = getattr(model, "model", model)

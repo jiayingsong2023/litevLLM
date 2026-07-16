@@ -18,9 +18,9 @@ or feature status lists.
 | Area | Status | Notes |
 | :--- | :--- | :--- |
 | Single-GPU lite runtime | Supported | Official path through `LiteEngine`, `RuntimeController`, and the lite backend. |
-| AMD ROCm | Supported | Primary tuning target. Current Gemma4 baselines use the default benchmark recommended profile. |
+| AMD ROCm | Supported | Primary tuning target. Current Gemma4 baselines use the default balanced profile. |
 | CUDA compatibility | Supported | Maintained where the Python + Triton path supports it. |
-| Adapter-owned direct runtime | Experimental | Used by DeepSeek V4 Flash GGUF. Direct runtimes must be installed by model adapters, not by model-name branches in the generic engine. |
+| Adapter-owned custom runtime components | Experimental | Used by DeepSeek V4 Flash GGUF for model-local executors and compressed KV lifecycle; the generic engine remains model-name agnostic. |
 | Multi-GPU distributed runtime | Unsupported | `vllm/distributed/` is not part of the current code tree or execution path. |
 | C++/CUDA extension source | Unsupported | Enforced by pre-commit outside allowed third-party code. |
 
@@ -35,7 +35,7 @@ or feature status lists.
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B, A-lite, and Gemma4 image multimodal quality spotcheck. A-strict remains manual/specialized. |
 | Gemma4 image multimodal | Supported | Gemma4 26B/31B image quality is covered by the default correctness regression. The path includes prompt placeholder expansion, official Gemma4 image patch preprocessing, Gemma4 vision tower embeddings, placeholder replacement in text prefill, multi-image requests, multi-request continuous batching, and Gemma4 projector LoRA. Gemma4 E4B is not in the supported regression surface. |
 | Qwen2VL image multimodal | Experimental | Qwen2VL image preprocessing, `image_grid_thw`, mRoPE positions, real vision tower, and placeholder replacement are implemented and covered by focused tests. Vision-tower LoRA is not supported. |
-| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned batch=1 greedy GPU direct runtime, AsyncLLM/OpenAI REST routing, compressed KV cache (per-request pre-allocated raw, compressed, and indexer buffers; not managed by the lite runtime's flat block pool), opt-in Tier-B quality smoke, and e2e benchmark coverage. Current validation target is 4K context; 8K remains a first-release limit but not a default regression load. Recent measured warm-cache decode is in the 1.6-1.9 tok/s range after selected-expert, Q8, and indexer-QAT work; this is not a production-speed parity claim. |
+| DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf | Experimental | Native DS4 GGUF target with adapter-owned executors and compressed KV lifecycle under the shared AsyncLLM/LiteEngine/RuntimeController path. Raw, compressed, and indexer KV buffers remain model-local rather than using the flat block pool. Tier-B smoke and e2e benchmark coverage are opt-in; current validation target is 4K context. Recent warm-cache decode is 1.6-1.9 tok/s, not a production-speed parity claim. |
 | Llama-like models outside the regression set | Experimental | Adapter fallback exists, but support should be claimed only after model-specific smoke and correctness gates. |
 | LoRA runtime | Experimental | Safetensors PEFT adapters, text-layer LoRA, `LoRAMapping`, and mixed LoRA batches are implemented and tested. Production policy calibration is still workload dependent. |
 | Multimodal serving | Experimental | Gemma4 image serving is maintained; Qwen2VL image serving is implemented but remains experimental pending broader real-checkpoint smoke coverage. Audio and video are unsupported. |
@@ -52,7 +52,7 @@ or feature status lists.
 | FP8 KV cache | Supported | Accuracy guard default for Gemma4 when int4 KV is not explicitly allowed. |
 | TurboQuant INT4 KV cache | Supported | Default runtime policy for non-guarded models; guarded by model policy where needed. |
 | Gemma4 recommended adapter profile | Supported | Gemma4 installs AWQ decode GEMV and fused gate-up defaults through runtime profile / adapter policy; dense Gemma4 also installs group32 GEMV and dense down-proj defaults. |
-| Gemma4-26B MoE int4 decode kernel | Supported | Supported through the benchmark / latency profile family with the current default strategy; alternate decode strategies remain benchmark-tool experiments, not production runtime switches. |
+| Gemma4-26B MoE int4 decode kernel | Supported | Supported through the balanced / latency profile family with the current default strategy; alternate decode strategies remain benchmark-tool experiments, not production runtime switches. |
 | Gemma4-26B AWQ grouped prefill MoE | Experimental | Profile-guided grouped prefill is available for the validated MoE shapes; alternate grouped / fused variants remain benchmark-tool experiments rather than production runtime controls. |
 | OpenAI-compatible REST serving | Supported | Lite subset through `vllm.entrypoints.openai.api_server`: `GET /v1/models` and `POST /v1/chat/completions` with streaming and non-streaming responses. |
 | Tokenize/detokenize REST router | Compatibility | Maintained under `vllm.entrypoints.serve.tokenize` when attached; not part of the standalone OpenAI API server contract. |
@@ -73,4 +73,4 @@ or feature status lists.
 | Smoke | `uv run pytest -q tests/smoke` | Import, routing, and no-model HTTP sanity checks. |
 | Fast regression | `bash tests/run_regression_suite.sh` | Unit and structural smoke tests without full model loads. |
 | Correctness | `bash tests/run_inference_correctness_regression.sh` | Local-model quality and semantic gates. |
-| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, profile-level baselines, async runtime counters, DeepSeek direct-GGUF smoke benchmark, and optional baseline warning reports. |
+| Performance | `uv run python tests/e2e_full_benchmark.py` | Throughput, TTFT, profile-level baselines, async runtime counters, DeepSeek GGUF smoke benchmark, and optional baseline warning reports. |

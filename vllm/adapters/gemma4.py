@@ -216,18 +216,6 @@ class Gemma4Adapter(ModelAdapter):
         config = set_gemma4_tuning_config(tuning_env, locked=True)
         _apply_global_tuning_config(config)
 
-    def build_direct_runtime(
-        self,
-        *,
-        model: Any,
-        model_config: Any,
-        runtime_config: Any,
-        tokenizer: Any | None,
-        device: Any,
-        observer: Any | None,
-    ) -> None:
-        return None
-
     def detect(self, model: Any, model_config: Any) -> ModelCapabilities:
         hf_config = getattr(model_config, "hf_config", None)
         inner_model = getattr(model, "model", model)

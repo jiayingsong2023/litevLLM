@@ -12,13 +12,13 @@
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [FP8 KV 稳定] |
   | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **5.85** | [e2e benchmark 2026-06-30] |
   | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.13** | [e2e benchmark 2026-06-30] |
-  | **DeepSeek V4 Flash Q2 GGUF** | batch=1, context~4096, greedy, direct GGUF | **1.6-1.9 decode** | [experimental direct smoke / e2e direct benchmark] |
+  | **DeepSeek V4 Flash Q2 GGUF** | context~4096, greedy, custom GGUF data plane | **1.6-1.9 decode** | [experimental smoke / e2e benchmark] |
 
   最新数值来自 `tests/e2e_full_benchmark.py`（2026-06-30，benchmark profile）。
   Gemma4-26B `TTFT p50=2189.5ms`、`prefill_tps_agg=179.95`、`decode_tps_agg=12.04`；
   Gemma4-31B `TTFT p50=5138.1ms`、`prefill_tps_agg=76.68`、`decode_tps_agg=3.75`；
-  DeepSeek V4 Flash direct GGUF 当前 warm-cache smoke 约 `1.6 tok/s`，
-  e2e direct benchmark 曾测得 `decode_tps_agg=1.88`。DeepSeek direct benchmark
+  DeepSeek V4 Flash GGUF 当前 warm-cache smoke 约 `1.6 tok/s`，
+  e2e benchmark 曾测得 `decode_tps_agg=1.88`。Standalone GPU smoke
   does not use the standard per-token streaming observer, so `stream_visible=0%`
   is an observability limitation rather than a correctness failure.
 
@@ -31,7 +31,7 @@
 
 - **当前正式支持面**:
   - **运行模式**: 单卡、lite runtime、CUDA/ROCm 推理主路径。
-  - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径；DeepSeek V4 Flash 通过目标 DS4 Q2/IQ2 GGUF 走 adapter-owned 实验性 direct runtime。
+  - **权重格式**: `Safetensors + AWQ` 为主，包含 Gemma4 Q4 压缩张量路径；DeepSeek V4 Flash 是目标 DS4 Q2/IQ2 GGUF 的实验性专用数据面，并接入同一 LiteEngine 控制面。
   - **回归目标**: `TinyLlama-1.1B`、`Qwen3.5-9B-AWQ`、`Gemma4-26B-A4B-it-AWQ-4bit`、`Gemma4-31B-it-AWQ-4bit`，以及目标 GGUF 存在时的 `DeepSeek-V4-Flash` Tier-B smoke。
   - **非目标**: `Qwen3.5-35B` 不再作为正式支持模型。
   - **已删除**: `vllm/worker/`、`vllm/core/`、`vllm/distributed/` 等上游 runtime 子系统。
@@ -41,7 +41,7 @@
 - **lite-only 主线**: 运行时以 `vllm/engine/lite_engine.py` 为核心，单卡执行链路。
 - **统一配置构建**: offline 与 OpenAI server 统一通过 `vllm/serving/config_builder.py` 构建 `VllmConfig + RuntimeConfig`。所有 tuning 参数通过 TOML 配置文件 `[tuning_keyvals]` 传递，不再使用 `os.environ`。
 - **分层执行架构**: `LiteEngine` 负责 orchestration，`AsyncDriver` 在后台工作线程执行 `engine.step()` 以避免 GPU sync 阻塞事件循环，`StepScheduler` 做 step 级调度并委托 admission/budget 给 `vllm/engine/planners/`，`RequestScheduler` 做 request/slot 生命周期管理，`PrefillExecutor` / `DecodeExecutor` 做执行，`SamplingDriver` 委托 penalty/mask 和 sampling 给 `vllm/engine/sampling/`，`OutputPipeline` 做输出拼装。
-- **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，policy keys 有 `TypedDict` 类型约束。DeepSeek V4 Flash 的 direct runtime 由 adapter 安装，generic engine 不再包含 DeepSeek 模型名分支。
+- **模型适配层**: 模型特性识别通过 `vllm/adapters/` 下的 adapter 完成，policy keys 有 `TypedDict` 类型约束。DeepSeek V4 Flash 由 adapter 安装专用 executor 与 KV lifecycle；generic engine 不包含模型名分支。
 - **RequestState / RequestScheduler 清债**: `RequestState` 移除 dict-like shim，成为严格 dataclass；`RequestScheduler` 仅接受 `RequestState`，使用 set 索引和 deque 空闲 slot 池优化，同时保留请求 admission 顺序。
 - **StepScheduler 薄片拆分**: admission、budget 与 prefill/decode plan 组装已分别拆出 `AdmissionPlanner`、`BudgetComputer` 和 `DecodePrefillPlanner`，`StepScheduler` 仅保留 step 级编排与委托调用。
 - **SamplingDriver 向量化**: penalty（repetition / frequency / presence）、EOS mask、anti-template mask 改为 batch 级 PyTorch 操作；结构化输出约束与特殊 context bias 仍走逐行 fallback。
@@ -78,7 +78,7 @@ LLM / AsyncLLM / OpenAI API Server
 TOML 配置示例：
 
 ```toml
-profile = "benchmark"
+profile = "balanced"
 kv_type = "turbo_int4"
 
 [tuning_keyvals]
@@ -91,10 +91,10 @@ FASTINFERENCE_KV_MAX_MODEL_LEN = "512"
 | Profile | 目标 | 说明 |
 | :--- | :--- | :--- |
 | `auto` | 默认平衡 | 让 registry 按当前模型/硬件选择稳定默认。 |
-| `benchmark` | 基线测量 | 用于仓库默认性能回归和 profile-level 基线比较。 |
+| `balanced` | 默认服务 | 已认证模型 envelope 的默认生产策略。 |
 | `latency` | 单请求延迟 | 优先 TTFT / decode latency 的保守策略。 |
 | `throughput` | 吞吐 | 优先批量吞吐和设备利用率。 |
-| `accuracy` | 精度保护 | 优先数值保守配置，适合做 correctness / audit。 |
+| `benchmark` / `accuracy` | 诊断 | 基线测量或 correctness/audit，不是生产服务 policy。 |
 
 ## 快速开始
 

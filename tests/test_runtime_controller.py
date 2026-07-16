@@ -40,7 +40,7 @@ class _FakeScheduler:
     def admit_specific_requests(self, request_ids, *, admitted_at):
         self.admitted.append((list(request_ids), admitted_at))
         self.running_request_count = len(request_ids)
-        self.req["admitted_at"] = admitted_at
+        self.req.admitted_at = admitted_at
         return list(request_ids)
 
     def get_request(self, _request_id: str):
@@ -57,6 +57,9 @@ class _FakeScheduler:
 
 
 class _FakeStepScheduler:
+    def update_runtime_feedback(self, _stats: dict[str, object]) -> None:
+        return None
+
     def build_plan(self, scheduler):
         return StepPlan(
             admissions=AdmissionPlan(request_ids=["q1"]),
@@ -112,6 +115,9 @@ class _FakeBackend:
 
     def maybe_apply_prefix_cache(self, request_state):
         self.prefix_cache_seen = request_state
+
+    def ensure_kv_blocks(self, _step_plan) -> None:
+        return None
 
     def maybe_preempt(self, step_plan, scheduler):
         self.preempt_calls.append((step_plan, scheduler))

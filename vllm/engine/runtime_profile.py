@@ -11,11 +11,13 @@ from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePol
 
 SUPPORTED_PROFILE_NAMES = (
     "auto",
+    "balanced",
     "latency",
     "throughput",
     "accuracy",
     "benchmark",
 )
+SERVICE_PROFILE_NAMES = ("balanced", "latency", "throughput")
 
 
 def _freeze_policy_value(value: Any) -> Any:
@@ -126,7 +128,7 @@ class RuntimeProfileRegistry:
     ) -> str:
         del model_capabilities, gpu_total_gb
         if requested == "auto":
-            return "benchmark"
+            return "balanced"
         return requested
 
     @staticmethod
@@ -151,6 +153,7 @@ class RuntimeProfileRegistry:
                     gpu_greedy_max_tokens_only=True,
                     gpu_greedy_bypass_cpu_policies=True,
                 ),
+                scheduler_policy=SchedulerRuntimePolicy(),
             )
         if effective_name == "throughput":
             return RuntimeProfile(
@@ -160,6 +163,22 @@ class RuntimeProfileRegistry:
                 kv_cache_dtype="turbo_int4",
                 kv_max_active_requests=16,
                 prefill_microbatch_size=4,
+                scheduler_policy=SchedulerRuntimePolicy(),
+            )
+        if effective_name == "balanced":
+            return RuntimeProfile(
+                requested_name=requested_name,
+                effective_name=effective_name,
+                description=(
+                    "Balanced production profile for certified model envelopes."
+                ),
+                kv_cache_dtype="turbo_int4",
+                backend_policy=BackendRuntimePolicy(
+                    gpu_greedy_sampling=True,
+                    gpu_greedy_max_tokens_only=True,
+                    gpu_greedy_bypass_cpu_policies=True,
+                ),
+                scheduler_policy=SchedulerRuntimePolicy(),
             )
         return RuntimeProfile(
             requested_name=requested_name,
@@ -171,4 +190,5 @@ class RuntimeProfileRegistry:
                 gpu_greedy_max_tokens_only=True,
                 gpu_greedy_bypass_cpu_policies=True,
             ),
+            scheduler_policy=SchedulerRuntimePolicy(),
         )
