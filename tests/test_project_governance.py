@@ -63,6 +63,10 @@ def test_fastinference_env_names_are_registered() -> None:
         ".mypy_cache",
         ".ruff_cache",
         ".pytest_cache",
+        ".gemini",
+        ".claude",
+        ".cursor",
+        ".superpowers",
     }
     pattern = re.compile(r"(?<![A-Z0-9_])FASTINFERENCE_[A-Z0-9_]*[A-Z0-9](?![A-Z0-9_])")
     found: set[str] = set()

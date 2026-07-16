@@ -214,8 +214,19 @@ class LlamaDecoderLayer(nn.Module):
                 )
             )
 
+            seq_lens_cpu = (
+                attn_metadata.get("seq_lens_cpu", None)
+                if isinstance(attn_metadata, dict)
+                else getattr(attn_metadata, "seq_lens_cpu", None)
+            )
             seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                bs, seq, is_prefill, seq_lens, block_tables, q.device
+                bs,
+                seq,
+                is_prefill,
+                seq_lens,
+                block_tables,
+                q.device,
+                seq_lens_cpu=seq_lens_cpu,
             )
 
             # For paged_attention, we need per-block scale pointers if using row-scales

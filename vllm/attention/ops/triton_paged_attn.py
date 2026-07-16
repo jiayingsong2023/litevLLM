@@ -34,7 +34,7 @@ def triton_paged_attention(
     out = torch.empty_like(q)
     num_heads = q.shape[1]
     block_size = key_cache.shape[1]
-    max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 0
+    max_seq_len = 0
 
     # 4. Invoke Triton Kernel
     paged_attention_v1(

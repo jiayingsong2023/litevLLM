@@ -1272,10 +1272,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         max_ctx = max(nh * hd, getattr(self.config, "max_position_embeddings", 4096))
         # Chunked prefill: only the first chunk starts at token 0. Direct prefill ignores KV prefix;
         # use paged attention when this step continues after prior chunks (kv_start_indices > 0).
-        kv_start_t = attn_metadata.get("kv_start_indices")
-        kv_chunk_start = (
-            int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
-        )
+        kv_start_cpu = attn_metadata.get("kv_start_indices_cpu")
+        if isinstance(kv_start_cpu, (list, tuple)) and kv_start_cpu:
+            kv_chunk_start = int(kv_start_cpu[0])
+        else:
+            kv_start_t = attn_metadata.get("kv_start_indices")
+            kv_chunk_start = (
+                int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
+            )
 
         # TurboQuant INT4 requires paged_attention for dequantization; skip direct prefill path
         is_int4 = "int4" in str(kv_cache_dtype).lower()
@@ -1308,8 +1312,19 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             attn_in = torch.empty((n_tokens, nh, hd), device=q.device, dtype=q.dtype)
             from vllm.engine.lite_engine import expand_metadata_for_paged_attention
 
+            seq_lens_cpu = (
+                attn_metadata.get("seq_lens_cpu", None)
+                if isinstance(attn_metadata, dict)
+                else getattr(attn_metadata, "seq_lens_cpu", None)
+            )
             seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                bs, seq, is_prefill, seq_lens, block_tables, q.device
+                bs,
+                seq,
+                is_prefill,
+                seq_lens,
+                block_tables,
+                q.device,
+                seq_lens_cpu=seq_lens_cpu,
             )
 
             # Kernel expects (batch_size, max_blocks) with stride_bt_seq.
