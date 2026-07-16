@@ -52,6 +52,9 @@ task decomposition, and the decision to escalate to a cloud model.
   actual multi-agent workloads, not speculative configurability.
 - DeepSeek GGUF is an experimental adapter-owned direct runtime with its own KV
   representation. It must not widen the standard Safetensors/AWQ runtime.
+- The measured Gemma4 12B dense AWQ M=1 path is about 10 decode tok/s at a
+  512-token context. It is not sufficient evidence that 12B-14B models can be
+  default concurrent agent workers on this target.
 - 26B and 31B models have insufficient decode capacity to be default concurrent
   agent workers on the measured AI PC target.
 
@@ -89,29 +92,32 @@ agent capacity:
 The model hierarchy should be:
 
 ```text
-7B-14B AWQ: default high-frequency local agent workers
+7B AWQ:     default high-frequency local agent worker candidate
+12B-14B:    quality/performance candidates; require an independent worker-capacity gate
 26B:        local high-quality escalation and complex review
 31B:        selective local expert, not a default worker pool
 cloud:      long reasoning, high-risk decisions, or quality fallback
 ```
 
-A 26B model at roughly 11 decode TPS cannot sustain several agents streaming
-long outputs at once. It is useful as a queued expert, not as the default model
-for concurrent workers. A 31B model with lower measured decode throughput has
-the same limitation more strongly.
+A 12B model at roughly 10 decode TPS, and a 26B model at roughly 11 decode TPS,
+cannot sustain several agents streaming long outputs at once. They are useful
+as queued quality tiers, not as default concurrent workers. A 31B model with
+lower measured decode throughput has the same limitation more strongly.
 
 ## Near-Term KPI
 
-The next formal performance target is 7B-14B AWQ worker capacity on the target
-AI PC. Initial acceptance targets are:
+The next formal performance target is 7B AWQ worker capacity on the target AI
+PC. A 12B-14B model must first demonstrate a useful M=1 improvement over the
+current 12B baseline before it is treated as a worker candidate. Initial
+acceptance targets for a selected worker model are:
 
-| Metric | 7B | 14B |
-| --- | ---: | ---: |
-| BS=1 decode | >= 35 tok/s | >= 20 tok/s |
-| BS=4 aggregate decode | >= 80 tok/s | >= 50 tok/s |
-| Four simultaneous short tasks | >= 10 tok/s per agent | >= 6 tok/s per agent |
-| Shared-prefix hit rate | >= 70% | >= 70% |
-| Cloud escalation rate | < 20% | < 10% |
+| Metric | 7B worker candidate |
+| --- | ---: |
+| BS=1 decode | >= 35 tok/s |
+| BS=4 aggregate decode | >= 80 tok/s |
+| Four simultaneous short tasks | >= 10 tok/s per agent |
+| Shared-prefix hit rate | >= 70% |
+| Cloud escalation rate | < 20% |
 
 These are product hypotheses. They must be calibrated against the selected
 hardware, model, prompt distribution, and task-quality baseline before they
@@ -126,7 +132,8 @@ become regression thresholds.
 3. Profile decode by weight bytes/token, lm-head, attention/KV, AWQ linear,
    kernel launch overhead, and Python control-plane cost.
 4. Optimise M=1, M=2, and M=4 AWQ linear and PagedAttention only when the
-   selected production path is confirmed by audit counters.
+   selected production path is confirmed by audit counters and a whole-model
+   TPS gain. Isolated kernel gains are insufficient.
 5. Make prefix-cache reuse reliable for common agent prefixes before adding new
    speculative execution mechanisms.
 6. Keep 26B/31B performance work separate and evidence-driven. A bandwidth

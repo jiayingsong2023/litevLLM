@@ -4,9 +4,10 @@ Date: 2026-07-15
 
 ## Purpose
 
-This document records the Gemma4 12B batch-decode investigation. The M=4 path
-is greedy token-ID equivalent and improves aggregate throughput, but it fails
-the per-agent p95 latency gate. It is therefore not a production envelope.
+This document records the Gemma4 12B batch-decode investigation and the M=1
+decode audit. This checkpoint is a dense model, not MoE. The M=4 path is greedy
+token-ID equivalent and improves aggregate throughput, but it fails the
+per-agent p95 latency gate. It is therefore not a production envelope.
 
 ## Execution Contract
 
@@ -15,6 +16,7 @@ The verified environment is:
 | Property | Required value |
 | --- | --- |
 | Model | `models/gemma-4-12B-it-AWQ-INT4` |
+| Architecture | Dense, 48 layers, hidden size 3840, MLP intermediate size 15360 |
 | Production decode batch | M=1 only |
 | Scheduler capacity | `max_num_seqs=4` |
 | KV cache | `fp8`; do not set `FASTINFERENCE_GEMMA4_ALLOW_INT4_KV=1` |
@@ -108,6 +110,29 @@ The public `LLM.generate()` end-to-end gate also passed on the same fixture:
 This is an end-to-end output-throughput metric: it includes prefill, request
 orchestration, and output handling. It is intentionally not compared with the
 decode-only table above.
+
+## M=1 Attention-Front Audit: Rejected Fusion
+
+`tests/tools/gemma4_12b_attention_front_audit.py` uses real layer-0 checkpoint
+weights, the production fused-QKV dispatch, position 512, and the engine's FP8
+KV cache. Its purpose is to establish whether Q/K/V norm, RoPE, and KV write
+are large enough to justify an exact-shape fusion candidate.
+
+On the local Radeon 8060S, the 512-token, 40-repetition median was:
+
+| Operation | GPU time |
+| --- | ---: |
+| Fused QKV | 0.131 ms |
+| Q/K/V norm + Q/K RoPE + FP8 KV write | 0.201 ms |
+
+The latter is about 60% of the measured attention front half. An experimental
+single-launch candidate passed its isolated timing test (`2.21x` for the front
+half) and preserved 512-token greedy token IDs, but reduced complete decode
+throughput from `10.235` to `10.061` tok/s (`0.983x`). It was deleted.
+
+This result is a boundary, not a future toggle: no attention-front fusion is
+installed in the runtime. Re-run the audit only after a material change in the
+GPU, ROCm stack, KV layout, or production attention path.
 
 ## Regression Entrypoints
 

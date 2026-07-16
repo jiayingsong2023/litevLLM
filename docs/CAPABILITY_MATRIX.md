@@ -30,6 +30,7 @@ or feature status lists.
 | :--- | :--- | :--- |
 | TinyLlama-1.1B | Supported | Tier-B quality spotcheck and A-strict semantic integrity. |
 | Qwen3.5-9B-AWQ | Supported | Tier-B quality spotcheck and A-strict AWQ-vs-FP16 audit. |
+| Gemma4-12B-it-AWQ-INT4 | Experimental | FP8 KV M=1 regression and M=2/M=4 token-ID parity diagnostics are maintained. The production scheduler advertises M=1 only: the M=4 path fails the per-agent p95 latency gate. |
 | Gemma4-26B-A4B-it-AWQ-4bit | Supported | Tier-B, A-lite, default A-strict audit unless locally disabled, and Gemma4 image multimodal quality spotcheck. |
 | Gemma4-31B-it-AWQ-4bit | Supported | Tier-B, A-lite, and Gemma4 image multimodal quality spotcheck. A-strict remains manual/specialized. |
 | Gemma4 image multimodal | Supported | Gemma4 26B/31B image quality is covered by the default correctness regression. The path includes prompt placeholder expansion, official Gemma4 image patch preprocessing, Gemma4 vision tower embeddings, placeholder replacement in text prefill, multi-image requests, multi-request continuous batching, and Gemma4 projector LoRA. Gemma4 E4B is not in the supported regression surface. |
