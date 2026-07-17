@@ -37,25 +37,25 @@ def test_run_inference_correctness_regression_wraps_stages_with_timeout(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                    'if [[ "$1" == "run" && ( ( "$2" == "python" && "$3" == "-" ) || ( "$2" == "--no-sync" && "$3" == "python" && "$4" == "-" ) ) ]]; then',
-                    '  [[ "$2" == "--no-sync" ]] && shift',
-                    "  shift 3",
+                'if [[ "$1" == "run" && ( ( "$2" == "python" && "$3" == "-" ) || ( "$2" == "--no-sync" && "$3" == "python" && "$4" == "-" ) ) ]]; then',
+                '  [[ "$2" == "--no-sync" ]] && shift',
+                "  shift 3",
                 '  python3 - "$@"',
                 "  exit 0",
                 "fi",
                 "echo DEBUG_NOISE_FROM_FAKE_UV",
                 'if [[ "$*" == *"quality_bar_spotcheck.py"* ]]; then',
                 "  printf '%s\\n' "
-                "'{\"id\":\"en_capital\","
-                "\"prompt_preview\":\"What is the capital of France?\","
-                "\"text\":\"Paris.\","
-                "\"heuristic_warn\":[],"
-                "\"heuristic_severe\":false,"
-                "\"tier_b_detail\":{\"tier_b_alignment\":{"
-                "\"readability_ok\":true,"
-                "\"coherence_ok\":true,"
-                "\"first_token_ok\":true,"
-                "\"substance_ok\":true}}}'",
+                '\'{"id":"en_capital",'
+                '"prompt_preview":"What is the capital of France?",'
+                '"text":"Paris.",'
+                '"heuristic_warn":[],'
+                '"heuristic_severe":false,'
+                '"tier_b_detail":{"tier_b_alignment":{'
+                '"readability_ok":true,'
+                '"coherence_ok":true,'
+                '"first_token_ok":true,'
+                '"substance_ok":true}}}\'',
                 "fi",
                 "exit 0",
             ]
@@ -216,7 +216,9 @@ def test_run_inference_correctness_regression_runs_opt_in_deepseek_gpu_smoke(
 
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     calls = log_path.read_text(encoding="utf-8")
-    assert "run --no-sync python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
+    assert (
+        "run --no-sync python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
+    )
     assert f"--model {deepseek_path}" in calls
     assert "MODEL: DeepSeek V4 Flash Tier-B" in proc.stdout
 
@@ -370,7 +372,9 @@ def test_run_inference_correctness_regression_runs_deepseek_gpu_smoke_by_default
 
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     calls = log_path.read_text(encoding="utf-8")
-    assert "run --no-sync python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
+    assert (
+        "run --no-sync python tests/tools/deepseek_v4_flash_quality_smoke.py" in calls
+    )
     assert f"--model {deepseek_path}" in calls
 
 
@@ -553,7 +557,10 @@ def test_run_inference_correctness_regression_runs_large_gemma_a_tier_by_default
     assert "run --no-sync python tests/tools/gemma4_prefill_strict_audit.py" in calls
     assert "--preset gemma4_26b_a4b" in calls
     assert "run --no-sync python tests/tools/gemma4_single_prompt_smoke.py" in calls
-    assert "run --no-sync python tests/tools/gemma4_multimodal_quality_spotcheck.py" in calls
+    assert (
+        "run --no-sync python tests/tools/gemma4_multimodal_quality_spotcheck.py"
+        in calls
+    )
     assert f"--model {gemma31_dir}" in calls
     assert f"--model {gemma26_dir}" in calls
     assert "KV_LEN=512 ACTIVE=1" not in calls
@@ -672,7 +679,10 @@ def test_run_inference_correctness_regression_uses_config_for_gemma4_26b(
     assert log_path.exists()
     calls = log_path.read_text(encoding="utf-8")
     assert "run --no-sync python tests/tools/quality_bar_spotcheck.py" in calls
-    assert "run --no-sync python tests/tools/gemma4_multimodal_quality_spotcheck.py" in calls
+    assert (
+        "run --no-sync python tests/tools/gemma4_multimodal_quality_spotcheck.py"
+        in calls
+    )
     assert str(gemma26_dir) in calls
     assert "CONFIG=/tmp/fastinference-correctness-config." in calls
     assert "gemma26b-benchmark-turbo.toml" in calls

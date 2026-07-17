@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Any, Tuple
+
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.lite_linear import LiteLinear
-from vllm.config import VllmConfig
+
 from .lite_config import LiteConfig
 
 
@@ -123,8 +124,8 @@ class LlamaDecoderLayer(nn.Module):
             else attn_metadata.get("slot_mapping")
         )
         if slot_mapping is not None and kv_cache is not None:
-            from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
             from vllm.kernels.triton.paged_attention import paged_attention_v1
+            from vllm.kernels.triton.reshape_and_cache import reshape_and_cache
 
             inf_config = (
                 attn_metadata.get("config")
@@ -288,10 +289,7 @@ class LlamaModel(nn.Module):
     def forward(
         self, input_ids, positions, kv_caches, attn_metadata, lora_mapping=None
     ):
-        if input_ids.dtype == torch.long:
-            x = self.embed_tokens(input_ids)
-        else:
-            x = input_ids
+        x = self.embed_tokens(input_ids) if input_ids.dtype == torch.long else input_ids
         for i in range(len(self.layers)):
             x = self.layers[i](x, positions, kv_caches[i], attn_metadata, lora_mapping)
         return self.norm(x)

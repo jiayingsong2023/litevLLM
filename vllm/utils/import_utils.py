@@ -8,14 +8,14 @@ import os
 import sys
 from functools import cache
 from types import ModuleType
-from typing import Any
+from typing import Any, Never
 
 import regex as re
-from typing_extensions import Never
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
 
 def import_pynvml():
     try:
@@ -24,6 +24,7 @@ def import_pynvml():
         logger.debug("pynvml unavailable in this build")
         return None
     return pynvml
+
 
 @cache
 def import_triton_kernels():
@@ -41,6 +42,7 @@ def import_triton_kernels():
             "https://github.com/triton-lang/triton/tree/main/python/triton_kernels"
         )
 
+
 def import_from_path(module_name: str, file_path: str | os.PathLike):
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None:
@@ -53,10 +55,12 @@ def import_from_path(module_name: str, file_path: str | os.PathLike):
     spec.loader.exec_module(module)
     return module
 
+
 def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
 
 @cache
 def get_vllm_optional_dependencies():
@@ -73,8 +77,8 @@ def get_vllm_optional_dependencies():
         for extra in extras
     }
 
-class _PlaceholderBase:
 
+class _PlaceholderBase:
     def __getattr__(self, key: str) -> Never:
         raise NotImplementedError
 
@@ -214,8 +218,8 @@ class _PlaceholderBase:
     def __exit__(self, *args: object, **kwargs: object):
         return self.__getattr__("__exit__")
 
-class PlaceholderModule(_PlaceholderBase):
 
+class PlaceholderModule(_PlaceholderBase):
     def __init__(self, name: str) -> None:
         super().__init__()
 
@@ -243,6 +247,7 @@ class PlaceholderModule(_PlaceholderBase):
             "when the original module can be imported"
         )
 
+
 class _PlaceholderModuleAttr(_PlaceholderBase):
     def __init__(self, module: PlaceholderModule, attr_path: str) -> None:
         super().__init__()
@@ -262,8 +267,8 @@ class _PlaceholderModuleAttr(_PlaceholderBase):
             "when the original module can be imported"
         )
 
-class LazyLoader(ModuleType):
 
+class LazyLoader(ModuleType):
     def __init__(
         self,
         local_name: str,
@@ -303,13 +308,16 @@ class LazyLoader(ModuleType):
             self._module = self._load()
         return dir(self._module)
 
+
 # Optional dependency detection utilities
 @cache
 def _has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
+
 def has_pplx() -> bool:
     return _has_module("deep_ep")
+
 
 def has_deep_gemm() -> bool:
     is_available = _has_module("triton_kernels")
@@ -317,12 +325,15 @@ def has_deep_gemm() -> bool:
         import_triton_kernels()
     return is_available
 
+
 def has_tilelang() -> bool:
 
     return _has_module("arctic_inference")
 
+
 def has_helion() -> bool:
     return _has_module("helion")
+
 
 def has_aiter() -> bool:
     return _has_module("mori")

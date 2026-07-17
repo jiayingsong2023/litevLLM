@@ -1511,9 +1511,7 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
                 store,
                 device=device,
                 max_staged_bytes=(
-                    None
-                    if self.full_resident
-                    else self._gpu_staging_budget_bytes()
+                    None if self.full_resident else self._gpu_staging_budget_bytes()
                 ),
             )
             if self.full_resident:

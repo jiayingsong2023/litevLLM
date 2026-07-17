@@ -14,6 +14,7 @@ class LiteConfig:
     Normalizes different attribute names from HuggingFace/GGUF/AWQ configs
     into a unified schema used by LiteDecoderLayer.
     """
+
     def __init__(self, hf_config: Any):
         self.hf_config = hf_config
         # Some HF configs set rope_parameters explicitly to null; treat as empty dict.
@@ -39,26 +40,33 @@ class LiteConfig:
         self.global_head_dim = int(getattr(hf_config, "global_head_dim", self.head_dim))
         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", 32)
         self.vocab_size = getattr(hf_config, "vocab_size", 32000)
-        
+
         # 2. Precision & Norm
-        self.rms_norm_eps = getattr(hf_config, "rms_norm_eps", 
-                            getattr(hf_config, "layer_norm_epsilon", 1e-6))
-        
+        self.rms_norm_eps = getattr(
+            hf_config, "rms_norm_eps", getattr(hf_config, "layer_norm_epsilon", 1e-6)
+        )
+
         # 3. Context & RoPE
-        self.max_position_embeddings = getattr(hf_config, "max_position_embeddings", 
-                                       getattr(hf_config, "max_model_len", 2048))
-        
+        self.max_position_embeddings = getattr(
+            hf_config,
+            "max_position_embeddings",
+            getattr(hf_config, "max_model_len", 2048),
+        )
+
         # Qwen3.5 / Llama3 often hide rope_theta inside rope_parameters dict
-        self.rope_theta = float(getattr(hf_config, "rope_theta", 
-                                 self.rope_parameters.get("rope_theta", 10000.0)))
-        
+        self.rope_theta = float(
+            getattr(
+                hf_config, "rope_theta", self.rope_parameters.get("rope_theta", 10000.0)
+            )
+        )
+
         # Qwen3.5 partial rotary
         self.partial_rotary_factor = getattr(
             hf_config,
             "partial_rotary_factor",
             self.rope_parameters.get("partial_rotary_factor", 1.0),
         )
-        
+
         # 4. Multi-modal / Specialized (DeepSeek/MLA)
         self.q_lora_rank = getattr(hf_config, "q_lora_rank", None)
         self.kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)

@@ -19,7 +19,9 @@ def _fake_hf_config() -> SimpleNamespace:
 def test_build_vllm_config_accepts_fastinference_config_object(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(config_builder, "load_hf_config", lambda _path: _fake_hf_config())
+    monkeypatch.setattr(
+        config_builder, "load_hf_config", lambda _path: _fake_hf_config()
+    )
     monkeypatch.setattr(config_builder.os.path, "isfile", lambda _path: False)
     monkeypatch.setattr(config_builder.os, "listdir", lambda _path: [])
 
@@ -38,7 +40,9 @@ def test_build_vllm_config_accepts_fastinference_config_path(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(config_builder, "load_hf_config", lambda _path: _fake_hf_config())
+    monkeypatch.setattr(
+        config_builder, "load_hf_config", lambda _path: _fake_hf_config()
+    )
     monkeypatch.setattr(config_builder.os.path, "isfile", lambda _path: False)
     monkeypatch.setattr(config_builder.os, "listdir", lambda _path: [])
     path = tmp_path / "fastinference.toml"
@@ -57,7 +61,9 @@ def test_build_vllm_config_accepts_fastinference_config_path(
 def test_build_vllm_config_applies_runtime_int4_kv_dtype_to_cache_config(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(config_builder, "load_hf_config", lambda _path: _fake_hf_config())
+    monkeypatch.setattr(
+        config_builder, "load_hf_config", lambda _path: _fake_hf_config()
+    )
     monkeypatch.setattr(config_builder.os.path, "isfile", lambda _path: False)
     monkeypatch.setattr(config_builder.os, "listdir", lambda _path: [])
 

@@ -23,9 +23,10 @@ def test_qwen35_missing_config_uses_production_on_defaults(monkeypatch) -> None:
 def test_qwen35_install_tuning_config_is_intentional_noop() -> None:
     adapter = Qwen35Adapter()
 
-    assert adapter.install_tuning_config(
-        {"FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "0"}
-    ) is None
+    assert (
+        adapter.install_tuning_config({"FASTINFERENCE_QWEN35_FULLATTN_STABILIZER": "0"})
+        is None
+    )
     assert not hasattr(qwen3_5, "_QWEN35_TUNING")
 
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
+
 from vllm.kernels.triton.paged_attention import paged_attention_v1
 
 
@@ -85,19 +86,15 @@ class TestKVSelectiveAttention:
         if select_ratio in (0.0, 1.0):
             # ratio=0.0 → USE_SELECTION=False (full attention)
             # ratio=1.0 → stride=1 (all blocks loaded)
-            assert (
-                cos_sim > 0.999
-            ), f"ratio={select_ratio} should be exact, got cos_sim={cos_sim:.6f}"
+            assert cos_sim > 0.999, (
+                f"ratio={select_ratio} should be exact, got cos_sim={cos_sim:.6f}"
+            )
         elif select_ratio >= 0.5:
             # Uniform strided selection with random KV; ~50-75% blocks loaded.
-            assert (
-                cos_sim > 0.2
-            ), f"ratio={select_ratio} cos_sim={cos_sim:.6f} too low"
+            assert cos_sim > 0.2, f"ratio={select_ratio} cos_sim={cos_sim:.6f} too low"
         else:
             # Very sparse selection; output may differ significantly but
             # must be well-formed (not NaN, not zero).
-            assert (
-                cos_sim > 0.05
-            ), f"ratio={select_ratio} cos_sim={cos_sim:.6f} too low"
+            assert cos_sim > 0.05, f"ratio={select_ratio} cos_sim={cos_sim:.6f} too low"
             assert not torch.isnan(out_selective_triton).any()
             assert out_selective_triton.abs().max() > 0

@@ -10,6 +10,7 @@ class EngineClient(ABC):
     """
     Standard interface for all LLM Engine frontends.
     """
+
     @abstractmethod
     def generate(
         self,

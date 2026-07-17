@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from transformers import AutoTokenizer
+from vllm.benchmarks.datasets import add_dataset_parser, get_samples
+from vllm.v1.metrics.reader import Counter, Vector
 
 from vllm import LLM, SamplingParams
-from vllm.benchmarks.datasets import add_dataset_parser, get_samples
 from vllm.inputs import TokensPrompt
-from vllm.v1.metrics.reader import Counter, Vector
 
 try:
     from vllm.utils.argparse_utils import FlexibleArgumentParser

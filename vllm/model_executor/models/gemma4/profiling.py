@@ -7,12 +7,12 @@ import time
 import torch
 
 from .config import (
-    Gemma4LayerConfig,
-    _gemma4_range_pop,
-    _gemma4_range_push,
     _GEMMA4_PROFILE_ENABLED,
     _GEMMA4_PROFILE_PRINTED,
     _GEMMA4_PROFILE_STATS,
+    Gemma4LayerConfig,
+    _gemma4_range_pop,
+    _gemma4_range_push,
 )
 
 

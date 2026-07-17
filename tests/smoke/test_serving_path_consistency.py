@@ -37,9 +37,11 @@ class _Tokenizer:
     model_max_length = 32
 
     def encode(self, prompt: str, *, add_special_tokens: bool) -> list[int]:
-        return [1] + [ord(char) for char in prompt] if add_special_tokens else [
-            ord(char) for char in prompt
-        ]
+        return (
+            [1] + [ord(char) for char in prompt]
+            if add_special_tokens
+            else [ord(char) for char in prompt]
+        )
 
     def convert_ids_to_tokens(self, tokens: list[int]) -> list[str]:
         return [str(token) for token in tokens]

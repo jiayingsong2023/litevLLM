@@ -32,10 +32,11 @@ Multi-node:
 import os
 from time import sleep
 
+from vllm.utils.network_utils import get_open_port
+
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import get_open_port
 
 
 def create_parser():

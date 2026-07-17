@@ -107,9 +107,15 @@ class LoRARuntimeRegistry:
     def stats(self) -> dict[str, Any]:
         return {
             "registered_adapters": len(self._adapters),
-            "active_adapters": sum(1 for record in self._adapters.values() if record.active_requests > 0),
-            "active_requests": sum(record.active_requests for record in self._adapters.values()),
-            "total_routed_requests": sum(record.total_requests for record in self._adapters.values()),
+            "active_adapters": sum(
+                1 for record in self._adapters.values() if record.active_requests > 0
+            ),
+            "active_requests": sum(
+                record.active_requests for record in self._adapters.values()
+            ),
+            "total_routed_requests": sum(
+                record.total_requests for record in self._adapters.values()
+            ),
             "adapters": {
                 name: {
                     "lora_int_id": record.request.lora_int_id,

@@ -28,7 +28,6 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from vllm.distributed.device_communicators.pynccl import (
     PyNcclCommunicator,
@@ -38,6 +37,7 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 

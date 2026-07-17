@@ -226,8 +226,8 @@ def test_lite_runtime_does_not_import_removed_upstream_runtimes() -> None:
         for path in (ROOT / "vllm").rglob("*.py")
         if forbidden.search(path.read_text(encoding="utf-8"))
     ]
-    assert not matches, (
-        "Removed runtime imports must stay absent: " + ", ".join(matches)
+    assert not matches, "Removed runtime imports must stay absent: " + ", ".join(
+        matches
     )
 
 

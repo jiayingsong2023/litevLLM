@@ -23,7 +23,6 @@ def test_custom_runtime_components_can_carry_null_multimodal_processor() -> None
     processor.reset_stats()
 
 
-
 def test_backend_accepts_token_prefill_and_decode_results() -> None:
     from types import SimpleNamespace
 

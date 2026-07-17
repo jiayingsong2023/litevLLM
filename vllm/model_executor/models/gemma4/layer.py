@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.lite_config import LiteConfig
 
 from .attention import Gemma4Attention
 from .config import Gemma4LayerConfig
-from vllm.model_executor.models.lite_config import LiteConfig
 from .mlp import Gemma4MLP
 from .moe import Gemma4SparseMoeBlock, _is_gemma4_moe_layer
 from .policy_utils import (
@@ -114,10 +114,7 @@ class Gemma4DecoderLayer(nn.Module):
             <= self.layer_idx
             < (self._fp32_residual_guard_start + self._fp32_residual_guard_span)
         )
-        if guard_hit:
-            x = _residual_add_fp32(residual, h)
-        else:
-            x = residual + h
+        x = _residual_add_fp32(residual, h) if guard_hit else residual + h
 
         residual = x
         h_dense = self.pre_feedforward_layernorm(x)
@@ -158,8 +155,5 @@ class Gemma4DecoderLayer(nn.Module):
             with _gemma4_profile_span("layer_dense_mlp", self._layer_config):
                 h = self.mlp(h_dense, lora_mapping, inf_config=inf_config)
         h = self.post_feedforward_layernorm(h)
-        if guard_hit:
-            x = _residual_add_fp32(residual, h)
-        else:
-            x = residual + h
+        x = _residual_add_fp32(residual, h) if guard_hit else residual + h
         return x * self.layer_scalar

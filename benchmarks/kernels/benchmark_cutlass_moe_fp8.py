@@ -7,19 +7,19 @@ but use different quantization strategies and backends.
 """
 
 import torch
-
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.cutlass_moe import CutlassExpertsFp8
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts, fused_topk
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
 )
+from vllm.v1.worker.workspace import init_workspace_manager
+
+from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts, fused_topk
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.worker.workspace import init_workspace_manager
 
 # Weight shapes for different models: [num_experts, topk, hidden_size,
 # intermediate_size]

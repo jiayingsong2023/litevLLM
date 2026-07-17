@@ -3,6 +3,7 @@
 
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 
+
 class KVCacheQuantSchema(BaseModel):
     dtype: str
     # Each key is a TP rank. Each value is a dictionary mapping a TP rank's
@@ -54,6 +55,7 @@ class KVCacheQuantSchema(BaseModel):
                     f"TP rank {tp_rank}."
                 )
         return self
+
 
 class QuantParamSchema(BaseModel):
     # TODO: Generalize and extend with more fields

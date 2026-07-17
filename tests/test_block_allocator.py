@@ -41,6 +41,7 @@ def test_free_rejects_unallocated_and_reserved_ids():
     with pytest.raises(ValueError, match="not currently allocated"):
         ba.free([3])
 
+
 def test_free_preserves_fifo_order_for_released_blocks():
     ba = BlockAllocator(num_total_blocks=5)
     ids = ba.allocate(4)
@@ -49,4 +50,3 @@ def test_free_preserves_fifo_order_for_released_blocks():
     reused = ba.allocate(2)
 
     assert reused == ids[:2]
-

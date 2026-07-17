@@ -23,11 +23,11 @@ import itertools
 
 import torch
 from compressed_tensors.transform.utils.hadamard import deterministic_hadamard_matrix
+from vllm._custom_ops import fusedQuantizeNv
+from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
 from weight_shapes import WEIGHT_SHAPES
 
 from vllm import _custom_ops as ops  # use existing nvfp4 gemm in vllm
-from vllm._custom_ops import fusedQuantizeNv
-from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
 from vllm.triton_utils import triton
 
 PROVIDER_CFGS = {

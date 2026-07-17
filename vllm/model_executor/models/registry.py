@@ -76,6 +76,7 @@ class _ModelRegistry:
             if arch in self.models:
                 mod_name, cls_name = self.models[arch]
                 import importlib
+
                 mod = importlib.import_module(f"vllm.model_executor.models.{mod_name}")
                 return getattr(mod, cls_name), arch
         raise ValueError(f"Unsupported architectures: {architectures}")

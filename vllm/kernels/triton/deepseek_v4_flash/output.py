@@ -63,15 +63,11 @@ class DeepSeekV4OutputKernelInputs:
                     f"output_hc_weight shape must be {expected_hc}; "
                     f"got {tuple(self.output_hc_weight.shape)}"
                 )
-        if (
-            self.output_hc_scale is not None
-            and tuple(self.output_hc_scale.shape) != (1,)
+        if self.output_hc_scale is not None and tuple(self.output_hc_scale.shape) != (
+            1,
         ):
             raise ValueError("output_hc_scale must have shape [1]")
-        if (
-            self.output_hc_base is not None
-            and tuple(self.output_hc_base.shape) != (4,)
-        ):
+        if self.output_hc_base is not None and tuple(self.output_hc_base.shape) != (4,):
             raise ValueError("output_hc_base must have shape [4]")
         if self.output_norm_weight is not None:
             expected_norm = (self.streams.shape[1],)
@@ -141,9 +137,7 @@ def _q8_0_output_matvec_kernel(
         value_offsets = row * BLOCKS_PER_ROW * BLOCK_SIZE + block_idx * BLOCK_SIZE
         values = tl.load(values_ptr + value_offsets + offsets).to(tl.float32)
         scale = tl.load(scales_ptr + row * BLOCKS_PER_ROW + block_idx).to(tl.float32)
-        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(
-            tl.float32
-        )
+        hidden = tl.load(hidden_ptr + block_idx * BLOCK_SIZE + offsets).to(tl.float32)
         total += tl.sum(values * scale * hidden, axis=0)
     tl.store(logits_ptr + row, total)
 

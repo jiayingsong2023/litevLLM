@@ -49,6 +49,7 @@ def test_deepseek_kernel_scaffolding_exports_expected_contracts() -> None:
     assert output_inputs.streams.shape == (4, 32)
     assert compressed_inputs.uses_page_tables is True
 
+
 def test_deepseek_model_keeps_kernel_execution_disabled_until_kernels_exist() -> None:
     model = DeepSeekV4FlashForCausalLM()
 

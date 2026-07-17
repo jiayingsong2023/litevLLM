@@ -8,8 +8,8 @@ import torch
 
 from vllm.model_executor.layers.quantization.tensor import (
     AWQExecutionPolicy,
-    _default_awq_dense_fallback_max_gb,
     PackedInt4Weight,
+    _default_awq_dense_fallback_max_gb,
     awq_decode_gemv_enabled,
     resolve_awq_execution_policy,
     should_allow_awq_fused,

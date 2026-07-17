@@ -17,9 +17,9 @@ import torch
 import torch.utils.benchmark as TBenchmark
 from torch.utils.benchmark import Measurement as TMeasurement
 from utils import ArgPool, Bench, CudaGraphBenchParams
+from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
 from weight_shapes import WEIGHT_SHAPES
 
-from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
 from vllm.triton_utils import HAS_TRITON, triton
 
 if HAS_TRITON:

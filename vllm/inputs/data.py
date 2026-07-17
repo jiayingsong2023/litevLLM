@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Optional, TypedDict, Union
+from typing import TypedDict
+
 
 class _CommonKeys(TypedDict, total=False):
-    multi_modal_data: Optional[dict]
+    multi_modal_data: dict | None
+
 
 class TextPrompt(_CommonKeys):
     prompt: str
 
+
 class TokensPrompt(_CommonKeys):
-    prompt_token_ids: List[int]
-    prompt: Optional[str]
+    prompt_token_ids: list[int]
+    prompt: str | None
+
 
 class EmbedsPrompt(_CommonKeys):
-    prompt_embeds: List[float]
-    prompt: Optional[str]
+    prompt_embeds: list[float]
+    prompt: str | None
 
 
-PromptInput = Union[str, TextPrompt, TokensPrompt, EmbedsPrompt]
+PromptInput = str | TextPrompt | TokensPrompt | EmbedsPrompt
 PromptType = PromptInput

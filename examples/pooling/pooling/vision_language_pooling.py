@@ -11,13 +11,13 @@ on HuggingFace model repository.
 from argparse import Namespace
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal, NamedTuple, TypeAlias, TypedDict, get_args
+from typing import Literal, NamedTuple, TypedDict, get_args
 
 from PIL.Image import Image
-
-from vllm import LLM, EngineArgs
 from vllm.entrypoints.pooling.score.utils import ScoreMultiModalParam
 from vllm.multimodal.utils import fetch_image
+
+from vllm import LLM, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -47,7 +47,7 @@ class TextImagesQuery(TypedDict):
 
 
 QueryModality = Literal["text", "image", "text+image", "text+images"]
-Query: TypeAlias = TextQuery | ImageQuery | TextImageQuery | TextImagesQuery
+type Query = TextQuery | ImageQuery | TextImageQuery | TextImagesQuery
 
 
 class ModelRequestData(NamedTuple):
@@ -231,7 +231,6 @@ def run_vlm2vec_qwen2vl(query: Query) -> ModelRequestData:
     from huggingface_hub.constants import HF_HUB_CACHE
     from peft import PeftConfig, PeftModel
     from transformers import AutoModelForImageTextToText, AutoProcessor
-
     from vllm.entrypoints.chat_utils import load_chat_template
 
     model_id = "TIGER-Lab/VLM2Vec-Qwen2VL-2B"

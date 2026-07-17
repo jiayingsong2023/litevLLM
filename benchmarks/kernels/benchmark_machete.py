@@ -16,9 +16,6 @@ import pandas as pd
 import torch
 import torch.utils.benchmark as TBenchmark
 from torch.utils.benchmark import Measurement as TMeasurement
-from weight_shapes import WEIGHT_SHAPES
-
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     GPTQ_MARLIN_MAX_PARALLEL,
     GPTQ_MARLIN_MIN_THREAD_N,
@@ -33,6 +30,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     quantize_weights,
 )
 from vllm.scalar_type import ScalarType, scalar_types
+from weight_shapes import WEIGHT_SHAPES
+
+from vllm import _custom_ops as ops
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 DEFAULT_MODELS = ["meta-llama/Llama-3-8b", "meta-llama/Llama-2-70b-hf"]

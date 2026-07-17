@@ -3,10 +3,12 @@
 
 from vllm.tokenizers import TokenizerLike
 
+
 def _replace_none_with_empty(tokens: list[str | None]):
     for i, token in enumerate(tokens):
         if token is None:
             tokens[i] = ""
+
 
 def _convert_tokens_to_string_with_added_encoders(
     tokenizer: TokenizerLike,
@@ -47,9 +49,11 @@ def _convert_tokens_to_string_with_added_encoders(
         return " ".join(sub_texts)
     return "".join(sub_texts)
 
+
 # 5 is an arbitrary value that should work for all
 # tokenizers (bigger = more conservative).
 INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
 
 def convert_prompt_ids_to_tokens(
     tokenizer: TokenizerLike,
@@ -68,6 +72,7 @@ def convert_prompt_ids_to_tokens(
     _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]
     return new_tokens, prefix_offset, read_offset
 
+
 def convert_ids_list_to_tokens(
     tokenizer: TokenizerLike,
     token_ids: list[int],
@@ -80,6 +85,7 @@ def convert_ids_list_to_tokens(
             token_str = ""
         token_str_lst.append(token_str)
     return token_str_lst
+
 
 # Based on
 # https://github.com/huggingface/text-generation-inference/blob/v0.9.4/server/text_generation_server/models/model.py#L62C9-L62C15

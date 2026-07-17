@@ -126,6 +126,7 @@ def _triton_mrope_forward(
     new_k_tile_2 = k_tile_2 * cos_row + k_tile_1 * sin_row
     tl.store(k_ptr + second_half_k_offsets, new_k_tile_2, mask=second_k_mask)
 
+
 def triton_mrope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -170,11 +171,13 @@ def triton_mrope(
     )
     return q, k
 
+
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     x_t = x[0].clone()
     x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
     x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
     return x_t
+
 
 def _apply_interleaved_mrope_hf(
     freqs: torch.Tensor, mrope_section: list[int]
@@ -225,8 +228,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         mrope_section: list[int],
         mrope_interleaved: bool = True,
     ) -> None:
-        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
-                         is_neox_style, dtype)
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
 
@@ -258,12 +262,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         inv_freq = 1.0 / (
             self.base
             ** (
-                torch.arange(0, dim, 2, dtype=torch.float32, device=device)
-                / float(dim)
+                torch.arange(0, dim, 2, dtype=torch.float32, device=device) / float(dim)
             )
         )
-        inv_freq_expanded = inv_freq[None, None, :, None].float().expand(
-            3, position_ids.shape[1], -1, 1
+        inv_freq_expanded = (
+            inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
         )
         position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)

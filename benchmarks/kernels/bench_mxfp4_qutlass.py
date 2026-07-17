@@ -23,10 +23,10 @@ import itertools
 
 import torch
 from compressed_tensors.transform.utils.hadamard import deterministic_hadamard_matrix
-from weight_shapes import WEIGHT_SHAPES
-
 from vllm._custom_ops import fusedQuantizeMx, matmul_mxf4_bf16_tn
 from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
+from weight_shapes import WEIGHT_SHAPES
+
 from vllm.triton_utils import triton
 
 PROVIDER_CFGS = {

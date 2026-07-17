@@ -3,8 +3,15 @@ class Platform:
     def __init__(self):
         self.device_type = "cuda"
         self.supported_quantization = ["awq", "compressed-tensors", "gguf"]
-    def is_cuda(self): return True
-    def is_rocm(self): return False
-    def is_macos(self): return False
+
+    def is_cuda(self):
+        return True
+
+    def is_rocm(self):
+        return False
+
+    def is_macos(self):
+        return False
+
 
 current_platform = Platform()

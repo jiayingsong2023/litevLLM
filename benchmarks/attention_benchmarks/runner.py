@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from batch_spec import parse_batch_spec, reorder_for_flashinfer
 from common import BenchmarkConfig, BenchmarkResult, MockLayer, get_attention_scale
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm.config import (
     CacheConfig,
@@ -25,8 +27,6 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 # ============================================================================
 # Backend Configuration

@@ -12,17 +12,20 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+
 # common functions
 def rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+
 def rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     x = torch.stack((-x2, x1), dim=-1)
     return x.flatten(-2)
+
 
 # yarn functions
 # Inverse dim formula to find dim based on number of rotations
@@ -35,6 +38,7 @@ def yarn_find_correction_dim(
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
         2 * math.log(base)
     )
+
 
 # Find dim range bounds based on rotations
 def yarn_find_correction_range(
@@ -52,6 +56,7 @@ def yarn_find_correction_range(
         high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
+
 def yarn_linear_ramp_mask(
     low: float, high: float, dim: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -62,10 +67,12 @@ def yarn_linear_ramp_mask(
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
+
 def yarn_get_mscale(scale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * math.log(scale) + 1.0
+
 
 def _flashinfer_rotary_embedding(
     positions: torch.Tensor,
@@ -86,6 +93,7 @@ def _flashinfer_rotary_embedding(
         is_neox=is_neox,
     )
 
+
 def _flashinfer_rotary_embedding_fake(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -96,6 +104,7 @@ def _flashinfer_rotary_embedding_fake(
 ) -> None:
     return
 
+
 # Register flashinfer rotary embedding custom op
 direct_register_custom_op(
     op_name="flashinfer_rotary_embedding",
@@ -103,6 +112,7 @@ direct_register_custom_op(
     mutates_args=["query", "key"],  # These tensors are modified in-place
     fake_impl=_flashinfer_rotary_embedding_fake,
 )
+
 
 # --8<-- [start:apply_rotary_emb]
 @CustomOp.register("apply_rotary_emb")

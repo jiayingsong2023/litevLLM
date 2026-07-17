@@ -7,6 +7,9 @@ from unittest import mock
 import numpy as np
 from benchmark_utils import TimeCollector
 from tabulate import tabulate
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm.config import (
     CacheConfig,
@@ -20,9 +23,6 @@ from vllm.config import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 def benchmark_propose(args):

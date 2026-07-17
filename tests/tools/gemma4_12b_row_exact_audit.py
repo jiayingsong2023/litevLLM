@@ -121,9 +121,7 @@ def main() -> None:
             quant_weight = getattr(layer, "_quant_weight", None)
             exact_prefix = str(getattr(quant_weight, "prefix", layer.prefix))
             exact_dispatches = int(
-                prefix_stats.get(exact_prefix, {}).get(
-                    "rows_exact_msmall_success", 0
-                )
+                prefix_stats.get(exact_prefix, {}).get("rows_exact_msmall_success", 0)
             )
             rows.append(
                 {

@@ -4,8 +4,6 @@
 import torch
 import torch.utils.benchmark as benchmark
 from benchmark_shapes import WEIGHT_SHAPES
-
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.allspark_utils import (
     ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
     ALLSPARK_SUPPORTED_QUANT_TYPES,
@@ -35,6 +33,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     sort_weights,
 )
 from vllm.scalar_type import ScalarType, scalar_types
+
+from vllm import _custom_ops as ops
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 DEFAULT_MODELS = ["meta-llama/Llama-2-7b-hf/TP1"]

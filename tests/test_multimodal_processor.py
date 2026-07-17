@@ -229,11 +229,13 @@ def test_multimodal_processor_keeps_per_placeholder_embeddings() -> None:
         device=torch.device("cpu"),
     )
 
-    embeddings = processor.get_multimodal_embeddings({
-        "pixel_values": torch.ones((1, 3, 8, 8)),
-        "image_token_count": 4,
-        "image_token_id": 77,
-    })
+    embeddings = processor.get_multimodal_embeddings(
+        {
+            "pixel_values": torch.ones((1, 3, 8, 8)),
+            "image_token_count": 4,
+            "image_token_id": 77,
+        }
+    )
 
     assert tuple(embeddings.shape) == (1, 4, 3)
     assert processor.embeddings_computed == 1
@@ -247,12 +249,14 @@ def test_multimodal_processor_forwards_lora_mapping_to_model() -> None:
         device=torch.device("cpu"),
     )
 
-    processor.get_multimodal_embeddings({
-        "pixel_values": torch.ones((1, 3, 8, 8)),
-        "image_token_count": 4,
-        "image_token_id": 77,
-        "lora_mapping": ["adapter-a"],
-    })
+    processor.get_multimodal_embeddings(
+        {
+            "pixel_values": torch.ones((1, 3, 8, 8)),
+            "image_token_count": 4,
+            "image_token_id": 77,
+            "lora_mapping": ["adapter-a"],
+        }
+    )
 
     assert model.last_multimodal_kwargs["lora_mapping"] == ["adapter-a"]
 

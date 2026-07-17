@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Protocol, overload
 if TYPE_CHECKING:
     from transformers import BatchEncoding
 
+
 class TokenizerLike(Protocol):
     @classmethod
     def from_pretrained(

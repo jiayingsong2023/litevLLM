@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from .attention import Gemma4Attention
+
 # Re-export all symbols from sub-modules in DAG order
 # to preserve the monolithic ``gemma4`` namespace.
-
 from .config import (
     _GEMMA4_ALLOWED_TUNING_ENV,
     _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS,
@@ -18,7 +19,42 @@ from .config import (
     _apply_global_tuning_config,
     set_gemma4_tuning_config,
 )
-
+from .kv_utils import (
+    _build_local_decode_aligned_metadata,
+    _causal_attention_ref,
+    _decode_int4_row,
+    _decode_int4_rows,
+    _gather_recent_kv,
+    _gather_recent_kv_batched,
+    _get_or_build_local_decode_aligned_metadata,
+    _is_packed_or_quantized_kv_cache,
+    _local_prefill_attention_sdpa,
+    _repeat_kv_for_gqa,
+    _should_use_full_decode_reference,
+    _use_legacy_full_precision_kv_write,
+    _write_full_precision_kv_cache,
+)
+from .layer import (
+    Gemma4DecoderLayer,
+    _residual_add_fp32,
+)
+from .mlp import Gemma4MLP
+from .model import (
+    Gemma4ForCausalLM,
+    Gemma4ForConditionalGeneration,
+    Gemma4TextModel,
+    _assert_text_only_kwargs,
+)
+from .moe import (
+    Gemma4MoeExpertsLite,
+    Gemma4SparseMoeBlock,
+    Gemma4TopKRouterLite,
+    _is_gemma4_26b_a4b_like,
+    _is_gemma4_moe_enabled,
+    _is_gemma4_moe_layer,
+    _materialize_litelinear_dense_weight_awqaware,
+    _resolve_gemma4_moe_compute_dtype,
+)
 from .policy_utils import (
     _gemma4_fp32_residual_guard_policy,
     _gemma4_kernel_policy_truthy,
@@ -35,54 +71,20 @@ from .policy_utils import (
     _resolve_max_position_plus_one_cpu,
     _restore_hidden_from_2d,
 )
-
 from .profiling import (
-    _Gemma4ProfileSpan,
     _dump_gemma4_profile,
     _gemma4_profile_record,
     _gemma4_profile_span,
     _gemma4_profile_sync,
+    _Gemma4ProfileSpan,
 )
-
 from .rope import (
+    Gemma4LayerRotaryEmbedding,
     _get_rope,
     _get_rope_with_runtime,
     _is_local_layer,
     _layer_type_for_idx,
-    Gemma4LayerRotaryEmbedding,
 )
-
-from .kv_utils import (
-    _build_local_decode_aligned_metadata,
-    _causal_attention_ref,
-    _decode_int4_row,
-    _decode_int4_rows,
-    _gather_recent_kv,
-    _gather_recent_kv_batched,
-    _get_or_build_local_decode_aligned_metadata,
-    _is_packed_or_quantized_kv_cache,
-    _local_prefill_attention_sdpa,
-    _repeat_kv_for_gqa,
-    _should_use_full_decode_reference,
-    _use_legacy_full_precision_kv_write,
-    _write_full_precision_kv_cache,
-)
-
-from .mlp import Gemma4MLP
-
-from .moe import (
-    _is_gemma4_26b_a4b_like,
-    _is_gemma4_moe_enabled,
-    _is_gemma4_moe_layer,
-    _materialize_litelinear_dense_weight_awqaware,
-    _resolve_gemma4_moe_compute_dtype,
-    Gemma4MoeExpertsLite,
-    Gemma4SparseMoeBlock,
-    Gemma4TopKRouterLite,
-)
-
-from .attention import Gemma4Attention
-
 from .vision import (
     Gemma4VisionAttention,
     Gemma4VisionEncoder,
@@ -92,16 +94,4 @@ from .vision import (
     Gemma4VisionPatchEmbedder,
     Gemma4VisionProjector,
     Gemma4VisionTower,
-)
-
-from .layer import (
-    _residual_add_fp32,
-    Gemma4DecoderLayer,
-)
-
-from .model import (
-    _assert_text_only_kwargs,
-    Gemma4ForCausalLM,
-    Gemma4ForConditionalGeneration,
-    Gemma4TextModel,
 )

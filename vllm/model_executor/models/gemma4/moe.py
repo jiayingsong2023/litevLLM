@@ -13,9 +13,9 @@ from vllm.model_executor.layers.quantization.tensor import (
     dequantize_awq_pytorch,
     dequantize_symmetric_packed_int4_pytorch,
 )
-
-from .config import Gemma4LayerConfig, _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS
 from vllm.model_executor.models.lite_config import LiteConfig
+
+from .config import _GEMMA4_MOE_MATERIALIZE_BATCH_EXPERTS, Gemma4LayerConfig
 from .mlp import Gemma4MLP
 from .policy_utils import (
     _gemma4_policy_value,
@@ -133,7 +133,6 @@ def _materialize_litelinear_dense_weight_awqaware(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    from vllm.model_executor.layers.lite_linear import LiteLinear
 
     dense_weight = getattr(layer, "weight", None)
     if isinstance(dense_weight, torch.Tensor) and dense_weight.numel() > 1:

@@ -22,7 +22,7 @@ class AsyncMicrobatchTokenizer:
         )
 
 
-def make_async(func: Callable[..., T], executor: Executor | None = None):
+def make_async[T](func: Callable[..., T], executor: Executor | None = None):
     async def _runner(*args: Any, **kwargs: Any) -> T:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
@@ -34,10 +34,14 @@ async def merge_async_iterators(
     *iterators: AsyncGenerator[Any, None],
 ) -> AsyncGenerator[tuple[int, Any], None]:
     iterator_map = {idx: iterator.__aiter__() for idx, iterator in enumerate(iterators)}
-    tasks = {idx: asyncio.create_task(ait.__anext__()) for idx, ait in iterator_map.items()}
+    tasks = {
+        idx: asyncio.create_task(ait.__anext__()) for idx, ait in iterator_map.items()
+    }
 
     while tasks:
-        done, _ = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            tasks.values(), return_when=asyncio.FIRST_COMPLETED
+        )
         finished_ids: list[int] = []
 
         for task in done:

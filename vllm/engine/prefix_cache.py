@@ -61,7 +61,9 @@ class PrefixCache:
         best_prefix_len = 0
         first_token = key[0]
         candidates = [
-            entry for entry in self._entries.values() if entry.key and entry.key[0] == first_token
+            entry
+            for entry in self._entries.values()
+            if entry.key and entry.key[0] == first_token
         ]
         self.lookup_candidates_total += len(candidates)
         for entry in candidates:

@@ -4,9 +4,9 @@
 import copy
 from dataclasses import dataclass, fields, replace
 from math import prod
+from typing import Self
 
 import torch
-from typing_extensions import Self
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -15,9 +15,9 @@ from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
 
+
 @dataclass(frozen=True)
 class KVCacheSpec:
-
     # number of tokens in a block
     block_size: int
 
@@ -37,6 +37,7 @@ class KVCacheSpec:
             "All layers in the same KV cache group must be the same."
         )
         return copy.deepcopy(specs[0])
+
 
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
@@ -63,9 +64,9 @@ class AttentionSpec(KVCacheSpec):
             * get_dtype_size(self.dtype)
         )
 
+
 @dataclass(frozen=True, kw_only=True)
 class FullAttentionSpec(AttentionSpec):
-
     head_size_v: int = None  # type: ignore[assignment]
 
     sliding_window: int | None = None
@@ -147,6 +148,7 @@ class FullAttentionSpec(AttentionSpec):
             * get_dtype_size(self.dtype)
         )
 
+
 @dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
@@ -184,6 +186,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
         )
 
+
 @dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int
@@ -201,6 +204,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         )
 
         return cdiv(num_tokens, self.block_size) * self.page_size_bytes
+
 
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
@@ -226,6 +230,7 @@ class SlidingWindowSpec(AttentionSpec):
         # is 4, we need two blocks [XXCD] [EF] to store the sliding
         # window [CDEF] of 6 tokens.
         return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
 
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
@@ -256,20 +261,22 @@ class MambaSpec(KVCacheSpec):
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
 
+
 @dataclass(frozen=True)
 class EncoderOnlyAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # Encoder-only layers do not need KV cache
         return 0
 
+
 @dataclass(frozen=True)
 class CrossAttentionSpec(AttentionSpec):
-
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # For cross-attention, we need to cache encoder states
         # Get encoder length (e.g., 1500 for Whisper).
         max_encoder_len = vllm_config.scheduler_config.max_num_encoder_input_tokens
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
+
 
 @dataclass(frozen=True)
 class SinkFullAttentionSpec(FullAttentionSpec):
@@ -317,9 +324,9 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         return merged_spec
 
+
 @dataclass(frozen=True)
 class UniformTypeKVCacheSpecs(KVCacheSpec):
-
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
@@ -380,22 +387,22 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
+
 @dataclass
 class KVCacheTensor:
-
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
 
+
 @dataclass
 class KVCacheGroupSpec:
-
     # The names of model layers in this group
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
 
+
 @dataclass
 class KVCacheConfig:
-
     num_blocks: int
     kv_cache_groups: list[KVCacheGroupSpec]

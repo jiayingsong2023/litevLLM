@@ -15,9 +15,9 @@ These tests validate two invariants:
 
 These are CPU-only tests; they do not require a GPU runtime.
 """
+
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
@@ -164,15 +164,17 @@ def test_meta_cpu_helpers_round_trip() -> None:
     }
     assert _meta_cpu_seq_lens(meta) == [12, 34, 56]
     assert _meta_cpu_max_seq_len(meta) == 56
-    assert _resolve_max_position_plus_one_cpu(
-        meta, torch.tensor([], dtype=torch.long)
-    ) == 56
+    assert (
+        _resolve_max_position_plus_one_cpu(meta, torch.tensor([], dtype=torch.long))
+        == 56
+    )
 
     # No CPU fields: the resolver should return None (caller will decide
     # whether to extend the RoPE cache to ``max_position_embeddings``).
-    assert _resolve_max_position_plus_one_cpu(
-        {}, torch.tensor([], dtype=torch.long)
-    ) is None
+    assert (
+        _resolve_max_position_plus_one_cpu({}, torch.tensor([], dtype=torch.long))
+        is None
+    )
 
 
 def test_legacy_item_env_path_preserved(monkeypatch: Any) -> None:

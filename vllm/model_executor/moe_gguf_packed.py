@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared MoE expert GGUF packed-row helpers."""
+
 from __future__ import annotations
 
 import numpy as np
 import torch
 
-_SUPPORTED_MOE_GGUF_TYPES = frozenset({2, 12, 14})  # Q4_0, Q4_K, Q6_K (same as GGUFWeight)
+_SUPPORTED_MOE_GGUF_TYPES = frozenset(
+    {2, 12, 14}
+)  # Q4_0, Q4_K, Q6_K (same as GGUFWeight)
 
 
 def moe_packed_gguf_enabled() -> bool:
@@ -59,7 +62,7 @@ def dequant_packed_rows_to_fp16(
 
     packed_2d must be uint8 with shape [total_rows, packed_cols] matching gguf layout for quant_type.
     """
-    from gguf import dequantize, GGMLQuantizationType
+    from gguf import GGMLQuantizationType, dequantize
 
     if packed_2d.dtype != torch.uint8:
         raise TypeError(f"packed_2d must be uint8, got {packed_2d.dtype}")

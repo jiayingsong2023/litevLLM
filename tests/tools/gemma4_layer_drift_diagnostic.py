@@ -19,12 +19,18 @@ import importlib.util
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.engine.lite_engine import LiteEngine
 from vllm.model_executor.model_loader import get_tokenizer
 from vllm.sampling_params import SamplingParams
@@ -42,7 +48,7 @@ def _load_smoke_module() -> Any:
 
 
 def _load_prompts(path: str) -> list[tuple[str, str]]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     out: list[tuple[str, str]] = []
     for idx, item in enumerate(raw):
@@ -101,7 +107,7 @@ def _maybe_tuple_first(x: Any) -> Any:
     return x
 
 
-def _last_token_hidden(x: Any) -> Optional[torch.Tensor]:
+def _last_token_hidden(x: Any) -> torch.Tensor | None:
     tensor = _maybe_tuple_first(x)
     if not isinstance(tensor, torch.Tensor):
         return None
@@ -140,7 +146,11 @@ def _summarize(
                 or step_cp not in step_captures[li]
             ):
                 continue
-            kind = "local" if bool(getattr(layer.self_attn, "is_sliding", False)) else "full"
+            kind = (
+                "local"
+                if bool(getattr(layer.self_attn, "is_sliding", False))
+                else "full"
+            )
             by_kind[f"{kind}_to_t1"].append(
                 _cos(step_captures[li][step_cp], step_captures[li][step_t1])
             )
@@ -156,8 +166,8 @@ def _summarize(
                 continue
             lines.append(
                 "  "
-                + f"{kind}: cos_to_t1 mean={sum(vals_t1)/len(vals_t1):.6f} min={min(vals_t1):.6f} "
-                + f"cos_to_prev mean={sum(vals_prev)/len(vals_prev):.6f} min={min(vals_prev):.6f}"
+                f"{kind}: cos_to_t1 mean={sum(vals_t1) / len(vals_t1):.6f} min={min(vals_t1):.6f} "
+                f"cos_to_prev mean={sum(vals_prev) / len(vals_prev):.6f} min={min(vals_prev):.6f}"
             )
     return lines
 
@@ -166,12 +176,16 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke = _load_smoke_module()
     default_model = smoke.resolve_default_model_path()
     p = argparse.ArgumentParser(description="Gemma4 long-decode layer drift diagnostic")
-    p.add_argument("--model", type=str, default=default_model, required=default_model is None)
+    p.add_argument(
+        "--model", type=str, default=default_model, required=default_model is None
+    )
     p.add_argument("--tokenizer", type=str, default=None)
     p.add_argument(
         "--prompts-file",
         type=str,
-        default=str(_ROOT / "tests" / "tools" / "fixtures" / "gemma4_edge_prompts_debug.json"),
+        default=str(
+            _ROOT / "tests" / "tools" / "fixtures" / "gemma4_edge_prompts_debug.json"
+        ),
     )
     p.add_argument("--prompt-id", type=str, default="short_hi")
     p.add_argument("--prompt", type=str, default=None)
@@ -195,7 +209,9 @@ def main() -> int:
     engine, tokenizer = _build_engine(args)
     wrapped_prompt = smoke._apply_chat_template(tokenizer, prompt)
     layers = list(engine.model.model.layers)
-    step_captures: dict[int, dict[int, torch.Tensor]] = {i: {} for i in range(len(layers))}
+    step_captures: dict[int, dict[int, torch.Tensor]] = {
+        i: {} for i in range(len(layers))
+    }
     token_to_step: dict[int, int] = {}
     handles = []
     current_step = {"value": 0}
@@ -252,7 +268,9 @@ def main() -> int:
         f"steps={current_step['value']} max_new_tokens={args.max_new_tokens}"
     )
     print(f"[Drift] output_tail={final_text[-240:]!r}")
-    print(f"[Drift] token_to_step={{{', '.join(f'{k}: {v}' for k, v in sorted(token_to_step.items()) if k in checkpoints)}}}")
+    print(
+        f"[Drift] token_to_step={{{', '.join(f'{k}: {v}' for k, v in sorted(token_to_step.items()) if k in checkpoints)}}}"
+    )
     for line in _summarize(step_captures, token_to_step, layers, checkpoints):
         print(line)
     return 0

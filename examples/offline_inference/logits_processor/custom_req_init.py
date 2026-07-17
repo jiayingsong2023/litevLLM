@@ -42,14 +42,14 @@ device, the first and third requests would not repeat the same token.
 """
 
 import torch
-
-from vllm import LLM, SamplingParams
-from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
 )
+
+from vllm import LLM, SamplingParams
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 

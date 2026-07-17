@@ -7,13 +7,11 @@ This module keeps legacy import paths stable while delegating all serving
 behavior to the Lite OpenAI-compatible API server implementation.
 """
 
+from vllm.entrypoints.openai.api_server import app as app
+from vllm.entrypoints.openai.api_server import main as _openai_main
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Re-export FastAPI app for callers importing from the legacy module.
-from vllm.entrypoints.openai.api_server import app  # noqa: E402
-from vllm.entrypoints.openai.api_server import main as _openai_main  # noqa: E402
 
 
 def main() -> None:

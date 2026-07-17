@@ -6,9 +6,6 @@ import logging
 import os
 import uuid
 
-from vllm import LLM, SamplingParams
-from vllm.engine.arg_utils import EngineArgs
-from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader.tensorizer import (
     TensorizerArgs,
     TensorizerConfig,
@@ -16,6 +13,10 @@ from vllm.model_executor.model_loader.tensorizer import (
     tensorize_vllm_model,
     tensorizer_kwargs_arg,
 )
+
+from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
+from vllm.lora.request import LoRARequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = logging.getLogger()

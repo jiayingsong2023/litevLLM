@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm.multimodal.utils import fetch_image
 
 from vllm import LLM
 from vllm.inputs.data import TextPrompt
-from vllm.multimodal.utils import fetch_image
 
 # Initialize model
 model = LLM(

@@ -8,20 +8,18 @@ For most models, the prompt format should follow corresponding examples
 on HuggingFace model repository.
 """
 
-import os
 import random
 from contextlib import contextmanager
 from dataclasses import asdict
 from typing import NamedTuple
 
-from huggingface_hub import snapshot_download
 from transformers import AutoProcessor, AutoTokenizer
-
-from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
-from vllm.lora.request import LoRARequest
 from vllm.multimodal.image import convert_image_mode
+
+from vllm import LLM, EngineArgs, SamplingParams
+from vllm.lora.request import LoRARequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 

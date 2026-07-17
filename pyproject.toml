@@ -66,6 +66,7 @@ include = ["vllm*"]
 [tool.ruff.lint.per-file-ignores]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+"**/__init__.py" = ["F401"]
 
 [tool.ruff.lint]
 select = [
@@ -87,6 +88,8 @@ select = [
     "G",
 ]
 ignore = [
+    # Ruff formatter owns wrapping; it intentionally leaves long strings and URLs.
+    "E501",
     # star imports
     "F405", "F403",
     # lambda expression assignment

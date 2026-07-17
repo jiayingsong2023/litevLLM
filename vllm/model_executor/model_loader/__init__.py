@@ -1,29 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
+import gc
+import json
 import os
+import re
 from math import prod
+from typing import Any
+
+import gguf
+import numpy as np
 import torch
 import torch.nn as nn
-from typing import Any, Dict, List, Optional, Set, Union
-import numpy as np
-import gguf
-import json
-import re
-import gc
-from transformers import AutoTokenizer, AutoConfig, PretrainedConfig
 from huggingface_hub import snapshot_download
-from vllm.config import VllmConfig, ModelConfig
-from vllm.model_executor.models.registry import ModelRegistry
-from vllm.model_executor.layers.lite_linear import LiteLinear
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
+
+from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.quantization.tensor import (
-    dequantize_awq_pytorch,
-    dequantize_symmetric_packed_int4_pytorch,
-)
+from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
+from vllm.model_executor.layers.quantization.tensor import (
+    dequantize_awq_pytorch,
+    dequantize_symmetric_packed_int4_pytorch,
+)
+from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.moe_fp8_utils import (
     dims_ok_for_moe_fp8,
     fp8_block_quantize_2d,
@@ -35,6 +37,7 @@ from vllm.model_executor.moe_gguf_packed import (
     gguf_quant_type_supported_for_moe_packed,
     numpy_gguf_data_to_packed_2d,
 )
+from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
 
 
 def _dequantize_gguf_tensor(
@@ -54,6 +57,7 @@ def _dequantize_gguf_tensor(
     except Exception:
         return None
 
+
 def _reorder_v_heads_ggml_to_hf(
     tensor: torch.Tensor,
     dim: int,
@@ -71,7 +75,7 @@ def _reorder_v_heads_ggml_to_hf(
     shape = list(tensor.shape)
     if dim < 0:
         dim += len(shape)
-    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1 :]
     t = tensor.reshape(*new_shape)
     perm = list(range(len(new_shape)))
     perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
@@ -167,7 +171,9 @@ def _qwen35_linear_attn_1d_gguf_to_hf(
     num_v_per_k = num_v // num_k
     if source.ndim != 1 or source.shape[0] != num_v:
         return source
-    return _reorder_v_heads_ggml_to_hf(source.unsqueeze(-1), 0, num_k, num_v_per_k, 1).squeeze(-1)
+    return _reorder_v_heads_ggml_to_hf(
+        source.unsqueeze(-1), 0, num_k, num_v_per_k, 1
+    ).squeeze(-1)
 
 
 def _qwen35_conv1d_channels_gguf_to_hf(
@@ -201,8 +207,8 @@ def _qwen35_conv1d_channels_gguf_to_hf(
 def _try_load_legacy_flat_linear_attn_norm_from_safetensors(
     p_name: str,
     p: torch.Tensor,
-    sd_keys: List[str],
-    sd: Dict[str, torch.Tensor],
+    sd_keys: list[str],
+    sd: dict[str, torch.Tensor],
 ) -> bool:
     """
     Old Lite checkpoints stored gated linear-attn RMS scale as a flat Parameter:
@@ -236,20 +242,33 @@ def _load_param_from_gguf_tensor(
     param: Any,
     gguf_tensor: Any,
     slice_offset: int = 0,
-    hf_config: Optional[Any] = None,
+    hf_config: Any | None = None,
 ) -> None:
-    actual_param = param; logical_shape = None
-    if isinstance(param, LiteLinear): logical_shape = torch.Size([param.output_size, param.input_size]); actual_param = param.weight
-    elif isinstance(param, nn.Module) and hasattr(param, "weight"): actual_param = param.weight
-    if not isinstance(actual_param, torch.Tensor) and logical_shape is None: return
+    actual_param = param
+    logical_shape = None
+    if isinstance(param, LiteLinear):
+        logical_shape = torch.Size([param.output_size, param.input_size])
+        actual_param = param.weight
+    elif isinstance(param, nn.Module) and hasattr(param, "weight"):
+        actual_param = param.weight
+    if not isinstance(actual_param, torch.Tensor) and logical_shape is None:
+        return
     target_shape = logical_shape if logical_shape is not None else actual_param.shape
     # Use universal dequant via gguf library
     source = _dequantize_gguf_tensor(gguf_tensor, "cpu", torch.float16, target_shape)
-    if source is None: return
+    if source is None:
+        return
 
     tname = str(getattr(gguf_tensor, "name", "") or "")
     if hf_config is not None and any(
-        x in tname for x in ("attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight", "ssm_beta.weight")
+        x in tname
+        for x in (
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "ssm_out.weight",
+            "ssm_alpha.weight",
+            "ssm_beta.weight",
+        )
     ):
         source = _qwen35_linear_attn_gguf_to_hf(source, tname, hf_config)
     if hf_config is not None:
@@ -268,7 +287,9 @@ def _load_param_from_gguf_tensor(
     if isinstance(param, LiteLinear):
         # Module-level load: can replace the Parameter
         if param.weight.numel() == 0 or param.weight.shape != source.shape:
-            param.weight = nn.Parameter(source.to(dtype=torch.float16), requires_grad=False)
+            param.weight = nn.Parameter(
+                source.to(dtype=torch.float16), requires_grad=False
+            )
         else:
             param.weight.data.copy_(source.to(dtype=param.weight.dtype))
     if isinstance(actual_param, nn.Parameter):
@@ -276,7 +297,9 @@ def _load_param_from_gguf_tensor(
         if actual_param.numel() == 0:
             # Resize empty parameter
             actual_param.data = source.to(dtype=actual_param.dtype)
-            print(f"    [Verify] {gguf_tensor.name} resized to {actual_param.shape}, numel={actual_param.numel()}")
+            print(
+                f"    [Verify] {gguf_tensor.name} resized to {actual_param.shape}, numel={actual_param.numel()}"
+            )
         elif actual_param.shape == source.shape:
             actual_param.data.copy_(source)
         else:
@@ -285,35 +308,46 @@ def _load_param_from_gguf_tensor(
                 o, i = actual_param.shape[0], actual_param.shape[1]
                 if source.ndim == 2 and source.shape == (i, o):
                     actual_param.data.copy_(source.T.contiguous())
-                elif source.shape[0] == actual_param.shape[1] and source.shape[1] >= actual_param.shape[0]:
-                    actual_param.data.copy_(source[:, :actual_param.shape[0]].T)
-                elif source.shape[1] == actual_param.shape[1] and source.shape[0] >= actual_param.shape[0]:
-                    actual_param.data.copy_(source[:actual_param.shape[0], :])
+                elif (
+                    source.shape[0] == actual_param.shape[1]
+                    and source.shape[1] >= actual_param.shape[0]
+                ):
+                    actual_param.data.copy_(source[:, : actual_param.shape[0]].T)
+                elif (
+                    source.shape[1] == actual_param.shape[1]
+                    and source.shape[0] >= actual_param.shape[0]
+                ):
+                    actual_param.data.copy_(source[: actual_param.shape[0], :])
             except Exception:
                 pass
-    elif isinstance(actual_param, torch.Tensor):
-        if actual_param.shape == source.shape:
-            actual_param.data.copy_(source)
-    try:
+    elif isinstance(actual_param, torch.Tensor) and actual_param.shape == source.shape:
+        actual_param.data.copy_(source)
+    with contextlib.suppress(NameError):
         del source
-    except NameError:
-        pass
+
 
 def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None:
     print(f">>> Mapping GGUF weights from {gguf_file}...")
-    reader = gguf.GGUFReader(gguf_file); tensor_map = {t.name: t for t in reader.tensors}
+    reader = gguf.GGUFReader(gguf_file)
+    tensor_map = {t.name: t for t in reader.tensors}
     # Per-layer only (global tensors loaded once below — avoids N× redundant embed/lm_head writes).
     map_rules = {
         "blk.{i}.attn_norm.weight": ["model.layers.{i}.input_layernorm.weight"],
         "blk.{i}.ffn_norm.weight": ["model.layers.{i}.post_attention_layernorm.weight"],
         # Qwen3.5 GGUF uses 'post_attention_norm' instead of 'ffn_norm'
-        "blk.{i}.post_attention_norm.weight": ["model.layers.{i}.post_attention_layernorm.weight"],
+        "blk.{i}.post_attention_norm.weight": [
+            "model.layers.{i}.post_attention_layernorm.weight"
+        ],
         # DeepSeek V2 MLA layers
         "blk.{i}.attn_q_a.weight": ["model.layers.{i}.self_attn.q_a_proj.weight"],
-        "blk.{i}.attn_q_a_norm.weight": ["model.layers.{i}.self_attn.q_a_layernorm.weight"],
+        "blk.{i}.attn_q_a_norm.weight": [
+            "model.layers.{i}.self_attn.q_a_layernorm.weight"
+        ],
         "blk.{i}.attn_q_b.weight": ["model.layers.{i}.self_attn.q_b_proj.weight"],
         "blk.{i}.attn_kv_a_mqa.weight": ["model.layers.{i}.self_attn.kv_a_proj.weight"],
-        "blk.{i}.attn_kv_a_norm.weight": ["model.layers.{i}.self_attn.kv_a_layernorm.weight"],
+        "blk.{i}.attn_kv_a_norm.weight": [
+            "model.layers.{i}.self_attn.kv_a_layernorm.weight"
+        ],
         "blk.{i}.attn_output.weight": ["model.layers.{i}.self_attn.o_proj.weight"],
         # Qwen3.5 full-attention layers (standard GGUF names)
         "blk.{i}.attn_q.weight": ["model.layers.{i}.self_attn.q_proj.weight"],
@@ -336,14 +370,25 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         "blk.{i}.ffn_down.weight": ["model.layers.{i}.mlp.down_proj.weight"],
         # Qwen3.5 MoE (HF: mlp.gate / mlp.experts / mlp.shared_expert / mlp.shared_expert_gate)
         "blk.{i}.ffn_gate_inp.weight": ["model.layers.{i}.mlp.gate.weight"],
-        "blk.{i}.ffn_gate_shexp.weight": ["model.layers.{i}.mlp.shared_expert.gate_proj.weight"],
-        "blk.{i}.ffn_up_shexp.weight": ["model.layers.{i}.mlp.shared_expert.up_proj.weight"],
-        "blk.{i}.ffn_down_shexp.weight": ["model.layers.{i}.mlp.shared_expert.down_proj.weight"],
+        "blk.{i}.ffn_gate_shexp.weight": [
+            "model.layers.{i}.mlp.shared_expert.gate_proj.weight"
+        ],
+        "blk.{i}.ffn_up_shexp.weight": [
+            "model.layers.{i}.mlp.shared_expert.up_proj.weight"
+        ],
+        "blk.{i}.ffn_down_shexp.weight": [
+            "model.layers.{i}.mlp.shared_expert.down_proj.weight"
+        ],
         # llama.cpp may name this ffn_gate_sw_shexp or ffn_gate_inp_shexp (same HF tensor)
-        "blk.{i}.ffn_gate_sw_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
-        "blk.{i}.ffn_gate_inp_shexp.weight": ["model.layers.{i}.mlp.shared_expert_gate.weight"],
+        "blk.{i}.ffn_gate_sw_shexp.weight": [
+            "model.layers.{i}.mlp.shared_expert_gate.weight"
+        ],
+        "blk.{i}.ffn_gate_inp_shexp.weight": [
+            "model.layers.{i}.mlp.shared_expert_gate.weight"
+        ],
     }
-    modules = dict(model.named_modules()); params = dict(model.named_parameters())
+    modules = dict(model.named_modules())
+    params = dict(model.named_parameters())
 
     # Global tensors (not tied to blk.{i}): load once.
     global_map = {
@@ -359,21 +404,26 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
             m_base = m_path.rsplit(".", 1)[0] if "." in m_path else m_path
             if m_base in modules:
                 print(f"    [Load Module] {g_key} -> {m_base}")
-                _load_param_from_gguf_tensor(modules[m_base], tensor_map[g_key], hf_config=hf_config)
+                _load_param_from_gguf_tensor(
+                    modules[m_base], tensor_map[g_key], hf_config=hf_config
+                )
                 loaded_count += 1
                 break
             if m_path in params:
                 print(f"    [Load Param] {g_key} -> {m_path}")
-                _load_param_from_gguf_tensor(params[m_path], tensor_map[g_key], hf_config=hf_config)
+                _load_param_from_gguf_tensor(
+                    params[m_path], tensor_map[g_key], hf_config=hf_config
+                )
                 loaded_count += 1
                 break
 
     # Metadata for MoE shapes — support both DeepSeek and Qwen naming
-    num_experts = getattr(hf_config, "num_experts",
-                  getattr(hf_config, "n_routed_experts", 64))
+    num_experts = getattr(
+        hf_config, "num_experts", getattr(hf_config, "n_routed_experts", 64)
+    )
     moe_inter = getattr(hf_config, "moe_intermediate_size", 1536)
     hidden = getattr(hf_config, "hidden_size", 2048)
-    
+
     num_layers = getattr(hf_config, "num_hidden_layers", 28)
     for i in range(num_layers):
         for g_pat, m_paths in map_rules.items():
@@ -381,15 +431,23 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
             if g_key in tensor_map:
                 for m_path in m_paths:
                     target_path = m_path.format(i=i)
-                    m_base = target_path.rsplit(".", 1)[0] if "." in target_path else target_path
+                    m_base = (
+                        target_path.rsplit(".", 1)[0]
+                        if "." in target_path
+                        else target_path
+                    )
                     if m_base in modules:
                         print(f"    [Load Module] {g_key} -> {m_base}")
-                        _load_param_from_gguf_tensor(modules[m_base], tensor_map[g_key], hf_config=hf_config)
+                        _load_param_from_gguf_tensor(
+                            modules[m_base], tensor_map[g_key], hf_config=hf_config
+                        )
                         loaded_count += 1
                         break
                     elif target_path in params:
                         print(f"    [Load Param] {g_key} -> {target_path}")
-                        _load_param_from_gguf_tensor(params[target_path], tensor_map[g_key], hf_config=hf_config)
+                        _load_param_from_gguf_tensor(
+                            params[target_path], tensor_map[g_key], hf_config=hf_config
+                        )
                         loaded_count += 1
                         break
 
@@ -399,8 +457,12 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         ssm_a_key = f"blk.{i}.ssm_a"
         a_log_path = f"model.layers.{i}.linear_attn.A_log"
         if ssm_a_key in tensor_map and a_log_path in params:
-            src = _dequantize_gguf_tensor(tensor_map[ssm_a_key], "cpu", torch.float32,
-                                          target_shape=params[a_log_path].shape)
+            src = _dequantize_gguf_tensor(
+                tensor_map[ssm_a_key],
+                "cpu",
+                torch.float32,
+                target_shape=params[a_log_path].shape,
+            )
             if src is not None:
                 src = _qwen35_linear_attn_1d_gguf_to_hf(src, hf_config)
                 params[a_log_path].data.copy_(src.to(dtype=params[a_log_path].dtype))
@@ -410,11 +472,17 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         dt_bias_key = f"blk.{i}.ssm_dt.bias"
         dt_bias_path = f"model.layers.{i}.linear_attn.dt_bias"
         if dt_bias_key in tensor_map and dt_bias_path in params:
-            src = _dequantize_gguf_tensor(tensor_map[dt_bias_key], "cpu", torch.float32,
-                                          target_shape=params[dt_bias_path].shape)
+            src = _dequantize_gguf_tensor(
+                tensor_map[dt_bias_key],
+                "cpu",
+                torch.float32,
+                target_shape=params[dt_bias_path].shape,
+            )
             if src is not None:
                 src = _qwen35_linear_attn_1d_gguf_to_hf(src, hf_config)
-                params[dt_bias_path].data.copy_(src.to(dtype=params[dt_bias_path].dtype))
+                params[dt_bias_path].data.copy_(
+                    src.to(dtype=params[dt_bias_path].dtype)
+                )
                 loaded_count += 1
 
         # ssm_conv1d.weight -> linear_attn.conv1d.weight
@@ -448,20 +516,30 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
         target_lin_norm_w = f"model.layers.{i}.linear_attn.norm.weight"
         if legacy_lin_norm in tensor_map and target_lin_norm_w in params:
             tgt = params[target_lin_norm_w]
-            src = _dequantize_gguf_tensor(tensor_map[legacy_lin_norm], "cpu", torch.float16, target_shape=tgt.shape)
+            src = _dequantize_gguf_tensor(
+                tensor_map[legacy_lin_norm],
+                "cpu",
+                torch.float16,
+                target_shape=tgt.shape,
+            )
             if src is not None and src.shape == tgt.shape:
                 tgt.data.copy_(src.to(dtype=tgt.dtype))
                 loaded_count += 1
 
-        kb_key = f"blk.{i}.attn_k_b.weight"; vb_key = f"blk.{i}.attn_v_b.weight"
+        kb_key = f"blk.{i}.attn_k_b.weight"
+        vb_key = f"blk.{i}.attn_v_b.weight"
         if kb_key in tensor_map and vb_key in tensor_map:
             kb = _dequantize_gguf_tensor(tensor_map[kb_key], "cpu", torch.float16)
             vb = _dequantize_gguf_tensor(tensor_map[vb_key], "cpu", torch.float16)
             if kb is not None and vb is not None:
                 fused_kv_b = torch.cat([kb, vb], dim=0)
                 m_path = f"model.layers.{i}.self_attn.kv_b_proj"
-                if m_path in modules: modules[m_path].weight = nn.Parameter(fused_kv_b, requires_grad=False); loaded_count += 1
-        
+                if m_path in modules:
+                    modules[m_path].weight = nn.Parameter(
+                        fused_kv_b, requires_grad=False
+                    )
+                    loaded_count += 1
+
         # MoE routed experts: fuse gate+up -> gate_up_proj (HF), load down_proj
         ge_key = f"blk.{i}.ffn_gate_exps.weight"
         ue_key = f"blk.{i}.ffn_up_exps.weight"
@@ -483,14 +561,18 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                 ue_t = tensor_map[ue_key]
                 qg = int(ge_t.tensor_type)
                 qu = int(ue_t.tensor_type)
-                if not gguf_quant_type_supported_for_moe_packed(qg) or not gguf_quant_type_supported_for_moe_packed(
-                    qu
-                ):
+                if not gguf_quant_type_supported_for_moe_packed(
+                    qg
+                ) or not gguf_quant_type_supported_for_moe_packed(qu):
                     raise RuntimeError(
                         f"MoE packed GGUF requires quant types Q4_0/Q4_K/Q6_K; got gate={qg} up={qu}"
                     )
-                gate_np = numpy_gguf_data_to_packed_2d(np.asarray(ge_t.data), tuple(t_shape_g), qg)
-                up_np = numpy_gguf_data_to_packed_2d(np.asarray(ue_t.data), tuple(t_shape_g), qu)
+                gate_np = numpy_gguf_data_to_packed_2d(
+                    np.asarray(ge_t.data), tuple(t_shape_g), qg
+                )
+                up_np = numpy_gguf_data_to_packed_2d(
+                    np.asarray(ue_t.data), tuple(t_shape_g), qu
+                )
                 exp_mod.register_buffer(
                     "_gate_exp_packed",
                     torch.from_numpy(np.ascontiguousarray(gate_np)).to(torch.uint8),
@@ -499,8 +581,12 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     "_up_exp_packed",
                     torch.from_numpy(np.ascontiguousarray(up_np)).to(torch.uint8),
                 )
-                exp_mod.register_buffer("_gguf_qtype_gate", torch.tensor(qg, dtype=torch.int32))
-                exp_mod.register_buffer("_gguf_qtype_up", torch.tensor(qu, dtype=torch.int32))
+                exp_mod.register_buffer(
+                    "_gguf_qtype_gate", torch.tensor(qg, dtype=torch.int32)
+                )
+                exp_mod.register_buffer(
+                    "_gguf_qtype_up", torch.tensor(qu, dtype=torch.int32)
+                )
                 loaded_count += 1
                 de_t = tensor_map[de_key]
                 qd = int(de_t.tensor_type)
@@ -508,14 +594,20 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     raise RuntimeError(
                         f"MoE packed GGUF requires quant types Q4_0/Q4_K/Q6_K; got down={qd}"
                     )
-                down_np = numpy_gguf_data_to_packed_2d(np.asarray(de_t.data), tuple(t_shape_d), qd)
+                down_np = numpy_gguf_data_to_packed_2d(
+                    np.asarray(de_t.data), tuple(t_shape_d), qd
+                )
                 exp_mod.register_buffer(
                     "_down_exp_packed",
                     torch.from_numpy(np.ascontiguousarray(down_np)).to(torch.uint8),
                 )
-                exp_mod.register_buffer("_gguf_qtype_down", torch.tensor(qd, dtype=torch.int32))
+                exp_mod.register_buffer(
+                    "_gguf_qtype_down", torch.tensor(qd, dtype=torch.int32)
+                )
                 loaded_count += 1
-            elif getattr(exp_mod, "moe_cpu_offload", False) and getattr(exp_mod, "fp8_moe", False):
+            elif getattr(exp_mod, "moe_cpu_offload", False) and getattr(
+                exp_mod, "fp8_moe", False
+            ):
                 t_shape_g = torch.Size([num_experts, moe_inter, hidden])
                 t_shape_d = torch.Size([num_experts, hidden, moe_inter])
                 dst_g = exp_mod._gate_up_fp8_cpu
@@ -621,15 +713,16 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
                     exp_mod.down_proj.data.copy_(de.to(dtype=exp_mod.down_proj.dtype))
                     loaded_count += 1
                 del de
-        if getattr(hf_config, "model_type", "") == "qwen3_5_moe_text":
-            gc.collect()
-        elif i % 4 == 0:
+        if getattr(hf_config, "model_type", "") == "qwen3_5_moe_text" or i % 4 == 0:
             gc.collect()
 
     _has_shexp_gate = ("blk.0.ffn_gate_sw_shexp.weight" in tensor_map) or (
         "blk.0.ffn_gate_inp_shexp.weight" in tensor_map
     )
-    if getattr(hf_config, "model_type", "") == "qwen3_5_moe_text" and not _has_shexp_gate:
+    if (
+        getattr(hf_config, "model_type", "") == "qwen3_5_moe_text"
+        and not _has_shexp_gate
+    ):
         print(
             ">>> [Info] Qwen3.5 MoE GGUF: no blk.*.ffn_gate_sw_shexp / ffn_gate_inp_shexp; "
             "shared_expert_gate not loaded from GGUF (defaults retained)."
@@ -644,19 +737,29 @@ def _load_gguf_weights(model: nn.Module, gguf_file: str, hf_config: Any) -> None
     for i in range(num_layers):
         for sp in ["ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"]:
             special_prefixes.add(f"blk.{i}.{sp}")
-        for sp in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
+        for sp in (
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ):
             special_prefixes.add(f"blk.{i}.{sp}")
-    all_mapped = mapped_prefixes | special_prefixes | {"token_embd.weight", "output_norm.weight", "output.weight"}
+    all_mapped = (
+        mapped_prefixes
+        | special_prefixes
+        | {"token_embd.weight", "output_norm.weight", "output.weight"}
+    )
     unmapped = [n for n in tensor_map if n not in all_mapped]
     if unmapped:
-        print(f">>> [Info] {len(unmapped)} GGUF tensors not mapped (may be MoE experts or unused): {unmapped[:10]}{'...' if len(unmapped) > 10 else ''}")
+        print(
+            f">>> [Info] {len(unmapped)} GGUF tensors not mapped (may be MoE experts or unused): {unmapped[:10]}{'...' if len(unmapped) > 10 else ''}"
+        )
     print(f">>> GGUF Weight loading complete. Loaded {loaded_count} parameters.")
 
 
 def _dequantize_pack_quantized_int4_symmetric(
     weight_packed: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_shape: Optional[torch.Tensor],
+    weight_shape: torch.Tensor | None,
 ) -> torch.Tensor:
     """
     Match Neural Magic `pack_quantized` (HF compressed-tensors): unpack int32 nibbles
@@ -679,7 +782,7 @@ def _dequantize_pack_quantized_int4_symmetric(
         if weight_scale.shape[1] <= 0 or K % weight_scale.shape[1] != 0:
             raise RuntimeError(
                 f"Bad scales shape {tuple(weight_scale.shape)} for in_features {K}"
-            )
+            ) from None
         group_size = K // weight_scale.shape[1]
         return dequantize_symmetric_packed_int4_pytorch(
             w32, weight_scale, group_size=group_size
@@ -694,12 +797,12 @@ def _dequantize_pack_quantized_int4_symmetric(
     ).to(torch.float16)
 
 
-def _checkpoint_has_language_model_layers(sd_keys: List[str]) -> bool:
+def _checkpoint_has_language_model_layers(sd_keys: list[str]) -> bool:
     return any(k.startswith("model.language_model.layers.") for k in sd_keys)
 
 
 def _fill_moe_experts_fp8_from_accum(
-    model: nn.Module, expert_accum: Dict[str, torch.Tensor]
+    model: nn.Module, expert_accum: dict[str, torch.Tensor]
 ) -> int:
     """
     Fill MoE expert FP8 CPU buffers from safetensors packed tensors.
@@ -730,7 +833,9 @@ def _fill_moe_experts_fp8_from_accum(
     br = moe_inter // moe_fp8_block_size()
     loaded_layers = 0
 
-    def _get_proj_tensor(li: int, e: int, proj: str, suffix: str) -> Optional[torch.Tensor]:
+    def _get_proj_tensor(
+        li: int, e: int, proj: str, suffix: str
+    ) -> torch.Tensor | None:
         for prefix in (
             f"model.language_model.layers.{li}.mlp.experts.{e}.{proj}",
             f"model.layers.{li}.mlp.experts.{e}.{proj}",
@@ -741,9 +846,8 @@ def _fill_moe_experts_fp8_from_accum(
         return None
 
     for li in range(n_layers):
-        exp_mod = (
-            modules.get(f"model.layers.{li}.mlp.experts")
-            or modules.get(f"model.model.layers.{li}.mlp.experts")
+        exp_mod = modules.get(f"model.layers.{li}.mlp.experts") or modules.get(
+            f"model.model.layers.{li}.mlp.experts"
         )
         if exp_mod is None or not getattr(exp_mod, "moe_cpu_offload", False):
             continue
@@ -777,13 +881,15 @@ def _fill_moe_experts_fp8_from_accum(
                 dst_g[e, :moe_inter].copy_(wf8_g.to(dtype=dst_g.dtype))
                 dst_g[e, moe_inter:].copy_(wf8_u.to(dtype=dst_g.dtype))
                 dst_gs[e, :br].copy_(sg)
-                dst_gs[e, br: 2 * br].copy_(su)
+                dst_gs[e, br : 2 * br].copy_(su)
                 wf8_d, sd = fp8_block_quantize_2d(de.contiguous())
                 dst_d[e].copy_(wf8_d.to(dtype=dst_d.dtype))
                 dst_ds[e].copy_(sd)
                 del ge, ue, de, wf8_g, wf8_u, wf8_d, sg, su, sd
             except Exception as ex:
-                print(f">>> [Warning] MoE expert FP8 fill failed layer={li} expert={e}: {ex}")
+                print(
+                    f">>> [Warning] MoE expert FP8 fill failed layer={li} expert={e}: {ex}"
+                )
                 ok_layer = False
                 break
         if ok_layer:
@@ -807,9 +913,7 @@ def _safetensors_key_matches_main_model_layer(
         return False
     if use_language_model_prefix:
         return key.startswith("model.language_model.layers.")
-    if key.startswith("mtp.") or key.startswith("model.mtp."):
-        return False
-    return True
+    return not (key.startswith("mtp.") or key.startswith("model.mtp."))
 
 
 def _param_copy_key_allowed(
@@ -826,7 +930,9 @@ def _param_copy_key_allowed(
 
 def _looks_like_qwen35_9b_awq_model_path(model_path: str) -> bool:
     base = os.path.basename(os.path.abspath(model_path)).lower()
-    return "qwen3.5-9b-awq" in base or ("qwen3.5" in base and "9b" in base and "awq" in base)
+    return "qwen3.5-9b-awq" in base or (
+        "qwen3.5" in base and "9b" in base and "awq" in base
+    )
 
 
 def _qwen35_awq_profile_hint_from_model_path(model_path: str) -> str:
@@ -853,7 +959,11 @@ def _awq_profile_hint_from_model_path(model_path: str) -> str:
 
 
 def _looks_like_hf_repo_id(model_ref: str) -> bool:
-    return isinstance(model_ref, str) and ("/" in model_ref) and (not os.path.isabs(model_ref))
+    return (
+        isinstance(model_ref, str)
+        and ("/" in model_ref)
+        and (not os.path.isabs(model_ref))
+    )
 
 
 def _resolve_model_dir_for_weights(model_path: str) -> str:
@@ -870,12 +980,20 @@ def _resolve_model_dir_for_weights(model_path: str) -> str:
         raise RuntimeError(f"Failed to download model repo {model_path!r}: {e}") from e
 
 
-def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dtype = torch.float16):
+def _load_safetensors(
+    model: nn.Module, model_path: str, target_dtype: torch.dtype = torch.float16
+):
     from safetensors.torch import load_file
+
     local_model_dir = _resolve_model_dir_for_weights(model_path)
-    sf_files = sorted([f for f in os.listdir(local_model_dir) if f.endswith(".safetensors")])
-    if not sf_files: return
-    print(f">>> Loading Safetensors from {local_model_dir} (Casting to {target_dtype} on-the-fly)...")
+    sf_files = sorted(
+        [f for f in os.listdir(local_model_dir) if f.endswith(".safetensors")]
+    )
+    if not sf_files:
+        return
+    print(
+        f">>> Loading Safetensors from {local_model_dir} (Casting to {target_dtype} on-the-fly)..."
+    )
     loaded_count = 0
     attr_map = {
         "qweight": ["weight_packed", "qweight", "weight"],
@@ -888,19 +1006,17 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
     # Do NOT match every submodule path containing "linear_attn": the parent `linear_attn`
     # nn.Module() container has no weights but used to pollute awq_accum and break loads.
     # Qwen3_5RMSNormGated / Conv1d under linear_attn load via params_dict (dense keys).
-    lite_modules: Dict[str, nn.Module] = {}
+    lite_modules: dict[str, nn.Module] = {}
     for n, mod in model.named_modules():
-        if isinstance(mod, (LiteLinear, RMSNorm)):
-            lite_modules[n] = mod
-        elif isinstance(mod, nn.Linear):
+        if isinstance(mod, (LiteLinear, RMSNorm, nn.Linear)):
             lite_modules[n] = mod
     params_dict = dict(model.named_parameters())
     loaded_params = set()
-    loaded_module_attrs: Set[str] = set()
+    loaded_module_attrs: set[str] = set()
     # Sharded checkpoints split qweight / scales / qzeros across files; merge before dequant.
-    awq_accum: Dict[str, Dict[str, torch.Tensor]] = {}
+    awq_accum: dict[str, dict[str, torch.Tensor]] = {}
     collect_moe_expert = moe_fp8_enabled() and moe_offload_enabled()
-    expert_accum: Dict[str, torch.Tensor] = {}
+    expert_accum: dict[str, torch.Tensor] = {}
     seen_language_model_layers = False
     for f in sf_files:
         print(f"    Processing {f}...")
@@ -951,16 +1067,26 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                                 if (
                                     k.endswith(f".{proj}.{suffix}")
                                     or k.endswith(f".{proj}_{suffix}")
-                                    or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}.{suffix}")
-                                    or k.endswith(f".{proj.replace('self_attn', 'linear_attn')}_{suffix}")
+                                    or k.endswith(
+                                        f".{proj.replace('self_attn', 'linear_attn')}.{suffix}"
+                                    )
+                                    or k.endswith(
+                                        f".{proj.replace('self_attn', 'linear_attn')}_{suffix}"
+                                    )
                                 ):
                                     matched = True
                                     break
                             if matched:
                                 found_v = sd[k]
                                 break
-                            if "linear_attn" in k and k.endswith(f".{s}") and proj in k:
-                                if not any(x in k for x in ["packed", "scale", "zero"]): found_v = sd[k]; break
+                            if (
+                                "linear_attn" in k
+                                and k.endswith(f".{s}")
+                                and proj in k
+                                and not any(x in k for x in ["packed", "scale", "zero"])
+                            ):
+                                found_v = sd[k]
+                                break
                         elif idx is None:
                             matched_key = _find_non_layer_module_attr_key(
                                 sd_keys,
@@ -972,35 +1098,48 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                                 k = matched_key
                                 found_v = sd[k]
                                 break
-                        if found_v is not None: break
-                    if found_v is not None: break
+                        if found_v is not None:
+                            break
+                    if found_v is not None:
+                        break
                 if found_v is None:
                     continue
                 if internal == "bias":
                     # [35B SURVIVAL] Move module shell to GPU before assigning parameter
                     m.to("cuda")
-                    m.bias = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
+                    m.bias = nn.Parameter(
+                        found_v.to(device="cuda", dtype=target_dtype),
+                        requires_grad=False,
+                    )
                     loaded_count += 1
                     loaded_module_attrs.add(module_internal_key)
-                    del sd[k]; torch.cuda.empty_cache()
+                    del sd[k]
+                    torch.cuda.empty_cache()
                 elif internal == "qweight" and _is_dense_safetensors_weight(found_v):
                     m.to("cuda")
-                    if hasattr(m, "weight"): m.weight = None
-                    m.weight = nn.Parameter(found_v.to(device="cuda", dtype=target_dtype), requires_grad=False)
+                    if hasattr(m, "weight"):
+                        m.weight = None
+                    m.weight = nn.Parameter(
+                        found_v.to(device="cuda", dtype=target_dtype),
+                        requires_grad=False,
+                    )
                     loaded_count += 1
                     loaded_params.add(m_name + ".weight")
                     loaded_module_attrs.add(module_internal_key)
-                    del sd[k]; torch.cuda.empty_cache()
+                    del sd[k]
+                    torch.cuda.empty_cache()
                 elif internal in ("qweight", "scales", "qzeros", "weight_shape"):
                     m.to("cuda")
-                    if hasattr(m, internal): setattr(m, internal, None)
+                    if hasattr(m, internal):
+                        setattr(m, internal, None)
                     if m_name not in awq_accum:
                         awq_accum[m_name] = {}
                     if internal in awq_accum[m_name]:
                         continue
                     awq_accum[m_name][internal] = found_v.to(device="cuda")
                     loaded_module_attrs.add(module_internal_key)
-                    del sd[k]; torch.cuda.empty_cache()
+                    del sd[k]
+                    torch.cuda.empty_cache()
         for p_name, p in params_dict.items():
             if p_name in loaded_params:
                 continue
@@ -1022,28 +1161,45 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
                     obj = model
                     try:
                         for part in parts[:-1]:
-                            if hasattr(obj, part): obj = getattr(obj, part)
-                            elif isinstance(obj, (nn.ModuleList, nn.ParameterList, list)) and part.isdigit():
+                            if hasattr(obj, part):
+                                obj = getattr(obj, part)
+                            elif (
+                                isinstance(obj, (nn.ModuleList, nn.ParameterList, list))
+                                and part.isdigit()
+                            ):
                                 obj = obj[int(part)]
-                            else: obj = getattr(obj, part)
-                        
+                            else:
+                                obj = getattr(obj, part)
+
                         # Move parent object to GPU before assignment
-                        if isinstance(obj, nn.Module): obj.to("cuda")
-                        
-                        val_on_gpu = nn.Parameter(sd[k].to(device="cuda", dtype=target_dtype), requires_grad=False)
-                        if isinstance(obj, (nn.ModuleList, nn.ParameterList, list)): obj[int(parts[-1])] = val_on_gpu
-                        else: setattr(obj, parts[-1], val_on_gpu)
-                        
+                        if isinstance(obj, nn.Module):
+                            obj.to("cuda")
+
+                        val_on_gpu = nn.Parameter(
+                            sd[k].to(device="cuda", dtype=target_dtype),
+                            requires_grad=False,
+                        )
+                        if isinstance(obj, (nn.ModuleList, nn.ParameterList, list)):
+                            obj[int(parts[-1])] = val_on_gpu
+                        else:
+                            setattr(obj, parts[-1], val_on_gpu)
+
                         loaded_count += 1
                         loaded_params.add(p_name)
                         copied = True
-                        del sd[k]; torch.cuda.empty_cache()
+                        del sd[k]
+                        torch.cuda.empty_cache()
                         break
-                    except Exception: continue
-            if not copied and _try_load_legacy_flat_linear_attn_norm_from_safetensors(p_name, p, list(sd.keys()), sd):
+                    except Exception:
+                        continue
+            if not copied and _try_load_legacy_flat_linear_attn_norm_from_safetensors(
+                p_name, p, list(sd.keys()), sd
+            ):
                 loaded_count += 1
                 loaded_params.add(p_name)
-        del sd; gc.collect(); torch.cuda.empty_cache()
+        del sd
+        gc.collect()
+        torch.cuda.empty_cache()
 
     for m_name, m in lite_modules.items():
         comps = awq_accum.get(m_name)
@@ -1063,7 +1219,7 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
         try:
             # Force preserve quant for all AWQ models to avoid CPU OOM
             m.awq_profile_hint = _awq_profile_hint_from_model_path(model_path)
-            
+
             # Tensors are already on GPU from immediate transfer above
             m.qweight = nn.Parameter(qw.contiguous(), requires_grad=False)
             m.scales = nn.Parameter(sc.contiguous(), requires_grad=False)
@@ -1103,18 +1259,24 @@ def _load_safetensors(model: nn.Module, model_path: str, target_dtype: torch.dty
 
     print(f">>> Safetensors loading complete. Loaded {loaded_count} parameters.")
 
+
 def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> None:
     """
     Move model to CUDA, then cast floating tensors to target_dtype without corrupting
     Qwen3.5 MoE FP8 expert weights or their float32 block scales.
     """
-    # [35B FIX] We NO LONGER call model.to("cuda") globally here because _load_safetensors 
+    # [35B FIX] We NO LONGER call model.to("cuda") globally here because _load_safetensors
     # already moved them layer-by-layer. Calling it again on 35B causes OOM due to peak allocation.
     f8 = getattr(torch, "float8_e4m3fn", None)
-    filter_suffixes = (".mlp.experts.gate_up_scale", ".mlp.experts.down_scale", 
-                       "_gate_up_fp8_cpu", "_gate_up_scale_cpu", 
-                       "_down_fp8_cpu", "_down_scale_cpu")
-    
+    filter_suffixes = (
+        ".mlp.experts.gate_up_scale",
+        ".mlp.experts.down_scale",
+        "_gate_up_fp8_cpu",
+        "_gate_up_scale_cpu",
+        "_down_fp8_cpu",
+        "_down_scale_cpu",
+    )
+
     with torch.no_grad():
         for name, p in model.named_parameters():
             if p.device.type != "cuda":
@@ -1127,7 +1289,7 @@ def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> No
                 continue
             if p.dtype != target_dtype:
                 p.data = p.data.to(dtype=target_dtype)
-        
+
         for name, b in model.named_buffers():
             if b.device.type != "cuda":
                 # Some buffers might be on CPU, move them
@@ -1138,7 +1300,7 @@ def _apply_cuda_then_hf_dtype(model: nn.Module, target_dtype: torch.dtype) -> No
                 continue
             if b.dtype != target_dtype:
                 b.data = b.data.to(dtype=target_dtype)
-                
+
     torch.cuda.empty_cache()
 
 
@@ -1195,20 +1357,32 @@ def _is_dense_safetensors_weight(tensor: torch.Tensor) -> bool:
     return tensor.is_floating_point()
 
 
-def get_tokenizer(model: Union[str, Any], **kwargs: Any):
+def get_tokenizer(model: str | Any, **kwargs: Any):
     name = model.model if hasattr(model, "model") else model
-    if hasattr(model, "trust_remote_code"): kwargs["trust_remote_code"] = model.trust_remote_code
-    try: return AutoTokenizer.from_pretrained(name, **kwargs)
-    except:
-        try: return AutoTokenizer.from_pretrained(name, use_fast=False, **kwargs)
-        except:
+    if hasattr(model, "trust_remote_code"):
+        kwargs["trust_remote_code"] = model.trust_remote_code
+    try:
+        return AutoTokenizer.from_pretrained(name, **kwargs)
+    except Exception:
+        try:
+            return AutoTokenizer.from_pretrained(name, use_fast=False, **kwargs)
+        except Exception:
+
             class Dummy:
-                def __init__(self): self.vocab_size = 154880; self.eos_token_id = 151329; self.pad_token_id = 151329
-                def encode(self, t, **kwargs): 
+                def __init__(self):
+                    self.vocab_size = 154880
+                    self.eos_token_id = 151329
+                    self.pad_token_id = 151329
+
+                def encode(self, t, **kwargs):
                     ids = [1, 2, 3, 4, 5] * 2
-                    if kwargs.get("return_tensors") == "pt": return torch.tensor([ids])
+                    if kwargs.get("return_tensors") == "pt":
+                        return torch.tensor([ids])
                     return ids
-                def decode(self, ids, **kwargs): return " [Dummy Output] "
+
+                def decode(self, ids, **kwargs):
+                    return " [Dummy Output] "
+
             return Dummy()
 
 
@@ -1294,7 +1468,7 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
         cfg.hf_config = PretrainedConfig()
     path = os.path.join(cfg.model, "config.json")
     if os.path.exists(path):
-        with open(path, "r") as f:
+        with open(path) as f:
             data = json.load(f)
             cfg.hf_config = build_fallback_hf_config(data)
     elif _should_skip_safetensors_load(vllm_config):
@@ -1304,26 +1478,32 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
             hf_auto_cfg = AutoConfig.from_pretrained(cfg.model, trust_remote_code=True)
             cfg.hf_config = build_fallback_hf_config(hf_auto_cfg.to_dict())
         except Exception as e:
-            print(f">>> [Warning] AutoConfig.from_pretrained failed for {cfg.model}: {e}")
+            print(
+                f">>> [Warning] AutoConfig.from_pretrained failed for {cfg.model}: {e}"
+            )
     _maybe_init_quant_config_from_hf(vllm_config)
     if getattr(cfg.hf_config, "model_type", "") == "deepseek_v2":
-        setattr(cfg.hf_config, "num_key_value_heads", getattr(cfg.hf_config, "num_attention_heads", 40))
-        setattr(cfg.hf_config, "head_dim", 128)
-    model_cls, _ = ModelRegistry.resolve_model_cls(getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg)
+        cfg.hf_config.num_key_value_heads = getattr(
+            cfg.hf_config, "num_attention_heads", 40
+        )
+        cfg.hf_config.head_dim = 128
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        getattr(cfg.hf_config, "architectures", ["LlamaForCausalLM"]), cfg
+    )
     if _should_skip_safetensors_load(vllm_config):
         return _build_deepseek_v4_flash_inspect_model(model_cls, vllm_config)
     model = model_cls(vllm_config)
-    
+
     # Pre-resolve target dtype
     target_dtype = _resolve_model_dtype_from_hf_config(cfg.hf_config)
-    
+
     # [35B FIX] Pre-cast to target dtype on CPU. Fast and memory-safe for empty tensors.
     model.to(dtype=target_dtype)
 
     # [35B OOM FIX] Atomic loading to avoid peaks.
     if not _should_skip_safetensors_load(vllm_config):
         _load_safetensors(model, cfg.model, target_dtype=target_dtype)
-    
+
     # [35B STABILITY] Final deterministic device and dtype sync.
     # Essential for rotary_emb caches, missed expert parameters, etc.
     print(">>> Synchronizing all model parameters to CUDA...")
@@ -1338,8 +1518,10 @@ def get_model(vllm_config: VllmConfig) -> nn.Module:
                 torch.cuda.empty_cache()
 
     # Final deterministic cast for consistency
-    if target_dtype == torch.bfloat16: model.bfloat16()
-    elif target_dtype == torch.float16: model.half()
+    if target_dtype == torch.bfloat16:
+        model.bfloat16()
+    elif target_dtype == torch.float16:
+        model.half()
 
     torch.cuda.empty_cache()
     return model.eval()

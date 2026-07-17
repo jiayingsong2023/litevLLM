@@ -6,16 +6,16 @@ import time
 
 import numpy as np
 import torch
-
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
     cpu_attn_get_scheduler_metadata,
     cpu_attn_reshape_and_cache,
 )
+from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend, _get_attn_isa
+
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, set_random_seed
-from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend, _get_attn_isa
 
 
 def get_attn_isa(

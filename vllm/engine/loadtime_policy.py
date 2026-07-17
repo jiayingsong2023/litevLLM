@@ -109,7 +109,9 @@ def select_loadtime_policy(
         return STABLE_PROFILE
 
     total_gb = (
-        total_gpu_memory_gb if total_gpu_memory_gb is not None else get_total_gpu_memory_gb()
+        total_gpu_memory_gb
+        if total_gpu_memory_gb is not None
+        else get_total_gpu_memory_gb()
     )
     model_b = estimate_model_size_billion(model_config)
 

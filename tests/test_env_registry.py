@@ -10,7 +10,7 @@ from vllm.engine.env_registry import (
 
 def test_final_public_fastinference_env_is_below_limit() -> None:
     assert len(FINAL_PUBLIC_FASTINFERENCE_ENV) < 10
-    assert FINAL_PUBLIC_FASTINFERENCE_ENV == {"FASTINFERENCE_CONFIG"}
+    assert {"FASTINFERENCE_CONFIG"} == FINAL_PUBLIC_FASTINFERENCE_ENV
 
 
 def test_kv_fp8_is_deprecated_alias_not_final_public() -> None:

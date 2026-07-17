@@ -45,7 +45,7 @@ class _ProfileSpan:
         self._enabled = False
         self._start = 0.0
 
-    def __enter__(self) -> "_ProfileSpan":
+    def __enter__(self) -> _ProfileSpan:
         self._enabled = _profile_enabled()
         if self._enabled:
             torch.cuda.synchronize()

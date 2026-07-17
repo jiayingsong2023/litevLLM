@@ -43,7 +43,9 @@ def test_resolve_model_surface_marks_unqualified_registry_models_experimental() 
     assert surface.reason == "model_not_in_regression_surface"
 
 
-def test_resolve_model_surface_marks_tinyllama_supported_despite_llama_adapter() -> None:
+def test_resolve_model_surface_marks_tinyllama_supported_despite_llama_adapter() -> (
+    None
+):
     surface = resolve_model_surface(
         model_name="models/TinyLlama-1.1B-Chat-v1.0",
         capabilities=_caps("llama"),

@@ -4,8 +4,8 @@ from typing import Any, TypeVar
 
 _T = TypeVar("_T", bound=type)
 
-class ExtensionManager:
 
+class ExtensionManager:
     def __init__(self) -> None:
         self.name2class: dict[str, type] = {}
 

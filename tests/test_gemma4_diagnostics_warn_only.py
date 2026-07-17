@@ -20,7 +20,9 @@ from tests.tools._gemma4_diag_utils import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
-_STRICT_BASELINE_PATH = _ROOT / "tests" / "tools" / "fixtures" / "gemma4_a_strict_baseline.json"
+_STRICT_BASELINE_PATH = (
+    _ROOT / "tests" / "tools" / "fixtures" / "gemma4_a_strict_baseline.json"
+)
 _DRIFT_BASELINE_PATH = (
     _ROOT / "tests" / "tools" / "fixtures" / "gemma4_layer_drift_baseline_short_hi.json"
 )
@@ -33,7 +35,9 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _resolve_default_gemma_model_path() -> str | None:
     module_path = _ROOT / "tests" / "tools" / "gemma4_single_prompt_smoke.py"
-    spec = importlib.util.spec_from_file_location("gemma4_single_prompt_smoke", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "gemma4_single_prompt_smoke", module_path
+    )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -62,13 +66,19 @@ def test_parse_helpers_cover_sample_formats() -> None:
 
 def test_gemma4_diagnostics_warn_only_against_baseline() -> None:
     if os.environ.get("RUN_GEMMA4_DIAGNOSTIC", "0") != "1":
-        pytest.skip("Set RUN_GEMMA4_DIAGNOSTIC=1 to run Gemma4 diagnostics warn-only audit.")
+        pytest.skip(
+            "Set RUN_GEMMA4_DIAGNOSTIC=1 to run Gemma4 diagnostics warn-only audit."
+        )
     if not torch.cuda.is_available():
-        pytest.skip("CUDA/ROCm unavailable; skipping Gemma4 diagnostics warn-only audit.")
+        pytest.skip(
+            "CUDA/ROCm unavailable; skipping Gemma4 diagnostics warn-only audit."
+        )
 
     model = _resolve_default_gemma_model_path()
     if not model or not Path(model).is_dir():
-        pytest.skip("Gemma4 local model dir not found; skipping diagnostics warn-only audit.")
+        pytest.skip(
+            "Gemma4 local model dir not found; skipping diagnostics warn-only audit."
+        )
 
     strict_base = _load_json(_STRICT_BASELINE_PATH)
     drift_base = _load_json(_DRIFT_BASELINE_PATH)
@@ -98,9 +108,15 @@ def test_gemma4_diagnostics_warn_only_against_baseline() -> None:
     assert strict_proc.returncode == 0, strict_proc.stdout + "\n" + strict_proc.stderr
     strict = parse_strict_metrics(strict_proc.stdout)
 
-    warn_if_diff("strict.cos_sim", strict["cos_sim"], float(strict_base["cos_sim"]), 0.001)
-    warn_if_diff("strict.max_err", strict["max_err"], float(strict_base["max_err"]), 0.05)
-    warn_if_token_mismatch("strict.hf_argmax", strict["hf_argmax"], int(strict_base["hf_argmax"]))
+    warn_if_diff(
+        "strict.cos_sim", strict["cos_sim"], float(strict_base["cos_sim"]), 0.001
+    )
+    warn_if_diff(
+        "strict.max_err", strict["max_err"], float(strict_base["max_err"]), 0.05
+    )
+    warn_if_token_mismatch(
+        "strict.hf_argmax", strict["hf_argmax"], int(strict_base["hf_argmax"])
+    )
     warn_if_token_mismatch(
         "strict.lite_engine_argmax",
         strict["lite_engine_argmax"],

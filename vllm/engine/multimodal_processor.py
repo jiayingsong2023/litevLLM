@@ -18,7 +18,6 @@ from vllm.model_executor.models.interfaces import supports_multimodal
 class NullMultiModalProcessor:
     """No-op multimodal processor for runtimes that reject multimodal input."""
 
-
     def prepare_request(self, request: RequestState) -> None:
         del request
 
@@ -66,7 +65,6 @@ class LiteMultiModalProcessor:
         self.embeddings_computed = 0
         self.embedding_feature_dim = 0
 
-
     def prepare_before_tokenize(
         self,
         prompt: str,
@@ -99,10 +97,12 @@ class LiteMultiModalProcessor:
             else:
                 prepared = self._prepare_gemma4_image(image)
                 image_token_count = int(prepared["image_token_count"])
-            prepared_images.append({
-                **item,
-                **prepared,
-            })
+            prepared_images.append(
+                {
+                    **item,
+                    **prepared,
+                }
+            )
             image_token_counts.append(image_token_count)
             replacement = self._image_replacement(model_image_token, image_token_count)
             expanded_parts.append(replacement)
@@ -117,7 +117,6 @@ class LiteMultiModalProcessor:
             "image_token_count": image_token_count,
             "image_token_counts": image_token_counts,
         }
-
 
     def prepare_request(self, request: RequestState) -> None:
         mm_data = request.multi_modal_data
@@ -332,8 +331,7 @@ class LiteMultiModalProcessor:
         config = getattr(self.model, "config", None)
         model_type = str(getattr(config, "model_type", "") or "").lower()
         return (
-            model_type == "qwen2_vl"
-            or "qwen2vl" in type(self.model).__name__.lower()
+            model_type == "qwen2_vl" or "qwen2vl" in type(self.model).__name__.lower()
         )
 
     def _prepare_qwen2_vl_image(self, image: Image.Image) -> dict[str, Any]:

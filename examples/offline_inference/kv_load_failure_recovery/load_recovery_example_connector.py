@@ -5,7 +5,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
@@ -17,6 +16,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (
 from vllm.forward_context import ForwardContext
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
+
+from vllm.config import VllmConfig
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

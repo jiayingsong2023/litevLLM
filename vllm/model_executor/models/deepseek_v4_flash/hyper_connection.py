@@ -66,9 +66,7 @@ def hyper_connection_pre_reference(
             f"got {tuple(fn_weight.shape)}"
         )
     if base.shape != (mix_count,):
-        raise ValueError(
-            f"base shape must be ({mix_count},); got {tuple(base.shape)}"
-        )
+        raise ValueError(f"base shape must be ({mix_count},); got {tuple(base.shape)}")
     if scale.shape != (3,):
         raise ValueError(f"scale shape must be (3,); got {tuple(scale.shape)}")
     if eps <= 0:
@@ -106,9 +104,7 @@ def hyper_connection_post_reference(
     if output.ndim != 1:
         raise ValueError(f"output must be 1-D; got {output.ndim}-D")
     if residual_streams.ndim != 2:
-        raise ValueError(
-            f"residual_streams must be 2-D; got {residual_streams.ndim}-D"
-        )
+        raise ValueError(f"residual_streams must be 2-D; got {residual_streams.ndim}-D")
     hc_mult, hidden_size = residual_streams.shape
     if output.shape != (hidden_size,):
         raise ValueError(
@@ -127,6 +123,7 @@ def hyper_connection_post_reference(
     residual_mix = state.combine.to(torch.float32).T.matmul(
         residual_streams.to(torch.float32)
     )
-    return state.post.reshape(hc_mult, 1).to(torch.float32) * output.to(
-        torch.float32
-    ) + residual_mix
+    return (
+        state.post.reshape(hc_mult, 1).to(torch.float32) * output.to(torch.float32)
+        + residual_mix
+    )

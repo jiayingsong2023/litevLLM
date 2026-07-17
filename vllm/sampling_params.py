@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+
 
 @dataclass
 class StructuredOutputsParams:
-    json: Optional[str] = None
-    regex: Optional[str] = None
-    grammar: Optional[str] = None
-    structural_tag: Optional[str] = None
+    json: str | None = None
+    regex: str | None = None
+    grammar: str | None = None
+    structural_tag: str | None = None
     json_object: bool = False
-    choice: Optional[List[str]] = None
+    choice: list[str] | None = None
 
     def all_constraints_none(self) -> bool:
         return not any(
@@ -23,9 +23,11 @@ class StructuredOutputsParams:
             )
         )
 
+
 class RequestOutputKind:
     DELTA = "delta"
     FINAL_ONLY = "final_only"
+
 
 @dataclass
 class SamplingParams:
@@ -36,21 +38,21 @@ class SamplingParams:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    max_tokens: Optional[int] = 16
+    max_tokens: int | None = 16
     min_tokens: int = 0
-    stop: List[str] = field(default_factory=list)
-    stop_token_ids: List[int] = field(default_factory=list)
+    stop: list[str] = field(default_factory=list)
+    stop_token_ids: list[int] = field(default_factory=list)
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     ignore_eos: bool = False
     n: int = 1
-    logprobs: Optional[int] = None
-    prompt_logprobs: Optional[int] = None
-    seed: Optional[int] = None
+    logprobs: int | None = None
+    prompt_logprobs: int | None = None
+    seed: int | None = None
     include_stop_str_in_output: bool = False
-    logit_bias: Optional[dict] = None
-    truncate_prompt_tokens: Optional[int] = None
-    structured_outputs: Optional[StructuredOutputsParams] = None
+    logit_bias: dict | None = None
+    truncate_prompt_tokens: int | None = None
+    structured_outputs: StructuredOutputsParams | None = None
     detokenize: bool = True
     output_kind: str = RequestOutputKind.FINAL_ONLY
 
@@ -58,5 +60,5 @@ class SamplingParams:
 @dataclass
 class BeamSearchParams:
     beam_width: int = 1
-    max_tokens: Optional[int] = 16
+    max_tokens: int | None = 16
     ignore_eos: bool = False

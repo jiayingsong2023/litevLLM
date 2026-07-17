@@ -16,8 +16,7 @@ def _router_scores(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
     if scoring_func == "softmax":
         return torch.softmax(logits, dim=0)
     raise ValueError(
-        "scoring_func must be 'sqrtsoftplus' or 'softmax'; "
-        f"got {scoring_func!r}"
+        f"scoring_func must be 'sqrtsoftplus' or 'softmax'; got {scoring_func!r}"
     )
 
 
@@ -33,9 +32,7 @@ def topk_router_reference(
     if hidden.ndim != 1:
         raise ValueError(f"hidden must be 1-D; got {hidden.ndim}-D")
     if router_weight.ndim != 2:
-        raise ValueError(
-            f"router_weight must be 2-D; got {router_weight.ndim}-D"
-        )
+        raise ValueError(f"router_weight must be 2-D; got {router_weight.ndim}-D")
     if hidden.numel() == 0:
         raise ValueError("hidden must contain at least one element")
     hidden_f32 = hidden.to(torch.float32)
@@ -60,8 +57,7 @@ def topk_router_reference(
     if correction_bias is not None:
         if correction_bias.ndim != 1:
             raise ValueError(
-                "correction_bias must be 1-D; "
-                f"got {correction_bias.ndim}-D"
+                f"correction_bias must be 1-D; got {correction_bias.ndim}-D"
             )
         if correction_bias.numel() != num_experts:
             raise ValueError(
@@ -127,8 +123,7 @@ def hash_routed_expert_ids_reference(
 ) -> torch.Tensor:
     if token_to_expert_ids.ndim != 2:
         raise ValueError(
-            "token_to_expert_ids must be 2-D; "
-            f"got {token_to_expert_ids.ndim}-D"
+            f"token_to_expert_ids must be 2-D; got {token_to_expert_ids.ndim}-D"
         )
     if token_id < 0 or token_id >= token_to_expert_ids.shape[1]:
         raise ValueError(

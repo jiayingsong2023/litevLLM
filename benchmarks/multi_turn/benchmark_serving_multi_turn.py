@@ -10,7 +10,7 @@ import random
 import time
 from collections import Counter, deque
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 from statistics import mean
 from typing import NamedTuple
@@ -36,7 +36,7 @@ NUM_TOKENS_FROM_DATASET = 0
 TERM_SIGNAL = None
 
 
-class ConversationSampling(str, Enum):
+class ConversationSampling(StrEnum):
     ROUND_ROBIN = "round_robin"
     RANDOM = "random"
 

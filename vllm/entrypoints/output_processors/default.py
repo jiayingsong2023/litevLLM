@@ -1,7 +1,9 @@
-from typing import List, Any
-from vllm.outputs import RequestOutput
 from vllm.entrypoints.output_processors.abstract import OutputProcessorStrategy
+from vllm.outputs import RequestOutput
+
 
 class DefaultOutputProcessor(OutputProcessorStrategy):
-    def process_outputs(self, request_outputs: List[RequestOutput], **kwargs) -> List[RequestOutput]:
+    def process_outputs(
+        self, request_outputs: list[RequestOutput], **kwargs
+    ) -> list[RequestOutput]:
         return request_outputs

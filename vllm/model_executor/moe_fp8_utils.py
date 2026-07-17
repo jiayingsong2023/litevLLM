@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared MoE FP8 block quant/dequant helpers and runtime flags."""
+
 from __future__ import annotations
 
 import torch
@@ -56,9 +57,7 @@ def fp8_block_quantize_2d(w: torch.Tensor, block_size: int = _MOE_FP8_BLOCK):
     )
 
     out_dim, in_dim = w.shape
-    assert out_dim % block_size == 0 and in_dim % block_size == 0, (
-        w.shape,
-    )
+    assert out_dim % block_size == 0 and in_dim % block_size == 0, (w.shape,)
     return _convert_to_fp8_with_scales(w.to(torch.float32), BS=block_size)
 
 
@@ -76,9 +75,13 @@ def moe_fp8_dequant_to_linear_weight(
 ) -> torch.Tensor:
     """Invert fp8_block_quantize_2d for F.linear (weights [out_dim, in_dim])."""
     out_dim, in_dim = w_fp8.shape
-    w_blocks = w_fp8.view(out_dim // block_size, block_size, in_dim // block_size, block_size)
+    w_blocks = w_fp8.view(
+        out_dim // block_size, block_size, in_dim // block_size, block_size
+    )
     w_blocks = w_blocks.to(torch.float32).permute(0, 2, 1, 3)
-    w_deq = (w_blocks * scales.unsqueeze(-1).unsqueeze(-1)).permute(0, 2, 1, 3).reshape(
-        out_dim, in_dim
+    w_deq = (
+        (w_blocks * scales.unsqueeze(-1).unsqueeze(-1))
+        .permute(0, 2, 1, 3)
+        .reshape(out_dim, in_dim)
     )
     return w_deq.to(out_dtype)

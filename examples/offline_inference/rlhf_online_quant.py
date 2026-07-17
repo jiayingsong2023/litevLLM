@@ -42,9 +42,9 @@ from torchao.quantization import (
     PerRow,
 )
 from transformers import AutoModelForCausalLM
+from vllm.utils.network_utils import get_ip, get_open_port
 
 from vllm import LLM, SamplingParams
-from vllm.utils.network_utils import get_ip, get_open_port
 
 
 class MyLLM(LLM):

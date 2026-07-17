@@ -62,9 +62,7 @@ def test_rope_cache_isolation_across_configs():
 
     # Simulate a cache entry with a unique key
     key_a = (0, 128, 1.0, "default", 10000.0, "linear", 4096, "llama3")
-    config_a.rope_cache_pool[key_a] = (
-        torch.randn(1, 128), torch.randn(1, 128)
-    )
+    config_a.rope_cache_pool[key_a] = (torch.randn(1, 128), torch.randn(1, 128))
 
     assert key_a in config_a.rope_cache_pool
     assert key_a not in config_b.rope_cache_pool, (

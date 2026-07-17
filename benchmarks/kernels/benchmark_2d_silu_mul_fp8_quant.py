@@ -9,13 +9,13 @@ from typing import Any
 import torch
 import torch.utils.benchmark as TBenchmark
 from torch.utils.benchmark import Measurement as TMeasurement
-
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _per_token_group_quant_fp8_colmajor,
     silu_mul_per_token_group_quant_fp8_colmajor,
 )
-from vllm.triton_utils import triton
 from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+from vllm.triton_utils import triton
 
 from .utils import ArgPool, Bench, CudaGraphBenchParams
 

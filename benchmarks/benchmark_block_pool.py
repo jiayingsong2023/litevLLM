@@ -4,9 +4,9 @@ import gc
 
 from benchmark_utils import TimeCollector
 from tabulate import tabulate
+from vllm.v1.core.block_pool import BlockPool
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.v1.core.block_pool import BlockPool
 
 
 def main(args):

@@ -10,8 +10,16 @@ QKVParallelLinear = LiteLinear
 MergedColumnParallelLinear = LiteLinear
 ReplicatedLinear = LiteLinear
 
+
 # Keep LinearBase/LinearMethodBase as dummy or import real ones if needed elsewhere
 # But mostly models just import *Linear classes.
-class LinearBase: pass
-class LinearMethodBase: pass
-class UnquantizedLinearMethod: pass # stub, handled inside LiteLinear
+class LinearBase:
+    pass
+
+
+class LinearMethodBase:
+    pass
+
+
+class UnquantizedLinearMethod:
+    pass  # stub, handled inside LiteLinear

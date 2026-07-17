@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import asyncio
+import contextlib
 import copy
 import json
 import math
@@ -13,7 +14,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 from PIL import Image
@@ -41,7 +42,7 @@ class ModelSpec:
     gpu_memory_utilization: float
     max_model_len: int
     max_run_seconds: int
-    stable_env: Dict[str, str]
+    stable_env: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ _DEEPSEEK_V4_FLASH_GGUF_PATH = (
 
 
 # KV cache default: TurboQuant INT4 (FASTINFERENCE_KV_TYPE=turbo_int4).
-MODEL_SPECS: Dict[str, ModelSpec] = {
+MODEL_SPECS: dict[str, ModelSpec] = {
     "tinyllama": ModelSpec(
         key="tinyllama",
         model_path="models/TinyLlama-1.1B-Chat-v1.0",
@@ -471,9 +472,9 @@ def _build_child_cli_args(single_model_key: str, json_out: str) -> list[str]:
 def _run_isolated_model_benchmarks(
     model_keys: list[str],
     compile_cache_env: dict[str, str],
-) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, object]]]:
-    summary: Dict[str, Dict[str, Any]] = {}
-    runtime_stats_summary: Dict[str, Dict[str, object]] = {}
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, object]]]:
+    summary: dict[str, dict[str, Any]] = {}
+    runtime_stats_summary: dict[str, dict[str, object]] = {}
     base_env = os.environ.copy()
     base_env.update(compile_cache_env)
     script_path = Path(__file__).resolve()
@@ -499,12 +500,10 @@ def _run_isolated_model_benchmarks(
                 f"Child benchmark failed for {key} with rc={proc.returncode}. "
                 "Run the single-model command to inspect the detailed traceback."
             )
-        with open(child_json, "r", encoding="utf-8") as f:
+        with open(child_json, encoding="utf-8") as f:
             payload = json.load(f)
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(child_json)
-        except OSError:
-            pass
         child_summary = payload.get("summary", {})
         child_runtime = payload.get("runtime_stats", {})
         if key not in child_summary:
@@ -645,7 +644,7 @@ def _read_q4_group_size_and_bits(model_path: str) -> tuple[int, int]:
     try:
         if not os.path.isfile(config_path):
             return group_size, bits
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             raw = json.load(f)
         qc = raw.get("quantization_config") or raw.get("compression_config") or {}
         groups = qc.get("config_groups")
@@ -744,7 +743,7 @@ def _build_benchmark_requests(
     return requests
 
 
-def _p95(values: List[float]) -> float:
+def _p95(values: list[float]) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -752,7 +751,7 @@ def _p95(values: List[float]) -> float:
     return ordered[idx]
 
 
-def _finite_values(values: List[float]) -> List[float]:
+def _finite_values(values: list[float]) -> list[float]:
     return [
         v for v in values if isinstance(v, (int, float)) and math.isfinite(float(v))
     ]
@@ -773,15 +772,15 @@ def _format_profile_summary(profile_stats: dict[str, object]) -> str:
     )
 
 
-def _apply_temp_env(env_map: Dict[str, str]) -> Dict[str, Optional[str]]:
-    old_env: Dict[str, Optional[str]] = {}
+def _apply_temp_env(env_map: dict[str, str]) -> dict[str, str | None]:
+    old_env: dict[str, str | None] = {}
     for key, value in env_map.items():
         old_env[key] = os.environ.get(key)
         os.environ[key] = value
     return old_env
 
 
-def _restore_env(old_env: Dict[str, Optional[str]]) -> None:
+def _restore_env(old_env: dict[str, str | None]) -> None:
     for key, value in old_env.items():
         if value is None:
             os.environ.pop(key, None)
@@ -793,7 +792,7 @@ def _collect_runtime_stats(
     llm: AsyncLLM,
     *,
     phase: str,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     snapshot = copy.deepcopy(llm.stats())
     profile_stats = dict(snapshot.get("profile") or {})
     derived_metrics = _derive_runtime_metrics(snapshot)
@@ -806,7 +805,7 @@ def _collect_runtime_stats(
     }
 
 
-def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
+def _derive_runtime_metrics(snapshot: dict[str, object]) -> dict[str, object]:
     """Return only metrics emitted by the lite runtime."""
     observer = snapshot.get("observer", {})
     backend = snapshot.get("backend", {})
@@ -878,8 +877,8 @@ def _derive_runtime_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
 
 
 def _derive_runtime_phase_diffs(
-    phases: Dict[str, Dict[str, object]],
-) -> Dict[str, object]:
+    phases: dict[str, dict[str, object]],
+) -> dict[str, object]:
     warmup = phases.get("warmup", {})
     benchmark = phases.get("benchmark", {})
     if not isinstance(warmup, dict) or not isinstance(benchmark, dict):
@@ -915,7 +914,7 @@ def _derive_runtime_phase_diffs(
 
 
 def _format_runtime_phase_diff_summary(
-    phase_diffs: Dict[str, object],
+    phase_diffs: dict[str, object],
 ) -> list[str]:
     lines: list[str] = []
     for section in ("async_driver", "prefix_cache"):
@@ -936,7 +935,7 @@ def _format_runtime_phase_diff_summary(
     return lines
 
 
-def _format_runtime_snapshot_summary(snapshot: Dict[str, object]) -> list[str]:
+def _format_runtime_snapshot_summary(snapshot: dict[str, object]) -> list[str]:
     metrics = snapshot.get("derived_metrics", {})
     if not isinstance(metrics, dict):
         return []
@@ -955,7 +954,7 @@ def _format_runtime_snapshot_summary(snapshot: Dict[str, object]) -> list[str]:
     return lines
 
 
-def _derive_awq_metrics(stats: Dict[str, int]) -> Dict[str, float]:
+def _derive_awq_metrics(stats: dict[str, int]) -> dict[str, float]:
     attempts = float(stats.get("awq_fused_attempt", 0))
     success = float(stats.get("awq_fused_success", 0))
     ratio = (success / attempts) if attempts > 0 else 0.0
@@ -1033,7 +1032,7 @@ async def _run_single_request(
     prompt_tokens: int,
     sampling_params: SamplingParams,
     multi_modal_data: dict[str, Any] | None = None,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     start = time.perf_counter()
     token_timestamps: list[float] = []
     output_event_count = 0
@@ -1212,7 +1211,7 @@ async def run_benchmark(
     warmup_config: WarmupConfig | None = None,
     fixed_decode_len: bool = True,
     clear_prefix_cache_after_warmup: bool = True,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     print(f"\n{'=' * 72}")
     print(f"BENCHMARKING: {spec.display_name}")
     print(f"PATH: {spec.model_path}")
@@ -1242,8 +1241,8 @@ async def run_benchmark(
         return {"skipped": 1.0}
 
     old_env = _apply_temp_env(spec.stable_env)
-    llm: Optional[AsyncLLM] = None
-    runtime_stats_by_phase: Dict[str, Dict[str, object]] = {}
+    llm: AsyncLLM | None = None
+    runtime_stats_by_phase: dict[str, dict[str, object]] = {}
     warmup_trace: list[dict[str, float | str]] = []
     image_tmpdir: tempfile.TemporaryDirectory[str] | None = None
     try:
@@ -1334,8 +1333,8 @@ async def run_benchmark(
                 asyncio.gather(*tasks),
                 timeout=float(spec.max_run_seconds),
             )
-        except asyncio.TimeoutError:
-            awq_stats: Dict = {}
+        except TimeoutError:
+            awq_stats: dict = {}
             if spec.quant in ("awq", "compressed-tensors"):
                 from vllm.model_executor.layers.quantization.tensor import (
                     get_awq_runtime_stats,
@@ -1440,7 +1439,7 @@ async def run_benchmark(
             else 0.0
         )
         awq_stats = {}
-        awq_metrics: Dict[str, float] = {}
+        awq_metrics: dict[str, float] = {}
         if spec.quant in ("awq", "compressed-tensors"):
             from vllm.model_executor.layers.quantization.tensor import (
                 get_awq_runtime_stats,
@@ -1802,8 +1801,7 @@ def _run_deepseek_v4_flash_gguf_benchmark(spec: ModelSpec) -> dict[str, Any]:
     try:
         proc = subprocess.run(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=False,
             timeout=spec.max_run_seconds,
@@ -1840,7 +1838,7 @@ def _run_deepseek_v4_flash_gguf_benchmark(spec: ModelSpec) -> dict[str, Any]:
 def _load_perf_baseline(path: str) -> dict[str, Any]:
     if not path.strip():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     summary = payload.get("summary", payload)
     return dict(summary) if isinstance(summary, dict) else {}
@@ -2306,8 +2304,8 @@ async def main() -> None:
             "(needs large VRAM; if you still see hipErrorLaunchFailure, try AMD_SERIALIZE_KERNEL=3 to locate)."
         )
     model_keys = [k.strip() for k in args.models.split(",") if k.strip()]
-    specs: List[ModelSpec] = []
-    resolved_scheduler_policy: Dict[str, Dict[str, Any]] = {}
+    specs: list[ModelSpec] = []
+    resolved_scheduler_policy: dict[str, dict[str, Any]] = {}
     for key in model_keys:
         if key not in MODEL_SPECS:
             raise ValueError(
@@ -2437,8 +2435,8 @@ async def main() -> None:
         )
     print("=" * 72)
 
-    summary: Dict[str, Dict[str, Any]] = {}
-    runtime_stats_summary: Dict[str, Dict[str, object]] = {}
+    summary: dict[str, dict[str, Any]] = {}
+    runtime_stats_summary: dict[str, dict[str, object]] = {}
     use_isolation = _should_use_model_process_isolation(args, model_keys)
     if use_isolation:
         print(

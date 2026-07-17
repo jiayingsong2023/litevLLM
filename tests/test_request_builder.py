@@ -312,7 +312,9 @@ def test_request_builder_expands_multimodal_prompt_before_tokenize() -> None:
         multi_modal_data={"image": [{"image": "file:///tmp/cat.png"}]},
     )
 
-    assert processor.calls == [("guarded", {"image": [{"image": "file:///tmp/cat.png"}]})]
+    assert processor.calls == [
+        ("guarded", {"image": [{"image": "file:///tmp/cat.png"}]})
+    ]
     assert request.guarded_prompt == "A B C"
     assert request.input_ids == [1, 2, 3]
     assert request.multi_modal_data == {

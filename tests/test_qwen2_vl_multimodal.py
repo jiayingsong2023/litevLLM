@@ -38,9 +38,7 @@ def test_qwen2_vl_merges_embeddings_by_image_placeholders() -> None:
         image_token_count=2,
     )
 
-    assert merged.tolist() == [
-        [[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]
-    ]
+    assert merged.tolist() == [[[1.0, 1.0], [8.0, 1.0], [9.0, 2.0], [4.0, 4.0]]]
 
 
 def test_qwen2_vl_builds_vision_tower_from_fallback_vision_config() -> None:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional, Any
+from typing import Any
+
 
 class AttentionConfig:
     def __init__(
@@ -9,7 +10,7 @@ class AttentionConfig:
         num_kv_heads: int,
         block_size: int = 16,
         is_causal: bool = True,
-        backend: Optional[Any] = None,
+        backend: Any | None = None,
     ):
         self.num_heads = num_heads
         self.head_size = head_size

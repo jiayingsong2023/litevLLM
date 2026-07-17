@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import List, Optional, Any
+from typing import Any
+
 
 @dataclass
 class PoolingParams:
     """Parameters for pooling operations."""
-    truncate_prompt_tokens: Optional[int] = None
+
+    truncate_prompt_tokens: int | None = None
     use_activation: bool = False
-    dimensions: Optional[int] = None
-    step_tag_id: Optional[int] = None
-    returned_token_ids: Optional[List[int]] = None
-    
+    dimensions: int | None = None
+    step_tag_id: int | None = None
+    returned_token_ids: list[int] | None = None
+
     task: Any = None
     requires_token_ids: bool = False
     skip_reading_prefix_cache: bool = False
@@ -28,5 +30,5 @@ class PoolingParams:
             requires_token_ids=self.requires_token_ids,
             skip_reading_prefix_cache=self.skip_reading_prefix_cache,
             extra_kwargs=self.extra_kwargs.copy(),
-            output_kind=self.output_kind
+            output_kind=self.output_kind,
         )
