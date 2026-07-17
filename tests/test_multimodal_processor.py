@@ -5,10 +5,14 @@ import base64
 import io
 from types import SimpleNamespace
 
+import pytest
 import torch
 from PIL import Image
 
-from vllm.engine.multimodal_processor import LiteMultiModalProcessor
+from vllm.engine.multimodal_processor import (
+    MAX_IMAGE_BYTES,
+    LiteMultiModalProcessor,
+)
 
 
 class _Gemma4LikeModel:
@@ -71,6 +75,24 @@ def test_multimodal_processor_expands_single_image_placeholder_before_tokenize()
     assert len(prepared["image"]) == 1
     assert tuple(prepared["image"][0]["prepared_pixel_values"].shape) == (1, 4, 48)
     assert tuple(prepared["image"][0]["image_position_ids"].shape) == (1, 4, 2)
+
+
+@pytest.mark.parametrize(
+    "image_url",
+    ["file:///tmp/image.png", "https://example.invalid/image.png", "/tmp/image.png"],
+)
+def test_multimodal_processor_rejects_host_and_network_image_urls(
+    image_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="only data"):
+        LiteMultiModalProcessor._load_image(image_url)
+
+
+def test_multimodal_processor_rejects_oversized_inline_image_payload() -> None:
+    image_url = "data:image/png;base64," + "A" * ((MAX_IMAGE_BYTES * 4 // 3) + 5)
+
+    with pytest.raises(ValueError, match="byte limit"):
+        LiteMultiModalProcessor._load_image(image_url)
 
 
 def test_multimodal_processor_accepts_gemma_chat_template_image_marker() -> None:

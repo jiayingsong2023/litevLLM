@@ -68,9 +68,18 @@ def _looks_like_awq_quantized_model(hf_config: Any, model_path: str) -> bool:
     return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
 
 
-def load_hf_config(model_path: str) -> Any:
+def load_hf_config(
+    model_path: str,
+    *,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
+) -> Any:
     try:
-        return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        return AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
     except Exception:
         config_path = os.path.join(model_path, "config.json")
         with open(config_path, encoding="utf-8") as f:
@@ -128,10 +137,24 @@ def _validate_deepseek_v4_flash_context(
 
 
 def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
+    fastinference_config = resolve_fastinference_config(
+        config=kwargs.get("fastinference_config"),
+        path=kwargs.get("fastinference_config_path"),
+    )
+    trust_remote_code = bool(
+        kwargs.get("trust_remote_code", fastinference_config.model.trust_remote_code)
+    )
+    revision = kwargs.get("revision", fastinference_config.model.revision)
+    if trust_remote_code and not revision:
+        raise ValueError("model revision is required when trust_remote_code is enabled")
     hf_config = (
         _build_deepseek_v4_flash_hf_config()
         if _is_deepseek_v4_flash_gguf(model_path)
-        else load_hf_config(model_path)
+        else load_hf_config(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
     )
     max_model_len = int(
         kwargs.get(
@@ -154,7 +177,8 @@ def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
         model=model_path,
         tokenizer=kwargs.get("tokenizer", model_path),
         tokenizer_mode="auto",
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
         dtype=str(kwargs.get("dtype", "float16")),
         max_model_len=max_model_len,
     )
@@ -191,10 +215,6 @@ def build_vllm_config(model_path: str, **kwargs: Any) -> VllmConfig:
             group_size=group_size,
         )
 
-    fastinference_config = resolve_fastinference_config(
-        config=kwargs.get("fastinference_config"),
-        path=kwargs.get("fastinference_config_path"),
-    )
     vllm_config.fastinference_config = fastinference_config
     vllm_config.fastinference_config_path = kwargs.get("fastinference_config_path")
     runtime_config = RuntimeConfig.from_vllm_config(vllm_config)

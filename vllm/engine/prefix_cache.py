@@ -21,7 +21,7 @@ class PrefixCacheEntry:
 
 class PrefixCache:
     def __init__(self, max_entries: int = 8) -> None:
-        self.max_entries = max(1, int(max_entries))
+        self.max_entries = max(0, int(max_entries))
         self._entries: OrderedDict[tuple[int, ...], PrefixCacheEntry] = OrderedDict()
         self.lookup_count = 0
         self.exact_hit_count = 0
@@ -43,6 +43,8 @@ class PrefixCache:
         return entry
 
     def put(self, entry: PrefixCacheEntry) -> None:
+        if self.max_entries == 0:
+            return
         self._entries[entry.key] = entry
         self._entries.move_to_end(entry.key)
         while len(self._entries) > self.max_entries:

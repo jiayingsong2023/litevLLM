@@ -81,6 +81,11 @@ class LiteRequestBuilder:
                 f"prompt tokens ({len(input_ids)}) exceed/equal max_model_len "
                 f"({self.max_model_len}); leave at least one decode token slot."
             )
+        if len(input_ids) + max_tokens > self.max_model_len:
+            raise ValueError(
+                f"request tokens ({len(input_ids)} prompt + {max_tokens} max_tokens) "
+                f"exceed max_model_len ({self.max_model_len})"
+            )
 
         rng: torch.Generator | None = None
         seed = getattr(effective_sampling_params, "seed", None)

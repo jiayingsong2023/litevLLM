@@ -33,7 +33,7 @@ class LiteSingleGpuBackend:
         output_coordinator: Any | None,
         kv_block_manager: Any,
         lora_registry: Any | None = None,
-        max_prefix_cache_entries: int = 8,
+        max_prefix_cache_entries: int = 0,
         min_prefix_cache_partial_hit_tokens: int = 1,
         gpu_greedy_sampling: bool = False,
         gpu_greedy_max_tokens_only: bool = False,
@@ -91,6 +91,8 @@ class LiteSingleGpuBackend:
             self.kv_block_manager.ensure_blocks_for_requests(request_ids, token_counts)
 
     def maybe_apply_prefix_cache(self, request_state: RequestState) -> None:
+        if self.prefix_cache.max_entries == 0:
+            return None
         cache_key = self._prefix_cache_key(request_state)
         if not cache_key:
             return None
@@ -222,8 +224,6 @@ class LiteSingleGpuBackend:
         except Exception as e:
             error = ExecutionStepError(f"prefill failed: {e}")
             logger.exception("LiteEngine prefill execution error: %s", error)
-            for rid in step_plan.prefills.request_ids:
-                self._free_request(rid)
             raise error from e
 
     def run_decodes(self, step_plan, results: list[RequestOutput]) -> None:
@@ -261,8 +261,6 @@ class LiteSingleGpuBackend:
         except Exception as e:
             error = ExecutionStepError(f"decode failed: {e}")
             logger.exception("LiteEngine decode execution error: %s", error)
-            for rid in step_plan.decodes.request_ids:
-                self._free_request(rid)
             raise error from e
 
     def _can_use_gpu_greedy_decode(self, request_ids: list[str]) -> bool:
@@ -429,16 +427,17 @@ class LiteSingleGpuBackend:
             elif len(req.generated_ids) >= int(req.sampling_params.max_tokens or 16):
                 finish_reason = "max_tokens"
             self.observer.on_request_finished(request_id, finish_reason)
-            self._free_request(request_id)
+            self.release_request(request_id)
 
     def free_request_resources(self, request_id: str) -> None:
         self.kv_block_manager.free_request_blocks(request_id)
 
-    def _free_request(self, request_id: str) -> None:
+    def release_request(self, request_id: str) -> RequestState | None:
         self.free_request_resources(request_id)
         request = self.scheduler.free_request(request_id)
         if request is not None and self.lora_registry is not None:
             self.lora_registry.on_request_removed(request.lora_id)
+        return request
 
     def _ensure_runtime_ready(self) -> None:
         if self.sampling_driver is None or self.output_coordinator is None:
@@ -480,6 +479,8 @@ class LiteSingleGpuBackend:
         request_state: RequestState,
         last_prompt_logits: torch.Tensor,
     ) -> None:
+        if self.prefix_cache.max_entries == 0:
+            return
         prompt_len = int(request_state.seq_len or 0)
         if prompt_len <= 0:
             return

@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
-import functools
 import os
 
 VLLM_SUBCMD_PARSER_EPILOG = "Use `vllm {subcmd} --help` for details."
@@ -23,14 +21,3 @@ def get_max_tokens(request) -> int | None:
 
 def sanitize_message(message: str | Exception) -> str:
     return str(message).strip()
-
-
-def with_cancellation(func):
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except asyncio.CancelledError:
-            raise
-
-    return wrapper

@@ -34,3 +34,22 @@ def test_int4_v_accumulation_does_not_keep_both_unpack_tiles_named() -> None:
         "acc_high = acc_high * alpha + tl.sum(p[:, None] * v_high_unpacked, axis=0)"
     )
     assert low_unpack < low_accum < high_unpack < high_accum
+
+
+def test_block_table_reads_are_masked_to_the_row_capacity() -> None:
+    src = _kernel_source()
+
+    assert "valid_block = i < max_num_blocks_per_seq" in src
+    assert "block_mask = (global_token_idx < seq_len) & valid_block" in src
+    assert "BlockTables_ptr + seq_idx * stride_bt_seq + i * stride_bt_block,\n                mask=valid_block" in src
+
+
+def test_atomic_reductions_are_explicitly_tolerance_only() -> None:
+    sources = [
+        Path("vllm/kernels/triton/awq_fused_gemm.py").read_text(encoding="utf-8"),
+        Path("vllm/kernels/triton/gemma4_moe_int4.py").read_text(encoding="utf-8"),
+    ]
+
+    for source in sources:
+        assert "atomic_add" in source
+        assert "non-deterministic" in source

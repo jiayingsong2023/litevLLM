@@ -8,7 +8,8 @@ class ModelConfig:
         model: str,
         tokenizer: str,
         tokenizer_mode: str = "auto",
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
+        revision: str | None = None,
         dtype: str = "auto",
         max_model_len: int = 2048,
     ):
@@ -16,6 +17,7 @@ class ModelConfig:
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
         self.trust_remote_code = trust_remote_code
+        self.revision = revision
         self.dtype = dtype
         self.max_model_len = max_model_len
         self.hf_config: Any = None

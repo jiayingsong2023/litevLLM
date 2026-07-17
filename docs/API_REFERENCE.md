@@ -6,6 +6,9 @@ This page documents the maintained HTTP surface in
 The server is OpenAI-compatible for the lite-supported chat subset. It is not a
 drop-in implementation of every OpenAI or upstream vLLM route.
 
+It binds to `127.0.0.1` by default. Public binding is explicit and should sit
+behind an authenticated, rate-limited reverse proxy.
+
 ## Start The Server
 
 ```bash
@@ -54,6 +57,9 @@ Returns the currently loaded model in OpenAI-style list form.
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
+`GET /healthz` reports process liveness. `GET /readyz` returns 503 until the
+engine is initialized or after it enters fatal state.
+
 ## POST `/v1/chat/completions`
 
 Minimum request:
@@ -71,9 +77,17 @@ Common fields:
 | :--- | :--- | :--- |
 | `stream` | boolean | Server-sent events when `true`. |
 | `max_tokens` | integer | Defaults to the server sampling default. |
-| `temperature` | number | Passed into `SamplingParams`. |
+| `max_completion_tokens` | integer | Alias for `max_tokens`. |
+| `temperature`, `top_p`, `top_k`, `min_p` | number | Passed into `SamplingParams`. |
+| `frequency_penalty`, `presence_penalty`, `repetition_penalty` | number | Passed into `SamplingParams`. |
 | `structured_outputs` | object | Native structured output request. |
 | `response_format` | object | OpenAI-compatible JSON object/schema mapping. |
+
+The loaded model name must exactly match `model`. All message history is passed
+through the loaded tokenizer's chat template. The server supports `n=1`; it
+rejects stop strings, logprobs, and seed rather than silently ignoring them.
+Non-streaming responses include `usage`; terminal choices report `stop` or
+`length`.
 
 Non-streaming example:
 
@@ -117,8 +131,8 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 ## Multimodal Message Content
 
 The chat endpoint accepts OpenAI-style content blocks with text and `image_url`
-items. Multimodal support is experimental; validate model-specific behavior
-before treating it as production-ready.
+items. Multimodal support is experimental; only bounded `data:image/...;base64`
+URLs are accepted by default. Local paths and network URLs are rejected.
 
 ```json
 {
@@ -126,13 +140,16 @@ before treating it as production-ready.
     "role": "user",
     "content": [
       {"type": "text", "text": "Describe this image."},
-      {"type": "image_url", "image_url": {"url": "file:///path/to/image.png"}}
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
     ]
   }]
 }
 ```
 
 ## Runtime Stats
+
+Debug routes are disabled by default. Start the server with
+`--enable-debug-endpoints` only on a trusted listener.
 
 `GET /debug/runtime_stats` returns a compact summary of runtime observer
 counters, including prefix cache, preemption, fairness, LoRA, async driver, and
@@ -157,20 +174,11 @@ Supported OpenAI-compatible routes in the standalone server are
 `/v1/responses`, `/v1/completions`, `/v1/embeddings`, pooling, score, and
 rerank APIs.
 
-## Error Shape
+## Errors
 
-Errors use a compact OpenAI-style envelope:
-
-```json
-{
-  "error": {
-    "message": "error detail",
-    "type": "BadRequestError",
-    "param": null,
-    "code": 400
-  }
-}
-```
+Input and unsupported-parameter errors return HTTP 400. Admission pressure
+returns 429; a fatal or uninitialized runtime returns 503. Responses use the
+standard FastAPI `{"detail": "..."}` error body.
 
 ## API Verification
 

@@ -112,6 +112,17 @@ def test_unknown_top_level_field_fails(tmp_path: Path) -> None:
         load_fastinference_config(path)
 
 
+def test_unknown_tuning_key_fails(tmp_path: Path) -> None:
+    path = tmp_path / "bad.toml"
+    unknown_key = "FASTINFERENCE_" + "TYP0"
+    path.write_text(
+        f'[tuning_keyvals]\n{unknown_key} = "1"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=unknown_key):
+        load_fastinference_config(path)
+
+
 def test_missing_config_file_fails(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_fastinference_config(tmp_path / "missing.toml")

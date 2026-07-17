@@ -399,7 +399,10 @@ def _paged_attention_kernel(
         )
         q = tl.load(Q_ptr + off_q).to(tl.float32)
 
-    num_blocks = (seq_len + block_size - 1) // block_size
+    num_blocks = tl.minimum(
+        (seq_len + block_size - 1) // block_size,
+        max_num_blocks_per_seq,
+    )
     offs_n = tl.arange(0, BLOCK_N)
 
     # When USE_SELECTION, iterate only over active (selected) blocks so the
@@ -415,27 +418,42 @@ def _paged_attention_kernel(
 
     for idx in range(0, num_iters):
         i = tl.load(ActiveBlocks_ptr + active_start + idx) if USE_SELECTION else idx
+        valid_block = i < max_num_blocks_per_seq
         global_token_idx = i * block_size + offs_n
-        block_mask = global_token_idx < seq_len
+        block_mask = (global_token_idx < seq_len) & valid_block
 
         # K load and QK computation
         if IS_CACHED:
-            k_base_ptr = tl.load(K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
+            k_base_ptr = tl.load(
+                K_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i,
+                mask=valid_block,
+                other=0,
+            ).to(
                 tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
             )
-            v_base_ptr = tl.load(V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i).to(
+            v_base_ptr = tl.load(
+                V_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i,
+                mask=valid_block,
+                other=0,
+            ).to(
                 tl.pointer_type(tl.uint8 if IS_INT4 else tl.float16)
             )
             if HAS_ROW_SCALE:
                 ks_base_ptr = tl.load(
-                    K_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                    K_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i,
+                    mask=valid_block,
+                    other=0,
                 ).to(tl.pointer_type(tl.float32))
                 vs_base_ptr = tl.load(
-                    V_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i
+                    V_Scale_Ptrs_ptr + seq_idx * max_num_blocks_per_seq + i,
+                    mask=valid_block,
+                    other=0,
                 ).to(tl.pointer_type(tl.float32))
         else:
             block_idx = tl.load(
-                BlockTables_ptr + seq_idx * stride_bt_seq + i * stride_bt_block
+                BlockTables_ptr + seq_idx * stride_bt_seq + i * stride_bt_block,
+                mask=valid_block,
+                other=0,
             )
             k_base_ptr = K_ptr + block_idx * stride_k_block
             v_base_ptr = V_ptr + block_idx * stride_v_block

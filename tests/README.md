@@ -80,7 +80,7 @@ RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correct
 uv run python tests/e2e_full_benchmark.py
 ```
 
-2026-07-17 的 Gemma4-26B 基线采用同机、同命令、独立进程的交错三次 A/B：
+2026-07-17 的 Gemma4-26B 最新复测采用同机、同命令、独立进程三次运行：
 
 ```bash
 uv run python tests/e2e_full_benchmark.py \
@@ -90,14 +90,14 @@ uv run python tests/e2e_full_benchmark.py \
 ```
 
 在 Radeon 8060S（96GB reported VRAM）、BS=1、prompt~384、max_new=24、FP8 KV 下，
-受控 A/B 的当前提交均值为 `decode_tps_agg=8.94`、`aggregate_tps=4.86`、
-`TTFT p50=2360.8ms`、`prefill_tps_agg=166.89`。与 `52a528b79` 的三次交错
-基线相比，decode TPS 差异为 `-0.24%`；单次结果不能单独作为回归结论。
+三次中位数为 `decode_tps_agg=12.39`、`aggregate_tps=5.52`、
+`TTFT p50=2307.9ms`、`prefill_tps_agg=170.72`。aggregate TPS 的三次结果为
+5.52、5.36、5.76（约 7.3% peak-to-peak 波动）；这不是跨提交 A/B 结论。
 
-最近一次全模型隔离 E2E（2026-07-17）记录为：26B `aggregate_tps=7.09`、
-`decode_tps_agg=17.16`、`TTFT p50=2043.3ms`；31B `2.76`、`4.94`、
-`4038.1ms`；DeepSeek `0.49`、`2.58`、`17593.4ms`。该运行的 JSON 为
-`/tmp/fastinference-e2e-ci-gates.json`，是单次验证样本，不替代上述 A/B 基线。
+最近一次全模型隔离 E2E（2026-07-17）记录为：26B `aggregate_tps=5.52`、
+`decode_tps_agg=11.15`、`TTFT p50=2284.2ms`；31B `2.42`、`4.56`、
+`4852.7ms`；DeepSeek `0.37`、`1.78`、`25924.5ms`。JSON 为
+`/tmp/fastinference-e2e-20260717.json`，是单次验证样本；26B 的三次复测结果如上。
 
 Gemma4 常用命令：
 
@@ -152,6 +152,16 @@ uv run python tests/e2e_full_benchmark.py \
 
 `perf_regressions` 默认只记录吞吐下降或延迟上升的 warning。对已建立稳定基线的
 发布或 CI，配合 `--perf-fail-on-regression` 阻断回归。
+
+比较两个改动时不要拿单次 JSON 下结论。使用两个已有 worktree 交错运行至少三轮；
+脚本会拒绝 GPU、ROCm、Torch、Triton、workload 或 shape fingerprint 不一致的结果：
+
+```bash
+uv run python tests/tools/interleaved_e2e_ab.py \
+  --baseline-worktree ../fastinference-main \
+  --candidate-worktree ../fastinference-change \
+  --json-out /tmp/e2e-ab.json -- --models tinyllama
+```
 
 ## `tests/tools/` 边界
 

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from vllm.engine.env_registry import FASTINFERENCE_ENV_REGISTRY, EnvScope
+
 SUPPORTED_CONFIG_PROFILES = frozenset(
     {"auto", "balanced", "latency", "throughput", "accuracy", "benchmark"}
 )
@@ -20,6 +22,7 @@ _TOP_LEVEL_FIELDS = frozenset(
         "log_level",
         "benchmark",
         "legacy_env",
+        "model",
         "tuning_keyvals",
     }
 )
@@ -36,6 +39,12 @@ class LegacyEnvConfig:
 
 
 @dataclass(frozen=True)
+class ModelLoadConfig:
+    trust_remote_code: bool = False
+    revision: str | None = None
+
+
+@dataclass(frozen=True)
 class FastInferenceConfig:
     profile: str = "auto"
     kv_type: str = "auto"
@@ -43,6 +52,7 @@ class FastInferenceConfig:
     log_level: str = "info"
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     legacy_env: LegacyEnvConfig = field(default_factory=LegacyEnvConfig)
+    model: ModelLoadConfig = field(default_factory=ModelLoadConfig)
     tuning_keyvals: dict[str, str] = field(default_factory=dict)
 
 
@@ -68,6 +78,19 @@ def _validate_kv_type(value: object) -> str:
     return kv_type
 
 
+def _validate_tuning_keyvals(raw: Mapping[str, Any]) -> dict[str, str]:
+    values = {str(key): str(value) for key, value in raw.items()}
+    unknown = sorted(
+        key
+        for key in values
+        if key not in FASTINFERENCE_ENV_REGISTRY
+        or FASTINFERENCE_ENV_REGISTRY[key].scope is EnvScope.REMOVED
+    )
+    if unknown:
+        raise ValueError("Unknown tuning_keyvals: " + ", ".join(unknown))
+    return values
+
+
 def config_from_mapping(data: Mapping[str, Any]) -> FastInferenceConfig:
     unknown = sorted(set(data) - _TOP_LEVEL_FIELDS)
     if unknown:
@@ -75,7 +98,12 @@ def config_from_mapping(data: Mapping[str, Any]) -> FastInferenceConfig:
 
     benchmark_data = _as_mapping(data.get("benchmark"), "benchmark")
     legacy_data = _as_mapping(data.get("legacy_env"), "legacy_env")
+    model_data = _as_mapping(data.get("model"), "model")
     tuning_raw = _as_mapping(data.get("tuning_keyvals"), "tuning_keyvals")
+    trust_remote_code = bool(model_data.get("trust_remote_code", False))
+    revision = str(model_data.get("revision", "")).strip() or None
+    if trust_remote_code and revision is None:
+        raise ValueError("model.revision is required when trust_remote_code is enabled")
 
     return FastInferenceConfig(
         profile=_validate_profile(data.get("profile", "auto")),
@@ -87,7 +115,11 @@ def config_from_mapping(data: Mapping[str, Any]) -> FastInferenceConfig:
             or "default",
         ),
         legacy_env=LegacyEnvConfig(enabled=bool(legacy_data.get("enabled", False))),
-        tuning_keyvals={str(k): str(v) for k, v in tuning_raw.items()},
+        model=ModelLoadConfig(
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        ),
+        tuning_keyvals=_validate_tuning_keyvals(tuning_raw),
     )
 
 

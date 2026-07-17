@@ -91,6 +91,23 @@ def test_resolve_compile_cache_env(tmp_path: Path) -> None:
     assert "TORCHINDUCTOR_CACHE_DIR" in env_map
 
 
+def test_benchmark_fingerprint_records_comparison_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(bench.torch.cuda, "is_available", lambda: False)
+    args = argparse.Namespace(workload="text", fixed_decode_len=True, warmup_preset="off")
+
+    assert bench._benchmark_fingerprint(args, ["tinyllama"]) == {
+        "models": ["tinyllama"],
+        "gpu": None,
+        "gpu_arch": None,
+        "rocm": bench.torch.version.hip,
+        "torch": bench.torch.__version__,
+        "triton": getattr(bench.torch.version, "triton", None),
+        "workload": "text",
+        "fixed_decode_len": True,
+        "warmup_preset": "off",
+    }
+
+
 def test_deepseek_v4_flash_gguf_is_registered_for_e2e_benchmark() -> None:
     spec = bench.MODEL_SPECS["deepseek_v4_flash_q2_gguf"]
 

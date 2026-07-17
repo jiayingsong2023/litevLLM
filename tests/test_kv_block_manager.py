@@ -62,10 +62,10 @@ def test_ensure_blocks_does_not_shrink() -> None:
     assert len(mgr._request_blocks["r0"]) == 3
 
 
-def test_ensure_blocks_caps_at_num_blocks_per_seq() -> None:
+def test_ensure_blocks_rejects_overflowing_block_table_row() -> None:
     mgr = _make_manager(num_blocks_per_seq=2)
-    mgr.ensure_blocks("r0", 100)
-    assert len(mgr._request_blocks["r0"]) == 2
+    with pytest.raises(ValueError, match="exceeding per-request capacity 2"):
+        mgr.ensure_blocks("r0", 100)
 
 
 def test_ensure_blocks_for_requests() -> None:

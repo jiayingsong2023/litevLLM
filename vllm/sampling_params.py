@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class StructuredOutputsParams:
-    json: str | None = None
+    json: str | dict | None = None
     regex: str | None = None
     grammar: str | None = None
     structural_tag: str | None = None

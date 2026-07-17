@@ -185,8 +185,7 @@ def _reshape_and_cache_kernel(
 
     if COMPUTE_DYNAMIC_SCALE:
         # Dynamic Row-wise Scale with Clipping for MoE Outliers
-        # We use a divisor of 6.0 to give more bits to non-outliers.
-        # This effectively treats values > 6.0*scale as outliers to be clipped.
+        # A divisor of 7.0 maps the symmetric int4 range [-7, 7].
         k_max = tl.max(tl.abs(k))
         v_max = tl.max(tl.abs(v))
         k_scale = tl.maximum(k_max / 7.0, 1e-4)

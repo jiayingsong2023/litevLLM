@@ -194,3 +194,11 @@ def test_async_llm_abort_forwards_request_ids() -> None:
     asyncio.run(llm.abort(["req-a", "req-b"]))
 
     assert llm.engine.aborted_requests == ["req-a", "req-b"]
+
+
+def test_async_llm_close_stream_aborts_uniterated_request() -> None:
+    llm = _bridge_llm()
+
+    asyncio.run(llm.close_stream("req-never-iterated"))
+
+    assert llm.engine.aborted_requests == ["req-never-iterated"]

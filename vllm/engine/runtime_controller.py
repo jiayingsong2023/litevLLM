@@ -29,6 +29,8 @@ class ExecutionBackend(Protocol):
         self, step_plan: StepPlan, results: list[RequestOutput]
     ) -> None: ...
 
+    def release_request(self, request_id: str) -> Any | None: ...
+
     def stats(self) -> dict[str, object]: ...
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None: ...
@@ -103,13 +105,12 @@ class RuntimeController:
             max_queue_wait_s=self.queue_timeout_s,
         )
         for request_id, reason, request in expired:
-            if self.lora_registry is not None:
-                self.lora_registry.on_request_removed(request.lora_id)
-            self.observer.on_request_rejected(request_id, reason)
             self.scheduler.publish_exception(
                 request_id,
                 RequestRejectedError(reason),
             )
+            self.backend.release_request(request_id)
+            self.observer.on_request_rejected(request_id, reason)
 
     def _admit_requests(self, step_plan: Any, now: float) -> None:
         if step_plan.admissions is None:

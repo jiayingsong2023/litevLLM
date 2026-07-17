@@ -22,7 +22,10 @@ check and the model paths below are present on the runner:
 Store the calibrated E2E baseline at
 `/opt/fastinference/baselines/e2e-default.json`. Generate it on that runner
 with the maintained isolated benchmark command, then review and replace it
-only with an explicit performance-baseline PR.
+only with an explicit performance-baseline PR. The JSON includes a hardware
+and workload fingerprint; never use a fingerprint-mismatched file as a CI
+regression gate. For a candidate change, run the maintained interleaved A/B
+tool from two worktrees at least three times and retain its raw JSON artifact.
 
 After the first successful run, make `static-quality` and
 `rocm-fast-regression` required checks for `main`. Add `rocm-performance` to

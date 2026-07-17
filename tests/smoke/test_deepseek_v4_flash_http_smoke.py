@@ -6,34 +6,41 @@ from vllm.entrypoints.openai import api_server
 
 class _FakeOutput:
     def __init__(self, text: str, finished: bool) -> None:
-        self.outputs = [type("_FakeToken", (), {"text": text})()]
+        self.outputs = [type("_FakeToken", (), {"text": text, "token_ids": [1]})()]
+        self.prompt_token_ids = [0]
         self.finished = finished
 
 
 class _FakeEngine:
     def __init__(self, payload_text: str = "ok") -> None:
         self.payload_text = payload_text
+        self.submitted: dict[str, tuple[str, object, object]] = {}
+        self.aborted: list[str] = []
 
     def generate_greedy_reference_chat(self, prompt: str, *, max_tokens: int) -> str:
         raise AssertionError(
             "production chat route must not call direct-reference helper"
         )
 
-    async def generate(
+    async def submit(
         self,
         prompt: str,
         sampling_params,
         request_id: str,
-        lora_request=None,
         multi_modal_data=None,
-        **kwargs,
-    ):
+    ) -> None:
         assert prompt == "x"
         assert getattr(sampling_params, "temperature", None) == 0
         assert request_id.startswith("chat-")
-        assert lora_request is None
         assert multi_modal_data is None
+        self.submitted[request_id] = (prompt, sampling_params, multi_modal_data)
+
+    async def stream(self, request_id: str):
+        assert request_id in self.submitted
         yield _FakeOutput(self.payload_text, True)
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
 
     async def get_model_config(self):
         return type("_FakeModelConfig", (), {"model": "deepseek-v4-flash"})()
@@ -134,6 +141,7 @@ def test_openai_server_enables_bounded_runtime_observer(monkeypatch) -> None:
     config = type("_Config", (), {})()
     captured = {}
     previous_engine = api_server.engine
+    previous_debug = api_server.debug_endpoints_enabled
 
     monkeypatch.setattr(api_server, "build_vllm_config", lambda *_args, **_kwargs: config)
     monkeypatch.setattr(
@@ -141,11 +149,18 @@ def test_openai_server_enables_bounded_runtime_observer(monkeypatch) -> None:
         "AsyncLLM",
         lambda received_config: captured.setdefault("config", received_config),
     )
-    monkeypatch.setattr(api_server.uvicorn, "run", lambda *_args, **_kwargs: None)
+    uvicorn_kwargs = {}
+    monkeypatch.setattr(
+        api_server.uvicorn,
+        "run",
+        lambda *_args, **kwargs: uvicorn_kwargs.update(kwargs),
+    )
     monkeypatch.setattr("sys.argv", ["api_server", "--model", "models/mock"])
     try:
         api_server.main()
     finally:
         api_server.engine = previous_engine
+        api_server.debug_endpoints_enabled = previous_debug
 
     assert isinstance(captured["config"].runtime_observer, InMemoryRuntimeObserver)
+    assert uvicorn_kwargs["host"] == "127.0.0.1"

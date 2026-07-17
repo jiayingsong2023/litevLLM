@@ -88,6 +88,10 @@ class _FakeObserver:
     def on_request_finished(self, request_id: str, reason: str) -> None:
         self.finished.append((request_id, reason))
 
+    def on_request_rejected(self, request_id: str, reason: str) -> None:
+        self.rejected = getattr(self, "rejected", [])
+        self.rejected.append((request_id, reason))
+
     def stats(self) -> dict[str, object]:
         return {
             "step_count": len(self.steps),
@@ -120,6 +124,11 @@ class _FakeBackend:
     def run_decodes(self, step_plan, results):
         del step_plan, results
         raise AssertionError("decode batch path should not be used in this test")
+
+    def release_request(self, _request_id: str):
+        self.released = getattr(self, "released", [])
+        self.released.append(_request_id)
+        return None
 
     def stats(self) -> dict[str, object]:
         return {
@@ -225,6 +234,37 @@ def test_runtime_controller_stats_snapshot() -> None:
             }
         },
     }
+
+
+def test_runtime_controller_timeout_publishes_before_releasing() -> None:
+    scheduler = _FakeScheduler()
+    scheduler.active_request_count = 1
+    scheduler.running_request_count = 0
+    events: list[tuple[str, str]] = []
+
+    def reject_expired(*, now: float, max_queue_wait_s: float):
+        del now, max_queue_wait_s
+        return [("q1", "queue timeout", scheduler.req)]
+
+    scheduler.reject_expired_queued_requests = reject_expired
+    scheduler.publish_exception = lambda request_id, exc: events.append(
+        (request_id, str(exc))
+    )
+    observer = _FakeObserver()
+    backend = _FakeBackend()
+    controller = RuntimeController(
+        scheduler=scheduler,
+        step_scheduler=_FakeStepScheduler(),
+        observer=observer,
+        backend=backend,
+        queue_timeout_s=1.0,
+    )
+
+    controller._reject_expired_queued_requests(now=12.0)
+
+    assert events == [("q1", "queue timeout")]
+    assert backend.released == ["q1"]
+    assert observer.rejected == [("q1", "queue timeout")]
 
 
 def test_runtime_controller_reset_stats_resets_window_and_dependencies(

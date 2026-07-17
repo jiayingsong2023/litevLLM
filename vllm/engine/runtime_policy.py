@@ -12,7 +12,7 @@ class SchedulerRuntimePolicy:
 
 @dataclass(frozen=True)
 class BackendRuntimePolicy:
-    max_prefix_cache_entries: int = 8
+    max_prefix_cache_entries: int = 0
     gpu_greedy_sampling: bool = False
     gpu_greedy_max_tokens_only: bool = False
     gpu_greedy_bypass_cpu_policies: bool = False

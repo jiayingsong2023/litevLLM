@@ -43,11 +43,15 @@ class KVBlockManager:
     def ensure_blocks(self, request_id: str, num_tokens: int) -> int:
         """Allocate additional blocks if needed. Return newly allocated count.
 
-        The number of blocks per request is capped to ``num_blocks_per_seq`` so
-        the block-table row in ``_block_table_buffer`` can always hold the IDs.
+        Requests cannot grow beyond ``num_blocks_per_seq`` because the
+        block-table row in ``_block_table_buffer`` cannot hold more IDs.
         """
         needed = cdiv(int(num_tokens), self.block_size)
-        needed = min(needed, self.num_blocks_per_seq)
+        if needed > self.num_blocks_per_seq:
+            raise ValueError(
+                f"Request {request_id} needs {needed} KV blocks for {num_tokens} "
+                f"tokens, exceeding per-request capacity {self.num_blocks_per_seq}"
+            )
         current_blocks = self._request_blocks.get(request_id)
         current_len = len(current_blocks) if current_blocks is not None else 0
         if needed <= current_len:

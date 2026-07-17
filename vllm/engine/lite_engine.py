@@ -136,6 +136,7 @@ class LiteEngine:
     def _initialize_before_model_load(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self._async_engine_lock: Any | None = None
+        self._fatal_error: BackgroundLoopError | None = None
         self.model_config = vllm_config.model_config
         self.device = torch.device("cuda:0")
         self.runtime_config: RuntimeConfig = cast(
@@ -726,6 +727,9 @@ class LiteEngine:
         lora_request: Any | None = None,
         multi_modal_data: dict[str, Any] | None = None,
     ):
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None:
+            raise RequestRejectedError(f"engine is fatal: {fatal_error}")
         if self.policies is None:
             self.policies = build_generation_policies(
                 str(self.model_config.model), self.tokenizer, self.adapter
@@ -852,25 +856,28 @@ class LiteEngine:
             raise RuntimeError("output pipeline was not initialized")
         output = self.output_pipeline.build_abort_output(request_id, req)
         self.scheduler.publish_output(request_id, output)
-        self.scheduler.abort_request(request_id)
-        self.execution_backend.free_request_resources(request_id)
+        self.execution_backend.release_request(request_id)
         self.observer.on_request_aborted(request_id)
 
     def handle_background_error(self, exc: BaseException) -> None:
+        if self._fatal_error is not None:
+            return
+        self._fatal_error = (
+            exc if isinstance(exc, BackgroundLoopError) else BackgroundLoopError(str(exc))
+        )
         request_ids = self.scheduler.request_ids()
-        self.observer.on_background_error(exc, request_ids)
+        self.observer.on_background_error(self._fatal_error, request_ids)
         for request_id in request_ids:
             self.scheduler.publish_exception(
                 request_id,
-                exc
-                if isinstance(exc, BackgroundLoopError)
-                else BackgroundLoopError(str(exc)),
+                self._fatal_error,
             )
-            self.execution_backend.free_request_resources(request_id)
-            self.scheduler.free_request(request_id)
+            self.execution_backend.release_request(request_id)
 
     @torch.inference_mode()
     def step(self) -> list[RequestOutput]:
+        if self._fatal_error is not None:
+            raise self._fatal_error
         return self.runtime_controller.step()
 
     def stats(self) -> dict[str, Any]:

@@ -129,4 +129,12 @@ def get_model_adapter(model: Any, model_config: Any) -> ModelAdapter:
         return Qwen2VLAdapter()
     if _looks_like_qwen35(model, model_config):
         return Qwen35Adapter()
+    for config in _hf_config_candidates(model_config):
+        architectures = getattr(config, "architectures", []) or []
+        if architectures and not any(
+            "llama" in str(architecture).lower() for architecture in architectures
+        ):
+            raise ValueError(
+                "unsupported model architecture: " + ", ".join(map(str, architectures))
+            )
     return LlamaAdapter()

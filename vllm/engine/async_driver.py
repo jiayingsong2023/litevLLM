@@ -88,13 +88,11 @@ class AsyncDriver:
                 error = BackgroundLoopError(str(exc))
                 self._background_errors += 1
                 logger.exception("AsyncDriver worker thread error: %s", error)
-                loop = self._loop
-                if loop is not None and hasattr(self.engine, "handle_background_error"):
-                    loop.call_soon_threadsafe(
-                        self.engine.handle_background_error, error
-                    )
-                self._sleep(self.min_step_interval_s)
-                continue
+                with self._locked_engine():
+                    if hasattr(self.engine, "handle_background_error"):
+                        self.engine.handle_background_error(error)
+                self._running = False
+                break
 
             if active_request_count > 0:
                 self._backpressure_sleeps += 1

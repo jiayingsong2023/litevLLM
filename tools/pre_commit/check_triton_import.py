@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 IMPORT_RE = re.compile(r"^\s*(import\s+triton\b|from\s+triton\b)")
@@ -30,8 +31,15 @@ def _is_excluded(path: pathlib.Path) -> bool:
 
 
 def main() -> int:
+    result = subprocess.run(
+        ["git", "ls-files", "*.py"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
     violations: list[str] = []
-    for path in ROOT.rglob("*.py"):
+    for raw_path in result.stdout.splitlines():
+        path = ROOT / raw_path
         if _is_excluded(path):
             continue
         try:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import threading
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -51,6 +52,48 @@ class AsyncLLM(EngineClient):
         multi_modal_data: dict[str, Any] | None = None,
         **kwargs,
     ) -> AsyncGenerator[RequestOutput, None]:
+        await self.submit(
+            prompt,
+            sampling_params,
+            request_id,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+            **kwargs,
+        )
+        async for output in self.stream(request_id):
+            yield output
+
+    async def submit(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str,
+        lora_request: Any | None = None,
+        multi_modal_data: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> None:
+        """Admit work before a caller starts consuming its output stream."""
+        await asyncio.to_thread(
+            self._submit_sync,
+            prompt,
+            sampling_params,
+            request_id,
+            lora_request,
+            multi_modal_data,
+            kwargs,
+        )
+        self.driver.notify_new_work()
+
+    def _submit_sync(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str,
+        lora_request: Any | None,
+        multi_modal_data: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> None:
+        del kwargs
         lora_id = getattr(lora_request, "lora_name", None) if lora_request else None
         with self._engine_lock:
             try:
@@ -74,13 +117,25 @@ class AsyncLLM(EngineClient):
                     lora_id=lora_id,
                     lora_request=lora_request,
                 )
-            self.driver.notify_new_work()
 
-        # Stream results back to API
-        async for output in self.engine.get_request_stream(request_id):
-            yield output
+    async def stream(self, request_id: str) -> AsyncGenerator[RequestOutput, None]:
+        finished = False
+        try:
+            async for output in self.engine.get_request_stream(request_id):
+                finished = output.finished
+                yield output
+        finally:
+            if not finished:
+                await self.abort(request_id)
+
+    async def close_stream(self, request_id: str) -> None:
+        """Release an admitted stream that a caller will not iterate."""
+        await self.abort(request_id)
 
     async def abort(self, request_ids: str | list[str]):
+        await asyncio.to_thread(self._abort_sync, request_ids)
+
+    def _abort_sync(self, request_ids: str | list[str]) -> None:
         if isinstance(request_ids, str):
             request_ids = [request_ids]
         with self._engine_lock:
@@ -93,6 +148,10 @@ class AsyncLLM(EngineClient):
             if hasattr(self.driver, "stats"):
                 stats["async_driver"] = self.driver.stats()
             return stats
+
+    def is_healthy(self) -> bool:
+        with self._engine_lock:
+            return getattr(self.engine, "_fatal_error", None) is None
 
     def register_lora_adapter(
         self,
@@ -117,4 +176,9 @@ class AsyncLLM(EngineClient):
             self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
 
     def shutdown(self):
+        with self._engine_lock:
+            scheduler = getattr(self.engine, "scheduler", None)
+            if scheduler is not None:
+                for request_id in scheduler.request_ids():
+                    self.engine.abort_request(request_id)
         self.driver.shutdown()

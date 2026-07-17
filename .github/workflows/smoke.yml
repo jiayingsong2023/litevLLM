@@ -6,6 +6,11 @@ on:
       - "vllm/**/*.py"
       - "tests/**/*.py"
       - "tests/*.sh"
+      - "tools/pre_commit/**"
+      - "scripts/check_lite_imports.sh"
+      - ".pre-commit-config.yaml"
+      - "AGENTS.md"
+      - "docs/**/*.md"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/smoke.yml"
@@ -15,6 +20,11 @@ on:
       - "vllm/**/*.py"
       - "tests/**/*.py"
       - "tests/*.sh"
+      - "tools/pre_commit/**"
+      - "scripts/check_lite_imports.sh"
+      - ".pre-commit-config.yaml"
+      - "AGENTS.md"
+      - "docs/**/*.md"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/smoke.yml"
@@ -41,11 +51,21 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: pip install uv
+        uses: astral-sh/setup-uv@v5
       - name: Sync development dependencies
         run: uv sync --group dev
+      - name: Run CPU smoke and governance tests
+        run: >-
+          uv run pytest tests/smoke tests/test_project_governance.py
+          tests/test_env_registry.py
       - name: Check repository style
         run: uv run ruff check .
+      - name: Enforce lite-only source tree
+        run: uv run python tools/pre_commit/check_no_cpp_sources.py
+      - name: Enforce Triton import boundary
+        run: uv run python tools/pre_commit/check_triton_import.py
+      - name: Enforce lite import closure
+        run: bash scripts/check_lite_imports.sh
       - name: Type-check concurrency contracts
         run: >-
           uv run mypy

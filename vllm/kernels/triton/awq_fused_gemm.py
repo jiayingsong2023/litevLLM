@@ -1862,7 +1862,8 @@ def _awq_native_tiled_gemm_split_k(
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
 
-    # Use atomic add if SPLIT_K > 1
+    # SPLIT_K reductions are non-deterministic because atomic-add order varies.
+    # They are benchmark/experimental paths, never a bit-exact correctness contract.
     if SPLIT_K > 1:
         tl.atomic_add(
             c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -2088,6 +2089,8 @@ def _packed_int4_symmetric_tiled_gemm_split_k(
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
 
+    # SPLIT_K reductions are non-deterministic because atomic-add order varies.
+    # They are benchmark/experimental paths, never a bit-exact correctness contract.
     if SPLIT_K > 1:
         tl.atomic_add(
             c_ptrs, result, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)

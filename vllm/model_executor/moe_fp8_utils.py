@@ -48,17 +48,15 @@ def dims_ok_for_moe_fp8(hidden: int, inter: int) -> bool:
 
 
 def fp8_block_quantize_2d(w: torch.Tensor, block_size: int = _MOE_FP8_BLOCK):
-    """
-    Convert a 2D FP16/BF16 tensor to float8_e4m3fn + block scales.
-    Matches vllm fused_moe._convert_to_fp8_with_scales layout.
-    """
-    from vllm.model_executor.layers.fused_moe.fused_moe import (
-        _convert_to_fp8_with_scales,
-    )
-
+    """Convert a 2D FP16/BF16 tensor to float8_e4m3fn + block scales."""
     out_dim, in_dim = w.shape
     assert out_dim % block_size == 0 and in_dim % block_size == 0, (w.shape,)
-    return _convert_to_fp8_with_scales(w.to(torch.float32), BS=block_size)
+    blocks = w.to(torch.float32).view(
+        out_dim // block_size, block_size, in_dim // block_size, block_size
+    ).permute(0, 2, 1, 3)
+    scales = blocks.abs().amax(dim=(-1, -2)).clamp_min(1e-12) / 448.0
+    quantized = (blocks / scales[..., None, None]).to(torch.float8_e4m3fn)
+    return quantized.permute(0, 2, 1, 3).reshape(out_dim, in_dim), scales
 
 
 def fp8_scale_shape_2d(

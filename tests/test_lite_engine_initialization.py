@@ -15,7 +15,6 @@ import torch
 
 from vllm.engine.block_allocator import BlockAllocator
 from vllm.engine.initialization import (
-    KVCacheAllocator,
     LiteRuntimeAssembler,
     MemoryAuditor,
 )
@@ -202,55 +201,6 @@ def test_memory_auditor_filters_off_device() -> None:
     auditor = MemoryAuditor(device=torch.device("meta"), topn=5)
     audit = auditor.audit(model)
     assert audit["params_count"] == 0
-
-
-def test_kv_cache_allocator_no_scale() -> None:
-    allocator = KVCacheAllocator(
-        num_layers=2,
-        num_total_blocks=4,
-        block_size=8,
-        device=torch.device("meta"),
-    )
-    kv_caches, kv_scale_caches = allocator.allocate(
-        layer_kv_specs=None,
-        kv_dtype=torch.float16,
-        kv_head_dim=16,
-        fallback_num_kv_heads=2,
-        fallback_kv_head_dim=16,
-        needs_scale_cache=False,
-    )
-    assert len(kv_caches) == 2
-    assert all(k is not None and v is not None for k, v in kv_caches)
-    assert kv_scale_caches == [(None, None), (None, None)]
-    # Meta-device tensors carry shape/dtype without allocating memory.
-    for k, v in kv_caches:
-        assert k.shape == (4, 8, 2, 16)
-        assert k.dtype == torch.float16
-        assert v.shape == k.shape
-
-
-def test_kv_cache_allocator_with_scale() -> None:
-    allocator = KVCacheAllocator(
-        num_layers=1,
-        num_total_blocks=2,
-        block_size=4,
-        device=torch.device("meta"),
-    )
-    kv_caches, kv_scale_caches = allocator.allocate(
-        layer_kv_specs=[(2, 16)],
-        kv_dtype=torch.uint8,
-        kv_head_dim=16,
-        fallback_num_kv_heads=2,
-        fallback_kv_head_dim=16,
-        needs_scale_cache=True,
-    )
-    assert len(kv_caches) == 1
-    assert len(kv_scale_caches) == 1
-    ks, vs = kv_scale_caches[0]
-    assert ks is not None and vs is not None
-    k, v = kv_caches[0]
-    assert k.shape == (2, 4, 2, 8)  # uint8 packs head_dim / 2
-    assert ks.shape == (2, 4, 2, 1)
 
 
 def test_lite_runtimeAssembler_signature_compiles_context() -> None:

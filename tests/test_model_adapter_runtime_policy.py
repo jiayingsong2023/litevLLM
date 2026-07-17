@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.adapters.gemma4 import Gemma4Adapter
 from vllm.adapters.qwen2_vl import Qwen2VLAdapter
@@ -112,6 +114,12 @@ def test_qwen_runtime_policy_owns_prefill_chunk_preference() -> None:
     assert policy.prefill_chunk_size_standard == 1024
 
 
+def test_runtime_planner_reserves_the_null_block_outside_request_capacity() -> None:
+    plan = RuntimePlanner(_runtime_config(), _caps()).build_execution_plan(4)
+
+    assert plan.num_total_blocks == 1 + plan.max_active_requests * plan.num_blocks_per_seq
+
+
 def test_registry_detects_gemma4_text_config_before_model_load() -> None:
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
@@ -162,6 +170,19 @@ def test_registry_detects_qwen2_vl_config_before_model_load() -> None:
     adapter = get_model_adapter(None, model_config)
 
     assert isinstance(adapter, Qwen2VLAdapter)
+
+
+def test_registry_rejects_unknown_architecture() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="typo_model",
+            architectures=["TypoForCausalLM"],
+            text_config=None,
+        )
+    )
+
+    with pytest.raises(ValueError, match="TypoForCausalLM"):
+        get_model_adapter(None, model_config)
 
 
 def test_runtime_planner_uses_policy_prefill_chunks(monkeypatch) -> None:

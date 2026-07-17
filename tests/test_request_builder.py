@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import pytest
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -174,6 +175,24 @@ def test_request_builder_preserves_explicit_min_tokens() -> None:
     )
 
     assert request.sampling_params.min_tokens == 2
+
+
+def test_request_builder_rejects_prompt_plus_generation_over_context() -> None:
+    builder = LiteRequestBuilder(
+        tokenizer=_Tokenizer(),
+        policies=_Policies(),
+        device=torch.device("cpu"),
+        num_layers=2,
+        max_model_len=16,
+        max_tokens_cap=16,
+    )
+
+    with pytest.raises(ValueError, match="request tokens .* exceed max_model_len"):
+        builder.build(
+            request_id="r-context-overflow",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=15),
+        )
 
 
 def test_request_builder_attaches_json_object_structured_output_constraint() -> None:

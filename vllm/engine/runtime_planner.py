@@ -6,7 +6,10 @@ import torch
 from vllm.adapters.base import ModelCapabilities, RuntimeModelPolicy
 from vllm.engine.loadtime_policy import get_total_gpu_memory_gb
 from vllm.engine.runtime_config import RuntimeConfig
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import dtype_nbytes
+
+logger = init_logger(__name__)
 
 
 def _align_kv_ctx_len(ctx: int, block_size: int, floor: int = 256) -> int:
@@ -55,11 +58,19 @@ class RuntimePlanner:
         is_high_end_gpu = gpu_total_gb > 24.0
 
         block_size = self.runtime_config.block_size
-        max_model_len = min(
-            self.caps.max_model_len, self.runtime_config.max_model_len, 4096
+        requested_max_model_len = min(
+            self.caps.max_model_len, self.runtime_config.max_model_len
         )
         if self.runtime_config.kv_max_model_len:
-            max_model_len = min(max_model_len, self.runtime_config.kv_max_model_len)
+            requested_max_model_len = min(
+                requested_max_model_len, self.runtime_config.kv_max_model_len
+            )
+        if requested_max_model_len > 4096:
+            logger.warning(
+                "Lite runtime context is capped at 4096 tokens; requested %s",
+                requested_max_model_len,
+            )
+        max_model_len = min(requested_max_model_len, 4096)
         max_model_len = _align_kv_ctx_len(max_model_len, block_size)
 
         max_active_requests = min(
@@ -76,7 +87,8 @@ class RuntimePlanner:
         max_active_requests = max(1, max_active_requests)
 
         num_blocks_per_seq = max_model_len // block_size
-        num_total_blocks = max_active_requests * num_blocks_per_seq
+        # Block 0 is a permanent null block, so it is not part of request capacity.
+        num_total_blocks = 1 + max_active_requests * num_blocks_per_seq
         default_budget = 8192 if is_high_end_gpu else 4096
         step_token_budget = max(
             1, int(self.runtime_config.max_num_batched_tokens or default_budget)

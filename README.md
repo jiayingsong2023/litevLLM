@@ -10,17 +10,17 @@
   | :--- | :--- | :--- | :--- |
   | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | [历史结果；未在 2026-07-17 重跑] |
   | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [历史结果；未在 2026-07-17 重跑] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **7.09 / 17.16** | [single isolated e2e run, 2026-07-17] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **2.76 / 4.94** | [single isolated e2e run, 2026-07-17] |
-  | **DeepSeek V4 Flash Q2 GGUF** | prompt~32, max_new=16, custom GGUF data plane | **0.49 / 2.58** | [single isolated e2e run, 2026-07-17] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **5.52 / 12.39** | [three isolated runs median, 2026-07-17] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **2.42 / 4.56** | [single isolated e2e run, 2026-07-17] |
+  | **DeepSeek V4 Flash Q2 GGUF** | prompt~32, max_new=16, custom GGUF data plane | **0.37 / 1.78** | [single isolated e2e run, 2026-07-17] |
 
   最新数值来自 `tests/e2e_full_benchmark.py --model-process-isolation` 的单次
-  运行（aggregate / decode TPS）。26B 为 `TTFT p50=2043.3ms`、
-  `prefill_tps_agg=192.82`、`decode_tps_agg=17.16`；31B 为
-  `TTFT p50=4038.1ms`、`prefill_tps_agg=97.57`、`decode_tps_agg=4.94`；
-  DeepSeek 为 `decode_tps_agg=2.58`。单次结果仅记录验证样本，不能单独作为
-  回归结论；26B 的受控三次交错 A/B 基线仍为 `decode_tps_agg=8.94`，相对
-  `52a528b79` 的 `8.96` 差异为 `-0.24%`。Standalone GPU smoke
+  运行（aggregate / decode TPS）。26B 三次独立进程的中位数为
+  `TTFT p50=2307.9ms`、`prefill_tps_agg=170.72`、`decode_tps_agg=12.39`；
+  31B 单次为 `TTFT p50=4852.7ms`、`prefill_tps_agg=81.19`、
+  `decode_tps_agg=4.56`；DeepSeek 单次为 `decode_tps_agg=1.78`。
+  26B 三次 aggregate TPS 为 5.52、5.36、5.76（约 7.3% peak-to-peak
+  波动）；31B 与 DeepSeek 仍是单次验证样本，不能单独作为回归结论。Standalone GPU smoke
   does not use the standard per-token streaming observer, so `stream_visible=0%`
   is an observability limitation rather than a correctness failure.
 

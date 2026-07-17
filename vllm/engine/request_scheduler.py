@@ -111,6 +111,8 @@ class RequestScheduler:
                 f"RequestScheduler.add_request expects RequestState, got "
                 f"{type(request).__name__}"
             )
+        if request_id in self._requests or request_id in self._request_streams:
+            raise ValueError(f"request_id is already active: {request_id}")
         slot_idx = request.slot_idx
         self._requests[request_id] = request
         self._request_streams[request_id] = asyncio.Queue()
@@ -189,18 +191,12 @@ class RequestScheduler:
             queue_wait = now - queued_at
             if queue_wait < max_queue_wait_s:
                 continue
-            self._queued_ids.remove(request_id)
-            self._queued_ids_set.discard(request_id)
-            removed_request = self._requests.pop(request_id, None)
-            self._request_slots.pop(request_id, None)
-            if removed_request is None:
-                continue
             expired.append(
                 (
                     request_id,
                     f"queue timeout after {queue_wait:.3f}s "
                     f"(limit={max_queue_wait_s:.3f}s)",
-                    removed_request,
+                    request,
                 )
             )
         return expired
@@ -225,13 +221,17 @@ class RequestScheduler:
 
     async def get_request_stream(self, request_id: str) -> AsyncIterator[RequestOutput]:
         queue = self._request_streams[request_id]
-        while True:
-            output = await queue.get()
-            if isinstance(output, BaseException):
-                raise output
-            yield output
-            if output.finished:
-                break
+        try:
+            while True:
+                output = await queue.get()
+                if isinstance(output, BaseException):
+                    raise output
+                yield output
+                if output.finished:
+                    break
+        finally:
+            if self._request_streams.get(request_id) is queue:
+                self._request_streams.pop(request_id, None)
 
     def publish_output(self, request_id: str, output: RequestOutput) -> None:
         queue = self._request_streams.get(request_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,10 @@ def score_output(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword.casefold() in folded for keyword in keywords)
 
 
+def image_data_url(path: Path) -> str:
+    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+
+
 async def run_case(
     llm: AsyncLLM,
     case: SpotcheckCase,
@@ -77,7 +82,7 @@ async def run_case(
         SamplingParams(max_tokens=max_tokens, temperature=0.0),
         request_id=f"gemma4-mm-quality-{case.case_id}",
         multi_modal_data={
-            "image": [{"image": f"file://{image_dir / case.image_name}"}],
+            "image": [{"image": image_data_url(image_dir / case.image_name)}],
         },
     ):
         output = item

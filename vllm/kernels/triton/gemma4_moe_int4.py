@@ -1495,6 +1495,8 @@ def _gemma4_moe_prefill_grouped_fused_kernel(
             axis=1,
         )
 
+    # Expert contributions use relaxed atomic adds, so accumulation order is
+    # non-deterministic; correctness is tolerance-based rather than bit-exact.
     tl.atomic_add(
         acc_ptr + token_id * stride_acc_m + offs_h * stride_acc_h,
         acc_h,

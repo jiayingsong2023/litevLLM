@@ -20,6 +20,9 @@ and feature status, use the capability matrix as the source of truth.
   compatibility, and unsupported areas.
 - [Architecture](ARCHITECTURE_LITE.md) - current lite runtime control plane and
   execution path.
+- [Runtime Hardening Design](design/runtime-hardening-and-serving-correctness.md) -
+  request/KV invariants, fatal error semantics, serving boundaries, and staged
+  acceptance gates.
 - [API Reference](API_REFERENCE.md) - maintained HTTP surface for the bundled
   OpenAI-compatible server.
 - [Inference Accuracy](INFERENCE_ACCURACY.md) - correctness tiers and local

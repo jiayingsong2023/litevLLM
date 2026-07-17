@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from vllm.engine import async_llm as async_llm_module
 from vllm.engine.async_driver import AsyncDriver
+from vllm.engine.errors import BackgroundLoopError
+from vllm.engine.lite_engine import LiteEngine
 from vllm.engine.request_scheduler import RequestScheduler
 from vllm.engine.request_state import RequestState
 from vllm.lora.request import LoRARequest
@@ -48,6 +53,7 @@ async def test_request_scheduler_stream_finishes_with_terminal_output() -> None:
     scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
     scheduler.publish_output("r1", _request_output("r1", finished=False))
     scheduler.publish_output("r1", _request_output("r1", finished=True))
+    scheduler.free_request("r1")
 
     outputs = []
     async for output in scheduler.get_request_stream("r1"):
@@ -55,6 +61,7 @@ async def test_request_scheduler_stream_finishes_with_terminal_output() -> None:
 
     assert len(outputs) == 2
     assert outputs[-1].finished is True
+    assert "r1" not in scheduler._request_streams
 
 
 @pytest.mark.asyncio
@@ -66,6 +73,47 @@ async def test_request_scheduler_stream_raises_published_exception() -> None:
     with pytest.raises(RuntimeError, match="boom"):
         async for _ in scheduler.get_request_stream("r1"):
             pass
+    assert "r1" not in scheduler._request_streams
+
+
+def test_lite_engine_background_error_publishes_then_releases_every_request() -> None:
+    published: list[tuple[str, BaseException]] = []
+    released: list[str] = []
+    observed: list[tuple[BaseException, list[str]]] = []
+    engine = SimpleNamespace(
+        _fatal_error=None,
+        scheduler=SimpleNamespace(
+            request_ids=lambda: ["r1", "r2"],
+            publish_exception=lambda request_id, exc: published.append((request_id, exc)),
+        ),
+        execution_backend=SimpleNamespace(
+            release_request=lambda request_id: released.append(request_id),
+        ),
+        observer=SimpleNamespace(
+            on_background_error=lambda exc, request_ids: observed.append(
+                (exc, request_ids)
+            ),
+        ),
+    )
+
+    LiteEngine.handle_background_error(engine, RuntimeError("step failed"))
+    LiteEngine.handle_background_error(engine, RuntimeError("later failure"))
+
+    assert isinstance(engine._fatal_error, BackgroundLoopError)
+    assert "step failed" in str(engine._fatal_error)
+    assert [request_id for request_id, _ in published] == ["r1", "r2"]
+    assert all(exc is engine._fatal_error for _, exc in published)
+    assert released == ["r1", "r2"]
+    assert observed == [(engine._fatal_error, ["r1", "r2"])]
+
+
+def test_request_scheduler_rejects_duplicate_id_until_stream_is_detached() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
+    scheduler.free_request("r1")
+
+    with pytest.raises(ValueError, match="already active"):
+        scheduler.enqueue_request("r1", _rs("r1", is_prefill=True))
 
 
 def test_request_scheduler_enqueue_and_admit_releases_queue() -> None:
@@ -110,7 +158,7 @@ def test_request_scheduler_rejects_expired_queued_requests() -> None:
     assert len(expired) == 1
     assert expired[0][0] == "r1"
     assert expired[0][2].queued_at == 1.0
-    assert scheduler.queued_ids == ["r2"]
+    assert scheduler.queued_ids == ["r1", "r2"]
 
 
 def test_async_driver_default_backpressure_interval_is_positive() -> None:
@@ -163,7 +211,7 @@ async def test_async_driver_applies_positive_backpressure_interval() -> None:
 
 @pytest.mark.asyncio
 async def test_async_driver_propagates_background_error_to_engine() -> None:
-    error_event = asyncio.Event()
+    error_event = threading.Event()
 
     class FakeEngine:
         def __init__(self) -> None:
@@ -183,7 +231,7 @@ async def test_async_driver_propagates_background_error_to_engine() -> None:
     engine = FakeEngine()
     driver = AsyncDriver(engine)
     driver.notify_new_work()
-    await asyncio.wait_for(error_event.wait(), timeout=5.0)
+    assert await asyncio.to_thread(error_event.wait, 5.0)
     driver.shutdown()
 
     assert engine.calls >= 1
@@ -391,6 +439,7 @@ async def test_async_llm_generate_abort_end_to_end(
             self.notified = 0
 
         def notify_new_work(self) -> None:
+            asyncio.get_running_loop()
             self.notified += 1
 
         def shutdown(self) -> None:
@@ -409,7 +458,8 @@ async def test_async_llm_generate_abort_end_to_end(
     )
 
     llm = async_llm_module.AsyncLLM(DummyConfig())
-    agen = llm.generate("hi", SamplingParams(max_tokens=4), "req-1")
+    await llm.submit("hi", SamplingParams(max_tokens=4), "req-1")
+    agen = llm.stream("req-1")
     abort_task = asyncio.create_task(llm.abort("req-1"))
     output = await agen.__anext__()
     await abort_task
@@ -417,6 +467,62 @@ async def test_async_llm_generate_abort_end_to_end(
     assert output.request_id == "req-1"
     assert output.finished is True
     assert llm.driver.notified == 1
+
+
+@pytest.mark.asyncio
+async def test_async_llm_stream_cancellation_aborts_admitted_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        def __init__(self, _vllm_config) -> None:
+            self.tokenizer = None
+            self.aborted: list[str] = []
+
+        def set_tokenizer(self, tokenizer) -> None:
+            self.tokenizer = tokenizer
+
+        def add_request(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def get_request_stream(self, _request_id: str):
+            await asyncio.Event().wait()
+            yield _request_output("unreachable", finished=True)
+
+        def abort_request(self, request_id: str) -> None:
+            self.aborted.append(request_id)
+
+    class FakeDriver:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def notify_new_work(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    class DummyConfig:
+        class ModelConfig:
+            model = "dummy"
+
+        model_config = ModelConfig()
+
+    monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
+
+    llm = async_llm_module.AsyncLLM(DummyConfig())
+    await llm.submit("hi", SamplingParams(max_tokens=1), "req-cancel")
+    stream = llm.stream("req-cancel")
+    pending = asyncio.create_task(stream.__anext__())
+    await asyncio.sleep(0)
+    pending.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending
+
+    assert llm.engine.aborted == ["req-cancel"]
 
 
 @pytest.mark.asyncio
