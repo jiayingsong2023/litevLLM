@@ -90,9 +90,14 @@ uv run python tests/e2e_full_benchmark.py \
 ```
 
 在 Radeon 8060S（96GB reported VRAM）、BS=1、prompt~384、max_new=24、FP8 KV 下，
-当前提交的均值为 `decode_tps_agg=8.94`、`aggregate_tps=4.86`、
+受控 A/B 的当前提交均值为 `decode_tps_agg=8.94`、`aggregate_tps=4.86`、
 `TTFT p50=2360.8ms`、`prefill_tps_agg=166.89`。与 `52a528b79` 的三次交错
 基线相比，decode TPS 差异为 `-0.24%`；单次结果不能单独作为回归结论。
+
+最近一次全模型隔离 E2E（2026-07-17）记录为：26B `aggregate_tps=7.09`、
+`decode_tps_agg=17.16`、`TTFT p50=2043.3ms`；31B `2.76`、`4.94`、
+`4038.1ms`；DeepSeek `0.49`、`2.58`、`17593.4ms`。该运行的 JSON 为
+`/tmp/fastinference-e2e-ci-gates.json`，是单次验证样本，不替代上述 A/B 基线。
 
 Gemma4 常用命令：
 

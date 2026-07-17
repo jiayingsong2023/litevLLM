@@ -1,4 +1,4 @@
-# 稳定性修复与回归保障（简要说明）
+# 稳定性修复与回归保障（历史摘要）
 
 本文档用于简要记录本轮稳定性工作，目标是避免再次出现“代码可导入但服务不可运行”的问题。
 
@@ -46,13 +46,13 @@
 - `tests/smoke/test_http_endpoints_smoke.py`
 - `tests/smoke/test_real_model_light_regression.py`
 
-## 4. CI 接入
+## 4. 当时的 CI 接入
 
 新增工作流：
 
 - `.github/workflows/smoke.yml`
 
-执行流程：
+此处记录的是当时的 smoke-only 流程，已不再是当前 CI 行为：
 
 1. `actions/setup-python`（3.12）
 2. install `uv` with the official installer if it is not already available
@@ -67,15 +67,29 @@
 - `uv.lock`
 - 工作流文件本身
 
-## 5. 如何本地复现
+## 5. 当前 CI
+
+当前 `.github/workflows/smoke.yml` 定义四类门禁：
+
+- GitHub-hosted Ubuntu 的 `static-quality`：全仓 Ruff 与最小 mypy；不导入
+  ROCm Torch。
+- 自托管 ROCm 的 `rocm-fast-regression`：快速回归。
+- 手工触发的 `rocm-correctness`：完整模型正确性回归。
+- 手工触发或带 `rocm-performance` 标签的 `rocm-performance`：固定基线的
+  隔离 E2E，并在回归时失败。
+
+ROCm 作业仅在仓库变量 `FASTINFERENCE_ROCM_RUNNER=enabled` 且符合
+[`ROCM_CI_RUNNER.md`](ROCM_CI_RUNNER.md) 的自托管 runner 存在时启用。
+
+## 6. 如何本地复现
 
 ```bash
-uv sync
-uv run pytest -q tests/smoke
+bash tests/run_regression_suite.sh
+bash tests/run_inference_correctness_regression.sh
+uv run python tests/e2e_full_benchmark.py --model-process-isolation
 ```
 
-## 6. 后续建议（可选）
+## 7. 后续建议（可选）
 
-- 增加一个更快的“前置导入检查”任务（仅做关键模块 `py_compile/import`）。
-- 逐步补功能级回归（例如 streaming chunk 格式、tokenize 参数边界）。
-- 对当前保留的 Lite 兼容实现做分层收敛，减少“临时兼容代码”长期膨胀风险。
+- 配置自托管 ROCm runner，并在首次成功后将静态检查与快速回归设为 main 的
+  required checks。

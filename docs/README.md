@@ -24,6 +24,8 @@ and feature status, use the capability matrix as the source of truth.
   OpenAI-compatible server.
 - [Inference Accuracy](INFERENCE_ACCURACY.md) - correctness tiers and local
   model quality gates.
+- [ROCm CI Runner Contract](ROCM_CI_RUNNER.md) - self-hosted runner setup and
+  the guarded correctness and performance jobs.
 - [DeepSeek V4 Flash Performance Profile](superpowers/plans/2026-06-30-deepseek-v4-flash-performance-profile.md) -
   current kept optimizations, rejected experiments, and measured bottlenecks
   for the experimental DS4 direct GGUF path.
