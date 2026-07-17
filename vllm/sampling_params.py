@@ -53,7 +53,6 @@ class SamplingParams:
     structured_outputs: Optional[StructuredOutputsParams] = None
     detokenize: bool = True
     output_kind: str = RequestOutputKind.FINAL_ONLY
-    service_class: str = "latency"
 
 
 @dataclass

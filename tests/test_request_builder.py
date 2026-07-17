@@ -133,29 +133,6 @@ def test_request_builder_attaches_choice_structured_output_constraint() -> None:
     assert request.input_ids == [10, 11]
     assert request.structured_output_constraint is not None
     assert request.queued_at is not None
-    assert request.service_class == "latency"
-
-
-def test_request_builder_preserves_explicit_service_class() -> None:
-    builder = LiteRequestBuilder(
-        tokenizer=_Tokenizer(),
-        policies=_Policies(),
-        device=torch.device("cpu"),
-        num_layers=2,
-        max_model_len=16,
-        max_tokens_cap=8,
-    )
-
-    request = builder.build(
-        request_id="r1",
-        prompt="prompt",
-        sampling_params=SamplingParams(
-            max_tokens=4,
-            service_class="background",
-        ),
-    )
-
-    assert request.service_class == "background"
 
 
 def test_request_builder_uses_explicit_default_min_new_tokens(monkeypatch) -> None:

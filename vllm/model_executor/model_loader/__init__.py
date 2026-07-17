@@ -31,6 +31,28 @@ from vllm.model_executor.moe_fp8_utils import (
     moe_fp8_enabled,
     moe_offload_enabled,
 )
+from vllm.model_executor.moe_gguf_packed import (
+    gguf_quant_type_supported_for_moe_packed,
+    numpy_gguf_data_to_packed_2d,
+)
+
+
+def _dequantize_gguf_tensor(
+    tensor: Any,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    target_shape: torch.Size | None = None,
+) -> torch.Tensor | None:
+    """Materialize a GGUF tensor for the maintained local loader."""
+    try:
+        quant_type = gguf.GGMLQuantizationType(int(tensor.tensor_type))
+        values = gguf.dequantize(np.asarray(tensor.data), quant_type)
+        result = torch.from_numpy(np.array(values, copy=True))
+        if target_shape is not None and result.numel() == prod(target_shape):
+            result = result.reshape(target_shape)
+        return result.to(device=device, dtype=dtype)
+    except Exception:
+        return None
 
 def _reorder_v_heads_ggml_to_hf(
     tensor: torch.Tensor,

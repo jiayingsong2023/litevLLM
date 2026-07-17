@@ -1,33 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import json
+import os
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional, Union, List, Callable
-from huggingface_hub import hf_hub_download, try_to_load_from_cache, list_repo_files as hf_list_repo_files
+
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
+from huggingface_hub import list_repo_files as hf_list_repo_files
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+
 def with_retry(fn: Callable, max_retries: int = 3, delay: float = 1.0):
     """A simple retry wrapper for network operations."""
+
     def wrapper(*args, **kwargs):
         retries = 0
         while retries < max_retries:
             try:
                 return fn(*args, **kwargs)
-            except Exception as e:
+            except Exception:
                 retries += 1
-                if retries >= max_retries: raise e
+                if retries >= max_retries:
+                    raise
                 time.sleep(delay * retries)
         return None
+
     return wrapper
 
-def file_or_path_exists(model: str | Path) -> bool:
-    return os.path.exists(str(model))
 
-def list_repo_files(model: str | Path, revision: Optional[str] = "main") -> List[str]:
+def file_or_path_exists(
+    model: str | Path,
+    config_name: str | None = None,
+    revision: str | None = "main",
+) -> bool:
+    if config_name is None:
+        return os.path.exists(str(model))
+    return try_get_local_file(model, config_name, revision) is not None
+
+
+def list_repo_files(model: str | Path, revision: str | None = "main") -> list[str]:
     if os.path.isdir(str(model)):
         return os.listdir(str(model))
     try:
@@ -35,8 +50,6 @@ def list_repo_files(model: str | Path, revision: Optional[str] = "main") -> List
     except Exception:
         return []
 
-def is_mistral_model_repo(model: str | Path) -> bool:
-    return False
 
 def get_hf_file_content(
     file_name: str, model: str | Path, revision: str | None = "main"
@@ -52,6 +65,7 @@ def get_hf_file_content(
         with open(file_path, "rb") as file:
             return file.read()
     return None
+
 
 def try_get_local_file(
     model: str | Path, file_name: str, revision: str | None = "main"
@@ -69,6 +83,7 @@ def try_get_local_file(
         except Exception:
             ...
     return None
+
 
 def get_hf_file_to_dict(
     file_name: str, model: str | Path, revision: str | None = "main"

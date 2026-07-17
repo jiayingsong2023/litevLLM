@@ -96,37 +96,23 @@ class RuntimeProfileRegistry:
     def resolve_from_config(
         cls,
         config: FastInferenceConfig,
-        *,
-        model_capabilities: Any | None,
-        gpu_total_gb: float,
     ) -> RuntimeProfile:
-        return cls.resolve(
-            requested_profile=config.profile,
-            model_capabilities=model_capabilities,
-            gpu_total_gb=gpu_total_gb,
-        )
+        return cls.resolve(requested_profile=config.profile)
 
     @classmethod
     def resolve(
         cls,
         *,
         requested_profile: str | None,
-        model_capabilities: Any | None,
-        gpu_total_gb: float,
     ) -> RuntimeProfile:
         requested = (requested_profile or "auto").strip().lower()
         if requested not in SUPPORTED_PROFILE_NAMES:
             requested = "auto"
-        effective = cls._effective_name(requested, model_capabilities, gpu_total_gb)
+        effective = cls._effective_name(requested)
         return cls._build(requested_name=requested, effective_name=effective)
 
     @staticmethod
-    def _effective_name(
-        requested: str,
-        model_capabilities: Any | None,
-        gpu_total_gb: float,
-    ) -> str:
-        del model_capabilities, gpu_total_gb
+    def _effective_name(requested: str) -> str:
         if requested == "auto":
             return "balanced"
         return requested

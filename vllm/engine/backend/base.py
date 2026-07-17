@@ -10,9 +10,6 @@ class ExecutionBackend(Protocol):
     def maybe_apply_prefix_cache(self, request_state) -> None:
         ...
 
-    def maybe_preempt(self, step_plan, scheduler):
-        ...
-
     def decode_step_sync(self, request_ids: list[str]) -> list[RequestOutput]:
         ...
 

@@ -5,28 +5,22 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict
 from functools import cache, partial
-from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Literal, TypeAlias
+from typing import Any
 
-import huggingface_hub
 from huggingface_hub import get_safetensors_metadata
-from packaging.version import Version
-from transformers import GenerationConfig, PretrainedConfig
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 from transformers.models.auto.image_processing_auto import get_image_processor_config
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     MODEL_MAPPING_NAMES,
 )
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
-from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.transformers_utils.repo_utils import is_mistral_model_repo
 from vllm.transformers_utils.utils import parse_safetensors_file_metadata
 
-from .config_parser_base import ConfigParserBase
 from .gguf_utils import (
     check_gguf_file,
     is_gguf,
@@ -41,23 +35,8 @@ from .repo_utils import (
     with_retry,
 )
 
-try:
-    # Transformers v5
-    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
-except ImportError:
-    # Transformers v4
-    from transformers.configuration_utils import (
-        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES,
-    )
-
-if envs.VLLM_USE_MODELSCOPE:
-    from modelscope import AutoConfig
-else:
-    from transformers import AutoConfig
-
-MISTRAL_CONFIG_NAME = "params.json"
-
 logger = init_logger(__name__)
+
 
 class LazyConfigDict(dict):
     def __getitem__(self, key):
@@ -68,33 +47,9 @@ class LazyConfigDict(dict):
 
         return getattr(configs, value)
 
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
-    afmoe="AfmoeConfig",
-    bagel="BagelConfig",
-    chatglm="ChatGLMConfig",
-    deepseek_vl_v2="DeepseekVLV2Config",
-    deepseek_v32="DeepseekV3Config",
-    flex_olmo="FlexOlmoConfig",
     gemma4="Gemma4Config",
-    hunyuan_vl="HunYuanVLConfig",
-    isaac="IsaacConfig",
-    kimi_linear="KimiLinearConfig",
-    kimi_vl="KimiVLConfig",
-    kimi_k25="KimiK25Config",
-    RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
-    RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)
-    jais="JAISConfig",
-    mlp_speculator="MLPSpeculatorConfig",
-    medusa="MedusaConfig",
-    eagle="EAGLEConfig",
-    speculators="SpeculatorsConfig",
-    nemotron="NemotronConfig",
-    olmo3="Olmo3Config",
-    ovis="OvisConfig",
-    step3_vl="Step3VLConfig",
-    step3_text="Step3TextConfig",
-    lfm2_moe="Lfm2MoeConfig",
-    tarsier2="Tarsier2Config",
 )
 
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {
@@ -107,116 +62,6 @@ _AUTO_CONFIG_KWARGS_OVERRIDES: dict[str, dict[str, Any]] = {
     "NVLM_D": {"has_no_defaults_at_init": True},
 }
 
-def is_rope_parameters_nested(rope_parameters: dict[str, Any]) -> bool:
-    if config_format not in _CONFIG_FORMAT_TO_CONFIG_PARSER:
-        raise ValueError(f"Unknown config format `{config_format}`.")
-    return _CONFIG_FORMAT_TO_CONFIG_PARSER[config_format]()
-
-def register_config_parser(config_format: str):
-
-    def _wrapper(config_parser_cls):
-        if config_format in _CONFIG_FORMAT_TO_CONFIG_PARSER:
-            logger.warning(
-                "Config format `%s` is already registered, and will be "
-                "overwritten by the new parser class `%s`.",
-                config_format,
-                config_parser_cls,
-            )
-        if not issubclass(config_parser_cls, ConfigParserBase):
-            raise ValueError(
-                "The config parser must be a subclass of `ConfigParserBase`."
-            )
-        _CONFIG_FORMAT_TO_CONFIG_PARSER[config_format] = config_parser_cls
-        logger.info(
-            "Registered config parser `%s` with config format `%s`",
-            config_parser_cls,
-            config_format,
-        )
-        return config_parser_cls
-
-    return _wrapper
-
-def set_default_rope_theta(config: PretrainedConfig, default_theta: float) -> None:
-    if getattr(config, "rope_parameters", None) is None:
-        config.rope_parameters = {"rope_type": "default"}
-    if "rope_theta" not in config.rope_parameters:
-        config.rope_parameters["rope_theta"] = default_theta
-
-def patch_rope_parameters(config: PretrainedConfig) -> None:
-    return (
-        _uses_mrope(config)
-        or _uses_mrope(config.get_text_config())
-        or thinker_uses_mrope(config)
-    )
-
-def thinker_uses_mrope(config: PretrainedConfig) -> bool:
-    xdrope_section = getattr(config, "xdrope_section", None)
-    if xdrope_section is not None and isinstance(xdrope_section, list):
-        return len(xdrope_section)
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None:
-        return 0
-
-    if isinstance(rope_scaling, dict) and "xdrope_section" in rope_scaling:
-        xdrope_section = rope_scaling["xdrope_section"]
-        if xdrope_section is not None and isinstance(xdrope_section, list):
-            return len(xdrope_section)
-
-    return 0
-
-def is_encoder_decoder(config: PretrainedConfig) -> bool:
-    """Remap config attributes based on _CONFIG_ATTRS_MAPPING."""
-    for old_attr, new_attr in _CONFIG_ATTRS_MAPPING.items():
-        if hasattr(config, old_attr):
-            if not hasattr(config, new_attr):
-                config.update({new_attr: getattr(config, old_attr)})
-            logger.debug("Remapped config attribute '%s' to '%s'", old_attr, new_attr)
-    return config
-
-def maybe_override_with_speculators(
-    model: str,
-    tokenizer: str | None,
-    trust_remote_code: bool,
-    revision: str | None = None,
-    vllm_speculative_config: dict[str, Any] | None = None,
-    **kwargs,
-) -> tuple[str, str | None, dict[str, Any] | None]:
-    if check_gguf_file(model):
-        kwargs["gguf_file"] = Path(model).name
-        gguf_model_repo = Path(model).parent
-    elif is_remote_gguf(model):
-        repo_id, _ = split_remote_gguf(model)
-        gguf_model_repo = Path(repo_id)
-    else:
-        gguf_model_repo = None
-    kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model if gguf_model_repo is None else gguf_model_repo,
-        revision=revision,
-        trust_remote_code=trust_remote_code,
-        **kwargs,
-    )
-    speculators_config = config_dict.get("speculators_config")
-
-    if speculators_config is None:
-        # No speculators config found, return original values
-        return model, tokenizer, vllm_speculative_config
-
-    # Speculators format detected - process overrides
-    from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
-
-    speculative_config = SpeculatorsConfig.extract_vllm_speculative_config(
-        config_dict=config_dict
-    )
-
-    # Set the draft model to the speculators model
-    speculative_config["model"] = model
-
-    # Override model and tokenizer with the verifier model from config
-    verifier_model = speculators_config["verifier"]["name_or_path"]
-    model = tokenizer = verifier_model
-
-    return model, tokenizer, speculative_config
 
 def get_config(
     model: str | Path,
@@ -243,68 +88,26 @@ def get_config(
             # Keep model as repo_id:quant_type for download, but use repo_id for config
             model, _ = split_remote_gguf(model)
 
-    if config_format == "auto":
-        try:
-            # First check for Mistral to avoid defaulting to
-            # Transformers implementation.
-            if is_mistral_model_repo(
-                model_name_or_path=str(model), revision=revision
-            ) and file_or_path_exists(
-                model=model, config_name=MISTRAL_CONFIG_NAME, revision=revision
-            ):
-                config_format = "mistral"
-            elif (_is_gguf and not _is_remote_gguf) or file_or_path_exists(
-                model, HF_CONFIG_NAME, revision=revision
-            ):
-                config_format = "hf"
-            # Remote GGUF models must have config.json in repo,
-            # otherwise the config can't be parsed correctly.
-            # FIXME(Isotr0py): Support remote GGUF repos without config.json
-            elif _is_remote_gguf and not file_or_path_exists(
-                model, HF_CONFIG_NAME, revision=revision
-            ):
-                err_msg = (
-                    "Could not find config.json for remote GGUF model repo. "
-                    "To load remote GGUF model through `<repo_id>:<quant_type>`, "
-                    "ensure your model has config.json (HF format) file. "
-                    "Otherwise please specify --hf-config-path <original_repo> "
-                    "in engine args to fetch config from unquantized hf model."
-                )
-                logger.error(err_msg)
-                raise ValueError(err_msg)
-            else:
-                raise ValueError(
-                    "Could not detect config format for no config file found. "
-                    "With config_format 'auto', ensure your model has either "
-                    "config.json (HF format) or params.json (Mistral format). "
-                    "Otherwise please specify your_custom_config_format "
-                    "in engine args for customized config parser."
-                )
+    if config_format not in {"auto", "hf"}:
+        raise ValueError("FastInference supports Hugging Face config.json only.")
 
-        except Exception as e:
-            error_message = (
-                "Invalid repository ID or local directory specified:"
-                " '{model}'.\nPlease verify the following requirements:\n"
-                "1. Provide a valid Hugging Face repository ID.\n"
-                "2. Specify a local directory that contains a recognized "
-                "configuration file.\n"
-                "   - For Hugging Face models: ensure the presence of a "
-                "'config.json'.\n"
-                "   - For Mistral models: ensure the presence of a "
-                "'params.json'.\n"
-            ).format(model=model)
-
-            raise ValueError(error_message) from e
-
-    config_parser = get_config_parser(config_format)
-    config_dict, config = config_parser.parse(
+    config_dict, _ = PretrainedConfig.get_config_dict(
         model,
         trust_remote_code=trust_remote_code,
         revision=revision,
-        code_revision=code_revision,
-        hf_overrides=hf_overrides_kw,
         **kwargs,
     )
+    config_cls = _CONFIG_REGISTRY.get(config_dict.get("model_type"))
+    if config_cls is None:
+        config = AutoConfig.from_pretrained(
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            code_revision=code_revision,
+            **kwargs,
+        )
+    else:
+        config = config_cls.from_dict(config_dict)
 
     # Patching defaults for GGUF models
     if _is_gguf:
@@ -383,19 +186,11 @@ def get_config(
         logger.debug("Overriding HF config with %s", hf_overrides_fn)
         config = hf_overrides_fn(config)
 
-    # Exhaustively patch RoPE parameters everywhere they might be
-    patch_rope_parameters(config)
-    patch_rope_parameters(config.get_text_config())
-    SubConfigs: TypeAlias = dict[str, PretrainedConfig]
-    sub_configs: SubConfigs | None = getattr(config, "sub_configs", None)
-    if sub_configs:
-        for sub_config in sub_configs:
-            patch_rope_parameters(getattr(config, sub_config))
-
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
 
     return config
+
 
 @cache
 def get_pooling_config(
@@ -460,6 +255,7 @@ def get_pooling_config(
 
     return None
 
+
 def parse_pooling_type(pooling_name: str):
     if "pooling_mode_" in pooling_name:
         pooling_name = pooling_name.replace("pooling_mode_", "")
@@ -471,6 +267,7 @@ def parse_pooling_type(pooling_name: str):
         pooling_name = "last"
 
     return pooling_name.upper()
+
 
 @cache
 def get_sentence_transformer_tokenizer_config(
@@ -518,6 +315,7 @@ def get_sentence_transformer_tokenizer_config(
         return encoder_dict
     return None
 
+
 def maybe_register_config_serialize_by_value() -> None:
     try:
         import transformers_modules
@@ -557,6 +355,7 @@ def maybe_register_config_serialize_by_value() -> None:
             exc_info=e,
         )
 
+
 def get_hf_image_processor_config(
     model: str | Path,
     hf_token: bool | str | None = None,
@@ -575,6 +374,7 @@ def get_hf_image_processor_config(
         model, token=hf_token, revision=revision, **kwargs
     )
 
+
 def get_hf_text_config(config: PretrainedConfig):
     text_config = config.get_text_config()
 
@@ -587,6 +387,7 @@ def get_hf_text_config(config: PretrainedConfig):
         )
 
     return text_config
+
 
 def try_get_generation_config(
     model: str,
@@ -618,6 +419,7 @@ def try_get_generation_config(
         except OSError:  # Not found
             return None
 
+
 def try_get_safetensors_metadata(
     model: str,
     *,
@@ -634,6 +436,7 @@ def try_get_safetensors_metadata(
     except Exception:
         return None
 
+
 def try_get_tokenizer_config(
     pretrained_model_name_or_path: str | os.PathLike,
     trust_remote_code: bool,
@@ -647,6 +450,7 @@ def try_get_tokenizer_config(
         )
     except Exception:
         return None
+
 
 @cache
 def try_get_dense_modules(
@@ -681,6 +485,7 @@ def try_get_dense_modules(
     except Exception:
         return None
 
+
 def get_safetensors_params_metadata(
     model: str,
     *,
@@ -705,17 +510,6 @@ def get_safetensors_params_metadata(
             }
     return full_metadata
 
-def _download_mistral_config_file(model, revision) -> dict:
-    config_file_name = "params.json"
-    config_dict = get_hf_file_to_dict(config_file_name, model, revision)
-    if config_dict is None:
-        raise ValueError(
-            f"Failed to load mistral '{config_file_name}' config for model "
-            f"{model}. Please check if the model is a mistral-format model "
-            f"and if the config file exists."
-        )
-    assert isinstance(config_dict, dict)
-    return config_dict
 
 def _maybe_retrieve_max_pos_from_hf(model, revision, **kwargs) -> int:
     max_position_embeddings = 128_000

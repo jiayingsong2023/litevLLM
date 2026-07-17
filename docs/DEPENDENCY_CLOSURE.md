@@ -12,14 +12,14 @@ report.
 - `vllm/adapters/*` - model capability and runtime policy.
 - `vllm/model_executor/models/*` - maintained model implementations, excluding
   removed upstream Transformers modeling backend wrappers.
-- `vllm/model_executor/model_loader/*` - local model loading.
+- `vllm/model_executor/model_loader/__init__.py` - local model loading.
 - `vllm/model_executor/layers/*` - runtime layers and quantization helpers,
   excluding removed upstream pooling layers.
 - `vllm/kernels/triton/*` - maintained Triton kernels.
 - `vllm/triton_utils/*` - approved Triton import and utility surface.
 - `vllm/config/{attention,cache,load,model,model_arch,multimodal,observability,scheduler,vllm}.py`
   - maintained config dataclasses and helpers.
-- `vllm/entrypoints/openai/*` - maintained HTTP serving entrypoint.
+- `vllm/entrypoints/openai/api_server.py` - maintained HTTP serving entrypoint.
 - `vllm/engine/sampling_driver.py`, `vllm/inputs/data.py`, selected
   `vllm/transformers_utils/*`, and selected `vllm/utils/*` - sampling, prompt
   input, HF config/tokenizer support, and utility support.
@@ -39,13 +39,35 @@ runtime dependencies:
 - `vllm/entrypoints/pooling/`
 - `vllm/model_executor/layers/pooler/`
 - `vllm/model_executor/models/transformers/`
+- `vllm/model_executor/models/config.py`
+- `vllm/model_executor/layers/vocab_parallel_embedding.py`
+- `vllm/model_executor/layers/logits_processor.py`
+- `vllm/model_executor/layers/attention/kv_transfer_utils.py`
+- `vllm/model_executor/layers/fused_moe/prepare_finalize.py`
+- `vllm/model_executor/layers/fused_moe/shared_fused_moe.py`
+- `vllm/attention/`
+- `vllm/forward_context.py`
+- `vllm/entrypoints/openai/{basic,chat_completion,engine,models}/`
+- `vllm/entrypoints/openai/{server_utils,utils}.py`
+- `vllm/model_executor/models/{mixtral,qwen2_moe}.py`
+- `vllm/model_executor/model_loader/{safetensors,sharded_loader,weight_utils}.py`
 - `vllm/sample/`
 - `vllm/structured_output/`
 - `vllm/third_party/triton_kernels/`
 - `vllm/assets/`
 - `vllm/inputs/preprocess.py`
 - `vllm/multimodal/audio.py`
+- `vllm/multimodal/media/audio.py`
+- `vllm/multimodal/media/video.py`
 - `vllm/multimodal/parse.py`
+- `vllm/multimodal/video.py`
+- `vllm/multimodal/`
+- `vllm/metrics/`
+- `vllm/plugins/`
+- `vllm/pool/`
+- `vllm/usage/`
+- `vllm/device_allocator/`
+- `vllm/transformers_utils/config_parser_base.py`
 - `vllm/transformers_utils/configs/qwen3_next.py`
 - `vllm/transformers_utils/model_arch_config_convertor.py`
 - `vllm/transformers_utils/processors/hunyuan_vl_image.py`

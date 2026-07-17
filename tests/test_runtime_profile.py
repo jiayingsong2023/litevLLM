@@ -1,27 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from vllm.engine.fastinference_config import FastInferenceConfig
-from vllm.engine.runtime_policy import BackendRuntimePolicy, SchedulerRuntimePolicy
 from vllm.engine.runtime_profile import (
     SUPPORTED_PROFILE_NAMES,
     RuntimeProfile,
     RuntimeProfileRegistry,
 )
-
-
-def _caps(model_type: str = "llama") -> SimpleNamespace:
-    return SimpleNamespace(
-        model_type=model_type,
-        supports_moe=False,
-        supports_int4_kv=True,
-        supports_fp8_kv=True,
-        max_model_len=4096,
-    )
 
 
 def test_supported_profile_names_are_stable() -> None:
@@ -37,11 +24,7 @@ def test_supported_profile_names_are_stable() -> None:
 
 def test_auto_profile_resolves_to_named_effective_profile(monkeypatch) -> None:
     monkeypatch.delenv("FASTINFERENCE_PROFILE", raising=False)
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile=None,
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile=None)
 
     assert profile.requested_name == "auto"
     assert profile.effective_name == "balanced"
@@ -54,9 +37,7 @@ def test_config_profile_is_the_runtime_selector(monkeypatch) -> None:
     monkeypatch.setenv("FASTINFERENCE_PROFILE", "accuracy")
 
     profile = RuntimeProfileRegistry.resolve_from_config(
-        FastInferenceConfig(profile="latency"),
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
+        FastInferenceConfig(profile="latency")
     )
 
     assert profile.requested_name == "latency"
@@ -64,22 +45,14 @@ def test_config_profile_is_the_runtime_selector(monkeypatch) -> None:
 
 
 def test_unknown_profile_falls_back_to_auto_in_pure_resolver() -> None:
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile="experimental_local",
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile="experimental_local")
 
     assert profile.requested_name == "auto"
     assert profile.effective_name in SUPPORTED_PROFILE_NAMES
 
 
 def test_latency_profile_caps_active_work_and_enables_gpu_greedy() -> None:
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile="latency",
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile="latency")
 
     assert profile.requested_name == "latency"
     assert profile.effective_name == "latency"
@@ -91,11 +64,7 @@ def test_latency_profile_caps_active_work_and_enables_gpu_greedy() -> None:
 
 
 def test_throughput_profile_uses_batched_defaults() -> None:
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile="throughput",
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile="throughput")
 
     assert profile.requested_name == "throughput"
     assert profile.effective_name == "throughput"
@@ -104,22 +73,14 @@ def test_throughput_profile_uses_batched_defaults() -> None:
 
 
 def test_balanced_profile_is_the_default_service_policy() -> None:
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile="balanced",
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile="balanced")
 
     assert profile.effective_name == "balanced"
     assert profile.backend_policy.gpu_greedy_sampling is True
 
 
 def test_benchmark_profile_uses_turbo_int4_and_gpu_greedy() -> None:
-    profile = RuntimeProfileRegistry.resolve(
-        requested_profile="benchmark",
-        model_capabilities=_caps("llama"),
-        gpu_total_gb=24.0,
-    )
+    profile = RuntimeProfileRegistry.resolve(requested_profile="benchmark")
 
     assert profile.requested_name == "benchmark"
     assert profile.effective_name == "benchmark"
@@ -187,30 +148,3 @@ def test_runtime_profile_nested_policy_values_are_immutable_snapshots() -> None:
         profile.model_policy["set"].add("moe")
     with pytest.raises(TypeError):
         profile.kernel_policy["nested"]["tile"][0] = 32
-
-
-def test_runtime_policy_collections_are_immutable_snapshots() -> None:
-    service_weights = {"gold": 2}
-    fairness_classes = {"gold"}
-    preemptible_classes = {"silver"}
-    scheduler_policy = SchedulerRuntimePolicy(
-        service_class_weights=service_weights,
-        fairness_guardrail_service_classes=fairness_classes,
-    )
-    backend_policy = BackendRuntimePolicy(
-        preemptible_service_classes=preemptible_classes,
-    )
-
-    service_weights["gold"] = 4
-    fairness_classes.add("silver")
-    preemptible_classes.add("bronze")
-
-    assert scheduler_policy.service_class_weights == {"gold": 2}
-    assert scheduler_policy.fairness_guardrail_service_classes == frozenset({"gold"})
-    assert backend_policy.preemptible_service_classes == frozenset({"silver"})
-    with pytest.raises(TypeError):
-        scheduler_policy.service_class_weights["gold"] = 4
-    with pytest.raises(AttributeError):
-        scheduler_policy.fairness_guardrail_service_classes.add("silver")
-    with pytest.raises(AttributeError):
-        backend_policy.preemptible_service_classes.add("bronze")

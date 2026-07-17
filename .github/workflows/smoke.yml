@@ -73,7 +73,6 @@ jobs:
           vllm/engine/runtime_controller.py
           vllm/engine/step_scheduler.py
           vllm/engine/request_scheduler.py
-          vllm/engine/scheduling_constraints.py
           vllm/engine/initialization
           tests/test_async_runtime_contracts.py
           tests/test_step_scheduler.py
@@ -83,4 +82,3 @@ jobs:
           uv run mypy
           vllm/engine/async_llm.py
           vllm/engine/request_scheduler.py
-          vllm/engine/scheduling_constraints.py

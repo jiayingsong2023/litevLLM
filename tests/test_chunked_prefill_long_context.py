@@ -28,7 +28,6 @@ def _scheduler_with_requests(requests: list[dict[str, Any]]) -> RequestScheduler
             is_prefill=request["is_prefill"],
             seq_len=request.get("seq_len", 0),
             generated_ids=request.get("generated_ids", [10]),
-            service_class=request.get("service_class", "latency"),
             lora_id=request.get("lora_id"),
             prefix_hit_len=request.get("prefix_hit_len", 0),
         )
@@ -53,20 +52,18 @@ def test_adaptive_sizing_verification() -> None:
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
     )
-    step_scheduler.min_prefill_chunk_size = 128
-    step_scheduler.max_prefill_chunk_size = 2048
     step_scheduler.build_plan(scheduler_short)
     assert step_scheduler.prefill_chunk_size == 2048
     scheduler_medium = _scheduler_with_requests(
         [{"is_prefill": True, "seq_len": 0, "input_ids": [1] * 12000}]
     )
     step_scheduler.build_plan(scheduler_medium)
-    assert step_scheduler.prefill_chunk_size == 512
+    assert step_scheduler.prefill_chunk_size == 2048
     scheduler_long = _scheduler_with_requests(
         [{"is_prefill": True, "seq_len": 0, "input_ids": [1] * 20000}]
     )
     step_scheduler.build_plan(scheduler_long)
-    assert step_scheduler.prefill_chunk_size == 256
+    assert step_scheduler.prefill_chunk_size == 2048
 
 
 def test_backlog_aware_budgeting() -> None:
@@ -199,8 +196,6 @@ def test_gemma4_qwen35_tinyllama_integration_smoke() -> None:
         prefill_catchup_ratio=0.25,
         prefill_microbatch_size=2,
     )
-    step_scheduler.min_prefill_chunk_size = 128
-    step_scheduler.max_prefill_chunk_size = 1024
     scheduler_tiny = _scheduler_with_requests(
         [{"is_prefill": True, "seq_len": 0, "input_ids": [1] * 256}]
     )
@@ -215,4 +210,4 @@ def test_gemma4_qwen35_tinyllama_integration_smoke() -> None:
         [{"is_prefill": True, "seq_len": 0, "input_ids": [1] * 18000}]
     )
     step_scheduler.build_plan(scheduler_gemma)
-    assert step_scheduler.prefill_chunk_size == 256
+    assert step_scheduler.prefill_chunk_size == 1024

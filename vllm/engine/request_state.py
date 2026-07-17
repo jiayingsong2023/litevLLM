@@ -39,7 +39,6 @@ class RequestState:
     lora_id: str | None = None
     lora_int_id: int | None = None
     lora_path: str | None = None
-    service_class: str = "latency"
 
     prefix_hit_len: int = 0
     _prefix_cache_entry: Any | None = None

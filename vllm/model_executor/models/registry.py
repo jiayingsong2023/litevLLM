@@ -13,9 +13,6 @@ class _ModelRegistry:
                 "qwen2_vl",
                 "Qwen2VLForConditionalGeneration",
             ),
-            "QWen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
-            "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
-            "KimiLinearForCausalLM": ("kimi_linear", "KimiLinearForCausalLM"),
             "Qwen3_5ForConditionalGeneration": (
                 "qwen3_5",
                 "Qwen3_5ForConditionalGeneration",
