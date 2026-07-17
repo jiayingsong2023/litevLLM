@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.engine.async_llm import AsyncLLM
+from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.serving.config_builder import build_vllm_config
@@ -303,6 +304,7 @@ def main() -> None:
 
     global engine
     v_config = build_vllm_config(args.model, policy_mode=args.policy_mode)
+    object.__setattr__(v_config, "runtime_observer", InMemoryRuntimeObserver())
     engine = AsyncLLM(v_config)
 
     logger.info(

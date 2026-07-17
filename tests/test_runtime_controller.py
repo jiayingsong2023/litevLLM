@@ -56,9 +56,6 @@ class _FakeScheduler:
 
 
 class _FakeStepScheduler:
-    def update_runtime_feedback(self, _stats: dict[str, object]) -> None:
-        return None
-
     def build_plan(self, scheduler):
         return StepPlan(
             admissions=AdmissionPlan(request_ids=["q1"]),

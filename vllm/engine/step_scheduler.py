@@ -49,10 +49,6 @@ class StepScheduler:
     ) -> None:
         self._decode_prefill_planner.set_verified_decode_batch_sizes(batch_sizes)
 
-    def update_runtime_feedback(self, stats: dict[str, object] | None) -> None:
-        """Compatibility no-op: scheduling no longer adapts to observer telemetry."""
-        del stats
-
     def build_plan(self, scheduler) -> StepPlan:
         fast_plan = self._build_single_request_fast_path(scheduler)
         if fast_plan is not None:

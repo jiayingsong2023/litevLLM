@@ -64,18 +64,8 @@ jobs:
       - name: Run fast regression
         run: bash tests/run_regression_suite.sh
 
-      - name: Check core runtime style
-        run: >-
-          uv run ruff check
-          vllm/engine/async_llm.py
-          vllm/engine/lite_engine.py
-          vllm/engine/runtime_factory.py
-          vllm/engine/runtime_controller.py
-          vllm/engine/step_scheduler.py
-          vllm/engine/request_scheduler.py
-          vllm/engine/initialization
-          tests/test_async_runtime_contracts.py
-          tests/test_step_scheduler.py
+      - name: Check repository style
+        run: uv run ruff check .
 
       - name: Type-check concurrency contracts
         run: >-

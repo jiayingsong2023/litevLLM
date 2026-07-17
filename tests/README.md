@@ -80,6 +80,20 @@ RUN_DEEPSEEK_V4_FLASH_GPU_SMOKE=1 SKIP_A_TIER=1 bash tests/run_inference_correct
 uv run python tests/e2e_full_benchmark.py
 ```
 
+2026-07-17 的 Gemma4-26B 基线采用同机、同命令、独立进程的交错三次 A/B：
+
+```bash
+uv run python tests/e2e_full_benchmark.py \
+  --models gemma4_26b_a4b \
+  --model-process-isolation \
+  --json-out /tmp/gemma26b.json
+```
+
+在 Radeon 8060S（96GB reported VRAM）、BS=1、prompt~384、max_new=24、FP8 KV 下，
+当前提交的均值为 `decode_tps_agg=8.94`、`aggregate_tps=4.86`、
+`TTFT p50=2360.8ms`、`prefill_tps_agg=166.89`。与 `52a528b79` 的三次交错
+基线相比，decode TPS 差异为 `-0.24%`；单次结果不能单独作为回归结论。
+
 Gemma4 常用命令：
 
 ```bash
@@ -97,6 +111,7 @@ uv run python tests/e2e_full_benchmark.py \
 - 这个隔离模式用于避免顺序大模型 benchmark 时的显存残留 / allocator fragmentation 导致的 OOM
 - benchmark 会在 stdout 和 JSON 中记录 `RUNTIME(async)` / `RUNTIME(async,current)`，用于观察 async driver step、backpressure sleep、idle wait 和 background error
 - 如果提供历史 JSON baseline，benchmark 会生成 advisory `perf_regressions` warning；默认不阻断运行
+- 对性能敏感的代码变更，使用同机、同命令、交错至少三次的 A/B；以中位数或均值判断，而不是引用一次性 stdout 数值
 
 可显式控制：
 

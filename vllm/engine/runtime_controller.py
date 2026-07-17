@@ -75,8 +75,6 @@ class RuntimeController:
         if self.scheduler.active_request_count == 0:
             return []
 
-        self.step_scheduler.update_runtime_feedback(self.observer.stats())
-
         step_plan = self.step_scheduler.build_plan(self.scheduler)
         self._admit_requests(step_plan, now)
 
