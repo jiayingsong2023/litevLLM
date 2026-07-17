@@ -80,8 +80,8 @@ def main(args: Namespace):
             clear_line(num_printed_lines)
             num_printed_lines = 0
             for i, line in enumerate(h):
-                num_printed_lines += 1
                 print(f"Beam candidate {i}: {line!r}", flush=True)
+                num_printed_lines = i + 1
     else:
         output = get_response(response)
         for i, line in enumerate(output):

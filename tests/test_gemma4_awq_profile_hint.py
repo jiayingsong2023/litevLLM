@@ -10,7 +10,9 @@ from vllm.model_executor.model_loader import (
 )
 
 
-def test_looks_like_gemma4_31b_model_path_accepts_common_variants(tmp_path: Path) -> None:
+def test_looks_like_gemma4_31b_model_path_accepts_common_variants(
+    tmp_path: Path,
+) -> None:
     good = [
         tmp_path / "models" / "gemma-4-31B-it-AWQ-4bit",
         tmp_path / "models" / "Gemma4-31B-Q4",

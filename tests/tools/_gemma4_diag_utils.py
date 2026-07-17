@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared helpers for Gemma4 diagnostic warn-only tests."""
+
 from __future__ import annotations
 
 import re
@@ -8,7 +9,9 @@ from typing import Any
 
 
 def parse_strict_metrics(text: str) -> dict[str, Any]:
-    cos_re = re.search(r"Prefill Logits -> CosSim:\s*([0-9.]+), MaxErr:\s*([0-9.]+)", text)
+    cos_re = re.search(
+        r"Prefill Logits -> CosSim:\s*([0-9.]+), MaxErr:\s*([0-9.]+)", text
+    )
     tok_re = re.search(
         r"Prefill Token:\s*HF\(argmax\)=(-?\d+)\s*\|\s*Lite\(engine\)=(-?\d+)\s*\|\s*Lite\(argmax logits\)=(-?\d+)",
         text,
@@ -63,7 +66,14 @@ def parse_drift_metrics(text: str) -> dict[str, Any]:
     return {"token_to_step": token_map, "metrics": metrics}
 
 
-def warn_if_diff(name: str, actual: float, expected: float, tol: float, *, tag: str = "Gemma4DiagWarn") -> None:
+def warn_if_diff(
+    name: str,
+    actual: float,
+    expected: float,
+    tol: float,
+    *,
+    tag: str = "Gemma4DiagWarn",
+) -> None:
     delta = abs(actual - expected)
     if delta > tol:
         warnings.warn(
@@ -73,7 +83,9 @@ def warn_if_diff(name: str, actual: float, expected: float, tol: float, *, tag: 
         )
 
 
-def warn_if_token_mismatch(name: str, actual: int, expected: int, *, tag: str = "Gemma4DiagWarn") -> None:
+def warn_if_token_mismatch(
+    name: str, actual: int, expected: int, *, tag: str = "Gemma4DiagWarn"
+) -> None:
     if actual != expected:
         warnings.warn(
             f"[{tag}] {name} changed: actual={actual} expected={expected}",

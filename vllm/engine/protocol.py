@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Optional, Union, Dict, Any
-from vllm.sampling_params import SamplingParams
+from collections.abc import AsyncGenerator
+
 from vllm.outputs import RequestOutput
+from vllm.sampling_params import SamplingParams
+
 
 class EngineClient(ABC):
     """
     Standard interface for all LLM Engine frontends.
     """
+
     @abstractmethod
-    async def generate(
+    def generate(
         self,
         prompt: str,
         sampling_params: SamplingParams,
@@ -19,7 +22,7 @@ class EngineClient(ABC):
         pass
 
     @abstractmethod
-    async def abort(self, request_ids: Union[str, List[str]]) -> None:
+    async def abort(self, request_ids: str | list[str]) -> None:
         pass
 
     @abstractmethod

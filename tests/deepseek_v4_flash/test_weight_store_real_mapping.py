@@ -48,10 +48,7 @@ def test_real_gguf_semantic_tensor_mapping() -> None:
         assert layer_0.attention_key_value is not None
         assert layer_0.attention_key_value.name == "blk.0.attn_kv.weight"
         assert layer_0.attention_key_value_a_norm is not None
-        assert (
-            layer_0.attention_key_value_a_norm.name
-            == "blk.0.attn_kv_a_norm.weight"
-        )
+        assert layer_0.attention_key_value_a_norm.name == "blk.0.attn_kv_a_norm.weight"
         assert layer_0.attention_output_a is not None
         assert layer_0.attention_output_a.name == "blk.0.attn_output_a.weight"
         assert layer_0.attention_output_b is not None
@@ -67,10 +64,7 @@ def test_real_gguf_semantic_tensor_mapping() -> None:
 
         layer_2 = bindings.layers[2]
         assert layer_2.attention_compressor is not None
-        assert (
-            layer_2.attention_compressor.kv.name
-            == "blk.2.attn_compressor_kv.weight"
-        )
+        assert layer_2.attention_compressor.kv.name == "blk.2.attn_compressor_kv.weight"
         assert layer_2.indexer is not None
         assert layer_2.indexer.query_b.name == "blk.2.indexer.attn_q_b.weight"
 

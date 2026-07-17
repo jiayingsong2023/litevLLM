@@ -7,13 +7,13 @@ from typing import Any, TypedDict
 import ray
 import torch
 from transformers import AutoConfig
-
-from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     moe_permute,
     moe_unpermute,
 )
 from vllm.model_executor.layers.fused_moe.utils import _fp8_quantize
+
+from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed

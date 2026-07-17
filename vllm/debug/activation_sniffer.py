@@ -8,7 +8,8 @@ Useful to locate the first layer where hidden states become NaN/Inf, collapse to
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import contextlib
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -51,7 +52,7 @@ def _tensor_stats_line(
     )
 
 
-def resolve_lite_backbone(lite_model: nn.Module) -> Optional[nn.Module]:
+def resolve_lite_backbone(lite_model: nn.Module) -> nn.Module | None:
     """
     Find inner backbone holding embed_tokens + layers (e.g. LlamaModel / Qwen2Model under ForCausalLM).
     """
@@ -79,12 +80,12 @@ class LiteActivationSniffer:
     def __init__(
         self,
         lite_model: nn.Module,
-        print_fn: Optional[Callable[[str], None]] = None,
+        print_fn: Callable[[str], None] | None = None,
         *,
         include_embeddings: bool = True,
         include_final_norm: bool = True,
         include_lm_head: bool = True,
-        max_passes: Optional[int] = None,
+        max_passes: int | None = None,
     ) -> None:
         self.lite_model = lite_model
         self.print_fn = print_fn or print
@@ -93,7 +94,7 @@ class LiteActivationSniffer:
         self.include_lm_head = include_lm_head
         self.max_passes = max_passes
 
-        self._handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._pass_id = 0
         self._enabled = False
 
@@ -102,7 +103,9 @@ class LiteActivationSniffer:
             self.detach()
         backbone = resolve_lite_backbone(self.lite_model)
         if backbone is None:
-            self.print_fn("[Activation] Could not resolve backbone (no .model.layers); no hooks attached.")
+            self.print_fn(
+                "[Activation] Could not resolve backbone (no .model.layers); no hooks attached."
+            )
             return
 
         def _root_pre(_mod, _inp):
@@ -128,14 +131,28 @@ class LiteActivationSniffer:
         layers = getattr(backbone, "layers", None)
         if layers is not None:
             for i, layer in enumerate(layers):
-                self._handles.append(layer.register_forward_hook(_make_hook(f"layer.{i:02d}.out")))
+                self._handles.append(
+                    layer.register_forward_hook(_make_hook(f"layer.{i:02d}.out"))
+                )
 
-        if self.include_final_norm and hasattr(backbone, "norm") and backbone.norm is not None:
-            self._handles.append(backbone.norm.register_forward_hook(_make_hook("final_norm")))
-
-        if self.include_lm_head and hasattr(self.lite_model, "lm_head") and self.lite_model.lm_head is not None:
+        if (
+            self.include_final_norm
+            and hasattr(backbone, "norm")
+            and backbone.norm is not None
+        ):
             self._handles.append(
-                self.lite_model.lm_head.register_forward_hook(_make_hook("lm_head.logits"))
+                backbone.norm.register_forward_hook(_make_hook("final_norm"))
+            )
+
+        if (
+            self.include_lm_head
+            and hasattr(self.lite_model, "lm_head")
+            and self.lite_model.lm_head is not None
+        ):
+            self._handles.append(
+                self.lite_model.lm_head.register_forward_hook(
+                    _make_hook("lm_head.logits")
+                )
             )
 
         self._enabled = True
@@ -146,10 +163,8 @@ class LiteActivationSniffer:
 
     def detach(self) -> None:
         for h in self._handles:
-            try:
+            with contextlib.suppress(Exception):
                 h.remove()
-            except Exception:
-                pass
         self._handles.clear()
         if self._enabled:
             self.print_fn("[Activation] Sniffer detached.")

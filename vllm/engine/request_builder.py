@@ -107,10 +107,6 @@ class LiteRequestBuilder:
                 prompt
             ),
             anti_template_token_ids=self.policies.anti_template_token_ids(),
-            service_class=str(
-                getattr(effective_sampling_params, "service_class", "latency")
-                or "latency"
-            ),
             multi_modal_data=prepared_multi_modal_data,
             is_multimodal=bool((prepared_multi_modal_data or {}).get("image")),
             is_multimodal_lora=bool(lora_id)

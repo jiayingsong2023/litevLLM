@@ -241,9 +241,7 @@ def _paged_attention_debug_snapshot(
         for row, count in enumerate(required)
         for block_id in table_cpu[row, :count].tolist()
     ]
-    invalid_lengths = [
-        row for row, count in enumerate(required) if count > table_cols
-    ]
+    invalid_lengths = [row for row, count in enumerate(required) if count > table_cols]
     invalid_ids = [
         block_id
         for block_id in used_ids
@@ -613,18 +611,23 @@ def paged_attention_v1(
         )
         print(f"PAGED_ATTN_DEBUG before={json.dumps(debug_snapshot, sort_keys=True)}")
 
-    # KV Block Selective Attention: convert ratio to stride.
-    # select_ratio=0.0 → disabled, 0.25 → stride 4, 0.5 → stride 2, 1.0 → stride 1.
     select_ratio = max(0.0, min(1.0, float(kv_select_ratio)))
     use_selection = select_ratio > 0.0
     select_stride = max(1, int(1.0 / select_ratio)) if use_selection else 1
     min_selected = max(1, int(kv_select_min_blocks))
+    active_blocks = kwargs.get("active_blocks")
+    active_offsets = kwargs.get("active_offsets")
     if use_selection:
-        active_blocks_cpu, active_offsets_cpu = build_selective_block_indices(
-            seq_lens, int(block_size), select_stride, min_selected
-        )
-        active_blocks = active_blocks_cpu.to(device=query.device, non_blocking=False)
-        active_offsets = active_offsets_cpu.to(device=query.device, non_blocking=False)
+        if active_blocks is None or active_offsets is None:
+            active_blocks_cpu, active_offsets_cpu = build_selective_block_indices(
+                seq_lens, int(block_size), select_stride, min_selected
+            )
+            active_blocks = active_blocks_cpu.to(
+                device=query.device, non_blocking=False
+            )
+            active_offsets = active_offsets_cpu.to(
+                device=query.device, non_blocking=False
+            )
     else:
         active_blocks = out
         active_offsets = out

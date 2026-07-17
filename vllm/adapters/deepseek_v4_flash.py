@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from vllm.engine.custom_runtime_components import CustomRuntimeComponents
 from vllm.model_executor.models.deepseek_v4_flash.config import (
     DEEPSEEK_V4_FLASH_SHAPE,
@@ -54,7 +56,9 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
         observer: Any | None,
         **kwargs: Any,
     ) -> CustomRuntimeComponents:
-        device = kwargs.get("device") or getattr(model, "device", lambda: "cuda:0")()
+        device = torch.device(
+            kwargs.get("device") or getattr(model, "device", lambda: "cuda:0")()
+        )
         context_length = int(
             getattr(runtime_config, "kv_max_model_len", None)
             or getattr(runtime_config, "max_model_len", None)
@@ -78,8 +82,6 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
             kv_block_manager=kv_block_manager,
             multimodal_processor=None,
         )
-
-
 
     def estimate_kv_bytes(
         self,
@@ -105,6 +107,30 @@ class DeepSeekV4FlashAdapter(ModelAdapter):
     def estimate_staging_bytes(self, *, max_active_requests: int) -> int:
         del max_active_requests
         return int(DeepSeekV4FlashMemoryPolicy.default_expert_cache_bytes)
+
+    def admission_cap(
+        self,
+        *,
+        current_max_active_requests: int,
+        max_model_len: int,
+        runtime_config: Any,
+    ) -> int:
+        """Keep the model-owned compressed-KV runtime inside its memory budget."""
+        budget = int(
+            (getattr(runtime_config, "model_policy", {}) or {}).get(
+                "runtime_budget_bytes", 0
+            )
+            or 0
+        )
+        if budget <= 0:
+            return current_max_active_requests
+        per_request = self.estimate_kv_bytes(
+            max_active_requests=1,
+            context_length=max_model_len,
+        ) + self.estimate_staging_bytes(max_active_requests=1)
+        if per_request <= 0:
+            return current_max_active_requests
+        return max(1, min(current_max_active_requests, budget // per_request))
 
     def validate_request(
         self,

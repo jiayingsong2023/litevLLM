@@ -209,7 +209,7 @@ class Gemma4ForConditionalGeneration(nn.Module):
             lora_mapping,
             multimodal_embeddings=multimodal_embeddings,
         )
-        with _gemma4_profile_span("lm_head", self._layer_config):
+        with _gemma4_profile_span("lm_head", getattr(self, "_layer_config", None)):
             if getattr(self.model.config, "tie_word_embeddings", False):
                 last_hidden = hidden[:, -1:, :]
                 if _gemma4_kernel_policy_truthy(

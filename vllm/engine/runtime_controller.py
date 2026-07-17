@@ -15,8 +15,6 @@ from vllm.outputs import RequestOutput
 class ExecutionBackend(Protocol):
     """Control-plane contract for the single-GPU execution backend."""
 
-    def maybe_preempt(self, step_plan: StepPlan, scheduler: Any) -> StepPlan: ...
-
     def ensure_kv_blocks(self, step_plan: StepPlan) -> None: ...
 
     def maybe_apply_prefix_cache(self, request: Any) -> None: ...
@@ -77,14 +75,7 @@ class RuntimeController:
         if self.scheduler.active_request_count == 0:
             return []
 
-        self.step_scheduler.update_runtime_feedback(self.observer.stats())
-
         step_plan = self.step_scheduler.build_plan(self.scheduler)
-        if not (
-            self.scheduler.running_request_count == 1
-            and self.scheduler.queued_request_count == 0
-        ):
-            step_plan = self.backend.maybe_preempt(step_plan, self.scheduler)
         self._admit_requests(step_plan, now)
 
         if self.scheduler.running_request_count == 0:
@@ -131,11 +122,7 @@ class RuntimeController:
             req = self.scheduler.get_request(request_id)
             self.backend.maybe_apply_prefix_cache(req)
             queue_wait_s = max(0.0, now - float(req.queued_at or now))
-            self.observer.on_request_admitted(
-                request_id,
-                queue_wait_s,
-                str(req.service_class or "latency"),
-            )
+            self.observer.on_request_admitted(request_id, queue_wait_s)
 
     def stats(self) -> dict[str, Any]:
         observer_stats = dict(self.observer.stats())

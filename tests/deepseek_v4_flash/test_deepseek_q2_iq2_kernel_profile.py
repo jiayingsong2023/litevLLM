@@ -21,12 +21,10 @@ def _iq2_xxs_deterministic_payload(rows: int) -> bytes:
         groups = bytearray()
         for group in range(8):
             grid_bytes = bytes(
-                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF)
-                for idx in range(4)
+                ((row * 19 + group * 29 + idx * 37 + 0x17) & 0xFF) for idx in range(4)
             )
             sign_indices = [
-                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F
-                for idx in range(4)
+                (row * 11 + group * 7 + idx * 23 + 0x05) & 0x7F for idx in range(4)
             ]
             scale_code = (row + group * 3) & 0x0F
             q_sign_scale = (

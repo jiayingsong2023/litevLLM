@@ -3,7 +3,6 @@
 import contextlib
 import copy
 from pathlib import Path
-from typing import TypeAlias
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -11,7 +10,8 @@ from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_co
 
 from .protocol import TokenizerLike
 
-HfTokenizer: TypeAlias = PreTrainedTokenizer | PreTrainedTokenizerFast
+type HfTokenizer = PreTrainedTokenizer | PreTrainedTokenizerFast
+
 
 def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     cached_tokenizer = copy.copy(tokenizer)
@@ -56,6 +56,7 @@ def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
     cached_tokenizer.__class__ = CachedTokenizer
     return cached_tokenizer
+
 
 class CachedHfTokenizer(TokenizerLike):
     @classmethod
@@ -117,9 +118,7 @@ class CachedHfTokenizer(TokenizerLike):
 
         # The special_tokens in tokenizer should also be
         # controlled by do_lower_case in encoder_config
-        encoder_config = get_sentence_transformer_tokenizer_config(
-            tok_path, revision
-        )
+        encoder_config = get_sentence_transformer_tokenizer_config(tok_path, revision)
         if isinstance(encoder_config, dict) and encoder_config.get(
             "do_lower_case", False
         ):

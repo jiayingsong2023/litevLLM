@@ -21,7 +21,6 @@ import argparse
 import pprint
 
 import requests
-
 from vllm.multimodal.utils import encode_image_url, fetch_image
 
 query = "A woman playing with her dog on a beach at sunset."

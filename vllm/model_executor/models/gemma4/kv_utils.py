@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from .policy_utils import (
     _gemma4_model_policy_truthy,
-    _meta_cpu_max_seq_len,
     _meta_cpu_seq_lens,
     _meta_get,
     _meta_set,
@@ -335,10 +334,7 @@ def _build_local_decode_aligned_metadata(
         max_blocks = 0
         for i in range(bsz):
             sl = int(seq_lens_cpu[i])
-            if lw > 0:
-                st = max(0, sl - lw)
-            else:
-                st = 0
+            st = max(0, sl - lw) if lw > 0 else 0
             sa = (st // block_size) * block_size
             nb = (sl - sa + block_size - 1) // block_size
             if nb > max_blocks:

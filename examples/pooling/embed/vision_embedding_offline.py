@@ -13,9 +13,9 @@ import argparse
 from dataclasses import asdict
 
 from PIL.Image import Image
+from vllm.multimodal.utils import fetch_image
 
 from vllm import LLM, EngineArgs
-from vllm.multimodal.utils import fetch_image
 
 image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
 text = "A cat standing in the snow."

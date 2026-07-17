@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -17,7 +18,7 @@ def _as_int(v: Any, default: int) -> int:
         return default
 
 
-def _read_bits_group_size(cfg: Dict[str, Any]) -> tuple[int, int]:
+def _read_bits_group_size(cfg: dict[str, Any]) -> tuple[int, int]:
     weight_bits = _as_int(cfg.get("weight_bits", cfg.get("bits", 4)), 4)
     group_size = _as_int(cfg.get("group_size", 128), 128)
     groups = cfg.get("config_groups")
@@ -85,7 +86,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         high_fidelity = _compressed_tensors_high_fidelity_enabled(
             getattr(layer, "_fastinference_config", None)
         )
-        if qzeros is not None and isinstance(qzeros, torch.Tensor) and qzeros.numel() > 1:
+        if (
+            qzeros is not None
+            and isinstance(qzeros, torch.Tensor)
+            and qzeros.numel() > 1
+        ):
             return AWQWeight(
                 qweight,
                 scales,
@@ -105,9 +110,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             profile_hint=str(getattr(layer, "awq_profile_hint", "")),
         )
 
-    def apply(
-        self, layer: nn.Module, x: torch.Tensor, *args, **kwargs
-    ) -> torch.Tensor:
+    def apply(self, layer: nn.Module, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         del args
         weight = getattr(layer, "_quant_weight", None)
         if weight is None:
@@ -122,8 +125,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         self,
         layer: nn.Module,
         weights_iter: Iterable[tuple[str, torch.Tensor]],
-        expert_idx: Optional[int] = None,
-        part: Optional[str] = None,
+        expert_idx: int | None = None,
+        part: str | None = None,
     ):
         del expert_idx, part
         for name, loaded_weight in weights_iter:
@@ -145,9 +148,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                 if len(vals) >= 2:
                     layer.weight_shape = (int(vals[0]), int(vals[1]))
             elif key == "bias":
-                layer.bias = nn.Parameter(loaded_weight.contiguous(), requires_grad=False)
+                layer.bias = nn.Parameter(
+                    loaded_weight.contiguous(), requires_grad=False
+                )
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "CompressedTensorsConfig":
+    def from_config(cls, config: dict[str, Any]) -> CompressedTensorsConfig:
         bits, group_size = _read_bits_group_size(config)
         return cls(weight_bits=bits, group_size=group_size)

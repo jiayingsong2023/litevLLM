@@ -26,6 +26,7 @@ The fused weight object is attached to ``owner`` as an attribute named
 ``_fused_awq_pair_<cache_key>`` so re-entering the same module reuses it
 without re-concatenating int4 bytes per step.
 """
+
 from __future__ import annotations
 
 from typing import Any

@@ -1,71 +1,67 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from http import HTTPStatus
+from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
-from typing_extensions import assert_never
-
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.serve.tokenize.protocol import (
-    DetokenizeRequest,
-    DetokenizeResponse,
-    TokenizeRequest,
-    TokenizeResponse,
-)
-from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
-from vllm.entrypoints.utils import with_cancellation
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 
 
-def tokenization(request: Request) -> OpenAIServingTokenization:
-    return request.app.state.openai_serving_tokenization
+class TokenizeRequest(BaseModel):
+    prompt: str
+    add_special_tokens: bool = True
+    return_token_strs: bool = False
+
+
+class DetokenizeRequest(BaseModel):
+    tokens: list[int] = Field(default_factory=list)
+
+
+def _tokenizer(request: Request) -> Any:
+    """Resolve the tokenizer supplied by the application attaching this router."""
+    tokenizer = getattr(request.app.state, "tokenizer", None)
+    if tokenizer is None:
+        engine = getattr(request.app.state, "engine", None)
+        tokenizer = getattr(getattr(engine, "engine", None), "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="tokenize router requires app.state.tokenizer or app.state.engine",
+        )
+    return tokenizer
 
 
 router = APIRouter()
 
 
-@router.post(
-    "/tokenize",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-async def tokenize(request: TokenizeRequest, raw_request: Request):
-    handler = tokenization(raw_request)
-    result = await handler.create_tokenize(request, raw_request)
+@router.post("/tokenize")
+async def tokenize(request: TokenizeRequest, raw_request: Request) -> dict[str, Any]:
+    tokenizer = _tokenizer(raw_request)
+    tokens = list(
+        tokenizer.encode(
+            request.prompt,
+            add_special_tokens=request.add_special_tokens,
+        )
+    )
+    token_strs = (
+        list(tokenizer.convert_ids_to_tokens(tokens))
+        if request.return_token_strs
+        else None
+    )
+    return {
+        "tokens": tokens,
+        "token_strs": token_strs,
+        "count": len(tokens),
+        "max_model_len": int(getattr(tokenizer, "model_max_length", 0) or 0),
+    }
 
-    if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
-    if isinstance(result, TokenizeResponse):
-        return JSONResponse(content=result.model_dump())
-    assert_never(result)
 
-
-@router.post(
-    "/detokenize",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-async def detokenize(request: DetokenizeRequest, raw_request: Request):
-    handler = tokenization(raw_request)
-    result = await handler.create_detokenize(request, raw_request)
-
-    if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
-    if isinstance(result, DetokenizeResponse):
-        return JSONResponse(content=result.model_dump())
-    assert_never(result)
+@router.post("/detokenize")
+async def detokenize(
+    request: DetokenizeRequest,
+    raw_request: Request,
+) -> dict[str, str]:
+    return {"prompt": _tokenizer(raw_request).decode(request.tokens)}
 
 
 def attach_router(app: FastAPI) -> None:

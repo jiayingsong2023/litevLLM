@@ -21,8 +21,6 @@ import time
 import pandas as pd
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
-
-from vllm.config.vllm import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
@@ -32,10 +30,12 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm  # noqa
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8  # noqa
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape  # noqa
+
+from vllm.config.vllm import CompilationConfig, VllmConfig, set_current_vllm_config
+from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm  # noqa
 from vllm.platforms import current_platform  # noqa
 
 RMS_NORM_OP = torch.ops._C.rms_norm

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -19,6 +20,16 @@ def _read_package(dir_path: str) -> str:
         if f.suffix == ".py":
             parts.append(f.read_text(encoding="utf-8"))
     return "\n".join(parts)
+
+
+def test_lite_runtime_sources_are_parseable() -> None:
+    invalid: list[str] = []
+    for path in (ROOT / "vllm").rglob("*.py"):
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            invalid.append(f"{path.relative_to(ROOT)}:{exc.lineno}: {exc.msg}")
+    assert not invalid, "\n".join(invalid)
 
 
 def _awq_env_context_violations(
@@ -63,6 +74,10 @@ def test_fastinference_env_names_are_registered() -> None:
         ".mypy_cache",
         ".ruff_cache",
         ".pytest_cache",
+        ".gemini",
+        ".claude",
+        ".cursor",
+        ".superpowers",
     }
     pattern = re.compile(r"(?<![A-Z0-9_])FASTINFERENCE_[A-Z0-9_]*[A-Z0-9](?![A-Z0-9_])")
     found: set[str] = set()
@@ -70,6 +85,8 @@ def test_fastinference_env_names_are_registered() -> None:
         if not path.is_file():
             continue
         rel = path.relative_to(ROOT)
+        if rel.parts[0] not in {"tests", "vllm"}:
+            continue
         if any(part in ignored_roots for part in rel.parts):
             continue
         if rel.parts[:2] == ("tests", "reports"):
@@ -135,9 +152,19 @@ def test_broken_upstream_residue_paths_are_absent() -> None:
         "vllm/assets/base.py",
         "vllm/assets/image.py",
         "vllm/assets/video.py",
+        "vllm/_bc_linter.py",
+        "vllm/beam_search.py",
+        "vllm/cudagraph_dispatcher.py",
+        "vllm/collect_env.py",
         "vllm/config/device.py",
         "vllm/config/utils.py",
+        "vllm/device_allocator/cumem.py",
+        "vllm/env_override.py",
         "vllm/inputs/preprocess.py",
+        "vllm/logits_process.py",
+        "vllm/logprobs.py",
+        "vllm/metrics/perf.py",
+        "vllm/metrics/stats.py",
         "vllm/model_executor/models/transformers/__init__.py",
         "vllm/model_executor/models/transformers/base.py",
         "vllm/model_executor/models/transformers/causal.py",
@@ -146,8 +173,39 @@ def test_broken_upstream_residue_paths_are_absent() -> None:
         "vllm/model_executor/models/transformers/multimodal.py",
         "vllm/model_executor/models/transformers/pooling.py",
         "vllm/model_executor/models/transformers/utils.py",
+        "vllm/model_inspection.py",
+        "vllm/model_executor/models/config.py",
+        "vllm/model_executor/layers/attention/kv_transfer_utils.py",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize.py",
+        "vllm/model_executor/layers/fused_moe/shared_fused_moe.py",
+        "vllm/model_executor/layers/logits_processor.py",
+        "vllm/model_executor/layers/vocab_parallel_embedding.py",
+        "vllm/model_executor/models/mixtral.py",
+        "vllm/model_executor/models/qwen2_moe.py",
+        "vllm/model_executor/model_loader/weight_utils.py",
+        "vllm/attention/backend.py",
+        "vllm/forward_context.py",
+        "vllm/entrypoints/openai/engine/serving.py",
         "vllm/multimodal/audio.py",
+        "vllm/multimodal/media/audio.py",
+        "vllm/multimodal/media/video.py",
         "vllm/multimodal/parse.py",
+        "vllm/multimodal/video.py",
+        "vllm/multimodal/registry.py",
+        "vllm/renderers/mistral.py",
+        "vllm/renderers/deepseek_v32.py",
+        "vllm/serial_utils.py",
+        "vllm/request.py",
+        "vllm/scalar_type.py",
+        "vllm/sequence.py",
+        "vllm/tasks.py",
+        "vllm/tokenizers/mistral.py",
+        "vllm/tokenizers/deepseek_v32.py",
+        "vllm/tracing.py",
+        "vllm/transformers_utils/config_parser_base.py",
+        "vllm/transformers_utils/processor.py",
+        "vllm/v1_outputs.py",
+        "vllm/v1_utils.py",
         "vllm/transformers_utils/configs/qwen3_next.py",
         "vllm/transformers_utils/model_arch_config_convertor.py",
         "vllm/transformers_utils/processors/hunyuan_vl_image.py",
@@ -156,6 +214,20 @@ def test_broken_upstream_residue_paths_are_absent() -> None:
     present = [path for path in removed_files if (ROOT / path).exists()]
     assert not present, "Broken upstream residue paths must stay removed: " + ", ".join(
         present
+    )
+
+
+def test_lite_runtime_does_not_import_removed_upstream_runtimes() -> None:
+    forbidden = re.compile(
+        r"vllm\.(distributed|worker|core|executor|grpc|spec_decode|compilation)"
+    )
+    matches = [
+        str(path.relative_to(ROOT))
+        for path in (ROOT / "vllm").rglob("*.py")
+        if forbidden.search(path.read_text(encoding="utf-8"))
+    ]
+    assert not matches, "Removed runtime imports must stay absent: " + ", ".join(
+        matches
     )
 
 
@@ -328,7 +400,6 @@ def test_lite_inference_config_has_no_env_factory() -> None:
 
 def test_kv_attention_layers_do_not_read_fastinference_env_directly() -> None:
     production_files = [
-        "vllm/model_executor/layers/attention/attention.py",
         "vllm/model_executor/layers/quantization/kv_cache.py",
     ]
     forbidden_patterns = (

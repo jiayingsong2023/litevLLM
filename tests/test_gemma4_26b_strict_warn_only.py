@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +17,9 @@ from tests.tools._gemma4_diag_utils import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
-_BASELINE_PATH = _ROOT / "tests" / "tools" / "fixtures" / "gemma4_26b_a_strict_baseline.json"
+_BASELINE_PATH = (
+    _ROOT / "tests" / "tools" / "fixtures" / "gemma4_26b_a_strict_baseline.json"
+)
 
 _MODEL_CANDIDATES: tuple[str, ...] = (
     "models/gemma-4-26B-A4B-it-AWQ-4bit",
@@ -65,13 +66,19 @@ def test_gemma4_26b_strict_baseline_fixture_schema() -> None:
 
 def test_gemma4_26b_strict_warn_only_against_baseline() -> None:
     if os.environ.get("RUN_GEMMA4_26B_DIAGNOSTIC", "0") != "1":
-        pytest.skip("Set RUN_GEMMA4_26B_DIAGNOSTIC=1 to run Gemma4-26B strict warn-only audit.")
+        pytest.skip(
+            "Set RUN_GEMMA4_26B_DIAGNOSTIC=1 to run Gemma4-26B strict warn-only audit."
+        )
     if not torch.cuda.is_available():
-        pytest.skip("CUDA/ROCm unavailable; skipping Gemma4-26B strict warn-only audit.")
+        pytest.skip(
+            "CUDA/ROCm unavailable; skipping Gemma4-26B strict warn-only audit."
+        )
 
     model = _resolve_model_path()
     if not model or not Path(model).is_dir():
-        pytest.skip("Gemma4-26B local model dir not found; skipping strict warn-only audit.")
+        pytest.skip(
+            "Gemma4-26B local model dir not found; skipping strict warn-only audit."
+        )
 
     base = _load_json(_BASELINE_PATH)
     env = os.environ.copy()
@@ -105,9 +112,26 @@ def test_gemma4_26b_strict_warn_only_against_baseline() -> None:
     assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
     got = parse_strict_metrics(proc.stdout)
 
-    warn_if_diff("strict.cos_sim", got["cos_sim"], float(base["cos_sim"]), 0.001, tag="Gemma4-26BDiagWarn")
-    warn_if_diff("strict.max_err", got["max_err"], float(base["max_err"]), 0.05, tag="Gemma4-26BDiagWarn")
-    warn_if_token_mismatch("strict.hf_argmax", got["hf_argmax"], int(base["hf_argmax"]), tag="Gemma4-26BDiagWarn")
+    warn_if_diff(
+        "strict.cos_sim",
+        got["cos_sim"],
+        float(base["cos_sim"]),
+        0.001,
+        tag="Gemma4-26BDiagWarn",
+    )
+    warn_if_diff(
+        "strict.max_err",
+        got["max_err"],
+        float(base["max_err"]),
+        0.05,
+        tag="Gemma4-26BDiagWarn",
+    )
+    warn_if_token_mismatch(
+        "strict.hf_argmax",
+        got["hf_argmax"],
+        int(base["hf_argmax"]),
+        tag="Gemma4-26BDiagWarn",
+    )
     warn_if_token_mismatch(
         "strict.lite_engine_argmax",
         got["lite_engine_argmax"],

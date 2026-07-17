@@ -226,11 +226,14 @@ class InputBatchBuilder:
         lora_mapping = self._lora_mapping(req_dicts)
         multimodal_flags = [self._is_multimodal_request(req) for req in req_dicts]
         max_seq_len_cpu = max(seq_lens_cpu_list) if seq_lens_cpu_list else 0
+        active_blocks, active_offsets = self._build_selective_indices(seq_lens_cpu_list)
         attn_metadata = {
             "slot_mapping": slot_mapping,
             "seq_lens": seq_lens_t,
             "seq_lens_cpu": seq_lens_cpu_list,
             "max_seq_len_cpu": int(max_seq_len_cpu),
+            "active_blocks": active_blocks,
+            "active_offsets": active_offsets,
             "positions_cpu": positions_cpu_list,
             "block_tables": block_tables,
             "is_prefill": False,
@@ -355,11 +358,14 @@ class InputBatchBuilder:
             req_dicts, self.num_layers, "linear_conv_carry"
         )
         max_seq_len_cpu = max(seq_lens_cpu_list) if seq_lens_cpu_list else 0
+        active_blocks, active_offsets = self._build_selective_indices(seq_lens_cpu_list)
         attn_metadata = {
             "slot_mapping": slot_mapping,
             "seq_lens": seq_lens,
             "seq_lens_cpu": seq_lens_cpu_list,
             "max_seq_len_cpu": int(max_seq_len_cpu),
+            "active_blocks": active_blocks,
+            "active_offsets": active_offsets,
             "positions_cpu": positions_cpu_list,
             "block_tables": block_tables,
             "is_prefill": False,
@@ -451,3 +457,23 @@ class InputBatchBuilder:
         self._split_per_layer_carries(
             attn_metadata["linear_conv_carry"], req_dicts, "linear_conv_carry"
         )
+
+    def _build_selective_indices(
+        self, seq_lens_cpu: list[int]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        select_ratio = max(
+            0.0, min(1.0, float(getattr(self.inf_config, "kv_select_ratio", 0.0)))
+        )
+        if select_ratio <= 0.0:
+            return None, None
+        from vllm.kernels.triton.paged_attention import build_selective_block_indices
+
+        select_stride = max(1, int(1.0 / select_ratio))
+        min_selected = max(1, int(getattr(self.inf_config, "kv_select_min_blocks", 4)))
+        block_size = int(self.kv_block_manager.block_size)
+        active_blocks_cpu, active_offsets_cpu = build_selective_block_indices(
+            seq_lens_cpu, block_size, select_stride, min_selected
+        )
+        active_blocks_gpu = active_blocks_cpu.to(device=self.device)
+        active_offsets_gpu = active_offsets_cpu.to(device=self.device)
+        return active_blocks_gpu, active_offsets_gpu

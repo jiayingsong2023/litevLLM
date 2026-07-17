@@ -7,7 +7,6 @@ import os
 os.environ["VLLM_USE_DEEP_GEMM"] = "0"
 
 import torch
-
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     W8A8BlockFp8LinearOp,
 )
@@ -17,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     CUTLASS_BLOCK_FP8_SUPPORTED,
 )
+
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton as vllm_triton
 

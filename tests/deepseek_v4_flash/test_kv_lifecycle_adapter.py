@@ -61,7 +61,6 @@ def test_kv_lifecycle_adapter_creates_state_before_ensuring_capacity() -> None:
     assert model.kv_stats()["active_requests"] == 0
 
 
-
 def test_kv_lifecycle_adapter_records_family_allocation_event() -> None:
     class Observer:
         def __init__(self) -> None:

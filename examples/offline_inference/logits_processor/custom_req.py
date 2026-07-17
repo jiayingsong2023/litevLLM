@@ -42,13 +42,13 @@ Output:    ' in the hands of the people.\n\nThe future of AI is in the'
 from typing import Any
 
 import torch
-
-from vllm import LLM, SamplingParams
-from vllm.logger import init_logger
 from vllm.v1.sample.logits_processor import (
     AdapterLogitsProcessor,
     RequestLogitsProcessor,
 )
+
+from vllm import LLM, SamplingParams
+from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 

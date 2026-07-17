@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeAlias
 
 from vllm.logger import init_logger
 
@@ -10,13 +9,15 @@ logger = init_logger(__file__)
 
 CHAT_TEMPLATES_DIR = Path(__file__).parent
 
-ChatTemplatePath: TypeAlias = Path | Callable[[str], Path | None]
+type ChatTemplatePath = Path | Callable[[str], Path | None]
+
 
 def _get_qwen_chat_template_fallback(tokenizer_name_or_path: str) -> Path | None:
     if tokenizer_name_or_path.endswith("-Chat"):
         return CHAT_TEMPLATES_DIR / "template_chatml.jinja"
 
     return CHAT_TEMPLATES_DIR / "template_basic.jinja"
+
 
 def _get_minicpmv_chat_template_fallback(tokenizer_name_or_path: str) -> Path | None:
     # MiniCPM-V-4.5 version uses a dedicated template
@@ -25,6 +26,7 @@ def _get_minicpmv_chat_template_fallback(tokenizer_name_or_path: str) -> Path | 
 
     # Other versions use chatml template
     return CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+
 
 _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
     "blip-2": CHAT_TEMPLATES_DIR / "template_blip2.jinja",
@@ -40,6 +42,7 @@ _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
     "siglip2": CHAT_TEMPLATES_DIR / "template_basic.jinja",
 }
 
+
 def register_chat_template_fallback_path(
     model_type: str,
     chat_template: ChatTemplatePath,
@@ -53,6 +56,7 @@ def register_chat_template_fallback_path(
         )
 
     _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK[model_type] = chat_template
+
 
 def get_chat_template_fallback_path(
     model_type: str,

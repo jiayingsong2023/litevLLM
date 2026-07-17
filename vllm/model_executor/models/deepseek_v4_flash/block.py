@@ -64,8 +64,7 @@ class DeepSeekV4FlashBlockReference:
     ) -> torch.Tensor:
         if hidden.shape != (self.hidden_size,):
             raise ValueError(
-                f"hidden shape must be ({self.hidden_size},); "
-                f"got {tuple(hidden.shape)}"
+                f"hidden shape must be ({self.hidden_size},); got {tuple(hidden.shape)}"
             )
         if self.attn_norm_weight.shape != (self.hidden_size,):
             raise ValueError(
@@ -564,8 +563,10 @@ class DeepSeekV4FlashCompressedLayerReferenceRunner(
         assert layer.attention_query_a is not None
         assert layer.attention_query_a_norm is not None
         assert layer.indexer is not None
-        qr = self.store.decode_matrix(layer.attention_query_a).transpose(0, 1).matmul(
-            hidden.to(torch.float32)
+        qr = (
+            self.store.decode_matrix(layer.attention_query_a)
+            .transpose(0, 1)
+            .matmul(hidden.to(torch.float32))
         )
         qr_norm = rms_norm_reference(
             qr,

@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Optional, List, Callable
+
+from vllm.logger import init_logger
+
 
 # Placeholder for missing config function in LitevLLM
 def get_cached_compilation_config():
     return None
 
-from vllm.logger import init_logger
-from vllm.model_executor.utils import maybe_disable_graph_partition
-from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
 
 class CustomOp(nn.Module):
     def __init__(self, enforce_enable: bool = False):
@@ -45,4 +46,5 @@ class CustomOp(nn.Module):
     def register(name: str):
         def wrapper(cls):
             return cls
+
         return wrapper

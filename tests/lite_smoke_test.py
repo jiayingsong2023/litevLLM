@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import torch
 import unittest
+
+import torch
+
 from vllm.model_executor.layers.lite_linear import LiteLinear
 from vllm.model_executor.models.llama import LlamaModel
+
 
 class TestLitevLLM(unittest.TestCase):
     def test_lite_linear_init(self):
@@ -18,13 +21,19 @@ class TestLitevLLM(unittest.TestCase):
 
     def test_llama_structure(self):
         """Verify LlamaModel structure with standardized prefix."""
+
         class DummyHFConfig:
             def __init__(self):
-                self.hidden_size = 128; self.intermediate_size = 256
-                self.num_attention_heads = 4; self.num_key_value_heads = 4
-                self.num_hidden_layers = 2; self.rms_norm_eps = 1e-6
-                self.vocab_size = 1000; self.max_position_embeddings = 2048; self.rope_theta = 10000.0
-        
+                self.hidden_size = 128
+                self.intermediate_size = 256
+                self.num_attention_heads = 4
+                self.num_key_value_heads = 4
+                self.num_hidden_layers = 2
+                self.rms_norm_eps = 1e-6
+                self.vocab_size = 1000
+                self.max_position_embeddings = 2048
+                self.rope_theta = 10000.0
+
         # Test loading with the new Mirror refactoring
         model = LlamaModel(DummyHFConfig(), quant_config=None, prefix="model")
         self.assertTrue(hasattr(model, "layers"))
@@ -32,6 +41,7 @@ class TestLitevLLM(unittest.TestCase):
         # Verify official naming chain
         self.assertTrue(hasattr(model.layers[0], "self_attn"))
         self.assertTrue(hasattr(model.layers[0].self_attn, "q_proj"))
+
 
 if __name__ == "__main__":
     unittest.main()

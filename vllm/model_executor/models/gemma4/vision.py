@@ -137,7 +137,7 @@ class Gemma4VisionAttention(nn.Module):
             getattr(config, "head_dim", config.hidden_size // self.num_heads)
         )
         hidden_size = int(config.hidden_size)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.q_proj = Gemma4VisionLinear(hidden_size, self.num_heads * self.head_dim)
         self.k_proj = Gemma4VisionLinear(hidden_size, self.num_heads * self.head_dim)
         self.v_proj = Gemma4VisionLinear(hidden_size, self.num_heads * self.head_dim)

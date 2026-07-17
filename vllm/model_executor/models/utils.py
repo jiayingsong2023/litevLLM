@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
-from typing import Iterable, Tuple, Any
+
 
 def maybe_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
+
 class PPMissingLayer(nn.Module):
     """LitevLLM placeholder for missing layers."""
-    def forward(self, *args, **kwargs): return args[0] if args else None
+
+    def forward(self, *args, **kwargs):
+        return args[0] if args else None
+
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
     """LitevLLM: Basic weight copy from checkpoint to parameter."""
@@ -17,10 +23,13 @@ def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor
         if param.data.numel() == loaded_weight.numel():
             loaded_weight = loaded_weight.view(param.data.shape)
         else:
-            raise ValueError(f"Shape mismatch: {param.data.shape} vs {loaded_weight.shape}")
+            raise ValueError(
+                f"Shape mismatch: {param.data.shape} vs {loaded_weight.shape}"
+            )
     param.data.copy_(loaded_weight)
 
-def load_weights_lite(model: nn.Module, weights: Iterable[Tuple[str, torch.Tensor]]):
+
+def load_weights_lite(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]):
     """
     Standardized weight loading for LiteModels.
     Iterates through state dict and maps to LiteLinear/RMSNorm.

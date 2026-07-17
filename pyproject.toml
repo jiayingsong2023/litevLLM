@@ -36,45 +36,19 @@ dependencies = [
     "numpy",
     "requests >= 2.26.0",
     "tqdm",
-    "pyyaml",
     "pillow",
     "pydantic >= 2.12.0",
     "fastapi[standard] >= 0.115.0",
     "aiohttp",
-    "openai >= 1.99.1",
-    "prometheus_client >= 0.18.0",
-    "einops",
     "compressed-tensors == 0.13.0",
-    "msgspec",
-    "ninja",
     "sentencepiece",
-    "psutil",
-    "peft",
-    "datasets",
-    "timm>=1.0.17",
-    "numba == 0.61.2",
     "torchvision == 0.24.0",
     "gguf>=0.17.1",
     "cloudpickle",
     "cbor2",
-    "pyzmq",
-    "pybase64",
-    "cachetools",
-    "py-cpuinfo",
-    "uvloop",
-    "openai-harmony",
-    "outlines-core",
-    "outlines >= 0.1.1",
     "xgrammar",
-    "lm-format-enforcer",
-    "partial-json-parser",
-    "llguidance",
     "typing-extensions",
     "filelock",
-    "mistral-common >= 1.5.0",
-    "tiktoken",
-    "amdsmi",
-    "protobuf>=7.34.0",
 ]
 
 [project.urls]
@@ -92,6 +66,7 @@ include = ["vllm*"]
 [tool.ruff.lint.per-file-ignores]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+"**/__init__.py" = ["F401"]
 
 [tool.ruff.lint]
 select = [
@@ -113,6 +88,8 @@ select = [
     "G",
 ]
 ignore = [
+    # Ruff formatter owns wrapping; it intentionally leaves long strings and URLs.
+    "E501",
     # star imports
     "F405", "F403",
     # lambda expression assignment
@@ -372,6 +349,7 @@ triton = [
 
 [dependency-groups]
 dev = [
+    "mypy>=1.19.1",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.15.12",
 ]

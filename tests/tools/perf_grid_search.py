@@ -70,7 +70,9 @@ def build_coarse_grid() -> list[GridConfig]:
             )
     # Ensure preferred baseline appears first for stable comparisons.
     baseline = _default_baseline_config()
-    return [baseline] + [x for x in out if x.prefill_chunk != 256 or x.prefill_microbatch != 2]
+    return [baseline] + [
+        x for x in out if x.prefill_chunk != 256 or x.prefill_microbatch != 2
+    ]
 
 
 def build_fine_grid(top: list[GridConfig]) -> list[GridConfig]:
@@ -185,7 +187,9 @@ def _run_cmd(
     return int(proc.returncode)
 
 
-def _score_row(row: dict[str, Any], baseline_ttft: float, ttft_degrade_limit: float) -> tuple[bool, str]:
+def _score_row(
+    row: dict[str, Any], baseline_ttft: float, ttft_degrade_limit: float
+) -> tuple[bool, str]:
     if row.get("ok") is not True:
         return False, "run_failed"
     if row.get("timed_out"):
@@ -193,9 +197,12 @@ def _score_row(row: dict[str, Any], baseline_ttft: float, ttft_degrade_limit: fl
     if row.get("skipped"):
         return False, "skipped"
     ttft = _safe_float(row.get("ttft_p50_ms"))
-    if baseline_ttft == baseline_ttft and ttft == ttft:
-        if ttft > baseline_ttft * (1.0 + ttft_degrade_limit):
-            return False, "ttft_regressed"
+    if (
+        baseline_ttft == baseline_ttft
+        and ttft == ttft
+        and ttft > baseline_ttft * (1.0 + ttft_degrade_limit)
+    ):
+        return False, "ttft_regressed"
     return True, "pass"
 
 
@@ -338,7 +345,9 @@ def _select_top(rows: list[dict[str, Any]], topn: int) -> list[dict[str, Any]]:
     return valid[: max(0, topn)]
 
 
-def _run_correctness_for_best(root: Path, best: dict[str, Any], skip_a_tier: bool) -> dict[str, Any]:
+def _run_correctness_for_best(
+    root: Path, best: dict[str, Any], skip_a_tier: bool
+) -> dict[str, Any]:
     cfg = best["config"]
     env = os.environ.copy()
     env["FASTINFERENCE_KV_TYPE"] = str(cfg["kv_type"])
@@ -352,8 +361,12 @@ def _run_correctness_for_best(root: Path, best: dict[str, Any], skip_a_tier: boo
         env.pop("FASTINFERENCE_KV_MAX_MODEL_LEN", None)
     env["FASTINFERENCE_LITE_PREFILL_CHUNK"] = str(cfg["prefill_chunk"])
     env["FASTINFERENCE_LITE_PREFILL_MICROBATCH"] = str(cfg["prefill_microbatch"])
-    env["FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS"] = str(cfg["prefill_reserved_tokens"])
-    env["FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG"] = str(cfg["prefill_reserve_backlog"])
+    env["FASTINFERENCE_LITE_PREFILL_RESERVED_TOKENS"] = str(
+        cfg["prefill_reserved_tokens"]
+    )
+    env["FASTINFERENCE_LITE_PREFILL_RESERVE_BACKLOG"] = str(
+        cfg["prefill_reserve_backlog"]
+    )
     env["FASTINFERENCE_LITE_PREFILL_CATCHUP_RATIO"] = str(cfg["prefill_catchup_ratio"])
     env["FASTINFERENCE_LITE_DECODE_PRIORITY"] = str(cfg["decode_priority"])
     env["RUN_GEMMA4_31B"] = "0"
@@ -390,7 +403,9 @@ def main() -> int:
     all_rows: list[dict[str, Any]] = []
 
     print(f"[Day2Grid] output_dir={out_root}")
-    print(f"[Day2Grid] phase={args.phase} model_key={args.model_key} runs={len(coarse_cfgs)}")
+    print(
+        f"[Day2Grid] phase={args.phase} model_key={args.model_key} runs={len(coarse_cfgs)}"
+    )
     for idx, cfg in enumerate(coarse_cfgs, start=1):
         print(f"[Day2Grid][coarse {idx}/{len(coarse_cfgs)}] {cfg.name}")
         row = _run_one(

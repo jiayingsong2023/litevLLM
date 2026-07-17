@@ -26,14 +26,12 @@ The last check is the real regression guard for Step 5 because it
 measures what the Chrome trace was measuring: per-call small-payload
 H->D copies issued inside reshape_and_cache's Python wrapper.
 """
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
 
 import pytest
 import torch
 
-from vllm.kernels.triton import reshape_and_cache as rac_mod
 from vllm.kernels.triton.reshape_and_cache import (
     _SCALE_TENSOR_CACHE,
     _clear_scale_tensor_cache,
@@ -71,9 +69,12 @@ def _make_kv_caches(
 
 
 def _reference_write_bf16(
-    k: torch.Tensor, v: torch.Tensor,
-    k_cache: torch.Tensor, v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor, block_size: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
 ) -> None:
     """Plain pytorch equivalent of the non-fp8, non-int4 write path."""
     for t in range(k.shape[0]):
@@ -107,7 +108,9 @@ def test_scalar_scale_cache_dedups_by_value_dtype_and_device(monkeypatch) -> Non
     t1 = _get_scalar_scale_tensor(1.0, dev)
     t2 = _get_scalar_scale_tensor(1.0, dev)
     assert t1 is t2, "same (device, dtype, value) must reuse tensor"
-    assert len(alloc_calls) == 1, f"expected exactly one allocation, got {len(alloc_calls)}"
+    assert len(alloc_calls) == 1, (
+        f"expected exactly one allocation, got {len(alloc_calls)}"
+    )
 
     # Different scalar value -> new cache entry.
     t3 = _get_scalar_scale_tensor(0.5, dev)
@@ -156,12 +159,16 @@ def test_reshape_and_cache_does_not_realloc_scale_after_warmup(monkeypatch) -> N
     num_tokens = 1
 
     kc, vc = _make_kv_caches(
-        num_blocks=num_blocks, block_size=block_size,
-        num_kv_heads=num_kv_heads, head_dim=head_dim,
-        dtype=torch.bfloat16, device=device,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
-    k = torch.randn(num_tokens, num_kv_heads, head_dim,
-                    dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        num_tokens, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     v = torch.randn_like(k)
     slot_mapping = torch.tensor([3], dtype=torch.int32, device=device)
 
@@ -210,9 +217,12 @@ def test_reshape_and_cache_tensor_input_bypasses_cache() -> None:
     device = torch.device("cuda")
     block_size = 16
     kc, vc = _make_kv_caches(
-        num_blocks=4, block_size=block_size,
-        num_kv_heads=2, head_dim=64,
-        dtype=torch.bfloat16, device=device,
+        num_blocks=4,
+        block_size=block_size,
+        num_kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        device=device,
     )
     k = torch.randn(1, 2, 64, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)
@@ -243,19 +253,22 @@ def test_reshape_and_cache_bf16_matches_reference() -> None:
     num_tokens = 5
 
     kc, vc = _make_kv_caches(
-        num_blocks=num_blocks, block_size=block_size,
-        num_kv_heads=num_kv_heads, head_dim=head_dim,
-        dtype=torch.bfloat16, device=device,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     kc_ref = kc.clone()
     vc_ref = vc.clone()
 
-    k = torch.randn(num_tokens, num_kv_heads, head_dim,
-                    dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        num_tokens, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     v = torch.randn_like(k)
     # Mix valid slots with one -1 to verify the skip branch still holds.
-    slot_mapping = torch.tensor([5, -1, 20, 35, 3],
-                                dtype=torch.int32, device=device)
+    slot_mapping = torch.tensor([5, -1, 20, 35, 3], dtype=torch.int32, device=device)
 
     reshape_and_cache(k, v, kc, vc, slot_mapping, "bf16", 1.0, 1.0)
     torch.cuda.synchronize()
@@ -275,9 +288,12 @@ def test_reshape_and_cache_zero_tokens_is_noop() -> None:
     device = torch.device("cuda")
     block_size = 16
     kc, vc = _make_kv_caches(
-        num_blocks=2, block_size=block_size,
-        num_kv_heads=2, head_dim=64,
-        dtype=torch.bfloat16, device=device,
+        num_blocks=2,
+        block_size=block_size,
+        num_kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        device=device,
     )
     kc_before = kc.clone()
     vc_before = vc.clone()
@@ -303,9 +319,12 @@ def test_reshape_and_cache_module_cache_survives_across_invocations() -> None:
     device = torch.device("cuda")
     block_size = 16
     kc, vc = _make_kv_caches(
-        num_blocks=2, block_size=block_size,
-        num_kv_heads=2, head_dim=64,
-        dtype=torch.bfloat16, device=device,
+        num_blocks=2,
+        block_size=block_size,
+        num_kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        device=device,
     )
     k = torch.randn(1, 2, 64, dtype=torch.bfloat16, device=device)
     v = torch.randn_like(k)

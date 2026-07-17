@@ -983,10 +983,6 @@ class DeepSeekV4PagedKVCache:
                 f"{name} shape must be ({self.hidden_size},); got {tuple(row.shape)}"
             )
         if row.dtype != self.dtype:
-            raise ValueError(
-                f"{name} dtype must be {self.dtype}; got {row.dtype}"
-            )
+            raise ValueError(f"{name} dtype must be {self.dtype}; got {row.dtype}")
         if row.device != self.device:
-            raise ValueError(
-                f"{name} device must be {self.device}; got {row.device}"
-            )
+            raise ValueError(f"{name} device must be {self.device}; got {row.device}")

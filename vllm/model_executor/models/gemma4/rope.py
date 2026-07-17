@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
-
-from .config import Gemma4LayerConfig, _GEMMA4_ROPE_CACHE_POOL
 from vllm.model_executor.models.lite_config import LiteConfig
+
+from .config import _GEMMA4_ROPE_CACHE_POOL, Gemma4LayerConfig
 from .policy_utils import (
     _gemma4_model_policy_truthy,
-    _gemma4_policy_value,
     _resolve_gemma4_rope_cache_max_pos,
     _resolve_gemma4_rope_cache_pool_limit,
 )

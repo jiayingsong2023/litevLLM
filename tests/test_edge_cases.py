@@ -23,7 +23,6 @@ def _scheduler_with_requests(requests: list[dict[str, Any]]) -> RequestScheduler
             is_prefill=request["is_prefill"],
             seq_len=request.get("seq_len", 0),
             generated_ids=request.get("generated_ids", [10]),
-            service_class=request.get("service_class", "latency"),
             lora_id=request.get("lora_id"),
             is_multimodal=request.get("is_multimodal", False),
             multi_modal_data={"image": [{"image": "file:///tmp/demo.png"}]}

@@ -3,13 +3,10 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
 from vllm.utils.text_utils import truthy
-
-from vllm.model_executor.models.lite_config import LiteConfig
 
 _GEMMA4_ALLOWED_TUNING_ENV = frozenset(
     {

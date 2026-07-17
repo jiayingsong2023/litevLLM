@@ -3,13 +3,12 @@ import asyncio
 import functools
 import os
 
-
 VLLM_SUBCMD_PARSER_EPILOG = "Use `vllm {subcmd} --help` for details."
 
 
 def log_version_and_model(logger, version, model):
-    logger.info(f"vLLM version {version}")
-    logger.info(f"Model: {model}")
+    logger.info("vLLM version %s", version)
+    logger.info("Model: %s", model)
 
 
 def cli_env_setup() -> None:

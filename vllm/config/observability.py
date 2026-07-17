@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
+
 @dataclass
 class ObservabilityConfig:
     otlp_traces_endpoint: str = ""

@@ -18,8 +18,12 @@ from tests.verify_semantic_integrity import (
 class _FakeLinear(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.qweight = torch.nn.Parameter(torch.zeros((2, 2), dtype=torch.int32), requires_grad=False)
-        self.scales = torch.nn.Parameter(torch.zeros((2, 2), dtype=torch.float32), requires_grad=False)
+        self.qweight = torch.nn.Parameter(
+            torch.zeros((2, 2), dtype=torch.int32), requires_grad=False
+        )
+        self.scales = torch.nn.Parameter(
+            torch.zeros((2, 2), dtype=torch.float32), requires_grad=False
+        )
         self.weight_shape = (0, 0)
 
 
@@ -41,7 +45,7 @@ class _FakeSafeOpen:
     def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
         self._tensors = tensors
 
-    def __enter__(self) -> "_FakeSafeOpen":
+    def __enter__(self) -> _FakeSafeOpen:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -57,22 +61,30 @@ class _FakeSafeOpen:
 
 def test_gemma4_map_ref_key_covers_text_and_ignores_multimodal() -> None:
     assert (
-        _gemma4_map_ref_key("model.language_model.layers.0.self_attn.q_proj.weight_packed")
+        _gemma4_map_ref_key(
+            "model.language_model.layers.0.self_attn.q_proj.weight_packed"
+        )
         == "model.layers.0.self_attn.q_proj.qweight"
     )
     assert (
-        _gemma4_map_ref_key("model.language_model.layers.0.self_attn.q_proj.weight_scale")
+        _gemma4_map_ref_key(
+            "model.language_model.layers.0.self_attn.q_proj.weight_scale"
+        )
         == "model.layers.0.self_attn.q_proj.scales"
     )
     assert (
-        _gemma4_map_ref_key("model.language_model.layers.0.self_attn.q_proj.weight_shape")
+        _gemma4_map_ref_key(
+            "model.language_model.layers.0.self_attn.q_proj.weight_shape"
+        )
         == "model.layers.0.self_attn.q_proj.weight_shape"
     )
     assert _gemma4_map_ref_key("model.embed_vision.patch_embedding.weight") is None
     assert _gemma4_map_ref_key("model.audio_tower.encoder.weight") is None
 
 
-def test_looks_like_gemma4_model_path_accepts_top_level_or_text_config(tmp_path: Path) -> None:
+def test_looks_like_gemma4_model_path_accepts_top_level_or_text_config(
+    tmp_path: Path,
+) -> None:
     top_level = tmp_path / "top_level"
     nested = tmp_path / "nested"
     other = tmp_path / "other"
@@ -80,12 +92,18 @@ def test_looks_like_gemma4_model_path_accepts_top_level_or_text_config(tmp_path:
     nested.mkdir()
     other.mkdir()
 
-    (top_level / "config.json").write_text(json.dumps({"model_type": "gemma4"}), encoding="utf-8")
+    (top_level / "config.json").write_text(
+        json.dumps({"model_type": "gemma4"}), encoding="utf-8"
+    )
     (nested / "config.json").write_text(
-        json.dumps({"model_type": "paligemma", "text_config": {"model_type": "gemma4_text"}}),
+        json.dumps(
+            {"model_type": "paligemma", "text_config": {"model_type": "gemma4_text"}}
+        ),
         encoding="utf-8",
     )
-    (other / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+    (other / "config.json").write_text(
+        json.dumps({"model_type": "llama"}), encoding="utf-8"
+    )
 
     assert _looks_like_gemma4_model_path(str(top_level)) is True
     assert _looks_like_gemma4_model_path(str(nested)) is True
@@ -109,7 +127,9 @@ def test_assign_gemma4_reference_weights_sets_qweight_scales_and_weight_shape(
         "model.language_model.layers.0.self_attn.q_proj.weight_shape": torch.tensor(
             [4096, 2048], dtype=torch.int32
         ),
-        "model.embed_vision.patch_embedding.weight": torch.ones((1,), dtype=torch.float32),
+        "model.embed_vision.patch_embedding.weight": torch.ones(
+            (1,), dtype=torch.float32
+        ),
     }
 
     def _fake_safe_open(path: str, framework: str, device: str) -> _FakeSafeOpen:
@@ -128,8 +148,14 @@ def test_assign_gemma4_reference_weights_sets_qweight_scales_and_weight_shape(
 
     q_proj = model.model.layers[0].self_attn.q_proj
     assert assigned == 3
-    assert torch.equal(q_proj.qweight.detach(), tensors["model.language_model.layers.0.self_attn.q_proj.weight_packed"])
-    assert torch.equal(q_proj.scales.detach(), tensors["model.language_model.layers.0.self_attn.q_proj.weight_scale"])
+    assert torch.equal(
+        q_proj.qweight.detach(),
+        tensors["model.language_model.layers.0.self_attn.q_proj.weight_packed"],
+    )
+    assert torch.equal(
+        q_proj.scales.detach(),
+        tensors["model.language_model.layers.0.self_attn.q_proj.weight_scale"],
+    )
     assert q_proj.weight_shape == (4096, 2048)
 
 
@@ -141,7 +167,9 @@ def test_assign_gemma4_reference_weights_raises_when_no_supported_weights(
     (shard_dir / "model-00001-of-00001.safetensors").touch()
 
     tensors = {
-        "model.embed_vision.patch_embedding.weight": torch.ones((1,), dtype=torch.float32),
+        "model.embed_vision.patch_embedding.weight": torch.ones(
+            (1,), dtype=torch.float32
+        ),
         "model.audio_tower.encoder.weight": torch.ones((1,), dtype=torch.float32),
     }
 

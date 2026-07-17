@@ -13,7 +13,15 @@ SUPPORTED_CONFIG_PROFILES = frozenset(
 )
 SUPPORTED_KV_TYPES = frozenset({"auto", "fp16", "fp8", "turbo_int4"})
 _TOP_LEVEL_FIELDS = frozenset(
-    {"profile", "kv_type", "debug", "log_level", "benchmark", "legacy_env", "tuning_keyvals"}
+    {
+        "profile",
+        "kv_type",
+        "debug",
+        "log_level",
+        "benchmark",
+        "legacy_env",
+        "tuning_keyvals",
+    }
 )
 
 

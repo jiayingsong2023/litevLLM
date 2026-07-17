@@ -88,6 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to the DeepSeek V4 Flash GGUF file.",
     )
     parser.add_argument("--context-length", type=int, default=4096)
+    parser.add_argument("--staging-budget-gb", type=float, default=0.0)
     parser.add_argument(
         "--prompt-text",
         type=str,
@@ -654,6 +655,7 @@ def _run_direct_generate(
             weight_store=store,
             runtime_budget=budget,
             gpu_backend=_build_ready_backend(args),
+            staging_budget_gb=args.staging_budget_gb,
         )
         if bool(getattr(args, "enable_profiler", False)):
             model.enable_deepseek_profile()

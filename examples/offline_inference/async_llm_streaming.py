@@ -13,10 +13,11 @@ Usage:
 
 import asyncio
 
+from vllm.v1.engine.async_llm import AsyncLLM
+
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine.async_llm import AsyncLLM
 
 
 async def stream_response(engine: AsyncLLM, prompt: str, request_id: str) -> None:

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Optional, Any
-from .model import ModelConfig
+from typing import Any
+
 from .cache import CacheConfig
-from .scheduler import SchedulerConfig
 from .load import LoadConfig
+from .model import ModelConfig
+from .scheduler import SchedulerConfig
+
 
 class VllmConfig:
     def __init__(
@@ -12,7 +14,7 @@ class VllmConfig:
         cache_config: CacheConfig,
         scheduler_config: SchedulerConfig,
         load_config: LoadConfig,
-        quant_config: Optional[Any] = None,
+        quant_config: Any | None = None,
     ):
         self.model_config = model_config
         self.cache_config = cache_config

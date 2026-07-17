@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Protocol, overload
 if TYPE_CHECKING:
     from transformers import BatchEncoding
 
-    from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
 class TokenizerLike(Protocol):
     @classmethod
@@ -93,7 +92,7 @@ class TokenizerLike(Protocol):
 
     def apply_chat_template(
         self,
-        messages: list["ChatCompletionMessageParam"],
+        messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> str | list[int]:

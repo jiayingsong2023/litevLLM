@@ -1,22 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+
 # Global memory optimization for AMD/MoE
 if "PYTORCH_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+    os.environ["PYTORCH_ALLOC_CONF"] = (
+        "expandable_segments:True,garbage_collection_threshold:0.8"
+    )
 
 # Enable experimental ROCm Flash/Mem Efficient Attention to remove warnings and boost perf
 if "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL" not in os.environ:
     os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
-from vllm.sampling_params import SamplingParams
-from vllm.pooling_params import PoolingParams
-from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.entrypoints.llm import LLM
+from vllm.inputs import TextPrompt, TokensPrompt
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
+
 
 def clear_cache():
     """Clears global Triton weight caches."""
     from vllm.model_executor.layers.quantization.tensor import _GLOBAL_WEIGHT_CACHE
-    _GLOBAL_WEIGHT_CACHE.clear()
-    import torch; torch.cuda.empty_cache()
 
-__all__ = ["SamplingParams", "PoolingParams", "TextPrompt", "TokensPrompt", "LLM", "clear_cache"]
+    _GLOBAL_WEIGHT_CACHE.clear()
+    import torch
+
+    torch.cuda.empty_cache()
+
+
+__all__ = [
+    "SamplingParams",
+    "PoolingParams",
+    "TextPrompt",
+    "TokensPrompt",
+    "LLM",
+    "clear_cache",
+]

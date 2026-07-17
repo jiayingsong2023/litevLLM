@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from transformers import AutoConfig
@@ -27,7 +28,11 @@ class _Gemma4ProportionalRopeValidationMixin:
         )
 
         rope_theta = rope_parameters["rope_theta"]
-        if rope_theta is None or not isinstance(rope_theta, (int, float)) or rope_theta <= 0:
+        if (
+            rope_theta is None
+            or not isinstance(rope_theta, (int, float))
+            or rope_theta <= 0
+        ):
             raise ValueError(
                 f"`rope_parameters`'s rope_theta field must be a positive number, got {rope_theta}"
             )
@@ -118,7 +123,7 @@ def build_fallback_hf_config(config_dict: dict[str, Any]) -> PretrainedConfig:
 
     cfg = PretrainedConfig()
     if "dtype" not in config_dict and "torch_dtype" in config_dict:
-        setattr(cfg, "dtype", config_dict["torch_dtype"])
+        cfg.dtype = config_dict["torch_dtype"]
     for k, v in config_dict.items():
         if k == "torch_dtype":
             continue
@@ -136,7 +141,5 @@ for model_type, config_cls in (
     ("gemma4_text", Gemma4TextConfig),
     ("gemma4_vision", Gemma4VisionConfig),
 ):
-    try:
+    with contextlib.suppress(ValueError):
         AutoConfig.register(model_type, config_cls)
-    except ValueError:
-        pass

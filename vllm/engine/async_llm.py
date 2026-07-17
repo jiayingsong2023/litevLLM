@@ -83,14 +83,16 @@ class AsyncLLM(EngineClient):
     async def abort(self, request_ids: str | list[str]):
         if isinstance(request_ids, str):
             request_ids = [request_ids]
-        for rid in request_ids:
-            self.engine.abort_request(rid)
+        with self._engine_lock:
+            for rid in request_ids:
+                self.engine.abort_request(rid)
 
     def stats(self) -> dict[str, Any]:
-        stats = dict(self.engine.stats())
-        if hasattr(self.driver, "stats"):
-            stats["async_driver"] = self.driver.stats()
-        return stats
+        with self._engine_lock:
+            stats = dict(self.engine.stats())
+            if hasattr(self.driver, "stats"):
+                stats["async_driver"] = self.driver.stats()
+            return stats
 
     def register_lora_adapter(
         self,
@@ -99,17 +101,20 @@ class AsyncLLM(EngineClient):
         lora_path: str | None = None,
         lora_int_id: int | None = None,
     ) -> dict[str, Any]:
-        return self.engine.register_lora_adapter(
-            lora_name=lora_name,
-            lora_path=lora_path,
-            lora_int_id=lora_int_id,
-        )
+        with self._engine_lock:
+            return self.engine.register_lora_adapter(
+                lora_name=lora_name,
+                lora_path=lora_path,
+                lora_int_id=lora_int_id,
+            )
 
     def unregister_lora_adapter(self, lora_name: str) -> bool:
-        return self.engine.unregister_lora_adapter(lora_name)
+        with self._engine_lock:
+            return self.engine.unregister_lora_adapter(lora_name)
 
     def reset_stats(self, *, clear_prefix_cache: bool = False) -> None:
-        self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
+        with self._engine_lock:
+            self.engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
 
     def shutdown(self):
         self.driver.shutdown()

@@ -6,18 +6,16 @@ multi-image input on vision language models for text generation,
 using the chat template defined by the model.
 """
 
-import os
 from argparse import Namespace
 from dataclasses import asdict
 from typing import NamedTuple
 
-from huggingface_hub import snapshot_download
 from PIL.Image import Image
 from transformers import AutoProcessor, AutoTokenizer
+from vllm.multimodal.utils import fetch_image
 
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.lora.request import LoRARequest
-from vllm.multimodal.utils import fetch_image
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 QUESTION = "What is the content of each image?"

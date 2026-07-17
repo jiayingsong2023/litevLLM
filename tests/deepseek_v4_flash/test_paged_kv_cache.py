@@ -227,6 +227,7 @@ def test_model_creates_request_states_from_one_paged_pool() -> None:
     assert first.kv_cache._pool is second.kv_cache._pool
     assert first.request_id != second.request_id
 
+
 def test_paged_cache_returns_empty_indexer_rows_for_ratio128_layers() -> None:
     cache = DeepSeekV4PagedKVCache(
         context_length=256,
@@ -244,6 +245,7 @@ def test_paged_cache_returns_empty_indexer_rows_for_ratio128_layers() -> None:
 
     assert rows.shape == (0, DEEPSEEK_V4_FLASH_SHAPE.indexer_head_dim)
     assert rows.dtype == torch.float32
+
 
 def test_paged_cache_sizes_allocator_for_concurrent_request_views() -> None:
     pool = DeepSeekV4PagedKVCache(
@@ -266,6 +268,7 @@ def test_paged_cache_sizes_allocator_for_concurrent_request_views() -> None:
 
     torch.testing.assert_close(keys, torch.full((1, 4), 127.0))
 
+
 def test_model_request_state_pool_tracks_max_requests() -> None:
     model = DeepSeekV4FlashForCausalLM()
 
@@ -282,4 +285,3 @@ def test_model_request_state_pool_tracks_max_requests() -> None:
 
     assert first.kv_cache._pool is second.kv_cache._pool
     assert first.kv_cache._pool.max_requests == 2
-

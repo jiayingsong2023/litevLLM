@@ -691,6 +691,17 @@ class Gemma4Attention(nn.Module):
                             if inf_config is not None
                             else 4
                         )
+                        active_blocks = (
+                            attn_metadata.get("active_blocks", None)
+                            if isinstance(attn_metadata, dict)
+                            else getattr(attn_metadata, "active_blocks", None)
+                        )
+                        active_offsets = (
+                            attn_metadata.get("active_offsets", None)
+                            if isinstance(attn_metadata, dict)
+                            else getattr(attn_metadata, "active_offsets", None)
+                        )
+
                         paged_attention_v1(
                             attn_out,
                             q.reshape(
@@ -721,6 +732,8 @@ class Gemma4Attention(nn.Module):
                             ),
                             kv_select_ratio=_kv_sel_ratio,
                             kv_select_min_blocks=_kv_sel_min,
+                            active_blocks=active_blocks,
+                            active_offsets=active_offsets,
                         )
                     out = attn_out.view(bsz, seqlen, -1)
         else:

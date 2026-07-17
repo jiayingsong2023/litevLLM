@@ -21,7 +21,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,7 +43,7 @@ DEFAULT_PROMPTS: dict[str, str] = {
 }
 
 
-def _default_model_path() -> Optional[str]:
+def _default_model_path() -> str | None:
     mod = _load_smoke_helpers()
     return mod.resolve_default_model_path()
 
@@ -52,7 +51,9 @@ def _default_model_path() -> Optional[str]:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Gemma4 prefill-only strict audit")
     default_model = _default_model_path()
-    p.add_argument("--model", type=str, default=default_model, required=default_model is None)
+    p.add_argument(
+        "--model", type=str, default=default_model, required=default_model is None
+    )
     p.add_argument("--hf-model", type=str, default=None)
     p.add_argument(
         "--preset",

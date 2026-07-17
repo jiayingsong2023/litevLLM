@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import torch
@@ -141,18 +142,14 @@ def _resolve_gemma4_rope_cache_max_pos(
     max_pos = int(getattr(config, "max_position_embeddings", 2048))
     kv_max_raw = getattr(runtime_config, "kv_max_model_len", None)
     if kv_max_raw is not None:
-        try:
+        with contextlib.suppress(ValueError):
             max_pos = min(max_pos, max(64, int(kv_max_raw)))
-        except ValueError:
-            pass
     rope_cap_raw = _gemma4_policy_value(runtime_config, "rope_cache_max_pos", None)
     if rope_cap_raw is None:
         rope_cap_raw = getattr(runtime_config, "gemma4_rope_cache_max_pos", None)
     if rope_cap_raw is not None:
-        try:
+        with contextlib.suppress(ValueError):
             max_pos = min(max_pos, max(64, int(rope_cap_raw)))
-        except ValueError:
-            pass
     return max(64, int(max_pos))
 
 

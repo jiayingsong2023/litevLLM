@@ -35,14 +35,6 @@ class LiteSingleGpuBackend:
         lora_registry: Any | None = None,
         max_prefix_cache_entries: int = 8,
         min_prefix_cache_partial_hit_tokens: int = 1,
-        preemption_mode: str = "defer_prefill",
-        preemption_min_backlog: int = 1,
-        preemption_min_decodes: int = 1,
-        preemption_max_queue_wait_s: float = 0.0,
-        preemptible_service_classes: set[str] | None = None,
-        preempt_multimodal_prefills: bool = False,
-        preempt_multimodal_max_queue_wait_s: float = 0.0,
-        multimodal_prefix_cache_protect_threshold: float = 0.0,
         gpu_greedy_sampling: bool = False,
         gpu_greedy_max_tokens_only: bool = False,
         gpu_greedy_bypass_cpu_policies: bool = False,
@@ -66,22 +58,6 @@ class LiteSingleGpuBackend:
         self.prefix_cache_materialized_exact_hits = 0
         self.prefix_cache_materialized_partial_hits = 0
         self.prefix_cache_materialized_saved_prefill_tokens = 0
-        self.preemption_mode = str(preemption_mode or "defer_prefill")
-        self.preemption_min_backlog = max(1, int(preemption_min_backlog))
-        self.preemption_min_decodes = max(1, int(preemption_min_decodes))
-        self.preemption_max_queue_wait_s = max(0.0, float(preemption_max_queue_wait_s))
-        self.preemptible_service_classes = {
-            str(service_class).strip()
-            for service_class in (preemptible_service_classes or set())
-            if str(service_class).strip()
-        }
-        self.preempt_multimodal_prefills = bool(preempt_multimodal_prefills)
-        self.preempt_multimodal_max_queue_wait_s = max(
-            0.0, float(preempt_multimodal_max_queue_wait_s)
-        )
-        self.multimodal_prefix_cache_protect_threshold = max(
-            0.0, float(multimodal_prefix_cache_protect_threshold)
-        )
         self.gpu_greedy_sampling = bool(gpu_greedy_sampling)
         self.gpu_greedy_max_tokens_only = bool(gpu_greedy_max_tokens_only)
         self.gpu_greedy_bypass_cpu_policies = bool(gpu_greedy_bypass_cpu_policies)
@@ -158,47 +134,6 @@ class LiteSingleGpuBackend:
         self._materialize_prefix_cache_entry(request_state, entry, prefix_len)
         request_state._prefix_cache_applied = True
         return None
-
-    def maybe_preempt(self, step_plan, scheduler):
-        # Soft preemption: when decode work exists and queued backlog remains,
-        # defer selected prefills for this step instead of partially executing them.
-        if not hasattr(step_plan, "prefills") or not hasattr(step_plan, "decodes"):
-            return step_plan
-        if self.preemption_mode == "off":
-            return step_plan
-        if self.preemption_mode != "defer_prefill":
-            return step_plan
-        if (
-            step_plan.prefills is not None
-            and step_plan.decodes is not None
-            and not getattr(step_plan.metrics, "prefill_starvation_protected", False)
-            and getattr(scheduler, "queued_request_count", 0)
-            >= self.preemption_min_backlog
-            and len(step_plan.decodes.request_ids) >= self.preemption_min_decodes
-            and not self._queue_wait_blocks_preemption(step_plan)
-            and self._multimodal_prefills_are_preemptible(step_plan, scheduler)
-            and self._prefills_are_preemptible(step_plan, scheduler)
-        ):
-            preempted_multimodal = 0
-            if hasattr(scheduler, "get_request"):
-                preempted_multimodal = sum(
-                    1
-                    for rid in step_plan.prefills.request_ids
-                    if self._is_multimodal_request(scheduler.get_request(rid))
-                )
-            self.observer.on_preemption_event(
-                preempted_prefill_requests=len(step_plan.prefills.request_ids),
-                queued_backlog=int(getattr(scheduler, "queued_request_count", 0)),
-                multimodal_prefill_requests=preempted_multimodal,
-            )
-            return StepPlan(
-                admissions=step_plan.admissions,
-                prefills=None,
-                decodes=step_plan.decodes,
-                step_token_budget=step_plan.step_token_budget,
-                metrics=step_plan.metrics,
-            )
-        return step_plan
 
     def decode_step_sync(self, request_ids: list[str]) -> list[RequestOutput]:
         self._ensure_runtime_ready()
@@ -428,18 +363,6 @@ class LiteSingleGpuBackend:
             "min_prefix_cache_partial_hit_tokens": (
                 self.min_prefix_cache_partial_hit_tokens
             ),
-            "preemption_mode": self.preemption_mode,
-            "preemption_min_backlog": self.preemption_min_backlog,
-            "preemption_min_decodes": self.preemption_min_decodes,
-            "preemption_max_queue_wait_s": self.preemption_max_queue_wait_s,
-            "preemptible_service_classes": sorted(self.preemptible_service_classes),
-            "preempt_multimodal_prefills": self.preempt_multimodal_prefills,
-            "preempt_multimodal_max_queue_wait_s": (
-                self.preempt_multimodal_max_queue_wait_s
-            ),
-            "multimodal_prefix_cache_protect_threshold": (
-                self.multimodal_prefix_cache_protect_threshold
-            ),
             "gpu_greedy_sampling": self.gpu_greedy_sampling,
             "gpu_greedy_max_tokens_only": self.gpu_greedy_max_tokens_only,
             "gpu_greedy_bypass_cpu_policies": self.gpu_greedy_bypass_cpu_policies,
@@ -543,72 +466,6 @@ class LiteSingleGpuBackend:
             prefix_len=prefix_len,
             saved_prefill_tokens=saved_prefill_tokens,
             is_multimodal=self._is_multimodal_request(request_state),
-        )
-
-    def _queue_wait_blocks_preemption(self, step_plan: StepPlan) -> bool:
-        threshold = self.preemption_max_queue_wait_s
-        if threshold <= 0:
-            return False
-        return (
-            float(getattr(step_plan.metrics, "queued_p95_wait_s", 0.0) or 0.0)
-            >= threshold
-        )
-
-    def _prefills_are_preemptible(self, step_plan: StepPlan, scheduler: Any) -> bool:
-        if not self.preemptible_service_classes or step_plan.prefills is None:
-            return True
-        return all(
-            str(scheduler.get_request(rid).service_class or "latency")
-            in self.preemptible_service_classes
-            for rid in step_plan.prefills.request_ids
-        )
-
-    def _multimodal_prefills_are_preemptible(
-        self,
-        step_plan: StepPlan,
-        scheduler: Any,
-    ) -> bool:
-        if step_plan.prefills is None:
-            return True
-        if not hasattr(scheduler, "get_request"):
-            return True
-        has_multimodal_prefill = any(
-            self._is_multimodal_request(scheduler.get_request(rid))
-            for rid in step_plan.prefills.request_ids
-        )
-        if not has_multimodal_prefill:
-            return True
-        if self._protect_multimodal_prefix_prefills(step_plan):
-            self.observer.on_multimodal_preemption_guard(
-                protected_prefill_requests=len(step_plan.prefills.request_ids),
-                prefix_cache_hit_rate=float(
-                    getattr(step_plan.metrics, "multimodal_prefix_cache_hit_rate", 0.0)
-                    or 0.0
-                ),
-            )
-            return False
-        if self.preempt_multimodal_prefills:
-            if self.preempt_multimodal_max_queue_wait_s <= 0:
-                return True
-            return (
-                float(
-                    getattr(step_plan.metrics, "queued_multimodal_p95_wait_s", 0.0)
-                    or 0.0
-                )
-                >= self.preempt_multimodal_max_queue_wait_s
-            )
-        return False
-
-    def _protect_multimodal_prefix_prefills(self, step_plan: StepPlan) -> bool:
-        threshold = self.multimodal_prefix_cache_protect_threshold
-        if threshold <= 0:
-            return False
-        return (
-            float(
-                getattr(step_plan.metrics, "multimodal_prefix_cache_hit_rate", 0.0)
-                or 0.0
-            )
-            >= threshold
         )
 
     @staticmethod

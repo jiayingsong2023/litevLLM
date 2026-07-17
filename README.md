@@ -5,20 +5,21 @@
 ## 核心架构与成就
 本引擎专注于 **纯 Python + Triton** 路径，实现单卡推理的高吞吐与低维护复杂度：
 
-- **极致性能 (AMD Radeon 8060S 65GB 实测)**:
-  | 模型 | 配置 | Aggregate TPS | 状态 |
+- **性能快照（AMD Radeon 8060S，96GB reported VRAM）**:
+  | 模型 | 配置 | 实测 TPS | 状态 |
   | :--- | :--- | :--- | :--- |
-  | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | [1:1 HF 对齐] |
-  | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [FP8 KV 稳定] |
-  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **5.85** | [e2e benchmark 2026-06-30] |
-  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, KV cap=512 | **2.13** | [e2e benchmark 2026-06-30] |
-  | **DeepSeek V4 Flash Q2 GGUF** | context~4096, greedy, custom GGUF data plane | **1.6-1.9 decode** | [experimental smoke / e2e benchmark] |
+  | **TinyLlama-1.1B** | BS=32, 2048ctx | **542.4** | [历史结果；未在 2026-07-17 重跑] |
+  | **Qwen3.5-9B (AWQ)** | BS=16, 4096ctx | **205.1** | [历史结果；未在 2026-07-17 重跑] |
+  | **Gemma4-26B-A4B (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **4.86 / 8.94** | [3-run interleaved A/B, 2026-07-17] |
+  | **Gemma4-31B-it (AWQ)** | BS=1, prompt~384, max_new=24, FP8 KV | **2.25 / 4.36** | [single e2e run, 2026-07-17] |
+  | **DeepSeek V4 Flash Q2 GGUF** | prompt~32, max_new=16, custom GGUF data plane | **0.33 / 1.58** | [experimental e2e run, 2026-07-17] |
 
-  最新数值来自 `tests/e2e_full_benchmark.py`（2026-06-30，benchmark profile）。
-  Gemma4-26B `TTFT p50=2189.5ms`、`prefill_tps_agg=179.95`、`decode_tps_agg=12.04`；
-  Gemma4-31B `TTFT p50=5138.1ms`、`prefill_tps_agg=76.68`、`decode_tps_agg=3.75`；
-  DeepSeek V4 Flash GGUF 当前 warm-cache smoke 约 `1.6 tok/s`，
-  e2e benchmark 曾测得 `decode_tps_agg=1.88`。Standalone GPU smoke
+  最新数值来自 `tests/e2e_full_benchmark.py`。26B 的受控 A/B 使用同机、同命令、
+  独立进程并交错各运行三次：当前提交的 `TTFT p50=2360.8ms`、
+  `prefill_tps_agg=166.89`、`decode_tps_agg=8.94`，相对 A/B 基线的
+  `8.96` decode TPS 差异为 `-0.24%`，不构成性能回归。31B 单次结果为
+  `TTFT p50=5405.3ms`、`prefill_tps_agg=72.89`、`decode_tps_agg=4.36`；
+  DeepSeek 单次 e2e 为 `decode_tps_agg=1.58`。Standalone GPU smoke
   does not use the standard per-token streaming observer, so `stream_visible=0%`
   is an observability limitation rather than a correctness failure.
 
@@ -113,8 +114,8 @@ bash tests/run_regression_suite.sh
 # 推理准确性/质量回归（本地模型语义门禁）
 SKIP_A_TIER=1 bash tests/run_inference_correctness_regression.sh
 
-# Gemma4 26B/31B 默认性能回归
-uv run python tests/e2e_full_benchmark.py
+# Gemma4 26B/31B 与 DeepSeek 默认性能基准
+uv run python tests/e2e_full_benchmark.py --model-process-isolation
 ```
 
 `tests/run_inference_correctness_regression.sh` 覆盖 TinyLlama-1.1B、Qwen3.5-9B-AWQ、Gemma4-26B-A4B、Gemma4-31B；Gemma4-26B/31B 还会运行真实端到端 image multimodal quality spotcheck。当 DeepSeek V4 Flash 目标 GGUF 文件存在时，还会运行实验性 Tier-B quality smoke。Gemma4 模型目录自动探测，优先本地路径。

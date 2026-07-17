@@ -2,7 +2,7 @@
 # GatedDeltaNet helpers below align with Hugging Face `modeling_qwen3_5.py`
 # (torch fallback path).
 from collections import OrderedDict
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -339,7 +339,7 @@ class Qwen3_5RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor, gate: Optional[torch.Tensor] = None):
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None):
         if gate is None:
             raise ValueError("Qwen3_5RMSNormGated requires gate")
         input_dtype = hidden_states.dtype
@@ -422,7 +422,9 @@ class Qwen3_5MoeExpertsLite(nn.Module):
         )
         self.moe_cpu_offload = bool(self.fp8_moe and moe_offload_enabled())
         self.lru_size = moe_expert_lru_size()
-        self._lru_gpu: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._lru_gpu: OrderedDict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
 
         # Standard ParameterLists for experts - populated during load
         self.gate_up_proj = nn.ParameterList(
@@ -708,7 +710,7 @@ def _qwen35_try_fused_awq_pair_matmul(
     lin_b: LiteLinear,
     owner: nn.Module,
     cache_key: str,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Backward-compatible shim over the model-agnostic helper in
     ``_fused_awq_pair``. Kept so existing Qwen3.5 callsites do not need
     touching in this refactor. New callers (Gemma4, future models) should
@@ -735,10 +737,7 @@ def _call_litelinear_stable(
     if layer.weight.numel() == 0:
         out_shape = (*x_f32.shape[:-1], layer.output_size)
         return torch.zeros(out_shape, device=x_f32.device, dtype=torch.float32)
-    if disable_input_cap:
-        x_safe = x_f32
-    else:
-        x_safe = _scale_tensor_to_abs_cap(x_f32, pre_cap)
+    x_safe = x_f32 if disable_input_cap else _scale_tensor_to_abs_cap(x_f32, pre_cap)
     out = layer(x_safe.to(layer.weight.dtype))
     return out.float()
 
@@ -1272,10 +1271,14 @@ class Qwen3_5FullAttentionLayer(nn.Module):
         max_ctx = max(nh * hd, getattr(self.config, "max_position_embeddings", 4096))
         # Chunked prefill: only the first chunk starts at token 0. Direct prefill ignores KV prefix;
         # use paged attention when this step continues after prior chunks (kv_start_indices > 0).
-        kv_start_t = attn_metadata.get("kv_start_indices")
-        kv_chunk_start = (
-            int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
-        )
+        kv_start_cpu = attn_metadata.get("kv_start_indices_cpu")
+        if isinstance(kv_start_cpu, (list, tuple)) and kv_start_cpu:
+            kv_chunk_start = int(kv_start_cpu[0])
+        else:
+            kv_start_t = attn_metadata.get("kv_start_indices")
+            kv_chunk_start = (
+                int(kv_start_t.reshape(-1)[0].item()) if kv_start_t is not None else 0
+            )
 
         # TurboQuant INT4 requires paged_attention for dequantization; skip direct prefill path
         is_int4 = "int4" in str(kv_cache_dtype).lower()
@@ -1308,8 +1311,19 @@ class Qwen3_5FullAttentionLayer(nn.Module):
             attn_in = torch.empty((n_tokens, nh, hd), device=q.device, dtype=q.dtype)
             from vllm.engine.lite_engine import expand_metadata_for_paged_attention
 
+            seq_lens_cpu = (
+                attn_metadata.get("seq_lens_cpu", None)
+                if isinstance(attn_metadata, dict)
+                else getattr(attn_metadata, "seq_lens_cpu", None)
+            )
             seq_lens_ext, block_tables_ext = expand_metadata_for_paged_attention(
-                bs, seq, is_prefill, seq_lens, block_tables, q.device
+                bs,
+                seq,
+                is_prefill,
+                seq_lens,
+                block_tables,
+                q.device,
+                seq_lens_cpu=seq_lens_cpu,
             )
 
             # Kernel expects (batch_size, max_blocks) with stride_bt_seq.

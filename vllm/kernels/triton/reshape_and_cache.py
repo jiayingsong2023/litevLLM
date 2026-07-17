@@ -297,6 +297,7 @@ def _reshape_and_cache_kernel(
             tl.store(kc_ptr, k.to(key_cache.dtype.element_ty))
             tl.store(vc_ptr, v.to(value_cache.dtype.element_ty))
 
+
 def reshape_and_cache(
     key,
     value,

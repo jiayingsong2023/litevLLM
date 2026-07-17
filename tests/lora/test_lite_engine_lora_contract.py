@@ -122,9 +122,7 @@ def test_lite_engine_rejects_lora_when_model_does_not_support_it() -> None:
             ),
         )
 
-    assert engine.observer.rejections == [
-        ("req-1", "model does not support LoRA")
-    ]
+    assert engine.observer.rejections == [("req-1", "model does not support LoRA")]
     assert engine.scheduler.enqueued == []
 
 

@@ -11,10 +11,10 @@ Coverage:
   * Boundary seq_len=1 and seq_len equals full block boundary
   * head_size 64 (LlaMA-like) and 256 (Gemma4 31B) both covered
 """
+
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import pytest
 import torch
@@ -43,7 +43,7 @@ def _paged_attention_reference(
     scale: float,
     num_heads: int,
     num_kv_heads: int,
-    softcap: Optional[float],
+    softcap: float | None,
 ) -> torch.Tensor:
     """Decode-step paged attention reference in fp32, then cast back to q dtype.
 
@@ -107,9 +107,7 @@ def _build_case(
     # per sequence without collisions.
     total_blocks = max(num_seqs * max_num_blocks_per_seq + 4, 8)
 
-    query = torch.randn(
-        num_seqs, num_heads, head_size, device=device, dtype=dtype
-    )
+    query = torch.randn(num_seqs, num_heads, head_size, device=device, dtype=dtype)
     key_cache = torch.randn(
         total_blocks, block_size, num_kv_heads, head_size, device=device, dtype=dtype
     )
@@ -174,8 +172,8 @@ def _run_kernel(
 @pytest.mark.parametrize(
     "head_size,num_heads,num_kv_heads",
     [
-        (64, 8, 2),     # small LLaMA-like
-        (256, 4, 1),    # Gemma4 31B attention head geometry
+        (64, 8, 2),  # small LLaMA-like
+        (256, 4, 1),  # Gemma4 31B attention head geometry
     ],
 )
 @pytest.mark.parametrize("softcap", [None, 0.0, -1.0])
@@ -202,17 +200,32 @@ def test_softcap_disabled_paths_equivalent(head_size, num_heads, num_kv_heads, s
     )
 
     triton_out = _run_kernel(
-        query, kc, vc, bt, sl,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        block_size=block_size, scale=scale, softcap=softcap,
+        query,
+        kc,
+        vc,
+        bt,
+        sl,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        scale=scale,
+        softcap=softcap,
     )
     ref_out = _paged_attention_reference(
-        query, kc, vc, bt, sl,
-        scale=scale, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        query,
+        kc,
+        vc,
+        bt,
+        sl,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         softcap=None,
     )
     # fp16 kernel vs fp32 ref: use loose tol. The goal is functional equivalence.
-    torch.testing.assert_close(triton_out.float(), ref_out.float(), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(
+        triton_out.float(), ref_out.float(), atol=5e-3, rtol=5e-3
+    )
 
 
 @REQUIRES_GPU
@@ -224,7 +237,9 @@ def test_softcap_disabled_paths_equivalent(head_size, num_heads, num_kv_heads, s
     ],
 )
 @pytest.mark.parametrize("softcap_value", [50.0, 30.0, 5.0])
-def test_softcap_matches_eager_reference(head_size, num_heads, num_kv_heads, softcap_value):
+def test_softcap_matches_eager_reference(
+    head_size, num_heads, num_kv_heads, softcap_value
+):
     """With softcap enabled, kernel output must match eager fp32 ref within fp16 tol."""
     device = torch.device("cuda")
     dtype = torch.float16
@@ -247,16 +262,31 @@ def test_softcap_matches_eager_reference(head_size, num_heads, num_kv_heads, sof
     )
 
     triton_out = _run_kernel(
-        query, kc, vc, bt, sl,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        block_size=block_size, scale=scale, softcap=softcap_value,
-    )
-    ref_out = _paged_attention_reference(
-        query, kc, vc, bt, sl,
-        scale=scale, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        query,
+        kc,
+        vc,
+        bt,
+        sl,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        scale=scale,
         softcap=softcap_value,
     )
-    torch.testing.assert_close(triton_out.float(), ref_out.float(), atol=5e-3, rtol=5e-3)
+    ref_out = _paged_attention_reference(
+        query,
+        kc,
+        vc,
+        bt,
+        sl,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        softcap=softcap_value,
+    )
+    torch.testing.assert_close(
+        triton_out.float(), ref_out.float(), atol=5e-3, rtol=5e-3
+    )
 
 
 @REQUIRES_GPU
@@ -276,16 +306,27 @@ def test_softcap_changes_output_when_enabled():
     seq_lens = [24]
     num_seqs = 1
     max_num_blocks_per_seq = 2
-    query = torch.randn(
-        num_seqs, num_heads, head_size, device=device, dtype=dtype
-    ) * 5.0
-    key_cache = torch.randn(
-        max_num_blocks_per_seq, block_size, num_kv_heads, head_size,
-        device=device, dtype=dtype,
-    ) * 5.0
+    query = (
+        torch.randn(num_seqs, num_heads, head_size, device=device, dtype=dtype) * 5.0
+    )
+    key_cache = (
+        torch.randn(
+            max_num_blocks_per_seq,
+            block_size,
+            num_kv_heads,
+            head_size,
+            device=device,
+            dtype=dtype,
+        )
+        * 5.0
+    )
     value_cache = torch.randn(
-        max_num_blocks_per_seq, block_size, num_kv_heads, head_size,
-        device=device, dtype=dtype,
+        max_num_blocks_per_seq,
+        block_size,
+        num_kv_heads,
+        head_size,
+        device=device,
+        dtype=dtype,
     )
     block_tables = torch.arange(
         max_num_blocks_per_seq, device=device, dtype=torch.int32
@@ -293,19 +334,32 @@ def test_softcap_changes_output_when_enabled():
     sl = torch.tensor(seq_lens, device=device, dtype=torch.int32)
 
     out_no_cap = _run_kernel(
-        query, key_cache, value_cache, block_tables, sl,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        block_size=block_size, scale=scale, softcap=None,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        sl,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        scale=scale,
+        softcap=None,
     )
     out_with_cap = _run_kernel(
-        query, key_cache, value_cache, block_tables, sl,
-        num_heads=num_heads, num_kv_heads=num_kv_heads,
-        block_size=block_size, scale=scale, softcap=5.0,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        sl,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        scale=scale,
+        softcap=5.0,
     )
     diff = (out_no_cap.float() - out_with_cap.float()).abs().max().item()
     assert diff > 1e-3, (
-        "softcap branch appears to have been compiled out "
-        f"(max_diff={diff:.3e})"
+        f"softcap branch appears to have been compiled out (max_diff={diff:.3e})"
     )
 
 
@@ -324,21 +378,45 @@ def test_softcap_non_gemma_models_zero_overhead_semantics():
     scale = 1.0 / math.sqrt(head_size)
 
     query, kc, vc, bt, sl = _build_case(
-        device=device, dtype=dtype,
-        num_seqs=num_seqs, num_heads=num_heads, num_kv_heads=num_kv_heads,
-        head_size=head_size, block_size=block_size, seq_lens=seq_lens, seed=99,
+        device=device,
+        dtype=dtype,
+        num_seqs=num_seqs,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens,
+        seed=99,
     )
 
     # No softcap kwarg at all (simulates Qwen/LLaMA call site).
     out = torch.empty_like(query)
     paged_attention_v1(
-        out, query, kc, vc, num_heads, scale, bt, sl,
-        block_size, max(seq_lens), None, "auto", 1.0, 1.0,
+        out,
+        query,
+        kc,
+        vc,
+        num_heads,
+        scale,
+        bt,
+        sl,
+        block_size,
+        max(seq_lens),
+        None,
+        "auto",
+        1.0,
+        1.0,
         num_kv_heads=num_kv_heads,
     )
     ref = _paged_attention_reference(
-        query, kc, vc, bt, sl,
-        scale=scale, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        query,
+        kc,
+        vc,
+        bt,
+        sl,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         softcap=None,
     )
     torch.testing.assert_close(out.float(), ref.float(), atol=5e-3, rtol=5e-3)

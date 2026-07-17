@@ -63,6 +63,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-tokens", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--min-steady-decode-tps", type=float, default=0.0)
+    parser.add_argument("--full-resident", action="store_true")
+    parser.add_argument("--staging-budget-gb", type=float, default=0.0)
     parser.add_argument(
         "--use-graph",
         action="store_true",
@@ -450,6 +452,8 @@ def main() -> int:
             weight_store=store,
             runtime_budget=budget,
             gpu_backend=_build_ready_backend(),
+            full_resident=args.full_resident,
+            staging_budget_gb=args.staging_budget_gb,
         )
         input_ids = torch.full(
             (args.prompt_length,),

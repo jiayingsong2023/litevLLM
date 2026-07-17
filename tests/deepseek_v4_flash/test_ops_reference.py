@@ -34,9 +34,7 @@ def test_silu_gate_reference_applies_silu_to_gate_then_multiplies_up() -> None:
 
     out = silu_gate_reference(gate, up)
 
-    expected = torch.nn.functional.silu(gate.to(torch.float32)) * up.to(
-        torch.float32
-    )
+    expected = torch.nn.functional.silu(gate.to(torch.float32)) * up.to(torch.float32)
     torch.testing.assert_close(out, expected)
     assert out.dtype == torch.float32
 

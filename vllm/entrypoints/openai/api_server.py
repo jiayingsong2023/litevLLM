@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.engine.async_llm import AsyncLLM
+from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.serving.config_builder import build_vllm_config
@@ -131,24 +132,9 @@ def _summarize_runtime_stats(stats: dict) -> dict:
     if not isinstance(lora, dict):
         lora = {}
     prefix_cache = observer.get("prefix_cache", {})
-    preemption = observer.get("preemption", {})
-    fairness = observer.get("fairness", {})
-    lora_observer = observer.get("lora", {})
-    multimodal_observer = observer.get("multimodal", {})
-    multimodal_backend = stats.get("backend", {}).get("multimodal", {})
     async_driver = stats.get("async_driver", {})
     if not isinstance(prefix_cache, dict):
         prefix_cache = {}
-    if not isinstance(preemption, dict):
-        preemption = {}
-    if not isinstance(fairness, dict):
-        fairness = {}
-    if not isinstance(lora_observer, dict):
-        lora_observer = {}
-    if not isinstance(multimodal_observer, dict):
-        multimodal_observer = {}
-    if not isinstance(multimodal_backend, dict):
-        multimodal_backend = {}
     if not isinstance(async_driver, dict):
         async_driver = {}
     return {
@@ -158,56 +144,10 @@ def _summarize_runtime_stats(stats: dict) -> dict:
                 prefix_cache.get("avg_saved_prefill_tokens_per_request", 0.0) or 0.0
             ),
         },
-        "preemption": {
-            "preempted_steps": int(preemption.get("preempted_steps", 0) or 0),
-            "preempted_prefill_requests": int(
-                preemption.get("preempted_prefill_requests", 0) or 0
-            ),
-            "preempted_multimodal_prefill_requests": int(
-                preemption.get("preempted_multimodal_prefill_requests", 0) or 0
-            ),
-            "protected_multimodal_prefix_steps": int(
-                preemption.get("protected_multimodal_prefix_steps", 0) or 0
-            ),
-            "protected_multimodal_prefix_prefill_requests": int(
-                preemption.get("protected_multimodal_prefix_prefill_requests", 0) or 0
-            ),
-        },
-        "fairness": {
-            "p95_queue_wait_s": float(fairness.get("p95_queue_wait_s", 0.0) or 0.0),
-            "max_queue_wait_s": float(fairness.get("max_queue_wait_s", 0.0) or 0.0),
-            "fairness_guardrail_triggered_steps": int(
-                fairness.get("fairness_guardrail_triggered_steps", 0) or 0
-            ),
-        },
         "lora": {
             "registered_adapters": int(lora.get("registered_adapters", 0) or 0),
             "active_adapters": int(lora.get("active_adapters", 0) or 0),
             "total_routed_requests": int(lora.get("total_routed_requests", 0) or 0),
-            "prefill_locality_rate": float(
-                lora_observer.get("prefill_locality_rate", 0.0) or 0.0
-            ),
-            "decode_locality_rate": float(
-                lora_observer.get("decode_locality_rate", 0.0) or 0.0
-            ),
-            "admit_relaxed_steps": int(
-                lora_observer.get("admit_relaxed_steps", 0) or 0
-            ),
-            "admit_tightened_steps": int(
-                lora_observer.get("admit_tightened_steps", 0) or 0
-            ),
-            "prefill_relaxed_steps": int(
-                lora_observer.get("prefill_relaxed_steps", 0) or 0
-            ),
-            "prefill_tightened_steps": int(
-                lora_observer.get("prefill_tightened_steps", 0) or 0
-            ),
-            "decode_relaxed_steps": int(
-                lora_observer.get("decode_relaxed_steps", 0) or 0
-            ),
-            "decode_tightened_steps": int(
-                lora_observer.get("decode_tightened_steps", 0) or 0
-            ),
         },
         "async_driver": {
             "steps": int(async_driver.get("steps", 0) or 0),
@@ -216,163 +156,6 @@ def _summarize_runtime_stats(stats: dict) -> dict:
             "background_errors": int(async_driver.get("background_errors", 0) or 0),
             "min_step_interval_s": float(
                 async_driver.get("min_step_interval_s", 0.0) or 0.0
-            ),
-        },
-        "multimodal": {
-            "requests": int(multimodal_observer.get("requests", 0) or 0),
-            "images": int(multimodal_observer.get("images", 0) or 0),
-            "multimodal_lora_requests": int(
-                multimodal_observer.get("multimodal_lora_requests", 0) or 0
-            ),
-            "queued_requests": int(multimodal_observer.get("queued_requests", 0) or 0),
-            "admitted_requests": int(
-                multimodal_observer.get("admitted_requests", 0) or 0
-            ),
-            "prefill_requests": int(
-                multimodal_observer.get("prefill_requests", 0) or 0
-            ),
-            "prefill_multimodal_lora_requests": int(
-                multimodal_observer.get("prefill_multimodal_lora_requests", 0) or 0
-            ),
-            "decode_requests": int(multimodal_observer.get("decode_requests", 0) or 0),
-            "p95_queue_wait_s": float(
-                multimodal_observer.get("p95_queue_wait_s", 0.0) or 0.0
-            ),
-            "mixed_multimodal_lora_prefill_ratio": float(
-                multimodal_observer.get("mixed_multimodal_lora_prefill_ratio", 0.0)
-                or 0.0
-            ),
-            "avg_effective_prefill_multimodal_limit": float(
-                multimodal_observer.get("avg_effective_prefill_multimodal_limit", 0.0)
-                or 0.0
-            ),
-            "prefill_multimodal_limit_relaxed_steps": int(
-                multimodal_observer.get("prefill_multimodal_limit_relaxed_steps", 0)
-                or 0
-            ),
-            "prefill_multimodal_limit_tightened_steps": int(
-                multimodal_observer.get("prefill_multimodal_limit_tightened_steps", 0)
-                or 0
-            ),
-            "prefill_multimodal_limit_triggered_steps": int(
-                multimodal_observer.get("prefill_multimodal_limit_triggered_steps", 0)
-                or 0
-            ),
-            "prefix_cache_hits": int(
-                multimodal_observer.get("prefix_cache_hits", 0) or 0
-            ),
-            "prefix_cache_misses": int(
-                multimodal_observer.get("prefix_cache_misses", 0) or 0
-            ),
-            "prefix_cache_saved_prefill_tokens": int(
-                multimodal_observer.get("prefix_cache_saved_prefill_tokens", 0) or 0
-            ),
-            "prefix_cache_hit_rate": float(
-                multimodal_observer.get("prefix_cache_hit_rate", 0.0) or 0.0
-            ),
-            "avg_effective_admit_multimodal_lora_limit": float(
-                multimodal_observer.get(
-                    "avg_effective_admit_multimodal_lora_limit", 0.0
-                )
-                or 0.0
-            ),
-            "avg_effective_prefill_multimodal_lora_limit": float(
-                multimodal_observer.get(
-                    "avg_effective_prefill_multimodal_lora_limit", 0.0
-                )
-                or 0.0
-            ),
-            "avg_effective_decode_multimodal_lora_limit": float(
-                multimodal_observer.get(
-                    "avg_effective_decode_multimodal_lora_limit", 0.0
-                )
-                or 0.0
-            ),
-            "admit_multimodal_lora_limit_triggered_steps": int(
-                multimodal_observer.get(
-                    "admit_multimodal_lora_limit_triggered_steps", 0
-                )
-                or 0
-            ),
-            "prefill_multimodal_lora_limit_triggered_steps": int(
-                multimodal_observer.get(
-                    "prefill_multimodal_lora_limit_triggered_steps", 0
-                )
-                or 0
-            ),
-            "prefill_multimodal_lora_limit_relaxed_steps": int(
-                multimodal_observer.get(
-                    "prefill_multimodal_lora_limit_relaxed_steps", 0
-                )
-                or 0
-            ),
-            "prefill_multimodal_lora_limit_relaxed_by_fairness_steps": int(
-                multimodal_observer.get(
-                    "prefill_multimodal_lora_limit_relaxed_by_fairness_steps", 0
-                )
-                or 0
-            ),
-            "prefill_multimodal_lora_limit_tightened_steps": int(
-                multimodal_observer.get(
-                    "prefill_multimodal_lora_limit_tightened_steps", 0
-                )
-                or 0
-            ),
-            "prefill_multimodal_lora_limit_tightened_by_locality_steps": int(
-                multimodal_observer.get(
-                    "prefill_multimodal_lora_limit_tightened_by_locality_steps", 0
-                )
-                or 0
-            ),
-            "decode_multimodal_lora_limit_relaxed_steps": int(
-                multimodal_observer.get("decode_multimodal_lora_limit_relaxed_steps", 0)
-                or 0
-            ),
-            "decode_multimodal_lora_limit_relaxed_by_fairness_steps": int(
-                multimodal_observer.get(
-                    "decode_multimodal_lora_limit_relaxed_by_fairness_steps", 0
-                )
-                or 0
-            ),
-            "decode_multimodal_lora_limit_tightened_steps": int(
-                multimodal_observer.get(
-                    "decode_multimodal_lora_limit_tightened_steps", 0
-                )
-                or 0
-            ),
-            "decode_multimodal_lora_limit_tightened_by_locality_steps": int(
-                multimodal_observer.get(
-                    "decode_multimodal_lora_limit_tightened_by_locality_steps", 0
-                )
-                or 0
-            ),
-            "decode_multimodal_lora_limit_triggered_steps": int(
-                multimodal_observer.get(
-                    "decode_multimodal_lora_limit_triggered_steps", 0
-                )
-                or 0
-            ),
-            "avg_prefill_multimodal_lora_max_fairness_gap": float(
-                multimodal_observer.get(
-                    "avg_prefill_multimodal_lora_max_fairness_gap", 0.0
-                )
-                or 0.0
-            ),
-            "avg_decode_multimodal_lora_max_fairness_gap": float(
-                multimodal_observer.get(
-                    "avg_decode_multimodal_lora_max_fairness_gap", 0.0
-                )
-                or 0.0
-            ),
-            "prepared_requests": int(
-                multimodal_backend.get("prepared_requests", 0) or 0
-            ),
-            "prepared_images": int(multimodal_backend.get("prepared_images", 0) or 0),
-            "embeddings_computed": int(
-                multimodal_backend.get("embeddings_computed", 0) or 0
-            ),
-            "avg_embedding_feature_dim": float(
-                multimodal_backend.get("avg_embedding_feature_dim", 0.0) or 0.0
             ),
         },
     }
@@ -521,6 +304,7 @@ def main() -> None:
 
     global engine
     v_config = build_vllm_config(args.model, policy_mode=args.policy_mode)
+    object.__setattr__(v_config, "runtime_observer", InMemoryRuntimeObserver())
     engine = AsyncLLM(v_config)
 
     logger.info(

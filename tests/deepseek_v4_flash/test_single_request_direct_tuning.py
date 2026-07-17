@@ -2,7 +2,6 @@
 # See task-1-report.md for full sweep numbers.
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -181,11 +180,6 @@ def test_token_id_decode_passes_capped_compressed_counts() -> None:
         ),
         patch.object(
             model,
-            "_schedule_next_layer_expert_prefetch",
-            lambda stager, next_layer, *, token_id: None,
-        ),
-        patch.object(
-            model,
             "_kernel_output_streams",
             lambda hidden: torch.zeros(
                 4,
@@ -283,8 +277,7 @@ def test_hot_expert_pinning_stages_deepseek_tensor() -> None:
     assert stager.pin_grouped_expert.call_count >= 4
 
 
-def test_gpu_staging_budget_respects_override_gb() -> None:
-    """FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB adds to the base budget."""
+def test_gpu_staging_budget_accepts_explicit_gb() -> None:
     # Give enough headroom so the 1 GB extra is not capped.
     model = _fake_model(
         context_length=16,
@@ -295,41 +288,14 @@ def test_gpu_staging_budget_respects_override_gb() -> None:
         ),
     )
     base = model._gpu_staging_budget_bytes()
-    with patch.dict(
-        os.environ,
-        {"FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB": "1"},
-    ):
-        overridden = model._gpu_staging_budget_bytes()
+    model.staging_budget_gb = 1
+    overridden = model._gpu_staging_budget_bytes()
     assert overridden is not None
     assert base is not None
     assert overridden == base + 1024 * 1024 * 1024
 
 
-def test_gpu_staging_budget_malformed_env_defaults_to_zero() -> None:
-    """A malformed FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB is ignored."""
-    model = _fake_model(
-        context_length=16,
-        runtime_budget=_runtime_budget(
-            16,
-            uma_budget_bytes=4 * 1024 * 1024 * 1024,
-            min_system_headroom_bytes=1024 * 1024 * 1024,
-        ),
-    )
-    base = model._gpu_staging_budget_bytes()
-    with (
-        patch.dict(
-            os.environ,
-            {"FASTINFERENCE_DEEPSEEK_V4_FLASH_STAGING_BUDGET_GB": "not-a-number"},
-        ),
-        pytest.warns(UserWarning, match="malformed"),
-    ):
-        malformed = model._gpu_staging_budget_bytes()
-    assert malformed is not None
-    assert base is not None
-    assert malformed == base
-
-
-def test_full_resident_env_removes_staging_budget_cap() -> None:
+def test_full_resident_removes_staging_budget_cap() -> None:
     model = _fake_model(
         context_length=16,
         runtime_budget=_runtime_budget(
@@ -339,11 +305,8 @@ def test_full_resident_env_removes_staging_budget_cap() -> None:
         ),
     )
 
-    with patch.dict(
-        os.environ,
-        {"FASTINFERENCE_DEEPSEEK_V4_FLASH_FULL_RESIDENT": "1"},
-    ):
-        stager = model._get_gpu_weight_stager(torch.device("cuda"))
+    model.full_resident = True
+    stager = model._get_gpu_weight_stager(torch.device("cuda"))
 
     assert stager.max_staged_bytes is None
     assert stager.full_resident_enabled is True

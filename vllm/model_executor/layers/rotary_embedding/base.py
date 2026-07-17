@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from abc import ABC
+
 import torch
 import torch.nn as nn
-from abc import ABC, abstractmethod
-from typing import Optional, Union, List
+
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
 
 class RotaryEmbedding(nn.Module, ABC):
     def __init__(
@@ -24,7 +26,7 @@ class RotaryEmbedding(nn.Module, ABC):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        
+
         self.use_flashinfer = False
         cos, sin = self._compute_cos_sin_cache()
         self.register_buffer("cos_cached", cos.to(dtype), persistent=False)
@@ -32,7 +34,12 @@ class RotaryEmbedding(nn.Module, ABC):
         self.apply_rotary_emb = ApplyRotaryEmb(is_neox_style=self.is_neox_style)
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
-        inv_freq = 1.0 / (base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim))
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
+        )
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -49,10 +56,15 @@ class RotaryEmbedding(nn.Module, ABC):
             positions = positions.to(self.cos_cached.device)
         cos = self.cos_cached[positions]
         sin = self.sin_cached[positions]
-        return self.apply_rotary_emb.forward_native(query, cos, sin), \
-               self.apply_rotary_emb.forward_native(key, cos, sin)
+        return self.apply_rotary_emb.forward_native(
+            query, cos, sin
+        ), self.apply_rotary_emb.forward_native(key, cos, sin)
 
-def get_rope(head_size, rotary_dim, max_position, base, is_neox_style, dtype=torch.float16):
+
+def get_rope(
+    head_size, rotary_dim, max_position, base, is_neox_style, dtype=torch.float16
+):
     class DefaultRoPE(RotaryEmbedding):
         pass
+
     return DefaultRoPE(head_size, rotary_dim, max_position, base, is_neox_style, dtype)

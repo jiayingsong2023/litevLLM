@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 import torch.nn as nn
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional, Any, Dict
-from collections import defaultdict
-
 
 _AWQ_TENSOR_TUNING: dict[str, str] = {}
 _AWQ_TENSOR_TUNING_LOCKED = False
@@ -59,12 +59,12 @@ class AWQExecutionPolicy:
 
 class LRUWeightCache:
     def __init__(self, max_size: int = 256, max_bytes: int = 0):
-        self.cache: Dict[int, Any] = {}
+        self.cache: dict[int, Any] = {}
         self.keys = []
         self.max_size = max_size
         self.max_bytes = max(0, int(max_bytes))
         self.current_bytes = 0
-        self.item_bytes: Dict[int, int] = {}
+        self.item_bytes: dict[int, int] = {}
 
     def _evict_one(self) -> None:
         if not self.keys:
@@ -74,7 +74,7 @@ class LRUWeightCache:
         old_bytes = self.item_bytes.pop(old_key, 0)
         self.current_bytes = max(0, self.current_bytes - old_bytes)
 
-    def get(self, key: int) -> Optional[Any]:
+    def get(self, key: int) -> Any | None:
         if key in self.cache:
             self.keys.remove(key)
             self.keys.append(key)
@@ -100,7 +100,7 @@ class LRUWeightCache:
         self.item_bytes[key] = value_bytes
         self.current_bytes += value_bytes
 
-    def get_memory_stats(self) -> Dict[str, int]:
+    def get_memory_stats(self) -> dict[str, int]:
         return {
             "cache_items": int(len(self.keys)),
             "cache_bytes": int(self.current_bytes),
@@ -223,8 +223,8 @@ _HIGH_FIDELITY_PREFIXES = tuple(
     if part.strip()
 )
 
-_AWQ_RUNTIME_STATS: Dict[str, int] = defaultdict(int)
-_AWQ_RUNTIME_PREFIX_STATS: Dict[str, Dict[str, int]] = {}
+_AWQ_RUNTIME_STATS: dict[str, int] = defaultdict(int)
+_AWQ_RUNTIME_PREFIX_STATS: dict[str, dict[str, int]] = {}
 
 
 def _awq_stat_inc(key: str, delta: int = 1) -> None:
@@ -561,16 +561,7 @@ def _env_awq_fused_scope_tool_override(profile_hint: str) -> str:
             return scope
     # Profile-aware default matrix (no override):
     # - qwen35_9b_awq: safe=attention_only, balanced|throughput=all, strict=off
-    if profile_hint == "qwen35_9b_awq":
-        default_scope = (
-            "all"
-            if matrix in ("balanced", "throughput")
-            else "off"
-            if matrix == "strict"
-            else "attention_only"
-        )
-    # - gemma4_31b_q4: throughput-first dense model; keep fused enabled except in strict mode
-    elif profile_hint == "gemma4_31b_q4":
+    if profile_hint == "qwen35_9b_awq" or profile_hint == "gemma4_31b_q4":
         default_scope = (
             "all"
             if matrix in ("balanced", "throughput")
@@ -613,9 +604,11 @@ def resolve_awq_execution_policy(
     cache_scope = awq_cache_scope(config)
     fused_scope = awq_fused_scope(config, profile_hint)
     allow_dense_cache = awq_dense_fallback_cache_enabled(config)
-    if cache_scope == "off":
-        allow_dense_cache = False
-    elif cache_scope == "attention_only" and not _is_attention_like_prefix(prefix):
+    if (
+        cache_scope == "off"
+        or cache_scope == "attention_only"
+        and not _is_attention_like_prefix(prefix)
+    ):
         allow_dense_cache = False
     return AWQExecutionPolicy(
         prefer_fused=awq_fused_gemm_enabled(config),
@@ -646,7 +639,7 @@ def should_use_awq_fused_path(
     x: torch.Tensor,
     qweight: torch.Tensor,
     scales: torch.Tensor,
-    qzeros: Optional[torch.Tensor],
+    qzeros: torch.Tensor | None,
     group_size: int,
     prefix: str,
     policy: AWQExecutionPolicy | None = None,
@@ -697,7 +690,7 @@ def reset_awq_runtime_stats() -> None:
     _awq_stat_set("awq_interleaved_cache_bytes", 0)
 
 
-def get_awq_runtime_stats() -> Dict[str, int]:
+def get_awq_runtime_stats() -> dict[str, int]:
     out = dict(_AWQ_RUNTIME_STATS)
     out.update(_GLOBAL_WEIGHT_CACHE.get_memory_stats())
     for key, value in _AWQ_AUDIT_EVENTS.items():
@@ -705,7 +698,7 @@ def get_awq_runtime_stats() -> Dict[str, int]:
     return out
 
 
-def get_awq_runtime_prefix_stats(limit: int = 20) -> Dict[str, Dict[str, int]]:
+def get_awq_runtime_prefix_stats(limit: int = 20) -> dict[str, dict[str, int]]:
     rows = sorted(
         _AWQ_RUNTIME_PREFIX_STATS.items(),
         key=lambda kv: (
@@ -714,7 +707,7 @@ def get_awq_runtime_prefix_stats(limit: int = 20) -> Dict[str, Dict[str, int]]:
             kv[0],
         ),
     )
-    out: Dict[str, Dict[str, int]] = {}
+    out: dict[str, dict[str, int]] = {}
     for prefix, stats in rows[: max(0, int(limit))]:
         out[prefix] = {k: int(v) for k, v in stats.items()}
     return out
@@ -770,7 +763,7 @@ def _should_use_high_fidelity_awq(
 def _apply_linear_with_cached_weight(
     x: torch.Tensor,
     cached_weight: Any,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if isinstance(cached_weight, dict):
         raise RuntimeError(
@@ -791,8 +784,8 @@ def dequantize_q4k_pytorch(
 ) -> torch.Tensor:
     """Accurate Q4_K dequantization using gguf library reference implementation."""
     try:
-        from gguf import dequantize, GGMLQuantizationType
         import numpy as np
+        from gguf import GGMLQuantizationType, dequantize
 
         w_np = qweight.cpu().numpy()
         dequant_np = dequantize(w_np, GGMLQuantizationType.Q4_K)
@@ -810,7 +803,7 @@ def dequantize_q4k_pytorch(
     except Exception as e:
         raise RuntimeError(
             f"Q4_K Dequant Error: {e} ({qweight.shape}, R:{n_rows}, C:{n_cols})"
-        )
+        ) from e
 
 
 def dequantize_q6k_pytorch(
@@ -818,8 +811,8 @@ def dequantize_q6k_pytorch(
 ) -> torch.Tensor:
     """Accurate Q6_K dequantization using gguf library reference implementation."""
     try:
-        from gguf import dequantize, GGMLQuantizationType
         import numpy as np
+        from gguf import GGMLQuantizationType, dequantize
 
         w_np = qweight.cpu().numpy()
         dequant_np = dequantize(w_np, GGMLQuantizationType.Q6_K)
@@ -836,7 +829,7 @@ def dequantize_q6k_pytorch(
     except Exception as e:
         raise RuntimeError(
             f"Q6_K Dequant Error: {e} ({qweight.shape}, R:{n_rows}, C:{n_cols})"
-        )
+        ) from e
 
 
 def dequantize_awq_pytorch(
@@ -864,7 +857,7 @@ def dequantize_awq_pytorch(
         res = (qs - zs.unsqueeze(-1)) * scales.to(torch.float32).unsqueeze(-1)
         return res.view(n_rows, n_cols).to(torch.float16)
     except Exception as e:
-        raise RuntimeError(f"AWQ PyTorch Dequant Error: {e}")
+        raise RuntimeError(f"AWQ PyTorch Dequant Error: {e}") from e
 
 
 def dequantize_symmetric_packed_int4_pytorch(
@@ -905,14 +898,14 @@ def dequantize_symmetric_packed_int4_pytorch(
         res = qs * scales.to(torch.float32).unsqueeze(-1)
         return res.reshape(*leading_shape, n_rows, n_cols).to(torch.float16)
     except Exception as e:
-        raise RuntimeError(f"Symmetric packed int4 dequant error: {e}")
+        raise RuntimeError(f"Symmetric packed int4 dequant error: {e}") from e
 
 
 def dequantize_symmetric_packed_int4(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     group_size: int,
-    original_shape: Optional[tuple[int, int]] = None,
+    original_shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """
     Prefer the same compressed-tensors unpack/dequant path the checkpoint expects.
@@ -959,7 +952,7 @@ class QuantizedLinearWeight(nn.Module, ABC):
     def matmul(
         self,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
         *,
         config: object | None = None,
     ) -> torch.Tensor:
@@ -1160,7 +1153,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
         qweight,
         scales,
         group_size=128,
-        original_shape: Optional[tuple[int, int]] = None,
+        original_shape: tuple[int, int] | None = None,
         prefix: str = "",
         high_fidelity: bool = False,
         profile_hint: str = "",
@@ -1205,10 +1198,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
             )
 
         x2 = x.reshape(-1, x.shape[-1])
-        if (
-            awq_rows_exact_msmall_enabled(config)
-            and int(x2.shape[0]) in (2, 4)
-        ):
+        if awq_rows_exact_msmall_enabled(config) and int(x2.shape[0]) in (2, 4):
             try:
                 from vllm.kernels.triton.awq_fused_gemm import (
                     packed_int4_symmetric_group32_rows_exact_msmall_safe,
@@ -1337,9 +1327,7 @@ class PackedInt4Weight(QuantizedLinearWeight):
                 if used_fused:
                     _awq_stat_inc("awq_fused_success")
                     _awq_prefix_stat_inc(self.prefix, "fused_success")
-                    _awq_prefix_stat_inc(
-                        self.prefix, "decision_fused_gemma4_down_proj"
-                    )
+                    _awq_prefix_stat_inc(self.prefix, "decision_fused_gemma4_down_proj")
                     return out.view(*x.shape[:-1], out.shape[-1])
             except Exception:
                 _awq_prefix_stat_inc(self.prefix, "fused_runtime_exception")

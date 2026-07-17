@@ -38,14 +38,6 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
         scheduler_policy=SchedulerRuntimePolicy(max_decode_streak=9),
         backend_policy=BackendRuntimePolicy(
             max_prefix_cache_entries=11,
-            preemption_mode="off",
-            preemption_min_backlog=3,
-            preemption_min_decodes=2,
-            preemption_max_queue_wait_s=1.5,
-            preemptible_service_classes={"throughput"},
-            preempt_multimodal_prefills=True,
-            preempt_multimodal_max_queue_wait_s=2.0,
-            multimodal_prefix_cache_protect_threshold=0.6,
             gpu_greedy_sampling=True,
             gpu_greedy_max_tokens_only=True,
             gpu_greedy_bypass_cpu_policies=True,
@@ -61,34 +53,16 @@ def test_lite_runtime_factory_builds_expected_components() -> None:
 
     runtime_components = LiteRuntimeFactory.build(context)
 
-    assert set(runtime_components) == {
-        "kv_block_manager",
-        "input_batch_builder",
-        "multimodal_processor",
-        "prefill_executor",
-        "decode_executor",
-        "step_scheduler",
-        "execution_backend",
-        "runtime_controller",
-    }
+    assert runtime_components.kv_block_manager is not None
+    assert runtime_components.input_batch_builder is not None
+    assert runtime_components.runtime_controller is not None
 
-    step_scheduler = runtime_components["step_scheduler"]
+    step_scheduler = runtime_components.step_scheduler
     assert step_scheduler.max_decode_streak == 9
-    assert step_scheduler.min_prefill_chunk_size == 4
-    assert step_scheduler.max_prefill_chunk_size == 8
-    assert step_scheduler.prefill_sla_ttft_ms == 1500.0
 
-    backend = runtime_components["execution_backend"]
+    backend = runtime_components.execution_backend
     stats = backend.stats()
     assert stats["prefix_cache"]["capacity"] == 11
-    assert stats["preemption_mode"] == "off"
-    assert stats["preemption_min_backlog"] == 3
-    assert stats["preemption_min_decodes"] == 2
-    assert stats["preemption_max_queue_wait_s"] == 1.5
-    assert stats["preemptible_service_classes"] == ["throughput"]
-    assert stats["preempt_multimodal_prefills"] is True
-    assert stats["preempt_multimodal_max_queue_wait_s"] == 2.0
-    assert stats["multimodal_prefix_cache_protect_threshold"] == 0.6
     assert stats["gpu_greedy_sampling"] is True
     assert stats["gpu_greedy_max_tokens_only"] is True
     assert stats["gpu_greedy_bypass_cpu_policies"] is True

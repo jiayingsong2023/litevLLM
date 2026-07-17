@@ -9,10 +9,11 @@ future tuning doesn't accidentally regress one model to help another.
 The kernel itself is exercised by ``test_awq_fused_gemm_numerics.py``;
 here we only validate the policy function, which is pure CPU code.
 """
+
 from __future__ import annotations
 
 import os
-from typing import Iterator
+from collections.abc import Iterator
 from unittest import mock
 
 import pytest

@@ -81,8 +81,6 @@ class RuntimeConfig:
 
     @classmethod
     def from_vllm_config(cls, vllm_config: object) -> "RuntimeConfig":
-        from vllm.engine.loadtime_policy import get_total_gpu_memory_gb
-
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
 
@@ -90,11 +88,7 @@ class RuntimeConfig:
             config=getattr(vllm_config, "fastinference_config", None),
             path=getattr(vllm_config, "fastinference_config_path", None),
         )
-        profile = RuntimeProfileRegistry.resolve_from_config(
-            fastinference_config,
-            model_capabilities=getattr(vllm_config, "model_capabilities", None),
-            gpu_total_gb=get_total_gpu_memory_gb(),
-        )
+        profile = RuntimeProfileRegistry.resolve_from_config(fastinference_config)
         tuning_env = collect_runtime_tuning_env(os.environ)
         tuning_env.update(fastinference_config.tuning_keyvals)
         tuning_env["FASTINFERENCE_PROFILE"] = profile.requested_name

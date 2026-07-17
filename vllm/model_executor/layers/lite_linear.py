@@ -25,7 +25,7 @@ class LiteLinear(nn.Module):
         if bias:
             self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         self.lora_manager: Any | None = None
         self.lora_target_name: str | None = None
@@ -44,9 +44,8 @@ class LiteLinear(nn.Module):
             qweight = getattr(self, "qweight", None)
             cached_quant_weight = getattr(self, "_quant_weight", None)
             has_quant_ready = (
-                (qweight is not None and getattr(qweight, "numel", lambda: 0)() > 1)
-                or cached_quant_weight is not None
-            )
+                qweight is not None and getattr(qweight, "numel", lambda: 0)() > 1
+            ) or cached_quant_weight is not None
             if has_quant_ready:
                 base_out = self.quant_config.apply(self, x, *args, **kwargs)
                 return self._apply_lora_delta(base_out, x, lora_mapping)

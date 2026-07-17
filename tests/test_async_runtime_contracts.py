@@ -273,6 +273,81 @@ def test_async_llm_stats_include_async_driver_stats(
     }
 
 
+def test_async_llm_serializes_all_engine_state_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TrackingLock:
+        def __init__(self) -> None:
+            self.depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.depth -= 1
+
+    class FakeEngine:
+        def __init__(self, _vllm_config) -> None:
+            self._async_engine_lock = None
+
+        def set_tokenizer(self, _tokenizer) -> None:
+            return None
+
+        def _assert_locked(self) -> None:
+            assert self._async_engine_lock.depth > 0
+
+        def abort_request(self, _request_id) -> None:
+            self._assert_locked()
+
+        def stats(self) -> dict[str, object]:
+            self._assert_locked()
+            return {}
+
+        def register_lora_adapter(self, **_kwargs) -> dict[str, object]:
+            self._assert_locked()
+            return {}
+
+        def unregister_lora_adapter(self, _lora_name: str) -> bool:
+            self._assert_locked()
+            return True
+
+        def reset_stats(self, **_kwargs) -> None:
+            self._assert_locked()
+
+    class FakeDriver:
+        def __init__(self, _engine, *, min_step_interval_s: float = 0.001) -> None:
+            del min_step_interval_s
+
+        def stats(self) -> dict[str, object]:
+            return {}
+
+        def shutdown(self) -> None:
+            return None
+
+    class DummyConfig:
+        class ModelConfig:
+            model = "dummy"
+
+        model_config = ModelConfig()
+
+    monkeypatch.setattr(async_llm_module, "LiteEngine", FakeEngine)
+    monkeypatch.setattr(async_llm_module, "AsyncDriver", FakeDriver)
+    monkeypatch.setattr(
+        async_llm_module, "get_tokenizer", lambda *_args, **_kwargs: object()
+    )
+    llm = async_llm_module.AsyncLLM(DummyConfig())
+    lock = TrackingLock()
+    llm._engine_lock = lock
+    llm.engine._async_engine_lock = lock
+
+    asyncio.run(llm.abort("r1"))
+    llm.stats()
+    llm.register_lora_adapter(lora_name="adapter")
+    assert llm.unregister_lora_adapter("adapter") is True
+    llm.reset_stats()
+
+
 @pytest.mark.asyncio
 async def test_async_llm_generate_abort_end_to_end(
     monkeypatch: pytest.MonkeyPatch,

@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.entrypoints.openai import api_server
 
 
@@ -127,3 +128,24 @@ def test_openai_server_streams_normal_generate_path_for_chat_requests() -> None:
     assert any(line.startswith("data: {") for line in chunks)
     assert any("streamed" in line for line in chunks)
     assert "data: [DONE]" in chunks
+
+
+def test_openai_server_enables_bounded_runtime_observer(monkeypatch) -> None:
+    config = type("_Config", (), {})()
+    captured = {}
+    previous_engine = api_server.engine
+
+    monkeypatch.setattr(api_server, "build_vllm_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        api_server,
+        "AsyncLLM",
+        lambda received_config: captured.setdefault("config", received_config),
+    )
+    monkeypatch.setattr(api_server.uvicorn, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("sys.argv", ["api_server", "--model", "models/mock"])
+    try:
+        api_server.main()
+    finally:
+        api_server.engine = previous_engine
+
+    assert isinstance(captured["config"].runtime_observer, InMemoryRuntimeObserver)

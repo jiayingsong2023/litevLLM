@@ -43,9 +43,13 @@ def test_build_parser_uses_discovered_default_model(
 
 
 def test_main_rejects_non_local_model_dir(
-    gemma4_strict_audit_mod: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    gemma4_strict_audit_mod: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["gemma4_prefill_strict_audit.py", "--model", "missing-model"])
+    monkeypatch.setattr(
+        sys, "argv", ["gemma4_prefill_strict_audit.py", "--model", "missing-model"]
+    )
 
     rc = gemma4_strict_audit_mod.main()
 

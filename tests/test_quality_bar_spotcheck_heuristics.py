@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Tier-B substance heuristics in tests/tools/quality_bar_spotcheck.py."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -7,7 +8,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 
 import pytest
 
@@ -29,7 +30,7 @@ def qb() -> Any:
 
 
 class _FakeTok:
-    def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
         if not token_ids:
             return ""
         return {198: "\n", 72: "T", 100: "The"}.get(token_ids[0], "x")
@@ -40,7 +41,9 @@ def test_nonspace_helper(qb: Any) -> None:
 
 
 def test_substance_whitespace_only_fails(qb: Any) -> None:
-    severe, detail, _ = qb.analyze_tier_b("\n\n", [198, 198], _FakeTok(), check_substance=True)
+    severe, detail, _ = qb.analyze_tier_b(
+        "\n\n", [198, 198], _FakeTok(), check_substance=True
+    )
     assert severe
     assert detail["substance"]["pass"] is False
     assert detail["tier_b_alignment"]["substance_ok"] is False
@@ -57,21 +60,25 @@ def test_substance_ok_for_normal_sentence(qb: Any) -> None:
 def test_substance_digit_heavy_fails(qb: Any) -> None:
     text = "1.3\n5 0\n\n30 4 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1"
     ids = list(range(40))
-    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    severe, detail, msgs = qb.analyze_tier_b(
+        text, ids, _FakeTok(), check_substance=True
+    )
     assert severe
     assert detail["substance"]["pass"] is False
     assert any("digit" in m or "letter" in m for m in msgs)
 
 
 def test_check_substance_disabled(qb: Any) -> None:
-    severe, detail, _ = qb.analyze_tier_b("\n\n", [1, 2], _FakeTok(), check_substance=False)
+    severe, detail, _ = qb.analyze_tier_b(
+        "\n\n", [1, 2], _FakeTok(), check_substance=False
+    )
     assert detail["substance"]["pass"] is True
 
 
 class _FragTok:
     """First id decodes to lone U+FFFD; prefix decode is valid (BPE fragment case)."""
 
-    def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
         if not token_ids:
             return ""
         if token_ids == [99]:
@@ -131,7 +138,9 @@ def test_substance_fails_on_mixed_script_fragmentation(qb: Any) -> None:
         "مرحباhelloहिन्दीかな한글abc"
     )
     ids = list(range(64))
-    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    severe, detail, msgs = qb.analyze_tier_b(
+        text, ids, _FakeTok(), check_substance=True
+    )
     assert severe
     assert detail["substance"]["pass"] is False
     assert any("mixed_script_fragmentation" in m for m in msgs)
@@ -140,7 +149,9 @@ def test_substance_fails_on_mixed_script_fragmentation(qb: Any) -> None:
 def test_substance_ok_for_single_script_with_small_english_mix(qb: Any) -> None:
     text = "法国的首都是巴黎。这是一个简短回答，with only a tiny English suffix."
     ids = list(range(40))
-    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    severe, detail, msgs = qb.analyze_tier_b(
+        text, ids, _FakeTok(), check_substance=True
+    )
     assert detail["substance"]["pass"] is True
     assert not any("mixed_script_fragmentation" in m for m in msgs)
 
@@ -151,7 +162,9 @@ def test_substance_fails_on_fragmented_short_run_salad(qb: Any) -> None:
         "阿-APPEND way̸-( worldるur- Ã arrange own debans de de de Americana autos much←Ann #-}"
     )
     ids = list(range(48))
-    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    severe, detail, msgs = qb.analyze_tier_b(
+        text, ids, _FakeTok(), check_substance=True
+    )
     assert severe
     assert detail["substance"]["pass"] is False
     assert any("fragmented_short_run_salad" in m for m in msgs)
@@ -163,7 +176,9 @@ def test_substance_hard_rule_not_triggered_for_normal_prose(qb: Any) -> None:
         "subtree are smaller while keys in the right subtree are larger."
     )
     ids = list(range(48))
-    severe, detail, msgs = qb.analyze_tier_b(text, ids, _FakeTok(), check_substance=True)
+    severe, detail, msgs = qb.analyze_tier_b(
+        text, ids, _FakeTok(), check_substance=True
+    )
     assert detail["substance"]["pass"] is True
     assert not any("fragmented_short_run_salad" in m for m in msgs)
 

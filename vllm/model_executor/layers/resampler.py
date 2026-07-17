@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 DEFAULT_LN = partial(nn.LayerNorm, eps=1e-6)
 
+
 def get_abs_pos(abs_pos: torch.Tensor, tgt_size: torch.Tensor | int) -> torch.Tensor:
     # abs_pos: L, C
     # tgt_size: (H, W)
@@ -62,6 +63,7 @@ def get_abs_pos(abs_pos: torch.Tensor, tgt_size: torch.Tensor | int) -> torch.Te
         .flatten(0, 2)
         .to(dtype=dtype)
     )
+
 
 # sin/cos positional embedding helpers are adapted from:
 # https://github.com/facebookresearch/mae/blob/efb2a8062c206524e35e47d04501ed4f544c0ae8/util/pos_embed.py#L20
@@ -86,6 +88,7 @@ def get_1d_sincos_pos_embed_from_grid(
         emb = np.concatenate([emb_sin, emb_cos], axis=-1)  # (H, W, D)
     return emb
 
+
 def get_2d_sincos_pos_embed_from_grid(
     embed_dim: int, grid: np.ndarray, version: tuple[int, int] = (2, 0)
 ) -> torch.Tensor:
@@ -104,6 +107,7 @@ def get_2d_sincos_pos_embed_from_grid(
     else:
         emb = np.concatenate([emb_h, emb_w], axis=-1)  # (H, W, D)
     return emb
+
 
 def get_2d_sincos_pos_embed(
     embed_dim: int,
@@ -131,8 +135,8 @@ def get_2d_sincos_pos_embed(
         pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, version)
     return pos_embed
 
-class BaseResampler(nn.Module):
 
+class BaseResampler(nn.Module):
     def __init__(
         self,
         num_queries: int,
@@ -178,8 +182,8 @@ class BaseResampler(nn.Module):
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
 
-class Resampler2(BaseResampler):
 
+class Resampler2(BaseResampler):
     def __init__(
         self,
         grid_size: int,

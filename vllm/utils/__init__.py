@@ -7,8 +7,10 @@ import torch
 
 MASK_64_BITS = (1 << 64) - 1
 
+
 def random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
+
 
 def length_from_prompt_token_ids_or_embeds(
     prompt_token_ids: list[int] | torch.Tensor | None,

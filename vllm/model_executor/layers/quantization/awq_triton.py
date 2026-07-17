@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
-from vllm.triton_utils import triton, tl
+
+from vllm.triton_utils import tl, triton
 
 
 def awq_fused_capability_check(
@@ -157,10 +158,7 @@ def awq_dequantize_triton(
     n_cols = qweight.shape[1] * 8
 
     # If scales has same rows as qweight, it's grouping along columns (Qwen style)
-    if scales.shape[0] == n_rows:
-        group_along_row = False
-    else:
-        group_along_row = True
+    group_along_row = scales.shape[0] != n_rows
 
     output = torch.empty((n_rows, n_cols), device=qweight.device, dtype=out_dtype)
     grid = lambda META: (

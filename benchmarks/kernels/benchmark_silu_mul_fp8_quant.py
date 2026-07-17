@@ -19,12 +19,12 @@ from collections.abc import Callable
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
 from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
     persistent_masked_m_silu_mul_quant,
 )
-from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import set_random_seed
 
 

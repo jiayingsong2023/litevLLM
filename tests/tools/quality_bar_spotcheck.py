@@ -12,6 +12,7 @@ without ``apply_chat_template`` often yield poor coherence. Use ``--chat-templat
 each prompt is wrapped as a user message when the tokenizer defines ``chat_template``.
 Pre-formatted prompts (containing ``<|im_start|>``) are left unchanged.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,7 +21,8 @@ import os
 import sys
 import unicodedata
 from collections import Counter
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 # Repo root
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,7 +32,13 @@ if _ROOT not in sys.path:
 # Keep spot-check default aligned with runtime default policy.
 os.environ.setdefault("FASTINFERENCE_KV_TYPE", "turbo_int4")
 
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig  # noqa: E402
+from vllm.config import (  # noqa: E402
+    CacheConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.engine.lite_engine import LiteEngine  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 
@@ -89,7 +97,9 @@ _MIN_WEIRD_TOKEN_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE = 0.30
 _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_MIXED_GARBLE = 0.45
 
 
-def _lite_engine_step_budget(engine: LiteEngine, prompt_token_len: int, max_new_tokens: int) -> int:
+def _lite_engine_step_budget(
+    engine: LiteEngine, prompt_token_len: int, max_new_tokens: int
+) -> int:
     chunk_sz = max(1, int(getattr(engine, "_prefill_chunk_size", 512)))
     prefill_chunks = max(1, (prompt_token_len + chunk_sz - 1) // chunk_sz)
     return prefill_chunks + max_new_tokens * 3 + 500
@@ -99,7 +109,7 @@ def _run_lite_steps_until(
     engine: LiteEngine,
     description: str,
     max_steps: int,
-    stop_fn: Callable[[List[Any]], Optional[Any]],
+    stop_fn: Callable[[list[Any]], Any | None],
 ) -> Any:
     for _ in range(max_steps):
         step_outputs = engine.step()
@@ -112,14 +122,14 @@ def _run_lite_steps_until(
     )
 
 
-def _model_config_hints(model_path: str) -> Dict[str, Any]:
+def _model_config_hints(model_path: str) -> dict[str, Any]:
     """Detect MoE / text config from HuggingFace-style config.json next to weights."""
-    out: Dict[str, Any] = {"is_moe": False, "model_type": ""}
+    out: dict[str, Any] = {"is_moe": False, "model_type": ""}
     try:
         p = os.path.join(model_path, "config.json")
         raw = None
         if os.path.isfile(p):
-            with open(p, "r", encoding="utf-8") as f:
+            with open(p, encoding="utf-8") as f:
                 raw = json.load(f)
         # GGUF trees often have no config.json; use sibling HF Chat (same as tokenizer resolution).
         if raw is None:
@@ -132,7 +142,7 @@ def _model_config_hints(model_path: str) -> Dict[str, Any]:
                 if ref:
                     ref_cfg = os.path.join(ref, "config.json")
                     if os.path.isfile(ref_cfg):
-                        with open(ref_cfg, "r", encoding="utf-8") as f:
+                        with open(ref_cfg, encoding="utf-8") as f:
                             raw = json.load(f)
             except Exception:
                 pass
@@ -168,7 +178,7 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
     try:
         if not os.path.isfile(cfg_path):
             return group_size, bits
-        with open(cfg_path, "r") as f:
+        with open(cfg_path) as f:
             raw = json.load(f)
         qc = raw.get("quantization_config") or {}
         groups = qc.get("config_groups")
@@ -195,10 +205,13 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
 # Mirrors docs/INFERENCE_ACCURACY.md §6 prompt list.
 # Use explicit questions/instructions so Instruct models (Qwen chat template) answer coherently;
 # completion-style fragments are kept only where we test continuation (code_fib, json_partial, short_hi).
-DEFAULT_SPOTCHECK_PROMPTS: List[Tuple[str, str]] = [
+DEFAULT_SPOTCHECK_PROMPTS: list[tuple[str, str]] = [
     ("en_capital", "What is the capital of France? Answer in a few words."),
     ("en_bst", "Explain what a binary search tree is in one short paragraph."),
-    ("en_python_sum", "Write a Python function that returns the sum of a list of integers."),
+    (
+        "en_python_sum",
+        "Write a Python function that returns the sum of a list of integers.",
+    ),
     ("zh_capital", "法国的首都是哪里？请用一句话回答。"),
     ("zh_gd", "用两三句话解释什么是梯度下降。"),
     ("zh_hello", "请用 Python 写一个简单的 Hello World 程序。"),
@@ -216,10 +229,10 @@ MINIMAL_PROMPT_IDS = frozenset(
 )
 
 
-def _load_prompts_from_file(path: str) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
+def _load_prompts_from_file(path: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
     if path.lower().endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             for i, item in enumerate(data):
@@ -229,9 +242,11 @@ def _load_prompts_from_file(path: str) -> List[Tuple[str, str]]:
                     pid = str(item.get("id", f"file_{i}"))
                     out.append((pid, str(item["prompt"])))
         else:
-            raise ValueError("JSON prompts file must be a list of strings or objects with 'prompt'.")
+            raise ValueError(
+                "JSON prompts file must be a list of strings or objects with 'prompt'."
+            )
         return out
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f):
             line = line.strip()
             if not line or line.startswith("#"):
@@ -240,7 +255,7 @@ def _load_prompts_from_file(path: str) -> List[Tuple[str, str]]:
     return out
 
 
-def _max_consecutive_same_token(token_ids: List[int]) -> int:
+def _max_consecutive_same_token(token_ids: list[int]) -> int:
     if not token_ids:
         return 0
     best = 1
@@ -280,12 +295,18 @@ def _max_char_frequency_domination_threshold(nonspace_text: str) -> float:
     """Severe threshold for max-char share; relaxed for Latin-heavy prose."""
     if len(nonspace_text) < _MIN_NONSPACE_FOR_DOMINANCE_CHECK:
         return float("inf")
-    if _latin_letter_ratio_nonspace(nonspace_text) >= _MIN_LATIN_LETTER_RATIO_FOR_RELAXED_DOMINANCE:
-        return max(_MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE, _MAX_CHAR_FREQUENCY_DOMINANCE_LATIN_PROSE)
+    if (
+        _latin_letter_ratio_nonspace(nonspace_text)
+        >= _MIN_LATIN_LETTER_RATIO_FOR_RELAXED_DOMINANCE
+    ):
+        return max(
+            _MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE,
+            _MAX_CHAR_FREQUENCY_DOMINANCE_LATIN_PROSE,
+        )
     return _MAX_CHAR_FREQUENCY_DOMINANCE_SEVERE
 
 
-def _unique_token_ratio(token_ids: List[int]) -> float:
+def _unique_token_ratio(token_ids: list[int]) -> float:
     if not token_ids:
         return 1.0
     return len(set(token_ids)) / len(token_ids)
@@ -330,14 +351,22 @@ def _is_letterish(ch: str) -> bool:
         return True
     if 0x3400 <= o <= 0x4DBF:
         return True
-    if 0x20000 <= o <= 0x2A6DF:
-        return True
-    return False
+    return 131072 <= o <= 173791
 
 
 def _looks_like_code_fragment(text: str) -> bool:
     s = text.lower()
-    needles = ("def ", "import ", "return ", "class ", "```", "fn ", "public ", "void ", "#include")
+    needles = (
+        "def ",
+        "import ",
+        "return ",
+        "class ",
+        "```",
+        "fn ",
+        "public ",
+        "void ",
+        "#include",
+    )
     return any(n in s for n in needles)
 
 
@@ -346,11 +375,7 @@ def _script_bucket(ch: str) -> str:
     if not _is_letterish(ch):
         return "non_letter"
     o = ord(ch)
-    if (
-        0x4E00 <= o <= 0x9FFF
-        or 0x3400 <= o <= 0x4DBF
-        or 0x20000 <= o <= 0x2A6DF
-    ):
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0x20000 <= o <= 0x2A6DF:
         return "cjk"
     name = unicodedata.name(ch, "")
     if "LATIN" in name:
@@ -372,9 +397,9 @@ def _script_bucket(ch: str) -> str:
     return "other_letter"
 
 
-def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
+def _substance_issues(text: str, token_ids: list[int]) -> list[str]:
     """Human-readability signals not covered by replacement/control/repeat checks."""
-    notes: List[str] = []
+    notes: list[str] = []
     if not token_ids:
         return notes
     stripped = text.strip()
@@ -384,7 +409,10 @@ def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
 
     core = _nonspace_chars(text)
     ntok = len(token_ids)
-    if ntok >= _MANY_TOKENS_FOR_SUBSTANCE and len(core) < _MIN_NONSPACE_CHARS_WHEN_MANY_TOKS:
+    if (
+        ntok >= _MANY_TOKENS_FOR_SUBSTANCE
+        and len(core) < _MIN_NONSPACE_CHARS_WHEN_MANY_TOKS
+    ):
         notes.append(
             f"little_substance_vs_tokens(nonspace={len(core)} tok={ntok}>={_MANY_TOKENS_FOR_SUBSTANCE})"
         )
@@ -430,9 +458,9 @@ def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
     # Pattern: many tiny letter runs split by punctuation/symbol glue ("de- own- ..."),
     # not natural prose and not code.
     if len(core) >= _MIN_CORE_CHARS_FOR_FRAGMENTED_SHORT_RUN_SALAD:
-        runs: List[int] = []
+        runs: list[int] = []
         run_len = 0
-        run_bucket: Optional[str] = None
+        run_bucket: str | None = None
         punct_sym = 0
         for ch in core:
             cat0 = unicodedata.category(ch)[0]
@@ -462,7 +490,8 @@ def _substance_issues(text: str, token_ids: List[int]) -> List[str]:
             punct_ratio = punct_sym / len(core)
             if (
                 short_ratio >= _MIN_SHORT_RUN_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD
-                and punct_ratio >= _MIN_PUNCT_SYMBOL_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD
+                and punct_ratio
+                >= _MIN_PUNCT_SYMBOL_RATIO_FOR_FRAGMENTED_SHORT_RUN_SALAD
             ):
                 notes.append(
                     "fragmented_short_run_salad("
@@ -477,9 +506,9 @@ def _looks_like_gemma4_26b_a4b_model(model_path: str) -> bool:
     return "gemma-4-26b" in b and "a4b" in b
 
 
-def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
+def _gemma4_26b_hard_quality_issues(text: str) -> list[str]:
     """Gemma4-26B-specific hard rule for garbled token-salad decode."""
-    notes: List[str] = []
+    notes: list[str] = []
     tokens = [t for t in text.split() if t]
     if len(tokens) < _MIN_TOKENS_FOR_GEMMA4_26B_STRUCTURE_CHECK:
         return notes
@@ -510,17 +539,13 @@ def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
             mixed_token_count += 1
 
         token_weird = (
-            punct_ratio >= 0.20
-            or letter_ratio < 0.55
-            or len(script_buckets) >= 2
+            punct_ratio >= 0.20 or letter_ratio < 0.55 or len(script_buckets) >= 2
         )
         if token_weird:
             weird += 1
 
         token_clean = (
-            punct_sym == 0
-            and letter_ratio >= 0.80
-            and len(script_buckets) <= 1
+            punct_sym == 0 and letter_ratio >= 0.80 and len(script_buckets) <= 1
         )
         if token_clean:
             clean += 1
@@ -542,7 +567,7 @@ def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
 
     # Catch "looks tokenized but unreadable" outputs with heavy short-word repetition
     # (e.g. de/own/much loops).
-    words: List[str] = []
+    words: list[str] = []
     for tok in tokens:
         core = tok.strip(strip_chars)
         if not core:
@@ -558,7 +583,9 @@ def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
         uniq_ratio = len(c_words) / len(words)
         top_counts = sorted(c_words.values(), reverse=True)
         top_ratio = top_counts[0] / len(words)
-        top2_ratio = (top_counts[0] + (top_counts[1] if len(top_counts) > 1 else 0)) / len(words)
+        top2_ratio = (
+            top_counts[0] + (top_counts[1] if len(top_counts) > 1 else 0)
+        ) / len(words)
         if (
             short_ratio >= _MIN_SHORT_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE
             and top_ratio >= _MIN_TOP_WORD_RATIO_FOR_GEMMA4_26B_LEXICAL_COLLAPSE
@@ -623,16 +650,16 @@ def _gemma4_26b_hard_quality_issues(text: str) -> List[str]:
 
 def _first_token_sanity(
     tokenizer: Any,
-    first_token_id: Optional[int],
-    token_ids: Optional[List[int]] = None,
-    full_text: Optional[str] = None,
-) -> Tuple[bool, List[str]]:
+    first_token_id: int | None,
+    token_ids: list[int] | None = None,
+    full_text: str | None = None,
+) -> tuple[bool, list[str]]:
     """
     Return (ok, messages). ok=False => first-token heuristic suspects garbage.
     BPE may decode the first id alone as U+FFFD while the full sequence is valid text;
     if full_text has low replacement ratio, do not fail on isolated replacement decode.
     """
-    msgs: List[str] = []
+    msgs: list[str] = []
     if first_token_id is None:
         msgs.append("no_first_token")
         return False, msgs
@@ -650,7 +677,9 @@ def _first_token_sanity(
             return True, msgs
         if token_ids and len(token_ids) >= 4:
             try:
-                prefix = tokenizer.decode(token_ids[: min(12, len(token_ids))], skip_special_tokens=False)
+                prefix = tokenizer.decode(
+                    token_ids[: min(12, len(token_ids))], skip_special_tokens=False
+                )
             except Exception:
                 prefix = ""
             if len(prefix) >= 4 and prefix.count("\ufffd") / max(len(prefix), 1) < 0.06:
@@ -666,12 +695,12 @@ def _first_token_sanity(
 
 def analyze_tier_b(
     text: str,
-    token_ids: List[int],
+    token_ids: list[int],
     tokenizer: Any,
     *,
     check_substance: bool = True,
     strict_profile: str = "default",
-) -> Tuple[bool, Dict[str, Any], List[str]]:
+) -> tuple[bool, dict[str, Any], list[str]]:
     """
     Map outputs to INFERENCE_ACCURACY.md tier-B dimensions:
     1 readability, 2 coherence, 4 first-token (3 relevance is not automated).
@@ -679,13 +708,13 @@ def analyze_tier_b(
 
     Returns (severe_any, detail_dict, flat_messages).
     """
-    detail: Dict[str, Any] = {
+    detail: dict[str, Any] = {
         "readability": {"pass": True, "notes": []},
         "coherence": {"pass": True, "notes": []},
         "first_token": {"pass": True, "notes": []},
         "substance": {"pass": True, "notes": []},
     }
-    flat: List[str] = []
+    flat: list[str] = []
     severe = False
 
     n = len(text)
@@ -702,7 +731,9 @@ def analyze_tier_b(
     cc = _control_char_ratio(text)
     if cc >= _CONTROL_CHAR_RATIO_SEVERE:
         detail["readability"]["pass"] = False
-        detail["readability"]["notes"].append(f"control_char_ratio={cc:.3f}>={_CONTROL_CHAR_RATIO_SEVERE}")
+        detail["readability"]["notes"].append(
+            f"control_char_ratio={cc:.3f}>={_CONTROL_CHAR_RATIO_SEVERE}"
+        )
         flat.append(detail["readability"]["notes"][-1])
         severe = True
 
@@ -795,8 +826,12 @@ def _build_engine(
     max_model_len: int = 2048,
     max_num_seqs: int = 32,
 ) -> LiteEngine:
-    m_cfg = ModelConfig(model=model_path, tokenizer=model_path, max_model_len=max_model_len)
-    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=0)
+    m_cfg = ModelConfig(
+        model=model_path, tokenizer=model_path, max_model_len=max_model_len
+    )
+    c_cfg = CacheConfig(
+        block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=0
+    )
     # Keep batched-token budget in line with max_model_len for short spotcheck prompts.
     mbt = min(8192, max(512, max_model_len * 4))
     s_cfg = SchedulerConfig(
@@ -822,7 +857,7 @@ def _build_engine(
 
 def _resolve_prompts(
     args: argparse.Namespace,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     if args.prompts_file:
         return _load_prompts_from_file(args.prompts_file)
     prompts = list(DEFAULT_SPOTCHECK_PROMPTS)
@@ -836,16 +871,14 @@ def _looks_like_preformatted_chat(text: str) -> bool:
     s = text.lstrip()
     if len(s) >= 12 and "<|im_start|>" in s[:400]:
         return True
-    if s.startswith("<|") and "user" in s[:120].lower():
-        return True
-    return False
+    return bool(s.startswith("<|") and "user" in s[:120].lower())
 
 
 def _apply_chat_template_to_prompts(
     mode: str,
     tokenizer: Any,
-    prompts: List[Tuple[str, str]],
-) -> List[Tuple[str, str]]:
+    prompts: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
     """
     mode: off | auto | on
     auto/on: wrap plain text as a single user turn when tokenizer.chat_template is set.
@@ -864,9 +897,11 @@ def _apply_chat_template_to_prompts(
             "[Tier-B] chat-template=auto: wrapping each prompt as user message (tokenizer has chat_template).\n"
         )
     else:
-        sys.stderr.write("[Tier-B] chat-template=on: wrapping each prompt as user message.\n")
+        sys.stderr.write(
+            "[Tier-B] chat-template=on: wrapping each prompt as user message.\n"
+        )
 
-    out: List[Tuple[str, str]] = []
+    out: list[tuple[str, str]] = []
     for pid, text in prompts:
         if _looks_like_preformatted_chat(text):
             out.append((pid, text))
@@ -889,13 +924,15 @@ def _apply_chat_template_to_prompts(
                     add_generation_prompt=True,
                 )
         except Exception as e:
-            sys.stderr.write(f"[Warning] chat template failed for {pid!r}: {e}; using raw text.\n")
+            sys.stderr.write(
+                f"[Warning] chat template failed for {pid!r}: {e}; using raw text.\n"
+            )
             wrapped = text
         out.append((pid, wrapped))
     return out
 
 
-def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> List[str]:
+def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> list[str]:
     """Prompt-specific minimal semantic anchors for Gemma4-26B Tier-B fixed suite."""
     pid = (prompt_id or "").strip().lower()
     s = (text or "").strip()
@@ -903,7 +940,7 @@ def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> List[str]:
     if not pid.startswith("gemma_"):
         return []
 
-    def _has_any(needles: List[str]) -> bool:
+    def _has_any(needles: list[str]) -> bool:
         return any(n in s_l for n in needles)
 
     if pid == "gemma_en_capital":
@@ -911,7 +948,9 @@ def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> List[str]:
             return ["gemma4_26b_prompt_anchor_miss(pid=gemma_en_capital, need=paris)"]
     elif pid == "gemma_zh_capital":
         if "巴黎" not in s and "paris" not in s_l:
-            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_zh_capital, need=巴黎|paris)"]
+            return [
+                "gemma4_26b_prompt_anchor_miss(pid=gemma_zh_capital, need=巴黎|paris)"
+            ]
     elif pid == "gemma_en_bst":
         has_tree = "tree" in s_l
         has_shape = any(k in s_l for k in ("node", "left", "right", "binary"))
@@ -922,10 +961,15 @@ def _gemma4_26b_prompt_anchor_issues(prompt_id: str, text: str) -> List[str]:
             ]
     elif pid == "gemma_zh_gd":
         if not _has_any(["梯度", "gradient", "loss", "学习率"]):
-            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_zh_gd, need=梯度|gradient|loss|学习率)"]
-    elif pid == "gemma_chat_intro":
-        if not _has_any(["hello", "hi", "assist", "help", "你好", "您好"]):
-            return ["gemma4_26b_prompt_anchor_miss(pid=gemma_chat_intro, need=greeting/help)"]
+            return [
+                "gemma4_26b_prompt_anchor_miss(pid=gemma_zh_gd, need=梯度|gradient|loss|学习率)"
+            ]
+    elif pid == "gemma_chat_intro" and not _has_any(
+        ["hello", "hi", "assist", "help", "你好", "您好"]
+    ):
+        return [
+            "gemma4_26b_prompt_anchor_miss(pid=gemma_chat_intro, need=greeting/help)"
+        ]
     return []
 
 
@@ -934,9 +978,15 @@ def main() -> int:
         description="Tier-B spot-check per docs/INFERENCE_ACCURACY.md (Lite only, no HF). "
         "See docs/INFERENCE_ACCURACY.md for goals."
     )
-    parser.add_argument("--model", type=str, required=True, help="Model directory (same as LiteEngine).")
-    parser.add_argument("--quant", type=str, default="none", choices=["none", "awq", "gguf"])
-    parser.add_argument("--max-new-tokens", type=int, default=96, help="Max new tokens per prompt.")
+    parser.add_argument(
+        "--model", type=str, required=True, help="Model directory (same as LiteEngine)."
+    )
+    parser.add_argument(
+        "--quant", type=str, default="none", choices=["none", "awq", "gguf"]
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=96, help="Max new tokens per prompt."
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -1012,7 +1062,9 @@ def main() -> int:
         action="store_true",
         help="Disable substance checks (newline-only / digit-heavy garbage). For debugging only.",
     )
-    parser.add_argument("--json", action="store_true", help="Print one JSON object per line to stdout.")
+    parser.add_argument(
+        "--json", action="store_true", help="Print one JSON object per line to stdout."
+    )
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
@@ -1050,12 +1102,18 @@ def main() -> int:
         )
         return 2
 
-    hints = _model_config_hints(args.model) if args.quant == "gguf" else {"is_moe": False, "model_type": ""}
+    hints = (
+        _model_config_hints(args.model)
+        if args.quant == "gguf"
+        else {"is_moe": False, "model_type": ""}
+    )
     is_qwen35_35b_awq = _looks_like_qwen35_35b_awq(args.model, args.quant)
 
     # DeepSeek-V2-Lite Q4 GGUF: logits are too lossy for coherent greedy/sampling Tier-B in practice.
     # Default Tier-B uses sibling HF bf16 Chat weights (same engine path as A-tier parity); GGUF-only when requested.
-    _ds_gguf_only = os.environ.get("FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY", "").strip().lower() in (
+    _ds_gguf_only = os.environ.get(
+        "FASTINFERENCE_TIER_B_DEEPSEEK_GGUF_ONLY", ""
+    ).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1067,7 +1125,9 @@ def main() -> int:
         and hints.get("model_type") == "deepseek_v2"
     ):
         try:
-            from vllm.model_executor.models.deepseek_hf_reference import resolve_deepseek_hf_chat_dir
+            from vllm.model_executor.models.deepseek_hf_reference import (
+                resolve_deepseek_hf_chat_dir,
+            )
 
             _ref = resolve_deepseek_hf_chat_dir(args.model)
         except Exception:
@@ -1215,7 +1275,9 @@ def main() -> int:
         f"presence_penalty={args.presence_penalty} "
         f"hints={{gguf_moe={hints.get('is_moe')!s}, model_type={hints.get('model_type')!r}}}\n"
     )
-    _moe_fp8_env = os.environ.get("FASTINFERENCE_MOE_FP8", os.environ.get("FASTINFERENCE_QWEN35_MOE_FP8", "0"))
+    _moe_fp8_env = os.environ.get(
+        "FASTINFERENCE_MOE_FP8", os.environ.get("FASTINFERENCE_QWEN35_MOE_FP8", "0")
+    )
     if _moe_fp8_env.strip().lower() in (
         "1",
         "true",
@@ -1269,10 +1331,12 @@ def main() -> int:
     engine.tokenizer = tokenizer
 
     prompts = _apply_chat_template_to_prompts(args.chat_template, tokenizer, prompts)
-    strict_profile = "gemma4_26b" if _looks_like_gemma4_26b_a4b_model(args.model) else "default"
+    strict_profile = (
+        "gemma4_26b" if _looks_like_gemma4_26b_a4b_model(args.model) else "default"
+    )
 
     any_severe = False
-    summary_rows: List[dict] = []
+    summary_rows: list[dict] = []
 
     for pid, prompt in prompts:
         sp = SamplingParams(
@@ -1291,7 +1355,7 @@ def main() -> int:
         prompt_len = len(enc)
         budget = _lite_engine_step_budget(engine, prompt_len, args.max_new_tokens)
 
-        def _done(outs: List[Any]) -> Optional[Any]:
+        def _done(outs: list[Any]) -> Any | None:
             if not outs:
                 return None
             ro = outs[0]
@@ -1350,7 +1414,9 @@ def main() -> int:
                 f"substance={ta.get('substance_ok')}"
             )
             if msgs:
-                print(f"  heuristics ({'WARN' if severe else 'info'}): {', '.join(msgs)}")
+                print(
+                    f"  heuristics ({'WARN' if severe else 'info'}): {', '.join(msgs)}"
+                )
             print(f"  output:\n{text!r}")
 
         if severe:

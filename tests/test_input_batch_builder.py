@@ -185,6 +185,43 @@ def test_input_batch_builder_build_decode_batch() -> None:
     assert req_dicts[0].seq_len == 3
 
 
+def test_input_batch_builder_selection_is_decode_only() -> None:
+    scheduler = _scheduler_with_request()
+    kv_block_manager = _make_kv_block_manager()
+    kv_block_manager.ensure_blocks("r1", 3)
+    config = type(
+        "Cfg",
+        (),
+        {
+            "kv_type": "fp16",
+            "k_scale": 1.0,
+            "v_scale": 1.0,
+            "kv_select_ratio": 0.5,
+            "kv_select_min_blocks": 1,
+        },
+    )()
+    builder = InputBatchBuilder(
+        device=torch.device("cpu"),
+        max_model_len=8,
+        num_layers=1,
+        kv_block_manager=kv_block_manager,
+        inf_config=config,
+        stack_per_layer_carries=_stack,
+        split_per_layer_carries=_split,
+    )
+
+    _, _, prefill_metadata, _, _ = builder.build_prefill(["r1"], scheduler, 2)
+    assert "active_blocks" not in prefill_metadata
+    assert "active_offsets" not in prefill_metadata
+
+    request = scheduler.get_request("r1")
+    request.is_prefill = False
+    request.seq_len = 3
+    _, _, decode_metadata, _ = builder.build_decode_batch(["r1"], scheduler)
+    assert decode_metadata["active_blocks"].tolist() == [0, 1]
+    assert decode_metadata["active_offsets"].tolist() == [0, 2]
+
+
 def test_input_batch_builder_reuses_decode_batch_tensors() -> None:
     scheduler = _scheduler_with_request()
     req = scheduler.get_request("r1")

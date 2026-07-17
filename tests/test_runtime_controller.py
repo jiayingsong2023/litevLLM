@@ -29,7 +29,6 @@ class _FakeScheduler:
             first_token_at=None,
             generated_ids=[],
             seq_len=0,
-            service_class="latency",
             finished=False,
         )
 
@@ -57,9 +56,6 @@ class _FakeScheduler:
 
 
 class _FakeStepScheduler:
-    def update_runtime_feedback(self, _stats: dict[str, object]) -> None:
-        return None
-
     def build_plan(self, scheduler):
         return StepPlan(
             admissions=AdmissionPlan(request_ids=["q1"]),
@@ -80,13 +76,8 @@ class _FakeObserver:
         self.first_tokens = []
         self.finished = []
 
-    def on_request_admitted(
-        self,
-        request_id: str,
-        queue_wait_s: float,
-        service_class: str | None = None,
-    ) -> None:
-        self.admitted.append((request_id, queue_wait_s, service_class))
+    def on_request_admitted(self, request_id: str, queue_wait_s: float) -> None:
+        self.admitted.append((request_id, queue_wait_s))
 
     def on_step_started(self, plan) -> None:
         self.steps.append(plan)
@@ -111,17 +102,12 @@ class _FakeObserver:
 class _FakeBackend:
     def __init__(self) -> None:
         self.fast_path_calls = []
-        self.preempt_calls = []
 
     def maybe_apply_prefix_cache(self, request_state):
         self.prefix_cache_seen = request_state
 
     def ensure_kv_blocks(self, _step_plan) -> None:
         return None
-
-    def maybe_preempt(self, step_plan, scheduler):
-        self.preempt_calls.append((step_plan, scheduler))
-        return step_plan
 
     def decode_step_sync(self, request_ids):
         self.fast_path_calls.append(list(request_ids))
@@ -185,46 +171,9 @@ def test_runtime_controller_admits_then_uses_decode_fast_path(monkeypatch) -> No
 
     assert outputs == [{"request_id": "q1", "finished": True}]
     assert scheduler.admitted == [(["q1"], 12.0)]
-    assert observer.admitted == [("q1", 2.0, "latency")]
+    assert observer.admitted == [("q1", 2.0)]
     assert len(observer.steps) == 1
-    assert len(backend.preempt_calls) == 1
-    assert backend.preempt_calls[0][1] is scheduler
     assert backend.prefix_cache_seen is scheduler.req
-    assert backend.fast_path_calls == [["q1"]]
-
-
-def test_runtime_controller_uses_preempted_step_plan(monkeypatch) -> None:
-    scheduler = _FakeScheduler()
-    observer = _FakeObserver()
-
-    class _PlanChangingBackend(_FakeBackend):
-        def maybe_preempt(self, step_plan, scheduler):
-            self.preempt_calls.append((step_plan, scheduler))
-            return StepPlan(
-                admissions=step_plan.admissions,
-                prefills=None,
-                decodes=DecodePlan(
-                    request_ids=["q1"], token_budget=1, use_fast_path=True
-                ),
-                step_token_budget=step_plan.step_token_budget,
-                metrics=step_plan.metrics,
-            )
-
-    backend = _PlanChangingBackend()
-    controller = RuntimeController(
-        scheduler=scheduler,
-        step_scheduler=_FakeStepScheduler(),
-        observer=observer,
-        backend=backend,
-        queue_timeout_s=30.0,
-    )
-    monkeypatch.setattr(
-        "vllm.engine.runtime_controller.time.perf_counter", lambda: 12.0
-    )
-
-    outputs = controller.step()
-
-    assert outputs == [{"request_id": "q1", "finished": True}]
     assert backend.fast_path_calls == [["q1"]]
 
 

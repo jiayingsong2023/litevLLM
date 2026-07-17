@@ -11,7 +11,6 @@ import base64
 
 import requests
 import torch
-
 from vllm.utils.serial_utils import (
     EMBED_DTYPE_TO_TORCH_DTYPE,
     ENDIANNESS,

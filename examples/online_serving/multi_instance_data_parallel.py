@@ -3,11 +3,12 @@
 import asyncio
 import threading
 
+from vllm.v1.metrics.loggers import AggregatedLoggingStatLogger
+
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.v1.metrics.loggers import AggregatedLoggingStatLogger
 
 """
 To run this example, run the following commands simultaneously with

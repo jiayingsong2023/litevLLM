@@ -45,10 +45,30 @@ def test_fine_grid_deduplicates_by_core_knobs() -> None:
 def test_select_top_prefers_decode_tps_then_ttft() -> None:
     mod = _load_module()
     rows = [
-        {"name": "a", "status": "pass", "decode_tps_aggregate": 10.0, "ttft_p50_ms": 1000.0},
-        {"name": "b", "status": "pass", "decode_tps_aggregate": 11.0, "ttft_p50_ms": 2000.0},
-        {"name": "c", "status": "pass", "decode_tps_aggregate": 11.0, "ttft_p50_ms": 1500.0},
-        {"name": "d", "status": "timed_out", "decode_tps_aggregate": 99.0, "ttft_p50_ms": 1.0},
+        {
+            "name": "a",
+            "status": "pass",
+            "decode_tps_aggregate": 10.0,
+            "ttft_p50_ms": 1000.0,
+        },
+        {
+            "name": "b",
+            "status": "pass",
+            "decode_tps_aggregate": 11.0,
+            "ttft_p50_ms": 2000.0,
+        },
+        {
+            "name": "c",
+            "status": "pass",
+            "decode_tps_aggregate": 11.0,
+            "ttft_p50_ms": 1500.0,
+        },
+        {
+            "name": "d",
+            "status": "timed_out",
+            "decode_tps_aggregate": 99.0,
+            "ttft_p50_ms": 1.0,
+        },
     ]
     top = mod._select_top(rows, 2)
     assert [x["name"] for x in top] == ["c", "b"]

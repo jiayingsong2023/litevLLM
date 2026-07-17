@@ -70,6 +70,7 @@ if not HAS_TRITON:
         " functions will not be available."
     )
 
+
 class TritonPlaceholder(types.ModuleType):
     def __init__(self):
         super().__init__("triton")
@@ -87,6 +88,7 @@ class TritonPlaceholder(types.ModuleType):
             return lambda f: f
 
         return decorator
+
 
 class TritonLanguagePlaceholder(types.ModuleType):
     def __init__(self):

@@ -30,7 +30,6 @@ Dependencies:
 
 import transformers
 from openai import OpenAI
-
 from vllm.utils.serial_utils import tensor2base64
 
 

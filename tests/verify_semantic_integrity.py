@@ -24,7 +24,18 @@ Same-directory Lite vs HF
 (``--hf-same-as-lite`` or no ``--hf-model``) keeps the strict ``PREFILL_COSIM_MIN``.
 GGUF and 35B MoE comparisons are no longer part of the default regression surface.
 """
+
+import argparse
+import gc
 import json
+import math
+import os
+import re
+from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
@@ -34,20 +45,17 @@ import transformers.utils.import_utils as _transformers_import_utils
 
 _transformers_import_utils.is_flash_linear_attention_available = lambda: False  # noqa: E731
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, AutoConfig
-from vllm.config import VllmConfig, ModelConfig, CacheConfig, SchedulerConfig, LoadConfig
-from vllm.engine.lite_engine import LiteEngine
-from vllm.sampling_params import SamplingParams
-import time
-import argparse
-import math
-import os
-import re
-import sys
-import gc
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM  # noqa: E402
+
+from vllm.config import (  # noqa: E402
+    CacheConfig,
+    LoadConfig,
+    ModelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
+from vllm.engine.lite_engine import LiteEngine  # noqa: E402
+from vllm.sampling_params import SamplingParams  # noqa: E402
 
 # Prefill-only audit: HF reference logits must align within this cosine floor (aligned vocab slice).
 # Same-precision Lite vs HF (e.g. both FP16).
@@ -57,9 +65,10 @@ PREFILL_COSIM_MIN_GGUF_VS_FP16 = 0.99
 # Lite AWQ vs HF FP16 baseline: INT4 groupwise weights vs BF16 reference; same rationale as GGUF vs FP16.
 PREFILL_COSIM_MIN_AWQ_VS_FP16 = 0.99
 
+
 def prefill_cosine_floor_for_hf_compare(
     model_path: str,
-    hf_model_path: Optional[str],
+    hf_model_path: str | None,
     quant_type: str,
 ) -> float:
     """Cosine floor for prefill-only Lite vs HF when HF may use a different checkpoint than Lite."""
@@ -89,7 +98,7 @@ def _run_lite_steps_until(
     engine: LiteEngine,
     description: str,
     max_steps: int,
-    stop_fn: Callable[[List[Any]], Optional[Any]],
+    stop_fn: Callable[[list[Any]], Any | None],
 ) -> Any:
     """
     Repeatedly call engine.step() until stop_fn returns non-None.
@@ -179,7 +188,7 @@ def _read_awq_group_size_and_bits(model_path: str) -> tuple[int, int]:
     try:
         if not os.path.isfile(cfg_path):
             return group_size, bits
-        with open(cfg_path, "r") as f:
+        with open(cfg_path) as f:
             cfg = json.load(f)
         qc = cfg.get("quantization_config") or {}
         groups = qc.get("config_groups")
@@ -209,13 +218,10 @@ def _resolve_hf_torch_dtype(config_path_dir: str) -> torch.dtype:
         p = os.path.join(config_path_dir, "config.json")
         if not os.path.isfile(p):
             return torch.float16
-        with open(p, "r") as f:
+        with open(p) as f:
             raw = json.load(f)
         tc = raw.get("text_config") or {}
-        if isinstance(tc, dict):
-            ds = tc.get("dtype") or tc.get("torch_dtype")
-        else:
-            ds = None
+        ds = tc.get("dtype") or tc.get("torch_dtype") if isinstance(tc, dict) else None
         if ds is None:
             ds = raw.get("torch_dtype")
         if isinstance(ds, str) and "bfloat16" in ds.lower():
@@ -227,7 +233,7 @@ def _resolve_hf_torch_dtype(config_path_dir: str) -> torch.dtype:
 
 def _read_model_config_json(model_path: str) -> dict[str, Any]:
     cfg_path = Path(model_path) / "config.json"
-    with open(cfg_path, "r", encoding="utf-8") as f:
+    with open(cfg_path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -237,11 +243,13 @@ def _looks_like_gemma4_model_path(model_path: str) -> bool:
     except Exception:
         return False
     model_type = str(raw.get("model_type", "") or "").lower()
-    text_model_type = str(((raw.get("text_config") or {}).get("model_type", "")) or "").lower()
+    text_model_type = str(
+        ((raw.get("text_config") or {}).get("model_type", "")) or ""
+    ).lower()
     return model_type == "gemma4" or text_model_type.startswith("gemma4")
 
 
-def _gemma4_map_ref_key(hf_key: str) -> Optional[str]:
+def _gemma4_map_ref_key(hf_key: str) -> str | None:
     if hf_key.startswith("model.embed_vision.") or hf_key.startswith("model.audio_"):
         return None
     if hf_key.startswith("model.language_model."):
@@ -279,10 +287,7 @@ def _set_module_attr_by_name(root: torch.nn.Module, full_name: str, value: Any) 
     parts = full_name.split(".")
     obj: Any = root
     for part in parts[:-1]:
-        if part.isdigit():
-            obj = obj[int(part)]
-        else:
-            obj = getattr(obj, part)
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
     leaf = parts[-1]
     if leaf.isdigit():
         obj[int(leaf)] = value
@@ -292,16 +297,14 @@ def _set_module_attr_by_name(root: torch.nn.Module, full_name: str, value: Any) 
 
 def _resolve_gemma4_target_with_shared_mlp_fallback(
     model: torch.nn.Module, target: str
-) -> Optional[str]:
+) -> str | None:
     candidates = [target]
     m = re.match(
         r"^(model\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj)(\..+)$",
         target,
     )
     if m is not None:
-        candidates.append(
-            f"{m.group(1)}.shared_mlp.{m.group(2)}{m.group(3)}"
-        )
+        candidates.append(f"{m.group(1)}.shared_mlp.{m.group(2)}{m.group(3)}")
     m_shared = re.match(
         r"^(model\.layers\.\d+\.mlp)\.shared_mlp\.(gate_proj|up_proj|down_proj)(\..+)$",
         target,
@@ -329,7 +332,7 @@ def _assign_gemma4_reference_weights(
     shards = sorted(str(p) for p in Path(hf_path).glob("*.safetensors"))
     for shard_path in shards:
         with safe_open_fn(shard_path, framework="pt", device="cpu") as f:
-            for hf_key in f.keys():
+            for hf_key in f.keys():  # noqa: SIM118 - safetensors exposes keys(), not iteration.
                 target = _gemma4_map_ref_key(hf_key)
                 if target is None:
                     continue
@@ -356,7 +359,9 @@ def _assign_gemma4_reference_weights(
                         module = model.get_submodule(resolved_module_name)
                     except Exception:
                         continue
-                    module.weight_shape = tuple(int(x) for x in tensor.view(-1).tolist())
+                    module.weight_shape = tuple(
+                        int(x) for x in tensor.view(-1).tolist()
+                    )
                     assigned += 1
                     continue
                 resolved_target = _resolve_gemma4_target_with_shared_mlp_fallback(
@@ -376,7 +381,9 @@ def _assign_gemma4_reference_weights(
                 )
                 assigned += 1
     if assigned == 0:
-        raise RuntimeError(f"Gemma4 reference loader assigned no weights from {hf_path}")
+        raise RuntimeError(
+            f"Gemma4 reference loader assigned no weights from {hf_path}"
+        )
     return assigned
 
 
@@ -392,8 +399,12 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
 
     @classmethod
     def _resolve_kv_type_for_gemma4(cls) -> str:
-        requested = str(os.environ.get("FASTINFERENCE_KV_TYPE", "turbo_int4")).strip().lower()
-        if requested in ("int4", "turbo_int4") and (not cls._env_truthy("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV")):
+        requested = (
+            str(os.environ.get("FASTINFERENCE_KV_TYPE", "turbo_int4")).strip().lower()
+        )
+        if requested in ("int4", "turbo_int4") and (
+            not cls._env_truthy("FASTINFERENCE_GEMMA4_ALLOW_INT4_KV")
+        ):
             # Keep Gemma4 reference path aligned with LiteEngine's accuracy guard.
             return "fp8"
         if requested in ("fp8", "float8", "float8_e4m3fn", "e4m3", "e4m3fn"):
@@ -403,7 +414,9 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
         # Conservative fallback for unknown/auto values.
         return "fp8"
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ):
         del attention_mask
         bsz, seqlen = input_ids.shape
         positions = (
@@ -413,7 +426,9 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
         )
         if input_ids.device.type == "cuda":
             block_size = 16
-            max_model_len = max(256, ((seqlen + block_size - 1) // block_size) * block_size)
+            max_model_len = max(
+                256, ((seqlen + block_size - 1) // block_size) * block_size
+            )
             num_blocks = max(1, max_model_len // block_size)
             num_layers = len(self.inner.model.layers)
             kv_type = self._resolve_kv_type_for_gemma4()
@@ -444,18 +459,28 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
                 else:
                     kv_scale_caches.append((None, None))
             meta = {
-                "slot_mapping": torch.arange(seqlen, device=input_ids.device, dtype=torch.long),
-                "seq_lens": torch.tensor([seqlen], device=input_ids.device, dtype=torch.int32),
+                "slot_mapping": torch.arange(
+                    seqlen, device=input_ids.device, dtype=torch.long
+                ),
+                "seq_lens": torch.tensor(
+                    [seqlen], device=input_ids.device, dtype=torch.int32
+                ),
                 "is_prefill": True,
-                "kv_start_indices": torch.tensor([0], device=input_ids.device, dtype=torch.int32),
-                "block_tables": torch.arange(num_blocks, device=input_ids.device, dtype=torch.int32).unsqueeze(0),
+                "kv_start_indices": torch.tensor(
+                    [0], device=input_ids.device, dtype=torch.int32
+                ),
+                "block_tables": torch.arange(
+                    num_blocks, device=input_ids.device, dtype=torch.int32
+                ).unsqueeze(0),
                 "linear_attn_carry": [None] * num_layers,
                 "linear_conv_carry": [None] * num_layers,
                 "kv_scale_cache": kv_scale_caches,
                 "kv_cache_dtype": kv_type,
                 "k_scale": k_scale,
                 "v_scale": v_scale,
-                "config": SimpleNamespace(kv_type=kv_type, k_scale=k_scale, v_scale=v_scale),
+                "config": SimpleNamespace(
+                    kv_type=kv_type, k_scale=k_scale, v_scale=v_scale
+                ),
             }
         else:
             kv_caches = [None] * len(self.inner.model.layers)
@@ -469,10 +494,18 @@ class _Gemma4ReferenceWrapper(torch.nn.Module):
         return SimpleNamespace(logits=logits)
 
 
-def _load_gemma4_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str) -> torch.nn.Module:
+def _load_gemma4_reference_model(
+    hf_path: str, dtype: torch.dtype, hf_device: str
+) -> torch.nn.Module:
     from safetensors import safe_open
 
-    from vllm.config import CacheConfig, LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
+    from vllm.config import (
+        CacheConfig,
+        LoadConfig,
+        ModelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
     from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.models.gemma4 import Gemma4ForConditionalGeneration
     from vllm.transformers_utils.configs.gemma4 import build_fallback_hf_config
@@ -492,7 +525,11 @@ def _load_gemma4_reference_model(hf_path: str, dtype: torch.dtype, hf_device: st
         quant_config=q_cfg,
     )
     target_device = torch.device("cuda" if hf_device == "cuda" else "cpu")
-    model = Gemma4ForConditionalGeneration(v_cfg).to(device=target_device, dtype=dtype).eval()
+    model = (
+        Gemma4ForConditionalGeneration(v_cfg)
+        .to(device=target_device, dtype=dtype)
+        .eval()
+    )
 
     _assign_gemma4_reference_weights(
         model,
@@ -507,9 +544,7 @@ def _looks_like_preformatted_chat(text: str) -> bool:
     s = text.lstrip()
     if len(s) >= 12 and "<|im_start|>" in s[:400]:
         return True
-    if s.startswith("<|") and "user" in s[:120].lower():
-        return True
-    return False
+    return bool(s.startswith("<|") and "user" in s[:120].lower())
 
 
 def apply_chat_template_for_verify(raw_prompt: str, tokenizer: Any, mode: str) -> str:
@@ -554,9 +589,9 @@ def apply_chat_template_for_verify(raw_prompt: str, tokenizer: Any, mode: str) -
 
 
 def prefill_hf_alignment_pass(
-    cos_sim: Optional[float],
-    lite_argmax: Optional[int],
-    hf_argmax: Optional[int],
+    cos_sim: float | None,
+    lite_argmax: int | None,
+    hf_argmax: int | None,
     cos_min: float = PREFILL_COSIM_MIN,
 ) -> bool:
     if cos_sim is None or lite_argmax is None or hf_argmax is None:
@@ -587,7 +622,7 @@ def compare_logits_aligned(lite_logits: torch.Tensor, ref_logits: torch.Tensor):
     return cos_sim, max_err
 
 
-def _extract_tensor_from_layer_output(output: Any) -> Optional[torch.Tensor]:
+def _extract_tensor_from_layer_output(output: Any) -> torch.Tensor | None:
     if isinstance(output, torch.Tensor):
         return output
     if isinstance(output, (tuple, list)):
@@ -610,11 +645,14 @@ def _get_gemma4_layers_for_hooks(model: torch.nn.Module) -> list[torch.nn.Module
 
 def _register_last_token_layer_hooks(
     layers: list[torch.nn.Module],
-    sink: Dict[int, torch.Tensor],
+    sink: dict[int, torch.Tensor],
 ) -> list[Any]:
     handles: list[Any] = []
     for idx, layer in enumerate(layers):
-        def _hook(_module: torch.nn.Module, _inputs: Any, output: Any, i: int = idx) -> None:
+
+        def _hook(
+            _module: torch.nn.Module, _inputs: Any, output: Any, i: int = idx
+        ) -> None:
             t = _extract_tensor_from_layer_output(output)
             if t is None or t.ndim < 3:
                 return
@@ -625,17 +663,19 @@ def _register_last_token_layer_hooks(
 
 
 def _print_first_drift_layer(
-    lite_layer_last_token: Dict[int, torch.Tensor],
-    hf_layer_last_token: Dict[int, torch.Tensor],
+    lite_layer_last_token: dict[int, torch.Tensor],
+    hf_layer_last_token: dict[int, torch.Tensor],
     cos_threshold: float,
 ) -> None:
-    shared_layers = sorted(set(lite_layer_last_token.keys()) & set(hf_layer_last_token.keys()))
+    shared_layers = sorted(
+        set(lite_layer_last_token.keys()) & set(hf_layer_last_token.keys())
+    )
     if not shared_layers:
         print("  [LayerDrift] no shared layer captures; skipping.")
         return
 
-    first_drift: Optional[int] = None
-    first_drift_cos: Optional[float] = None
+    first_drift: int | None = None
+    first_drift_cos: float | None = None
     for li in shared_layers:
         cos_sim, _ = compare_logits_aligned(
             lite_layer_last_token[li],
@@ -658,6 +698,7 @@ def _print_first_drift_layer(
             f"  [LayerDrift] compared={len(shared_layers)} first_drift_layer={first_drift} "
             f"cos={first_drift_cos:.6f} threshold={cos_threshold:.4f}"
         )
+
 
 def _load_hf_reference_model(hf_path: str, dtype: torch.dtype, hf_device: str):
     """
@@ -710,7 +751,7 @@ def run_alignment_test(
     hf_model_path=None,
     hf_device="auto",
     activation_audit: bool = False,
-    activation_audit_max_passes: Optional[int] = None,
+    activation_audit_max_passes: int | None = None,
     disable_qwen35_stabilizers: bool = False,
     apply_chat_template: str = "off",
     prefill_only: bool = False,
@@ -719,7 +760,7 @@ def run_alignment_test(
     report_first_drift_layer: bool = False,
     drift_cos_threshold: float = 0.995,
 ):
-    print(f"\n" + "="*60)
+    print("\n" + "=" * 60)
     print(f"AUDITING: {os.path.basename(model_path)} (Quant: {quant_type})")
     if hf_model_path:
         print(f"  HF baseline: {hf_model_path}")
@@ -730,15 +771,17 @@ def run_alignment_test(
             "  [Note] 35B MoE GGUF: full HF logits comparison is often infeasible on one machine; "
             "this path is not part of the maintained default regression surface."
         )
-    print("="*60)
+    print("=" * 60)
 
-    device = "cuda"
     # HF baseline dtype; refined when hf_load_path is known (see below).
     dtype = torch.float16
 
     # Default to TurboQuant INT4 KV unless caller explicitly requests otherwise.
     # Keep legacy FASTINFERENCE_KV_FP8 behavior only when KV_TYPE is explicitly "auto".
-    if "FASTINFERENCE_KV_TYPE" not in os.environ and "FASTINFERENCE_KV_FP8" not in os.environ:
+    if (
+        "FASTINFERENCE_KV_TYPE" not in os.environ
+        and "FASTINFERENCE_KV_FP8" not in os.environ
+    ):
         os.environ["FASTINFERENCE_KV_TYPE"] = "turbo_int4"
     if quant_type == "awq":
         if awq_disable_fused:
@@ -759,43 +802,50 @@ def run_alignment_test(
             "  [Ablation] Qwen3.5 linear-input cap + residual RMS disabled "
             "(relevant if FASTINFERENCE_QWEN35_FULLATTN_STABILIZER=1)."
         )
-    
+
     # 1. Initialize LitevLLM Engine
     m_cfg = ModelConfig(model=model_path, tokenizer=model_path)
-    c_cfg = CacheConfig(block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=4)
+    c_cfg = CacheConfig(
+        block_size=16, gpu_memory_utilization=gpu_memory_utilization, swap_space=4
+    )
     s_cfg = SchedulerConfig(
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=32,
         max_model_len=max_model_len,
     )
     l_cfg = LoadConfig()
-    
+
     q_cfg = None
     if quant_type == "awq":
         from vllm.model_executor.layers.quantization.awq import AWQConfig
 
         gs, wb = _read_awq_group_size_and_bits(model_path)
         q_cfg = AWQConfig(weight_bits=wb, group_size=gs)
-        print(f"  [AWQ] group_size={gs}, weight_bits={wb} (from {model_path}/config.json)")
+        print(
+            f"  [AWQ] group_size={gs}, weight_bits={wb} (from {model_path}/config.json)"
+        )
     elif quant_type == "gguf":
         from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
         q_cfg = GGUFConfig()
-        
+
     v_cfg = VllmConfig(m_cfg, c_cfg, s_cfg, l_cfg, quant_config=q_cfg)
-    
+
     print("[1/3] Loading LitevLLM (Python/Triton)...")
     engine = LiteEngine(v_cfg)
-    
+
     # [DEBUG] Verify weight loading
     try:
-        if hasattr(engine.model, "model") and hasattr(engine.model.model, "embed_tokens"):
+        if hasattr(engine.model, "model") and hasattr(
+            engine.model.model, "embed_tokens"
+        ):
             emb = engine.model.model.embed_tokens.weight.data
-            print(f"[DEBUG] embed_tokens.weight[0,:5]: {emb[0,:5].tolist()}")
+            print(f"[DEBUG] embed_tokens.weight[0,:5]: {emb[0, :5].tolist()}")
             if emb.abs().mean() < 1e-6:
                 print("[WARNING] embed_tokens.weight is all zero!")
         if hasattr(engine.model, "lm_head"):
             lmh = engine.model.lm_head.weight.data
-            print(f"[DEBUG] lm_head.weight[0,:5]: {lmh[0,:5].tolist()}")
+            print(f"[DEBUG] lm_head.weight[0,:5]: {lmh[0, :5].tolist()}")
     except Exception as e:
         print(f"[DEBUG] Weight inspection failed: {e}")
     from vllm.model_executor.model_loader import get_tokenizer
@@ -827,11 +877,9 @@ def run_alignment_test(
             # to avoid two large models on one GPU (ROCm OOM / illegal access).
             # When paths are the *same*, HF Transformers may use CUDA-only FLA kernels (chunk_gated_delta_rule);
             # CPU tensors fail there — allow explicit --hf-device cuda.
-            _hf_differs_from_lite = (
-                hf_model_path is not None
-                and os.path.abspath(os.path.realpath(hf_model_path))
-                != os.path.abspath(os.path.realpath(model_path))
-            )
+            _hf_differs_from_lite = hf_model_path is not None and os.path.abspath(
+                os.path.realpath(hf_model_path)
+            ) != os.path.abspath(os.path.realpath(model_path))
             if hf_model_path and hf_device != "cpu" and _hf_differs_from_lite:
                 print(
                     f"  [Note] --hf-model is a different directory than --model; loading HF on {hf_device} "
@@ -848,14 +896,20 @@ def run_alignment_test(
                 text_cfg = getattr(_cfg, "text_config", None)
                 dtype_str = None
                 if text_cfg is not None:
-                    dtype_str = getattr(text_cfg, "dtype", None) or getattr(text_cfg, "torch_dtype", None)
+                    dtype_str = getattr(text_cfg, "dtype", None) or getattr(
+                        text_cfg, "torch_dtype", None
+                    )
                 if dtype_str is None:
                     dtype_str = getattr(_cfg, "torch_dtype", None)
                 if isinstance(dtype_str, str) and dtype_str.lower() == "bfloat16":
                     dtype = torch.bfloat16
-                print(f"[2/3] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}...")
+                print(
+                    f"[2/3] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}..."
+                )
             except Exception:
-                print(f"[2/3] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}...")
+                print(
+                    f"[2/3] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}..."
+                )
             try:
                 hf_model = _load_hf_reference_model(hf_load_path, dtype, hf_device)
             except Exception as e:
@@ -869,21 +923,25 @@ def run_alignment_test(
                 text_cfg = getattr(_cfg, "text_config", None)
                 dtype_str = None
                 if text_cfg is not None:
-                    dtype_str = getattr(text_cfg, "dtype", None) or getattr(text_cfg, "torch_dtype", None)
+                    dtype_str = getattr(text_cfg, "dtype", None) or getattr(
+                        text_cfg, "torch_dtype", None
+                    )
                 if dtype_str is None:
                     dtype_str = getattr(_cfg, "torch_dtype", None)
                 if isinstance(dtype_str, str) and dtype_str.lower() == "bfloat16":
                     dtype = torch.bfloat16
             except Exception:
                 pass
-            print(f"[2/3] HF Reference will load after Lite prefill (path={hf_load_path}, device={hf_device})...")
+            print(
+                f"[2/3] HF Reference will load after Lite prefill (path={hf_load_path}, device={hf_device})..."
+            )
 
         # 3. Execution & Comparison (Greedy)
-        prefill_cos_sim: Optional[float] = None
-        prefill_lite_argmax: Optional[int] = None
-        prefill_hf_argmax: Optional[int] = None
-        lite_layer_last_token: Dict[int, torch.Tensor] = {}
-        hf_layer_last_token: Dict[int, torch.Tensor] = {}
+        prefill_cos_sim: float | None = None
+        prefill_lite_argmax: int | None = None
+        prefill_hf_argmax: int | None = None
+        lite_layer_last_token: dict[int, torch.Tensor] = {}
+        hf_layer_last_token: dict[int, torch.Tensor] = {}
 
         input_ids_tokens = tokenizer.encode(prompt, return_tensors="pt")
         print(f"  Input Tokens: {input_ids_tokens[0].tolist()}")
@@ -894,9 +952,11 @@ def run_alignment_test(
         )
 
         if prefill_only:
-            print("[3/3] Running Prefill Audit (full multi-token generation skipped)...")
+            print(
+                "[3/3] Running Prefill Audit (full multi-token generation skipped)..."
+            )
         else:
-            print(f"[3/3] Running Generation Audit...")
+            print("[3/3] Running Generation Audit...")
 
         # Prefill logits: when --hf-model is set, run Lite FIRST while GPU is not shared with HF.
         lite_prefill_logits_cpu = None
@@ -907,7 +967,9 @@ def run_alignment_test(
             lite_handles: list[Any] = []
             if report_first_drift_layer and _looks_like_gemma4_model_path(model_path):
                 lite_layers = _get_gemma4_layers_for_hooks(engine.model)
-                lite_handles = _register_last_token_layer_hooks(lite_layers, lite_layer_last_token)
+                lite_handles = _register_last_token_layer_hooks(
+                    lite_layers, lite_layer_last_token
+                )
 
             def audit_forward(*args, **kwargs):
                 if lite_handles:
@@ -917,7 +979,9 @@ def run_alignment_test(
                 return res
 
             engine.model.forward = audit_forward
-            engine.add_request("audit", prompt, SamplingParams(max_tokens=1, temperature=0.0))
+            engine.add_request(
+                "audit", prompt, SamplingParams(max_tokens=1, temperature=0.0)
+            )
             audit_ro = _run_lite_steps_until(
                 engine,
                 "Prefill audit (HF deferred path)",
@@ -930,18 +994,26 @@ def run_alignment_test(
                 h.remove()
             # Last forward in chunked prefill is the final prompt chunk (not the first).
             lite_prefill_logits_cpu = captured_logits[-1][:, -1, :].float().cpu()
-            lite_argmax_from_logits = int(torch.argmax(lite_prefill_logits_cpu, dim=-1).item())
+            lite_argmax_from_logits = int(
+                torch.argmax(lite_prefill_logits_cpu, dim=-1).item()
+            )
             if not torch.isfinite(lite_prefill_logits_cpu).all():
                 n_bad = int((~torch.isfinite(lite_prefill_logits_cpu)).sum().item())
-                print(f"  [Warning] Lite prefill logits: {n_bad} non-finite values (check AWQ group_size / weights).")
+                print(
+                    f"  [Warning] Lite prefill logits: {n_bad} non-finite values (check AWQ group_size / weights)."
+                )
 
-            print(f"  [2b] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}...")
+            print(
+                f"  [2b] Loading HF Reference (PyTorch {dtype}) from {hf_load_path}..."
+            )
             if (
                 hf_device == "cuda"
                 and prefill_only
                 and _looks_like_gemma4_model_path(hf_load_path)
             ):
-                print("  [Info] Releasing LiteEngine GPU state before Gemma4 CUDA reference load.")
+                print(
+                    "  [Info] Releasing LiteEngine GPU state before Gemma4 CUDA reference load."
+                )
                 del engine
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -949,17 +1021,25 @@ def run_alignment_test(
                 hf_model = _load_hf_reference_model(hf_load_path, dtype, hf_device)
             except Exception as e:
                 print(f"  [Warning] HF Reference load failed: {e}")
-                print("  Falling back to LitevLLM-only run (prefill logits captured but not compared).")
+                print(
+                    "  Falling back to LitevLLM-only run (prefill logits captured but not compared)."
+                )
                 hf_model = None
 
             if hf_model is not None:
                 hf_eval_device = next(hf_model.parameters()).device
                 input_ids_hf = input_ids_tokens.to(hf_eval_device)
-                attn_mask = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+                attn_mask = torch.ones_like(
+                    input_ids_hf, dtype=torch.long, device=hf_eval_device
+                )
                 hf_handles: list[Any] = []
-                if report_first_drift_layer and _looks_like_gemma4_model_path(hf_load_path):
+                if report_first_drift_layer and _looks_like_gemma4_model_path(
+                    hf_load_path
+                ):
                     hf_layers = _get_gemma4_layers_for_hooks(hf_model)
-                    hf_handles = _register_last_token_layer_hooks(hf_layers, hf_layer_last_token)
+                    hf_handles = _register_last_token_layer_hooks(
+                        hf_layers, hf_layer_last_token
+                    )
                     hf_layer_last_token.clear()
                 with torch.inference_mode():
                     hf_outputs = hf_model(input_ids_hf, attention_mask=attn_mask)
@@ -968,16 +1048,24 @@ def run_alignment_test(
                     elif isinstance(hf_outputs, tuple):
                         hf_logits = hf_outputs[0][:, -1, :]
                     else:
-                        raise RuntimeError("HF model output has no usable logits for audit.")
+                        raise RuntimeError(
+                            "HF model output has no usable logits for audit."
+                        )
                     hf_token = torch.argmax(hf_logits, dim=-1).item()
                 for h in hf_handles:
                     h.remove()
                 hf_logits_cmp = hf_logits.float().cpu()
                 vl, vr = lite_prefill_logits_cpu.shape[-1], hf_logits_cmp.shape[-1]
                 if vl != vr:
-                    print(f"  [Note] Vocab size: Lite={vl} vs HF={vr}; logits compared on min slice.")
-                cos_sim, max_err = compare_logits_aligned(lite_prefill_logits_cpu, hf_logits_cmp)
-                print(f"  Prefill Logits -> CosSim: {cos_sim:.6f}, MaxErr: {max_err:.6f}")
+                    print(
+                        f"  [Note] Vocab size: Lite={vl} vs HF={vr}; logits compared on min slice."
+                    )
+                cos_sim, max_err = compare_logits_aligned(
+                    lite_prefill_logits_cpu, hf_logits_cmp
+                )
+                print(
+                    f"  Prefill Logits -> CosSim: {cos_sim:.6f}, MaxErr: {max_err:.6f}"
+                )
                 print(
                     f"  Prefill Token: HF(argmax)={hf_token} | "
                     f"Lite(engine)={lite_prefill_token} | Lite(argmax logits)={lite_argmax_from_logits}"
@@ -989,11 +1077,15 @@ def run_alignment_test(
         elif hf_model is not None:
             hf_eval_device = next(hf_model.parameters()).device
             input_ids_hf = input_ids_tokens.to(hf_eval_device)
-            attn_mask = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+            attn_mask = torch.ones_like(
+                input_ids_hf, dtype=torch.long, device=hf_eval_device
+            )
             hf_handles: list[Any] = []
             if report_first_drift_layer and _looks_like_gemma4_model_path(hf_load_path):
                 hf_layers = _get_gemma4_layers_for_hooks(hf_model)
-                hf_handles = _register_last_token_layer_hooks(hf_layers, hf_layer_last_token)
+                hf_handles = _register_last_token_layer_hooks(
+                    hf_layers, hf_layer_last_token
+                )
                 hf_layer_last_token.clear()
             with torch.inference_mode():
                 hf_outputs = hf_model(input_ids_hf, attention_mask=attn_mask)
@@ -1002,7 +1094,9 @@ def run_alignment_test(
                 elif isinstance(hf_outputs, tuple):
                     hf_logits = hf_outputs[0][:, -1, :]
                 else:
-                    raise RuntimeError("HF model output has no usable logits for audit.")
+                    raise RuntimeError(
+                        "HF model output has no usable logits for audit."
+                    )
                 hf_token = torch.argmax(hf_logits, dim=-1).item()
             for h in hf_handles:
                 h.remove()
@@ -1012,7 +1106,9 @@ def run_alignment_test(
             lite_handles: list[Any] = []
             if report_first_drift_layer and _looks_like_gemma4_model_path(model_path):
                 lite_layers = _get_gemma4_layers_for_hooks(engine.model)
-                lite_handles = _register_last_token_layer_hooks(lite_layers, lite_layer_last_token)
+                lite_handles = _register_last_token_layer_hooks(
+                    lite_layers, lite_layer_last_token
+                )
 
             def audit_forward(*args, **kwargs):
                 if lite_handles:
@@ -1022,7 +1118,9 @@ def run_alignment_test(
                 return res
 
             engine.model.forward = audit_forward
-            engine.add_request("audit", prompt, SamplingParams(max_tokens=1, temperature=0.0))
+            engine.add_request(
+                "audit", prompt, SamplingParams(max_tokens=1, temperature=0.0)
+            )
             audit_ro2 = _run_lite_steps_until(
                 engine,
                 "Prefill audit (HF same-dir path)",
@@ -1038,7 +1136,9 @@ def run_alignment_test(
             hf_logits_cmp = hf_logits.float().cpu()
             vl, vr = lite_logits.shape[-1], hf_logits_cmp.shape[-1]
             if vl != vr:
-                print(f"  [Note] Vocab size: Lite={vl} vs HF={vr}; logits compared on min slice.")
+                print(
+                    f"  [Note] Vocab size: Lite={vl} vs HF={vr}; logits compared on min slice."
+                )
             cos_sim, max_err = compare_logits_aligned(lite_logits, hf_logits_cmp)
             print(f"  Prefill Logits -> CosSim: {cos_sim:.6f}, MaxErr: {max_err:.6f}")
             print(
@@ -1102,9 +1202,7 @@ def run_alignment_test(
                 engine,
                 "Full greedy generation audit",
                 step_budget_full,
-                lambda outs: (
-                    outs[0].outputs[0] if outs and outs[0].finished else None
-                ),
+                lambda outs: outs[0].outputs[0] if outs and outs[0].finished else None,
             )
 
             lite_text = full_lite_out.text
@@ -1120,22 +1218,24 @@ def run_alignment_test(
                     pad_id = getattr(tokenizer, "eos_token_id", None)
                 if pad_id is not None:
                     gen_kwargs["pad_token_id"] = pad_id
-                attn_mask_gen = torch.ones_like(input_ids_hf, dtype=torch.long, device=hf_eval_device)
+                attn_mask_gen = torch.ones_like(
+                    input_ids_hf, dtype=torch.long, device=hf_eval_device
+                )
                 gen_kwargs["attention_mask"] = attn_mask_gen
                 hf_full_gen = hf_model.generate(input_ids_hf, **gen_kwargs)
                 hf_text = tokenizer.decode(
-                    hf_full_gen[0][input_ids_hf.shape[-1]:],
+                    hf_full_gen[0][input_ids_hf.shape[-1] :],
                     skip_special_tokens=True,
                 )
                 print(f"  HF Reference:   '{hf_text}'")
 
-                match = (lite_text.strip() == hf_text.strip())
+                match = lite_text.strip() == hf_text.strip()
                 if match:
                     print("  ✅ PASS: Semantic Integrity Verified.")
                 else:
                     print("  ❌ FAIL: Semantic Drift Detected.")
                     lite_tokens = full_lite_out.token_ids
-                    hf_tokens = hf_full_gen[0][input_ids_hf.shape[-1]:].tolist()
+                    hf_tokens = hf_full_gen[0][input_ids_hf.shape[-1] :].tolist()
                     print(f"  Lite Tokens: {lite_tokens}")
                     print(f"  HF Tokens:   {hf_tokens}")
                 audit_result = match
@@ -1147,10 +1247,13 @@ def run_alignment_test(
             _act_sniffer.detach()
     return audit_result
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--quant", type=str, default="none", choices=["none", "awq", "gguf"])
+    parser.add_argument(
+        "--quant", type=str, default="none", choices=["none", "awq", "gguf"]
+    )
     parser.add_argument(
         "--preset",
         type=str,
@@ -1158,7 +1261,9 @@ if __name__ == "__main__":
         choices=sorted(PRESETS.keys()),
         help="Optional model preset key to populate default prompt/max_new_tokens/quant.",
     )
-    parser.add_argument("--prompt", type=str, default=None, help="Override prompt for the audit.")
+    parser.add_argument(
+        "--prompt", type=str, default=None, help="Override prompt for the audit."
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -1276,7 +1381,7 @@ if __name__ == "__main__":
     if args.awq_force_fused and args.awq_disable_fused:
         parser.error("--awq-force-fused and --awq-disable-fused are mutually exclusive")
 
-    effective_hf_model_path: Optional[str] = args.hf_model
+    effective_hf_model_path: str | None = args.hf_model
     if args.hf_same_as_lite:
         effective_hf_model_path = args.model
         if args.hf_model:

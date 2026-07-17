@@ -7,7 +7,13 @@ import torch
 import torch.nn as nn
 
 from vllm.engine.block_allocator import BlockAllocator
-from vllm.engine.runtime_factory import LiteRuntimeFactory, RuntimeAssemblyContext
+from vllm.engine.runtime_factory import (
+    KVCache,
+    KVScaleCache,
+    LiteRuntimeFactory,
+    RuntimeAssemblyContext,
+    RuntimeComponents,
+)
 
 
 class LiteRuntimeAssembler:
@@ -18,8 +24,8 @@ class LiteRuntimeAssembler:
         cls,
         *,
         block_allocator: BlockAllocator | None,
-        kv_caches: list[torch.Tensor],
-        kv_scale_caches: list[torch.Tensor],
+        kv_caches: list[KVCache],
+        kv_scale_caches: list[KVScaleCache],
         num_blocks_per_seq: int,
         block_size: int,
         device: torch.device,
@@ -51,7 +57,7 @@ class LiteRuntimeAssembler:
         lora_registry: Any,
         queue_timeout_s: float,
         custom_runtime_components: Any | None = None,
-    ) -> dict[str, Any]:
+    ) -> RuntimeComponents:
         runtime_context = RuntimeAssemblyContext(
             block_allocator=block_allocator,
             kv_caches=kv_caches,
