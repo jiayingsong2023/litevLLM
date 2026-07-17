@@ -24,6 +24,7 @@ class StepScheduler:
     ) -> None:
         self.step_token_budget = max(1, int(step_token_budget))
         self.prefill_chunk_size = max(1, int(prefill_chunk_size))
+        self.prefill_microbatch_size = max(1, int(prefill_microbatch_size))
         self.max_decode_streak = max(1, int(max_decode_streak))
         self.max_prefill_deferrals = max(1, int(max_prefill_deferrals))
         self._decode_only_streak = 0
@@ -41,7 +42,7 @@ class StepScheduler:
         )
         self._decode_prefill_planner = DecodePrefillPlanner(
             prefill_chunk_size=self.prefill_chunk_size,
-            prefill_microbatch_size=prefill_microbatch_size,
+            prefill_microbatch_size=self.prefill_microbatch_size,
         )
 
     def set_verified_decode_batch_sizes(

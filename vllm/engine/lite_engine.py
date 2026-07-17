@@ -101,6 +101,39 @@ def expand_metadata_for_paged_attention(
 
 class LiteEngine:
     def __init__(self, vllm_config: VllmConfig):
+        self._initialize_before_model_load(vllm_config)
+        self._load_model_and_detect_capabilities()
+
+        # Pre-allocate Block-based KV Cache (paged: block table + fixed pool).
+        self.inf_config = LiteInferenceConfig(
+            kv_type=self.runtime_config.kv_cache_dtype,
+            k_scale=self.runtime_config.k_scale,
+            v_scale=self.runtime_config.v_scale,
+            fusion_level=self.runtime_config.fusion_level,
+            block_size=self.runtime_config.block_size,
+            max_model_len=self.runtime_config.kv_max_model_len,
+            max_active_requests=self.runtime_config.kv_max_active_requests,
+            use_prompt_guard=self.runtime_config.use_prompt_guard,
+            paged_attn_num_warps=self.runtime_config.paged_attn_num_warps,
+            paged_attn_num_stages=self.runtime_config.paged_attn_num_stages,
+            paged_attn_num_warps_global=self.runtime_config.paged_attn_num_warps_global,
+            paged_attn_num_stages_global=self.runtime_config.paged_attn_num_stages_global,
+            paged_attn_num_warps_local=self.runtime_config.paged_attn_num_warps_local,
+            paged_attn_num_stages_local=self.runtime_config.paged_attn_num_stages_local,
+            gemma4_c1_preset=(
+                self.runtime_config.gemma4_c1_preset
+                or bool(self.runtime_policy.model_policy.get("gemma4_c1_preset"))
+            ),
+            tuning_env=self._active_tuning_env,
+            model_policy=dict(self.runtime_policy.model_policy),
+            kernel_policy=dict(self.runtime_policy.kernel_policy),
+            kv_select_ratio=self.runtime_config.kv_select_ratio,
+            kv_select_min_blocks=self.runtime_config.kv_select_min_blocks,
+        )
+
+        self._initialize_loaded_runtime()
+
+    def _initialize_before_model_load(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self._async_engine_lock: Any | None = None
         self.model_config = vllm_config.model_config
@@ -111,7 +144,7 @@ class LiteEngine:
             or RuntimeConfig.from_vllm_config(vllm_config),
         )
         object.__setattr__(self.vllm_config, "runtime_config", self.runtime_config)
-        requested_policy_mode = self.runtime_config.policy_mode
+        self._requested_policy_mode = self.runtime_config.policy_mode
         self.observer = (
             getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
         )
@@ -125,7 +158,7 @@ class LiteEngine:
         object.__setattr__(self.vllm_config, "runtime_config", self.runtime_config)
         self._install_tuning_configs_for_model(self.runtime_policy)
 
-        # 1. Load Model
+    def _load_model_and_detect_capabilities(self) -> None:
         print(f">>> LiteEngine: Loading {self.model_config.model}...")
         self.model = get_model(vllm_config=self.vllm_config)
         print(f">>> LiteEngine: Model Type: {type(self.model)}")
@@ -133,8 +166,8 @@ class LiteEngine:
         self.adapter = get_model_adapter(self.model, self.model_config)
         self.execution_policy = select_loadtime_policy(
             model_config=self.model_config,
-            quant_config=getattr(vllm_config, "quant_config", None),
-            policy_mode=requested_policy_mode,  # type: ignore[arg-type]
+            quant_config=getattr(self.vllm_config, "quant_config", None),
+            policy_mode=self._requested_policy_mode,  # type: ignore[arg-type]
         )
         self.model_capabilities = self.adapter.detect(self.model, self.model_config)
         self.model_surface = resolve_model_surface(
@@ -168,34 +201,7 @@ class LiteEngine:
                 "(from runtime profile/model policy)."
             )
 
-        # 3. Pre-allocate Block-based KV Cache
-        #    (paged: block table + fixed pool; block_size tokens/block)
-        self.inf_config = LiteInferenceConfig(
-            kv_type=self.runtime_config.kv_cache_dtype,
-            k_scale=self.runtime_config.k_scale,
-            v_scale=self.runtime_config.v_scale,
-            fusion_level=self.runtime_config.fusion_level,
-            block_size=self.runtime_config.block_size,
-            max_model_len=self.runtime_config.kv_max_model_len,
-            max_active_requests=self.runtime_config.kv_max_active_requests,
-            use_prompt_guard=self.runtime_config.use_prompt_guard,
-            paged_attn_num_warps=self.runtime_config.paged_attn_num_warps,
-            paged_attn_num_stages=self.runtime_config.paged_attn_num_stages,
-            paged_attn_num_warps_global=self.runtime_config.paged_attn_num_warps_global,
-            paged_attn_num_stages_global=self.runtime_config.paged_attn_num_stages_global,
-            paged_attn_num_warps_local=self.runtime_config.paged_attn_num_warps_local,
-            paged_attn_num_stages_local=self.runtime_config.paged_attn_num_stages_local,
-            gemma4_c1_preset=(
-                self.runtime_config.gemma4_c1_preset
-                or bool(self.runtime_policy.model_policy.get("gemma4_c1_preset"))
-            ),
-            tuning_env=self._active_tuning_env,
-            model_policy=dict(self.runtime_policy.model_policy),
-            kernel_policy=dict(self.runtime_policy.kernel_policy),
-            kv_select_ratio=self.runtime_config.kv_select_ratio,
-            kv_select_min_blocks=self.runtime_config.kv_select_min_blocks,
-        )
-
+    def _initialize_loaded_runtime(self) -> None:
         planner = RuntimePlanner(
             self.runtime_config,
             self.model_capabilities,
@@ -317,9 +323,6 @@ class LiteEngine:
         self.sampling_driver: SamplingDriver | None = None
         self.output_pipeline: OutputPipeline | None = None
         self.request_builder: LiteRequestBuilder | None = None
-        self.observer = (
-            getattr(vllm_config, "runtime_observer", None) or NullRuntimeObserver()
-        )
         self._record_model_surface_event()
         self._queue_timeout_s = float(self.runtime_config.queue_timeout_s)
 

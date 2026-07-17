@@ -1,4 +1,4 @@
-name: Smoke Tests
+name: Quality Gates
 
 on:
   pull_request:
@@ -10,9 +10,7 @@ on:
       - "uv.lock"
       - ".github/workflows/smoke.yml"
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
     paths:
       - "vllm/**/*.py"
       - "tests/**/*.py"
@@ -20,55 +18,107 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/smoke.yml"
+  workflow_dispatch:
+    inputs:
+      run_correctness:
+        description: Run the full ROCm correctness suite.
+        required: false
+        type: boolean
+        default: false
+      run_performance:
+        description: Run the fixed-model ROCm performance gate.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  smoke:
+  static-quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install uv
         run: pip install uv
-
-      - name: Sync dependencies
-        run: uv sync
-
-      - name: Run smoke tests
-        run: uv run pytest -q tests/smoke
-
-  quality:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        run: pip install uv
-
       - name: Sync development dependencies
         run: uv sync --group dev
-
-      - name: Run fast regression
-        run: bash tests/run_regression_suite.sh
-
       - name: Check repository style
         run: uv run ruff check .
-
       - name: Type-check concurrency contracts
         run: >-
           uv run mypy
           vllm/engine/async_llm.py
           vllm/engine/request_scheduler.py
+
+  rocm-fast-regression:
+    if: vars.FASTINFERENCE_ROCM_RUNNER == 'enabled'
+    runs-on: [self-hosted, linux, rocm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync development dependencies
+        run: uv sync --group dev
+      - name: Verify ROCm runtime
+        run: >-
+          uv run python -c
+          "import torch; assert torch.version.hip, 'ROCm Torch is required'"
+      - name: Run fast regression
+        run: bash tests/run_regression_suite.sh
+
+  rocm-correctness:
+    if: >-
+      vars.FASTINFERENCE_ROCM_RUNNER == 'enabled' &&
+      github.event_name == 'workflow_dispatch' && inputs.run_correctness
+    runs-on: [self-hosted, linux, rocm]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync development dependencies
+        run: uv sync --group dev
+      - name: Run full correctness regression
+        run: bash tests/run_inference_correctness_regression.sh
+
+  rocm-performance:
+    if: >-
+      vars.FASTINFERENCE_ROCM_RUNNER == 'enabled' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.run_performance) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'rocm-performance')))
+    runs-on: [self-hosted, linux, rocm]
+    timeout-minutes: 180
+    env:
+      FASTINFERENCE_PERF_BASELINE: /opt/fastinference/baselines/e2e-default.json
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync development dependencies
+        run: uv sync --group dev
+      - name: Verify fixed baseline
+        run: test -f "$FASTINFERENCE_PERF_BASELINE"
+      - name: Run model performance gate
+        run: >-
+          uv run python tests/e2e_full_benchmark.py
+          --model-process-isolation
+          --perf-baseline-json "$FASTINFERENCE_PERF_BASELINE"
+          --perf-fail-on-regression
+          --json-out /tmp/e2e-current.json
+      - name: Upload performance result
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ github.sha }}
+          path: /tmp/e2e-current.json
+
+  rocm-wheel-smoke:
+    if: >-
+      vars.FASTINFERENCE_ROCM_RUNNER == 'enabled' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, rocm]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel
+        run: uv build
+      - name: Import supported package surface
+        run: >-
+          uv run --isolated --with dist/*.whl python -c
+          "import vllm; from vllm.entrypoints.openai import api_server"

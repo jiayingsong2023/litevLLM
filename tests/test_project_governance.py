@@ -104,14 +104,13 @@ def test_fastinference_env_names_are_registered() -> None:
     )
 
 
-def test_smoke_workflow_pytest_target_exists() -> None:
+def test_quality_workflow_declares_static_and_rocm_gates() -> None:
     workflow = _read(".github/workflows/smoke.yml")
-    targets = re.findall(r"uv run pytest(?: -q)? ([^\n]+)", workflow)
-
-    assert targets, "smoke workflow must run pytest against an explicit target"
-    for target in targets:
-        path = ROOT / target.strip()
-        assert path.exists(), f"smoke workflow target is missing: {target}"
+    assert "uv run ruff check ." in workflow
+    assert "runs-on: [self-hosted, linux, rocm]" in workflow
+    assert "bash tests/run_regression_suite.sh" in workflow
+    assert "bash tests/run_inference_correctness_regression.sh" in workflow
+    assert "--perf-fail-on-regression" in workflow
 
 
 def test_stability_summary_smoke_files_exist() -> None:
