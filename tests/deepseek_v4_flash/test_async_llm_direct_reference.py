@@ -50,6 +50,7 @@ class _BridgeEngine:
     def __init__(self) -> None:
         self.added_requests: list[tuple[str, str]] = []
         self.aborted_requests: list[str] = []
+        self.closed_streams: list[str] = []
 
     def add_request(
         self,
@@ -72,6 +73,9 @@ class _BridgeEngine:
 
     def abort_request(self, request_id: str) -> None:
         self.aborted_requests.append(request_id)
+
+    def close_request_stream(self, request_id: str) -> None:
+        self.closed_streams.append(request_id)
 
     def stats(self) -> dict[str, object]:
         return {"bridge": True}
@@ -202,3 +206,4 @@ def test_async_llm_close_stream_aborts_uniterated_request() -> None:
     asyncio.run(llm.close_stream("req-never-iterated"))
 
     assert llm.engine.aborted_requests == ["req-never-iterated"]
+    assert llm.engine.closed_streams == ["req-never-iterated"]

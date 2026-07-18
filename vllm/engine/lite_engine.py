@@ -7,7 +7,12 @@ import torch
 
 from vllm.adapters import get_model_adapter
 from vllm.config import VllmConfig
-from vllm.engine.errors import BackgroundLoopError, RequestRejectedError
+from vllm.engine.errors import (
+    BackgroundLoopError,
+    EngineFatalError,
+    InvalidRequestError,
+    RequestRejectedError,
+)
 from vllm.engine.inference_config import LiteInferenceConfig
 from vllm.engine.initialization import (
     BlockAllocator,
@@ -729,7 +734,7 @@ class LiteEngine:
     ):
         fatal_error = getattr(self, "_fatal_error", None)
         if fatal_error is not None:
-            raise RequestRejectedError(f"engine is fatal: {fatal_error}")
+            raise EngineFatalError(f"engine is fatal: {fatal_error}")
         if self.policies is None:
             self.policies = build_generation_policies(
                 str(self.model_config.model), self.tokenizer, self.adapter
@@ -741,7 +746,10 @@ class LiteEngine:
                 use_legacy=self.runtime_config.use_legacy_sampling,
             )
             self.output_pipeline = OutputPipeline(
-                self.tokenizer, self.policies, self.sampling_driver
+                self.tokenizer,
+                self.policies,
+                self.sampling_driver,
+                max_model_len=self.max_model_len,
             )
             self.request_builder = LiteRequestBuilder(
                 tokenizer=self.tokenizer,
@@ -776,7 +784,7 @@ class LiteEngine:
             except ValueError as exc:
                 reason = str(exc)
                 self.observer.on_request_rejected(request_id, reason)
-                raise RequestRejectedError(reason) from exc
+                raise InvalidRequestError(reason) from exc
 
         try:
             resolved_lora = self.lora_registry.resolve_adapter(
@@ -826,7 +834,7 @@ class LiteEngine:
         except ValueError as exc:
             reason = str(exc)
             self.observer.on_request_rejected(request_id, reason)
-            raise RequestRejectedError(reason) from exc
+            raise InvalidRequestError(reason) from exc
         if (
             not bool(getattr(self.model_capabilities, "supports_chunked_prefill", True))
             and self.scheduler.active_request_count >= self.max_active_requests
@@ -859,20 +867,29 @@ class LiteEngine:
         self.execution_backend.release_request(request_id)
         self.observer.on_request_aborted(request_id)
 
+    def close_request_stream(self, request_id: str) -> None:
+        self.scheduler.close_request_stream(request_id)
+
     def handle_background_error(self, exc: BaseException) -> None:
         if self._fatal_error is not None:
             return
         self._fatal_error = (
-            exc if isinstance(exc, BackgroundLoopError) else BackgroundLoopError(str(exc))
+            exc
+            if isinstance(exc, BackgroundLoopError)
+            else BackgroundLoopError(str(exc))
         )
         request_ids = self.scheduler.request_ids()
         self.observer.on_background_error(self._fatal_error, request_ids)
         for request_id in request_ids:
-            self.scheduler.publish_exception(
-                request_id,
-                self._fatal_error,
-            )
-            self.execution_backend.release_request(request_id)
+            self.scheduler.publish_exception(request_id, self._fatal_error)
+        for request_id in request_ids:
+            try:
+                self.execution_backend.release_request(request_id)
+            except Exception:
+                # The engine is already fatal; continue teardown so every
+                # stream has a terminal notification and every sibling gets a
+                # chance to release its resources.
+                logger.exception("fatal teardown failed for request %s", request_id)
 
     @torch.inference_mode()
     def step(self) -> list[RequestOutput]:

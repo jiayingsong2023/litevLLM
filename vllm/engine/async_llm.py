@@ -130,7 +130,14 @@ class AsyncLLM(EngineClient):
 
     async def close_stream(self, request_id: str) -> None:
         """Release an admitted stream that a caller will not iterate."""
-        await self.abort(request_id)
+        await asyncio.to_thread(self._close_stream_sync, request_id)
+
+    def _close_stream_sync(self, request_id: str) -> None:
+        with self._engine_lock:
+            self.engine.abort_request(request_id)
+            close_stream = getattr(self.engine, "close_request_stream", None)
+            if close_stream is not None:
+                close_stream(request_id)
 
     async def abort(self, request_ids: str | list[str]):
         await asyncio.to_thread(self._abort_sync, request_ids)

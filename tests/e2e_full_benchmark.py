@@ -1844,19 +1844,41 @@ def _load_perf_baseline(path: str) -> dict[str, Any]:
     return dict(summary) if isinstance(summary, dict) else {}
 
 
-def _benchmark_fingerprint(args: argparse.Namespace, model_keys: list[str]) -> dict[str, Any]:
+def _benchmark_fingerprint(
+    args: argparse.Namespace, model_keys: list[str]
+) -> dict[str, Any]:
     """Identify results that may be compared as a performance baseline."""
     device = torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None
     return {
         "models": model_keys,
         "gpu": device.name if device is not None else None,
-        "gpu_arch": getattr(device, "gcnArchName", None) if device is not None else None,
+        "gpu_arch": getattr(device, "gcnArchName", None)
+        if device is not None
+        else None,
         "rocm": torch.version.hip,
         "torch": torch.__version__,
         "triton": getattr(torch.version, "triton", None),
         "workload": args.workload,
         "fixed_decode_len": bool(args.fixed_decode_len),
         "warmup_preset": args.warmup_preset,
+        "shape": {
+            key: value
+            for key, value in vars(args).items()
+            if any(
+                token in key
+                for token in (
+                    "concurrent",
+                    "prompt_tokens",
+                    "max_new_tokens",
+                    "max_model_len",
+                )
+            )
+            and isinstance(value, (bool, int, float, str, type(None)))
+        },
+        "runtime_env": {
+            key: os.environ.get(key)
+            for key in ("FASTINFERENCE_KV_TYPE", "FASTINFERENCE_FUSION_LEVEL")
+        },
     }
 
 

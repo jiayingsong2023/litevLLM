@@ -76,6 +76,17 @@ async def test_request_scheduler_stream_raises_published_exception() -> None:
     assert "r1" not in scheduler._request_streams
 
 
+def test_request_scheduler_close_stream_releases_unconsumed_queue() -> None:
+    scheduler = RequestScheduler(max_active_requests=1)
+    scheduler.add_request("r1", _rs("r1", slot_idx=0, is_prefill=True))
+    scheduler.free_request("r1")
+
+    scheduler.close_request_stream("r1")
+
+    assert "r1" not in scheduler._request_streams
+    scheduler.enqueue_request("r1", _rs("r1", is_prefill=True))
+
+
 def test_lite_engine_background_error_publishes_then_releases_every_request() -> None:
     published: list[tuple[str, BaseException]] = []
     released: list[str] = []
@@ -105,6 +116,31 @@ def test_lite_engine_background_error_publishes_then_releases_every_request() ->
     assert all(exc is engine._fatal_error for _, exc in published)
     assert released == ["r1", "r2"]
     assert observed == [(engine._fatal_error, ["r1", "r2"])]
+
+
+def test_lite_engine_background_error_continues_release_after_failure() -> None:
+    published: list[str] = []
+    released: list[str] = []
+
+    def release(request_id: str) -> None:
+        released.append(request_id)
+        if request_id == "r1":
+            raise RuntimeError("release failed")
+
+    engine = SimpleNamespace(
+        _fatal_error=None,
+        scheduler=SimpleNamespace(
+            request_ids=lambda: ["r1", "r2"],
+            publish_exception=lambda request_id, _exc: published.append(request_id),
+        ),
+        execution_backend=SimpleNamespace(release_request=release),
+        observer=SimpleNamespace(on_background_error=lambda *_args: None),
+    )
+
+    LiteEngine.handle_background_error(engine, RuntimeError("step failed"))
+
+    assert published == ["r1", "r2"]
+    assert released == ["r1", "r2"]
 
 
 def test_request_scheduler_rejects_duplicate_id_until_stream_is_detached() -> None:
@@ -237,6 +273,18 @@ async def test_async_driver_propagates_background_error_to_engine() -> None:
     assert engine.calls >= 1
     assert isinstance(engine.error, RuntimeError)
     assert "driver-failure" in str(engine.error)
+
+
+@pytest.mark.asyncio
+async def test_async_driver_does_not_restart_a_fatal_engine() -> None:
+    engine = SimpleNamespace(active_request_count=0, _fatal_error=RuntimeError("fatal"))
+    driver = AsyncDriver(engine)
+
+    driver.notify_new_work()
+    await asyncio.sleep(0)
+
+    assert not driver._running
+    assert driver._worker_thread is None
 
 
 def test_async_llm_passes_runtime_backpressure_interval_to_driver(

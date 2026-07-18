@@ -105,6 +105,11 @@ def test_benchmark_fingerprint_records_comparison_inputs(monkeypatch) -> None:
         "workload": "text",
         "fixed_decode_len": True,
         "warmup_preset": "off",
+        "shape": {},
+        "runtime_env": {
+            "FASTINFERENCE_KV_TYPE": None,
+            "FASTINFERENCE_FUSION_LEVEL": None,
+        },
     }
 
 

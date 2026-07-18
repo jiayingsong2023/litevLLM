@@ -233,6 +233,10 @@ class RequestScheduler:
             if self._request_streams.get(request_id) is queue:
                 self._request_streams.pop(request_id, None)
 
+    def close_request_stream(self, request_id: str) -> None:
+        """Drop a stream whose caller explicitly declines to consume it."""
+        self._request_streams.pop(request_id, None)
+
     def publish_output(self, request_id: str, output: RequestOutput) -> None:
         queue = self._request_streams.get(request_id)
         if queue is None:
