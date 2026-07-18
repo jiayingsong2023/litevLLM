@@ -70,6 +70,7 @@ class RequestOutput:
         prompt_token_ids: list[int],
         outputs: list[CompletionOutput],
         finished: bool,
+        finish_reason: str | None = None,
         **kwargs,
     ):
         self.request_id = request_id
@@ -77,6 +78,7 @@ class RequestOutput:
         self.prompt_token_ids = prompt_token_ids
         self.outputs = outputs
         self.finished = finished
+        self.finish_reason = finish_reason
 
 
 class PoolingOutput:

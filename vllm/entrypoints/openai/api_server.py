@@ -14,7 +14,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.engine.async_llm import AsyncLLM
-from vllm.engine.errors import RequestRejectedError
+from vllm.engine.errors import (
+    EngineFatalError,
+    InvalidRequestError,
+    RequestRejectedError,
+)
+from vllm.engine.multimodal_processor import MAX_IMAGE_BYTES
 from vllm.engine.runtime_observer import InMemoryRuntimeObserver
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -23,7 +28,9 @@ from vllm.serving.config_builder import build_vllm_config
 logger = init_logger(__name__)
 engine: AsyncLLM | None = None
 debug_endpoints_enabled = False
-MAX_REQUEST_BODY_BYTES = 1 << 20
+# A base64 image needs roughly four thirds of its decoded byte count, plus the
+# JSON/chat envelope. Keep the HTTP limit compatible with the image contract.
+MAX_REQUEST_BODY_BYTES = (MAX_IMAGE_BYTES * 4 // 3) + (64 << 10)
 
 
 @asynccontextmanager
@@ -56,7 +63,9 @@ async def _read_json_object(request: Request) -> dict:
             if int(content_length) > MAX_REQUEST_BODY_BYTES:
                 raise HTTPException(status_code=413, detail="request body too large")
         except ValueError:
-            raise HTTPException(status_code=400, detail="invalid Content-Length") from None
+            raise HTTPException(
+                status_code=400, detail="invalid Content-Length"
+            ) from None
 
     chunks: list[bytes] = []
     received = 0
@@ -68,9 +77,13 @@ async def _read_json_object(request: Request) -> dict:
     try:
         body = json.loads(b"".join(chunks))
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail="request body must be valid JSON") from exc
+        raise HTTPException(
+            status_code=400, detail="request body must be valid JSON"
+        ) from exc
     if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        raise HTTPException(
+            status_code=400, detail="request body must be a JSON object"
+        )
     return body
 
 
@@ -115,7 +128,9 @@ def _parse_structured_outputs(body: dict) -> StructuredOutputsParams | None:
     )
 
 
-def _normalize_chat_messages(messages: list[dict]) -> tuple[list[dict[str, str]], dict | None]:
+def _normalize_chat_messages(
+    messages: list[dict],
+) -> tuple[list[dict[str, str]], dict | None]:
     normalized: list[dict[str, str]] = []
     images: list[dict[str, str]] = []
     for message in messages:
@@ -176,7 +191,9 @@ def _parse_chat_message_content(messages: list[dict]) -> tuple[str, dict | None]
     return (normalized[-1]["content"] if normalized else ""), multi_modal_data
 
 
-def _render_chat_prompt(runtime_engine: AsyncLLM, messages: list[dict[str, str]]) -> str:
+def _render_chat_prompt(
+    runtime_engine: AsyncLLM, messages: list[dict[str, str]]
+) -> str:
     tokenizer = getattr(getattr(runtime_engine, "engine", None), "tokenizer", None)
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
         return "\n".join(message["content"] for message in messages)
@@ -187,7 +204,9 @@ def _render_chat_prompt(runtime_engine: AsyncLLM, messages: list[dict[str, str]]
             add_generation_prompt=True,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"chat template failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"chat template failed: {exc}"
+        ) from exc
     if not isinstance(prompt, str):
         raise HTTPException(status_code=400, detail="chat template must return text")
     return prompt
@@ -217,6 +236,9 @@ def _sampling_params_from_body(body: dict[str, Any]) -> SamplingParams:
 
 
 def _finish_reason(output: Any, max_tokens: int | None) -> str:
+    known_reason = getattr(output, "finish_reason", None)
+    if known_reason in {"stop", "length"}:
+        return known_reason
     if (
         output.outputs
         and max_tokens is not None
@@ -305,7 +327,7 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     runtime_engine = _require_engine()
-    if not getattr(runtime_engine, "is_healthy", lambda: True)():
+    if not await asyncio.to_thread(getattr(runtime_engine, "is_healthy", lambda: True)):
         raise HTTPException(status_code=503, detail="engine is fatal")
     return {"status": "ready"}
 
@@ -315,7 +337,7 @@ async def get_runtime_stats():
     _require_debug_endpoints()
     runtime_engine = _require_engine()
     model_config = await runtime_engine.get_model_config()
-    stats = runtime_engine.stats()
+    stats = await asyncio.to_thread(runtime_engine.stats)
     return JSONResponse(
         content={
             "model": getattr(model_config, "model", None),
@@ -329,9 +351,11 @@ async def get_runtime_stats():
 async def reset_runtime_stats(clear_prefix_cache: bool = False):
     _require_debug_endpoints()
     runtime_engine = _require_engine()
-    runtime_engine.reset_stats(clear_prefix_cache=clear_prefix_cache)
+    await asyncio.to_thread(
+        runtime_engine.reset_stats, clear_prefix_cache=clear_prefix_cache
+    )
     model_config = await runtime_engine.get_model_config()
-    stats = runtime_engine.stats()
+    stats = await asyncio.to_thread(runtime_engine.stats)
     return JSONResponse(
         content={
             "model": getattr(model_config, "model", None),
@@ -365,9 +389,12 @@ async def create_chat_completion(request: Request):
             request_id,
             multi_modal_data=multi_modal_data,
         )
+    except InvalidRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EngineFatalError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RequestRejectedError as exc:
-        status_code = 503 if "fatal" in str(exc).lower() else 429
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -413,7 +440,9 @@ async def create_chat_completion(request: Request):
         async for output in runtime_engine.stream(request_id):
             final_output = output
         if final_output is None:
-            raise HTTPException(status_code=503, detail="generation ended without output")
+            raise HTTPException(
+                status_code=503, detail="generation ended without output"
+            )
 
         return JSONResponse(
             content={
@@ -452,6 +481,7 @@ def main() -> None:
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
+        default=None,
         help="Allow model-provided Python only with --revision.",
     )
     parser.add_argument(
@@ -471,12 +501,12 @@ def main() -> None:
 
     global debug_endpoints_enabled, engine
     debug_endpoints_enabled = args.enable_debug_endpoints
-    v_config = build_vllm_config(
-        args.model,
-        policy_mode=args.policy_mode,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.revision,
-    )
+    config_overrides: dict[str, Any] = {"policy_mode": args.policy_mode}
+    if args.trust_remote_code is not None:
+        config_overrides["trust_remote_code"] = args.trust_remote_code
+    if args.revision is not None:
+        config_overrides["revision"] = args.revision
+    v_config = build_vllm_config(args.model, **config_overrides)
     object.__setattr__(v_config, "runtime_observer", InMemoryRuntimeObserver())
     engine = AsyncLLM(v_config)
 

@@ -143,6 +143,32 @@ def test_output_pipeline_decodes_when_finished() -> None:
     assert out.outputs[0].text == "ab"
 
 
+def test_output_pipeline_finishes_at_context_limit() -> None:
+    pipeline = OutputPipeline(
+        FakeTokenizer(),
+        CountingOutputProcessor(),
+        _make_sampling_driver(),
+        max_model_len=4,
+    )
+    req = _make_request(generated_ids=[1], max_tokens=10)
+    req.seq_len = 4
+
+    out = pipeline.finalize_step("r1", req, next_token=4)
+
+    assert out.finished
+    assert out.finish_reason == "length"
+
+
+def test_output_pipeline_prefers_eos_finish_reason_at_token_limit() -> None:
+    pipeline = OutputPipeline(FakeTokenizer(), CountingOutputProcessor(), _make_sampling_driver())
+    req = _make_request(generated_ids=[1, 3], max_tokens=2)
+
+    out = pipeline.finalize_step("r1", req, next_token=3)
+
+    assert out.finished
+    assert out.finish_reason == "stop"
+
+
 def test_output_pipeline_decodes_for_early_stop_policy() -> None:
     tokenizer = FakeTokenizer()
     policies = CountingOutputProcessor(stop_text="ab")

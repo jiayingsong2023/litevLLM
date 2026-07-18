@@ -51,6 +51,8 @@ class AsyncDriver:
     def start(self) -> None:
         if self._running:
             return
+        if getattr(self.engine, "_fatal_error", None) is not None:
+            return
         self._running = True
         self._loop = asyncio.get_running_loop()
         scheduler = getattr(self.engine, "scheduler", None)

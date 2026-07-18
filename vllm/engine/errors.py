@@ -9,6 +9,14 @@ class RequestRejectedError(LiteRuntimeError):
     """Raised when a new request cannot be accepted."""
 
 
+class InvalidRequestError(RequestRejectedError):
+    """Raised when a caller supplied invalid request data."""
+
+
+class EngineFatalError(RequestRejectedError):
+    """Raised when a request arrives after the engine became fatal."""
+
+
 class RequestAbortedError(LiteRuntimeError):
     """Raised or propagated when a request is aborted."""
 

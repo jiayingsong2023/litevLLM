@@ -3,9 +3,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
-from vllm.engine.errors import RequestRejectedError
+from vllm.engine.errors import (
+    EngineFatalError,
+    InvalidRequestError,
+    RequestRejectedError,
+)
 from vllm.entrypoints.openai import api_server
 from vllm.outputs import CompletionOutput, RequestOutput
 
@@ -24,7 +29,7 @@ class _TemplateTokenizer:
 
 
 class _ChatEngine:
-    def __init__(self, *, reject: str | None = None) -> None:
+    def __init__(self, *, reject: BaseException | None = None) -> None:
         self.tokenizer = _TemplateTokenizer()
         self.engine = SimpleNamespace(tokenizer=self.tokenizer)
         self.reject = reject
@@ -36,7 +41,7 @@ class _ChatEngine:
 
     async def submit(self, prompt, sampling_params, request_id, **kwargs) -> None:
         if self.reject is not None:
-            raise RequestRejectedError(self.reject)
+            raise self.reject
         self.submissions.append((prompt, sampling_params, request_id, kwargs))
 
     async def stream(self, request_id):
@@ -124,7 +129,7 @@ def test_chat_rejects_unsupported_sampling_before_submit() -> None:
 
 def test_chat_maps_admission_rejection_to_429() -> None:
     previous_engine = api_server.engine
-    api_server.engine = _ChatEngine(reject="request queue full")  # type: ignore[assignment]
+    api_server.engine = _ChatEngine(reject=RequestRejectedError("request queue full"))  # type: ignore[assignment]
     try:
         response = TestClient(api_server.app).post(
             "/v1/chat/completions",
@@ -137,3 +142,57 @@ def test_chat_maps_admission_rejection_to_429() -> None:
         api_server.engine = previous_engine
 
     assert response.status_code == 429
+
+
+def test_chat_maps_invalid_request_and_fatal_errors_by_type() -> None:
+    previous_engine = api_server.engine
+    try:
+        api_server.engine = _ChatEngine(reject=InvalidRequestError("invalid image"))  # type: ignore[assignment]
+        invalid = TestClient(api_server.app).post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [{"role": "user", "content": "x"}]},
+        )
+        api_server.engine = _ChatEngine(reject=EngineFatalError("engine is fatal"))  # type: ignore[assignment]
+        fatal = TestClient(api_server.app).post(
+            "/v1/chat/completions",
+            json={"model": "model-a", "messages": [{"role": "user", "content": "x"}]},
+        )
+    finally:
+        api_server.engine = previous_engine
+
+    assert invalid.status_code == 400
+    assert fatal.status_code == 503
+
+
+def test_server_main_leaves_toml_model_options_unoverridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace(
+        model="model-a",
+        host="127.0.0.1",
+        port=8000,
+        enable_debug_endpoints=False,
+        trust_remote_code=None,
+        revision=None,
+        policy_mode="auto",
+    )
+    captured: dict[str, object] = {}
+    previous_engine = api_server.engine
+    monkeypatch.setattr(
+        api_server.argparse.ArgumentParser, "parse_args", lambda _self: args
+    )
+    monkeypatch.setattr(
+        api_server,
+        "build_vllm_config",
+        lambda model, **kwargs: (
+            captured.update(model=model, **kwargs) or SimpleNamespace()
+        ),
+    )
+    monkeypatch.setattr(api_server, "AsyncLLM", lambda _config: object())
+    monkeypatch.setattr(api_server.uvicorn, "run", lambda *_args, **_kwargs: None)
+    try:
+        api_server.main()
+    finally:
+        api_server.engine = previous_engine
+
+    assert captured == {"model": "model-a", "policy_mode": "auto"}

@@ -4,17 +4,21 @@ from __future__ import annotations
 import base64
 import io
 import math
+import warnings
 from typing import Any
 from urllib.parse import urlparse
 
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from vllm.engine.request_state import RequestState
 from vllm.model_executor.models.interfaces import supports_multimodal
 
 MAX_IMAGE_BYTES = 8 << 20
 MAX_IMAGE_PIXELS = 16_000_000
+ALLOWED_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/webp", "image/gif"}
+)
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
@@ -187,9 +191,7 @@ class LiteMultiModalProcessor:
             self.prepare_failures += 1
             raise
 
-    def build_prefill_inputs(
-        self, req_dicts: list[RequestState]
-    ) -> dict[str, Any]:
+    def build_prefill_inputs(self, req_dicts: list[RequestState]) -> dict[str, Any]:
         mm_requests = [req for req in req_dicts if req.multi_modal_inputs]
         if not mm_requests:
             return {}
@@ -508,7 +510,8 @@ class LiteMultiModalProcessor:
             header, encoded = image_url.split(",", 1)
         except ValueError as exc:
             raise ValueError("data image URL is missing payload") from exc
-        if not header.lower().startswith("data:image/") or ";base64" not in header:
+        mime_type = header.partition(";")[0].lower().removeprefix("data:")
+        if mime_type not in ALLOWED_IMAGE_MIME_TYPES or ";base64" not in header:
             raise ValueError("data image URL must be a base64-encoded image")
         if len(encoded) > (MAX_IMAGE_BYTES * 4 // 3) + 4:
             raise ValueError("image payload exceeds byte limit")
@@ -518,8 +521,18 @@ class LiteMultiModalProcessor:
             raise ValueError("data image URL has invalid base64 payload") from exc
         if len(payload) > MAX_IMAGE_BYTES:
             raise ValueError("image payload exceeds byte limit")
-        with Image.open(io.BytesIO(payload)) as image:
-            width, height = image.size
-            if width * height > MAX_IMAGE_PIXELS:
-                raise ValueError("image exceeds pixel limit")
-            return image.convert("RGB")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(payload)) as image:
+                    width, height = image.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        raise ValueError("image exceeds pixel limit")
+                    return image.convert("RGB")
+        except (
+            UnidentifiedImageError,
+            OSError,
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+        ) as exc:
+            raise ValueError("data image URL could not be decoded") from exc

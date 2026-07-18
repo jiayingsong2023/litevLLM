@@ -95,6 +95,21 @@ def test_multimodal_processor_rejects_oversized_inline_image_payload() -> None:
         LiteMultiModalProcessor._load_image(image_url)
 
 
+@pytest.mark.parametrize(
+    "image_url, message",
+    [
+        ("data:image/png;base64,not-base64", "invalid base64"),
+        ("data:image/png;base64,aGVsbG8=", "could not be decoded"),
+        ("data:image/svg+xml;base64,PHN2Zy8+", "base64-encoded image"),
+    ],
+)
+def test_multimodal_processor_normalizes_invalid_images(
+    image_url: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        LiteMultiModalProcessor._load_image(image_url)
+
+
 def test_multimodal_processor_accepts_gemma_chat_template_image_marker() -> None:
     processor = LiteMultiModalProcessor(
         model=_Gemma4LikeModel(),
